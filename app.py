@@ -18387,7 +18387,9 @@ AUTH_EXEMPT_PREFIXES = (
     "/assets/",
     "/favicon",
     "/mcp",
+    "/mcp-readonly",
     "/sse",
+    "/sse-readonly",
 )
 
 
@@ -18438,7 +18440,7 @@ def canonical_web_redirect():
     current_host = request.host.split(":", 1)[0].lower()
     if current_host in {canonical_host, mcp_host}:
         return None
-    if request.path.startswith(("/mcp", "/sse")) and mcp_host:
+    if request.path.startswith(("/mcp", "/mcp-readonly", "/sse", "/sse-readonly")) and mcp_host:
         target_host = mcp_host
     else:
         target_host = canonical_host
@@ -18589,12 +18591,29 @@ def mcp_auth_ok(path_token: str | None = None) -> bool:
     return auth_header == f"Bearer {expected}"
 
 
+def readonly_mcp_auth_ok(path_token: str | None = None) -> bool:
+    expected = os.getenv("MCP_READONLY_SHARED_SECRET", "").strip()
+    if not expected:
+        return False
+    if path_token and path_token == expected:
+        return True
+    auth_header = request.headers.get("Authorization", "").strip()
+    return auth_header == f"Bearer {expected}"
+
+
 def mcp_auth_error():
     return jsonify({
         "jsonrpc": "2.0",
         "id": None,
         "error": {"code": -32001, "message": "MCP authentication required."},
     }), 401
+
+
+def mcp_status_code(response: dict[str, Any]) -> int:
+    if "error" not in response:
+        return 200
+    code = response["error"].get("code")
+    return 400 if code in {-32700, -32600, -32601, -32602} else 500
 
 
 def mcp_sse_event(event: str, data: str) -> str:
@@ -18635,11 +18654,46 @@ def mcp_http(path_token: str | None = None):
     response = handle_request(payload)
     if response is None:
         return ("", 202)
-    status_code = 200
-    if "error" in response:
-        code = response["error"].get("code")
-        status_code = 400 if code in {-32700, -32600, -32601, -32602} else 500
-    return jsonify(response), status_code
+    return jsonify(response), mcp_status_code(response)
+
+
+@app.get("/mcp-readonly")
+@app.get("/mcp-readonly/<path:path_token>")
+def mcp_readonly_info(path_token: str | None = None):
+    if not readonly_mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    from mcp.context_server import READONLY_TOOL_NAMES
+
+    return jsonify({
+        "name": "employee-analytics-context-readonly",
+        "transport": "http-json-rpc",
+        "endpoint": "/mcp-readonly",
+        "auth": "shared-secret",
+        "scope": "read-only company knowledge, Zoom calls, and org structure",
+        "methods": ["initialize", "tools/list", "tools/call"],
+        "tools": sorted(READONLY_TOOL_NAMES),
+    })
+
+
+@app.post("/mcp-readonly")
+@app.post("/mcp-readonly/<path:path_token>")
+def mcp_readonly_http(path_token: str | None = None):
+    if not readonly_mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    from mcp.context_server import READONLY_TOOL_NAMES, handle_request
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Request body must be JSON."},
+        }), 400
+
+    response = handle_request(payload, tool_names=READONLY_TOOL_NAMES)
+    if response is None:
+        return ("", 202)
+    return jsonify(response), mcp_status_code(response)
 
 
 @app.get("/sse")
@@ -18655,6 +18709,42 @@ def mcp_sse(path_token: str | None = None):
         endpoint = url_for("mcp_sse_messages", session_id=session_id, path_token=path_token)
     else:
         endpoint = url_for("mcp_sse_messages", session_id=session_id)
+
+    @stream_with_context
+    def stream():
+        yield mcp_sse_event("endpoint", endpoint)
+        try:
+            while True:
+                try:
+                    yield queue.get(timeout=15)
+                except Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            MCP_SSE_SESSIONS.pop(session_id, None)
+
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/sse-readonly")
+@app.get("/sse-readonly/<path:path_token>")
+def mcp_readonly_sse(path_token: str | None = None):
+    if not readonly_mcp_auth_ok(path_token):
+        return mcp_auth_error()
+
+    session_id = uuid4().hex
+    queue: Queue[str] = Queue()
+    MCP_SSE_SESSIONS[session_id] = queue
+    if path_token:
+        endpoint = url_for("mcp_readonly_sse_messages", session_id=session_id, path_token=path_token)
+    else:
+        endpoint = url_for("mcp_readonly_sse_messages", session_id=session_id)
 
     @stream_with_context
     def stream():
@@ -18702,6 +18792,35 @@ def mcp_sse_messages(session_id: str, path_token: str | None = None):
         }), 400
 
     response = handle_request(payload)
+    if response is not None:
+        queue.put(mcp_sse_event("message", json.dumps(response, ensure_ascii=False)))
+    return ("", 202)
+
+
+@app.post("/mcp-readonly/messages/<session_id>")
+@app.post("/mcp-readonly/messages/<session_id>/<path:path_token>")
+def mcp_readonly_sse_messages(session_id: str, path_token: str | None = None):
+    if not readonly_mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    queue = MCP_SSE_SESSIONS.get(session_id)
+    if queue is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32004, "message": "Unknown MCP SSE session."},
+        }), 404
+
+    from mcp.context_server import READONLY_TOOL_NAMES, handle_request
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Request body must be JSON."},
+        }), 400
+
+    response = handle_request(payload, tool_names=READONLY_TOOL_NAMES)
     if response is not None:
         queue.put(mcp_sse_event("message", json.dumps(response, ensure_ascii=False)))
     return ("", 202)

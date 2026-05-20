@@ -2838,7 +2838,30 @@ TOOLS: dict[str, dict[str, Any]] = {
 }
 
 
-def list_tools() -> list[dict[str, Any]]:
+READONLY_TOOL_NAMES: set[str] = {
+    "start_here_always_read_ai_instructions",
+    "health",
+    "get_context_guide",
+    "get_ai_instructions",
+    "list_available_sources",
+    "get_company_profile",
+    "list_company_files",
+    "get_company_file",
+    "search_company_knowledge",
+    "get_org_structure",
+    "list_zoom_calls",
+    "get_zoom_call_transcript",
+    "search_zoom_transcripts",
+}
+
+
+def _allowed_tools(tool_names: set[str] | None = None) -> dict[str, dict[str, Any]]:
+    if tool_names is None:
+        return TOOLS
+    return {name: TOOLS[name] for name in tool_names if name in TOOLS}
+
+
+def list_tools(tool_names: set[str] | None = None) -> list[dict[str, Any]]:
     return [
         {
             "name": name,
@@ -2849,13 +2872,14 @@ def list_tools() -> list[dict[str, Any]]:
             ),
             "inputSchema": spec["inputSchema"],
         }
-        for name, spec in TOOLS.items()
+        for name, spec in _allowed_tools(tool_names).items()
     ]
 
 
-def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
+def handle_request(request: dict[str, Any], tool_names: set[str] | None = None) -> dict[str, Any] | None:
     request_id = request.get("id")
     method = request.get("method")
+    available_tools = _allowed_tools(tool_names)
 
     if method == "notifications/initialized":
         return None
@@ -2868,14 +2892,14 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             }
         elif method == "tools/list":
-            result = {"tools": list_tools()}
+            result = {"tools": list_tools(tool_names)}
         elif method == "tools/call":
             params = request.get("params") or {}
             name = params.get("name")
             args = params.get("arguments") or {}
-            if name not in TOOLS:
-                raise McpError(-32601, f"Unknown tool: {name}")
-            result = text_response(TOOLS[name]["handler"](args))
+            if name not in available_tools:
+                raise McpError(-32601, f"Unknown or unavailable tool: {name}")
+            result = text_response(available_tools[name]["handler"](args))
         else:
             raise McpError(-32601, f"Unknown method: {method}")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
