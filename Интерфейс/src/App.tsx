@@ -2704,7 +2704,7 @@ export default function App() {
     setCompanyLoading(true);
     setCompanyMessage("");
     try {
-      const payload = await fetchJsonSafe("/api/company-folders/sync-google-drive", { method: "POST" }, 180000);
+      const payload = await fetchJsonSafe("/api/company-folders/sync-google-drive", { method: "POST" }, 600000);
       const result = payload.result || {};
       await loadCompanyFolders(companyFolderId);
       const importProblems = Number(result.document_errors_count ?? 0) + Number(result.skipped_files_count ?? 0);
@@ -3854,7 +3854,7 @@ export default function App() {
     setZoomCallsLoading(true);
     setZoomCallsMessage("");
     try {
-      const payload = await fetchJsonSafe("/api/zoom-calls/sync-google-drive", { method: "POST" }, 180000);
+      const payload = await fetchJsonSafe("/api/zoom-calls/sync-google-drive", { method: "POST" }, 600000);
       if (payload.tree) setZoomCallsTree({ years: payload.tree.years || [], total: payload.tree.total || 0 });
       setZoomCallsMessage(
         `transcript.txt из Google Drive подтянуты: созвонов ${payload.calls_synced || 0}; участников ${payload.participants_synced || 0}; реплик ${payload.segments_synced || 0}; удалено ${payload.removed_calls || 0}.`,

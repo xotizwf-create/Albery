@@ -301,7 +301,8 @@ def google_drive_company_sync_config() -> tuple[str, str]:
 
 def fetch_google_drive_company_payload() -> dict[str, Any]:
     sync_url, token = google_drive_company_sync_config()
-    response = requests.get(sync_url, params={"token": token}, timeout=180)
+    timeout = int(os.getenv("GOOGLE_DRIVE_SYNC_TIMEOUT_SECONDS", "600") or "600")
+    response = requests.get(sync_url, params={"token": token}, timeout=timeout)
     if not response.ok:
         raise RuntimeError(f"Google Apps Script вернул HTTP {response.status_code}: {response.text[:500]}")
     payload = response.json()
@@ -2876,7 +2877,8 @@ def google_drive_calls_sync_config() -> tuple[str, str]:
 
 def fetch_google_drive_call_transcripts() -> list[dict[str, Any]]:
     sync_url, token = google_drive_calls_sync_config()
-    response = requests.get(sync_url, params={"token": token}, timeout=180)
+    timeout = int(os.getenv("GOOGLE_DRIVE_SYNC_TIMEOUT_SECONDS", "600") or "600")
+    response = requests.get(sync_url, params={"token": token}, timeout=timeout)
     if not response.ok:
         raise RuntimeError(f"Google Apps Script вернул HTTP {response.status_code}: {response.text[:500]}")
     payload = response.json()
