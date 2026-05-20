@@ -29,6 +29,7 @@ Read-only MCP server for Claude Code / Claude Desktop. It exposes the local Post
 - `save_chat_daily_report` - write a generated daily report for one chat/date and its structured items.
 - `get_chat_weekly_report` - read the saved weekly report for one chat and period.
 - `save_chat_weekly_report` - write a generated weekly report for one chat/period.
+- `get_previous_owner_daily_context` - read only the previous calendar day's current owner daily report for continuity when creating a new owner daily report.
 - `get_owner_reports` - read recent current owner daily/weekly reports for recommendation continuity.
 - `save_owner_daily_report` - write a generated daily owner report to `owner_daily_reports`.
 - `save_owner_weekly_report` - write a generated weekly owner report to `owner_weekly_reports`.
@@ -46,7 +47,8 @@ For new analysis requests, call `get_context_guide` after `start_here_always_rea
 - date-based analysis: `get_period_index`, then `search_tasks`, `search_messages`, and Zoom tools;
 - chat evidence: `list_chats`, then `get_chat_transcript`;
 - meeting evidence: `list_zoom_calls`, then `get_zoom_call_transcript` or `search_zoom_transcripts`.
-- recommendations and management answers: read `get_owner_reports(report_kind=daily)`, `get_owner_reports(report_kind=weekly)`, relevant chat reports, company knowledge, and concrete Bitrix tasks before answering.
+- owner daily report creation: read the previous day through `get_previous_owner_daily_context(report_date=YYYY-MM-DD)`, then use relevant chat reports, Zoom reports, company knowledge, and concrete Bitrix tasks before saving.
+- recommendations and management answers: read prior owner context, relevant chat reports, company knowledge, and concrete Bitrix tasks before answering.
 - daily chat report creation: `get_ai_instructions`, active `get_report_contract(category_key=chat_analysis)`, `get_chat_ocr_status`, `process_chat_ocr` if OCR is missing, `get_chat_transcript` with `include_ocr=true`, `list_zoom_calls`, `search_zoom_transcripts` with keywords from chat/OCR/tasks/risks, `get_zoom_call_transcript` for matches and for the only same-day call, previous `get_chat_daily_report`, then `save_chat_daily_report`.
 - weekly chat report creation: `get_report_contract(category_key=chat_weekly_report)`, verify/generate required daily reports, check existing report with `get_chat_weekly_report`, then save to `chat_weekly_reports` with `save_chat_weekly_report`.
 

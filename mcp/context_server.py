@@ -284,7 +284,7 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "use_for": ["conversation evidence", "commitments", "decisions", "questions", "OCR from screenshots", "daily and weekly chat report storage"],
             },
             "owner_reports": {
-                "tools": ["get_owner_reports", "save_owner_daily_report", "save_owner_weekly_report"],
+                "tools": ["get_previous_owner_daily_context", "get_owner_reports", "save_owner_daily_report", "save_owner_weekly_report"],
                 "tables": ["owner_daily_reports", "owner_weekly_reports"],
                 "use_for": ["recent owner context", "general daily reports for owner", "general weekly reports for owner", "owner-level report storage", "recommendation continuity"],
             },
@@ -345,7 +345,7 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "if any active chat daily report is missing, run the daily_chat_report_creation workflow for that chat before continuing",
                 "list_zoom_calls(date_from=report_date,date_to=report_date)",
                 "for every same-day Zoom call, check analytical_note only; if missing, use zoom_call_report instructions and save_zoom_call_report before continuing",
-                "check that the previous owner_daily_report exists; if missing, create it first",
+                "get_previous_owner_daily_context(report_date) to read the previous calendar day's current owner daily report; if missing, stop or create the missing previous day first",
                 "only after every chat daily report, every Zoom analytical report, and previous owner_daily_report are ready, create owner_daily_report",
                 "if any required source is missing or failed, stop and return the missing chat/Zoom/OCR source list instead of writing owner_daily_report",
             ],
@@ -1739,6 +1739,58 @@ def tool_get_owner_reports(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_get_previous_owner_daily_context(args: dict[str, Any]) -> dict[str, Any]:
+    report_date = parse_date_arg(args, "report_date")
+    if report_date is None:
+        raise McpError(-32602, "Missing required argument: report_date")
+    previous_date = report_date - timedelta(days=1)
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, report_date, version, is_current, generated_at,
+                       summary, dynamics_summary, risks_summary, recommendations,
+                       report_text, raw_json
+                FROM owner_daily_reports
+                WHERE report_date = %s AND is_current = TRUE
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (previous_date,),
+            )
+            report = cur.fetchone()
+
+    if not report:
+        return {
+            "report_date": report_date,
+            "previous_report_date": previous_date,
+            "previous_owner_daily": None,
+            "message": "Previous owner daily report was not found for the previous calendar day.",
+            "rule": "Do not invent the previous owner report. Use other verified sources and state that previous owner continuity is unavailable.",
+        }
+
+    raw_json = report.get("raw_json") if isinstance(report, dict) else None
+    analysis = raw_json.get("analysis") if isinstance(raw_json, dict) and isinstance(raw_json.get("analysis"), dict) else None
+    return {
+        "report_date": report_date,
+        "previous_report_date": previous_date,
+        "previous_owner_daily": {
+            "id": report.get("id"),
+            "report_date": report.get("report_date"),
+            "version": report.get("version"),
+            "generated_at": report.get("generated_at"),
+            "summary": report.get("summary"),
+            "dynamics_summary": report.get("dynamics_summary"),
+            "risks_summary": report.get("risks_summary"),
+            "recommendations": report.get("recommendations"),
+            "report_text": report.get("report_text"),
+            "analysis": analysis,
+        },
+        "rule": "Use this previous-day owner daily context only for continuity: open questions, repeated risks, completed items, and recommendations. Do not treat it as evidence for the new day without current sources.",
+    }
+
+
 def owner_report_raw_json(args: dict[str, Any], report_text: str, model: str, status: str) -> dict[str, Any]:
     raw_json = args.get("raw_json") if isinstance(args.get("raw_json"), dict) else {}
     analysis = args.get("analysis") if isinstance(args.get("analysis"), dict) else {}
@@ -2614,6 +2666,18 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_owner_reports,
+    },
+    "get_previous_owner_daily_context": {
+        "description": "Read only the previous calendar day's current owner daily report as continuity context for creating or checking a new owner daily report.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "report_date": {"type": "string", "description": "Target owner daily report date in YYYY-MM-DD. The tool reads report_date minus one day."},
+            },
+            "required": ["report_date"],
+            "additionalProperties": False,
+        },
+        "handler": tool_get_previous_owner_daily_context,
     },
     "save_chat_daily_report": {
         "description": "Save a generated daily report for one chat/date directly to PostgreSQL. Use after the MCP agent has analyzed chat OCR text, same-day Zoom reports, and previous-day report using the active chat_analysis report contract.",
