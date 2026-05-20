@@ -3,6 +3,7 @@
 import json
 import hashlib
 import base64
+import html
 import mimetypes
 import os
 from queue import Empty, Queue
@@ -18,10 +19,11 @@ from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory, stream_with_context, url_for
+from flask import Flask, Response, abort, jsonify, redirect, request, send_file, send_from_directory, session, stream_with_context, url_for
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from werkzeug.security import check_password_hash
 
 
 load_dotenv()
@@ -18360,6 +18362,7 @@ def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = Fal
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "change-this-secret")
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=int(os.getenv("AUTH_SESSION_DAYS", "30") or "30"))
 app.jinja_env.filters["dt_ru"] = format_datetime_ru
 if not postgres_enabled():
     init_db()
@@ -18369,6 +18372,203 @@ if not postgres_enabled():
 
 
 MCP_SSE_SESSIONS: dict[str, Queue[str]] = {}
+LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+AUTH_EXEMPT_PREFIXES = (
+    "/login",
+    "/logout",
+    "/assets/",
+    "/favicon",
+    "/mcp",
+    "/sse",
+)
+
+
+def configured_admin_password_hash() -> str:
+    return os.getenv("ADMIN_PASSWORD_HASH", "").strip()
+
+
+def request_client_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+    return forwarded or request.remote_addr or "unknown"
+
+
+def login_rate_limited(client_ip: str) -> bool:
+    window_seconds = int(os.getenv("AUTH_RATE_LIMIT_WINDOW_SECONDS", "900") or "900")
+    max_attempts = int(os.getenv("AUTH_RATE_LIMIT_ATTEMPTS", "6") or "6")
+    now = time.time()
+    attempts = [ts for ts in LOGIN_ATTEMPTS.get(client_ip, []) if now - ts < window_seconds]
+    LOGIN_ATTEMPTS[client_ip] = attempts
+    return len(attempts) >= max_attempts
+
+
+def record_failed_login(client_ip: str) -> None:
+    LOGIN_ATTEMPTS.setdefault(client_ip, []).append(time.time())
+
+
+def clear_failed_logins(client_ip: str) -> None:
+    LOGIN_ATTEMPTS.pop(client_ip, None)
+
+
+def authenticated() -> bool:
+    return bool(session.get("admin_authenticated"))
+
+
+def auth_exempt_path(path: str) -> bool:
+    return any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in AUTH_EXEMPT_PREFIXES)
+
+
+def wants_json_response() -> bool:
+    return request.path.startswith("/api/") or "application/json" in request.headers.get("Accept", "")
+
+
+def canonical_web_redirect():
+    canonical_host = os.getenv("CANONICAL_WEB_HOST", "").strip().lower()
+    if not canonical_host:
+        return None
+
+    mcp_host = os.getenv("MCP_HOST", "").strip().lower()
+    current_host = request.host.split(":", 1)[0].lower()
+    if current_host in {canonical_host, mcp_host}:
+        return None
+    if request.path.startswith(("/mcp", "/sse")) and mcp_host:
+        target_host = mcp_host
+    else:
+        target_host = canonical_host
+    return redirect(f"https://{target_host}{request.full_path.rstrip('?')}", code=301)
+
+
+@app.before_request
+def require_admin_auth():
+    redirect_response = canonical_web_redirect()
+    if redirect_response is not None:
+        return redirect_response
+
+    path = request.path
+    if path == "/":
+        return redirect("/main", code=302)
+    if auth_exempt_path(path):
+        return None
+    if authenticated():
+        return None
+    if wants_json_response():
+        return jsonify({"error": "Authentication required."}), 401
+    return redirect(url_for("login", next=request.full_path.rstrip("?")), code=302)
+
+
+def login_page(error: str = "") -> str:
+    error_html = f'<div class="error">{error}</div>' if error else ""
+    next_value = html.escape(request.args.get("next") or "/main", quote=True)
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Albery Admin</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f4f7fb;
+      color: #111827;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{
+      width: min(420px, calc(100vw - 32px));
+      padding: 32px;
+      border: 1px solid #dbe3ef;
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: 0 24px 70px rgba(15, 23, 42, 0.08);
+    }}
+    h1 {{ margin: 0 0 8px; font-size: 24px; line-height: 1.2; }}
+    p {{ margin: 0 0 24px; color: #64748b; font-size: 14px; line-height: 1.5; }}
+    label {{ display: block; margin-bottom: 8px; font-size: 13px; font-weight: 700; color: #334155; }}
+    input {{
+      width: 100%;
+      height: 46px;
+      padding: 0 14px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      font-size: 16px;
+    }}
+    input:focus {{ outline: 3px solid rgba(37, 99, 235, 0.14); border-color: #2563eb; }}
+    button {{
+      width: 100%;
+      height: 46px;
+      margin-top: 18px;
+      border: 0;
+      border-radius: 8px;
+      background: #111827;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+    .error {{
+      margin-bottom: 16px;
+      padding: 10px 12px;
+      border: 1px solid #fecaca;
+      border-radius: 8px;
+      background: #fef2f2;
+      color: #b91c1c;
+      font-size: 13px;
+      line-height: 1.4;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Albery Admin</h1>
+    <p>Введите пароль для доступа к панели.</p>
+    {error_html}
+    <form method="post" action="/login">
+      <input type="hidden" name="next" value="{next_value}">
+      <label for="password">Пароль</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+      <button type="submit">Войти</button>
+    </form>
+  </main>
+</body>
+</html>"""
+
+
+@app.get("/login")
+def login():
+    if authenticated():
+        return redirect(request.args.get("next") or "/main", code=302)
+    return Response(login_page(), mimetype="text/html")
+
+
+@app.post("/login")
+def login_submit():
+    client_ip = request_client_ip()
+    next_url = request.form.get("next") or "/main"
+    password_hash = configured_admin_password_hash()
+    if not password_hash:
+        return Response(login_page("ADMIN_PASSWORD_HASH не задан в .env."), status=503, mimetype="text/html")
+    if login_rate_limited(client_ip):
+        return Response(login_page("Слишком много попыток входа. Повторите позже."), status=429, mimetype="text/html")
+
+    password = request.form.get("password", "")
+    if not check_password_hash(password_hash, password):
+        record_failed_login(client_ip)
+        return Response(login_page("Неверный пароль."), status=401, mimetype="text/html")
+
+    clear_failed_logins(client_ip)
+    session.clear()
+    session.permanent = True
+    session["admin_authenticated"] = True
+    safe_next_url = next_url if next_url.startswith("/") and not next_url.startswith("//") else "/main"
+    return redirect(safe_next_url, code=302)
+
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"), code=302)
 
 
 def mcp_auth_ok(path_token: str | None = None) -> bool:
@@ -18500,6 +18700,7 @@ def mcp_sse_messages(session_id: str, path_token: str | None = None):
 
 
 @app.get("/")
+@app.get("/main")
 @app.get("/registry")
 @app.get("/reports")
 @app.get("/tasks/reports")
