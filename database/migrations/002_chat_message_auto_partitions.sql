@@ -18,6 +18,10 @@ BEGIN
     partition_end := (partition_start + INTERVAL '1 month')::date;
     partition_name := format('chat_messages_%s', to_char(partition_start, 'YYYY_MM'));
 
+    IF to_regclass(format('public.%I', partition_name)) IS NOT NULL THEN
+        RETURN;
+    END IF;
+
     EXECUTE format(
         'CREATE TABLE IF NOT EXISTS %I PARTITION OF chat_messages FOR VALUES FROM (%L) TO (%L)',
         partition_name,
@@ -25,7 +29,7 @@ BEGIN
         partition_end
     );
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
 CREATE OR REPLACE FUNCTION trg_chat_messages_ensure_partition() RETURNS TRIGGER AS $$
 BEGIN
@@ -50,4 +54,3 @@ BEGIN
 END$$;
 
 COMMIT;
-

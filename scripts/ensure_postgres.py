@@ -23,6 +23,10 @@ REQUIRED_TABLE_MIGRATIONS = {
     "chat_day_syncs": "016_chat_day_syncs.sql",
 }
 
+REQUIRED_FUNCTION_MIGRATIONS = {
+    "ensure_chat_messages_partition": "017_fix_chat_message_partition_privileges.sql",
+}
+
 
 def normalize_postgres_url(database_url: str) -> str:
     normalized = database_url.strip()
@@ -86,6 +90,24 @@ def apply_required_migrations(database_url: str) -> None:
                     raise FileNotFoundError(f"Migration file not found: {migration_path}")
                 cur.execute(migration_path.read_text(encoding="utf-8"))
                 print(f"PostgreSQL migration applied: {migration_name}")
+            for function_name, migration_name in REQUIRED_FUNCTION_MIGRATIONS.items():
+                cur.execute(
+                    """
+                    SELECT p.prosecdef
+                    FROM pg_proc p
+                    JOIN pg_namespace n ON n.oid = p.pronamespace
+                    WHERE n.nspname = 'public' AND p.proname = %s
+                    """,
+                    (function_name,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    continue
+                migration_path = MIGRATIONS_DIR / migration_name
+                if not migration_path.exists():
+                    raise FileNotFoundError(f"Migration file not found: {migration_path}")
+                cur.execute(migration_path.read_text(encoding="utf-8"))
+                print(f"PostgreSQL migration applied: {migration_name}")
 
 
 def main() -> int:
@@ -96,14 +118,17 @@ def main() -> int:
         return 1
 
     database_url = normalize_postgres_url(database_url)
-    create_database_if_missing(database_url)
+    admin_url = os.getenv("DATABASE_ADMIN_URL", "").strip()
+    migration_url = normalize_postgres_url(admin_url) if admin_url else database_url
+
+    create_database_if_missing(migration_url)
     if schema_is_initialized(database_url):
         print("PostgreSQL schema already initialized.")
-        apply_required_migrations(database_url)
+        apply_required_migrations(migration_url)
         return 0
 
-    apply_schema(database_url)
-    apply_required_migrations(database_url)
+    apply_schema(migration_url)
+    apply_required_migrations(migration_url)
     return 0
 
 

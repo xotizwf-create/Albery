@@ -20616,6 +20616,17 @@ def api_chat_weekly_report_post(dialog_id: str):
         report = save_chat_weekly_report(dialog_id, period_start, period_end, force=force)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 500
+        if status_code in {429, 500, 502, 503, 504}:
+            return jsonify({
+                "error": (
+                    "ИИ-сервис временно недоступен, недельный отчет не сформирован и не сохранен в БД. "
+                    "Повторите генерацию позже."
+                ),
+                "details": str(exc),
+            }), 503
+        return jsonify({"error": f"Ошибка формирования недельного отчета по чату: {exc}"}), 500
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"Ошибка формирования недельного отчета по чату: {exc}"}), 500
     return jsonify({
