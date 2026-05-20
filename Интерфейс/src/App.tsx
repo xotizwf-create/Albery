@@ -2686,9 +2686,7 @@ export default function App() {
     try {
       const params = new URLSearchParams();
       if (folderId) params.set("folder_id", folderId);
-      const response = await fetch(`/api/company-folders?${params.toString()}`);
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Не удалось загрузить папки компании");
+      const payload = await fetchJsonSafe(`/api/company-folders?${params.toString()}`, undefined, 60000);
       const current = payload.current || null;
       setCompanyFolderId(folderId);
       setCompanyCurrentFolder(current);
@@ -2706,9 +2704,7 @@ export default function App() {
     setCompanyLoading(true);
     setCompanyMessage("");
     try {
-      const response = await fetch("/api/company-folders/sync-google-drive", { method: "POST" });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Не удалось подтянуть данные из Google Drive");
+      const payload = await fetchJsonSafe("/api/company-folders/sync-google-drive", { method: "POST" }, 180000);
       const result = payload.result || {};
       await loadCompanyFolders(companyFolderId);
       const importProblems = Number(result.document_errors_count ?? 0) + Number(result.skipped_files_count ?? 0);
@@ -2850,9 +2846,7 @@ export default function App() {
     try {
       const params = new URLSearchParams();
       if (folderId) params.set("folder_id", folderId);
-      const response = await fetch(`/api/ai-instruction-folders?${params.toString()}`);
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Не удалось загрузить инструкции");
+      const payload = await fetchJsonSafe(`/api/ai-instruction-folders?${params.toString()}`, undefined, 60000);
       const current = payload.current || null;
       setAiInstructionFolderId(folderId);
       setAiInstructionCurrentFolder(current);
