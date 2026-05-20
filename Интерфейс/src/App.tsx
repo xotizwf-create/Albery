@@ -3951,6 +3951,17 @@ export default function App() {
     }
   }, [activeTab]);
 
+  useEffect(() => {
+    if (!selectedZoomCall) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSelectedZoomCall(null);
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [selectedZoomCall]);
+
   const weekBoundsFromIso = (value: string) => {
     const date = dateFromIso(value);
     const day = date.getDay() || 7;
@@ -5465,111 +5476,6 @@ export default function App() {
               </div>
             )}
 
-            {selectedZoomCall && (
-              <div className="fixed inset-0 z-50 bg-slate-950/30 backdrop-blur-sm flex items-center justify-center p-6">
-                <div className="relative bg-white rounded-3xl w-full max-w-6xl h-[86vh] shadow-2xl overflow-hidden animate-in zoom-in-95 duration-300 flex flex-col">
-                  <div className="px-6 py-5 border-b border-[#Eef0f4] flex items-start justify-between gap-4">
-                    <div className="min-w-0">
-                      <h3 className="text-xl font-black text-slate-900 truncate">{selectedZoomCall.technical_topic}</h3>
-                      <div className="flex flex-wrap gap-2 mt-3 text-xs font-bold text-slate-500">
-                        <span className="px-3 py-1 rounded-md bg-slate-50 border border-slate-100">{selectedZoomCall.date_text}</span>
-                        <span className="px-3 py-1 rounded-md bg-slate-50 border border-slate-100">{selectedZoomCall.time_text}</span>
-                        <span className="px-3 py-1 rounded-md bg-slate-50 border border-slate-100">{selectedZoomCall.topic}</span>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        onClick={() => void generateZoomCallReport(selectedZoomCall)}
-                        disabled={zoomCallDetailLoading || Boolean(selectedZoomCall.analytical_note)}
-                        className="h-10 px-4 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[13px] font-bold flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        <Sparkles className="w-4 h-4" />
-                        Сформировать отчет
-                      </button>
-                      <button
-                        onClick={() => setZoomTranscriptVisible((current) => !current)}
-                        className="h-10 px-4 rounded-xl bg-[#5440F6] hover:bg-[#4532db] text-white text-[13px] font-bold flex items-center justify-center gap-2 shadow-md shadow-[#5440F6]/20"
-                      >
-                        <FileText className="w-4 h-4" />
-                        {zoomTranscriptVisible ? "Посмотреть отчет" : "Посмотреть транскрибацию"}
-                      </button>
-                      <button
-                        onClick={() => void deleteZoomCallReport(selectedZoomCall)}
-                        disabled={zoomCallDetailLoading || !selectedZoomCall.analytical_note}
-                        className="h-10 px-4 rounded-xl bg-red-50 hover:bg-red-100 text-red-700 text-[13px] font-bold flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                        Удалить отчет
-                      </button>
-                      <button
-                        onClick={() => setSelectedZoomCall(null)}
-                        className="w-10 h-10 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-500 flex items-center justify-center"
-                      >
-                        <X className="w-5 h-5" />
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="px-6 py-4 border-b border-[#Eef0f4] bg-slate-50/70">
-                    <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Участники</p>
-                    <div className="flex flex-wrap gap-2">
-                      {selectedZoomCall.participants.length ? selectedZoomCall.participants.map((participant, idx) => (
-                        <span key={`${participant.email || participant.name || idx}`} className="bg-blue-100/60 text-blue-700 text-xs font-bold px-2.5 py-1 rounded flex items-center gap-1.5">
-                          <Users className="w-3 h-3" />
-                          {participant.name || participant.email}
-                        </span>
-                      )) : (
-                        <span className="text-xs font-bold text-slate-400">Не определены</span>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="flex-1 overflow-y-auto p-6">
-                    {zoomCallDetailLoading ? (
-                      <div className="h-40 flex items-center justify-center text-sm font-bold text-slate-400">
-                        Загрузка отчета о созвоне...
-                      </div>
-                    ) : zoomTranscriptVisible ? (
-                      <>
-                        <h4 className="text-xs font-black uppercase tracking-wider text-slate-400 mb-3">Полная транскрибация</h4>
-                        {selectedZoomCall.segments?.length ? (
-                          <div className="space-y-2">
-                            {selectedZoomCall.segments.map((segment) => (
-                              <div key={`${segment.segment_index}-${segment.cue_index}`} className="grid grid-cols-[170px_1fr] gap-4 py-2 border-b border-slate-100 last:border-0">
-                                <div className="text-[12px] font-bold text-slate-400">
-                                  {segment.start_offset} - {segment.end_offset}
-                                </div>
-                                <div className="text-[14px] leading-relaxed text-slate-800">
-                                  {segment.speaker && <span className="font-black text-blue-700">{segment.speaker}: </span>}
-                                  {segment.text}
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <pre className="whitespace-pre-wrap text-[14px] leading-relaxed text-slate-800 font-sans">
-                            {selectedZoomCall.transcript_text || "Транскрибация отсутствует."}
-                          </pre>
-                        )}
-                      </>
-                    ) : (
-                      <>
-                        <h4 className="text-xs font-black uppercase tracking-wider text-slate-400 mb-3">Отчет о созвоне</h4>
-                        <div className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
-                          {selectedZoomCall.analytical_note ? (
-                            <div className="space-y-4">
-                              {renderZoomReportText(selectedZoomCall.analytical_note)}
-                            </div>
-                          ) : (
-                            <p className="text-[14px] font-bold text-slate-400">Пока пусто</p>
-                          )}
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
         </div>
       );
@@ -7807,6 +7713,117 @@ export default function App() {
           <div className="flex-1">{renderContent()}</div>
         </main>
       </div>
+
+      {selectedZoomCall && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-200">
+          <div className="absolute inset-0 bg-slate-950/35 backdrop-blur-md" onClick={() => setSelectedZoomCall(null)}></div>
+          <div
+            className="relative bg-white/95 backdrop-blur-xl rounded-3xl w-full max-w-5xl max-h-[88vh] shadow-2xl overflow-hidden animate-in zoom-in-95 duration-300 flex flex-col ring-1 ring-white/70"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="px-6 py-5 border-b border-[#Eef0f4] flex items-start justify-between gap-4 bg-white/90">
+              <div className="min-w-0">
+                <h3 className="text-xl font-black text-slate-950 truncate">{selectedZoomCall.technical_topic}</h3>
+                <div className="flex flex-wrap gap-2 mt-3 text-xs font-bold text-slate-500">
+                  <span className="px-3 py-1 rounded-md bg-slate-50 border border-slate-100">{selectedZoomCall.date_text}</span>
+                  <span className="px-3 py-1 rounded-md bg-slate-50 border border-slate-100">{selectedZoomCall.time_text}</span>
+                  <span className="px-3 py-1 rounded-md bg-slate-50 border border-slate-100">{selectedZoomCall.topic}</span>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
+                <button
+                  onClick={() => void generateZoomCallReport(selectedZoomCall)}
+                  disabled={zoomCallDetailLoading || Boolean(selectedZoomCall.analytical_note)}
+                  className="h-10 px-4 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[13px] font-bold flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  Сформировать отчет
+                </button>
+                <button
+                  onClick={() => setZoomTranscriptVisible((current) => !current)}
+                  className="h-10 px-4 rounded-xl bg-[#5440F6] hover:bg-[#4532db] text-white text-[13px] font-bold flex items-center justify-center gap-2 shadow-md shadow-[#5440F6]/20"
+                >
+                  <FileText className="w-4 h-4" />
+                  {zoomTranscriptVisible ? "Посмотреть отчет" : "Посмотреть транскрибацию"}
+                </button>
+                <button
+                  onClick={() => void deleteZoomCallReport(selectedZoomCall)}
+                  disabled={zoomCallDetailLoading || !selectedZoomCall.analytical_note}
+                  className="h-10 px-4 rounded-xl bg-red-50 hover:bg-red-100 text-red-700 text-[13px] font-bold flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Удалить отчет
+                </button>
+                <button
+                  onClick={() => setSelectedZoomCall(null)}
+                  className="w-10 h-10 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-500 flex items-center justify-center"
+                  aria-label="Закрыть"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="px-6 py-4 border-b border-[#Eef0f4] bg-slate-50/70">
+              <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Участники</p>
+              <div className="flex flex-wrap gap-2">
+                {selectedZoomCall.participants.length ? selectedZoomCall.participants.map((participant, idx) => (
+                  <span key={`${participant.email || participant.name || idx}`} className="bg-blue-100/60 text-blue-700 text-xs font-bold px-2.5 py-1 rounded flex items-center gap-1.5">
+                    <Users className="w-3 h-3" />
+                    {participant.name || participant.email}
+                  </span>
+                )) : (
+                  <span className="text-xs font-bold text-slate-400">Не определены</span>
+                )}
+              </div>
+            </div>
+
+            <div className="flex-1 min-h-0 overflow-y-auto p-6 bg-white">
+              {zoomCallDetailLoading ? (
+                <div className="h-40 flex items-center justify-center text-sm font-bold text-slate-400">
+                  Загрузка отчета о созвоне...
+                </div>
+              ) : zoomTranscriptVisible ? (
+                <>
+                  <h4 className="text-xs font-black uppercase tracking-wider text-slate-400 mb-3">Полная транскрибация</h4>
+                  {selectedZoomCall.segments?.length ? (
+                    <div className="space-y-2">
+                      {selectedZoomCall.segments.map((segment) => (
+                        <div key={`${segment.segment_index}-${segment.cue_index}`} className="grid grid-cols-[170px_1fr] gap-4 py-2 border-b border-slate-100 last:border-0">
+                          <div className="text-[12px] font-bold text-slate-400">
+                            {segment.start_offset} - {segment.end_offset}
+                          </div>
+                          <div className="text-[14px] leading-relaxed text-slate-800">
+                            {segment.speaker && <span className="font-black text-blue-700">{segment.speaker}: </span>}
+                            {segment.text}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <pre className="whitespace-pre-wrap text-[14px] leading-relaxed text-slate-800 font-sans">
+                      {selectedZoomCall.transcript_text || "Транскрибация отсутствует."}
+                    </pre>
+                  )}
+                </>
+              ) : (
+                <>
+                  <h4 className="text-xs font-black uppercase tracking-wider text-slate-400 mb-3">Отчет о созвоне</h4>
+                  <div className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
+                    {selectedZoomCall.analytical_note ? (
+                      <div className="space-y-4">
+                        {renderZoomReportText(selectedZoomCall.analytical_note)}
+                      </div>
+                    ) : (
+                      <p className="text-[14px] font-bold text-slate-400">Пока пусто</p>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {chatContextMenu && (
         <>
