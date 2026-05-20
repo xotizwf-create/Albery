@@ -883,15 +883,15 @@ def ensure_chat_day_syncs_schema() -> None:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        CREATE TABLE IF NOT EXISTS chat_day_syncs (
-                            chat_id uuid NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-                            sync_date date NOT NULL,
-                            messages_count integer NOT NULL DEFAULT 0,
-                            synced_at timestamptz NOT NULL DEFAULT now(),
-                            PRIMARY KEY (chat_id, sync_date)
-                        )
+                        SELECT to_regclass('public.chat_day_syncs') IS NOT NULL AS exists
                         """
                     )
+                    row = cur.fetchone()
+                    if not row or not row["exists"]:
+                        raise RuntimeError(
+                            "PostgreSQL table public.chat_day_syncs is missing. "
+                            "Apply database migrations before running chat sync."
+                        )
                     cur.execute(
                         """
                         INSERT INTO chat_day_syncs (chat_id, sync_date, messages_count, synced_at)

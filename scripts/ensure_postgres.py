@@ -20,6 +20,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "chat_weekly_reports": "009_chat_weekly_reports.sql",
     "company_profile": "012_company_profile.sql",
     "company_folders": "013_company_folders.sql",
+    "chat_day_syncs": "016_chat_day_syncs.sql",
 }
 
 
