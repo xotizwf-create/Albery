@@ -359,12 +359,30 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
         },
     }
 
-def tool_start_here_always_read_ai_instructions(_: dict[str, Any]) -> dict[str, Any]:
+def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[str, Any]:
     instructions = load_ai_instructions()
+    available_tools = list(args.get("_connector_tools") or sorted(TOOLS.keys()))
+    connector_id = args.get("_connector_id") or "full"
+    is_faq = connector_id == "faq" or set(available_tools) == FAQ_TOOL_NAMES
+    connector_label = "FAQ MCP (read-only)" if is_faq else "Full MCP"
     return {
         "mandatory_status": "READ_FIRST_AND_OBEY_EXACTLY",
         "purpose": "This is the mandatory entry tool for this MCP server. The assistant must read these live settings before any analysis, report, recommendation, database lookup plan, or final answer.",
         "source": "Настройки -> Инструкции для ИИ (table ai_instruction_folders)",
+        "connector_scope": {
+            "connector_id": connector_id,
+            "connector_label": connector_label,
+            "available_tools": sorted(available_tools),
+            "rules": [
+                "STEP 0 (before any planning): inspect this connector's available_tools list above. Treat it as the complete and only set of capabilities you have right now.",
+                "Do not assume access to any tool, data source, table, file, integration, web search, or external service that is not in available_tools. Do not invoke or describe tools by name that are not in the list.",
+                "Do not look outside this MCP connector for information: no general web knowledge, no other connectors, no prior conversations, no offline assumptions about what 'usually' exists.",
+                "Plan the order of actions ONLY after Step 0: pick the tool from available_tools that matches the user's task, then follow live_ai_instructions and the execution_contract below.",
+                "If the user asks for data that requires a tool not present in available_tools (for example Bitrix tasks/chats, OCR, report saving, or any source not exposed here), reply briefly in the user's language: 'Нет доступа к этой информации в текущем коннекторе.' Then list which tools you do have so the user can refine the request or switch connectors. Never guess or fabricate the missing data.",
+                "If multiple tools could match, prefer the more specific one. If none match, follow the previous rule.",
+                "Even when available_tools is small (FAQ connector), do not apologize, do not invent capabilities, and do not offer to do work you cannot do here.",
+            ],
+        },
         "live_ai_instructions": instructions,
         "execution_contract": [
             "Treat every non-empty instruction as binding for the current user request.",
@@ -374,6 +392,7 @@ def tool_start_here_always_read_ai_instructions(_: dict[str, Any]) -> dict[str, 
             "If the request conflicts with these instructions, explain the conflict and ask the user to update Настройки -> Инструкции для ИИ or confirm a one-off exception.",
             "If the user request is vague, ambiguous, or missing the needed scope, ask one concise clarifying question first. Do not infer dates, chats, people, report type, or whether to save/write unless the user said it clearly.",
             "When instructions are incomplete for the task, continue with get_context_guide and the relevant source tools instead of guessing.",
+            "If an instruction names a tool that is not in connector_scope.available_tools, skip that step and tell the user that the action requires a connector that exposes that tool. Do not pretend the step succeeded.",
         ],
         "next_tool_guidance": [
             "Use get_context_guide for route selection and source rules.",
@@ -2899,6 +2918,13 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None) 
             args = params.get("arguments") or {}
             if name not in available_tools:
                 raise McpError(-32601, f"Unknown or unavailable tool: {name}")
+            if name == "start_here_always_read_ai_instructions":
+                connector_id = "faq" if tool_names == FAQ_TOOL_NAMES else "full"
+                args = {
+                    **args,
+                    "_connector_tools": sorted(available_tools.keys()),
+                    "_connector_id": connector_id,
+                }
             result = text_response(available_tools[name]["handler"](args))
         else:
             raise McpError(-32601, f"Unknown method: {method}")
