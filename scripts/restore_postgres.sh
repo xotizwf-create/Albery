@@ -14,12 +14,25 @@ if [ ! -f "$backup_path" ]; then
   exit 1
 fi
 
-if [ -f "$APP_DIR/.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$APP_DIR/.env"
-  set +a
-fi
+read_env_value() {
+  local key="$1"
+  local env_file="$2"
+  if [ ! -f "$env_file" ]; then
+    return 0
+  fi
+  awk -F= -v key="$key" '
+    $1 == key {
+      sub(/^[^=]*=/, "")
+      gsub(/^[ \t]+|[ \t]+$/, "")
+      gsub(/^"|"$/, "")
+      gsub(/^'\''|'\''$/, "")
+      print
+      exit
+    }
+  ' "$env_file"
+}
+
+DATABASE_URL="${DATABASE_URL:-$(read_env_value DATABASE_URL "$APP_DIR/.env")}"
 
 if [ -z "${DATABASE_URL:-}" ]; then
   echo "DATABASE_URL is not set" >&2

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_DIR="${APP_DIR:-/var/www/albery}"
 SERVICE_NAME="${SERVICE_NAME:-albery}"
-FRONTEND_DIR="${FRONTEND_DIR:-$APP_DIR/Интерфейс}"
+FRONTEND_DIR="${FRONTEND_DIR:-}"
 VENV_DIR="${VENV_DIR:-$APP_DIR/.venv}"
 
 log() {
@@ -27,6 +27,13 @@ log "Applying PostgreSQL schema and migrations"
 "$VENV_DIR/bin/python" "$APP_DIR/scripts/ensure_postgres.py"
 
 log "Building frontend"
+if [ -z "$FRONTEND_DIR" ]; then
+  FRONTEND_DIR="$(find "$APP_DIR" -mindepth 1 -maxdepth 2 -name package.json -not -path '*/node_modules/*' -printf '%h\n' | head -n 1)"
+fi
+if [ -z "$FRONTEND_DIR" ] || [ ! -f "$FRONTEND_DIR/package.json" ]; then
+  echo "Frontend package.json was not found" >&2
+  exit 1
+fi
 cd "$FRONTEND_DIR"
 if [ -f package-lock.json ]; then
   npm ci
@@ -40,6 +47,15 @@ systemctl restart "$SERVICE_NAME"
 systemctl --no-pager --full status "$SERVICE_NAME"
 
 log "Local HTTP check"
-curl -fsSI http://127.0.0.1:5002 >/dev/null
+for attempt in $(seq 1 20); do
+  if curl -fsSI http://127.0.0.1:5002 >/dev/null; then
+    break
+  fi
+  if [ "$attempt" -eq 20 ]; then
+    journalctl -u "$SERVICE_NAME" -n 80 --no-pager || true
+    exit 1
+  fi
+  sleep 1
+done
 
 log "Update completed"
