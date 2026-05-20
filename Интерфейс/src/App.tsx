@@ -299,6 +299,9 @@ const MENU_ITEMS = [
   { label: "Команда", icon: Users },
   { label: "Настройки", icon: Settings },
 ];
+const HIDDEN_MAIN_MENU_LABELS = new Set(["Бухгалтерия", "Склад", "Справочники"]);
+const VISIBLE_MENU_ITEMS = MENU_ITEMS.filter((item) => !HIDDEN_MAIN_MENU_LABELS.has(item.label));
+const HIDDEN_HEADER_LINKS = new Set(["Бухгалтерия", "Склад"]);
 
 const MONTHS = [
   "Январь",
@@ -2038,9 +2041,7 @@ type PromptVersion = {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("Сводная аналитика");
-  const [summaryTab, setSummaryTab] = useState<"overview" | "reports">(
-    window.location.pathname === "/registry" ? "reports" : "overview",
-  );
+  const [summaryTab, setSummaryTab] = useState<"overview" | "reports">("reports");
   const [tasksSubTab, setTasksSubTab] = useState<"reports" | "registry" | "chats" | "prompts" | "ai_requests">(
     window.location.pathname === "/registry" ? "registry" : "reports",
   );
@@ -6012,17 +6013,6 @@ export default function App() {
           <div className="flex justify-between items-center mb-0">
             <div className="flex items-center gap-2 bg-white p-1.5 rounded-xl border border-[#Eef0f4] w-max shadow-sm">
               <button
-                onClick={() => setSummaryTab("overview")}
-                className={cn(
-                  "px-5 py-2 rounded-lg text-[13px] font-bold transition-all",
-                  summaryTab === "overview"
-                    ? "bg-[#5440F6] text-white shadow-md shadow-[#5440F6]/20"
-                    : "text-slate-500 hover:text-slate-900",
-                )}
-              >
-                Обзор
-              </button>
-              <button
                 onClick={() => setSummaryTab("reports")}
                 className={cn(
                   "px-5 py-2 rounded-lg text-[13px] font-bold transition-all",
@@ -6058,7 +6048,7 @@ export default function App() {
                       key={tab.id}
                       onClick={() => {
                         setTasksSubTab(tab.id);
-                        window.history.pushState(null, "", tab.id === "registry" ? "/registry" : "/");
+                        window.history.pushState(null, "", tab.id === "registry" ? "/registry" : "/main");
                       }}
                       className={cn(
                         "px-4 py-1.5 rounded-lg text-[13px] font-bold transition-all whitespace-nowrap",
@@ -6821,17 +6811,6 @@ export default function App() {
         {/* Sub Navigation */}
         <div className="flex justify-between items-center mb-0">
           <div className="flex items-center gap-2 bg-white p-1.5 rounded-xl border border-[#Eef0f4] w-max shadow-sm">
-            <button
-              onClick={() => setSummaryTab("overview")}
-              className={cn(
-                "px-5 py-2 rounded-lg text-[13px] font-bold transition-all",
-                summaryTab === "overview"
-                  ? "bg-[#5440F6] text-white shadow-md shadow-[#5440F6]/20"
-                  : "text-slate-500 hover:text-slate-900",
-              )}
-            >
-              Обзор
-            </button>
             <button
               onClick={() => setSummaryTab("reports")}
               className={cn(
@@ -7670,7 +7649,7 @@ export default function App() {
         </div>
 
         <nav className="flex-1 px-4 py-7 flex flex-col gap-2 overflow-y-auto custom-scrollbar">
-          {MENU_ITEMS.map((item) => {
+          {VISIBLE_MENU_ITEMS.map((item) => {
             const isActive = activeTab === item.label;
             return (
               <button
@@ -7730,7 +7709,7 @@ export default function App() {
             </div>
 
             <nav className="flex items-center gap-8 text-[14px] font-semibold text-slate-400 pl-2">
-              {["Бухгалтерия", "Склад", "WB-кабинет"].map((item) => (
+              {["Бухгалтерия", "Склад", "WB-кабинет"].filter((item) => !HIDDEN_HEADER_LINKS.has(item)).map((item) => (
                 <span
                   key={item}
                   onClick={() => setActiveTab(item)}
