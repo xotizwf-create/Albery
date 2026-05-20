@@ -2194,6 +2194,7 @@ export default function App() {
   const [ownerReportRecommendationTexts, setOwnerReportRecommendationTexts] = useState<OwnerReportRecommendationMap>({});
   const [ownerReportSendLoading, setOwnerReportSendLoading] = useState(false);
   const [ownerReportSendMessage, setOwnerReportSendMessage] = useState("");
+  const [ownerReportSendStatus, setOwnerReportSendStatus] = useState<"idle" | "success" | "error">("idle");
   const [editableReport, setEditableReport] = useState<EditableReport | null>(null);
   const [reportEditSaving, setReportEditSaving] = useState(false);
   const [reportEditMessage, setReportEditMessage] = useState("");
@@ -2451,6 +2452,7 @@ export default function App() {
     setSelectedOwnerReport(report);
     setOwnerReportSendMode(mode);
     setOwnerReportSendMessage("");
+    setOwnerReportSendStatus("idle");
     setIsOwnerReportSendOpen(true);
     let members = teamRows;
     if (!teamRows.length) {
@@ -2477,6 +2479,7 @@ export default function App() {
     }
     setOwnerReportSendLoading(true);
     setOwnerReportSendMessage("");
+    setOwnerReportSendStatus("idle");
     try {
       const reportScope = selectedOwnerReport.kind === "weekly" ? "weekly-reports" : "daily-reports";
       const actionPath = ownerReportSendMode === "full" ? "send-full" : "send";
@@ -2498,8 +2501,11 @@ export default function App() {
         },
         120000,
       );
-      setOwnerReportSendMessage(payload.message || (ownerReportSendMode === "full" ? "PDF-отчет отправлен в Bitrix." : "Рекомендации отправлены в Bitrix."));
+      const failed = Number(payload.failed || 0);
+      setOwnerReportSendStatus(failed > 0 ? "error" : "success");
+      setOwnerReportSendMessage(payload.message || (ownerReportSendMode === "full" ? "PDF-отчет успешно отправлен в Bitrix." : "Рекомендации успешно отправлены в Bitrix."));
     } catch (error) {
+      setOwnerReportSendStatus("error");
       setOwnerReportSendMessage(error instanceof Error ? error.message : "Не удалось отправить отчет.");
     } finally {
       setOwnerReportSendLoading(false);
@@ -8869,7 +8875,23 @@ export default function App() {
                 </div>
               )}
               {ownerReportSendMessage && (
-                <div className="mt-4 rounded-xl border border-[#Eef0f4] bg-[#F8FAFC] px-4 py-3 text-[13px] font-bold text-slate-700">
+                <div
+                  className={cn(
+                    "mt-4 rounded-xl border px-4 py-3 text-[13px] font-bold",
+                    ownerReportSendStatus === "success"
+                      ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                      : ownerReportSendStatus === "error"
+                        ? "border-red-200 bg-red-50 text-red-800"
+                        : "border-[#Eef0f4] bg-[#F8FAFC] text-slate-700",
+                  )}
+                >
+                  {ownerReportSendStatus === "success"
+                    ? ownerReportSendMode === "full"
+                      ? "Отчет успешно отправлен. "
+                      : "Рекомендации успешно отправлены. "
+                    : ownerReportSendStatus === "error"
+                      ? "Ошибка отправки. "
+                      : ""}
                   {ownerReportSendMessage}
                 </div>
               )}

@@ -14096,10 +14096,16 @@ def reportlab_font_paths() -> tuple[str, str]:
     regular_candidates = [
         Path("C:/Windows/Fonts/arial.ttf"),
         Path("C:/Windows/Fonts/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
     ]
     bold_candidates = [
         Path("C:/Windows/Fonts/arialbd.ttf"),
         Path("C:/Windows/Fonts/DejaVuSans-Bold.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
+        Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
     ]
     regular = next((str(path) for path in regular_candidates if path.exists()), "")
     bold = next((str(path) for path in bold_candidates if path.exists()), regular)
