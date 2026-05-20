@@ -232,67 +232,20 @@ def ensure_company_profile_schema() -> None:
     with pg_connect() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS company_profile (
-                        profile_key text PRIMARY KEY DEFAULT 'main',
-                        title text NOT NULL DEFAULT 'О компании',
-                        content text NOT NULL DEFAULT '',
-                        created_at timestamptz NOT NULL DEFAULT now(),
-                        updated_at timestamptz NOT NULL DEFAULT now(),
-                        CHECK (profile_key = 'main')
-                    )
-                    """
-                )
+                required_tables = ("company_profile", "company_folders", "company_drive_sources")
+                for table_name in required_tables:
+                    cur.execute("SELECT to_regclass(%s) IS NOT NULL AS exists", (f"public.{table_name}",))
+                    row = cur.fetchone()
+                    if not row or not row["exists"]:
+                        raise RuntimeError(
+                            f"PostgreSQL table public.{table_name} is missing. "
+                            "Apply database migrations before using company folders."
+                        )
                 cur.execute(
                     """
                     INSERT INTO company_profile (profile_key, title, content)
                     VALUES ('main', 'О компании', '')
                     ON CONFLICT (profile_key) DO NOTHING
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS company_folders (
-                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-                        parent_id uuid REFERENCES company_folders(id) ON DELETE CASCADE,
-                        name text NOT NULL,
-                        content text NOT NULL DEFAULT '',
-                        sort_order int NOT NULL DEFAULT 0,
-                        created_at timestamptz NOT NULL DEFAULT now(),
-                        updated_at timestamptz NOT NULL DEFAULT now(),
-                        CHECK (btrim(name) <> '')
-                    )
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_company_folders_parent
-                        ON company_folders(parent_id, sort_order, name)
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS company_drive_sources (
-                        google_file_id text PRIMARY KEY,
-                        folder_id uuid NOT NULL UNIQUE REFERENCES company_folders(id) ON DELETE CASCADE,
-                        name text NOT NULL,
-                        mime_type text NOT NULL,
-                        source_url text,
-                        google_updated_at timestamptz,
-                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-                        content_hash text NOT NULL DEFAULT '',
-                        last_seen_at timestamptz NOT NULL DEFAULT now(),
-                        created_at timestamptz NOT NULL DEFAULT now(),
-                        updated_at timestamptz NOT NULL DEFAULT now()
-                    )
-                    """
-                )
-                cur.execute("ALTER TABLE company_drive_sources ADD COLUMN IF NOT EXISTS raw_json jsonb NOT NULL DEFAULT '{}'::jsonb")
-                cur.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_company_drive_sources_folder
-                        ON company_drive_sources(folder_id)
                     """
                 )
 
@@ -717,48 +670,18 @@ def ensure_ai_instruction_schema() -> None:
             with conn.cursor() as cur:
                 cur.execute("SELECT to_regclass('public.ai_instruction_folders') IS NOT NULL AS exists")
                 table_existed = bool(cur.fetchone()["exists"])
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS ai_instruction_folders (
-                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-                        parent_id uuid REFERENCES ai_instruction_folders(id) ON DELETE CASCADE,
-                        name text NOT NULL,
-                        content text NOT NULL DEFAULT '',
-                        sort_order int NOT NULL DEFAULT 0,
-                        created_at timestamptz NOT NULL DEFAULT now(),
-                        updated_at timestamptz NOT NULL DEFAULT now(),
-                        CHECK (btrim(name) <> '')
-                    )
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS ai_instruction_deleted_defaults (
-                        name text PRIMARY KEY,
-                        deleted_at timestamptz NOT NULL DEFAULT now()
-                    )
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_ai_instruction_folders_parent
-                        ON ai_instruction_folders(parent_id, sort_order, name)
-                    """
-                )
                 if not table_existed:
-                    for name, content, sort_order in AI_INSTRUCTION_DEFAULTS:
-                        cur.execute(
-                            """
-                            INSERT INTO ai_instruction_folders (parent_id, name, content, sort_order)
-                            SELECT NULL, %s, %s, %s
-                            WHERE NOT EXISTS (
-                                SELECT 1
-                                FROM ai_instruction_deleted_defaults
-                                WHERE lower(name) = lower(%s)
-                            )
-                            """,
-                            (name, content, sort_order, name),
-                        )
+                    raise RuntimeError(
+                        "PostgreSQL table public.ai_instruction_folders is missing. "
+                        "Apply database migrations before using AI instruction folders."
+                    )
+                cur.execute("SELECT to_regclass('public.ai_instruction_deleted_defaults') IS NOT NULL AS exists")
+                deleted_defaults_exists = bool(cur.fetchone()["exists"])
+                if not deleted_defaults_exists:
+                    raise RuntimeError(
+                        "PostgreSQL table public.ai_instruction_deleted_defaults is missing. "
+                        "Apply database migrations before using AI instruction folders."
+                    )
                 cur.execute(
                     """
                     DELETE FROM ai_instruction_folders
