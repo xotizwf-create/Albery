@@ -9,7 +9,7 @@ cat > "$CRON_FILE" <<EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-15 3 * * * root APP_DIR=$APP_DIR BACKUP_DIR=/var/backups/albery/postgres RETENTION_DAYS=14 $APP_DIR/scripts/backup_postgres.sh >> $LOG_FILE 2>&1
+15 3 * * * root APP_DIR=$APP_DIR BACKUP_DIR=/var/backups/albery/postgres RETENTION_DAYS=10 $APP_DIR/scripts/backup_postgres.sh >> $LOG_FILE 2>&1
 EOF
 
 chmod 644 "$CRON_FILE"

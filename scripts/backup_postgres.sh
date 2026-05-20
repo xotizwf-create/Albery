@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_DIR="${APP_DIR:-/var/www/albery}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/albery/postgres}"
-RETENTION_DAYS="${RETENTION_DAYS:-14}"
+RETENTION_DAYS="${RETENTION_DAYS:-10}"
 
 read_env_value() {
   local key="$1"
