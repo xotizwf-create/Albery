@@ -298,6 +298,12 @@ BITRIX_WEBHOOK_BASE=...
 BITRIX_EXPORT_MODE=audit
 BITRIX_REQUEST_DELAY=0.05
 BITRIX_LOOKBACK_DAYS=30
+AUTO_SYNC_BITRIX_LOOKBACK_DAYS=30
+AUTO_SYNC_CHAT_LOOKBACK_DAYS=1
+AUTO_SYNC_CHAT_GENERATE_REPORTS=0
+AUTO_SYNC_ZOOM_FROM=2026-01-01
+AUTO_SYNC_ZOOM_TO=
+AUTO_SYNC_GOOGLE_DRIVE_ZOOM_TRANSCRIPTS=1
 
 MCP_SHARED_SECRET=...
 MCP_ALLOW_UNAUTHENTICATED=0
@@ -339,6 +345,74 @@ from werkzeug.security import generate_password_hash
 password = getpass("Admin password: ")
 print("ADMIN_PASSWORD_HASH=" + generate_password_hash(password))
 PY
+```
+
+## Автоматическая Ежедневная Синхронизация
+
+Ежедневная синхронизация ставится отдельным cron-файлом:
+
+```text
+/etc/cron.d/albery-daily-sync
+```
+
+Время запуска:
+
+```text
+19:00 Europe/Moscow каждый день
+```
+
+Установить или обновить cron:
+
+```bash
+cd /var/www/albery && ./scripts/install_daily_sync_cron.sh
+```
+
+Запустить вручную:
+
+```bash
+cd /var/www/albery
+ALBERY_LOG_DIR=/var/log/albery ALBERY_DAILY_SYNC_LOG=/var/log/albery/daily-sync.log .venv/bin/python scripts/run_daily_sync.py
+```
+
+Что запускает `scripts/run_daily_sync.py`:
+
+- `bitrix_team` - синхронизация сотрудников Bitrix
+- `bitrix_tasks` - синхронизация Bitrix-задач за период
+- `bitrix_chat_messages` - синхронизация списка чатов и сообщений
+- `zoom_api_calls` - синхронизация Zoom-созвонов через Zoom API
+- `google_drive_company_instructions` - подтягивание Google Drive документов/инструкций в раздел "О компании"
+- `google_drive_zoom_transcripts` - подтягивание `transcript.txt` из Google Drive для Zoom, если включено
+
+Логи:
+
+```text
+/var/log/albery/daily-sync.log       структурированный JSONL-лог каждого шага
+/var/log/albery/daily-sync.cron.log  stdout/stderr cron-обертки
+```
+
+Смотреть логи:
+
+```bash
+tail -n 200 /var/log/albery/daily-sync.log
+tail -n 200 /var/log/albery/daily-sync.cron.log
+grep '"status": "failed"' /var/log/albery/daily-sync.log
+```
+
+Настройки в `.env`:
+
+```env
+AUTO_SYNC_BITRIX_LOOKBACK_DAYS=30
+AUTO_SYNC_CHAT_LOOKBACK_DAYS=1
+AUTO_SYNC_CHAT_GENERATE_REPORTS=0
+AUTO_SYNC_ZOOM_FROM=2026-01-01
+AUTO_SYNC_ZOOM_TO=
+AUTO_SYNC_GOOGLE_DRIVE_ZOOM_TRANSCRIPTS=1
+```
+
+Если нужно, чтобы при вечерней синхронизации сразу формировались дневные отчеты по чатам:
+
+```env
+AUTO_SYNC_CHAT_GENERATE_REPORTS=1
 ```
 
 ## Деплой И Обновление
