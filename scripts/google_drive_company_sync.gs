@@ -1,0 +1,395 @@
+const FOLDER_ID = '11R9uAL6vkbWDiGvjOnS8k22NQxxmrAlK';
+const CALLS_FOLDER_ID = '11cy4HOs1IPOgrIsI9cVDZMnZ5i4UYgCG';
+const SYNC_TOKEN = 'C-NJb3jZB_PYpOAQZboPjcuL7zauBlOul1IYB6dt0dWslO2Rd70B6am-9teKP4aP';
+const TRANSCRIPT_FILE_NAME = 'transcript.txt';
+
+const MIME_GOOGLE_DOC = 'application/vnd.google-apps.document';
+const MIME_GOOGLE_SHEET = 'application/vnd.google-apps.spreadsheet';
+const MIME_DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+const MIME_DOC = 'application/msword';
+const MIME_XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const MIME_XLS = 'application/vnd.ms-excel';
+
+const SUPPORTED_MIME_TYPES = [
+  MIME_GOOGLE_DOC,
+  MIME_GOOGLE_SHEET,
+  MIME_DOCX,
+  MIME_DOC,
+  MIME_XLSX,
+  MIME_XLS,
+];
+
+// For DOC/DOCX/XLS/XLSX conversion this Apps Script project must also have:
+// - Advanced Google Service: Drive API enabled.
+// - appsscript.json oauthScopes including https://www.googleapis.com/auth/drive.
+
+function doGet(e) {
+  const token = e && e.parameter ? String(e.parameter.token || '') : '';
+  if (token !== SYNC_TOKEN) {
+    return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
+  }
+
+  const folder = DriveApp.getFolderById(FOLDER_ID);
+  const files = [];
+  collectFolderFiles(folder, files);
+
+  const supportedFiles = files.filter((file) => SUPPORTED_MIME_TYPES.includes(file.getMimeType()));
+  const documents = [];
+  const document_errors = [];
+  supportedFiles.forEach((file) => {
+    try {
+      documents.push(filePayload(file));
+    } catch (error) {
+      document_errors.push({
+        id: file.getId(),
+        name: file.getName(),
+        mime_type: file.getMimeType(),
+        url: file.getUrl(),
+        error: String(error && error.message ? error.message : error),
+      });
+    }
+  });
+  const skipped_files = files
+    .filter((file) => !SUPPORTED_MIME_TYPES.includes(file.getMimeType()))
+    .map((file) => ({
+      id: file.getId(),
+      name: file.getName(),
+      mime_type: file.getMimeType(),
+      url: file.getUrl(),
+      reason: 'unsupported_mime_type',
+    }));
+
+  const callsFolder = DriveApp.getFolderById(CALLS_FOLDER_ID);
+  const transcripts = [];
+  collectTranscriptFiles(callsFolder, [], transcripts);
+
+  return jsonResponse({
+    ok: true,
+    folder_id: FOLDER_ID,
+    calls_folder_id: CALLS_FOLDER_ID,
+    synced_at: new Date().toISOString(),
+    documents,
+    document_errors,
+    skipped_files,
+    transcripts,
+  });
+}
+
+function collectFolderFiles(folder, files) {
+  const fileIterator = folder.getFiles();
+  while (fileIterator.hasNext()) {
+    files.push(fileIterator.next());
+  }
+
+  const folderIterator = folder.getFolders();
+  while (folderIterator.hasNext()) {
+    collectFolderFiles(folderIterator.next(), files);
+  }
+}
+
+function collectTranscriptFiles(folder, pathParts, transcripts) {
+  const currentPath = pathParts.concat([folder.getName()]);
+  const fileIterator = folder.getFiles();
+
+  while (fileIterator.hasNext()) {
+    const file = fileIterator.next();
+    if (file.getName().toLowerCase() !== TRANSCRIPT_FILE_NAME) {
+      continue;
+    }
+
+    transcripts.push({
+      id: file.getId(),
+      name: file.getName(),
+      url: file.getUrl(),
+      mime_type: file.getMimeType(),
+      updated_at: file.getLastUpdated().toISOString(),
+      parent_folder_id: folder.getId(),
+      parent_folder_name: folder.getName(),
+      path_parts: currentPath,
+      path: currentPath.join(' / '),
+      content: file.getBlob().getDataAsString('UTF-8'),
+    });
+  }
+
+  const folderIterator = folder.getFolders();
+  while (folderIterator.hasNext()) {
+    collectTranscriptFiles(folderIterator.next(), currentPath, transcripts);
+  }
+}
+
+function filePayload(file) {
+  const mimeType = file.getMimeType();
+  let content = '';
+  let contentFormat = 'text';
+  let blocks = [];
+  let convertedMimeType = null;
+
+  if (mimeType === MIME_GOOGLE_DOC) {
+    const parsed = googleDocContent(file.getId());
+    content = parsed.content;
+    blocks = parsed.blocks;
+  } else if (mimeType === MIME_GOOGLE_SHEET) {
+    const parsed = googleSheetContent(file.getId());
+    content = parsed.content;
+    blocks = parsed.blocks;
+    contentFormat = 'markdown';
+  } else if ([MIME_DOCX, MIME_DOC].includes(mimeType)) {
+    const parsed = convertedGoogleDocContent(file);
+    content = parsed.content;
+    blocks = parsed.blocks;
+    convertedMimeType = MIME_GOOGLE_DOC;
+  } else if ([MIME_XLSX, MIME_XLS].includes(mimeType)) {
+    const parsed = convertedGoogleSheetContent(file);
+    content = parsed.content;
+    blocks = parsed.blocks;
+    contentFormat = 'markdown';
+    convertedMimeType = MIME_GOOGLE_SHEET;
+  }
+
+  return {
+    id: file.getId(),
+    name: file.getName(),
+    mime_type: mimeType,
+    url: file.getUrl(),
+    updated_at: file.getLastUpdated().toISOString(),
+    content_format: contentFormat,
+    converted_mime_type: convertedMimeType,
+    content,
+    blocks,
+  };
+}
+
+function convertedGoogleDocContent(file) {
+  const convertedFileId = temporaryConvertedFileId(file, MIME_GOOGLE_DOC);
+  try {
+    return googleDocContent(convertedFileId);
+  } finally {
+    trashTemporaryFile(convertedFileId);
+  }
+}
+
+function convertedGoogleSheetContent(file) {
+  const convertedFileId = temporaryConvertedFileId(file, MIME_GOOGLE_SHEET);
+  try {
+    return googleSheetContent(convertedFileId);
+  } finally {
+    trashTemporaryFile(convertedFileId);
+  }
+}
+
+function temporaryConvertedFileId(file, targetMimeType) {
+  if (typeof Drive === 'undefined' || !Drive.Files || !Drive.Files.copy) {
+    throw new Error('Advanced Drive service is required: enable Services -> Drive API in Apps Script.');
+  }
+
+  const resource = {
+    title: '__sync_tmp__' + file.getName(),
+    mimeType: targetMimeType,
+  };
+  const converted = Drive.Files.copy(resource, file.getId(), { convert: true });
+  if (!converted || !converted.id) {
+    throw new Error('Failed to convert file: ' + file.getName());
+  }
+  return converted.id;
+}
+
+function trashTemporaryFile(fileId) {
+  try {
+    DriveApp.getFileById(fileId).setTrashed(true);
+  } catch (error) {
+    // Best effort cleanup. Sync should not fail only because temp cleanup failed.
+  }
+}
+
+function googleDocContent(fileId) {
+  const doc = DocumentApp.openById(fileId);
+  const blocks = googleDocBodyBlocks(doc.getBody());
+  return {
+    blocks,
+    content: blocksToText(blocks),
+  };
+}
+
+function googleDocBodyBlocks(body) {
+  const blocks = [];
+  let tableIndex = 1;
+
+  for (let i = 0; i < body.getNumChildren(); i += 1) {
+    const element = body.getChild(i);
+    const type = element.getType();
+
+    if (type === DocumentApp.ElementType.PARAGRAPH) {
+      const text = element.asParagraph().getText().trim();
+      if (text) blocks.push({ type: 'paragraph', text });
+      continue;
+    }
+
+    if (type === DocumentApp.ElementType.LIST_ITEM) {
+      const text = element.asListItem().getText().trim();
+      if (text) blocks.push({ type: 'list_item', text });
+      continue;
+    }
+
+    if (type === DocumentApp.ElementType.TABLE) {
+      const tableBlock = googleDocTableBlock(element.asTable(), tableIndex);
+      if (tableBlock) {
+        blocks.push(tableBlock);
+        tableIndex += 1;
+      }
+      continue;
+    }
+
+    const fallback = element.getText ? String(element.getText()).trim() : '';
+    if (fallback) blocks.push({ type: 'paragraph', text: fallback });
+  }
+
+  return blocks;
+}
+
+function googleDocTableBlock(table, tableIndex) {
+  const rows = [];
+  for (let rowIndex = 0; rowIndex < table.getNumRows(); rowIndex += 1) {
+    const row = table.getRow(rowIndex);
+    const values = [];
+    for (let cellIndex = 0; cellIndex < row.getNumCells(); cellIndex += 1) {
+      values.push(markdownCell(row.getCell(cellIndex).getText()));
+    }
+    rows.push(values);
+  }
+
+  if (!rows.length) return null;
+  return tableBlockFromRows('Таблица ' + tableIndex, rows);
+}
+
+function googleSheetContent(fileId) {
+  const spreadsheet = SpreadsheetApp.openById(fileId);
+  const blocks = [];
+
+  spreadsheet.getSheets().forEach((sheet) => {
+    const values = sheet.getDataRange().getDisplayValues();
+    blocks.push({ type: 'heading', text: sheet.getName(), level: 1 });
+
+    if (!values.length) {
+      return;
+    }
+
+    const normalized = normalizeRows(values);
+    blocks.push(tableBlockFromRows(sheet.getName(), normalized));
+  });
+
+  return {
+    blocks,
+    content: blocksToText(blocks),
+  };
+}
+
+function normalizeRows(values) {
+  const width = values.reduce((max, row) => Math.max(max, row.length), 0);
+  return values.map((row) => {
+    const copy = row.slice();
+    while (copy.length < width) copy.push('');
+    return copy.map(markdownCell);
+  });
+}
+
+function rowsToMarkdownTable(rows) {
+  const normalized = normalizeRows(rows);
+  if (!normalized.length) return '';
+  const header = normalized[0].map((value, index) => value || 'Колонка ' + (index + 1));
+  const output = [];
+  output.push('| ' + header.join(' | ') + ' |');
+  output.push('| ' + header.map(() => '---').join(' | ') + ' |');
+  normalized.slice(1).forEach((row) => {
+    output.push('| ' + row.join(' | ') + ' |');
+  });
+  return output.join('\n');
+}
+
+function rowsToRecordText(rows) {
+  const normalized = normalizeRows(rows);
+  if (normalized.length < 2) return '';
+  const headers = normalized[0].map((value, index) => value || 'Колонка ' + (index + 1));
+  const records = [];
+
+  normalized.slice(1).forEach((row, rowIndex) => {
+    const pairs = [];
+    row.forEach((value, index) => {
+      if (value) pairs.push('- ' + headers[index] + ': ' + value);
+    });
+    if (pairs.length) {
+      records.push('Запись ' + (rowIndex + 1) + ':\n' + pairs.join('\n'));
+    }
+  });
+
+  return records.join('\n\n');
+}
+
+function tableBlockFromRows(title, rows) {
+  const normalized = normalizeRows(rows);
+  const headers = normalized[0].map((value, index) => value || 'Колонка ' + (index + 1));
+  const dataRows = normalized.slice(1);
+  const records = dataRows
+    .map((row) => {
+      const record = {};
+      row.forEach((value, index) => {
+        if (value) record[headers[index]] = value;
+      });
+      return record;
+    })
+    .filter((record) => Object.keys(record).length > 0);
+
+  return {
+    type: 'table',
+    title,
+    headers,
+    rows: dataRows,
+    records,
+    markdown: rowsToMarkdownTable(normalized),
+  };
+}
+
+function blocksToText(blocks) {
+  const chunks = [];
+  blocks.forEach((block) => {
+    if (block.type === 'heading') {
+      chunks.push('# ' + block.text);
+      return;
+    }
+    if (block.type === 'paragraph') {
+      chunks.push(block.text);
+      return;
+    }
+    if (block.type === 'list_item') {
+      chunks.push('- ' + block.text);
+      return;
+    }
+    if (block.type === 'table') {
+      chunks.push(block.title || 'Таблица');
+      chunks.push(block.markdown || rowsToMarkdownTable([block.headers].concat(block.rows || [])));
+      if (block.records && block.records.length) {
+        chunks.push(
+          block.records
+            .map((record, index) => {
+              const lines = Object.keys(record).map((key) => '- ' + key + ': ' + record[key]);
+              return 'Запись ' + (index + 1) + ':\n' + lines.join('\n');
+            })
+            .join('\n\n')
+        );
+      }
+    }
+  });
+  return chunks.join('\n\n');
+}
+
+function markdownCell(value) {
+  return String(value || '')
+    .replace(/\r?\n/g, '<br>')
+    .replace(/\|/g, '\\|')
+    .trim();
+}
+
+function jsonResponse(payload) {
+  return ContentService
+    .createTextOutput(JSON.stringify(payload))
+    .setMimeType(ContentService.MimeType.JSON);
+}

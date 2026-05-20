@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "employee-context": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": [
+        "mcp\\context_server.py"
+      ]
+    }
+  }
+}

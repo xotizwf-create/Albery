@@ -1,0 +1,20762 @@
+﻿from __future__ import annotations
+
+import json
+import hashlib
+import base64
+import mimetypes
+import os
+from queue import Empty, Queue
+import re
+import time
+from collections import Counter
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterable
+from uuid import UUID, uuid4
+from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
+
+import requests
+from dotenv import load_dotenv
+from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory, stream_with_context, url_for
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+
+load_dotenv()
+
+APP_ROOT = Path(__file__).resolve().parent
+EXPORT_DIR = APP_ROOT / "exports"
+EXPORT_DIR.mkdir(exist_ok=True)
+ATTACHMENTS_DIR = APP_ROOT / "attachments_cache"
+ATTACHMENTS_DIR.mkdir(exist_ok=True)
+FRONTEND_DIST = APP_ROOT / "Интерфейс" / "dist"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+MSK_TZ = ZoneInfo("Europe/Moscow")
+LOCAL_TZ = MSK_TZ
+
+
+def llm_api_base_url() -> str:
+    load_dotenv(override=True)
+    base = (
+        os.getenv("OPENAI_BASE_URL", "").strip()
+        or os.getenv("GOOGLE_API_BASE_URL", "").strip()
+        or "https://api.openai.com/v1"
+    )
+    return base.rstrip("/")
+
+
+def llm_api_url(path: str) -> str:
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    return f"{llm_api_base_url()}{normalized_path}"
+
+
+def llm_auth_headers(api_key: str) -> dict[str, str]:
+    base_url = llm_api_base_url().lower()
+    headers = {"Content-Type": "application/json"}
+    if "generativelanguage.googleapis.com" in base_url and "/openai" not in base_url:
+        headers["x-goog-api-key"] = api_key
+        return headers
+    headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def llm_api_key() -> str:
+    load_dotenv(override=True)
+    return os.getenv("OPENAI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+
+
+def is_google_genai_base() -> bool:
+    return "generativelanguage.googleapis.com" in llm_api_base_url().lower()
+
+
+def llm_provider_name() -> str:
+    base = llm_api_base_url().lower()
+    if "generativelanguage.googleapis.com" in base:
+        return "google"
+    if "anthropic" in base:
+        return "anthropic"
+    if "yandex" in base:
+        return "yandex"
+    return "openai"
+
+
+def llm_model_for_request(request_type: str) -> str:
+    load_dotenv(override=True)
+    fallback = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    if request_type == "owner_daily_report":
+        return (
+            os.getenv("OWNER_DAILY_MODEL", "").strip()
+            or os.getenv("OWNER_REPORT_MODEL", "").strip()
+            or os.getenv("OPENAI_OWNER_DAILY_MODEL", "").strip()
+            or "gemini-2.0-flash"
+        )
+    if request_type == "owner_weekly_report":
+        return (
+            os.getenv("OWNER_WEEKLY_MODEL", "").strip()
+            or os.getenv("OWNER_REPORT_MODEL", "").strip()
+            or os.getenv("OPENAI_OWNER_WEEKLY_MODEL", "").strip()
+            or fallback
+        )
+    if request_type == "zoom_processing":
+        return os.getenv("ZOOM_PROCESSING_MODEL", "").strip() or fallback
+    return fallback
+
+
+def _parse_model_list(raw: str) -> list[str]:
+    items = [part.strip() for part in (raw or "").split(",")]
+    return [item for item in items if item]
+
+
+def _google_ocr_model_candidates(primary_model: str) -> list[str]:
+    explicit = _parse_model_list(os.getenv("GOOGLE_OCR_MODEL_CANDIDATES", "").strip())
+    if explicit:
+        return explicit
+    default_fallback = _parse_model_list(
+        os.getenv("GOOGLE_OCR_FALLBACK_MODELS", "gemini-2.0-flash")
+    )
+    primary = primary_model if primary_model.startswith("gemini-") else "gemini-2.0-flash"
+    ordered = [primary] + default_fallback
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for model_name in ordered:
+        if model_name not in seen:
+            seen.add(model_name)
+            dedup.append(model_name)
+    return dedup
+
+
+def _retry_after_seconds(response: requests.Response) -> float | None:
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return max(0.0, seconds)
+
+
+def llm_post_with_retry(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: int = 120,
+) -> requests.Response:
+    max_retries = max(0, int(os.getenv("LLM_MAX_RETRIES", "2")))
+    base_delay = max(0.2, float(os.getenv("LLM_RETRY_BASE_DELAY", "0.8")))
+    last_response: requests.Response | None = None
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code not in {429, 503}:
+                return response
+            last_response = response
+            if attempt >= max_retries:
+                return response
+            wait_seconds = _retry_after_seconds(response)
+            if wait_seconds is None:
+                wait_seconds = min(base_delay * (2**attempt), 8.0)
+            time.sleep(wait_seconds)
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= max_retries:
+                break
+            time.sleep(min(base_delay * (2**attempt), 8.0))
+    if last_response is not None:
+        return last_response
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("LLM request failed without details")
+
+
+def msk_now() -> datetime:
+    return datetime.now(MSK_TZ)
+
+
+def msk_today() -> date:
+    return msk_now().date()
+
+
+def is_future_day(value: date) -> bool:
+    return value > msk_today()
+
+
+def can_finalize_chat_day(value: date) -> bool:
+    today = msk_today()
+    if value > today:
+        return False
+    if value < today:
+        return True
+    return msk_now().time() >= dt_time(19, 0)
+
+
+def chat_day_finalization_error(value: date) -> str | None:
+    if is_future_day(value):
+        return "Нельзя формировать результаты за будущую дату."
+    if value == msk_today() and not can_finalize_chat_day(value):
+        return "Отчет за текущий день можно сформировать только после 19:00 МСК."
+    return None
+
+
+def latest_visible_report_date() -> date:
+    today = msk_today()
+    return today if can_finalize_chat_day(today) else today - timedelta(days=1)
+
+
+def previous_week_bounds_for_report(value: date) -> tuple[date, date]:
+    week_start = value - timedelta(days=value.weekday())
+    previous_end = week_start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=6)
+    return previous_start, previous_end
+
+
+def db_connect() -> Any:
+    raise RuntimeError("SQLite отключен. Все данные должны храниться в PostgreSQL через DATABASE_URL.")
+
+
+def postgres_enabled() -> bool:
+    return True
+
+
+def normalize_postgres_url(database_url: str) -> str:
+    normalized = database_url.strip()
+    for prefix in ("postgresql+psycopg2://", "postgresql+psycopg://"):
+        if normalized.startswith(prefix):
+            return "postgresql://" + normalized[len(prefix):]
+    return normalized
+
+
+def pg_connect() -> psycopg.Connection:
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL не задан. Приложение переведено в режим PostgreSQL-only.")
+    return psycopg.connect(normalize_postgres_url(DATABASE_URL), row_factory=dict_row)
+
+
+def ensure_company_profile_schema() -> None:
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS company_profile (
+                        profile_key text PRIMARY KEY DEFAULT 'main',
+                        title text NOT NULL DEFAULT 'О компании',
+                        content text NOT NULL DEFAULT '',
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        updated_at timestamptz NOT NULL DEFAULT now(),
+                        CHECK (profile_key = 'main')
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO company_profile (profile_key, title, content)
+                    VALUES ('main', 'О компании', '')
+                    ON CONFLICT (profile_key) DO NOTHING
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS company_folders (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        parent_id uuid REFERENCES company_folders(id) ON DELETE CASCADE,
+                        name text NOT NULL,
+                        content text NOT NULL DEFAULT '',
+                        sort_order int NOT NULL DEFAULT 0,
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        updated_at timestamptz NOT NULL DEFAULT now(),
+                        CHECK (btrim(name) <> '')
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_company_folders_parent
+                        ON company_folders(parent_id, sort_order, name)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS company_drive_sources (
+                        google_file_id text PRIMARY KEY,
+                        folder_id uuid NOT NULL UNIQUE REFERENCES company_folders(id) ON DELETE CASCADE,
+                        name text NOT NULL,
+                        mime_type text NOT NULL,
+                        source_url text,
+                        google_updated_at timestamptz,
+                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        content_hash text NOT NULL DEFAULT '',
+                        last_seen_at timestamptz NOT NULL DEFAULT now(),
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        updated_at timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cur.execute("ALTER TABLE company_drive_sources ADD COLUMN IF NOT EXISTS raw_json jsonb NOT NULL DEFAULT '{}'::jsonb")
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_company_drive_sources_folder
+                        ON company_drive_sources(folder_id)
+                    """
+                )
+
+
+def company_profile_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "title": row["title"] or "О компании",
+        "content": row["content"] or "",
+        "updated_at": iso_or_none(row["updated_at"]),
+        "updated_at_text": format_datetime_ru(row["updated_at"]) if row["updated_at"] else "Еще не сохранялось",
+    }
+
+
+def company_folder_to_dict(row: Any) -> dict[str, Any]:
+    payload = {
+        "id": str(row["id"]),
+        "parent_id": str(row["parent_id"]) if row["parent_id"] else None,
+        "name": row["name"],
+        "content": row["content"] or "",
+        "children_count": int(row["children_count"] or 0) if "children_count" in row else 0,
+        "updated_at": iso_or_none(row["updated_at"]),
+        "updated_at_text": format_datetime_ru(row["updated_at"]) if row["updated_at"] else "",
+    }
+    if "drive_google_file_id" in row and row["drive_google_file_id"]:
+        raw_json = row["drive_raw_json"] or {}
+        if isinstance(raw_json, str):
+            try:
+                raw_json = json.loads(raw_json)
+            except json.JSONDecodeError:
+                raw_json = {}
+        payload["drive_source"] = {
+            "google_file_id": row["drive_google_file_id"],
+            "mime_type": row["drive_mime_type"],
+            "source_url": row["drive_source_url"],
+            "google_updated_at": iso_or_none(row["drive_google_updated_at"]),
+            "blocks": raw_json.get("blocks", []) if isinstance(raw_json, dict) else [],
+        }
+    return payload
+
+
+def google_drive_company_sync_config() -> tuple[str, str]:
+    load_dotenv(override=True)
+    sync_url = os.getenv("GOOGLE_APPS_SCRIPT_SYNC_URL", "").strip()
+    token = os.getenv("GOOGLE_APPS_SCRIPT_SYNC_TOKEN", "").strip()
+    if not sync_url:
+        raise ValueError("Укажите GOOGLE_APPS_SCRIPT_SYNC_URL в .env")
+    if not token:
+        raise ValueError("Укажите GOOGLE_APPS_SCRIPT_SYNC_TOKEN в .env")
+    return sync_url, token
+
+
+def fetch_google_drive_company_payload() -> dict[str, Any]:
+    sync_url, token = google_drive_company_sync_config()
+    response = requests.get(sync_url, params={"token": token}, timeout=180)
+    if not response.ok:
+        raise RuntimeError(f"Google Apps Script вернул HTTP {response.status_code}: {response.text[:500]}")
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        error = payload.get("error") if isinstance(payload, dict) else "неожиданный формат ответа"
+        raise RuntimeError(f"Google Apps Script error: {error}")
+    return payload
+
+
+def fetch_google_drive_company_documents() -> list[dict[str, Any]]:
+    payload = fetch_google_drive_company_payload()
+    documents = payload.get("documents", [])
+    if not isinstance(documents, list):
+        raise RuntimeError("Google Apps Script вернул documents не в виде списка")
+    return [doc for doc in documents if isinstance(doc, dict)]
+
+
+def google_drive_document_content(document: dict[str, Any]) -> str:
+    source_url = str(document.get("url") or "").strip()
+    updated_at = str(document.get("updated_at") or "").strip()
+    mime_type = str(document.get("mime_type") or "").strip()
+    content = str(document.get("content") or "")
+    header = [
+        f"Источник: {source_url}" if source_url else "",
+        f"Обновлено в Google Drive: {updated_at}" if updated_at else "",
+        f"Тип: {mime_type}" if mime_type else "",
+    ]
+    header_text = "\n".join(item for item in header if item)
+    return f"{header_text}\n\n{content}".strip() if header_text else content
+
+
+def google_drive_document_structured_content(document: dict[str, Any]) -> str:
+    blocks = document.get("blocks")
+    if not isinstance(blocks, list):
+        return google_drive_document_content(document)
+
+    chunks: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "")
+        if block_type == "heading":
+            text = str(block.get("text") or "").strip()
+            if text:
+                chunks.append(f"# {text}")
+        elif block_type == "paragraph":
+            text = str(block.get("text") or "").strip()
+            if text:
+                chunks.append(text)
+        elif block_type == "list_item":
+            text = str(block.get("text") or "").strip()
+            if text:
+                chunks.append(f"- {text}")
+        elif block_type == "table":
+            title = str(block.get("title") or "Таблица").strip()
+            markdown = str(block.get("markdown") or "").strip()
+            records = block.get("records") if isinstance(block.get("records"), list) else []
+            table_parts = [title]
+            if markdown:
+                table_parts.append(markdown)
+            record_parts: list[str] = []
+            for index, record in enumerate(records, start=1):
+                if not isinstance(record, dict):
+                    continue
+                lines = [f"- {key}: {value}" for key, value in record.items() if str(value).strip()]
+                if lines:
+                    record_parts.append(f"Запись {index}:\n" + "\n".join(lines))
+            if record_parts:
+                table_parts.append("\n\n".join(record_parts))
+            chunks.append("\n\n".join(part for part in table_parts if part))
+
+    structured = "\n\n".join(chunks).strip()
+    if not structured:
+        structured = str(document.get("content") or "")
+
+    source_url = str(document.get("url") or "").strip()
+    updated_at = str(document.get("updated_at") or "").strip()
+    mime_type = str(document.get("mime_type") or "").strip()
+    header = [
+        f"Источник: {source_url}" if source_url else "",
+        f"Обновлено в Google Drive: {updated_at}" if updated_at else "",
+        f"Тип: {mime_type}" if mime_type else "",
+    ]
+    header_text = "\n".join(item for item in header if item)
+    return f"{header_text}\n\n{structured}".strip() if header_text else structured
+
+
+def ensure_company_drive_root(cur: Any) -> str:
+    root_name = os.getenv("GOOGLE_DRIVE_COMPANY_ROOT_NAME", "Google Drive").strip() or "Google Drive"
+    cur.execute(
+        """
+        SELECT id
+        FROM company_folders
+        WHERE parent_id IS NULL AND lower(name) = lower(%s)
+        ORDER BY created_at
+        LIMIT 1
+        """,
+        (root_name,),
+    )
+    row = cur.fetchone()
+    if row:
+        return str(row["id"])
+    cur.execute(
+        """
+        SELECT COALESCE(max(sort_order), -1) + 1 AS next_order
+        FROM company_folders
+        WHERE parent_id IS NULL
+        """
+    )
+    sort_order = cur.fetchone()["next_order"]
+    cur.execute(
+        """
+        INSERT INTO company_folders (parent_id, name, content, sort_order)
+        VALUES (NULL, %s, '', %s)
+        RETURNING id
+        """,
+        (root_name, sort_order),
+    )
+    return str(cur.fetchone()["id"])
+
+
+def parse_google_timestamp(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def sync_google_drive_company_documents() -> dict[str, Any]:
+    payload = fetch_google_drive_company_payload()
+    documents_raw = payload.get("documents", [])
+    if not isinstance(documents_raw, list):
+        raise RuntimeError("Google Apps Script вернул documents не в виде списка")
+    documents = [doc for doc in documents_raw if isinstance(doc, dict)]
+    document_errors = payload.get("document_errors", [])
+    skipped_files = payload.get("skipped_files", [])
+    seen_ids: set[str] = set()
+    created = 0
+    updated = 0
+    skipped = 0
+
+    ensure_company_profile_schema()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                root_id = ensure_company_drive_root(cur)
+                cur.execute("SELECT google_file_id, folder_id, content_hash FROM company_drive_sources")
+                existing = {str(row["google_file_id"]): row for row in cur.fetchall()}
+
+                for document in documents:
+                    google_file_id = str(document.get("id") or "").strip()
+                    name = str(document.get("name") or "").strip()
+                    if not google_file_id or not name:
+                        skipped += 1
+                        continue
+                    seen_ids.add(google_file_id)
+
+                    content = google_drive_document_structured_content(document)
+                    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    mime_type = str(document.get("mime_type") or "").strip()
+                    source_url = str(document.get("url") or "").strip() or None
+                    google_updated_at = parse_google_timestamp(document.get("updated_at"))
+                    existing_row = existing.get(google_file_id)
+
+                    if existing_row:
+                        folder_id = str(existing_row["folder_id"])
+                        cur.execute("SELECT id FROM company_folders WHERE id = %s", (folder_id,))
+                        if not cur.fetchone():
+                            existing_row = None
+
+                    if existing_row:
+                        folder_id = str(existing_row["folder_id"])
+                        cur.execute(
+                            """
+                            UPDATE company_folders
+                            SET parent_id = %s, name = %s, content = %s, updated_at = now()
+                            WHERE id = %s
+                            """,
+                            (root_id, name, content, folder_id),
+                        )
+                        cur.execute(
+                            """
+                            UPDATE company_drive_sources
+                            SET name = %s,
+                                mime_type = %s,
+                                source_url = %s,
+                                google_updated_at = %s,
+                                raw_json = %s,
+                                content_hash = %s,
+                                last_seen_at = now(),
+                                updated_at = now()
+                            WHERE google_file_id = %s
+                            """,
+                            (name, mime_type, source_url, google_updated_at, Jsonb(document), content_hash, google_file_id),
+                        )
+                        updated += 1
+                    else:
+                        cur.execute(
+                            """
+                            SELECT COALESCE(max(sort_order), -1) + 1 AS next_order
+                            FROM company_folders
+                            WHERE parent_id = %s
+                            """,
+                            (root_id,),
+                        )
+                        sort_order = cur.fetchone()["next_order"]
+                        cur.execute(
+                            """
+                            INSERT INTO company_folders (parent_id, name, content, sort_order)
+                            VALUES (%s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (root_id, name, content, sort_order),
+                        )
+                        folder_id = str(cur.fetchone()["id"])
+                        cur.execute(
+                            """
+                            INSERT INTO company_drive_sources (
+                                google_file_id, folder_id, name, mime_type, source_url,
+                                google_updated_at, raw_json, content_hash
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (google_file_id, folder_id, name, mime_type, source_url, google_updated_at, Jsonb(document), content_hash),
+                        )
+                        created += 1
+
+                if seen_ids:
+                    cur.execute(
+                        """
+                        DELETE FROM company_folders
+                        WHERE id IN (
+                            SELECT folder_id
+                            FROM company_drive_sources
+                            WHERE google_file_id <> ALL(%s)
+                        )
+                        """,
+                        (list(seen_ids),),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        DELETE FROM company_folders
+                        WHERE id IN (SELECT folder_id FROM company_drive_sources)
+                        """
+                    )
+                deleted = cur.rowcount
+
+    return {
+        "documents_total": len(documents),
+        "source_folder_id": payload.get("folder_id"),
+        "created": created,
+        "updated": updated,
+        "deleted": deleted,
+        "skipped": skipped,
+        "document_errors": document_errors if isinstance(document_errors, list) else [],
+        "document_errors_count": len(document_errors) if isinstance(document_errors, list) else 0,
+        "skipped_files": skipped_files if isinstance(skipped_files, list) else [],
+        "skipped_files_count": len(skipped_files) if isinstance(skipped_files, list) else 0,
+    }
+
+
+AI_INSTRUCTION_DEFAULTS: list[tuple[str, str, int]] = [
+    (
+        "Базовое поведение",
+        """Ты аналитический ассистент компании. Всегда работай по данным из MCP employee-context.
+
+Правила:
+- Не выдумывай факты.
+- Отделяй факты из базы от своих выводов.
+- Если данных недостаточно, задай наводящий вопрос: что именно нужно уточнить, за какой период, по какому чату/человеку/задаче, какой формат ответа нужен.
+- Не угадывай недостающую постановку. Лучше спросить один короткий уточняющий вопрос, чем дать общий ответ без опоры.
+- Всегда указывай источник: документ, задача Bitrix, чат, Zoom или раздел "О компании".
+- Если есть конфликт данных, явно покажи конфликт.
+- Для незнакомых задач сначала используй get_context_guide.
+- Веди себя как внутренний ИИ-агент компании: учитывай регламенты, документы компании, предыдущие отчеты, роли людей, задачи и решения.""",
+        0,
+    ),
+    (
+        "Порядок поиска",
+        """1. Правила, регламенты, процессы и знания компании: search_company_knowledge.
+2. Сотрудники, роли, руководители, отделы: get_org_structure.
+3. Последние owner daily/weekly и релевантные chat daily/weekly отчеты: get_owner_reports, get_chat_daily_report, get_chat_weekly_report. Обязательно перед рекомендациями и управленческими выводами.
+4. Вопросы за период: get_period_index.
+5. Задачи, сроки, ответственные: search_tasks.
+6. Переписка, решения, договоренности: list_chats, search_messages, get_chat_transcript.
+7. Созвоны и устные решения: list_zoom_calls, get_zoom_call_transcript, search_zoom_transcripts.
+
+Не делай итоговый вывод по одному источнику, если вопрос требует проверки нескольких источников.
+Для рекомендаций сначала проверь, что уже было рекомендовано, что закрыто, что повторяется и что осталось без движения.""",
+        1,
+    ),
+    (
+        "Формат ответа",
+        """Стандартный формат ответа:
+1. Короткий вывод.
+2. Факты из источников.
+3. Анализ и интерпретация.
+4. Риски или пробелы в данных.
+5. Что сделать дальше.
+
+Правила конкретики:
+- Не пиши только номер задачи. Формат: "Задача 318099: Сформировать реестр платежей. Ответственный: Наталья. Статус: ждет выполнения. Срок: 18.05 16:00. Источник: Bitrix".
+- Если названия задачи нет, явно напиши "название задачи в источнике не найдено" и задай уточняющий вопрос, если без названия нельзя ответить качественно.
+- В рекомендациях обязательно указывай кому, что сделать, к какому сроку, какой результат должен получиться и на каком источнике это основано.
+
+Для простых вопросов можно отвечать короче, но источник и уровень уверенности должны быть понятны.""",
+        2,
+    ),
+]
+
+OWNER_REPORT_PIPELINE_INSTRUCTION_NAME = "Ежедневный отчет по компании"
+OWNER_REPORT_PIPELINE_INSTRUCTION_PARENT_NAME = "Формирование отчетов"
+OWNER_REPORT_PIPELINE_INSTRUCTION_CONTENT = """Инструкция: ежедневный отчет по компании.
+
+Назначение: сформировать ежедневный управленческий отчет для собственника по компании. Это не техническая сводка и не каталог задач. Итог должен отвечать на вопросы: что сдвинулось, что зависло, какие риски, кому какой адресный вопрос нужно отправить.
+
+Главное правило: отчет по компании формируется только из подготовленных отчетов-источников, а не из сырых чатов, сырых Zoom-транскриптов или одной выгрузки Bitrix.
+
+Перед началом обязательно открой раздел:
+Сводная аналитика -> Настройка промтов -> ежедневный общий отчет для собственника.
+Активный ИИ-промт из этого раздела является основным контрактом структуры, стиля и JSON-ответа. Эта инструкция задает порядок подготовки источников и запреты.
+
+Условия допуска к формированию:
+1. Сформированы daily-отчеты по каждому активному чату за report_date.
+2. Сформированы аналитические отчеты по каждому Zoom-созвону за report_date.
+3. Сформирован предыдущий ежедневный отчет для собственника.
+
+Если хотя бы одно условие не выполнено:
+- не формируй ежедневный отчет по компании;
+- сначала сформируй недостающие отчеты по инструкциям соответствующего типа;
+- для чата используй инструкцию ежедневного отчета по чату;
+- для Zoom используй инструкцию отчета по Zoom-созвону;
+- для предыдущего owner-отчета сначала сформируй отчет за предыдущую доступную дату;
+- после подготовки источников вернись к ежедневному отчету по компании.
+
+Что читать при формировании:
+1. Каждый daily-отчет каждого активного чата за дату. Общей сводки по всем чатам как источника нет: нельзя опираться на chat_overall_daily_report вместо чтения отчетов конкретных чатов.
+2. Каждый Zoom-отчет за дату. Используй только готовый аналитический отчет Zoom, без текста сырой транскрибации.
+3. Предыдущий ежедневный отчет собственнику целиком, включая адресные рекомендации. Если в текущих отчетах по чатам, Zoom или Bitrix нет явного подтверждения выполнения прошлой адресной рекомендации, повтори ее в новом пункте 6.
+4. Bitrix используй как формальный источник статусов, сроков, ответственных и просрочек.
+5. Оргструктуру используй для проверки адресатов: адресные рекомендации можно давать только реальным пользователям Bitrix.
+
+Что запрещено:
+- формировать отчет по одному чату, если за день есть несколько активных чатов;
+- использовать общую сводку по всем чатам вместо отчетов каждого конкретного чата;
+- использовать сырую Zoom-транскрибацию в ежедневном отчете по компании;
+- писать техническую сводку вида "найдено N чатов / N задач";
+- упоминать MCP, коннекторы, пайплайн, get_period_index, search_tasks;
+- строить отчет вокруг номеров Bitrix, call_id или dialog_id;
+- адресовать рекомендации ролям без пользователя: "Координатор", "ответственный", "юридический контур", "административный блок".
+
+Требования к качеству:
+- отчет должен быть управленческим, как записка собственнику;
+- верхние блоки должны быть без технических id;
+- в полном тексте допускаются ссылки на источник только когда они нужны для проверки факта;
+- пункт 6 обязателен и должен содержать готовые адресные сообщения реальным людям из оргструктуры;
+- старые незакрытые адресные вопросы из предыдущего owner-отчета не заменяются новыми темами по тому же человеку, а повторяются до явного подтверждения закрытия.
+"""
+
+
+def ensure_ai_instruction_schema() -> None:
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass('public.ai_instruction_folders') IS NOT NULL AS exists")
+                table_existed = bool(cur.fetchone()["exists"])
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ai_instruction_folders (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        parent_id uuid REFERENCES ai_instruction_folders(id) ON DELETE CASCADE,
+                        name text NOT NULL,
+                        content text NOT NULL DEFAULT '',
+                        sort_order int NOT NULL DEFAULT 0,
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        updated_at timestamptz NOT NULL DEFAULT now(),
+                        CHECK (btrim(name) <> '')
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ai_instruction_deleted_defaults (
+                        name text PRIMARY KEY,
+                        deleted_at timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_ai_instruction_folders_parent
+                        ON ai_instruction_folders(parent_id, sort_order, name)
+                    """
+                )
+                if not table_existed:
+                    for name, content, sort_order in AI_INSTRUCTION_DEFAULTS:
+                        cur.execute(
+                            """
+                            INSERT INTO ai_instruction_folders (parent_id, name, content, sort_order)
+                            SELECT NULL, %s, %s, %s
+                            WHERE NOT EXISTS (
+                                SELECT 1
+                                FROM ai_instruction_deleted_defaults
+                                WHERE lower(name) = lower(%s)
+                            )
+                            """,
+                            (name, content, sort_order, name),
+                        )
+                cur.execute(
+                    """
+                    DELETE FROM ai_instruction_folders
+                    WHERE parent_id IS NULL
+                      AND lower(name) = lower(%s)
+                    """,
+                    ("Регламент owner-отчета",),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO ai_instruction_folders (parent_id, name, content, sort_order)
+                    SELECT NULL, %s, '', %s
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM ai_instruction_folders
+                        WHERE parent_id IS NULL
+                          AND lower(name) = lower(%s)
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        OWNER_REPORT_PIPELINE_INSTRUCTION_PARENT_NAME,
+                        3,
+                        OWNER_REPORT_PIPELINE_INSTRUCTION_PARENT_NAME,
+                    ),
+                )
+                parent_row = cur.fetchone()
+                if parent_row:
+                    parent_id = parent_row["id"]
+                else:
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM ai_instruction_folders
+                        WHERE parent_id IS NULL
+                          AND lower(name) = lower(%s)
+                        LIMIT 1
+                        """,
+                        (OWNER_REPORT_PIPELINE_INSTRUCTION_PARENT_NAME,),
+                    )
+                    parent_id = cur.fetchone()["id"]
+                cur.execute(
+                    """
+                    INSERT INTO ai_instruction_folders (parent_id, name, content, sort_order)
+                    SELECT %s, %s, %s, %s
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM ai_instruction_folders
+                        WHERE parent_id = %s
+                          AND lower(name) = lower(%s)
+                    )
+                    """,
+                    (
+                        parent_id,
+                        OWNER_REPORT_PIPELINE_INSTRUCTION_NAME,
+                        OWNER_REPORT_PIPELINE_INSTRUCTION_CONTENT,
+                        10,
+                        parent_id,
+                        OWNER_REPORT_PIPELINE_INSTRUCTION_NAME,
+                    ),
+                )
+                # Do not rewrite existing instruction text here. These folders are editable
+                # from Настройки -> Инструкции для ИИ, so schema/default seeding must never
+                # roll user edits back to the bundled template.
+
+
+def ai_instruction_folder_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "parent_id": str(row["parent_id"]) if row["parent_id"] else None,
+        "name": row["name"],
+        "content": row["content"] or "",
+        "children_count": int(row["children_count"] or 0) if "children_count" in row else 0,
+        "updated_at": iso_or_none(row["updated_at"]),
+        "updated_at_text": format_datetime_ru(row["updated_at"]) if row["updated_at"] else "",
+    }
+
+
+def pg_user_id_by_bitrix(cur: Any, bitrix_user_id: Any) -> Any:
+    user_id = to_int(bitrix_user_id)
+    if user_id is None:
+        return None
+    cur.execute("SELECT id FROM users WHERE bitrix_user_id = %s", (user_id,))
+    row = cur.fetchone()
+    return row["id"] if row else None
+
+
+def pg_chat_id_by_dialog(cur: Any, dialog_id: str) -> Any:
+    cur.execute("SELECT id FROM chats WHERE dialog_id = %s", (dialog_id,))
+    row = cur.fetchone()
+    return row["id"] if row else None
+
+
+def pg_table_exists(cur: Any, table_name: str) -> bool:
+    cur.execute("SELECT to_regclass(%s) IS NOT NULL AS exists", (table_name,))
+    row = cur.fetchone()
+    return bool(row and row["exists"])
+
+
+def pg_json(value: Any) -> Jsonb:
+    safe_value = value if value is not None else {}
+    try:
+        # Normalize datetime/date/UUID-like values to JSON-safe primitives.
+        safe_value = json.loads(json.dumps(safe_value, ensure_ascii=False, default=str))
+    except Exception:
+        safe_value = {"value": str(safe_value)}
+    return Jsonb(safe_value)
+
+
+def ensure_chat_day_syncs_schema() -> None:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS chat_day_syncs (
+                            chat_id uuid NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                            sync_date date NOT NULL,
+                            messages_count integer NOT NULL DEFAULT 0,
+                            synced_at timestamptz NOT NULL DEFAULT now(),
+                            PRIMARY KEY (chat_id, sync_date)
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO chat_day_syncs (chat_id, sync_date, messages_count, synced_at)
+                        SELECT chat_id, message_day, COUNT(*)::int, now()
+                        FROM chat_messages
+                        GROUP BY chat_id, message_day
+                        ON CONFLICT (chat_id, sync_date) DO UPDATE SET
+                            messages_count = EXCLUDED.messages_count,
+                            synced_at = GREATEST(chat_day_syncs.synced_at, EXCLUDED.synced_at)
+                        """
+                    )
+        return
+    with db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_day_syncs (
+                dialog_id TEXT NOT NULL,
+                sync_date TEXT NOT NULL,
+                messages_count INTEGER NOT NULL DEFAULT 0,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY(dialog_id, sync_date),
+                FOREIGN KEY(dialog_id) REFERENCES chats(dialog_id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO chat_day_syncs (dialog_id, sync_date, messages_count, synced_at)
+            SELECT dialog_id, message_day, COUNT(*), ?
+            FROM chat_messages
+            GROUP BY dialog_id, message_day
+            ON CONFLICT(dialog_id, sync_date) DO UPDATE SET
+                messages_count = excluded.messages_count
+            """,
+            (datetime.now().isoformat(),),
+        )
+
+
+def upsert_chat_day_syncs(dialog_id: str, date_from: date, date_to: date, counts_by_date: dict[str, int]) -> None:
+    ensure_chat_day_syncs_schema()
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    chat_uuid = pg_chat_id_by_dialog(cur, dialog_id)
+                    if not chat_uuid:
+                        return
+                    for day in _daterange(date_from, date_to):
+                        cur.execute(
+                            """
+                            INSERT INTO chat_day_syncs (chat_id, sync_date, messages_count, synced_at)
+                            VALUES (%s, %s, %s, now())
+                            ON CONFLICT (chat_id, sync_date) DO UPDATE SET
+                                messages_count = EXCLUDED.messages_count,
+                                synced_at = now()
+                            """,
+                            (chat_uuid, day, int(counts_by_date.get(day.isoformat(), 0))),
+                        )
+        return
+    with db_connect() as conn:
+        now = datetime.now().isoformat()
+        for day in _daterange(date_from, date_to):
+            conn.execute(
+                """
+                INSERT INTO chat_day_syncs (dialog_id, sync_date, messages_count, synced_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(dialog_id, sync_date) DO UPDATE SET
+                    messages_count = excluded.messages_count,
+                    synced_at = excluded.synced_at
+                """,
+                (dialog_id, day.isoformat(), int(counts_by_date.get(day.isoformat(), 0)), now),
+            )
+
+
+def init_db() -> None:
+    with db_connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS sync_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                date_from TEXT,
+                date_to TEXT,
+                export_mode TEXT,
+                scanned_tasks_total INTEGER DEFAULT 0,
+                matched_tasks_total INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'running',
+                error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id INTEGER PRIMARY KEY,
+                title TEXT,
+                description TEXT,
+                status_code TEXT,
+                status_label TEXT,
+                responsible_id INTEGER,
+                responsible_name TEXT,
+                creator_id INTEGER,
+                creator_name TEXT,
+                deadline TEXT,
+                closed_date TEXT,
+                created_date TEXT,
+                changed_date TEXT,
+                priority TEXT,
+                mark TEXT,
+                comments_count INTEGER DEFAULT 0,
+                results_count INTEGER DEFAULT 0,
+                history_count INTEGER DEFAULT 0,
+                checklist_count INTEGER DEFAULT 0,
+                files_count INTEGER DEFAULT 0,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                last_synced_at TEXT NOT NULL,
+                raw_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS task_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                sync_run_id INTEGER,
+                captured_at TEXT NOT NULL,
+                status_code TEXT,
+                status_label TEXT,
+                responsible_id INTEGER,
+                responsible_name TEXT,
+                creator_id INTEGER,
+                creator_name TEXT,
+                deadline TEXT,
+                closed_date TEXT,
+                comments_count INTEGER DEFAULT 0,
+                results_count INTEGER DEFAULT 0,
+                history_count INTEGER DEFAULT 0,
+                checklist_count INTEGER DEFAULT 0,
+                raw_json TEXT NOT NULL,
+                FOREIGN KEY(sync_run_id) REFERENCES sync_runs(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status_code);
+            CREATE INDEX IF NOT EXISTS idx_tasks_responsible ON tasks(responsible_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_creator ON tasks(creator_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline);
+            CREATE INDEX IF NOT EXISTS idx_task_snapshots_task ON task_snapshots(task_id);
+
+            CREATE TABLE IF NOT EXISTS chats (
+                dialog_id TEXT PRIMARY KEY,
+                chat_id INTEGER,
+                title TEXT,
+                chat_type TEXT,
+                member_count INTEGER DEFAULT 0,
+                avatar_url TEXT,
+                last_message_date TEXT,
+                last_activity_date TEXT,
+                is_excluded INTEGER DEFAULT 0,
+                last_synced_at TEXT NOT NULL,
+                raw_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_members (
+                dialog_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                name TEXT,
+                work_position TEXT,
+                avatar_url TEXT,
+                email TEXT,
+                is_bot INTEGER DEFAULT 0,
+                is_extranet INTEGER DEFAULT 0,
+                raw_json TEXT NOT NULL,
+                PRIMARY KEY(dialog_id, user_id),
+                FOREIGN KEY(dialog_id) REFERENCES chats(dialog_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chats_member_count ON chats(member_count);
+            CREATE INDEX IF NOT EXISTS idx_chat_members_dialog ON chat_members(dialog_id);
+
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                dialog_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                chat_id INTEGER,
+                author_id INTEGER,
+                author_name TEXT,
+                message_date TEXT,
+                message_day TEXT,
+                text TEXT,
+                raw_json TEXT NOT NULL,
+                PRIMARY KEY(dialog_id, message_id),
+                FOREIGN KEY(dialog_id) REFERENCES chats(dialog_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_message_files (
+                dialog_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                name TEXT,
+                extension TEXT,
+                file_type TEXT,
+                size INTEGER,
+                preview_url TEXT,
+                show_url TEXT,
+                download_url TEXT,
+                raw_json TEXT NOT NULL,
+                PRIMARY KEY(dialog_id, message_id, file_id),
+                FOREIGN KEY(dialog_id, message_id) REFERENCES chat_messages(dialog_id, message_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_daily_reports (
+                dialog_id TEXT NOT NULL,
+                report_date TEXT NOT NULL,
+                report_text TEXT NOT NULL,
+                model TEXT,
+                generated_at TEXT NOT NULL,
+                raw_json TEXT,
+                PRIMARY KEY(dialog_id, report_date),
+                FOREIGN KEY(dialog_id) REFERENCES chats(dialog_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_day ON chat_messages(dialog_id, message_day);
+            CREATE INDEX IF NOT EXISTS idx_chat_message_files_message ON chat_message_files(dialog_id, message_id);
+
+            CREATE TABLE IF NOT EXISTS chat_day_syncs (
+                dialog_id TEXT NOT NULL,
+                sync_date TEXT NOT NULL,
+                messages_count INTEGER NOT NULL DEFAULT 0,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY(dialog_id, sync_date),
+                FOREIGN KEY(dialog_id) REFERENCES chats(dialog_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS departments (
+                department_id INTEGER PRIMARY KEY,
+                name TEXT,
+                parent_id INTEGER,
+                head_id INTEGER,
+                raw_json TEXT NOT NULL,
+                last_synced_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS team_members (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT,
+                email TEXT,
+                work_position TEXT,
+                active INTEGER DEFAULT 1,
+                avatar_url TEXT,
+                manager_id INTEGER,
+                manager_name TEXT,
+                departments_text TEXT,
+                raw_json TEXT NOT NULL,
+                last_synced_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS team_member_departments (
+                user_id INTEGER NOT NULL,
+                department_id INTEGER NOT NULL,
+                department_name TEXT,
+                department_head_id INTEGER,
+                PRIMARY KEY(user_id, department_id),
+                FOREIGN KEY(user_id) REFERENCES team_members(user_id) ON DELETE CASCADE,
+                FOREIGN KEY(department_id) REFERENCES departments(department_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_team_members_manager ON team_members(manager_id);
+            CREATE INDEX IF NOT EXISTS idx_team_member_departments_user ON team_member_departments(user_id);
+
+            CREATE TABLE IF NOT EXISTS source_artifacts (
+                artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_key TEXT NOT NULL UNIQUE,
+                source_title TEXT,
+                source_text TEXT,
+                source_url TEXT,
+                person_id INTEGER,
+                person_name TEXT,
+                dialog_id TEXT,
+                task_id INTEGER,
+                message_id INTEGER,
+                file_id INTEGER,
+                artifact_date TEXT,
+                raw_json TEXT,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_goals (
+                goal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dialog_id TEXT,
+                goal_title TEXT NOT NULL,
+                goal_text TEXT,
+                period_type TEXT DEFAULT 'month',
+                period_start TEXT,
+                period_end TEXT,
+                owner_id INTEGER,
+                owner_name TEXT,
+                success_metrics TEXT,
+                status TEXT DEFAULT 'active',
+                source_artifact_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS work_items (
+                work_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT,
+                assignee_id INTEGER,
+                assignee_name TEXT,
+                manager_id INTEGER,
+                manager_name TEXT,
+                dialog_id TEXT,
+                goal_id INTEGER,
+                period_type TEXT,
+                period_start TEXT,
+                period_end TEXT,
+                deadline TEXT,
+                status TEXT DEFAULT 'open',
+                priority TEXT,
+                confidence REAL DEFAULT 1.0,
+                source_type TEXT,
+                source_artifact_id INTEGER UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                raw_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS work_item_evidence (
+                work_item_id INTEGER NOT NULL,
+                artifact_id INTEGER NOT NULL,
+                evidence_type TEXT,
+                confidence REAL DEFAULT 1.0,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(work_item_id, artifact_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS extracted_facts (
+                fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                artifact_id INTEGER UNIQUE,
+                fact_type TEXT,
+                person_id INTEGER,
+                person_name TEXT,
+                title TEXT,
+                fact_text TEXT,
+                deadline TEXT,
+                status TEXT,
+                confidence REAL,
+                raw_json TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_file_ocr (
+                dialog_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                file_name TEXT,
+                source_url TEXT,
+                local_path TEXT,
+                mime_type TEXT,
+                file_size INTEGER,
+                sha256 TEXT,
+                ocr_text TEXT,
+                model TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                processed_at TEXT,
+                raw_json TEXT,
+                PRIMARY KEY(dialog_id, message_id, file_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS work_facts (
+                fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact_type TEXT NOT NULL,
+                fact_date TEXT,
+                person_id INTEGER,
+                person_name TEXT,
+                dialog_id TEXT,
+                title TEXT,
+                fact_text TEXT NOT NULL,
+                linked_task_title TEXT,
+                linked_goal_title TEXT,
+                confidence REAL DEFAULT 0.7,
+                source_type TEXT,
+                source_artifact_id INTEGER UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                raw_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS analysis_reviews (
+                review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dialog_id TEXT,
+                period_start TEXT,
+                period_end TEXT,
+                review_type TEXT NOT NULL,
+                model TEXT,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_daily_analytics (
+                dialog_id TEXT NOT NULL,
+                analytics_date TEXT NOT NULL,
+                summary_text TEXT,
+                model TEXT,
+                tasks_saved INTEGER DEFAULT 0,
+                goals_saved INTEGER DEFAULT 0,
+                facts_saved INTEGER DEFAULT 0,
+                confirmations_count INTEGER DEFAULT 0,
+                unknown_blocks_count INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'done',
+                error TEXT,
+                generated_at TEXT NOT NULL,
+                raw_json TEXT,
+                PRIMARY KEY(dialog_id, analytics_date)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_artifacts_type ON source_artifacts(source_type);
+            CREATE INDEX IF NOT EXISTS idx_source_artifacts_person ON source_artifacts(person_id);
+            CREATE INDEX IF NOT EXISTS idx_source_artifacts_dialog ON source_artifacts(dialog_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_goals_dialog ON chat_goals(dialog_id);
+            CREATE INDEX IF NOT EXISTS idx_work_items_assignee ON work_items(assignee_id);
+            CREATE INDEX IF NOT EXISTS idx_work_items_manager ON work_items(manager_id);
+            CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status);
+            CREATE INDEX IF NOT EXISTS idx_work_items_deadline ON work_items(deadline);
+            CREATE INDEX IF NOT EXISTS idx_extracted_facts_type ON extracted_facts(fact_type);
+            CREATE INDEX IF NOT EXISTS idx_chat_file_ocr_status ON chat_file_ocr(status);
+            CREATE INDEX IF NOT EXISTS idx_chat_file_ocr_dialog ON chat_file_ocr(dialog_id, message_id);
+            CREATE INDEX IF NOT EXISTS idx_work_facts_date ON work_facts(fact_date);
+            CREATE INDEX IF NOT EXISTS idx_work_facts_person ON work_facts(person_id);
+            CREATE INDEX IF NOT EXISTS idx_work_facts_dialog ON work_facts(dialog_id);
+            CREATE INDEX IF NOT EXISTS idx_analysis_reviews_dialog ON analysis_reviews(dialog_id, period_start, period_end);
+            CREATE INDEX IF NOT EXISTS idx_chat_daily_analytics_date ON chat_daily_analytics(analytics_date);
+            """
+        )
+
+
+def create_sync_run(date_from: date, date_to: date, export_mode: str) -> Any:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bitrix_task_sync_runs (period_start, period_end, status)
+                    VALUES (%s, %s, 'running')
+                    RETURNING id
+                    """,
+                    (date_from, date_to),
+                )
+                return cur.fetchone()["id"]
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO sync_runs (started_at, date_from, date_to, export_mode)
+            VALUES (?, ?, ?, ?)
+            """,
+            (now, date_from.isoformat(), date_to.isoformat(), export_mode),
+        )
+        return int(cur.lastrowid)
+
+
+def finish_sync_run(
+    sync_run_id: Any,
+    status: str,
+    scanned_tasks_total: int = 0,
+    matched_tasks_total: int = 0,
+    error: str | None = None,
+) -> None:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE bitrix_task_sync_runs
+                    SET sync_finished_at = now(),
+                        status = %s,
+                        tasks_found_count = %s,
+                        tasks_updated_count = %s,
+                        error_text = %s
+                    WHERE id = %s
+                    """,
+                    (status, scanned_tasks_total, matched_tasks_total, error, sync_run_id),
+                )
+        return
+    with db_connect() as conn:
+        conn.execute(
+            """
+            UPDATE sync_runs
+            SET finished_at = ?, status = ?, scanned_tasks_total = ?, matched_tasks_total = ?, error = ?
+            WHERE id = ?
+            """,
+            (
+                datetime.now().isoformat(),
+                status,
+                scanned_tasks_total,
+                matched_tasks_total,
+                error,
+                sync_run_id,
+            ),
+        )
+
+
+def task_counts(record: dict[str, Any]) -> dict[str, int]:
+    return {
+        "comments_count": len(record.get("comments", {}).get("items", []) or []),
+        "results_count": len(record.get("result", {}).get("items", []) or []),
+        "history_count": len(record.get("history", {}).get("items", []) or []),
+        "checklist_count": count_checklist_items(record.get("checklist", {}).get("items", []) or []),
+        "files_count": len(record.get("files", []) or []),
+    }
+
+
+def checklist_parent_id(item: Any) -> int | None:
+    if not isinstance(item, dict):
+        return None
+    return to_int(first_non_empty(item.get("PARENT_ID"), item.get("parentId"), item.get("parent_id")))
+
+
+def count_checklist_items(items: list[Any]) -> int:
+    """Count actionable checklist items, not root checklist containers."""
+    count = 0
+    for item in items:
+        if not isinstance(item, dict):
+            count += 1
+            continue
+        parent_id = checklist_parent_id(item)
+        if parent_id is None or parent_id == 0:
+            continue
+        count += 1
+    return count
+
+
+def upsert_task_records(records: list[dict[str, Any]], sync_run_id: int | None = None) -> None:
+    if postgres_enabled():
+        now = datetime.now()
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    for record in records:
+                        task_id = to_int(record.get("task_id"))
+                        if task_id is None or "error" in record:
+                            continue
+                        status = record.get("status", {}) or {}
+                        responsible = record.get("responsible", {}) or {}
+                        creator = record.get("creator", {}) or {}
+                        dates = record.get("dates", {}) or {}
+                        responsible_bitrix_id = to_int(responsible.get("id"))
+                        creator_bitrix_id = to_int(creator.get("id"))
+                        responsible_id = pg_user_id_by_bitrix(cur, responsible_bitrix_id)
+                        creator_id = pg_user_id_by_bitrix(cur, creator_bitrix_id)
+                        cur.execute(
+                            """
+                            INSERT INTO bitrix_tasks (
+                                bitrix_task_id, title, description, status, status_name, priority,
+                                creator_id, creator_bitrix_user_id, responsible_id, responsible_bitrix_user_id,
+                                deadline_at, created_at_bitrix, updated_at_bitrix, closed_at_bitrix,
+                                raw_json, synced_at
+                            ) VALUES (
+                                %(bitrix_task_id)s, %(title)s, %(description)s, %(status)s, %(status_name)s,
+                                %(priority)s, %(creator_id)s, %(creator_bitrix_user_id)s,
+                                %(responsible_id)s, %(responsible_bitrix_user_id)s, %(deadline_at)s,
+                                %(created_at_bitrix)s, %(updated_at_bitrix)s, %(closed_at_bitrix)s,
+                                %(raw_json)s, %(synced_at)s
+                            )
+                            ON CONFLICT (bitrix_task_id) DO UPDATE SET
+                                title = EXCLUDED.title,
+                                description = EXCLUDED.description,
+                                status = EXCLUDED.status,
+                                status_name = EXCLUDED.status_name,
+                                priority = EXCLUDED.priority,
+                                creator_id = EXCLUDED.creator_id,
+                                creator_bitrix_user_id = EXCLUDED.creator_bitrix_user_id,
+                                responsible_id = EXCLUDED.responsible_id,
+                                responsible_bitrix_user_id = EXCLUDED.responsible_bitrix_user_id,
+                                deadline_at = EXCLUDED.deadline_at,
+                                created_at_bitrix = EXCLUDED.created_at_bitrix,
+                                updated_at_bitrix = EXCLUDED.updated_at_bitrix,
+                                closed_at_bitrix = EXCLUDED.closed_at_bitrix,
+                                raw_json = EXCLUDED.raw_json,
+                                synced_at = EXCLUDED.synced_at,
+                                updated_at = now()
+                            RETURNING id
+                            """,
+                            {
+                                "bitrix_task_id": task_id,
+                                "title": record.get("title") or f"Task {task_id}",
+                                "description": record.get("description"),
+                                "status": str(status.get("code")) if status.get("code") is not None else None,
+                                "status_name": status.get("label"),
+                                "priority": record.get("priority"),
+                                "creator_id": creator_id,
+                                "creator_bitrix_user_id": creator_bitrix_id,
+                                "responsible_id": responsible_id,
+                                "responsible_bitrix_user_id": responsible_bitrix_id,
+                                "deadline_at": parse_datetime(record.get("deadline")),
+                                "created_at_bitrix": parse_datetime(dates.get("created")),
+                                "updated_at_bitrix": parse_datetime(dates.get("changed")),
+                                "closed_at_bitrix": parse_datetime(record.get("closed_date")),
+                                "raw_json": pg_json(record),
+                                "synced_at": now,
+                            },
+                        )
+                        bitrix_task_uuid = cur.fetchone()["id"]
+                        if sync_run_id:
+                            cur.execute(
+                                """
+                                INSERT INTO bitrix_task_snapshots (
+                                    task_id, bitrix_task_id, sync_run_id, snapshot_date, status,
+                                    priority, responsible_id, deadline_at, closed_at_bitrix, raw_json
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (task_id, sync_run_id) DO NOTHING
+                                """,
+                                (
+                                    bitrix_task_uuid,
+                                    task_id,
+                                    sync_run_id,
+                                    date.today(),
+                                    str(status.get("code")) if status.get("code") is not None else None,
+                                    record.get("priority"),
+                                    responsible_id,
+                                    parse_datetime(record.get("deadline")),
+                                    parse_datetime(record.get("closed_date")),
+                                    pg_json(record),
+                                ),
+                            )
+                        for role, user_uuid, bitrix_id in (
+                            ("creator", creator_id, creator_bitrix_id),
+                            ("responsible", responsible_id, responsible_bitrix_id),
+                        ):
+                            if user_uuid:
+                                cur.execute(
+                                    """
+                                    INSERT INTO bitrix_task_members (task_id, user_id, bitrix_user_id, role)
+                                    VALUES (%s, %s, %s, %s)
+                                    ON CONFLICT (task_id, user_id, role) DO NOTHING
+                                    """,
+                                    (bitrix_task_uuid, user_uuid, bitrix_id, role),
+                                )
+        return
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        for record in records:
+            task_id = to_int(record.get("task_id"))
+            if task_id is None or "error" in record:
+                continue
+
+            counts = task_counts(record)
+            status = record.get("status", {}) or {}
+            responsible = record.get("responsible", {}) or {}
+            creator = record.get("creator", {}) or {}
+            dates = record.get("dates", {}) or {}
+            raw_json = json.dumps(record, ensure_ascii=False)
+
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    task_id, title, description, status_code, status_label,
+                    responsible_id, responsible_name, creator_id, creator_name,
+                    deadline, closed_date, created_date, changed_date, priority, mark,
+                    comments_count, results_count, history_count, checklist_count, files_count,
+                    first_seen_at, last_seen_at, last_synced_at, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    title = excluded.title,
+                    description = excluded.description,
+                    status_code = excluded.status_code,
+                    status_label = excluded.status_label,
+                    responsible_id = excluded.responsible_id,
+                    responsible_name = excluded.responsible_name,
+                    creator_id = excluded.creator_id,
+                    creator_name = excluded.creator_name,
+                    deadline = excluded.deadline,
+                    closed_date = excluded.closed_date,
+                    created_date = excluded.created_date,
+                    changed_date = excluded.changed_date,
+                    priority = excluded.priority,
+                    mark = excluded.mark,
+                    comments_count = excluded.comments_count,
+                    results_count = excluded.results_count,
+                    history_count = excluded.history_count,
+                    checklist_count = excluded.checklist_count,
+                    files_count = excluded.files_count,
+                    last_seen_at = excluded.last_seen_at,
+                    last_synced_at = excluded.last_synced_at,
+                    raw_json = excluded.raw_json
+                """,
+                (
+                    task_id,
+                    record.get("title"),
+                    record.get("description"),
+                    str(status.get("code")) if status.get("code") is not None else None,
+                    status.get("label"),
+                    to_int(responsible.get("id")),
+                    responsible.get("name"),
+                    to_int(creator.get("id")),
+                    creator.get("name"),
+                    record.get("deadline"),
+                    record.get("closed_date"),
+                    dates.get("created"),
+                    dates.get("changed"),
+                    record.get("priority"),
+                    record.get("mark"),
+                    counts["comments_count"],
+                    counts["results_count"],
+                    counts["history_count"],
+                    counts["checklist_count"],
+                    counts["files_count"],
+                    now,
+                    now,
+                    now,
+                    raw_json,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO task_snapshots (
+                    task_id, sync_run_id, captured_at, status_code, status_label,
+                    responsible_id, responsible_name, creator_id, creator_name,
+                    deadline, closed_date, comments_count, results_count,
+                    history_count, checklist_count, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    sync_run_id,
+                    now,
+                    str(status.get("code")) if status.get("code") is not None else None,
+                    status.get("label"),
+                    to_int(responsible.get("id")),
+                    responsible.get("name"),
+                    to_int(creator.get("id")),
+                    creator.get("name"),
+                    record.get("deadline"),
+                    record.get("closed_date"),
+                    counts["comments_count"],
+                    counts["results_count"],
+                    counts["history_count"],
+                    counts["checklist_count"],
+                    raw_json,
+                ),
+            )
+
+
+def db_period_where() -> str:
+    return """
+        (
+            (created_date IS NOT NULL AND created_date != '' AND substr(created_date, 1, 10) BETWEEN ? AND ?)
+            OR (changed_date IS NOT NULL AND changed_date != '' AND substr(changed_date, 1, 10) BETWEEN ? AND ?)
+            OR (closed_date IS NOT NULL AND closed_date != '' AND substr(closed_date, 1, 10) BETWEEN ? AND ?)
+            OR (deadline IS NOT NULL AND deadline != '' AND substr(deadline, 1, 10) BETWEEN ? AND ?)
+            OR (
+                created_date IS NOT NULL
+                AND created_date != ''
+                AND substr(created_date, 1, 10) <= ?
+                AND (closed_date IS NULL OR closed_date = '' OR substr(closed_date, 1, 10) >= ?)
+            )
+        )
+    """
+
+
+def db_period_params(date_from: date, date_to: date) -> tuple[str, ...]:
+    start = date_from.isoformat()
+    end = date_to.isoformat()
+    return (start, end, start, end, start, end, start, end, end, start)
+
+
+def delete_task_records(task_ids: list[int]) -> int:
+    if postgres_enabled():
+        if not task_ids:
+            return 0
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM bitrix_tasks WHERE bitrix_task_id = ANY(%s)", (task_ids,))
+                return cur.rowcount
+    if not task_ids:
+        return 0
+    placeholders = ",".join("?" for _ in task_ids)
+    with db_connect() as conn:
+        conn.execute(f"DELETE FROM task_snapshots WHERE task_id IN ({placeholders})", task_ids)
+        cur = conn.execute(f"DELETE FROM tasks WHERE task_id IN ({placeholders})", task_ids)
+        return int(cur.rowcount)
+
+
+def reconcile_deleted_tasks(
+    client: "BitrixClient",
+    date_from: date,
+    date_to: date,
+    bitrix_task_ids: set[int],
+) -> list[int]:
+    if not bitrix_task_ids:
+        return []
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT bitrix_task_id
+                    FROM bitrix_tasks
+                    WHERE
+                        created_at_bitrix::date BETWEEN %s AND %s
+                        OR updated_at_bitrix::date BETWEEN %s AND %s
+                        OR closed_at_bitrix::date BETWEEN %s AND %s
+                        OR deadline_at::date BETWEEN %s AND %s
+                        OR (
+                            created_at_bitrix::date <= %s
+                            AND (closed_at_bitrix IS NULL OR closed_at_bitrix::date >= %s)
+                        )
+                    """,
+                    (date_from, date_to, date_from, date_to, date_from, date_to, date_from, date_to, date_to, date_from),
+                )
+                local_ids = {int(row["bitrix_task_id"]) for row in cur.fetchall()}
+
+        missing_ids = sorted(local_ids - bitrix_task_ids)
+        deleted_ids: list[int] = []
+        for task_id in missing_ids:
+            details = client.get_task_details(task_id)
+            if details:
+                continue
+            deleted_ids.append(task_id)
+            time.sleep(client.request_delay)
+
+        delete_task_records(deleted_ids)
+        return deleted_ids
+
+    where_sql = db_period_where()
+    with db_connect() as conn:
+        rows = conn.execute(
+            f"SELECT task_id FROM tasks WHERE {where_sql}",
+            db_period_params(date_from, date_to),
+        ).fetchall()
+
+    local_ids = {int(row["task_id"]) for row in rows}
+    missing_ids = sorted(local_ids - bitrix_task_ids)
+    deleted_ids: list[int] = []
+    for task_id in missing_ids:
+        details = client.get_task_details(task_id)
+        if details:
+            continue
+        deleted_ids.append(task_id)
+        time.sleep(client.request_delay)
+
+    delete_task_records(deleted_ids)
+    return deleted_ids
+
+
+def load_registry(
+    search: str = "",
+    status: str = "",
+    responsible_id: str = "",
+    created_from: str = "",
+    created_to: str = "",
+    deadline_from: str = "",
+    deadline_to: str = "",
+    period_from: str = "",
+    period_to: str = "",
+    limit: int = 500,
+) -> tuple[list[Any], dict[str, Any]]:
+    if postgres_enabled():
+        clauses: list[str] = []
+        params: list[Any] = []
+        if search:
+            clauses.append("(bt.title ILIKE %s OR bt.description ILIKE %s OR ru.full_name ILIKE %s OR cu.full_name ILIKE %s)")
+            like = f"%{search}%"
+            params.extend([like, like, like, like])
+        if status:
+            clauses.append("bt.status = %s")
+            params.append(status)
+        if responsible_id:
+            clauses.append("bt.responsible_bitrix_user_id = %s")
+            params.append(to_int(responsible_id))
+        if period_from and period_to:
+            clauses.append(
+                """
+                (
+                    bt.created_at_bitrix::date BETWEEN %s AND %s
+                    OR (
+                        bt.closed_at_bitrix IS NULL
+                        AND COALESCE(bt.status, '') NOT IN ('5', '7', 'completed', 'declined')
+                    )
+                )
+                """
+            )
+            params.extend([period_from, period_to])
+        if created_from:
+            clauses.append("bt.created_at_bitrix::date >= %s")
+            params.append(created_from)
+        if created_to:
+            clauses.append("bt.created_at_bitrix::date <= %s")
+            params.append(created_to)
+        if deadline_from:
+            clauses.append("bt.deadline_at::date >= %s")
+            params.append(deadline_from)
+        if deadline_to:
+            clauses.append("bt.deadline_at::date <= %s")
+            params.append(deadline_to)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        bt.bitrix_task_id AS task_id,
+                        bt.title,
+                        bt.status AS status_code,
+                        bt.status_name AS status_label,
+                        bt.responsible_bitrix_user_id AS responsible_id,
+                        ru.full_name AS responsible_name,
+                        bt.creator_bitrix_user_id AS creator_id,
+                        cu.full_name AS creator_name,
+                        bt.created_at_bitrix AS created_date,
+                        bt.deadline_at AS deadline,
+                        bt.closed_at_bitrix AS closed_date,
+                        0 AS comments_count,
+                        0 AS results_count,
+                        0 AS history_count,
+                        0 AS checklist_count,
+                        bt.synced_at AS last_synced_at
+                    FROM bitrix_tasks bt
+                    LEFT JOIN users ru ON ru.id = bt.responsible_id
+                    LEFT JOIN users cu ON cu.id = bt.creator_id
+                    {where_sql}
+                    ORDER BY COALESCE(bt.created_at_bitrix, bt.updated_at_bitrix, bt.created_at) DESC, bt.bitrix_task_id DESC
+                    LIMIT %s
+                    """,
+                    (*params, limit),
+                )
+                rows = cur.fetchall()
+                cur.execute("SELECT COUNT(*) AS count FROM bitrix_tasks")
+                total = cur.fetchone()["count"]
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*) AS count
+                    FROM bitrix_tasks bt
+                    LEFT JOIN users ru ON ru.id = bt.responsible_id
+                    LEFT JOIN users cu ON cu.id = bt.creator_id
+                    {where_sql}
+                    """,
+                    params,
+                )
+                filtered_total = cur.fetchone()["count"]
+                cur.execute(
+                    """
+                    SELECT COALESCE(status_name, status, 'Без статуса') AS status, COUNT(*) AS count
+                    FROM bitrix_tasks
+                    GROUP BY COALESCE(status_name, status, 'Без статуса')
+                    ORDER BY count DESC
+                    """
+                )
+                by_status = cur.fetchall()
+                cur.execute("SELECT * FROM bitrix_task_sync_runs ORDER BY sync_started_at DESC LIMIT 1")
+                last_sync = cur.fetchone()
+        return rows, {
+            "total": total,
+            "filtered_total": filtered_total,
+            "by_status": by_status,
+            "last_sync": last_sync,
+        }
+    clauses: list[str] = []
+    params: list[Any] = []
+    if search:
+        clauses.append("(title LIKE ? OR description LIKE ? OR responsible_name LIKE ? OR creator_name LIKE ?)")
+        like = f"%{search}%"
+        params.extend([like, like, like, like])
+    if status:
+        clauses.append("status_code = ?")
+        params.append(status)
+    if responsible_id:
+        clauses.append("responsible_id = ?")
+        params.append(to_int(responsible_id))
+    if period_from and period_to:
+        clauses.append(
+            """
+            (
+                (created_date IS NOT NULL AND created_date != '' AND substr(created_date, 1, 10) BETWEEN ? AND ?)
+                OR (
+                    (closed_date IS NULL OR closed_date = '')
+                    AND COALESCE(status_code, '') NOT IN ('5', '7', 'completed', 'declined')
+                )
+            )
+            """
+        )
+        params.extend([period_from, period_to])
+    if created_from:
+        clauses.append("created_date IS NOT NULL AND created_date != '' AND substr(created_date, 1, 10) >= ?")
+        params.append(created_from)
+    if created_to:
+        clauses.append("created_date IS NOT NULL AND created_date != '' AND substr(created_date, 1, 10) <= ?")
+        params.append(created_to)
+    if deadline_from:
+        clauses.append("deadline IS NOT NULL AND deadline != '' AND substr(deadline, 1, 10) >= ?")
+        params.append(deadline_from)
+    if deadline_to:
+        clauses.append("deadline IS NOT NULL AND deadline != '' AND substr(deadline, 1, 10) <= ?")
+        params.append(deadline_to)
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with db_connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM tasks
+            {where_sql}
+            ORDER BY COALESCE(created_date, '') DESC, task_id DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        stats = {
+            "total": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "filtered_total": conn.execute(
+                f"SELECT COUNT(*) FROM tasks {where_sql}",
+                params,
+            ).fetchone()[0],
+            "by_status": conn.execute(
+                "SELECT COALESCE(status_label, status_code, 'Без статуса') AS status, COUNT(*) AS count FROM tasks GROUP BY COALESCE(status_label, status_code, 'Без статуса') ORDER BY count DESC"
+            ).fetchall(),
+            "last_sync": conn.execute(
+                "SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone(),
+        }
+    return rows, stats
+
+
+def upsert_chat_records(records: list[dict[str, Any]]) -> None:
+    if postgres_enabled():
+        now = datetime.now().isoformat()
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    for record in records:
+                        dialog_id = str(record.get("dialog_id") or "").strip()
+                        if not dialog_id:
+                            continue
+                        members = record.get("members") if isinstance(record.get("members"), list) else []
+                        cur.execute(
+                            """
+                            INSERT INTO chats (
+                                bitrix_chat_id, dialog_id, chat_title, chat_type, last_message_at,
+                                members_count, raw_json, synced_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (dialog_id) DO UPDATE SET
+                                bitrix_chat_id = EXCLUDED.bitrix_chat_id,
+                                chat_title = EXCLUDED.chat_title,
+                                chat_type = EXCLUDED.chat_type,
+                                last_message_at = EXCLUDED.last_message_at,
+                                members_count = EXCLUDED.members_count,
+                                raw_json = EXCLUDED.raw_json,
+                                synced_at = EXCLUDED.synced_at,
+                                updated_at = now()
+                            RETURNING id
+                            """,
+                            (
+                                to_int(record.get("chat_id")),
+                                dialog_id,
+                                record.get("title"),
+                                record.get("type") if record.get("type") in {"group", "private", "open"} else "group",
+                                parse_datetime(first_non_empty(record.get("last_activity_date"), record.get("last_message_date"))),
+                                len(members),
+                                pg_json(record.get("raw", record)),
+                                now,
+                            ),
+                        )
+                        chat_uuid = cur.fetchone()["id"]
+                        cur.execute("DELETE FROM chat_members WHERE chat_id = %s", (chat_uuid,))
+                        for member in members:
+                            bitrix_user_id = to_int(member.get("id"))
+                            user_uuid = pg_user_id_by_bitrix(cur, bitrix_user_id)
+                            if not user_uuid:
+                                continue
+                            cur.execute(
+                                """
+                                INSERT INTO chat_members (chat_id, user_id, bitrix_user_id, role)
+                                VALUES (%s, %s, %s, 'member')
+                                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                                    bitrix_user_id = EXCLUDED.bitrix_user_id,
+                                    updated_at = now()
+                                """,
+                                (chat_uuid, user_uuid, bitrix_user_id),
+                            )
+        return
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        for record in records:
+            dialog_id = str(record.get("dialog_id") or "").strip()
+            if not dialog_id:
+                continue
+            members = record.get("members") if isinstance(record.get("members"), list) else []
+            conn.execute(
+                """
+                INSERT INTO chats (
+                    dialog_id, chat_id, title, chat_type, member_count, avatar_url,
+                    last_message_date, last_activity_date, last_synced_at, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dialog_id) DO UPDATE SET
+                    chat_id = excluded.chat_id,
+                    title = excluded.title,
+                    chat_type = excluded.chat_type,
+                    member_count = excluded.member_count,
+                    avatar_url = excluded.avatar_url,
+                    last_message_date = excluded.last_message_date,
+                    last_activity_date = excluded.last_activity_date,
+                    last_synced_at = excluded.last_synced_at,
+                    raw_json = excluded.raw_json
+                """,
+                (
+                    dialog_id,
+                    to_int(record.get("chat_id")),
+                    record.get("title"),
+                    record.get("type"),
+                    len(members),
+                    record.get("avatar_url"),
+                    record.get("last_message_date"),
+                    record.get("last_activity_date"),
+                    now,
+                    json.dumps(record.get("raw", record), ensure_ascii=False),
+                ),
+            )
+            conn.execute("DELETE FROM chat_members WHERE dialog_id = ?", (dialog_id,))
+            for member in members:
+                user_id = to_int(member.get("id"))
+                if user_id is None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO chat_members (
+                        dialog_id, user_id, name, work_position, avatar_url, email,
+                        is_bot, is_extranet, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        dialog_id,
+                        user_id,
+                        member.get("name"),
+                        member.get("work_position"),
+                        first_non_empty(member.get("avatar"), member.get("avatar_hr")),
+                        member.get("email"),
+                        1 if member.get("bot") else 0,
+                        1 if member.get("extranet") else 0,
+                        json.dumps(member, ensure_ascii=False),
+                    ),
+                )
+
+
+def load_chats() -> list[dict[str, Any]]:
+    ensure_chat_day_syncs_schema()
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                has_chat_weekly_reports = pg_table_exists(cur, "chat_weekly_reports")
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM chats
+                    WHERE members_count >= 3
+                    ORDER BY COALESCE(last_message_at, updated_at) DESC, chat_title
+                    """
+                )
+                chats = cur.fetchall()
+                result: list[dict[str, Any]] = []
+                for chat in chats:
+                    cur.execute(
+                        """
+                        SELECT u.bitrix_user_id AS user_id, u.full_name AS name, u.work_position,
+                               u.avatar_url, u.email, FALSE AS is_bot, FALSE AS is_extranet
+                        FROM chat_members cm
+                        JOIN users u ON u.id = cm.user_id
+                        WHERE cm.chat_id = %s
+                        ORDER BY u.full_name
+                        """,
+                        (chat["id"],),
+                    )
+                    members = cur.fetchall()
+                    visible_report_date = latest_visible_report_date()
+                    if has_chat_weekly_reports:
+                        cur.execute(
+                            """
+                            SELECT 'daily' AS report_kind, 1 AS sort_kind, id, report_date, report_date AS sort_date,
+                                   NULL::date AS period_start, NULL::date AS period_end,
+                                   'postgres' AS model, generated_at, messages_count,
+                                   ai_request_id, raw_ai_json, summary, version
+                            FROM (
+                                SELECT DISTINCT ON (report_date)
+                                    id, report_date, generated_at, messages_count,
+                                    ai_request_id, raw_ai_json, summary, version, is_current
+                                FROM chat_daily_reports
+                                WHERE chat_id = %s AND report_date <= %s
+                                ORDER BY report_date, is_current DESC, version DESC NULLS LAST, generated_at DESC NULLS LAST
+                            ) latest_daily
+                            UNION ALL
+                            SELECT 'daily' AS report_kind, 1 AS sort_kind, NULL::uuid AS id,
+                                   s.sync_date AS report_date, s.sync_date AS sort_date,
+                                   NULL::date AS period_start, NULL::date AS period_end,
+                                   'messages-pending' AS model, NULL::timestamptz AS generated_at,
+                                   COALESCE(COUNT(m.id), 0)::int AS messages_count,
+                                   NULL::uuid AS ai_request_id, '{}'::jsonb AS raw_ai_json,
+                                   'Сообщения загружены, ИИ-отчет еще не сформирован' AS summary,
+                                   NULL::int AS version
+                            FROM chat_day_syncs s
+                            LEFT JOIN chat_messages m ON m.chat_id = s.chat_id AND m.message_day = s.sync_date
+                            WHERE s.chat_id = %s
+                              AND s.sync_date <= %s
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM chat_daily_reports existing
+                                  WHERE existing.chat_id = s.chat_id
+                                    AND existing.report_date = s.sync_date
+                              )
+                            GROUP BY s.sync_date
+                            UNION ALL
+                            SELECT 'weekly' AS report_kind, 0 AS sort_kind, id, period_end AS report_date, period_end AS sort_date,
+                                   period_start, period_end, 'postgres' AS model, generated_at, messages_count,
+                                   ai_request_id, raw_json AS raw_ai_json, summary, version
+                            FROM chat_weekly_reports
+                            WHERE chat_id = %s AND is_current = TRUE AND period_end <= %s
+                            UNION ALL
+                            SELECT 'weekly' AS report_kind, 0 AS sort_kind, NULL::uuid AS id,
+                                   weekly.period_end AS report_date, weekly.period_end AS sort_date,
+                                   weekly.period_start, weekly.period_end, 'weekly-pending' AS model,
+                                   NULL::timestamptz AS generated_at, weekly.messages_count,
+                                   NULL::uuid AS ai_request_id, '{}'::jsonb AS raw_ai_json,
+                                   'Недельный отчет еще не сформирован' AS summary, NULL::int AS version
+                            FROM (
+                                SELECT
+                                    (report_date - ((EXTRACT(ISODOW FROM report_date)::int - 1) * INTERVAL '1 day'))::date AS period_start,
+                                    (report_date - ((EXTRACT(ISODOW FROM report_date)::int - 1) * INTERVAL '1 day') + INTERVAL '6 days')::date AS period_end,
+                                    SUM(messages_count)::int AS messages_count,
+                                    BOOL_OR(EXTRACT(ISODOW FROM report_date)::int = 7) AS has_sunday_report
+                            FROM (
+                                SELECT DISTINCT ON (report_date) report_date, messages_count
+                                FROM chat_daily_reports
+                                WHERE chat_id = %s
+                                ORDER BY report_date, is_current DESC, version DESC NULLS LAST, generated_at DESC NULLS LAST
+                            ) latest_daily_for_week
+                            GROUP BY 1, 2
+                            ) weekly
+                            WHERE weekly.period_end <= %s
+                              AND weekly.has_sunday_report = TRUE
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM chat_weekly_reports existing
+                                  WHERE existing.chat_id = %s
+                                    AND existing.period_start = weekly.period_start
+                                    AND existing.period_end = weekly.period_end
+                                    AND existing.is_current = TRUE
+                              )
+                            ORDER BY sort_date DESC, sort_kind ASC
+                            """,
+                            (
+                                chat["id"], visible_report_date,
+                                chat["id"], visible_report_date,
+                                chat["id"], visible_report_date,
+                                chat["id"], visible_report_date, chat["id"],
+                            ),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT 'daily' AS report_kind, 1 AS sort_kind, id, report_date, report_date AS sort_date,
+                                   NULL::date AS period_start, NULL::date AS period_end,
+                                   'postgres' AS model, generated_at, messages_count,
+                                   ai_request_id, raw_ai_json, summary, version
+                            FROM (
+                                SELECT DISTINCT ON (report_date)
+                                    id, report_date, generated_at, messages_count,
+                                    ai_request_id, raw_ai_json, summary, version, is_current
+                                FROM chat_daily_reports
+                                WHERE chat_id = %s AND report_date <= %s
+                                ORDER BY report_date, is_current DESC, version DESC NULLS LAST, generated_at DESC NULLS LAST
+                            ) latest_daily
+                            UNION ALL
+                            SELECT 'daily' AS report_kind, 1 AS sort_kind, NULL::uuid AS id,
+                                   s.sync_date AS report_date, s.sync_date AS sort_date,
+                                   NULL::date AS period_start, NULL::date AS period_end,
+                                   'messages-pending' AS model, NULL::timestamptz AS generated_at,
+                                   COALESCE(COUNT(m.id), 0)::int AS messages_count,
+                                   NULL::uuid AS ai_request_id, '{}'::jsonb AS raw_ai_json,
+                                   'Сообщения загружены, ИИ-отчет еще не сформирован' AS summary,
+                                   NULL::int AS version
+                            FROM chat_day_syncs s
+                            LEFT JOIN chat_messages m ON m.chat_id = s.chat_id AND m.message_day = s.sync_date
+                            WHERE s.chat_id = %s
+                              AND s.sync_date <= %s
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM chat_daily_reports existing
+                                  WHERE existing.chat_id = s.chat_id
+                                    AND existing.report_date = s.sync_date
+                              )
+                            GROUP BY s.sync_date
+                            ORDER BY sort_date DESC, sort_kind ASC
+                            """,
+                            (chat["id"], visible_report_date, chat["id"], visible_report_date),
+                        )
+                    reports = cur.fetchall()
+                    reports_payload: list[dict[str, Any]] = []
+                    for report in reports:
+                        report_date = report["report_date"]
+                        is_weekly = report["report_kind"] == "weekly"
+                        raw_weekly = report.get("raw_ai_json") if isinstance(report, dict) else None
+                        weekly_source = raw_weekly.get("source") if isinstance(raw_weekly, dict) else None
+                        is_weekly_placeholder = is_weekly and weekly_source in {"chat_weekly_placeholder", "weekly_placeholder"}
+                        is_weekly_empty = is_weekly and int(report.get("messages_count") or 0) == 0
+                        is_weekly_pending = is_weekly and (is_weekly_placeholder or is_weekly_empty)
+                        is_generated_weekly = is_weekly and report["id"] is not None and not is_weekly_pending
+                        workflow_status = (
+                            {
+                                "workflow_status": "report_formed",
+                                "workflow_status_text": "Недельный отчет сформирован",
+                                "status": "done",
+                                "status_text": "Недельный отчет сформирован",
+                                "image_files": 0,
+                                "ocr_success": 0,
+                                "ocr_pending": 0,
+                                "ocr_errors": 0,
+                                "is_processed": True,
+                            }
+                            if is_generated_weekly
+                            else {
+                                "workflow_status": "needs_report" if is_weekly else "pending",
+                                "workflow_status_text": "Не обработан" if is_weekly else "Нужно сформировать неделю",
+                                "status": "needs_report" if is_weekly else "pending",
+                                "status_text": "Не обработан" if is_weekly else "Нужно сформировать неделю",
+                                "image_files": 0,
+                                "ocr_success": 0,
+                                "ocr_pending": 0,
+                                "ocr_errors": 0,
+                                "is_processed": False,
+                            }
+                            if is_weekly
+                            else chat_day_workflow_status(chat["dialog_id"], report_date, report_exists=is_display_chat_report(report))
+                        )
+                        reports_payload.append(
+                            {
+                                "report_id": str(report["id"]) if report["id"] else None,
+                                "report_kind": report["report_kind"],
+                                "date": report_date.isoformat() if hasattr(report_date, "isoformat") else report_date,
+                                "date_text": format_date_ru(report_date),
+                                "period_start": report["period_start"].isoformat() if report["period_start"] else None,
+                                "period_end": report["period_end"].isoformat() if report["period_end"] else None,
+                                "period_text": (
+                                    f"{format_date_ru(report['period_start'])} - {format_date_ru(report['period_end'])}"
+                                    if report["period_start"] and report["period_end"]
+                                    else None
+                                ),
+                                "title": (
+                                    f"Неделя {format_date_ru(report['period_start'])} - {format_date_ru(report['period_end'])}"
+                                    if is_weekly and report["period_start"] and report["period_end"]
+                                    else f"Сводка {format_date_ru(report_date)}"
+                                ),
+                                "model": report["model"],
+                                "generated_at": iso_or_none(report["generated_at"]),
+                                "generated_at_text": format_datetime_ru(report["generated_at"]),
+                                "messages_count": report["messages_count"],
+                                "version": report["version"],
+                                "summary": report["summary"],
+                                "text_status": workflow_status,
+                                "workflow_status": workflow_status["workflow_status"],
+                                "workflow_status_text": workflow_status["workflow_status_text"],
+                            }
+                        )
+                    result.append(
+                        {
+                            "dialog_id": chat["dialog_id"],
+                            "chat_id": chat["bitrix_chat_id"],
+                            "title": chat["chat_title"],
+                            "type": chat["chat_type"],
+                            "member_count": chat["members_count"],
+                            "avatar_url": None,
+                            "is_excluded": 1 if chat["is_excluded"] else 0,
+                            "last_message_date": iso_or_none(chat["last_message_at"]),
+                            "last_message_date_text": format_datetime_ru(chat["last_message_at"]),
+                            "last_activity_date": iso_or_none(chat["last_message_at"]),
+                            "last_activity_date_text": format_datetime_ru(chat["last_message_at"]),
+                            "last_synced_at": iso_or_none(chat["synced_at"]),
+                            "last_synced_at_text": format_datetime_ru(chat["synced_at"]),
+                            "members": [dict(member) for member in members],
+                            "reports": reports_payload,
+                            "analytics": [],
+                        }
+                    )
+                return result
+    with db_connect() as conn:
+        chats = conn.execute(
+            """
+            SELECT *
+            FROM chats
+            WHERE member_count >= 3
+            ORDER BY COALESCE(last_activity_date, last_message_date, '') DESC, title COLLATE NOCASE
+            """
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for chat in chats:
+            members = conn.execute(
+                """
+                SELECT user_id, name, work_position, avatar_url, email, is_bot, is_extranet
+                FROM chat_members
+                WHERE dialog_id = ?
+                ORDER BY name COLLATE NOCASE
+                """,
+                (chat["dialog_id"],),
+            ).fetchall()
+            reports = conn.execute(
+                """
+                SELECT
+                    r.report_date,
+                    r.model,
+                    r.generated_at,
+                    r.raw_json,
+                    COUNT(m.message_id) AS messages_count
+                FROM chat_daily_reports r
+                LEFT JOIN chat_messages m
+                    ON m.dialog_id = r.dialog_id
+                    AND m.message_day = r.report_date
+                WHERE r.dialog_id = ? AND r.report_date <= ?
+                GROUP BY r.report_date, r.model, r.generated_at, r.raw_json
+                ORDER BY r.report_date DESC
+                """,
+                (chat["dialog_id"], latest_visible_report_date().isoformat()),
+            ).fetchall()
+            analytics = conn.execute(
+                """
+                SELECT *
+                FROM chat_daily_analytics
+                WHERE dialog_id = ?
+                ORDER BY analytics_date DESC
+                LIMIT 14
+                """,
+                (chat["dialog_id"],),
+            ).fetchall()
+            reports_payload = []
+            for report in reports:
+                workflow_status = chat_day_workflow_status(chat["dialog_id"], safe_parse_date(report["report_date"]) or date.today(), report_exists=is_display_chat_report(report))
+                reports_payload.append(
+                    {
+                        "date": report["report_date"],
+                        "date_text": format_date_ru(report["report_date"]),
+                        "model": report["model"],
+                        "generated_at": report["generated_at"],
+                        "generated_at_text": format_datetime_ru(report["generated_at"]),
+                        "messages_count": report["messages_count"],
+                        "text_status": workflow_status,
+                        "workflow_status": workflow_status["workflow_status"],
+                        "workflow_status_text": workflow_status["workflow_status_text"],
+                    }
+                )
+            result.append(
+                {
+                    "dialog_id": chat["dialog_id"],
+                    "chat_id": chat["chat_id"],
+                    "title": chat["title"],
+                    "type": chat["chat_type"],
+                    "member_count": chat["member_count"],
+                    "avatar_url": chat["avatar_url"],
+                    "is_excluded": chat["is_excluded"],
+                    "last_message_date": chat["last_message_date"],
+                    "last_message_date_text": format_datetime_ru(chat["last_message_date"]),
+                    "last_activity_date": chat["last_activity_date"],
+                    "last_activity_date_text": format_datetime_ru(chat["last_activity_date"]),
+                    "last_synced_at": chat["last_synced_at"],
+                    "last_synced_at_text": format_datetime_ru(chat["last_synced_at"]),
+                    "members": [dict(member) for member in members],
+                    "reports": reports_payload,
+                    "analytics": [
+                        {
+                            "date": item["analytics_date"],
+                            "date_text": format_date_ru(item["analytics_date"]),
+                            "summary_text": item["summary_text"],
+                            "model": item["model"],
+                            "tasks_saved": item["tasks_saved"] or 0,
+                            "goals_saved": item["goals_saved"] or 0,
+                            "facts_saved": item["facts_saved"] or 0,
+                            "confirmations_count": item["confirmations_count"] or 0,
+                            "unknown_blocks_count": item["unknown_blocks_count"] or 0,
+                            "status": item["status"],
+                            "error": item["error"],
+                            "generated_at": item["generated_at"],
+                            "generated_at_text": format_datetime_ru(item["generated_at"]),
+                        }
+                        for item in analytics
+                    ],
+                }
+            )
+        return result
+
+
+def set_chat_excluded(dialog_id: str, is_excluded: bool) -> dict[str, Any] | None:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE chats
+                        SET is_excluded = %s,
+                            excluded_at = CASE WHEN %s THEN now() ELSE NULL END,
+                            excluded_reason = CASE WHEN %s THEN COALESCE(excluded_reason, 'manual') ELSE NULL END,
+                            updated_at = now()
+                        WHERE dialog_id = %s
+                        RETURNING id
+                        """,
+                        (is_excluded, is_excluded, is_excluded, dialog_id),
+                    )
+                    chat = cur.fetchone()
+                    if chat is None:
+                        return None
+                    cur.execute(
+                        """
+                        INSERT INTO chat_exclusions (chat_id, action, reason)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (chat["id"], "exclude" if is_excluded else "include", "manual"),
+                    )
+        return next((item for item in load_chats() if item["dialog_id"] == dialog_id), None)
+
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE chats SET is_excluded = ? WHERE dialog_id = ?",
+            (1 if is_excluded else 0, dialog_id),
+        )
+        chat = conn.execute("SELECT dialog_id FROM chats WHERE dialog_id = ?", (dialog_id,)).fetchone()
+    if chat is None:
+        return None
+    return next((item for item in load_chats() if item["dialog_id"] == dialog_id), None)
+
+
+def department_identity(department: dict[str, Any]) -> dict[str, Any]:
+    dep_id = to_int(first_non_empty(department.get("ID"), department.get("id")))
+    return {
+        "id": dep_id,
+        "name": first_non_empty(department.get("NAME"), department.get("name"), f"Отдел {dep_id}" if dep_id else None),
+        "parent_id": to_int(first_non_empty(department.get("PARENT"), department.get("parent"), department.get("PARENT_ID"), department.get("parentId"))),
+        "head_id": to_int(first_non_empty(department.get("UF_HEAD"), department.get("head"), department.get("HEAD"), department.get("headId"))),
+    }
+
+
+def department_depth(department_id: int, departments_by_id: dict[int, dict[str, Any]]) -> int:
+    depth = 0
+    seen: set[int] = set()
+    current_id: int | None = department_id
+    while current_id is not None and current_id not in seen:
+        seen.add(current_id)
+        department = departments_by_id.get(current_id)
+        if not department:
+            break
+        parent_id = department.get("parent_id")
+        if parent_id is None:
+            break
+        depth += 1
+        current_id = parent_id
+    return depth
+
+
+def find_manager_by_department_hierarchy(user_id: int, department_ids: list[int], departments_by_id: dict[int, dict[str, Any]]) -> int | None:
+    ordered_department_ids = sorted(
+        {dep_id for dep_id in department_ids if dep_id in departments_by_id},
+        key=lambda dep_id: department_depth(dep_id, departments_by_id),
+        reverse=True,
+    )
+    for dep_id in ordered_department_ids:
+        current_id: int | None = dep_id
+        seen: set[int] = set()
+        while current_id is not None and current_id not in seen:
+            seen.add(current_id)
+            department = departments_by_id.get(current_id)
+            if not department:
+                break
+            head_id = to_int(department.get("head_id"))
+            if head_id and head_id != user_id:
+                return head_id
+            current_id = to_int(department.get("parent_id"))
+    return None
+
+
+def normalize_team_member(user: dict[str, Any], departments: list[dict[str, Any]], users_by_id: dict[int, dict[str, Any]]) -> dict[str, Any] | None:
+    user_id = to_int(first_non_empty(user.get("ID"), user.get("id")))
+    if user_id is None:
+        return None
+    name = format_person_name(user, fallback_name=first_non_empty(user.get("NAME"), user.get("name"))) or f"Пользователь {user_id}"
+    department_ids = [dep for dep in (to_int(item) for item in to_list(first_non_empty(user.get("UF_DEPARTMENT"), user.get("ufDepartment")))) if dep is not None]
+    departments_by_id = {
+        dep["id"]: dep
+        for department in departments
+        if (dep := department_identity(department)).get("id") is not None
+    }
+    member_departments: list[dict[str, Any]] = []
+
+    for dep_id in department_ids:
+        department = departments_by_id.get(dep_id, {})
+        member_departments.append(
+            {
+                "id": dep_id,
+                "name": department.get("name") or f"Отдел {dep_id}",
+                "head_id": department.get("head_id"),
+                "parent_id": department.get("parent_id"),
+                "depth": department_depth(dep_id, departments_by_id),
+            }
+        )
+
+    member_departments.sort(key=lambda dep: dep.get("depth") or 0, reverse=True)
+    manager_id = find_manager_by_department_hierarchy(user_id, department_ids, departments_by_id)
+    manager_name: str | None = None
+    if manager_id:
+        manager_profile = users_by_id.get(manager_id, {})
+        manager_name = format_person_name(manager_profile) or f"Пользователь {manager_id}"
+
+    return {
+        "user_id": user_id,
+        "name": name,
+        "email": first_non_empty(user.get("EMAIL"), user.get("email")),
+        "work_position": first_non_empty(user.get("WORK_POSITION"), user.get("workPosition")),
+        "active": 0 if str(first_non_empty(user.get("ACTIVE"), user.get("active"), "Y")).upper() in {"N", "FALSE", "0"} else 1,
+        "avatar_url": first_non_empty(user.get("PERSONAL_PHOTO"), user.get("personalPhoto"), user.get("avatar")),
+        "manager_id": manager_id,
+        "manager_name": manager_name,
+        "departments": member_departments,
+        "raw": user,
+    }
+
+
+def split_bitrix_user_name(raw: dict[str, Any], fallback_name: str | None) -> tuple[str | None, str | None, str | None]:
+    first_name = first_non_empty(raw.get("NAME"), raw.get("name"))
+    last_name = first_non_empty(raw.get("LAST_NAME"), raw.get("lastName"), raw.get("last_name"))
+    second_name = first_non_empty(raw.get("SECOND_NAME"), raw.get("secondName"), raw.get("second_name"))
+    if first_name or last_name or second_name:
+        return first_name, last_name, second_name
+    parts = str(fallback_name or "").split()
+    return (
+        parts[0] if len(parts) > 0 else None,
+        parts[1] if len(parts) > 1 else None,
+        " ".join(parts[2:]) if len(parts) > 2 else None,
+    )
+
+
+def upsert_team_records_postgres(members: list[dict[str, Any]], departments: list[dict[str, Any]]) -> None:
+    now = datetime.now().isoformat()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for department in departments:
+                    dep_id = to_int(first_non_empty(department.get("ID"), department.get("id")))
+                    if dep_id is None:
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO departments (
+                            bitrix_department_id, name, parent_bitrix_department_id,
+                            head_bitrix_user_id, raw_json, synced_at
+                        ) VALUES (
+                            %(bitrix_department_id)s, %(name)s, %(parent_bitrix_department_id)s,
+                            %(head_bitrix_user_id)s, %(raw_json)s, %(synced_at)s
+                        )
+                        ON CONFLICT (bitrix_department_id) DO UPDATE SET
+                            name = EXCLUDED.name,
+                            parent_bitrix_department_id = EXCLUDED.parent_bitrix_department_id,
+                            head_bitrix_user_id = EXCLUDED.head_bitrix_user_id,
+                            raw_json = EXCLUDED.raw_json,
+                            synced_at = EXCLUDED.synced_at,
+                            updated_at = now()
+                        """,
+                        {
+                            "bitrix_department_id": dep_id,
+                            "name": first_non_empty(department.get("NAME"), department.get("name")),
+                            "parent_bitrix_department_id": to_int(first_non_empty(department.get("PARENT"), department.get("parent"), department.get("PARENT_ID"))),
+                            "head_bitrix_user_id": to_int(first_non_empty(department.get("UF_HEAD"), department.get("head"))),
+                            "raw_json": Jsonb(department),
+                            "synced_at": now,
+                        },
+                    )
+
+                for member in members:
+                    raw = member.get("raw") if isinstance(member.get("raw"), dict) else member
+                    first_name, last_name, second_name = split_bitrix_user_name(raw, member.get("name"))
+                    phone = first_non_empty(raw.get("PERSONAL_MOBILE"), raw.get("WORK_PHONE"), raw.get("phone"))
+                    cur.execute(
+                        """
+                        INSERT INTO users (
+                            bitrix_user_id, full_name, first_name, last_name, second_name,
+                            email, phone, avatar_url, work_position, is_active,
+                            manager_bitrix_user_id, raw_json, synced_at
+                        ) VALUES (
+                            %(bitrix_user_id)s, %(full_name)s, %(first_name)s, %(last_name)s,
+                            %(second_name)s, %(email)s, %(phone)s, %(avatar_url)s,
+                            %(work_position)s, %(is_active)s, %(manager_bitrix_user_id)s,
+                            %(raw_json)s, %(synced_at)s
+                        )
+                        ON CONFLICT (bitrix_user_id) DO UPDATE SET
+                            full_name = EXCLUDED.full_name,
+                            first_name = EXCLUDED.first_name,
+                            last_name = EXCLUDED.last_name,
+                            second_name = EXCLUDED.second_name,
+                            email = EXCLUDED.email,
+                            phone = EXCLUDED.phone,
+                            avatar_url = EXCLUDED.avatar_url,
+                            work_position = EXCLUDED.work_position,
+                            is_active = EXCLUDED.is_active,
+                            manager_bitrix_user_id = EXCLUDED.manager_bitrix_user_id,
+                            raw_json = EXCLUDED.raw_json,
+                            synced_at = EXCLUDED.synced_at,
+                            updated_at = now()
+                        """,
+                        {
+                            "bitrix_user_id": member["user_id"],
+                            "full_name": member.get("name"),
+                            "first_name": first_name,
+                            "last_name": last_name,
+                            "second_name": second_name,
+                            "email": member.get("email"),
+                            "phone": phone,
+                            "avatar_url": member.get("avatar_url"),
+                            "work_position": member.get("work_position"),
+                            "is_active": bool(member.get("active", 1)),
+                            "manager_bitrix_user_id": member.get("manager_id"),
+                            "raw_json": Jsonb(raw),
+                            "synced_at": now,
+                        },
+                    )
+
+                cur.execute("SELECT id, bitrix_user_id FROM users")
+                user_ids = {int(row["bitrix_user_id"]): row["id"] for row in cur.fetchall()}
+                cur.execute("SELECT id, bitrix_department_id FROM departments")
+                department_ids = {int(row["bitrix_department_id"]): row["id"] for row in cur.fetchall()}
+
+                for department in departments:
+                    dep_id = to_int(first_non_empty(department.get("ID"), department.get("id")))
+                    if dep_id is None:
+                        continue
+                    parent_bitrix_id = to_int(first_non_empty(department.get("PARENT"), department.get("parent"), department.get("PARENT_ID")))
+                    head_bitrix_id = to_int(first_non_empty(department.get("UF_HEAD"), department.get("head")))
+                    cur.execute(
+                        """
+                        UPDATE departments
+                        SET parent_id = %(parent_id)s,
+                            head_id = %(head_id)s,
+                            updated_at = now()
+                        WHERE bitrix_department_id = %(bitrix_department_id)s
+                        """,
+                        {
+                            "parent_id": department_ids.get(parent_bitrix_id) if parent_bitrix_id else None,
+                            "head_id": user_ids.get(head_bitrix_id) if head_bitrix_id else None,
+                            "bitrix_department_id": dep_id,
+                        },
+                    )
+
+                for member in members:
+                    manager_bitrix_id = to_int(member.get("manager_id"))
+                    cur.execute(
+                        """
+                        UPDATE users
+                        SET manager_id = %(manager_id)s,
+                            updated_at = now()
+                        WHERE bitrix_user_id = %(bitrix_user_id)s
+                        """,
+                        {
+                            "manager_id": user_ids.get(manager_bitrix_id) if manager_bitrix_id else None,
+                            "bitrix_user_id": member["user_id"],
+                        },
+                    )
+
+                    user_uuid = user_ids.get(member["user_id"])
+                    if not user_uuid:
+                        continue
+                    cur.execute("DELETE FROM user_departments WHERE user_id = %(user_id)s", {"user_id": user_uuid})
+                    primary_department_id = None
+                    if member.get("departments"):
+                        primary_department_id = to_int(member["departments"][0].get("id"))
+                    for dep in member.get("departments", []):
+                        dep_id = to_int(dep.get("id"))
+                        department_uuid = department_ids.get(dep_id) if dep_id else None
+                        if not department_uuid:
+                            continue
+                        cur.execute(
+                            """
+                            INSERT INTO user_departments (user_id, department_id, is_primary)
+                            VALUES (%(user_id)s, %(department_id)s, %(is_primary)s)
+                            ON CONFLICT (user_id, department_id) DO UPDATE SET
+                                is_primary = EXCLUDED.is_primary
+                            """,
+                            {
+                                "user_id": user_uuid,
+                                "department_id": department_uuid,
+                                "is_primary": dep_id == primary_department_id,
+                            },
+                        )
+
+                active_user_ids = [member["user_id"] for member in members]
+                if active_user_ids:
+                    cur.execute(
+                        """
+                        UPDATE users
+                        SET is_active = FALSE,
+                            updated_at = now()
+                        WHERE bitrix_user_id <> ALL(%s)
+                        """,
+                        (active_user_ids,),
+                    )
+
+
+def upsert_team_records(members: list[dict[str, Any]], departments: list[dict[str, Any]]) -> None:
+    if postgres_enabled():
+        upsert_team_records_postgres(members, departments)
+        return
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        for department in departments:
+            dep_id = to_int(first_non_empty(department.get("ID"), department.get("id")))
+            if dep_id is None:
+                continue
+            conn.execute(
+                """
+                INSERT INTO departments (
+                    department_id, name, parent_id, head_id, raw_json, last_synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(department_id) DO UPDATE SET
+                    name = excluded.name,
+                    parent_id = excluded.parent_id,
+                    head_id = excluded.head_id,
+                    raw_json = excluded.raw_json,
+                    last_synced_at = excluded.last_synced_at
+                """,
+                (
+                    dep_id,
+                    first_non_empty(department.get("NAME"), department.get("name")),
+                    to_int(first_non_empty(department.get("PARENT"), department.get("parent"), department.get("PARENT_ID"))),
+                    to_int(first_non_empty(department.get("UF_HEAD"), department.get("head"))),
+                    json.dumps(department, ensure_ascii=False),
+                    now,
+                ),
+            )
+
+        for member in members:
+            departments_text = ", ".join(dep.get("name") for dep in member.get("departments", []) if dep.get("name"))
+            conn.execute(
+                """
+                INSERT INTO team_members (
+                    user_id, name, email, work_position, active, avatar_url,
+                    manager_id, manager_name, departments_text, raw_json, last_synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    name = excluded.name,
+                    email = excluded.email,
+                    work_position = excluded.work_position,
+                    active = excluded.active,
+                    avatar_url = excluded.avatar_url,
+                    manager_id = excluded.manager_id,
+                    manager_name = excluded.manager_name,
+                    departments_text = excluded.departments_text,
+                    raw_json = excluded.raw_json,
+                    last_synced_at = excluded.last_synced_at
+                """,
+                (
+                    member["user_id"],
+                    member.get("name"),
+                    member.get("email"),
+                    member.get("work_position"),
+                    member.get("active", 1),
+                    member.get("avatar_url"),
+                    member.get("manager_id"),
+                    member.get("manager_name"),
+                    departments_text,
+                    json.dumps(member.get("raw", member), ensure_ascii=False),
+                    now,
+                ),
+            )
+            conn.execute("DELETE FROM team_member_departments WHERE user_id = ?", (member["user_id"],))
+            for dep in member.get("departments", []):
+                dep_id = to_int(dep.get("id"))
+                if dep_id is None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO departments (
+                        department_id, name, parent_id, head_id, raw_json, last_synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        dep_id,
+                        dep.get("name") or f"Отдел {dep_id}",
+                        None,
+                        dep.get("head_id"),
+                        json.dumps({"ID": dep_id, "NAME": dep.get("name") or f"Отдел {dep_id}", "UF_HEAD": dep.get("head_id")}, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO team_member_departments (
+                        user_id, department_id, department_name, department_head_id
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (member["user_id"], dep_id, dep.get("name"), dep.get("head_id")),
+                )
+
+        active_user_ids = [member["user_id"] for member in members]
+        if active_user_ids:
+            placeholders = ",".join("?" for _ in active_user_ids)
+            conn.execute(
+                f"DELETE FROM team_members WHERE user_id NOT IN ({placeholders})",
+                active_user_ids,
+            )
+
+
+def iso_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+RU_MONTH_NAMES = {
+    1: ("Январь", "января"),
+    2: ("Февраль", "февраля"),
+    3: ("Март", "марта"),
+    4: ("Апрель", "апреля"),
+    5: ("Май", "мая"),
+    6: ("Июнь", "июня"),
+    7: ("Июль", "июля"),
+    8: ("Август", "августа"),
+    9: ("Сентябрь", "сентября"),
+    10: ("Октябрь", "октября"),
+    11: ("Ноябрь", "ноября"),
+    12: ("Декабрь", "декабря"),
+}
+
+
+def ensure_zoom_schema() -> None:
+    if not postgres_enabled():
+        return
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS zoom_calls (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        zoom_account_key text NOT NULL,
+                        zoom_user_email text,
+                        zoom_meeting_id bigint,
+                        zoom_uuid text NOT NULL UNIQUE,
+                        topic text,
+                        technical_topic text,
+                        start_time_utc timestamptz NOT NULL,
+                        start_time_msk timestamptz NOT NULL,
+                        end_time_msk timestamptz,
+                        call_date date NOT NULL,
+                        duration_min int,
+                        timezone text,
+                        share_url text,
+                        analytical_note text NOT NULL DEFAULT '',
+                        transcript_text text NOT NULL DEFAULT '',
+                        transcript_format text NOT NULL DEFAULT 'vtt',
+                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        synced_at timestamptz NOT NULL DEFAULT now(),
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        updated_at timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_zoom_calls_tree ON zoom_calls (call_date DESC, start_time_msk DESC)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_zoom_calls_user ON zoom_calls (zoom_user_email)")
+                cur.execute("ALTER TABLE ai_requests DROP CONSTRAINT IF EXISTS ai_requests_request_type_check")
+                cur.execute(
+                    """
+                    ALTER TABLE ai_requests
+                    ADD CONSTRAINT ai_requests_request_type_check CHECK (request_type IN (
+                        'image_ocr','chat_daily_analysis','chat_weekly_analysis',
+                        'chat_overall_weekly_analysis','chat_overall_daily_report','user_daily_report',
+                        'owner_daily_report','owner_weekly_report',
+                        'weekly_report','monthly_report','quarterly_report',
+                        'yearly_report','memory_update','zoom_processing'
+                    ))
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS zoom_call_participants (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        call_id uuid NOT NULL REFERENCES zoom_calls(id) ON DELETE CASCADE,
+                        participant_name text,
+                        participant_email text,
+                        participant_user_id text,
+                        join_time timestamptz,
+                        leave_time timestamptz,
+                        duration_seconds int,
+                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        UNIQUE (call_id, participant_email, participant_name, join_time)
+                    )
+                    """
+                )
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_zoom_call_participants_call ON zoom_call_participants(call_id)")
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS zoom_call_transcript_segments (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        call_id uuid NOT NULL REFERENCES zoom_calls(id) ON DELETE CASCADE,
+                        segment_index int NOT NULL,
+                        cue_index int NOT NULL,
+                        start_offset text,
+                        end_offset text,
+                        speaker text,
+                        text text NOT NULL,
+                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        UNIQUE (call_id, segment_index, cue_index)
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_zoom_call_transcript_call ON zoom_call_transcript_segments(call_id, segment_index, cue_index)"
+                )
+
+
+def zoom_oauth_url() -> str:
+    load_dotenv(override=True)
+    value = (os.getenv("ZOOM_OAUTH_URL") or "https://zoom.us/oauth/token").strip().rstrip("/")
+    if not value.endswith("/oauth/token"):
+        value = f"{value}/oauth/token"
+    return value
+
+
+def zoom_api_base_url() -> str:
+    load_dotenv(override=True)
+    return (os.getenv("ZOOM_API_BASE_URL") or "https://api.zoom.us/v2").strip().rstrip("/")
+
+
+def zoom_access_token(account_key: str = "ZOOM_ACC2") -> str:
+    load_dotenv(override=True)
+    account_id = os.getenv(f"{account_key}_ACCOUNT_ID", "").strip()
+    client_id = os.getenv(f"{account_key}_CLIENT_ID", "").strip()
+    client_secret = os.getenv(f"{account_key}_CLIENT_SECRET", "").strip()
+    missing = [
+        key
+        for key, value in {
+            f"{account_key}_ACCOUNT_ID": account_id,
+            f"{account_key}_CLIENT_ID": client_id,
+            f"{account_key}_CLIENT_SECRET": client_secret,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"Не заданы переменные Zoom: {', '.join(missing)}")
+    response = requests.post(
+        zoom_oauth_url(),
+        params={"grant_type": "account_credentials", "account_id": account_id},
+        auth=(client_id, client_secret),
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(f"Zoom OAuth error {response.status_code}: {response.text[:500]}")
+    return str(response.json()["access_token"])
+
+
+def zoom_session(account_key: str = "ZOOM_ACC2") -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {zoom_access_token(account_key)}"})
+    return session
+
+
+def parse_zoom_datetime(value: Any, tz_name: str = "Europe/Moscow") -> datetime | None:
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo(tz_name or "Europe/Moscow"))
+    return parsed
+
+
+def parse_zoom_vtt(text: str) -> list[dict[str, Any]]:
+    lines = text.replace("\ufeff", "").splitlines()
+    cues: list[dict[str, Any]] = []
+    time_re = re.compile(r"(?P<start>\d{2}:\d{2}:\d{2}\.\d{3})\s+-->\s+(?P<end>\d{2}:\d{2}:\d{2}\.\d{3})")
+    i = 0
+    while i < len(lines):
+        match = time_re.search(lines[i].strip())
+        if not match:
+            i += 1
+            continue
+        start_offset = match.group("start")
+        end_offset = match.group("end")
+        i += 1
+        payload: list[str] = []
+        while i < len(lines) and lines[i].strip():
+            payload.append(lines[i].strip())
+            i += 1
+        raw_text = re.sub(r"<[^>]+>", "", " ".join(payload)).strip()
+        speaker = None
+        cue_text = raw_text
+        speaker_match = re.match(r"^([^:]{1,80}):\s*(.*)$", raw_text)
+        if speaker_match:
+            speaker = speaker_match.group(1).strip()
+            cue_text = speaker_match.group(2).strip()
+        if cue_text:
+            cues.append(
+                {
+                    "start": start_offset,
+                    "end": end_offset,
+                    "speaker": speaker,
+                    "text": cue_text,
+                }
+            )
+        i += 1
+    return cues
+
+
+def zoom_plain_transcript(cues: list[dict[str, Any]]) -> str:
+    lines = []
+    for cue in cues:
+        prefix = f"[{cue.get('start')} - {cue.get('end')}]"
+        if cue.get("speaker"):
+            prefix += f" {cue['speaker']}:"
+        lines.append(f"{prefix} {cue.get('text') or ''}".strip())
+    return "\n".join(lines)
+
+
+DRIVE_CALLS_ACCOUNT_KEY = "GOOGLE_DRIVE_TRANSCRIPTS"
+
+
+def google_drive_calls_sync_config() -> tuple[str, str]:
+    load_dotenv(override=True)
+    sync_url = (
+        os.getenv("GOOGLE_CALLS_APPS_SCRIPT_SYNC_URL", "").strip()
+        or os.getenv("GOOGLE_APPS_SCRIPT_SYNC_URL", "").strip()
+    )
+    token = (
+        os.getenv("GOOGLE_CALLS_APPS_SCRIPT_SYNC_TOKEN", "").strip()
+        or os.getenv("GOOGLE_APPS_SCRIPT_SYNC_TOKEN", "").strip()
+    )
+    if not sync_url:
+        raise ValueError("Укажите GOOGLE_CALLS_APPS_SCRIPT_SYNC_URL или GOOGLE_APPS_SCRIPT_SYNC_URL в .env")
+    if not token:
+        raise ValueError("Укажите GOOGLE_CALLS_APPS_SCRIPT_SYNC_TOKEN в .env")
+    return sync_url, token
+
+
+def fetch_google_drive_call_transcripts() -> list[dict[str, Any]]:
+    sync_url, token = google_drive_calls_sync_config()
+    response = requests.get(sync_url, params={"token": token}, timeout=180)
+    if not response.ok:
+        raise RuntimeError(f"Google Apps Script вернул HTTP {response.status_code}: {response.text[:500]}")
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        error = payload.get("error") if isinstance(payload, dict) else "неожиданный формат ответа"
+        raise RuntimeError(f"Google Apps Script error: {error}")
+    transcripts = payload.get("transcripts", [])
+    if not isinstance(transcripts, list):
+        raise RuntimeError("Google Apps Script вернул transcripts не в виде списка")
+    return [item for item in transcripts if isinstance(item, dict)]
+
+
+def drive_call_topic(item: dict[str, Any]) -> str:
+    parent_name = str(item.get("parent_folder_name") or "").strip()
+    path_parts = [str(part).strip() for part in (item.get("path_parts") or []) if str(part).strip()]
+    if parent_name:
+        return parent_name
+    if path_parts:
+        return path_parts[-1]
+    return "Созвон из Google Drive"
+
+
+def parse_drive_call_datetime(item: dict[str, Any]) -> datetime:
+    path_parts = [str(part).strip() for part in (item.get("path_parts") or []) if str(part).strip()]
+    candidates = [
+        str(item.get("parent_folder_name") or ""),
+        *reversed(path_parts),
+        str(item.get("path") or ""),
+        str(item.get("name") or ""),
+    ]
+    datetime_patterns = [
+        r"(?P<year>20\d{2})[-_.](?P<month>\d{1,2})[-_.](?P<day>\d{1,2})[ T_-]+(?P<hour>\d{1,2})[:.-](?P<minute>\d{2})",
+        r"(?P<day>\d{1,2})[.-](?P<month>\d{1,2})[.-](?P<year>20\d{2})[ T_-]+(?P<hour>\d{1,2})[:.-](?P<minute>\d{2})",
+    ]
+    date_patterns = [
+        r"(?P<year>20\d{2})[-_.](?P<month>\d{1,2})[-_.](?P<day>\d{1,2})",
+        r"(?P<day>\d{1,2})[.-](?P<month>\d{1,2})[.-](?P<year>20\d{2})",
+    ]
+
+    for candidate in candidates:
+        for pattern in datetime_patterns:
+            match = re.search(pattern, candidate)
+            if not match:
+                continue
+            try:
+                return datetime(
+                    int(match.group("year")),
+                    int(match.group("month")),
+                    int(match.group("day")),
+                    int(match.group("hour")),
+                    int(match.group("minute")),
+                    tzinfo=MSK_TZ,
+                )
+            except ValueError:
+                continue
+
+    for candidate in candidates:
+        for pattern in date_patterns:
+            match = re.search(pattern, candidate)
+            if not match:
+                continue
+            try:
+                return datetime(
+                    int(match.group("year")),
+                    int(match.group("month")),
+                    int(match.group("day")),
+                    0,
+                    0,
+                    tzinfo=MSK_TZ,
+                )
+            except ValueError:
+                continue
+
+    legacy_match = re.search(r"(?P<day>\d{1,2})\s+(?P<month>[а-яА-ЯёЁ]+)\s+(?P<year>20\d{2})", " ".join(candidates))
+    if legacy_match:
+        month_name = legacy_match.group("month").lower().replace("ё", "е")
+        month_map = {value[1].replace("ё", "е"): key for key, value in RU_MONTH_NAMES.items()}
+        try:
+            if month_name in month_map:
+                return datetime(
+                    int(legacy_match.group("year")),
+                    month_map[month_name],
+                    int(legacy_match.group("day")),
+                    0,
+                    0,
+                    tzinfo=MSK_TZ,
+                )
+        except ValueError:
+            pass
+
+    updated_at = parse_datetime(item.get("updated_at"))
+    if updated_at:
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=MSK_TZ)
+        return updated_at.astimezone(MSK_TZ)
+    return datetime.now(MSK_TZ)
+
+
+def parse_transcript_offset(value: str) -> str | None:
+    match = re.search(r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?", value)
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    millis = (match.group(4) or "000").ljust(3, "0")[:3]
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis}"
+
+
+def parse_drive_transcript_txt(text: str) -> list[dict[str, Any]]:
+    lines = text.replace("\ufeff", "").splitlines()
+    cues: list[dict[str, Any]] = []
+    time_value = r"(?:(?:\d{1,2}:)?\d{1,2}:\d{2})(?:[.,]\d{1,3})?"
+    speaker_range_re = re.compile(
+        rf"^\[(?P<start>{time_value})\s*(?:-->|-|–|—|\?)\s*(?P<end>{time_value})\]\s*(?P<speaker>[^:]+):\s*(?P<text>.*)$"
+    )
+    speaker_single_time_re = re.compile(
+        rf"^\[(?P<start>{time_value})\]\s*(?P<speaker>[^:]+):\s*(?P<text>.*)$"
+    )
+    speaker_plain_re = re.compile(r"^(?P<speaker>[^:]{1,80}):\s*(?P<text>.+)$")
+
+    def clean_speaker(value: str) -> str:
+        cleaned = re.sub(r"^\s*\d+\]\s*", "", value).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned[:120]
+
+    def append_text(raw_value: str) -> None:
+        value = raw_value.strip()
+        if not value:
+            return
+        if cues:
+            cues[-1]["text"] = f"{cues[-1].get('text', '').rstrip()} {value}".strip()
+            cues[-1]["raw"] = f"{cues[-1].get('raw', '')}\n{raw_value}".strip()
+            return
+        cues.append(
+            {
+                "segment_index": 1,
+                "start": None,
+                "end": None,
+                "speaker": None,
+                "text": value,
+                "raw": raw_value,
+            }
+        )
+
+    def start_cue(start: str | None, end: str | None, speaker: str | None, cue_text: str, raw_line: str) -> None:
+        cues.append(
+            {
+                "segment_index": 1,
+                "start": parse_transcript_offset(start or ""),
+                "end": parse_transcript_offset(end or ""),
+                "speaker": clean_speaker(speaker or "") or None,
+                "text": cue_text.strip(),
+                "raw": raw_line,
+            }
+        )
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.upper() == "WEBVTT":
+            continue
+
+        range_speaker_match = speaker_range_re.match(line)
+        if range_speaker_match:
+            start_cue(
+                range_speaker_match.group("start"),
+                range_speaker_match.group("end"),
+                range_speaker_match.group("speaker"),
+                range_speaker_match.group("text"),
+                raw_line,
+            )
+            continue
+
+        single_time_speaker_match = speaker_single_time_re.match(line)
+        if single_time_speaker_match:
+            start_cue(
+                single_time_speaker_match.group("start"),
+                None,
+                single_time_speaker_match.group("speaker"),
+                single_time_speaker_match.group("text"),
+                raw_line,
+            )
+            continue
+
+        plain_speaker_match = speaker_plain_re.match(line)
+        if plain_speaker_match and not re.match(r"^(https?|Источник|Тип|Обновлено)\b", line, re.IGNORECASE):
+            start_cue(
+                None,
+                None,
+                plain_speaker_match.group("speaker"),
+                plain_speaker_match.group("text"),
+                raw_line,
+            )
+            continue
+
+        append_text(raw_line)
+
+    return [cue for cue in cues if str(cue.get("text") or "").strip()]
+
+
+def drive_transcript_participants(cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    participants: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    ignored = {"unknown", "speaker", "webvtt", "transcript", "участник", "спикер"}
+    for cue in cues:
+        speaker = str(cue.get("speaker") or "").strip()
+        speaker_key = speaker.lower()
+        if not speaker or speaker_key in ignored or speaker_key in seen:
+            continue
+        seen.add(speaker_key)
+        participants.append({"name": speaker, "source": "transcript_speaker"})
+    return participants
+
+
+def sync_google_drive_call_transcripts() -> dict[str, Any]:
+    ensure_zoom_schema()
+    transcripts = fetch_google_drive_call_transcripts()
+    synced_calls = 0
+    synced_segments = 0
+    synced_participants = 0
+    seen_uuids: list[str] = []
+
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for item in transcripts:
+                    file_id = str(item.get("id") or "").strip()
+                    content = str(item.get("content") or "").strip()
+                    if not file_id or not content:
+                        continue
+                    zoom_uuid = f"drive_transcript:{file_id}"
+                    seen_uuids.append(zoom_uuid)
+                    start_msk = parse_drive_call_datetime(item)
+                    start_utc = start_msk.astimezone(timezone.utc)
+                    cues = parse_drive_transcript_txt(content)
+                    participants = drive_transcript_participants(cues)
+                    topic = drive_call_topic(item)
+                    raw_json = dict(item)
+                    raw_json["source"] = "google_drive_transcript_txt"
+                    raw_json["parsed_segments_count"] = len(cues)
+                    raw_json["parsed_participants_count"] = len(participants)
+
+                    cur.execute(
+                        """
+                        INSERT INTO zoom_calls (
+                            zoom_account_key, zoom_user_email, zoom_meeting_id, zoom_uuid,
+                            topic, technical_topic, start_time_utc, start_time_msk,
+                            end_time_msk, call_date, duration_min, timezone, share_url,
+                            transcript_text, transcript_format, raw_json, synced_at, updated_at
+                        )
+                        VALUES (%s, NULL, NULL, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, 'txt', %s, now(), now())
+                        ON CONFLICT (zoom_uuid) DO UPDATE SET
+                            zoom_account_key = EXCLUDED.zoom_account_key,
+                            topic = EXCLUDED.topic,
+                            technical_topic = EXCLUDED.technical_topic,
+                            start_time_utc = EXCLUDED.start_time_utc,
+                            start_time_msk = EXCLUDED.start_time_msk,
+                            call_date = EXCLUDED.call_date,
+                            timezone = EXCLUDED.timezone,
+                            share_url = EXCLUDED.share_url,
+                            transcript_text = EXCLUDED.transcript_text,
+                            transcript_format = EXCLUDED.transcript_format,
+                            raw_json = EXCLUDED.raw_json,
+                            synced_at = now(),
+                            updated_at = now()
+                        RETURNING id
+                        """,
+                        (
+                            DRIVE_CALLS_ACCOUNT_KEY,
+                            zoom_uuid,
+                            topic,
+                            topic,
+                            start_utc,
+                            start_msk,
+                            start_msk.date(),
+                            "Europe/Moscow",
+                            item.get("url"),
+                            content,
+                            pg_json(raw_json),
+                        ),
+                    )
+                    call_id = cur.fetchone()["id"]
+                    cur.execute("DELETE FROM zoom_call_participants WHERE call_id = %s", (call_id,))
+                    cur.execute("DELETE FROM zoom_call_transcript_segments WHERE call_id = %s", (call_id,))
+                    for participant in participants:
+                        cur.execute(
+                            """
+                            INSERT INTO zoom_call_participants (call_id, participant_name, raw_json)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (call_id, participant["name"], pg_json(participant)),
+                        )
+                    for cue_index, cue in enumerate(cues, start=1):
+                        cur.execute(
+                            """
+                            INSERT INTO zoom_call_transcript_segments (
+                                call_id, segment_index, cue_index, start_offset, end_offset, speaker, text, raw_json
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (call_id, segment_index, cue_index) DO UPDATE SET
+                                start_offset = EXCLUDED.start_offset,
+                                end_offset = EXCLUDED.end_offset,
+                                speaker = EXCLUDED.speaker,
+                                text = EXCLUDED.text,
+                                raw_json = EXCLUDED.raw_json
+                            """,
+                            (
+                                call_id,
+                                int(cue.get("segment_index") or 1),
+                                cue_index,
+                                cue.get("start"),
+                                cue.get("end"),
+                                cue.get("speaker"),
+                                cue.get("text") or "",
+                                pg_json(cue),
+                            ),
+                        )
+                    synced_calls += 1
+                    synced_segments += len(cues)
+                    synced_participants += len(participants)
+
+                if seen_uuids:
+                    cur.execute(
+                        """
+                        DELETE FROM zoom_calls
+                        WHERE zoom_account_key = %s AND NOT (zoom_uuid = ANY(%s))
+                        """,
+                        (DRIVE_CALLS_ACCOUNT_KEY, seen_uuids),
+                    )
+                    removed_calls = cur.rowcount
+                else:
+                    cur.execute("DELETE FROM zoom_calls WHERE zoom_account_key = %s", (DRIVE_CALLS_ACCOUNT_KEY,))
+                    removed_calls = cur.rowcount
+
+    return {
+        "calls_synced": synced_calls,
+        "transcript_files_synced": len(transcripts),
+        "segments_synced": synced_segments,
+        "participants_synced": synced_participants,
+        "removed_calls": removed_calls,
+    }
+
+
+def zoom_encoded_uuid(uuid_value: str) -> str:
+    # Zoom requires double-encoding meeting UUIDs containing "/" or "==".
+    return quote(quote(uuid_value, safe=""), safe="")
+
+
+def zoom_list_users(session: requests.Session) -> list[dict[str, Any]]:
+    users: list[dict[str, Any]] = []
+    page = ""
+    while True:
+        response = session.get(
+            f"{zoom_api_base_url()}/users",
+            params={"page_size": 300, "next_page_token": page},
+            timeout=30,
+        )
+        if not response.ok:
+            raise RuntimeError(f"Zoom users error {response.status_code}: {response.text[:500]}")
+        payload = response.json()
+        users.extend(payload.get("users") or [])
+        page = payload.get("next_page_token") or ""
+        if not page:
+            return users
+
+
+def zoom_list_recordings(session: requests.Session, user_id: str, date_from: date, date_to: date) -> list[dict[str, Any]]:
+    meetings: list[dict[str, Any]] = []
+    page = ""
+    while True:
+        response = session.get(
+            f"{zoom_api_base_url()}/users/{user_id}/recordings",
+            params={
+                "from": date_from.isoformat(),
+                "to": date_to.isoformat(),
+                "page_size": 300,
+                "next_page_token": page,
+            },
+            timeout=30,
+        )
+        if not response.ok:
+            raise RuntimeError(f"Zoom recordings error {response.status_code}: {response.text[:500]}")
+        payload = response.json()
+        meetings.extend(payload.get("meetings") or [])
+        page = payload.get("next_page_token") or ""
+        if not page:
+            return meetings
+
+
+def zoom_list_participants(session: requests.Session, meeting_uuid: str) -> tuple[list[dict[str, Any]], str | None]:
+    participants: list[dict[str, Any]] = []
+    page = ""
+    try:
+        while True:
+            response = session.get(
+                f"{zoom_api_base_url()}/past_meetings/{zoom_encoded_uuid(meeting_uuid)}/participants",
+                params={"page_size": 300, "next_page_token": page},
+                timeout=30,
+            )
+            if not response.ok:
+                return participants, f"HTTP {response.status_code}: {response.text[:300]}"
+            payload = response.json()
+            participants.extend(payload.get("participants") or [])
+            page = payload.get("next_page_token") or ""
+            if not page:
+                return participants, None
+    except requests.RequestException as exc:
+        return participants, str(exc)
+
+
+def sync_zoom_calls(date_from: date, date_to: date, account_key: str = "ZOOM_ACC2") -> dict[str, Any]:
+    ensure_zoom_schema()
+    session = zoom_session(account_key)
+    users = zoom_list_users(session)
+    windows: list[tuple[date, date]] = []
+    current = date_from
+    while current <= date_to:
+        window_end = min(current + timedelta(days=29), date_to)
+        windows.append((current, window_end))
+        current = window_end + timedelta(days=1)
+
+    synced_calls = 0
+    synced_transcript_files = 0
+    participant_errors: list[dict[str, Any]] = []
+    seen_uuids: set[str] = set()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for user in users:
+                    user_id = str(user.get("id") or user.get("email") or "")
+                    if not user_id:
+                        continue
+                    for window_start, window_end in windows:
+                        for meeting in zoom_list_recordings(session, user_id, window_start, window_end):
+                            meeting_uuid = str(meeting.get("uuid") or "")
+                            if not meeting_uuid or meeting_uuid in seen_uuids:
+                                continue
+                            seen_uuids.add(meeting_uuid)
+                            tz_name = str(meeting.get("timezone") or "Europe/Moscow")
+                            start_utc = parse_zoom_datetime(meeting.get("start_time"), "UTC")
+                            if not start_utc:
+                                continue
+                            start_msk = start_utc.astimezone(MSK_TZ)
+                            duration_min = to_int(meeting.get("duration")) or 0
+                            end_msk = start_msk + timedelta(minutes=duration_min) if duration_min else None
+                            transcript_files = [
+                                file_item
+                                for file_item in (meeting.get("recording_files") or [])
+                                if file_item.get("file_type") == "TRANSCRIPT"
+                                or file_item.get("recording_type") == "audio_transcript"
+                            ]
+                            all_cues: list[dict[str, Any]] = []
+                            transcript_payload: list[dict[str, Any]] = []
+                            for segment_index, file_item in enumerate(
+                                sorted(transcript_files, key=lambda item: item.get("recording_start") or ""),
+                                start=1,
+                            ):
+                                download_url = file_item.get("download_url")
+                                if not download_url:
+                                    continue
+                                response = session.get(download_url, timeout=60)
+                                if not response.ok:
+                                    transcript_payload.append(
+                                        {
+                                            "file": file_item,
+                                            "error": f"HTTP {response.status_code}: {response.text[:200]}",
+                                        }
+                                    )
+                                    continue
+                                cues = parse_zoom_vtt(response.text)
+                                for cue in cues:
+                                    cue["segment_index"] = segment_index
+                                all_cues.extend(cues)
+                                transcript_payload.append(
+                                    {
+                                        "file_id": file_item.get("id"),
+                                        "file_type": file_item.get("file_type"),
+                                        "recording_type": file_item.get("recording_type"),
+                                        "recording_start": file_item.get("recording_start"),
+                                        "recording_end": file_item.get("recording_end"),
+                                        "cue_count": len(cues),
+                                    }
+                                )
+                                synced_transcript_files += 1
+
+                            participants, participant_error = zoom_list_participants(session, meeting_uuid)
+                            if participant_error:
+                                participant_errors.append({"uuid": meeting_uuid, "error": participant_error})
+                            if not participants:
+                                participants = [
+                                    {
+                                        "name": user.get("display_name") or user.get("first_name") or user.get("email"),
+                                        "user_email": user.get("email"),
+                                        "user_id": user.get("id"),
+                                        "role": "host_fallback",
+                                    }
+                                ]
+
+                            raw_json = dict(meeting)
+                            raw_json["zoom_user"] = user
+                            raw_json["transcripts"] = transcript_payload
+                            if participant_error:
+                                raw_json["participants_error"] = participant_error
+
+                            cur.execute(
+                                """
+                                INSERT INTO zoom_calls (
+                                    zoom_account_key, zoom_user_email, zoom_meeting_id, zoom_uuid,
+                                    topic, technical_topic, start_time_utc, start_time_msk,
+                                    end_time_msk, call_date, duration_min, timezone, share_url,
+                                    transcript_text, transcript_format, raw_json, synced_at, updated_at
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'vtt', %s, now(), now())
+                                ON CONFLICT (zoom_uuid) DO UPDATE SET
+                                    zoom_account_key = EXCLUDED.zoom_account_key,
+                                    zoom_user_email = EXCLUDED.zoom_user_email,
+                                    zoom_meeting_id = EXCLUDED.zoom_meeting_id,
+                                    topic = EXCLUDED.topic,
+                                    technical_topic = EXCLUDED.technical_topic,
+                                    start_time_utc = EXCLUDED.start_time_utc,
+                                    start_time_msk = EXCLUDED.start_time_msk,
+                                    end_time_msk = EXCLUDED.end_time_msk,
+                                    call_date = EXCLUDED.call_date,
+                                    duration_min = EXCLUDED.duration_min,
+                                    timezone = EXCLUDED.timezone,
+                                    share_url = EXCLUDED.share_url,
+                                    transcript_text = EXCLUDED.transcript_text,
+                                    transcript_format = EXCLUDED.transcript_format,
+                                    raw_json = EXCLUDED.raw_json,
+                                    synced_at = now(),
+                                    updated_at = now()
+                                RETURNING id
+                                """,
+                                (
+                                    account_key,
+                                    user.get("email"),
+                                    to_int(meeting.get("id")),
+                                    meeting_uuid,
+                                    meeting.get("topic"),
+                                    meeting.get("topic"),
+                                    start_utc,
+                                    start_msk,
+                                    end_msk,
+                                    start_msk.date(),
+                                    duration_min,
+                                    tz_name,
+                                    meeting.get("share_url"),
+                                    zoom_plain_transcript(all_cues),
+                                    pg_json(raw_json),
+                                ),
+                            )
+                            call_id = cur.fetchone()["id"]
+                            cur.execute("DELETE FROM zoom_call_participants WHERE call_id = %s", (call_id,))
+                            cur.execute("DELETE FROM zoom_call_transcript_segments WHERE call_id = %s", (call_id,))
+                            for participant in participants:
+                                cur.execute(
+                                    """
+                                    INSERT INTO zoom_call_participants (
+                                        call_id, participant_name, participant_email, participant_user_id,
+                                        join_time, leave_time, duration_seconds, raw_json
+                                    )
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                    ON CONFLICT DO NOTHING
+                                    """,
+                                    (
+                                        call_id,
+                                        participant.get("name"),
+                                        participant.get("user_email") or participant.get("email"),
+                                        str(participant.get("user_id") or participant.get("id") or ""),
+                                        parse_zoom_datetime(participant.get("join_time"), tz_name),
+                                        parse_zoom_datetime(participant.get("leave_time"), tz_name),
+                                        to_int(participant.get("duration")),
+                                        pg_json(participant),
+                                    ),
+                                )
+                            for cue_index, cue in enumerate(all_cues, start=1):
+                                cur.execute(
+                                    """
+                                    INSERT INTO zoom_call_transcript_segments (
+                                        call_id, segment_index, cue_index, start_offset, end_offset, speaker, text, raw_json
+                                    )
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                    ON CONFLICT (call_id, segment_index, cue_index) DO UPDATE SET
+                                        start_offset = EXCLUDED.start_offset,
+                                        end_offset = EXCLUDED.end_offset,
+                                        speaker = EXCLUDED.speaker,
+                                        text = EXCLUDED.text,
+                                        raw_json = EXCLUDED.raw_json
+                                    """,
+                                    (
+                                        call_id,
+                                        int(cue.get("segment_index") or 1),
+                                        cue_index,
+                                        cue.get("start"),
+                                        cue.get("end"),
+                                        cue.get("speaker"),
+                                        cue.get("text") or "",
+                                        pg_json(cue),
+                                    ),
+                                )
+                            synced_calls += 1
+    return {
+        "users_count": len(users),
+        "calls_synced": synced_calls,
+        "transcript_files_synced": synced_transcript_files,
+        "participant_errors": participant_errors,
+    }
+
+
+def dedupe_zoom_participants(participants: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for participant in participants or []:
+        name = str(participant.get("name") or "").strip()
+        email = str(participant.get("email") or "").strip()
+        key = (email.lower(), name.lower())
+        if not name and not email:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({"name": name or None, "email": email or None})
+    return result
+
+
+def zoom_call_row_payload(
+    row: dict[str, Any],
+    participants: list[dict[str, Any]] | None = None,
+    include_transcript: bool = False,
+) -> dict[str, Any]:
+    start_time = row["start_time_msk"]
+    end_time = row.get("end_time_msk")
+    call_date = row["call_date"]
+    date_text = f"{call_date.day} {RU_MONTH_NAMES[call_date.month][1]} {call_date.year}" if isinstance(call_date, date) else format_date_ru(call_date)
+    payload = {
+        "id": str(row["id"]),
+        "date": call_date.isoformat() if hasattr(call_date, "isoformat") else str(call_date),
+        "date_text": date_text,
+        "start_time_msk": iso_or_none(start_time),
+        "end_time_msk": iso_or_none(end_time),
+        "time_text": f"{start_time.astimezone(MSK_TZ).strftime('%H:%M')} - {end_time.astimezone(MSK_TZ).strftime('%H:%M')}" if start_time and end_time else format_datetime_ru(start_time),
+        "topic": row.get("topic") or "Без темы",
+        "technical_topic": row.get("technical_topic") or row.get("topic") or "Без темы",
+        "participants": dedupe_zoom_participants(participants),
+        "analytical_note": row.get("analytical_note") or "",
+        "duration_min": row.get("duration_min"),
+    }
+    if include_transcript:
+        payload["transcript_text"] = row.get("transcript_text") or ""
+    return payload
+
+
+def load_zoom_calls_tree() -> dict[str, Any]:
+    ensure_zoom_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT zc.*, COALESCE(
+                    jsonb_agg(
+                        jsonb_build_object(
+                            'name', zcp.participant_name,
+                            'email', zcp.participant_email
+                        )
+                        ORDER BY zcp.participant_name NULLS LAST, zcp.participant_email NULLS LAST
+                    ) FILTER (WHERE zcp.id IS NOT NULL),
+                    '[]'::jsonb
+                ) AS participants_json
+                FROM zoom_calls zc
+                LEFT JOIN zoom_call_participants zcp ON zcp.call_id = zc.id
+                GROUP BY zc.id
+                ORDER BY zc.call_date DESC, zc.start_time_msk DESC
+                """
+            )
+            rows = cur.fetchall()
+    years_map: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        call_date = row["call_date"]
+        year = call_date.year
+        month = call_date.month
+        participants = [
+            item
+            for item in (row.get("participants_json") or [])
+            if item.get("name") or item.get("email")
+        ]
+        call_payload = zoom_call_row_payload(row, participants)
+        year_payload = years_map.setdefault(year, {"year": year, "months": {}})
+        month_payload = year_payload["months"].setdefault(
+            month,
+            {
+                "month": month,
+                "title": f"{RU_MONTH_NAMES[month][0]} {year}",
+                "dates": {},
+            },
+        )
+        date_key = call_payload["date"]
+        date_payload = month_payload["dates"].setdefault(
+            date_key,
+            {
+                "date": date_key,
+                "date_text": call_payload["date_text"],
+                "calls": [],
+            },
+        )
+        date_payload["calls"].append(call_payload)
+
+    years = []
+    for year_payload in sorted(years_map.values(), key=lambda item: item["year"], reverse=True):
+        months = []
+        for month_payload in sorted(year_payload["months"].values(), key=lambda item: item["month"], reverse=True):
+            dates = sorted(month_payload["dates"].values(), key=lambda item: item["date"], reverse=True)
+            month_payload = dict(month_payload)
+            month_payload["dates"] = dates
+            months.append(month_payload)
+        years.append({"year": year_payload["year"], "months": months})
+    return {"years": years, "total": len(rows)}
+
+
+def load_zoom_call_detail(call_id: str) -> dict[str, Any] | None:
+    ensure_zoom_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM zoom_calls WHERE id = %s", (call_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            cur.execute(
+                """
+                SELECT participant_name AS name, participant_email AS email
+                FROM zoom_call_participants
+                WHERE call_id = %s
+                ORDER BY participant_name NULLS LAST, participant_email NULLS LAST
+                """,
+                (call_id,),
+            )
+            participants = cur.fetchall()
+            cur.execute(
+                """
+                SELECT segment_index, cue_index, start_offset, end_offset, speaker, text
+                FROM zoom_call_transcript_segments
+                WHERE call_id = %s
+                ORDER BY cue_index
+                """,
+                (call_id,),
+            )
+            segments = cur.fetchall()
+    payload = zoom_call_row_payload(row, participants, include_transcript=False)
+    payload["segments"] = [dict(segment) for segment in segments]
+    if not segments:
+        payload["transcript_text"] = row.get("transcript_text") or ""
+    return payload
+
+
+def delete_zoom_call_report(call_id: str) -> dict[str, Any] | None:
+    ensure_zoom_schema()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE zoom_calls
+                    SET analytical_note = '',
+                        raw_json = COALESCE(raw_json, '{}'::jsonb) - 'ai_report',
+                        updated_at = now()
+                    WHERE id = %s
+                    RETURNING id, zoom_uuid, call_date, topic, technical_topic
+                    """,
+                    (call_id,),
+                )
+                row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def generate_zoom_call_report_if_needed(call_id: str) -> None:
+    call = load_zoom_call_detail(call_id)
+    if not call or (call.get("analytical_note") or "").strip():
+        return
+
+    segments = call.get("segments") or []
+    transcript_text = call.get("transcript_text") or "\n".join(
+        " ".join(
+            part
+            for part in [
+                str(segment.get("start_offset") or "").strip(),
+                str(segment.get("speaker") or "").strip(),
+                str(segment.get("text") or "").strip(),
+            ]
+            if part
+        )
+        for segment in segments
+    )
+    transcript_text = transcript_text.strip()
+    if not transcript_text:
+        return
+
+    api_key = llm_api_key()
+    if not api_key:
+        raise ValueError("Для ИИ-отчета по Zoom укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+
+    model = llm_model_for_request("zoom_processing")
+    provider = llm_provider_name()
+    prompt_id = None
+    base_prompt = ""
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            prompt_id, base_prompt = pg_active_prompt(cur, "zoom_processing", "")
+    if not base_prompt:
+        raise ValueError("Не найден активный промт «Обработка Зумов» (category_key=zoom_processing).")
+
+    max_chars = max(10000, int(os.getenv("ZOOM_PROCESSING_MAX_TRANSCRIPT_CHARS", "90000")))
+    input_payload = {
+        "call_date": call.get("date"),
+        "call_id": call.get("id"),
+        "topic": call.get("topic"),
+        "technical_topic": call.get("technical_topic"),
+        "participants": call.get("participants") or [],
+        "org_context": {
+            "users": [
+                {
+                    "bitrix_user_id": member.get("user_id"),
+                    "full_name": member.get("name"),
+                    "email": member.get("email"),
+                    "work_position": member.get("work_position"),
+                    "departments": [
+                        item.strip()
+                        for item in str(member.get("departments_text") or "").split(",")
+                        if item.strip()
+                    ],
+                    "manager_name": member.get("manager_name"),
+                }
+                for member in load_team_members()
+            ],
+        },
+        "transcript_segments": segments,
+        "full_text": transcript_text[:max_chars],
+        "transcript_truncated": len(transcript_text) > max_chars,
+    }
+    prompt = base_prompt.strip() + "\n\nВходные данные JSON:\n" + json.dumps(input_payload, ensure_ascii=False, default=str)
+
+    started_at = datetime.now()
+    ai_request_id = None
+    raw: dict[str, Any] | None = None
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                ai_request_id = pg_insert_ai_request(
+                    cur,
+                    "zoom_processing",
+                    prompt_id,
+                    prompt,
+                    provider,
+                    model,
+                    input_payload,
+                    started_at,
+                )
+
+    try:
+        response = llm_post_with_retry(
+            llm_api_url("/chat/completions"),
+            headers=llm_auth_headers(api_key),
+            payload={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "Ты управленческий аналитик. Возвращай только валидный JSON по запрошенной схеме."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=max(180, int(os.getenv("OPENAI_TIMEOUT_SECONDS", "180"))),
+        )
+        response.raise_for_status()
+        raw = response.json()
+        content = response_output_text(raw).strip()
+        if not content and raw.get("choices"):
+            content = str(raw["choices"][0].get("message", {}).get("content") or "").strip()
+        analysis = extract_json_object(content)
+        report_text = str(analysis.get("report_text") or analysis.get("summary") or "").strip()
+        if not report_text:
+            report_text = content
+    except Exception as exc:  # noqa: BLE001
+        if ai_request_id:
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        pg_finish_ai_request(
+                            cur,
+                            ai_request_id,
+                            "error",
+                            started_at,
+                            raw_response_json=raw if isinstance(raw, dict) else {"error": str(exc)},
+                            error_text=str(exc),
+                        )
+        raise
+
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                report_payload = {
+                    "source": "app_generate_zoom_call_report",
+                    "summary": str(analysis.get("summary") or "").strip(),
+                    "report_text": report_text,
+                    "analysis": analysis,
+                    "raw_input": {
+                        "call_id": call_id,
+                        "prompt_id": str(prompt_id) if prompt_id else None,
+                        "transcript_segments_count": len(segments),
+                        "transcript_truncated": len(transcript_text) > max_chars,
+                    },
+                    "model": model,
+                    "provider": provider,
+                    "status": "done",
+                    "saved_at": datetime.now().isoformat(),
+                }
+                cur.execute(
+                    """
+                    UPDATE zoom_calls
+                    SET analytical_note = %s,
+                        raw_json = COALESCE(raw_json, '{}'::jsonb) || jsonb_build_object('ai_report', %s::jsonb),
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (report_text, pg_json(report_payload), call_id),
+                )
+                if ai_request_id:
+                    pg_finish_ai_request(
+                        cur,
+                        ai_request_id,
+                        "success",
+                        started_at,
+                        response_text=content,
+                        response_json=analysis,
+                        raw_response_json=raw,
+                    )
+
+
+def load_team_members_postgres() -> list[dict[str, Any]]:
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    u.bitrix_user_id AS user_id,
+                    u.full_name AS name,
+                    u.email,
+                    u.work_position,
+                    u.is_active AS active,
+                    u.avatar_url,
+                    m.bitrix_user_id AS manager_id,
+                    m.full_name AS manager_name,
+                    COALESCE(string_agg(d.name, ', ' ORDER BY ud.is_primary DESC, d.name), '') AS departments_text,
+                    u.synced_at AS last_synced_at
+                FROM users u
+                LEFT JOIN users m ON m.id = u.manager_id
+                LEFT JOIN user_departments ud ON ud.user_id = u.id
+                LEFT JOIN departments d ON d.id = ud.department_id
+                WHERE u.is_active = TRUE
+                GROUP BY
+                    u.id, u.bitrix_user_id, u.full_name, u.email, u.work_position,
+                    u.is_active, u.avatar_url, m.bitrix_user_id, m.full_name, u.synced_at
+                ORDER BY u.is_active DESC, u.full_name
+                """
+            )
+            rows = cur.fetchall()
+    team: list[dict[str, Any]] = []
+    for row in rows:
+        last_synced_at = iso_or_none(row["last_synced_at"])
+        team.append(
+            {
+                "user_id": row["user_id"],
+                "name": row["name"],
+                "email": row["email"],
+                "work_position": row["work_position"],
+                "active": 1 if row["active"] else 0,
+                "avatar_url": row["avatar_url"],
+                "manager_id": row["manager_id"],
+                "manager_name": row["manager_name"],
+                "departments_text": row["departments_text"],
+                "last_synced_at": last_synced_at,
+                "last_synced_at_text": format_datetime_ru(last_synced_at),
+            }
+        )
+    return team
+
+
+def load_team_members() -> list[dict[str, Any]]:
+    if postgres_enabled():
+        return load_team_members_postgres()
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM team_members
+            WHERE active = 1
+            ORDER BY active DESC, name COLLATE NOCASE
+            """
+        ).fetchall()
+    return [
+        {
+            "user_id": row["user_id"],
+            "name": row["name"],
+            "email": row["email"],
+            "work_position": row["work_position"],
+            "active": row["active"],
+            "avatar_url": row["avatar_url"],
+            "manager_id": row["manager_id"],
+            "manager_name": row["manager_name"],
+            "departments_text": row["departments_text"],
+            "last_synced_at": row["last_synced_at"],
+            "last_synced_at_text": format_datetime_ru(row["last_synced_at"]),
+        }
+        for row in rows
+    ]
+
+
+def sync_bitrix_team(webhook_base: str) -> dict[str, Any]:
+    client = BitrixClient(webhook_base)
+    users = client.list_users(active_only=True)
+    users_by_id = {
+        user_id: user
+        for user in users
+        if (user_id := to_int(first_non_empty(user.get("ID"), user.get("id")))) is not None
+    }
+    department_ids: set[int] = set()
+    for user in users:
+        for dep_id in [to_int(item) for item in to_list(first_non_empty(user.get("UF_DEPARTMENT"), user.get("ufDepartment")))]:
+            if dep_id is not None:
+                department_ids.add(dep_id)
+
+    departments_by_id: dict[int, dict[str, Any]] = {}
+    pending_department_ids = set(department_ids)
+    while pending_department_ids:
+        dep_id = min(pending_department_ids)
+        pending_department_ids.remove(dep_id)
+        department = client.get_department(dep_id)
+        if department:
+            identity = department_identity(department)
+            normalized_dep_id = identity.get("id")
+            if normalized_dep_id is not None:
+                departments_by_id[normalized_dep_id] = department
+                parent_id = identity.get("parent_id")
+                if parent_id is not None and parent_id not in departments_by_id:
+                    pending_department_ids.add(parent_id)
+        time.sleep(client.request_delay)
+
+    head_ids = {
+        head_id
+        for department in departments_by_id.values()
+        if (head_id := department_identity(department).get("head_id")) is not None
+    }
+    for head_id in sorted(head_ids):
+        if head_id not in users_by_id:
+            profile = client.get_user(head_id)
+            if profile:
+                users_by_id[head_id] = profile
+
+    departments = list(departments_by_id.values())
+    members = [
+        member
+        for user in users
+        if (member := normalize_team_member(user, departments, users_by_id)) is not None
+    ]
+    upsert_team_records(members, departments)
+    return {"scanned": len(users), "saved": len(members), "team": load_team_members()}
+
+
+def upsert_source_artifact(conn: Any, artifact: dict[str, Any]) -> int:
+    now = datetime.now().isoformat()
+    source_key = str(artifact.get("source_key") or "").strip()
+    if not source_key:
+        raise ValueError("source_key is required")
+    conn.execute(
+        """
+        INSERT INTO source_artifacts (
+            source_type, source_key, source_title, source_text, source_url,
+            person_id, person_name, dialog_id, task_id, message_id, file_id,
+            artifact_date, raw_json, created_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_key) DO UPDATE SET
+            source_type = excluded.source_type,
+            source_title = excluded.source_title,
+            source_text = excluded.source_text,
+            source_url = excluded.source_url,
+            person_id = excluded.person_id,
+            person_name = excluded.person_name,
+            dialog_id = excluded.dialog_id,
+            task_id = excluded.task_id,
+            message_id = excluded.message_id,
+            file_id = excluded.file_id,
+            artifact_date = excluded.artifact_date,
+            raw_json = excluded.raw_json,
+            last_seen_at = excluded.last_seen_at
+        """,
+        (
+            artifact.get("source_type"),
+            source_key,
+            artifact.get("source_title"),
+            artifact.get("source_text"),
+            artifact.get("source_url"),
+            artifact.get("person_id"),
+            artifact.get("person_name"),
+            artifact.get("dialog_id"),
+            artifact.get("task_id"),
+            artifact.get("message_id"),
+            artifact.get("file_id"),
+            artifact.get("artifact_date"),
+            json.dumps(artifact.get("raw_json", {}), ensure_ascii=False),
+            now,
+            now,
+        ),
+    )
+    row = conn.execute(
+        "SELECT artifact_id FROM source_artifacts WHERE source_key = ?",
+        (source_key,),
+    ).fetchone()
+    return int(row["artifact_id"])
+
+
+def link_work_item_evidence(conn: Any, work_item_id: int, artifact_id: int, evidence_type: str, confidence: float = 1.0) -> None:
+    conn.execute(
+        """
+        INSERT INTO work_item_evidence (
+            work_item_id, artifact_id, evidence_type, confidence, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(work_item_id, artifact_id) DO UPDATE SET
+            evidence_type = excluded.evidence_type,
+            confidence = excluded.confidence
+        """,
+        (work_item_id, artifact_id, evidence_type, confidence, datetime.now().isoformat()),
+    )
+
+
+def upsert_extracted_fact(conn: Any, fact: dict[str, Any]) -> int:
+    now = datetime.now().isoformat()
+    conn.execute(
+        """
+        INSERT INTO extracted_facts (
+            artifact_id, fact_type, person_id, person_name, title, fact_text,
+            deadline, status, confidence, raw_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(artifact_id) DO UPDATE SET
+            fact_type = excluded.fact_type,
+            person_id = excluded.person_id,
+            person_name = excluded.person_name,
+            title = excluded.title,
+            fact_text = excluded.fact_text,
+            deadline = excluded.deadline,
+            status = excluded.status,
+            confidence = excluded.confidence,
+            raw_json = excluded.raw_json
+        """,
+        (
+            fact.get("artifact_id"),
+            fact.get("fact_type"),
+            fact.get("person_id"),
+            fact.get("person_name"),
+            fact.get("title"),
+            fact.get("fact_text"),
+            fact.get("deadline"),
+            fact.get("status"),
+            fact.get("confidence", 0.5),
+            json.dumps(fact.get("raw_json", {}), ensure_ascii=False),
+            now,
+        ),
+    )
+    row = conn.execute(
+        "SELECT fact_id FROM extracted_facts WHERE artifact_id = ?",
+        (fact.get("artifact_id"),),
+    ).fetchone()
+    return int(row["fact_id"])
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("ИИ не вернул JSON-объект")
+    json_text = cleaned[start : end + 1]
+    try:
+        return json.loads(json_text)
+    except json.JSONDecodeError:
+        return json.JSONDecoder(strict=False).decode(json_text)
+
+
+def name_key(value: Any) -> str:
+    return " ".join(str(value or "").lower().replace("ё", "е").split())
+
+
+def find_person_by_name(conn: Any, person_name: Any) -> Any | None:
+    key = name_key(person_name)
+    if not key:
+        return None
+    rows = conn.execute("SELECT * FROM team_members WHERE active = 1").fetchall()
+    for row in rows:
+        candidate = name_key(row["name"])
+        if candidate and (candidate == key or candidate in key or key in candidate):
+            return row
+    return None
+
+
+def create_work_item_from_task(conn: Any, task: Any, artifact_id: int) -> int:
+    now = datetime.now().isoformat()
+    manager = None
+    if task["responsible_id"] is not None:
+        manager = conn.execute(
+            "SELECT manager_id, manager_name FROM team_members WHERE user_id = ?",
+            (task["responsible_id"],),
+        ).fetchone()
+    status = task["status_label"] or task["status_code"] or "Без статуса"
+    period_start = str(task["created_date"] or task["changed_date"] or task["deadline"] or "")[:10] or None
+    period_end = str(task["closed_date"] or task["deadline"] or task["changed_date"] or "")[:10] or None
+    raw = {
+        "task_id": task["task_id"],
+        "source": "bitrix_task",
+        "status_code": task["status_code"],
+        "status_label": task["status_label"],
+    }
+    conn.execute(
+        """
+        INSERT INTO work_items (
+            title, description, assignee_id, assignee_name, manager_id, manager_name,
+            period_type, period_start, period_end, deadline, status, priority,
+            confidence, source_type, source_artifact_id, created_at, updated_at, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_artifact_id) DO UPDATE SET
+            title = excluded.title,
+            description = excluded.description,
+            assignee_id = excluded.assignee_id,
+            assignee_name = excluded.assignee_name,
+            manager_id = excluded.manager_id,
+            manager_name = excluded.manager_name,
+            period_type = excluded.period_type,
+            period_start = excluded.period_start,
+            period_end = excluded.period_end,
+            deadline = excluded.deadline,
+            status = excluded.status,
+            priority = excluded.priority,
+            confidence = excluded.confidence,
+            source_type = excluded.source_type,
+            updated_at = excluded.updated_at,
+            raw_json = excluded.raw_json
+        """,
+        (
+            task["title"] or f"Задача {task['task_id']}",
+            task["description"],
+            task["responsible_id"],
+            task["responsible_name"],
+            manager["manager_id"] if manager else None,
+            manager["manager_name"] if manager else None,
+            "day",
+            period_start,
+            period_end,
+            task["deadline"],
+            status,
+            task["priority"],
+            1.0,
+            "bitrix_task",
+            artifact_id,
+            now,
+            now,
+            json.dumps(raw, ensure_ascii=False),
+        ),
+    )
+    row = conn.execute(
+        "SELECT work_item_id FROM work_items WHERE source_artifact_id = ?",
+        (artifact_id,),
+    ).fetchone()
+    work_item_id = int(row["work_item_id"])
+    link_work_item_evidence(conn, work_item_id, artifact_id, "primary_source", 1.0)
+    return work_item_id
+
+
+def create_work_item_from_ai_task(
+    conn: Any,
+    dialog_id: str,
+    date_from: date,
+    date_to: date,
+    task: dict[str, Any],
+    artifact_id: int,
+) -> int:
+    now = datetime.now().isoformat()
+    assignee = find_person_by_name(conn, task.get("assignee_name"))
+    manager_id = assignee["manager_id"] if assignee else None
+    manager_name = assignee["manager_name"] if assignee else None
+    title = str(task.get("title") or "").strip()
+    if not title:
+        raise ValueError("AI task title is empty")
+    conn.execute(
+        """
+        INSERT INTO work_items (
+            title, description, assignee_id, assignee_name, manager_id, manager_name,
+            dialog_id, goal_id, period_type, period_start, period_end, deadline,
+            status, priority, confidence, source_type, source_artifact_id,
+            created_at, updated_at, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_artifact_id) DO UPDATE SET
+            title = excluded.title,
+            description = excluded.description,
+            assignee_id = excluded.assignee_id,
+            assignee_name = excluded.assignee_name,
+            manager_id = excluded.manager_id,
+            manager_name = excluded.manager_name,
+            dialog_id = excluded.dialog_id,
+            period_type = excluded.period_type,
+            period_start = excluded.period_start,
+            period_end = excluded.period_end,
+            deadline = excluded.deadline,
+            status = excluded.status,
+            priority = excluded.priority,
+            confidence = excluded.confidence,
+            source_type = excluded.source_type,
+            updated_at = excluded.updated_at,
+            raw_json = excluded.raw_json
+        """,
+        (
+            title,
+            task.get("description"),
+            assignee["user_id"] if assignee else None,
+            assignee["name"] if assignee else task.get("assignee_name"),
+            manager_id,
+            manager_name,
+            dialog_id,
+            None,
+            "day" if date_from == date_to else "period",
+            date_from.isoformat(),
+            date_to.isoformat(),
+            task.get("deadline"),
+            task.get("status") or "ai_extracted",
+            task.get("priority"),
+            float(task.get("confidence") or 0.7),
+            "chat_ai_analysis",
+            artifact_id,
+            now,
+            now,
+            json.dumps(task, ensure_ascii=False),
+        ),
+    )
+    row = conn.execute(
+        "SELECT work_item_id FROM work_items WHERE source_artifact_id = ?",
+        (artifact_id,),
+    ).fetchone()
+    return int(row["work_item_id"])
+
+
+def create_work_fact_from_ai(
+    conn: Any,
+    dialog_id: str,
+    date_from: date,
+    date_to: date,
+    fact: dict[str, Any],
+    artifact_id: int,
+) -> int:
+    now = datetime.now().isoformat()
+    person = find_person_by_name(conn, fact.get("person_name"))
+    fact_text = str(fact.get("text") or fact.get("fact_text") or "").strip()
+    if not fact_text:
+        raise ValueError("AI fact text is empty")
+    conn.execute(
+        """
+        INSERT INTO work_facts (
+            fact_type, fact_date, person_id, person_name, dialog_id, title, fact_text,
+            linked_task_title, linked_goal_title, confidence, source_type,
+            source_artifact_id, created_at, updated_at, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_artifact_id) DO UPDATE SET
+            fact_type = excluded.fact_type,
+            fact_date = excluded.fact_date,
+            person_id = excluded.person_id,
+            person_name = excluded.person_name,
+            dialog_id = excluded.dialog_id,
+            title = excluded.title,
+            fact_text = excluded.fact_text,
+            linked_task_title = excluded.linked_task_title,
+            linked_goal_title = excluded.linked_goal_title,
+            confidence = excluded.confidence,
+            source_type = excluded.source_type,
+            updated_at = excluded.updated_at,
+            raw_json = excluded.raw_json
+        """,
+        (
+            fact.get("type") or fact.get("fact_type") or "progress_update",
+            fact.get("date") or date_to.isoformat(),
+            person["user_id"] if person else None,
+            person["name"] if person else fact.get("person_name"),
+            dialog_id,
+            fact.get("title") or fact_text[:120],
+            fact_text,
+            fact.get("linked_task_title"),
+            fact.get("linked_goal_title"),
+            float(fact.get("confidence") or 0.7),
+            "chat_second_layer_analysis",
+            artifact_id,
+            now,
+            now,
+            json.dumps(fact, ensure_ascii=False),
+        ),
+    )
+    row = conn.execute(
+        "SELECT fact_id FROM work_facts WHERE source_artifact_id = ?",
+        (artifact_id,),
+    ).fetchone()
+    return int(row["fact_id"])
+
+
+def save_analysis_review(
+    conn: Any,
+    dialog_id: str,
+    date_from: date,
+    date_to: date,
+    review_type: str,
+    model: str,
+    result: dict[str, Any],
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO analysis_reviews (
+            dialog_id, period_start, period_end, review_type, model, result_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            dialog_id,
+            date_from.isoformat(),
+            date_to.isoformat(),
+            review_type,
+            model,
+            json.dumps(result, ensure_ascii=False),
+            datetime.now().isoformat(),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def save_chat_daily_analytics(
+    dialog_id: str,
+    analytics_date: date,
+    model: str | None,
+    status: str,
+    summary_text: str | None = None,
+    tasks_saved: int = 0,
+    goals_saved: int = 0,
+    facts_saved: int = 0,
+    confirmations_count: int = 0,
+    unknown_blocks_count: int = 0,
+    error: str | None = None,
+    raw: dict[str, Any] | None = None,
+) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_daily_analytics (
+                dialog_id, analytics_date, summary_text, model, tasks_saved,
+                goals_saved, facts_saved, confirmations_count, unknown_blocks_count,
+                status, error, generated_at, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dialog_id, analytics_date) DO UPDATE SET
+                summary_text = excluded.summary_text,
+                model = excluded.model,
+                tasks_saved = excluded.tasks_saved,
+                goals_saved = excluded.goals_saved,
+                facts_saved = excluded.facts_saved,
+                confirmations_count = excluded.confirmations_count,
+                unknown_blocks_count = excluded.unknown_blocks_count,
+                status = excluded.status,
+                error = excluded.error,
+                generated_at = excluded.generated_at,
+                raw_json = excluded.raw_json
+            """,
+            (
+                dialog_id,
+                analytics_date.isoformat(),
+                summary_text,
+                model,
+                tasks_saved,
+                goals_saved,
+                facts_saved,
+                confirmations_count,
+                unknown_blocks_count,
+                status,
+                error,
+                datetime.now().isoformat(),
+                json.dumps(raw or {}, ensure_ascii=False),
+            ),
+        )
+
+
+def upsert_ai_chat_goal(
+    conn: Any,
+    dialog_id: str,
+    date_from: date,
+    date_to: date,
+    goal: dict[str, Any],
+    artifact_id: int,
+) -> int | None:
+    title = str(goal.get("title") or goal.get("goal_title") or "").strip()
+    if not title:
+        return None
+    owner = find_person_by_name(conn, goal.get("owner_name"))
+    now = datetime.now().isoformat()
+    existing = conn.execute(
+        """
+        SELECT goal_id
+        FROM chat_goals
+        WHERE dialog_id = ? AND period_start = ? AND period_end = ? AND source_artifact_id = ?
+        """,
+        (dialog_id, date_from.isoformat(), date_to.isoformat(), artifact_id),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE chat_goals
+            SET goal_title = ?, goal_text = ?, period_type = ?, owner_id = ?, owner_name = ?,
+                success_metrics = ?, status = ?, updated_at = ?
+            WHERE goal_id = ?
+            """,
+            (
+                title,
+                goal.get("description") or goal.get("goal_text"),
+                goal.get("period_type") or ("day" if date_from == date_to else "period"),
+                owner["user_id"] if owner else None,
+                owner["name"] if owner else goal.get("owner_name"),
+                goal.get("success_metrics"),
+                goal.get("status") or "active",
+                now,
+                existing["goal_id"],
+            ),
+        )
+        return int(existing["goal_id"])
+
+    cur = conn.execute(
+        """
+        INSERT INTO chat_goals (
+            dialog_id, goal_title, goal_text, period_type, period_start, period_end,
+            owner_id, owner_name, success_metrics, status, source_artifact_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            dialog_id,
+            title,
+            goal.get("description") or goal.get("goal_text"),
+            goal.get("period_type") or ("day" if date_from == date_to else "period"),
+            date_from.isoformat(),
+            date_to.isoformat(),
+            owner["user_id"] if owner else None,
+            owner["name"] if owner else goal.get("owner_name"),
+            goal.get("success_metrics"),
+            goal.get("status") or "active",
+            artifact_id,
+            now,
+            now,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def bitrix_origin_from_webhook(webhook_base: str) -> str:
+    parts = webhook_base.strip().split("/")
+    if len(parts) >= 3 and parts[0].startswith("http"):
+        return "/".join(parts[:3])
+    return webhook_base.strip().rstrip("/")
+
+
+def absolute_bitrix_url(url: str | None, webhook_base: str) -> str | None:
+    if not url:
+        return None
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    if url.startswith("/"):
+        return f"{bitrix_origin_from_webhook(webhook_base)}{url}"
+    return url
+
+
+def is_image_file_value(file_name: Any, file_type: Any, extension: Any) -> bool:
+    markers = [str(value or "").lower() for value in (file_type, extension, file_name)]
+    return any(
+        marker.endswith(ext) or marker == ext.lstrip(".") or marker == "image"
+        for marker in markers
+        for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+    )
+
+
+def is_pdf_file_value(file_name: Any, file_type: Any, extension: Any, mime_type: Any = None) -> bool:
+    markers = [str(value or "").lower() for value in (file_type, extension, file_name)]
+    mime = str(mime_type or "").lower()
+    return any(marker.endswith(".pdf") or marker == "pdf" for marker in markers) or mime == "application/pdf"
+
+
+def is_ocr_supported_file_value(file_name: Any, file_type: Any, extension: Any, mime_type: Any = None) -> bool:
+    return is_image_file_value(file_name, file_type, extension) or is_pdf_file_value(file_name, file_type, extension, mime_type)
+
+
+def safe_attachment_name(dialog_id: str, message_id: Any, file_id: Any, file_name: str | None) -> str:
+    extension = Path(file_name or "").suffix.lower()
+    if extension not in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".pdf"}:
+        extension = ".bin"
+    digest = hashlib.sha1(f"{dialog_id}:{message_id}:{file_id}:{file_name or ''}".encode("utf-8")).hexdigest()[:16]
+    return f"{dialog_id.replace('/', '_')}_{message_id}_{file_id}_{digest}{extension}"
+
+
+def response_output_text(raw: dict[str, Any]) -> str:
+    if raw.get("output_text"):
+        return str(raw["output_text"])
+    parts: list[str] = []
+    for item in raw.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []) or []:
+            if isinstance(content, dict) and content.get("text"):
+                parts.append(str(content["text"]))
+    return "\n".join(parts).strip()
+
+
+def _is_image_bytes(content: bytes) -> bool:
+    if not content:
+        return False
+    head = content[:16]
+    return (
+        head.startswith(b"\x89PNG\r\n\x1a\n")
+        or head.startswith(b"\xff\xd8\xff")
+        or head.startswith(b"GIF87a")
+        or head.startswith(b"GIF89a")
+        or head.startswith(b"RIFF") and content[8:12] == b"WEBP"
+        or head.startswith(b"BM")
+    )
+
+
+def _is_pdf_bytes(content: bytes) -> bool:
+    return bool(content and content[:8].lstrip().startswith(b"%PDF-"))
+
+
+def _is_html_bytes(content: bytes) -> bool:
+    if not content:
+        return False
+    sample = content[:256].lstrip().lower()
+    return sample.startswith(b"<!doctype html") or sample.startswith(b"<html")
+
+
+def _refresh_bitrix_download_url(webhook_base: str, bitrix_file_id: Any) -> str | None:
+    file_id = to_int(bitrix_file_id)
+    if file_id is None:
+        return None
+    client = BitrixClient(webhook_base)
+    payload = client.call_with_fallback("disk.file.get", {"id": file_id}, prefer_api=False)
+    result = payload.get("result") or {}
+    if not isinstance(result, dict):
+        return None
+    for key in ("DOWNLOAD_URL", "DOWNLOAD_URL_EXTERNAL", "DOWNLOAD_URL_EXT", "SHOW_URL"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return absolute_bitrix_url(value, webhook_base)
+    return None
+
+
+def download_chat_image_file(file_row: Any, webhook_base: str, max_bytes: int = 25 * 1024 * 1024) -> dict[str, Any]:
+    source_url = absolute_bitrix_url(
+        first_non_empty(file_row["download_url"], file_row["show_url"], file_row["preview_url"]),
+        webhook_base,
+    )
+    if not source_url:
+        raise ValueError("У файла нет URL для скачивания")
+    local_path = ATTACHMENTS_DIR / safe_attachment_name(
+        file_row["dialog_id"],
+        int(file_row["message_id"]),
+        int(file_row["file_id"]),
+        file_row["name"],
+    )
+    def fetch_bytes(url: str) -> bytes:
+        with requests.get(url, stream=True, timeout=60) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("Изображение слишком большое для OCR")
+                chunks.append(chunk)
+        return b"".join(chunks)
+
+    content = b""
+    if local_path.exists() and local_path.stat().st_size > 0:
+        cached = local_path.read_bytes()
+        if _is_image_bytes(cached) or _is_pdf_bytes(cached):
+            content = cached
+        else:
+            try:
+                local_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    if not content:
+        content = fetch_bytes(source_url)
+        if not (_is_image_bytes(content) or _is_pdf_bytes(content)):
+            refreshed_url = _refresh_bitrix_download_url(webhook_base, file_row["file_id"])
+            if refreshed_url and refreshed_url != source_url:
+                content = fetch_bytes(refreshed_url)
+                source_url = refreshed_url
+        if not (_is_image_bytes(content) or _is_pdf_bytes(content)):
+            if _is_html_bytes(content):
+                raise ValueError("Bitrix вернул HTML вместо файла (временная ссылка устарела или нет доступа)")
+            raise ValueError("Скачанный файл не распознан как изображение или PDF")
+        local_path.write_bytes(content)
+    sha256 = hashlib.sha256(content).hexdigest()
+    mime_type = mimetypes.guess_type(str(local_path))[0] or ("application/pdf" if _is_pdf_bytes(content) else "image/jpeg")
+    return {
+        "source_url": source_url,
+        "local_path": str(local_path),
+        "content": content,
+        "size": len(content),
+        "sha256": sha256,
+        "mime_type": mime_type,
+    }
+
+
+def build_ocr_prompt(prompt: str, context: dict[str, Any] | None = None) -> str:
+    if not context:
+        return prompt
+    context_lines = [
+        "Контекст изображения. Это НЕ текст с картинки:",
+        f"file_id: {context.get('file_id') or '-'}",
+        f"chat_id: {context.get('chat_id') or '-'}",
+        f"dialog_id: {context.get('dialog_id') or '-'}",
+        f"chat_title: {context.get('chat_title') or '-'}",
+        f"message_id: {context.get('message_id') or '-'}",
+        f"message_date: {context.get('message_date') or '-'}",
+        f"message_day: {context.get('message_day') or '-'}",
+        f"file_name: {context.get('file_name') or '-'}",
+        "",
+        "Используй контекст только для ориентации. Не добавляй эти поля в OCR-текст, если их нет на изображении.",
+        "",
+    ]
+    return "\n".join(context_lines) + prompt
+
+
+def recognize_image_text_with_openai(
+    content: bytes,
+    mime_type: str,
+    file_name: str | None,
+    prompt_override: str | None = None,
+    context: dict[str, Any] | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    api_key = llm_api_key()
+    if not api_key:
+        raise ValueError("Для OCR изображений укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+    model = os.getenv("OPENAI_OCR_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")).strip()
+    b64 = base64.b64encode(content).decode("ascii")
+    prompt = prompt_override or (
+        "Выполни только OCR/расшифровку изображения. "
+        "Распознай весь видимый текст максимально точно, сохрани строки, колонки, заголовки, даты, галочки, нумерацию и переносы. "
+        "Если это таблица, передай ее как текстовую таблицу. "
+        "Не классифицируй документ, не создавай цели, задачи, факты, статусы и ответственных. "
+        "Не добавляй управленческих выводов и не придумывай отсутствующий текст. "
+        "Если фрагмент неразборчив, напиши [неразборчиво]. "
+        "Верни только OCR-текст на русском/исходном языке, без JSON."
+    )
+    prompt = build_ocr_prompt(prompt, context)
+    if is_google_genai_base():
+        model_candidates = _google_ocr_model_candidates(model)
+        last_error: str | None = None
+        quota_exhausted = False
+        for google_model in model_candidates:
+            response = llm_post_with_retry(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{google_model}:generateContent?key={api_key}",
+                headers={"Content-Type": "application/json"},
+                payload={
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [
+                                {"text": f"{prompt}\nФайл: {file_name or 'image'}"},
+                                {"inline_data": {"mime_type": mime_type, "data": b64}},
+                            ],
+                        }
+                    ],
+                    "generationConfig": {"temperature": 0.0},
+                },
+                timeout=120,
+            )
+            if not response.ok:
+                body = response.text[:1200]
+                last_error = f"OCR API error {response.status_code} [{google_model}]: {body}"
+                # If model quota is exhausted or model is unavailable, try next fallback model.
+                if response.status_code == 429 and ("RESOURCE_EXHAUSTED" in body or "Quota exceeded" in body):
+                    quota_exhausted = True
+                    continue
+                if response.status_code == 404 and "not found" in body.lower():
+                    continue
+                raise ValueError(last_error)
+            raw = response.json()
+            ocr_parts: list[str] = []
+            for candidate in raw.get("candidates") or []:
+                content = candidate.get("content") if isinstance(candidate, dict) else None
+                if not isinstance(content, dict):
+                    continue
+                for part in content.get("parts") or []:
+                    if isinstance(part, dict) and part.get("text"):
+                        ocr_parts.append(str(part["text"]))
+            ocr_text = "\n".join(ocr_parts).strip()
+            if ocr_text:
+                return ocr_text, google_model, raw
+            last_error = f"OCR API вернул пустой текст [{google_model}]"
+        if quota_exhausted:
+            raise ValueError(
+                "OCR API quota exhausted (Google Gemini): для текущего GOOGLE_API_KEY лимит равен 0. "
+                "Проверьте billing/plan в Google AI Studio или переключите OCR на другой провайдер "
+                "(например, задайте OPENAI_API_KEY и OPENAI_OCR_MODEL)."
+            )
+        raise ValueError(last_error or "OCR API error: не удалось обработать изображение всеми доступными моделями")
+
+    response = llm_post_with_retry(
+        llm_api_url("/chat/completions"),
+        headers=llm_auth_headers(api_key),
+        payload={
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"{prompt}\nФайл: {file_name or 'image'}"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0.0,
+        },
+        timeout=120,
+    )
+    if not response.ok:
+        raise ValueError(f"OCR API error {response.status_code}: {response.text[:1200]}")
+    raw = response.json()
+    ocr_text = ""
+    choices = raw.get("choices") or []
+    if choices:
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            ocr_text = content.strip()
+        elif isinstance(content, list):
+            ocr_text = "\n".join(
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict) and part.get("text")
+            ).strip()
+    if not ocr_text:
+        ocr_text = response_output_text(raw)
+    if not ocr_text:
+        raise ValueError("OCR API вернул пустой текст")
+    return ocr_text, model, raw
+
+
+def pg_active_prompt(cur: Any, category_key: str, fallback: str) -> tuple[Any, str]:
+    cur.execute(
+        """
+        SELECT p.id, p.prompt_text
+        FROM ai_prompts p
+        JOIN ai_prompt_categories c ON c.id = p.category_id
+        WHERE c.category_key = %s AND p.is_active = TRUE
+        LIMIT 1
+        """,
+        (category_key,),
+    )
+    row = cur.fetchone()
+    if row:
+        return row["id"], row["prompt_text"]
+    return None, fallback
+
+
+def pg_insert_ai_request(
+    cur: Any,
+    request_type: str,
+    prompt_id: Any,
+    prompt_text: str,
+    provider: str,
+    model: str,
+    input_payload: dict[str, Any],
+    started_at: datetime,
+) -> Any:
+    cur.execute(
+        """
+        INSERT INTO ai_requests (
+            request_type, prompt_id, provider, model, status, started_at,
+            input_payload, prompt_text_snapshot
+        ) VALUES (%s, %s, %s, %s, 'pending', %s, %s, %s)
+        RETURNING id
+        """,
+        (request_type, prompt_id, provider, model, started_at, pg_json(input_payload), prompt_text),
+    )
+    return cur.fetchone()["id"]
+
+
+def pg_finish_ai_request(
+    cur: Any,
+    request_id: Any,
+    status: str,
+    started_at: datetime,
+    response_text: str | None = None,
+    response_json: dict[str, Any] | None = None,
+    raw_response_json: dict[str, Any] | None = None,
+    error_text: str | None = None,
+) -> None:
+    tz = started_at.tzinfo if isinstance(started_at, datetime) else None
+    finished_at = datetime.now(tz) if tz is not None else datetime.now()
+    usage = (raw_response_json or {}).get("usage") if isinstance(raw_response_json, dict) else {}
+    input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    output_tokens = usage.get("output_tokens") or usage.get("completion_tokens") if isinstance(usage, dict) else None
+    total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+    cur.execute(
+        """
+        UPDATE ai_requests
+        SET status = %s,
+            finished_at = %s,
+            duration_ms = %s,
+            response_text = %s,
+            response_json = %s,
+            raw_response_json = %s,
+            input_tokens = %s,
+            output_tokens = %s,
+            total_tokens = %s,
+            error_text = %s
+        WHERE id = %s
+        """,
+        (
+            status,
+            finished_at,
+            int((finished_at - started_at).total_seconds() * 1000),
+            response_text,
+            pg_json(response_json or {}) if response_json is not None else None,
+            pg_json(raw_response_json or {}) if raw_response_json is not None else None,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            error_text,
+            request_id,
+        ),
+    )
+
+
+def pg_get_user_by_name(cur: Any, person_name: Any) -> dict[str, Any] | None:
+    key = name_key(person_name)
+    if not key:
+        return None
+    cur.execute(
+        """
+        SELECT id, bitrix_user_id, full_name, manager_id
+        FROM users
+        WHERE is_active = TRUE
+        ORDER BY full_name
+        """
+    )
+    for row in cur.fetchall():
+        candidate = name_key(row["full_name"])
+        if candidate and (candidate == key or candidate in key or key in candidate):
+            return dict(row)
+    return None
+
+
+def pg_get_user_by_bitrix_id(cur: Any, bitrix_user_id: Any) -> dict[str, Any] | None:
+    user_id = to_int(bitrix_user_id)
+    if user_id is None:
+        return None
+    cur.execute(
+        """
+        SELECT id, bitrix_user_id, full_name, manager_id
+        FROM users
+        WHERE bitrix_user_id = %s
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def normalize_work_status(value: Any) -> str:
+    status = name_key(value)
+    if status in {"done", "completed", "готово", "готов", "выполнено", "выполнен", "завершена", "завершено"}:
+        return "done"
+    if status in {"blocked", "blocker", "блокер", "заблокировано", "проблема"}:
+        return "overdue"
+    if status in {"cancelled", "canceled", "отменено", "отмена"}:
+        return "cancelled"
+    if status in {"planned", "new", "план", "запланировано"}:
+        return "new"
+    if status in {"in_progress", "progress", "в работе", "делается"}:
+        return "in_progress"
+    return "unknown"
+
+
+def normalize_period_type(value: Any, date_from: date | None = None, date_to: date | None = None) -> str:
+    period = str(value or "").strip().lower()
+    if period in {"day", "week", "month", "quarter", "year", "project"}:
+        return period
+    if date_from and date_to and date_from == date_to:
+        return "day"
+    return "week"
+
+
+def safe_parse_date(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def pg_upsert_source_artifact(
+    cur: Any,
+    source_type: str,
+    external_id: str,
+    content_text: str | None = None,
+    artifact_date: date | None = None,
+    user_id: Any = None,
+    chat_id: Any = None,
+    bitrix_task_id: Any = None,
+    chat_message_id: Any = None,
+    chat_message_day: date | None = None,
+    chat_file_id: Any = None,
+    chat_file_ocr_id: Any = None,
+    ai_request_id: Any = None,
+    raw: dict[str, Any] | None = None,
+) -> Any:
+    natural_filters: list[tuple[str, Any]] = []
+    if bitrix_task_id is not None:
+        natural_filters.append(("bitrix_task_id", bitrix_task_id))
+    if chat_message_id is not None:
+        natural_filters.append(("chat_message_id", chat_message_id))
+    if chat_file_id is not None:
+        natural_filters.append(("chat_file_id", chat_file_id))
+    if chat_file_ocr_id is not None:
+        natural_filters.append(("chat_file_ocr_id", chat_file_ocr_id))
+    for column, value in natural_filters:
+        cur.execute(
+            f"""
+            SELECT id
+            FROM source_artifacts
+            WHERE source_type = %s AND {column} = %s
+            LIMIT 1
+            """,
+            (source_type, value),
+        )
+        row = cur.fetchone()
+        if row:
+            artifact_id = row["id"]
+            cur.execute(
+                """
+                UPDATE source_artifacts
+                SET external_id = %s,
+                    bitrix_task_id = %s,
+                    chat_message_id = %s,
+                    chat_message_day = %s,
+                    chat_file_id = %s,
+                    chat_file_ocr_id = %s,
+                    ai_request_id = %s,
+                    user_id = %s,
+                    chat_id = %s,
+                    artifact_date = %s,
+                    content_text = %s,
+                    raw_json = %s
+                WHERE id = %s
+                """,
+                (
+                    external_id,
+                    bitrix_task_id,
+                    chat_message_id,
+                    chat_message_day,
+                    chat_file_id,
+                    chat_file_ocr_id,
+                    ai_request_id,
+                    user_id,
+                    chat_id,
+                    artifact_date,
+                    content_text,
+                    pg_json(raw or {}),
+                    artifact_id,
+                ),
+            )
+            return artifact_id
+
+    cur.execute(
+        """
+        SELECT id
+        FROM source_artifacts
+        WHERE source_type = %s AND external_id = %s
+        LIMIT 1
+        """,
+        (source_type, external_id),
+    )
+    row = cur.fetchone()
+    if row:
+        artifact_id = row["id"]
+        cur.execute(
+            """
+            UPDATE source_artifacts
+            SET bitrix_task_id = %s,
+                chat_message_id = %s,
+                chat_message_day = %s,
+                chat_file_id = %s,
+                chat_file_ocr_id = %s,
+                ai_request_id = %s,
+                user_id = %s,
+                chat_id = %s,
+                artifact_date = %s,
+                content_text = %s,
+                raw_json = %s
+            WHERE id = %s
+            """,
+            (
+                bitrix_task_id,
+                chat_message_id,
+                chat_message_day,
+                chat_file_id,
+                chat_file_ocr_id,
+                ai_request_id,
+                user_id,
+                chat_id,
+                artifact_date,
+                content_text,
+                pg_json(raw or {}),
+                artifact_id,
+            ),
+        )
+        return artifact_id
+    cur.execute(
+        """
+        INSERT INTO source_artifacts (
+            source_type, bitrix_task_id, chat_message_id, chat_message_day,
+            chat_file_id, chat_file_ocr_id, ai_request_id, user_id, chat_id,
+            external_id, artifact_date, content_text, raw_json
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            source_type,
+            bitrix_task_id,
+            chat_message_id,
+            chat_message_day,
+            chat_file_id,
+            chat_file_ocr_id,
+            ai_request_id,
+            user_id,
+            chat_id,
+            external_id,
+            artifact_date,
+            content_text,
+            pg_json(raw or {}),
+        ),
+    )
+    return cur.fetchone()["id"]
+
+
+def pg_create_work_item_from_ai_task(
+    cur: Any,
+    chat_id: Any,
+    date_from: date,
+    date_to: date,
+    task: dict[str, Any],
+    source_artifact_id: Any,
+) -> Any:
+    assignee = pg_get_user_by_name(cur, task.get("assignee_name"))
+    responsible_id = assignee["id"] if assignee else None
+    manager_id = assignee["manager_id"] if assignee else None
+    deadline = parse_datetime(task.get("deadline"))
+    title = str(task.get("title") or "").strip()
+    if not title:
+        raise ValueError("AI task title is empty")
+    cur.execute(
+        """
+        SELECT id
+        FROM work_items
+        WHERE source_artifact_id = %s
+        LIMIT 1
+        """,
+        (source_artifact_id,),
+    )
+    existing = cur.fetchone()
+    values = (
+        title,
+        task.get("description"),
+        responsible_id,
+        manager_id,
+        normalize_work_status(task.get("status")),
+        deadline.date() if deadline else date_to,
+        normalize_period_type(task.get("period_type"), date_from, date_to),
+        deadline,
+        deadline if normalize_work_status(task.get("status")) == "done" else None,
+        float(task.get("confidence") or 0.7),
+        pg_json({"task": task, "chat_id": str(chat_id)}),
+    )
+    if existing:
+        cur.execute(
+            """
+            UPDATE work_items
+            SET title = %s,
+                description = %s,
+                responsible_id = %s,
+                manager_id = %s,
+                normalized_status = %s,
+                work_date = %s,
+                period_type = %s,
+                deadline_at = %s,
+                completed_at = %s,
+                confidence = %s,
+                raw_json = %s,
+                updated_at = now()
+            WHERE id = %s
+            """,
+            (*values, existing["id"]),
+        )
+        return existing["id"]
+    cur.execute(
+        """
+        INSERT INTO work_items (
+            source_type, source_artifact_id, title, description, responsible_id,
+            manager_id, normalized_status, work_date, period_type, deadline_at,
+            completed_at, confidence, raw_json
+        ) VALUES ('ai', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (source_artifact_id, *values),
+    )
+    return cur.fetchone()["id"]
+
+
+def pg_upsert_ai_goal(
+    cur: Any,
+    date_from: date,
+    date_to: date,
+    goal: dict[str, Any],
+    source_artifact_id: Any,
+) -> Any | None:
+    title = str(goal.get("title") or goal.get("goal_title") or "").strip()
+    if not title:
+        return None
+    owner = pg_get_user_by_name(cur, goal.get("owner_name"))
+    user_id = owner["id"] if owner else None
+    cur.execute(
+        """
+        SELECT id
+        FROM user_goals
+        WHERE source_artifact_id = %s
+        LIMIT 1
+        """,
+        (source_artifact_id,),
+    )
+    existing = cur.fetchone()
+    period_type = normalize_period_type(goal.get("period_type"), date_from, date_to)
+    period_start = safe_parse_date(goal.get("period_start")) or date_from
+    period_end = safe_parse_date(goal.get("period_end")) or date_to
+    values = (
+        user_id,
+        title,
+        goal.get("description") or goal.get("goal_text"),
+        period_type,
+        period_start,
+        period_end,
+        goal.get("success_metrics"),
+        goal.get("expected_result"),
+        goal.get("status") if goal.get("status") in {"draft", "active", "done", "cancelled", "archived"} else "active",
+        float(goal.get("confidence") or 0.7),
+    )
+    if existing:
+        cur.execute(
+            """
+            UPDATE user_goals
+            SET user_id = %s,
+                goal_title = %s,
+                goal_text = %s,
+                period_type = %s,
+                period_start = %s,
+                period_end = %s,
+                success_metrics = %s,
+                expected_result = %s,
+                status = %s,
+                confidence = %s,
+                updated_at = now()
+            WHERE id = %s
+            """,
+            (*values, existing["id"]),
+        )
+        return existing["id"]
+    cur.execute(
+        """
+        INSERT INTO user_goals (
+            user_id, goal_title, goal_text, goal_level, period_type, period_start,
+            period_end, success_metrics, expected_result, status, source_type,
+            source_artifact_id, confidence, is_confirmed, confirmed_at
+        ) VALUES (%s, %s, %s, 'employee', %s, %s, %s, %s, %s, %s, 'ai', %s, %s, FALSE, NULL)
+        RETURNING id
+        """,
+        (*values[:9], source_artifact_id, values[9]),
+    )
+    return cur.fetchone()["id"]
+
+
+def save_chat_file_ocr(
+    conn: Any,
+    file_row: Any,
+    download: dict[str, Any] | None,
+    status: str,
+    ocr_text: str | None = None,
+    model: str | None = None,
+    error: str | None = None,
+    raw: dict[str, Any] | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO chat_file_ocr (
+            dialog_id, message_id, file_id, file_name, source_url, local_path,
+            mime_type, file_size, sha256, ocr_text, model, status, error,
+            processed_at, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(dialog_id, message_id, file_id) DO UPDATE SET
+            file_name = excluded.file_name,
+            source_url = excluded.source_url,
+            local_path = excluded.local_path,
+            mime_type = excluded.mime_type,
+            file_size = excluded.file_size,
+            sha256 = excluded.sha256,
+            ocr_text = excluded.ocr_text,
+            model = excluded.model,
+            status = excluded.status,
+            error = excluded.error,
+            processed_at = excluded.processed_at,
+            raw_json = excluded.raw_json
+        """,
+        (
+            file_row["dialog_id"],
+            file_row["message_id"],
+            file_row["file_id"],
+            file_row["name"],
+            download.get("source_url") if download else first_non_empty(file_row["download_url"], file_row["show_url"], file_row["preview_url"]),
+            download.get("local_path") if download else None,
+            download.get("mime_type") if download else None,
+            download.get("size") if download else file_row["size"],
+            download.get("sha256") if download else None,
+            ocr_text,
+            model,
+            status,
+            error,
+            datetime.now().isoformat(),
+            json.dumps(raw or {}, ensure_ascii=False),
+            ),
+        )
+
+
+def chat_day_text_status(dialog_id: str, report_date: date) -> dict[str, Any]:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM chats WHERE dialog_id = %s", (dialog_id,))
+                chat = cur.fetchone()
+                if not chat:
+                    return {"status": "not_found", "status_text": "Чат не найден", "image_files": 0, "ocr_success": 0, "ocr_pending": 0, "ocr_errors": 0, "is_processed": False}
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (
+                            WHERE f.file_type = 'image'
+                               OR f.mime_type LIKE 'image/%%'
+                               OR f.mime_type = 'application/pdf'
+                               OR lower(COALESCE(f.file_name, '')) LIKE '%%.pdf'
+                        ) AS image_files,
+                        COUNT(*) FILTER (
+                            WHERE (
+                                f.file_type = 'image'
+                                OR f.mime_type LIKE 'image/%%'
+                                OR f.mime_type = 'application/pdf'
+                                OR lower(COALESCE(f.file_name, '')) LIKE '%%.pdf'
+                            )
+                              AND o.ocr_status = 'success'
+                        ) AS ocr_success,
+                        COUNT(*) FILTER (
+                            WHERE (
+                                f.file_type = 'image'
+                                OR f.mime_type LIKE 'image/%%'
+                                OR f.mime_type = 'application/pdf'
+                                OR lower(COALESCE(f.file_name, '')) LIKE '%%.pdf'
+                            )
+                              AND o.ocr_status = 'error'
+                        ) AS ocr_errors,
+                        COUNT(*) FILTER (
+                            WHERE (
+                                f.file_type = 'image'
+                                OR f.mime_type LIKE 'image/%%'
+                                OR f.mime_type = 'application/pdf'
+                                OR lower(COALESCE(f.file_name, '')) LIKE '%%.pdf'
+                            )
+                              AND (o.ocr_status IS NULL OR o.ocr_status NOT IN ('success', 'error'))
+                        ) AS ocr_pending
+                    FROM chat_message_files f
+                    LEFT JOIN LATERAL (
+                        SELECT ocr_status
+                        FROM chat_file_ocr
+                        WHERE file_id = f.id
+                        ORDER BY
+                            CASE ocr_provider WHEN 'manual' THEN 0 WHEN 'openai' THEN 1 ELSE 2 END,
+                            updated_at DESC
+                        LIMIT 1
+                    ) o ON TRUE
+                    WHERE f.chat_id = %s AND f.message_day = %s
+                    """,
+                    (chat["id"], report_date),
+                )
+                row = cur.fetchone()
+        image_files = int(row["image_files"] or 0)
+        ocr_success = int(row["ocr_success"] or 0)
+        ocr_pending = int(row["ocr_pending"] or 0)
+        ocr_errors = int(row["ocr_errors"] or 0)
+        is_processed = image_files == 0 or (ocr_success == image_files and ocr_pending == 0 and ocr_errors == 0)
+        if is_processed:
+            status_text = "Готов к отчету"
+            status = "processed"
+        elif ocr_errors:
+            status_text = "Ошибка OCR"
+            status = "ocr_error"
+        else:
+            status_text = "Не обработан"
+            status = "not_processed"
+        return {
+            "status": status,
+            "status_text": status_text,
+            "image_files": image_files,
+            "ocr_success": ocr_success,
+            "ocr_pending": ocr_pending,
+            "ocr_errors": ocr_errors,
+            "is_processed": is_processed,
+        }
+    date_text = report_date.isoformat()
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT f.*, o.status AS ocr_status
+            FROM chat_message_files f
+            JOIN chat_messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id
+            LEFT JOIN chat_file_ocr o ON o.dialog_id = f.dialog_id AND o.message_id = f.message_id AND o.file_id = f.file_id
+            WHERE f.dialog_id = ? AND m.message_day = ?
+            """,
+            (dialog_id, date_text),
+        ).fetchall()
+    image_rows = [row for row in rows if is_image_file_value(row["name"], row["file_type"], row["extension"])]
+    success = sum(1 for row in image_rows if row["ocr_status"] == "done")
+    errors = sum(1 for row in image_rows if row["ocr_status"] == "error")
+    pending = len(image_rows) - success - errors
+    is_processed = len(image_rows) == 0 or (success == len(image_rows) and pending == 0 and errors == 0)
+    return {
+        "status": "processed" if is_processed else ("ocr_error" if errors else "not_processed"),
+        "status_text": "Готов к отчету" if is_processed else ("Ошибка OCR" if errors else "Не обработан"),
+        "image_files": len(image_rows),
+        "ocr_success": success,
+        "ocr_pending": pending,
+        "ocr_errors": errors,
+        "is_processed": is_processed,
+    }
+
+
+def chat_day_workflow_status(dialog_id: str, report_date: date, report_exists: bool = False) -> dict[str, Any]:
+    text_status = chat_day_text_status(dialog_id, report_date)
+    if report_exists:
+        status = "report_formed"
+        status_text = "Отчет сформирован"
+    elif text_status.get("is_processed"):
+        status = "ready"
+        status_text = "Готов к отчету"
+    else:
+        status = "not_processed"
+        status_text = "Не обработан"
+    return {
+        **text_status,
+        "text_ready_status": text_status.get("status"),
+        "text_ready_status_text": text_status.get("status_text"),
+        "status": status,
+        "status_text": status_text,
+        "workflow_status": status,
+        "workflow_status_text": status_text,
+    }
+
+
+LOCAL_CHAT_REPORT_SOURCES = {
+    "local_fallback",
+    "no_messages",
+    "empty_day_verdict",
+    "empty_day_carry_forward",
+    "local_manual_chat_report_no_external_ai",
+    "local_manual_empty_day_carry_forward_no_external_ai",
+}
+
+
+def is_local_chat_report_payload(raw: Any) -> bool:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = {}
+    if not isinstance(raw, dict):
+        return False
+    source = str(raw.get("source") or "").strip()
+    model = str(raw.get("model") or "").strip()
+    return (
+        source in LOCAL_CHAT_REPORT_SOURCES
+        or source.startswith("local_manual_")
+        or model.startswith("local_manual_")
+        or model in {"empty-day-carry-forward", "empty-day-rule"}
+    )
+
+
+def is_real_ai_chat_report(report: Any) -> bool:
+    if not report:
+        return False
+    raw = report.get("raw_ai_json") or report.get("raw_json") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = {}
+    if not isinstance(raw, dict):
+        return False
+    if is_local_chat_report_payload(raw):
+        return False
+    if report.get("ai_request_id"):
+        return True
+    return bool(raw.get("choices") or raw.get("id") or raw.get("model"))
+
+
+def is_completed_chat_day_report(report: Any) -> bool:
+    if is_real_ai_chat_report(report):
+        return True
+    if not report:
+        return False
+    raw = report.get("raw_ai_json") or report.get("raw_json") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = {}
+    status = str(report.get("status") or "").strip()
+    summary = str(report.get("summary") or report.get("report_text") or "").strip()
+    return status == "no_data" and bool(summary)
+
+
+def is_display_chat_report(report: Any) -> bool:
+    if is_real_ai_chat_report(report):
+        return True
+    if not report:
+        return False
+    raw = report.get("raw_ai_json") or report.get("raw_json") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = {}
+    if is_local_chat_report_payload(raw):
+        return False
+    summary = str(report.get("summary") or report.get("report_text") or "").strip()
+    if not summary:
+        return False
+    pending_markers = (
+        "Сообщения загружены, ИИ-отчет еще не сформирован",
+        "Недельный отчет еще не сформирован",
+    )
+    return summary not in pending_markers
+
+
+def empty_chat_day_verdict(report_date: date) -> str:
+    if report_date.weekday() >= 5:
+        return "Сообщений в чате нет. Выходной."
+    return "Сообщений в чате нет. Уточнить почему."
+
+
+def load_previous_chat_report(dialog_id: str, report_date: date) -> dict[str, Any] | None:
+    previous_date = report_date - timedelta(days=1)
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                chat_id = pg_chat_id_by_dialog(cur, dialog_id)
+                if not chat_id:
+                    return None
+                cur.execute(
+                    """
+                    SELECT report_date, summary, raw_ai_json
+                    FROM chat_daily_reports
+                    WHERE chat_id = %s
+                      AND is_current = TRUE
+                      AND report_date <= %s
+                    ORDER BY report_date DESC
+                    LIMIT 30
+                    """,
+                    (chat_id, previous_date),
+                )
+                rows = cur.fetchall()
+        if not rows:
+            return None
+        selected = rows[0]
+        for row in rows:
+            raw = row["raw_ai_json"] if isinstance(row["raw_ai_json"], dict) else {}
+            if isinstance(raw.get("analysis"), dict):
+                selected = row
+                break
+        return {
+            "report_date": selected["report_date"],
+            "report_text": selected["summary"] or "",
+            "raw": selected["raw_ai_json"] if isinstance(selected["raw_ai_json"], dict) else {},
+        }
+
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT report_date, report_text, raw_json
+            FROM chat_daily_reports
+            WHERE dialog_id = ? AND report_date <= ?
+            ORDER BY report_date DESC
+            LIMIT 30
+            """,
+            (dialog_id, previous_date.isoformat()),
+        ).fetchall()
+    if not rows:
+        return None
+    selected = rows[0]
+    selected_raw: dict[str, Any] = {}
+    for row in rows:
+        raw = {}
+        try:
+            raw = json.loads(row["raw_json"] or "{}")
+        except Exception:
+            raw = {}
+        if isinstance(raw, dict) and isinstance(raw.get("analysis"), dict):
+            selected = row
+            selected_raw = raw
+            break
+    if not selected_raw:
+        try:
+            selected_raw = json.loads(selected["raw_json"] or "{}")
+        except Exception:
+            selected_raw = {}
+    return {
+        "report_date": safe_parse_date(selected["report_date"]),
+        "report_text": selected["report_text"] or "",
+        "raw": selected_raw if isinstance(selected_raw, dict) else {},
+    }
+
+
+def ensure_empty_chat_day_report(dialog_id: str, report_date: date, chat_day: dict[str, Any] | None = None) -> dict[str, Any]:
+    return chat_day or load_chat_day(dialog_id, report_date)
+
+
+def _daterange(start_date: date, end_date: date) -> list[date]:
+    days: list[date] = []
+    current = start_date
+    while current <= end_date:
+        days.append(current)
+        current += timedelta(days=1)
+    return days
+
+
+def create_chat_overall_daily_placeholder(report_date: date) -> None:
+    if not postgres_enabled():
+        return
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM chat_overall_daily_reports
+                    WHERE report_date = %s AND is_current = TRUE
+                    """,
+                    (report_date,),
+                )
+                if cur.fetchone():
+                    return
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(DISTINCT r.chat_id) AS chats_count,
+                        COALESCE(SUM(r.messages_count), 0) AS messages_count,
+                        COALESCE(SUM(r.extracted_goals_count), 0) AS goals_created_count
+                    FROM chat_daily_reports r
+                    JOIN chats c ON c.id = r.chat_id
+                    WHERE r.report_date = %s
+                      AND r.is_current = TRUE
+                      AND c.is_excluded = FALSE
+                    """,
+                    (report_date,),
+                )
+                stats = cur.fetchone() or {}
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(version), 0) + 1 AS version
+                    FROM chat_overall_daily_reports
+                    WHERE report_date = %s
+                    """,
+                    (report_date,),
+                )
+                version = cur.fetchone()["version"]
+                summary = f"Заглушка: сводный отчет за {format_date_ru(report_date)} будет сформирован автоматически."
+                raw_json = {
+                    "source": "overall_daily_placeholder",
+                    "report_text": summary,
+                    "date": report_date.isoformat(),
+                }
+                cur.execute(
+                    """
+                    INSERT INTO chat_overall_daily_reports (
+                        report_date, version, is_current, generated_at,
+                        chats_count, messages_count, goals_created_count, goal_updates_count,
+                        commitments_count, results_count, next_steps_count, risks_count,
+                        blockers_count, unresolved_questions_count, done_goal_updates_count,
+                        high_risk_goal_updates_count, summary, dynamics_summary, positives_summary,
+                        problems_summary, raw_json
+                    ) VALUES (
+                        %s, %s, TRUE, now(),
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s
+                    )
+                    """,
+                    (
+                        report_date,
+                        version,
+                        int(stats.get("chats_count") or 0),
+                        int(stats.get("messages_count") or 0),
+                        int(stats.get("goals_created_count") or 0),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        summary,
+                        "Динамика будет рассчитана после формирования полного отчета.",
+                        "Нет данных.",
+                        "Нет данных.",
+                        pg_json(raw_json),
+                    ),
+                )
+
+
+def create_chat_overall_weekly_placeholder(period_start: date, period_end: date) -> None:
+    if not postgres_enabled():
+        return
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM chat_overall_weekly_reports
+                    WHERE period_start = %s AND period_end = %s AND is_current = TRUE
+                    """,
+                    (period_start, period_end),
+                )
+                if cur.fetchone():
+                    return
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS daily_reports_count,
+                        COALESCE(SUM(chats_count), 0) AS chats_count,
+                        COALESCE(SUM(messages_count), 0) AS messages_count,
+                        COALESCE(SUM(goals_created_count), 0) AS goals_created_count,
+                        COALESCE(SUM(goal_updates_count), 0) AS goal_updates_count,
+                        COALESCE(SUM(commitments_count), 0) AS commitments_count,
+                        COALESCE(SUM(results_count), 0) AS results_count,
+                        COALESCE(SUM(next_steps_count), 0) AS next_steps_count,
+                        COALESCE(SUM(risks_count), 0) AS risks_count,
+                        COALESCE(SUM(blockers_count), 0) AS blockers_count,
+                        COALESCE(SUM(unresolved_questions_count), 0) AS unresolved_questions_count,
+                        COALESCE(SUM(done_goal_updates_count), 0) AS done_goal_updates_count,
+                        COALESCE(SUM(high_risk_goal_updates_count), 0) AS high_risk_goal_updates_count
+                    FROM chat_overall_daily_reports
+                    WHERE report_date BETWEEN %s AND %s
+                      AND is_current = TRUE
+                    """,
+                    (period_start, period_end),
+                )
+                stats = cur.fetchone() or {}
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(version), 0) + 1 AS version
+                    FROM chat_overall_weekly_reports
+                    WHERE period_start = %s AND period_end = %s
+                    """,
+                    (period_start, period_end),
+                )
+                version = cur.fetchone()["version"]
+                summary = (
+                    f"Заглушка недели {format_date_ru(period_start)} - {format_date_ru(period_end)}. "
+                    "Сформируйте недельный общий отчет для итоговой аналитики."
+                )
+                raw_json = {
+                    "source": "overall_weekly_placeholder",
+                    "report_text": summary,
+                    "period_start": period_start.isoformat(),
+                    "period_end": period_end.isoformat(),
+                }
+                cur.execute(
+                    """
+                    INSERT INTO chat_overall_weekly_reports (
+                        period_start, period_end, version, is_current, ai_request_id, prompt_id,
+                        generated_at, days_count, chats_count, daily_reports_count, messages_count,
+                        goals_created_count, goal_updates_count, commitments_count, results_count,
+                        next_steps_count, risks_count, blockers_count, unresolved_questions_count,
+                        done_goal_updates_count, high_risk_goal_updates_count, summary,
+                        dynamics_summary, positives_summary, problems_summary, recommendations, raw_json
+                    ) VALUES (
+                        %s, %s, %s, TRUE, NULL, NULL, now(),
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        period_start,
+                        period_end,
+                        version,
+                        (period_end - period_start).days + 1,
+                        int(stats.get("chats_count") or 0),
+                        int(stats.get("daily_reports_count") or 0),
+                        int(stats.get("messages_count") or 0),
+                        int(stats.get("goals_created_count") or 0),
+                        int(stats.get("goal_updates_count") or 0),
+                        int(stats.get("commitments_count") or 0),
+                        int(stats.get("results_count") or 0),
+                        int(stats.get("next_steps_count") or 0),
+                        int(stats.get("risks_count") or 0),
+                        int(stats.get("blockers_count") or 0),
+                        int(stats.get("unresolved_questions_count") or 0),
+                        int(stats.get("done_goal_updates_count") or 0),
+                        int(stats.get("high_risk_goal_updates_count") or 0),
+                        summary,
+                        "Динамика будет рассчитана после формирования полного недельного отчета.",
+                        "Нет данных.",
+                        "Нет данных.",
+                        "Сформируйте недельный общий отчет при необходимости.",
+                        pg_json(raw_json),
+                    ),
+                )
+
+
+def create_chat_weekly_placeholder(chat_id: Any, period_start: date, period_end: date) -> None:
+    if not postgres_enabled():
+        return
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM chat_weekly_reports
+                    WHERE chat_id = %s AND period_start = %s AND period_end = %s AND is_current = TRUE
+                    """,
+                    (chat_id, period_start, period_end),
+                )
+                if cur.fetchone():
+                    return
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS daily_reports_count,
+                        COALESCE(SUM(messages_count), 0) AS messages_count,
+                        COALESCE(SUM(extracted_goals_count), 0) AS goals_created_count,
+                        COALESCE(SUM(extracted_tasks_count), 0) AS commitments_count,
+                        0::int AS goal_updates_count,
+                        0::int AS results_count,
+                        0::int AS next_steps_count,
+                        0::int AS risks_count,
+                        0::int AS blockers_count,
+                        0::int AS unresolved_questions_count,
+                        0::int AS done_goal_updates_count,
+                        0::int AS high_risk_goal_updates_count
+                    FROM chat_daily_reports
+                    WHERE chat_id = %s
+                      AND report_date BETWEEN %s AND %s
+                      AND is_current = TRUE
+                    """,
+                    (chat_id, period_start, period_end),
+                )
+                stats = cur.fetchone() or {}
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(version), 0) + 1 AS version
+                    FROM chat_weekly_reports
+                    WHERE chat_id = %s AND period_start = %s AND period_end = %s
+                    """,
+                    (chat_id, period_start, period_end),
+                )
+                version = cur.fetchone()["version"]
+                summary = (
+                    f"Заглушка недели {format_date_ru(period_start)} - {format_date_ru(period_end)}. "
+                    "Сформируйте недельный отчет по чату."
+                )
+                raw_json = {
+                    "source": "chat_weekly_placeholder",
+                    "report_text": summary,
+                    "period_start": period_start.isoformat(),
+                    "period_end": period_end.isoformat(),
+                }
+                cur.execute(
+                    """
+                    INSERT INTO chat_weekly_reports (
+                        chat_id, period_start, period_end, version, is_current, ai_request_id, prompt_id,
+                        generated_at, days_count, daily_reports_count, messages_count,
+                        goals_created_count, goal_updates_count, commitments_count, results_count,
+                        next_steps_count, risks_count, blockers_count, unresolved_questions_count,
+                        done_goal_updates_count, high_risk_goal_updates_count, summary,
+                        dynamics_summary, positives_summary, problems_summary, recommendations, raw_json
+                    ) VALUES (
+                        %s, %s, %s, %s, TRUE, NULL, NULL, now(),
+                        %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        chat_id, period_start, period_end, version,
+                        (period_end - period_start).days + 1,
+                        int(stats.get("daily_reports_count") or 0),
+                        int(stats.get("messages_count") or 0),
+                        int(stats.get("goals_created_count") or 0),
+                        int(stats.get("goal_updates_count") or 0),
+                        int(stats.get("commitments_count") or 0),
+                        int(stats.get("results_count") or 0),
+                        int(stats.get("next_steps_count") or 0),
+                        int(stats.get("risks_count") or 0),
+                        int(stats.get("blockers_count") or 0),
+                        int(stats.get("unresolved_questions_count") or 0),
+                        int(stats.get("done_goal_updates_count") or 0),
+                        int(stats.get("high_risk_goal_updates_count") or 0),
+                        summary,
+                        "Динамика будет рассчитана после формирования полного недельного отчета.",
+                        "Нет данных.",
+                        "Нет данных.",
+                        "Сформируйте недельный отчет по чату при необходимости.",
+                        pg_json(raw_json),
+                    ),
+                )
+
+
+def ensure_reports_placeholders(anchor_date: date | None = None) -> None:
+    if not postgres_enabled():
+        return
+    if anchor_date is None:
+        anchor_date = date(2026, 3, 30)
+    end_date = latest_visible_report_date()
+    if anchor_date > end_date:
+        return
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, dialog_id FROM chats WHERE is_excluded = FALSE ORDER BY dialog_id")
+            chats = [{"chat_id": row["id"], "dialog_id": row["dialog_id"]} for row in cur.fetchall()]
+    for chat in chats:
+        dialog_id = chat["dialog_id"]
+        chat_id = chat["chat_id"]
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT report_date
+                    FROM chat_daily_reports
+                    WHERE chat_id = %s
+                      AND is_current = TRUE
+                      AND report_date BETWEEN %s AND %s
+                    """,
+                    (chat_id, anchor_date, end_date),
+                )
+                existing_reports = {row["report_date"] for row in cur.fetchall()}
+                cur.execute(
+                    """
+                    SELECT DISTINCT message_day
+                    FROM chat_messages
+                    WHERE chat_id = %s
+                      AND message_day BETWEEN %s AND %s
+                    """,
+                    (chat_id, anchor_date, end_date),
+                )
+                message_days = {row["message_day"] for row in cur.fetchall()}
+        for day in _daterange(anchor_date, end_date):
+            if day in existing_reports:
+                continue
+            if day in message_days:
+                continue
+            continue
+        for day in _daterange(anchor_date, end_date):
+            if day.weekday() != 6:
+                continue
+            week_start = day - timedelta(days=6)
+            create_chat_weekly_placeholder(chat_id, week_start, day)
+    for day in _daterange(anchor_date, end_date):
+        create_chat_overall_daily_placeholder(day)
+        if day.weekday() == 6:
+            week_start = day - timedelta(days=6)
+            create_chat_overall_weekly_placeholder(week_start, day)
+
+
+def ensure_reports_placeholders_once_per_day() -> None:
+    global _PLACEHOLDER_SYNCED_THROUGH
+    target_day = latest_visible_report_date()
+    if _PLACEHOLDER_SYNCED_THROUGH is not None and _PLACEHOLDER_SYNCED_THROUGH >= target_day:
+        return
+    try:
+        ensure_reports_placeholders(REPORT_PLACEHOLDER_START_DATE)
+        _PLACEHOLDER_SYNCED_THROUGH = target_day
+    except Exception:
+        # Placeholder sync must not break API responses.
+        pass
+
+
+def process_chat_image_ocr_for_period(date_from: date, date_to: date, force: bool = False, dialog_id: str | None = None) -> dict[str, Any]:
+    if date_from > msk_today() or date_to > msk_today():
+        raise ValueError("Нельзя обрабатывать чаты за будущую дату.")
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        f.*,
+                        c.id AS pg_chat_id,
+                        c.dialog_id,
+                        c.chat_title,
+                        m.bitrix_message_id AS message_id,
+                        m.message_date,
+                        m.message_day,
+                        f.bitrix_file_id AS file_id,
+                        f.file_name AS name,
+                        NULL::text AS extension,
+                        f.file_size AS size,
+                        NULL::text AS show_url,
+                        NULL::text AS preview_url,
+                        o.ocr_status
+                    FROM chat_message_files f
+                    JOIN chat_messages m ON m.id = f.message_id AND m.message_day = f.message_day
+                    JOIN chats c ON c.id = f.chat_id
+                    LEFT JOIN LATERAL (
+                        SELECT ocr_status
+                        FROM chat_file_ocr
+                        WHERE file_id = f.id
+                        ORDER BY
+                            CASE ocr_provider WHEN 'manual' THEN 0 WHEN 'openai' THEN 1 ELSE 2 END,
+                            updated_at DESC
+                        LIMIT 1
+                    ) o ON TRUE
+                    WHERE c.is_excluded = FALSE
+                      AND m.message_day BETWEEN %s AND %s
+                      AND (%s::text IS NULL OR c.dialog_id = %s)
+                      AND (%s = TRUE OR o.ocr_status IS NULL OR o.ocr_status != 'success')
+                    ORDER BY m.message_day ASC, m.bitrix_message_id ASC, f.bitrix_file_id ASC
+                    """,
+                    (date_from, date_to, dialog_id, dialog_id, force),
+                )
+                files = cur.fetchall()
+
+        image_files = [
+            file_row
+            for file_row in files
+            if is_ocr_supported_file_value(file_row["name"], file_row["file_type"], file_row["extension"], file_row.get("mime_type"))
+        ]
+        if not image_files:
+            return {
+                "message": (
+                    f"За {format_date_ru(date_from)} - {format_date_ru(date_to)} изображений или PDF для OCR не найдено. "
+                    "Чаты с текстом без вложений для OCR считаются обработанными."
+                ),
+                "ocr": {"processed": 0, "skipped": len(files), "errors": [], "dialog_id": dialog_id},
+            }
+        if not webhook_base:
+            raise ValueError("Укажите BITRIX_WEBHOOK_BASE в .env для скачивания файлов Bitrix")
+        if not llm_api_key():
+            raise ValueError("Для OCR изображений укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+
+        processed = 0
+        skipped = 0
+        errors: list[dict[str, Any]] = []
+        for file_row in files:
+            if not is_ocr_supported_file_value(file_row["name"], file_row["file_type"], file_row["extension"], file_row.get("mime_type")):
+                skipped += 1
+                continue
+            download: dict[str, Any] | None = None
+            started_at = datetime.now()
+            ai_request_id = None
+            try:
+                download = download_chat_image_file(file_row, webhook_base)
+                with pg_connect() as conn:
+                    with conn.transaction():
+                        with conn.cursor() as cur:
+                            fallback_prompt = (
+                                "Выполни только OCR/расшифровку изображения или PDF-документа. "
+                                "Распознай весь видимый текст максимально точно. "
+                                "Не создавай цели, задачи, факты и выводы. Верни только OCR-текст."
+                            )
+                            prompt_id, prompt_text = pg_active_prompt(cur, "image_processing", fallback_prompt)
+                            model = os.getenv("OPENAI_OCR_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")).strip()
+                            ai_request_id = pg_insert_ai_request(
+                                cur,
+                                "image_ocr",
+                                prompt_id,
+                                prompt_text,
+                                "openai",
+                                model,
+                                {
+                                    "file_id": str(file_row["id"]),
+                                    "bitrix_file_id": file_row["bitrix_file_id"],
+                                    "file_name": file_row["file_name"],
+                                    "message_id": file_row["message_id"],
+                                    "message_date": iso_or_none(file_row["message_date"]),
+                                    "message_day": file_row["message_day"].isoformat() if hasattr(file_row["message_day"], "isoformat") else file_row["message_day"],
+                                    "dialog_id": file_row["dialog_id"],
+                                    "chat_id": str(file_row["pg_chat_id"]),
+                                    "chat_title": file_row["chat_title"],
+                                    "size": download.get("size"),
+                                    "sha256": download.get("sha256"),
+                                },
+                                started_at,
+                            )
+                ocr_context = {
+                    "file_id": str(file_row["id"]),
+                    "chat_id": str(file_row["pg_chat_id"]),
+                    "dialog_id": file_row["dialog_id"],
+                    "chat_title": file_row["chat_title"],
+                    "message_id": file_row["message_id"],
+                    "message_date": iso_or_none(file_row["message_date"]),
+                    "message_day": file_row["message_day"].isoformat() if hasattr(file_row["message_day"], "isoformat") else file_row["message_day"],
+                    "file_name": file_row["name"],
+                }
+                ocr_text, model, raw = recognize_image_text_with_openai(download["content"], download["mime_type"], file_row["name"], prompt_text, ocr_context)
+                with pg_connect() as conn:
+                    with conn.transaction():
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO chat_file_ocr (
+                                    file_id, ocr_provider, ocr_text, ocr_status,
+                                    confidence, error_text, raw_json
+                                ) VALUES (%s, 'openai', %s, 'success', NULL, NULL, %s)
+                                ON CONFLICT (file_id, ocr_provider) DO UPDATE SET
+                                    ocr_text = EXCLUDED.ocr_text,
+                                    ocr_status = 'success',
+                                    error_text = NULL,
+                                    raw_json = EXCLUDED.raw_json,
+                                    updated_at = now()
+                                RETURNING id
+                                """,
+                                (file_row["id"], ocr_text, pg_json(raw)),
+                            )
+                            cur.fetchone()
+                            cur.execute(
+                                """
+                                UPDATE chat_message_files
+                                SET local_path = %s,
+                                    is_downloaded = TRUE,
+                                    downloaded_at = now(),
+                                    updated_at = now()
+                                WHERE id = %s
+                                """,
+                                (download.get("local_path"), file_row["id"]),
+                            )
+                            if ai_request_id:
+                                pg_finish_ai_request(cur, ai_request_id, "success", started_at, response_text=ocr_text, raw_response_json=raw)
+                processed += 1
+            except Exception as exc:  # noqa: BLE001
+                with pg_connect() as conn:
+                    with conn.transaction():
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO chat_file_ocr (
+                                    file_id, ocr_provider, ocr_text, ocr_status,
+                                    confidence, error_text, raw_json
+                                ) VALUES (%s, 'openai', NULL, 'error', NULL, %s, %s)
+                                ON CONFLICT (file_id, ocr_provider) DO UPDATE SET
+                                    ocr_status = 'error',
+                                    error_text = EXCLUDED.error_text,
+                                    raw_json = EXCLUDED.raw_json,
+                                    updated_at = now()
+                                """,
+                                (file_row["id"], str(exc), pg_json({"error": str(exc)})),
+                            )
+                            if ai_request_id:
+                                pg_finish_ai_request(cur, ai_request_id, "error", started_at, error_text=str(exc), raw_response_json={"error": str(exc)})
+                errors.append({"file_id": file_row["file_id"], "message_id": file_row["message_id"], "dialog_id": file_row["dialog_id"], "error": str(exc)})
+
+        return {
+            "message": (
+                f"OCR изображений/PDF завершен за {format_date_ru(date_from)} - {format_date_ru(date_to)}: "
+                f"распознано {processed}, пропущено не-картинок {skipped}, ошибок {len(errors)}."
+            ),
+            "ocr": {"processed": processed, "skipped": skipped, "errors": errors[:50], "dialog_id": dialog_id},
+        }
+
+    sync_work_registry()
+    with db_connect() as conn:
+        files = conn.execute(
+            """
+            SELECT f.*
+            FROM chat_message_files f
+            JOIN chat_messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id
+            JOIN chats c ON c.dialog_id = f.dialog_id
+            LEFT JOIN chat_file_ocr o ON o.dialog_id = f.dialog_id AND o.message_id = f.message_id AND o.file_id = f.file_id
+            WHERE COALESCE(c.is_excluded, 0) = 0
+              AND m.message_day BETWEEN ? AND ?
+              AND (? = 1 OR o.status IS NULL OR o.status != 'done')
+            ORDER BY m.message_day ASC, f.file_id ASC
+            """,
+            (date_from.isoformat(), date_to.isoformat(), 1 if force else 0),
+        ).fetchall()
+
+    processed = 0
+    skipped = 0
+    errors: list[dict[str, Any]] = []
+    for file_row in files:
+        if not is_ocr_supported_file_value(file_row["name"], file_row["file_type"], file_row["extension"]):
+            skipped += 1
+            continue
+        download: dict[str, Any] | None = None
+        try:
+            download = download_chat_image_file(file_row, webhook_base)
+            ocr_text, model, raw = recognize_image_text_with_openai(download["content"], download["mime_type"], file_row["name"])
+            with db_connect() as conn:
+                save_chat_file_ocr(conn, file_row, download, "done", ocr_text=ocr_text, model=model, raw=raw)
+                artifact_id = upsert_source_artifact(
+                    conn,
+                    {
+                        "source_type": "chat_file_ocr",
+                        "source_key": f"chat_file_ocr:{file_row['dialog_id']}:{file_row['message_id']}:{file_row['file_id']}",
+                        "source_title": f"OCR: {file_row['name'] or file_row['file_id']}",
+                        "source_text": ocr_text,
+                        "source_url": download.get("source_url"),
+                        "dialog_id": file_row["dialog_id"],
+                        "message_id": file_row["message_id"],
+                        "file_id": file_row["file_id"],
+                        "artifact_date": date_to.isoformat(),
+                        "raw_json": {"model": model, "sha256": download.get("sha256")},
+                    },
+                )
+                source_artifact = conn.execute(
+                    """
+                    SELECT artifact_id
+                    FROM source_artifacts
+                    WHERE source_key = ?
+                    """,
+                    (f"chat_file:{file_row['dialog_id']}:{file_row['message_id']}:{file_row['file_id']}",),
+                ).fetchone()
+                if source_artifact:
+                    # OCR artifact is a derived evidence source; work items will link to it after chat analysis.
+                    pass
+            processed += 1
+        except Exception as exc:  # noqa: BLE001
+            with db_connect() as conn:
+                save_chat_file_ocr(conn, file_row, download, "error", error=str(exc), raw={"error": str(exc)})
+            errors.append({"file_id": file_row["file_id"], "message_id": file_row["message_id"], "dialog_id": file_row["dialog_id"], "error": str(exc)})
+
+    payload = load_work_registry(
+        message=(
+            f"OCR изображений завершен за {format_date_ru(date_from)} - {format_date_ru(date_to)}: "
+            f"распознано {processed}, пропущено не-картинок {skipped}, ошибок {len(errors)}."
+        )
+    )
+    payload["ocr"] = {"processed": processed, "skipped": skipped, "errors": errors[:50]}
+    return payload
+
+
+def sync_work_registry() -> dict[str, Any]:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT bt.id, bt.bitrix_task_id, bt.title, bt.responsible_id,
+                               COALESCE(bt.created_at_bitrix, bt.updated_at_bitrix, bt.synced_at, bt.created_at)::date AS artifact_date,
+                               bt.raw_json
+                        FROM bitrix_tasks bt
+                        """
+                    )
+                    tasks = cur.fetchall()
+                    task_artifacts = 0
+                    for task in tasks:
+                        pg_upsert_source_artifact(
+                            cur,
+                            "bitrix_task",
+                            f"bitrix_task:{task['bitrix_task_id']}",
+                            content_text=task["title"],
+                            artifact_date=task["artifact_date"],
+                            user_id=task["responsible_id"],
+                            bitrix_task_id=task["id"],
+                            raw=task["raw_json"] if isinstance(task["raw_json"], dict) else {},
+                        )
+                        task_artifacts += 1
+
+                    cur.execute(
+                        """
+                        SELECT m.id, m.message_day, m.bitrix_message_id, m.author_id,
+                               m.message_text, m.raw_json, c.id AS chat_id, c.dialog_id
+                        FROM chat_messages m
+                        JOIN chats c ON c.id = m.chat_id
+                        WHERE c.is_excluded = FALSE
+                        """
+                    )
+                    messages = cur.fetchall()
+                    chat_artifacts = 0
+                    for message in messages:
+                        pg_upsert_source_artifact(
+                            cur,
+                            "chat_message",
+                            f"chat_message:{message['id']}",
+                            content_text=message["message_text"],
+                            artifact_date=message["message_day"],
+                            user_id=message["author_id"],
+                            chat_id=message["chat_id"],
+                            chat_message_id=message["id"],
+                            chat_message_day=message["message_day"],
+                            raw={
+                                "dialog_id": message["dialog_id"],
+                                "bitrix_message_id": message["bitrix_message_id"],
+                                "message": message["raw_json"],
+                            },
+                        )
+                        chat_artifacts += 1
+
+                    cur.execute(
+                        """
+                        SELECT f.id, f.message_day, f.file_name, f.raw_json, f.chat_id,
+                               f.message_id, m.author_id, c.dialog_id
+                        FROM chat_message_files f
+                        JOIN chat_messages m ON m.id = f.message_id AND m.message_day = f.message_day
+                        JOIN chats c ON c.id = f.chat_id
+                        WHERE c.is_excluded = FALSE
+                        """
+                    )
+                    files = cur.fetchall()
+                    file_artifacts = 0
+                    for file_row in files:
+                        pg_upsert_source_artifact(
+                            cur,
+                            "chat_file",
+                            f"chat_file:{file_row['id']}",
+                            content_text=file_row["file_name"],
+                            artifact_date=file_row["message_day"],
+                            user_id=file_row["author_id"],
+                            chat_id=file_row["chat_id"],
+                            chat_message_id=file_row["message_id"],
+                            chat_message_day=file_row["message_day"],
+                            chat_file_id=file_row["id"],
+                            raw={"dialog_id": file_row["dialog_id"], "file": file_row["raw_json"]},
+                        )
+                        file_artifacts += 1
+
+        return load_work_registry(
+            message=(
+                f"Единый реестр PostgreSQL обновлен: источников из задач {task_artifacts}, "
+                f"сообщений {chat_artifacts}, файлов {file_artifacts}. "
+                "Задачи из чатов появляются после ИИ-анализа всего диалога."
+            )
+        )
+
+    result_message = ""
+    with db_connect() as conn:
+        tasks = conn.execute("SELECT * FROM tasks ORDER BY task_id DESC").fetchall()
+        messages = conn.execute(
+            """
+            SELECT m.*, c.title AS chat_title
+            FROM chat_messages m
+            JOIN chats c ON c.dialog_id = m.dialog_id
+            WHERE COALESCE(c.is_excluded, 0) = 0
+            ORDER BY m.message_day DESC, m.message_id DESC
+            """
+        ).fetchall()
+        files = conn.execute(
+            """
+            SELECT f.*, m.author_id, m.author_name, m.message_date, m.message_day, c.title AS chat_title
+            FROM chat_message_files f
+            JOIN chat_messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id
+            JOIN chats c ON c.dialog_id = f.dialog_id
+            WHERE COALESCE(c.is_excluded, 0) = 0
+            ORDER BY m.message_day DESC, f.file_id DESC
+            """
+        ).fetchall()
+
+        task_artifacts = 0
+        work_items = 0
+        chat_artifacts = 0
+        file_artifacts = 0
+        conn.execute(
+            """
+            DELETE FROM extracted_facts
+            WHERE fact_type IN ('chat_message_unprocessed', 'chat_file_needs_ocr')
+            """
+        )
+
+        for task in tasks:
+            artifact_id = upsert_source_artifact(
+                conn,
+                {
+                    "source_type": "bitrix_task",
+                    "source_key": f"bitrix_task:{task['task_id']}",
+                    "source_title": task["title"],
+                    "source_text": "\n\n".join(part for part in [task["title"], task["description"]] if part),
+                    "person_id": task["responsible_id"],
+                    "person_name": task["responsible_name"],
+                    "task_id": task["task_id"],
+                    "artifact_date": str(task["changed_date"] or task["created_date"] or task["deadline"] or "")[:10],
+                    "raw_json": {"task_id": task["task_id"]},
+                },
+            )
+            task_artifacts += 1
+            create_work_item_from_task(conn, task, artifact_id)
+            work_items += 1
+
+        for message in messages:
+            text = (message["text"] or "").strip()
+            artifact_id = upsert_source_artifact(
+                conn,
+                {
+                    "source_type": "chat_message",
+                    "source_key": f"chat_message:{message['dialog_id']}:{message['message_id']}",
+                    "source_title": f"{message['chat_title'] or message['dialog_id']} / сообщение {message['message_id']}",
+                    "source_text": text,
+                    "person_id": message["author_id"],
+                    "person_name": message["author_name"],
+                    "dialog_id": message["dialog_id"],
+                    "message_id": message["message_id"],
+                    "artifact_date": message["message_day"],
+                    "raw_json": {"message_id": message["message_id"], "dialog_id": message["dialog_id"]},
+                },
+            )
+            chat_artifacts += 1
+
+        for file_row in files:
+            file_url = first_non_empty(file_row["show_url"], file_row["download_url"], file_row["preview_url"])
+            artifact_id = upsert_source_artifact(
+                conn,
+                {
+                    "source_type": "chat_file",
+                    "source_key": f"chat_file:{file_row['dialog_id']}:{file_row['message_id']}:{file_row['file_id']}",
+                    "source_title": file_row["name"] or f"Файл {file_row['file_id']}",
+                    "source_text": f"Файл из чата {file_row['chat_title'] or file_row['dialog_id']}: {file_row['name'] or file_row['file_id']}",
+                    "source_url": file_url,
+                    "person_id": file_row["author_id"],
+                    "person_name": file_row["author_name"],
+                    "dialog_id": file_row["dialog_id"],
+                    "message_id": file_row["message_id"],
+                    "file_id": file_row["file_id"],
+                    "artifact_date": file_row["message_day"],
+                    "raw_json": {"file_id": file_row["file_id"], "name": file_row["name"], "url": file_url},
+                },
+            )
+            file_artifacts += 1
+
+        result_message = (
+            f"Единый реестр обновлен: источников из задач {task_artifacts}, "
+            f"сообщений {chat_artifacts}, файлов {file_artifacts}, рабочих задач {work_items}. "
+            "Сообщения чатов сохранены как сырье; задачи из них появятся только после ИИ-анализа."
+        )
+
+    return load_work_registry(message=result_message)
+
+
+def chat_transcript_for_period(conn: Any, dialog_id: str, date_from: date, date_to: date) -> tuple[Any | None, list[Any], list[Any]]:
+    chat = conn.execute("SELECT * FROM chats WHERE dialog_id = ?", (dialog_id,)).fetchone()
+    messages = conn.execute(
+        """
+        SELECT *
+        FROM chat_messages
+        WHERE dialog_id = ? AND message_day BETWEEN ? AND ?
+        ORDER BY message_day ASC, message_id ASC
+        """,
+        (dialog_id, date_from.isoformat(), date_to.isoformat()),
+    ).fetchall()
+    files = conn.execute(
+        """
+        SELECT *
+        FROM chat_message_files
+        WHERE dialog_id = ? AND message_id IN (
+            SELECT message_id FROM chat_messages
+            WHERE dialog_id = ? AND message_day BETWEEN ? AND ?
+        )
+        ORDER BY message_id ASC, file_id ASC
+        """,
+        (dialog_id, dialog_id, date_from.isoformat(), date_to.isoformat()),
+    ).fetchall()
+    return chat, messages, files
+
+
+def analyze_chat_work_with_ai(dialog_id: str, date_from: date, date_to: date) -> dict[str, Any]:
+    api_key = llm_api_key()
+    if not api_key:
+        raise ValueError("Для ИИ-анализа чатов укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM chats WHERE dialog_id = %s", (dialog_id,))
+                chat = cur.fetchone()
+                if chat is None:
+                    raise ValueError(f"Чат {dialog_id} не найден")
+                cur.execute(
+                    """
+                    SELECT m.*, u.full_name AS author_name
+                    FROM chat_messages m
+                    LEFT JOIN users u ON u.id = m.author_id
+                    WHERE m.chat_id = %s AND m.message_day BETWEEN %s AND %s
+                    ORDER BY m.message_day ASC, m.bitrix_message_id ASC
+                    """,
+                    (chat["id"], date_from, date_to),
+                )
+                messages = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT f.*, m.bitrix_message_id, m.author_id, o.ocr_text, o.ocr_status
+                    FROM chat_message_files f
+                    JOIN chat_messages m ON m.id = f.message_id AND m.message_day = f.message_day
+                    LEFT JOIN chat_file_ocr o ON o.file_id = f.id AND o.ocr_provider = 'openai'
+                    WHERE f.chat_id = %s AND f.message_day BETWEEN %s AND %s
+                    ORDER BY m.bitrix_message_id ASC, f.bitrix_file_id ASC
+                    """,
+                    (chat["id"], date_from, date_to),
+                )
+                files = cur.fetchall()
+                if not messages and not files:
+                    version = 1
+                    cur.execute("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM chat_daily_reports WHERE chat_id = %s AND report_date = %s", (chat["id"], date_from))
+                    version = cur.fetchone()["version"]
+                    cur.execute(
+                        """
+                        INSERT INTO chat_daily_reports (
+                            chat_id, report_date, version, is_current, messages_count,
+                            files_count, ocr_files_count, summary, status, raw_ai_json
+                        ) VALUES (%s, %s, %s, TRUE, 0, 0, 0, %s, 'no_data', %s)
+                        """,
+                        (chat["id"], date_from, version, "За день нет сообщений и вложений. Новых подтверждений прогресса по чату нет.", pg_json({"source": "no_messages"})),
+                    )
+                    return {"dialog_id": dialog_id, "tasks_saved": 0, "goals_saved": 0, "facts_saved": 0, "message": "Нет сообщений за период"}
+
+                files_by_message: dict[int, list[dict[str, Any]]] = {}
+                for file_row in files:
+                    files_by_message.setdefault(file_row["bitrix_message_id"], []).append(dict(file_row))
+                transcript_lines: list[str] = []
+                for message in messages:
+                    attachments = files_by_message.get(message["bitrix_message_id"], [])
+                    attachment_text = ""
+                    if attachments:
+                        parts = []
+                        for file_row in attachments:
+                            file_name = file_row.get("file_name") or f"Файл {file_row.get('bitrix_file_id')}"
+                            if file_row.get("ocr_status") == "success" and file_row.get("ocr_text"):
+                                parts.append(f"{file_name} OCR: {str(file_row['ocr_text'])[:4000]}")
+                            else:
+                                parts.append(f"{file_name} OCR: не распознано")
+                        attachment_text = f" | вложения: {'; '.join(parts)}"
+                    transcript_lines.append(
+                        f"message_id={message['bitrix_message_id']} date={format_datetime_ru(message['message_date'])} "
+                        f"author={message['author_name'] or 'Системное сообщение'}: {message['message_text'] or ''}{attachment_text}"
+                    )
+
+                cur.execute(
+                    """
+                    SELECT u.bitrix_user_id AS user_id, u.full_name AS name, u.work_position
+                    FROM chat_members cm
+                    JOIN users u ON u.id = cm.user_id
+                    WHERE cm.chat_id = %s AND cm.is_active = TRUE
+                    ORDER BY u.full_name
+                    """,
+                    (chat["id"],),
+                )
+                members = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT u.bitrix_user_id AS user_id, u.full_name AS name, u.work_position,
+                           m.bitrix_user_id AS manager_id, m.full_name AS manager_name
+                    FROM users u
+                    LEFT JOIN users m ON m.id = u.manager_id
+                    WHERE u.is_active = TRUE
+                    ORDER BY u.full_name
+                    """
+                )
+                team = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT goal_title, goal_text, period_type, period_start, period_end,
+                           u.full_name AS owner_name, success_metrics, status
+                    FROM user_goals g
+                    LEFT JOIN users u ON u.id = g.user_id
+                    WHERE g.status = 'active'
+                      AND g.period_start <= %s AND g.period_end >= %s
+                    ORDER BY g.period_end DESC, g.updated_at DESC
+                    LIMIT 80
+                    """,
+                    (date_to, date_from),
+                )
+                active_goals = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT v.title, v.description, ru.full_name AS assignee_name,
+                           mu.full_name AS manager_name, v.period_type, v.work_date,
+                           v.deadline_at, v.normalized_status AS status
+                    FROM v_work_items_full v
+                    LEFT JOIN users ru ON ru.id = v.responsible_id
+                    LEFT JOIN users mu ON mu.id = v.manager_id
+                    WHERE COALESCE(v.normalized_status, '') NOT IN ('done', 'cancelled')
+                    ORDER BY COALESCE(v.deadline_at, v.work_date::timestamptz, v.updated_at) DESC
+                    LIMIT 120
+                    """
+                )
+                open_work_items = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT artifact_date, raw_json, content_text
+                    FROM source_artifacts
+                    WHERE source_type = 'ai_analysis'
+                      AND COALESCE(raw_json->>'kind', '') IN ('fact', 'confirmation', 'unknown')
+                    ORDER BY artifact_date DESC NULLS LAST, created_at DESC
+                    LIMIT 80
+                    """
+                )
+                recent_facts = cur.fetchall()
+                fallback_prompt, _ = "", None
+                prompt_id, configured_prompt = pg_active_prompt(cur, "chat_analysis", "")
+
+        transcript = "\n".join(transcript_lines)[-60000:]
+        roster_text = "\n".join(
+            f"{row['user_id']}: {row['name']} ({row['work_position'] or 'без должности'}), руководитель: {row['manager_name'] or '-'}"
+            for row in team[:120]
+        )
+        member_text = "\n".join(f"{row['user_id']}: {row['name']} ({row['work_position'] or 'без должности'})" for row in members)
+        goals_text = "\n".join(
+            f"- {row['goal_title']} | {row['period_type'] or '-'} {row['period_start'] or '?'}..{row['period_end'] or '?'} | owner={row['owner_name'] or '-'} | metrics={row['success_metrics'] or '-'}"
+            for row in active_goals
+        ) or "Нет активных целей в памяти."
+        open_tasks_text = "\n".join(
+            f"- {row['title']} | assignee={row['assignee_name'] or '-'} | status={row['status'] or '-'} | deadline={format_datetime_ru(row['deadline_at']) if row['deadline_at'] else '-'} | work_date={row['work_date'] or '-'}"
+            for row in open_work_items
+        ) or "Нет открытых задач в памяти."
+        facts_text = "\n".join(
+            f"- {row['artifact_date'] or '-'} {((row['raw_json'] or {}).get('kind') if isinstance(row['raw_json'], dict) else '-')}: {row['content_text']}"
+            for row in recent_facts
+        ) or "Нет прошлых фактов в памяти."
+        base_prompt = configured_prompt or (
+            "Проанализируй дневную переписку чата как единый второй слой аналитики. "
+            "Сообщение не равно задача. OCR не равен задача. Создавай задачи только при явном основании. "
+            "Верни строго JSON с ключами daily_summary, chat_goal, tasks, facts, confirmations, unknown_blocks."
+        )
+        prompt = (
+            f"{base_prompt}\n\n"
+            "Формат JSON:\n"
+            '{"daily_summary":"...", "chat_goal":null, "tasks":[], "facts":[], "confirmations":[], "unknown_blocks":[]}\n\n'
+            f"Чат: {chat['chat_title'] or dialog_id}\n"
+            f"Период: {date_from.isoformat()} - {date_to.isoformat()}\n\n"
+            f"Участники чата:\n{member_text}\n\n"
+            f"Команда и руководители:\n{roster_text}\n\n"
+            f"Активные цели из памяти:\n{goals_text}\n\n"
+            f"Открытые задачи из памяти:\n{open_tasks_text}\n\n"
+            f"Последние факты из памяти:\n{facts_text}\n\n"
+            f"Переписка:\n{transcript}"
+        )
+        started_at = datetime.now()
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    ai_request_id = pg_insert_ai_request(
+                        cur,
+                        "chat_daily_analysis",
+                        prompt_id,
+                        prompt,
+                        "openai",
+                        model,
+                        {"dialog_id": dialog_id, "date_from": date_from.isoformat(), "date_to": date_to.isoformat()},
+                        started_at,
+                    )
+        try:
+            response = llm_post_with_retry(
+                llm_api_url("/chat/completions"),
+                headers=llm_auth_headers(api_key),
+                payload={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": "Ты строгий операционный аналитик. Не превращай сообщения в задачи без явного основания."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.1,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=120,
+            )
+            response.raise_for_status()
+            raw_response = response.json()
+            content = raw_response["choices"][0]["message"]["content"]
+            analysis = extract_json_object(content)
+        except Exception as exc:
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        pg_finish_ai_request(cur, ai_request_id, "error", started_at, error_text=str(exc), raw_response_json={"error": str(exc)})
+            raise
+
+        tasks = analysis.get("tasks") if isinstance(analysis.get("tasks"), list) else []
+        facts = analysis.get("facts") if isinstance(analysis.get("facts"), list) else []
+        confirmations = analysis.get("confirmations") if isinstance(analysis.get("confirmations"), list) else []
+        unknown_blocks = analysis.get("unknown_blocks") if isinstance(analysis.get("unknown_blocks"), list) else []
+        goal = analysis.get("chat_goal") if isinstance(analysis.get("chat_goal"), dict) else None
+        tasks_saved = 0
+        goals_saved = 0
+        facts_saved = 0
+        summary_text = str(analysis.get("daily_summary") or "").strip()
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    pg_finish_ai_request(cur, ai_request_id, "success", started_at, response_text=content, response_json=analysis, raw_response_json=raw_response)
+                    goal_artifact_id = pg_upsert_source_artifact(
+                        cur,
+                        "ai_analysis",
+                        f"chat_ai_goal:{dialog_id}:{date_from.isoformat()}:{date_to.isoformat()}",
+                        content_text=json.dumps(goal or {}, ensure_ascii=False),
+                        artifact_date=date_to,
+                        chat_id=chat["id"],
+                        ai_request_id=ai_request_id,
+                        raw={"kind": "goal", "goal": goal, "model": model},
+                    )
+                    if goal:
+                        goals_saved = 1 if pg_upsert_ai_goal(cur, date_from, date_to, goal, goal_artifact_id) else 0
+                    for index, task in enumerate(tasks, start=1):
+                        if not isinstance(task, dict) or not str(task.get("title") or "").strip():
+                            continue
+                        fingerprint = hashlib.sha1(f"{dialog_id}|{date_from}|{date_to}|{task.get('title')}|{task.get('assignee_name')}".encode("utf-8")).hexdigest()[:12]
+                        artifact_id = pg_upsert_source_artifact(
+                            cur,
+                            "ai_analysis",
+                            f"chat_ai_task:{dialog_id}:{date_from.isoformat()}:{date_to.isoformat()}:{fingerprint}",
+                            content_text=json.dumps(task, ensure_ascii=False),
+                            artifact_date=date_to,
+                            chat_id=chat["id"],
+                            ai_request_id=ai_request_id,
+                            raw={"kind": "task", "task": task, "model": model, "index": index},
+                        )
+                        pg_create_work_item_from_ai_task(cur, chat["id"], date_from, date_to, task, artifact_id)
+                        tasks_saved += 1
+                    for index, fact in enumerate(facts, start=1):
+                        text = str(fact.get("text") or fact.get("fact_text") or "").strip() if isinstance(fact, dict) else ""
+                        if not text:
+                            continue
+                        person = pg_get_user_by_name(cur, fact.get("person_name"))
+                        fingerprint = hashlib.sha1(f"{dialog_id}|{date_from}|{date_to}|{fact.get('type')}|{text}|{fact.get('person_name')}".encode("utf-8")).hexdigest()[:12]
+                        pg_upsert_source_artifact(
+                            cur,
+                            "ai_analysis",
+                            f"chat_ai_fact:{dialog_id}:{date_from.isoformat()}:{date_to.isoformat()}:{fingerprint}",
+                            content_text=text,
+                            artifact_date=safe_parse_date(fact.get("date")) or date_to,
+                            user_id=person["id"] if person else None,
+                            chat_id=chat["id"],
+                            ai_request_id=ai_request_id,
+                            raw={"kind": "fact", "fact": fact, "model": model, "index": index},
+                        )
+                        facts_saved += 1
+                    for index, confirmation in enumerate(confirmations, start=1):
+                        text = str(confirmation.get("reason") or confirmation.get("target_title") or "").strip() if isinstance(confirmation, dict) else ""
+                        if not text:
+                            continue
+                        fingerprint = hashlib.sha1(f"{dialog_id}|{date_from}|{date_to}|confirmation|{text}|{index}".encode("utf-8")).hexdigest()[:12]
+                        pg_upsert_source_artifact(
+                            cur,
+                            "ai_analysis",
+                            f"chat_ai_confirmation:{dialog_id}:{date_from.isoformat()}:{date_to.isoformat()}:{fingerprint}",
+                            content_text=text,
+                            artifact_date=date_to,
+                            chat_id=chat["id"],
+                            ai_request_id=ai_request_id,
+                            raw={"kind": "confirmation", "confirmation": confirmation, "model": model, "index": index},
+                        )
+                    for index, block in enumerate(unknown_blocks, start=1):
+                        text = str(block.get("text") or block.get("reason") or "").strip() if isinstance(block, dict) else ""
+                        if not text:
+                            continue
+                        fingerprint = hashlib.sha1(f"{dialog_id}|{date_from}|{date_to}|unknown|{text}|{index}".encode("utf-8")).hexdigest()[:12]
+                        pg_upsert_source_artifact(
+                            cur,
+                            "ai_analysis",
+                            f"chat_ai_unknown:{dialog_id}:{date_from.isoformat()}:{date_to.isoformat()}:{fingerprint}",
+                            content_text=text,
+                            artifact_date=date_to,
+                            chat_id=chat["id"],
+                            ai_request_id=ai_request_id,
+                            raw={"kind": "unknown", "unknown": block, "model": model, "index": index},
+                        )
+                    cur.execute(
+                        "SELECT COALESCE(MAX(version), 0) + 1 AS version FROM chat_daily_reports WHERE chat_id = %s AND report_date = %s",
+                        (chat["id"], date_from),
+                    )
+                    version = cur.fetchone()["version"]
+                    cur.execute(
+                        """
+                        INSERT INTO chat_daily_reports (
+                            chat_id, report_date, version, is_current, ai_request_id,
+                            prompt_id, generated_at, messages_count, files_count,
+                            ocr_files_count, extracted_tasks_count, extracted_goals_count,
+                            extracted_facts_count, summary, raw_ai_json, status
+                        ) VALUES (%s, %s, %s, TRUE, %s, %s, now(), %s, %s, %s, %s, %s, %s, %s, %s, 'done')
+                        """,
+                        (
+                            chat["id"], date_from, version, ai_request_id, prompt_id,
+                            len(messages), len(files),
+                            sum(1 for file_row in files if file_row.get("ocr_status") == "success"),
+                            tasks_saved, goals_saved, facts_saved, summary_text,
+                            pg_json(analysis),
+                        ),
+                    )
+        if not summary_text:
+            summary_text = f"Извлечено задач: {tasks_saved}, целей: {goals_saved}, фактов: {facts_saved}."
+        return {
+            "dialog_id": dialog_id,
+            "chat_title": chat["chat_title"] or dialog_id,
+            "model": model,
+            "tasks_saved": tasks_saved,
+            "goals_saved": goals_saved,
+            "facts_saved": facts_saved,
+            "confirmations_count": len(confirmations),
+            "unknown_blocks_count": len(unknown_blocks),
+            "summary_text": summary_text,
+        }
+
+    with db_connect() as conn:
+        chat, messages, files = chat_transcript_for_period(conn, dialog_id, date_from, date_to)
+        if chat is None:
+            raise ValueError(f"Чат {dialog_id} не найден")
+        if not messages and not files:
+            if date_from == date_to:
+                save_chat_daily_analytics(
+                    dialog_id=dialog_id,
+                    analytics_date=date_from,
+                    model=model,
+                    status="no_data",
+                    summary_text="За день нет сообщений и вложений. Новых подтверждений прогресса по чату нет.",
+                    raw={"source": "no_messages"},
+                )
+            return {"dialog_id": dialog_id, "tasks_saved": 0, "goals_saved": 0, "message": "Нет сообщений за период"}
+
+        files_by_message: dict[int, list[Any]] = {}
+        for file_row in files:
+            files_by_message.setdefault(file_row["message_id"], []).append(file_row)
+        ocr_rows = conn.execute(
+            """
+            SELECT *
+            FROM chat_file_ocr
+            WHERE dialog_id = ? AND message_id IN (
+                SELECT message_id FROM chat_messages
+                WHERE dialog_id = ? AND message_day BETWEEN ? AND ?
+            )
+            """,
+            (dialog_id, dialog_id, date_from.isoformat(), date_to.isoformat()),
+        ).fetchall()
+        ocr_by_file = {
+            (row["message_id"], row["file_id"]): row
+            for row in ocr_rows
+            if row["status"] == "done" and row["ocr_text"]
+        }
+
+        transcript_lines: list[str] = []
+        for message in messages:
+            attachments = files_by_message.get(message["message_id"], [])
+            attachment_text = ""
+            if attachments:
+                parts = []
+                for file_row in attachments:
+                    file_name = file_row["name"] or f"Файл {file_row['file_id']}"
+                    ocr = ocr_by_file.get((file_row["message_id"], file_row["file_id"]))
+                    if ocr:
+                        parts.append(f"{file_name} OCR: {str(ocr['ocr_text'])[:4000]}")
+                    else:
+                        parts.append(f"{file_name} OCR: не распознано")
+                attachment_text = f" | вложения: {'; '.join(parts)}"
+            transcript_lines.append(
+                f"message_id={message['message_id']} date={format_datetime_ru(message['message_date'])} "
+                f"author={message['author_name'] or 'Системное сообщение'}: {message['text'] or ''}{attachment_text}"
+            )
+
+        members = conn.execute(
+            """
+            SELECT user_id, name, work_position
+            FROM chat_members
+            WHERE dialog_id = ?
+            ORDER BY name COLLATE NOCASE
+            """,
+            (dialog_id,),
+        ).fetchall()
+        team = conn.execute(
+            """
+            SELECT user_id, name, work_position, manager_id, manager_name
+            FROM team_members
+            WHERE active = 1
+            ORDER BY name COLLATE NOCASE
+            """
+        ).fetchall()
+        active_goals = conn.execute(
+            """
+            SELECT goal_title, goal_text, period_type, period_start, period_end, owner_name, success_metrics, status
+            FROM chat_goals
+            WHERE status = 'active'
+              AND (dialog_id IS NULL OR dialog_id = ?)
+              AND (
+                period_start IS NULL
+                OR period_end IS NULL
+                OR (period_start <= ? AND period_end >= ?)
+              )
+            ORDER BY COALESCE(period_end, '') DESC, goal_id DESC
+            LIMIT 80
+            """,
+            (dialog_id, date_to.isoformat(), date_from.isoformat()),
+        ).fetchall()
+        open_work_items = conn.execute(
+            """
+            SELECT title, description, assignee_name, manager_name, dialog_id, period_type, period_start, period_end, deadline, status
+            FROM work_items
+            WHERE COALESCE(status, '') NOT IN ('done', 'completed', 'Завершена')
+              AND (dialog_id IS NULL OR dialog_id = ? OR source_type = 'bitrix_task')
+              AND (
+                period_start IS NULL
+                OR period_end IS NULL
+                OR (period_start <= ? AND period_end >= ?)
+                OR (deadline IS NOT NULL AND substr(deadline, 1, 10) BETWEEN ? AND ?)
+              )
+            ORDER BY COALESCE(deadline, period_end, period_start, updated_at) DESC
+            LIMIT 120
+            """,
+            (dialog_id, date_to.isoformat(), date_from.isoformat(), date_from.isoformat(), date_to.isoformat()),
+        ).fetchall()
+        recent_facts = conn.execute(
+            """
+            SELECT fact_type, fact_date, person_name, dialog_id, title, fact_text, linked_task_title, linked_goal_title
+            FROM work_facts
+            WHERE (dialog_id IS NULL OR dialog_id = ?)
+              AND (fact_date IS NULL OR fact_date <= ?)
+            ORDER BY COALESCE(fact_date, created_at) DESC, fact_id DESC
+            LIMIT 80
+            """,
+            (dialog_id, date_to.isoformat()),
+        ).fetchall()
+
+    transcript = "\n".join(transcript_lines)[-60000:]
+    roster_text = "\n".join(
+        f"{row['user_id']}: {row['name']} ({row['work_position'] or 'без должности'}), руководитель: {row['manager_name'] or '-'}"
+        for row in team[:120]
+    )
+    member_text = "\n".join(
+        f"{row['user_id']}: {row['name']} ({row['work_position'] or 'без должности'})"
+        for row in members
+    )
+    goals_text = "\n".join(
+        f"- {row['goal_title']} | {row['period_type'] or '-'} {row['period_start'] or '?'}..{row['period_end'] or '?'} | owner={row['owner_name'] or '-'} | metrics={row['success_metrics'] or '-'}"
+        for row in active_goals
+    ) or "Нет активных целей в памяти."
+    open_tasks_text = "\n".join(
+        f"- {row['title']} | assignee={row['assignee_name'] or '-'} | status={row['status'] or '-'} | deadline={row['deadline'] or '-'} | period={row['period_start'] or '?'}..{row['period_end'] or '?'}"
+        for row in open_work_items
+    ) or "Нет открытых задач в памяти."
+    facts_text = "\n".join(
+        f"- {row['fact_date'] or '-'} {row['fact_type']}: {row['fact_text']} | person={row['person_name'] or '-'} | task={row['linked_task_title'] or '-'} | goal={row['linked_goal_title'] or '-'}"
+        for row in recent_facts
+    ) or "Нет прошлых фактов в памяти."
+    prompt = (
+        "Проанализируй дневную переписку чата как единый второй слой аналитики.\n"
+        "На входе есть обычные сообщения чата, OCR-текст картинок, отправители картинок и накопленная память по целям/задачам/фактам.\n"
+        "Именно этот этап принимает управленческое решение: что является целью, задачей, фактом, подтверждением или мусором.\n\n"
+        "Критически важно:\n"
+        "- Обычные сообщения, обсуждения, вопросы, ссылки и болтовня НЕ являются задачами.\n"
+        "- OCR-текст картинки сам по себе НЕ является задачей; его нужно интерпретировать вместе с чатом и памятью.\n"
+        "- Задача фиксируется только если есть явное поручение, плановое действие, обещание выполнить работу, дедлайн, ответственный или завершенное действие.\n"
+        "- Если задача/цель есть в OCR, но ответственный не указан, ответственным считается отправитель картинки из строки сообщения author=...\n"
+        "- Если в чате есть подтверждение выполнения задачи из OCR или памяти — сохрани это как fact type=completed_work и укажи linked_task_title.\n"
+        "- Если в чате текстом указали новую цель/задачу без картинки — извлеки ее тоже.\n"
+        "- Если чат опровергает, меняет срок или статус данных из OCR/памяти — зафиксируй это в confirmations.\n"
+        "- Если картинка или сообщение содержит левую информацию, сохрани только fact type=unclassified_attachment, не создавай задачу/цель.\n"
+        "- Если не уверен, не создавай задачу; положи в unknown_blocks.\n\n"
+        "Стандартизация разных форматов:\n"
+        "- Цели проекта/года/квартала/месяца/недели/дня возвращай в chat_goal, если это главная цель чата/периода. Если целей несколько, важные дополнительные цели фиксируй как facts type=plan_update или confirmations.\n"
+        "- Дневные планы возвращай в tasks со status=planned, если нет признака выполнения.\n"
+        "- Галочки, 'выполнено', 'готово', 'результат' возвращай в facts type=completed_work и при необходимости tasks со status=done.\n"
+        "- 'Ожидание результата' — это expected_result в description, не отдельная задача.\n"
+        "- Риски, ошибки, блокеры, решения, встречи возвращай в facts.\n\n"
+        "Верни строго JSON без markdown в формате:\n"
+        "{\n"
+        '  "daily_summary": "краткий управленческий итог дня по этому чату: что произошло, что подтверждено, что требует внимания",\n'
+        '  "chat_goal": null или {"title":"...", "description":"...", "period_type":"day|week|month|quarter|year|period", "owner_name":"...", "success_metrics":"...", "status":"active", "confidence":0.0},\n'
+        '  "tasks": [\n'
+        '    {"title":"...", "description":"...", "assignee_name":"...", "deadline":"YYYY-MM-DD или null", "status":"planned|in_progress|done|blocked|unknown", "priority":"low|normal|high|null", "confidence":0.0, "evidence_message_ids":[123]}\n'
+        "  ],\n"
+        '  "facts": [\n'
+        '    {"type":"completed_work|progress_update|risk|blocker|decision|meeting|plan_update|unclassified_attachment", "date":"YYYY-MM-DD или null", "person_name":"...", "text":"...", "linked_task_title":"... или null", "linked_goal_title":"... или null", "confidence":0.0, "evidence_message_ids":[123]}\n'
+        "  ],\n"
+        '  "confirmations": [\n'
+        '    {"target_type":"goal|task|fact|ocr", "target_title":"...", "result":"confirmed|refuted|updated|insufficient_context", "reason":"...", "evidence_message_ids":[123]}\n'
+        "  ],\n"
+        '  "unknown_blocks": [{"text":"...", "reason":"..."}]\n'
+        "}\n\n"
+        f"Чат: {chat['title'] or dialog_id}\n"
+        f"Период: {date_from.isoformat()} - {date_to.isoformat()}\n\n"
+        f"Участники чата:\n{member_text}\n\n"
+        f"Команда и руководители:\n{roster_text}\n\n"
+        f"Активные цели из памяти:\n{goals_text}\n\n"
+        f"Открытые задачи из памяти:\n{open_tasks_text}\n\n"
+        f"Последние факты из памяти:\n{facts_text}\n\n"
+        f"Переписка:\n{transcript}"
+    )
+    response = llm_post_with_retry(
+        llm_api_url("/chat/completions"),
+        headers=llm_auth_headers(api_key),
+        payload={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "Ты строгий операционный аналитик. Не превращай сообщения в задачи без явного основания."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    raw_response = response.json()
+    content = raw_response["choices"][0]["message"]["content"]
+    analysis = extract_json_object(content)
+
+    tasks = analysis.get("tasks") if isinstance(analysis.get("tasks"), list) else []
+    facts = analysis.get("facts") if isinstance(analysis.get("facts"), list) else []
+    confirmations = analysis.get("confirmations") if isinstance(analysis.get("confirmations"), list) else []
+    unknown_blocks = analysis.get("unknown_blocks") if isinstance(analysis.get("unknown_blocks"), list) else []
+    goal = analysis.get("chat_goal") if isinstance(analysis.get("chat_goal"), dict) else None
+    tasks_saved = 0
+    goals_saved = 0
+    facts_saved = 0
+    with db_connect() as conn:
+        save_analysis_review(conn, dialog_id, date_from, date_to, "chat_second_layer", model, analysis)
+        goal_artifact_id = upsert_source_artifact(
+            conn,
+            {
+                "source_type": "chat_ai_analysis",
+                "source_key": f"chat_ai_goal:{dialog_id}:{date_from.isoformat()}:{date_to.isoformat()}",
+                "source_title": f"ИИ-анализ цели: {(chat['title'] if chat else dialog_id) or dialog_id}",
+                "source_text": json.dumps(goal or {}, ensure_ascii=False),
+                "dialog_id": dialog_id,
+                "artifact_date": date_to.isoformat(),
+                "raw_json": {"analysis": analysis, "model": model},
+            },
+        )
+        if goal:
+            goal_id = upsert_ai_chat_goal(conn, dialog_id, date_from, date_to, goal, goal_artifact_id)
+            goals_saved = 1 if goal_id else 0
+
+        for index, task in enumerate(tasks, start=1):
+            if not isinstance(task, dict) or not str(task.get("title") or "").strip():
+                continue
+            fingerprint = hashlib.sha1(
+                f"{dialog_id}|{date_from.isoformat()}|{date_to.isoformat()}|{task.get('title')}|{task.get('assignee_name')}".encode("utf-8")
+            ).hexdigest()[:12]
+            task_artifact_id = upsert_source_artifact(
+                conn,
+                {
+                    "source_type": "chat_ai_task",
+                    "source_key": f"chat_ai_task:{dialog_id}:{date_from.isoformat()}:{date_to.isoformat()}:{fingerprint}",
+                    "source_title": task.get("title"),
+                    "source_text": json.dumps(task, ensure_ascii=False),
+                    "dialog_id": dialog_id,
+                    "artifact_date": date_to.isoformat(),
+                    "raw_json": {"task": task, "model": model, "index": index},
+                },
+            )
+            work_item_id = create_work_item_from_ai_task(conn, dialog_id, date_from, date_to, task, task_artifact_id)
+            link_work_item_evidence(conn, work_item_id, task_artifact_id, "ai_extracted_from_chat", float(task.get("confidence") or 0.7))
+            for message_id in task.get("evidence_message_ids") or []:
+                message_artifact = conn.execute(
+                    """
+                    SELECT artifact_id
+                    FROM source_artifacts
+                    WHERE source_key = ?
+                    """,
+                    (f"chat_message:{dialog_id}:{message_id}",),
+                ).fetchone()
+                if message_artifact:
+                    link_work_item_evidence(conn, work_item_id, message_artifact["artifact_id"], "chat_message_evidence", 0.9)
+            tasks_saved += 1
+
+        for index, fact in enumerate(facts, start=1):
+            if not isinstance(fact, dict) or not str(fact.get("text") or fact.get("fact_text") or "").strip():
+                continue
+            fingerprint = hashlib.sha1(
+                f"{dialog_id}|{date_from.isoformat()}|{date_to.isoformat()}|{fact.get('type')}|{fact.get('text') or fact.get('fact_text')}|{fact.get('person_name')}".encode("utf-8")
+            ).hexdigest()[:12]
+            fact_artifact_id = upsert_source_artifact(
+                conn,
+                {
+                    "source_type": "chat_ai_fact",
+                    "source_key": f"chat_ai_fact:{dialog_id}:{date_from.isoformat()}:{date_to.isoformat()}:{fingerprint}",
+                    "source_title": fact.get("title") or str(fact.get("text") or fact.get("fact_text"))[:120],
+                    "source_text": json.dumps(fact, ensure_ascii=False),
+                    "dialog_id": dialog_id,
+                    "artifact_date": fact.get("date") or date_to.isoformat(),
+                    "raw_json": {"fact": fact, "model": model, "index": index},
+                },
+            )
+            fact_id = create_work_fact_from_ai(conn, dialog_id, date_from, date_to, fact, fact_artifact_id)
+            for message_id in fact.get("evidence_message_ids") or []:
+                message_artifact = conn.execute(
+                    """
+                    SELECT artifact_id
+                    FROM source_artifacts
+                    WHERE source_key = ?
+                    """,
+                    (f"chat_message:{dialog_id}:{message_id}",),
+                ).fetchone()
+                if message_artifact:
+                    # The fact itself stores the normalized result; the raw message remains available as evidence source.
+                    pass
+            facts_saved += 1
+
+    summary_text = str(analysis.get("daily_summary") or "").strip()
+    if not summary_text:
+        summary_text = (
+            f"Извлечено задач: {tasks_saved}, целей: {goals_saved}, фактов: {facts_saved}. "
+            f"Подтверждений/изменений: {len(confirmations)}, неясных блоков: {len(unknown_blocks)}."
+        )
+    if date_from == date_to:
+        save_chat_daily_analytics(
+            dialog_id=dialog_id,
+            analytics_date=date_from,
+            model=model,
+            status="done",
+            summary_text=summary_text,
+            tasks_saved=tasks_saved,
+            goals_saved=goals_saved,
+            facts_saved=facts_saved,
+            confirmations_count=len(confirmations),
+            unknown_blocks_count=len(unknown_blocks),
+            raw=analysis,
+        )
+
+    return {
+        "dialog_id": dialog_id,
+        "chat_title": chat["title"] if chat else dialog_id,
+        "model": model,
+        "tasks_saved": tasks_saved,
+        "goals_saved": goals_saved,
+        "facts_saved": facts_saved,
+        "confirmations_count": len(confirmations),
+        "unknown_blocks_count": len(unknown_blocks),
+        "summary_text": summary_text,
+    }
+
+
+def analyze_all_chats_work(date_from: date, date_to: date) -> dict[str, Any]:
+    if not llm_api_key():
+        raise ValueError("Для ИИ-анализа чатов укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+    sync_work_registry()
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT dialog_id
+                    FROM chats
+                    WHERE members_count >= 3 AND is_excluded = FALSE
+                    ORDER BY COALESCE(last_message_at, updated_at) DESC
+                    """
+                )
+                chats = cur.fetchall()
+        results = []
+        errors = []
+        current_date = date_from
+        while current_date <= date_to:
+            for chat in chats:
+                dialog_id = chat["dialog_id"]
+                try:
+                    status = chat_day_text_status(dialog_id, current_date)
+                    if not status.get("is_processed"):
+                        process_chat_image_ocr_for_period(current_date, current_date, force=False, dialog_id=dialog_id)
+                    results.append(analyze_chat_work_with_ai(dialog_id, current_date, current_date))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"dialog_id": dialog_id, "date": current_date.isoformat(), "error": str(exc)})
+            current_date += timedelta(days=1)
+        payload = load_work_registry(
+            message=(
+                f"ИИ-анализ чатов PostgreSQL завершен за {format_date_ru(date_from)} - {format_date_ru(date_to)}: "
+                f"связок чат-день обработано {len(results)}, ошибок {len(errors)}, "
+                f"задач извлечено {sum(item.get('tasks_saved', 0) for item in results)}, "
+                f"целей зафиксировано {sum(item.get('goals_saved', 0) for item in results)}, "
+                f"фактов подтверждено {sum(item.get('facts_saved', 0) for item in results)}."
+            )
+        )
+        payload["analysis_results"] = results
+        payload["errors"] = errors[:50]
+        return payload
+
+    with db_connect() as conn:
+        chats = conn.execute(
+            """
+            SELECT dialog_id
+            FROM chats
+            WHERE member_count >= 3 AND COALESCE(is_excluded, 0) = 0
+            ORDER BY COALESCE(last_activity_date, last_message_date, '') DESC
+            """
+        ).fetchall()
+    results = []
+    errors = []
+    current_date = date_from
+    while current_date <= date_to:
+        for chat in chats:
+            dialog_id = chat["dialog_id"]
+            try:
+                results.append(analyze_chat_work_with_ai(dialog_id, current_date, current_date))
+            except Exception as exc:  # noqa: BLE001
+                save_chat_daily_analytics(
+                    dialog_id=dialog_id,
+                    analytics_date=current_date,
+                    model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip(),
+                    status="error",
+                    summary_text=None,
+                    error=str(exc),
+                    raw={"error": str(exc)},
+                )
+                errors.append({"dialog_id": dialog_id, "date": current_date.isoformat(), "error": str(exc)})
+        current_date += timedelta(days=1)
+    payload = load_work_registry(
+        message=(
+            f"ИИ-анализ чатов завершен за {format_date_ru(date_from)} - {format_date_ru(date_to)}: "
+            f"связок чат-день обработано {len(results)}, ошибок {len(errors)}, "
+            f"задач извлечено {sum(item.get('tasks_saved', 0) for item in results)}, "
+            f"целей зафиксировано {sum(item.get('goals_saved', 0) for item in results)}, "
+            f"фактов подтверждено {sum(item.get('facts_saved', 0) for item in results)}."
+        )
+    )
+    payload["analysis_results"] = results
+    payload["errors"] = errors[:50]
+    return payload
+
+
+def work_item_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "work_item_id": row["work_item_id"],
+        "title": row["title"],
+        "description": row["description"],
+        "assignee_id": row["assignee_id"],
+        "assignee_name": row["assignee_name"],
+        "manager_id": row["manager_id"],
+        "manager_name": row["manager_name"],
+        "dialog_id": row["dialog_id"],
+        "goal_id": row["goal_id"],
+        "period_type": row["period_type"],
+        "period_start": row["period_start"],
+        "period_end": row["period_end"],
+        "deadline": row["deadline"],
+        "deadline_text": format_datetime_ru(row["deadline"]),
+        "status": row["status"],
+        "priority": row["priority"],
+        "confidence": row["confidence"],
+        "source_type": row["source_type"],
+        "source_artifact_id": row["source_artifact_id"],
+        "updated_at_text": format_datetime_ru(row["updated_at"]),
+    }
+
+
+def fact_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "fact_id": row["fact_id"],
+        "artifact_id": row["artifact_id"],
+        "fact_type": row["fact_type"],
+        "person_id": row["person_id"],
+        "person_name": row["person_name"],
+        "title": row["title"],
+        "fact_text": row["fact_text"],
+        "deadline": row["deadline"],
+        "deadline_text": format_datetime_ru(row["deadline"]),
+        "status": row["status"],
+        "confidence": row["confidence"],
+        "created_at_text": format_datetime_ru(row["created_at"]),
+    }
+
+
+def goal_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "goal_id": row["goal_id"],
+        "dialog_id": row["dialog_id"],
+        "goal_title": row["goal_title"],
+        "goal_text": row["goal_text"],
+        "period_type": row["period_type"],
+        "period_start": row["period_start"],
+        "period_end": row["period_end"],
+        "owner_id": row["owner_id"],
+        "owner_name": row["owner_name"],
+        "success_metrics": row["success_metrics"],
+        "status": row["status"],
+        "updated_at_text": format_datetime_ru(row["updated_at"]),
+    }
+
+
+def load_work_registry(message: str | None = None) -> dict[str, Any]:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        wi.id,
+                        wi.source_type,
+                        wi.normalized_status,
+                        wi.work_date,
+                        wi.period_type,
+                        wi.deadline_at,
+                        wi.completed_at,
+                        wi.confidence,
+                        wi.created_at,
+                        wi.updated_at,
+                        v.title,
+                        v.description,
+                        ru.bitrix_user_id AS responsible_id,
+                        ru.full_name AS responsible_name,
+                        cu.bitrix_user_id AS creator_id,
+                        cu.full_name AS creator_name,
+                        mu.bitrix_user_id AS manager_id,
+                        mu.full_name AS manager_name
+                    FROM work_items wi
+                    JOIN v_work_items_full v ON v.id = wi.id
+                    LEFT JOIN users ru ON ru.id = wi.responsible_id
+                    LEFT JOIN users cu ON cu.id = wi.creator_id
+                    LEFT JOIN users mu ON mu.id = wi.manager_id
+                    ORDER BY COALESCE(wi.deadline_at, wi.work_date::timestamptz, wi.updated_at) DESC, wi.created_at DESC
+                    LIMIT 500
+                    """
+                )
+                work_rows = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT
+                        g.id,
+                        g.goal_title,
+                        g.goal_text,
+                        g.period_type,
+                        g.period_start,
+                        g.period_end,
+                        g.status,
+                        g.source_type,
+                        g.is_confirmed,
+                        u.bitrix_user_id AS owner_id,
+                        u.full_name AS owner_name,
+                        g.success_metrics,
+                        g.expected_result,
+                        g.confidence,
+                        g.created_at,
+                        g.updated_at
+                    FROM user_goals g
+                    LEFT JOIN users u ON u.id = g.user_id
+                    ORDER BY COALESCE(g.period_end, g.updated_at::date) DESC, g.updated_at DESC
+                    LIMIT 250
+                    """
+                )
+                goal_rows = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT
+                        sa.id,
+                        sa.artifact_date,
+                        sa.content_text,
+                        sa.raw_json,
+                        u.bitrix_user_id AS person_id,
+                        u.full_name AS person_name,
+                        c.dialog_id
+                    FROM source_artifacts sa
+                    LEFT JOIN users u ON u.id = sa.user_id
+                    LEFT JOIN chats c ON c.id = sa.chat_id
+                    WHERE sa.source_type = 'ai_analysis'
+                      AND COALESCE(sa.raw_json->>'kind', '') IN ('fact', 'confirmation', 'unknown')
+                    ORDER BY sa.artifact_date DESC NULLS LAST, sa.created_at DESC
+                    LIMIT 250
+                    """
+                )
+                fact_rows = cur.fetchall()
+                cur.execute("SELECT COUNT(*) AS count FROM source_artifacts")
+                sources_total = cur.fetchone()["count"]
+                cur.execute("SELECT COUNT(*) AS count FROM work_items")
+                work_items_total = cur.fetchone()["count"]
+                cur.execute("SELECT COUNT(*) AS count FROM user_goals")
+                goals_total = cur.fetchone()["count"]
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM source_artifacts
+                    WHERE source_type = 'ai_analysis'
+                      AND COALESCE(raw_json->>'kind', '') IN ('fact', 'confirmation')
+                    """
+                )
+                facts_total = cur.fetchone()["count"]
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM source_artifacts
+                    WHERE source_type = 'ai_analysis'
+                      AND COALESCE(raw_json->>'kind', '') = 'unknown'
+                    """
+                )
+                needs_review_total = cur.fetchone()["count"]
+        return {
+            "work_items": [
+                {
+                    "work_item_id": str(row["id"]),
+                    "source_type": row["source_type"],
+                    "title": row["title"],
+                    "description": row["description"],
+                    "assignee_id": row["responsible_id"],
+                    "assignee_name": row["responsible_name"],
+                    "creator_id": row["creator_id"],
+                    "creator_name": row["creator_name"],
+                    "manager_id": row["manager_id"],
+                    "manager_name": row["manager_name"],
+                    "status": row["normalized_status"],
+                    "deadline": iso_or_none(row["deadline_at"]),
+                    "deadline_text": format_datetime_ru(row["deadline_at"]),
+                    "completed_at": iso_or_none(row["completed_at"]),
+                    "period_type": row["period_type"],
+                    "period_start": row["work_date"].isoformat() if hasattr(row["work_date"], "isoformat") else row["work_date"],
+                    "period_end": row["work_date"].isoformat() if hasattr(row["work_date"], "isoformat") else row["work_date"],
+                    "confidence": row["confidence"],
+                    "updated_at": iso_or_none(row["updated_at"]),
+                    "updated_at_text": format_datetime_ru(row["updated_at"]),
+                }
+                for row in work_rows
+            ],
+            "facts": [
+                {
+                    "fact_id": str(row["id"]),
+                    "artifact_id": str(row["id"]),
+                    "fact_type": (row["raw_json"] or {}).get("kind") if isinstance(row["raw_json"], dict) else "fact",
+                    "person_id": row["person_id"],
+                    "person_name": row["person_name"],
+                    "dialog_id": row["dialog_id"],
+                    "title": ((row["raw_json"] or {}).get("fact") or {}).get("title") if isinstance(row["raw_json"], dict) and isinstance((row["raw_json"] or {}).get("fact"), dict) else None,
+                    "fact_text": row["content_text"],
+                    "deadline": row["artifact_date"].isoformat() if hasattr(row["artifact_date"], "isoformat") else row["artifact_date"],
+                    "status": "needs_review" if isinstance(row["raw_json"], dict) and row["raw_json"].get("kind") == "unknown" else "confirmed",
+                    "confidence": (((row["raw_json"] or {}).get("fact") or {}).get("confidence") if isinstance(row["raw_json"], dict) and isinstance((row["raw_json"] or {}).get("fact"), dict) else None),
+                    "created_at": None,
+                }
+                for row in fact_rows
+            ],
+            "goals": [
+                {
+                    "goal_id": str(row["id"]),
+                    "dialog_id": None,
+                    "goal_title": row["goal_title"],
+                    "goal_text": row["goal_text"],
+                    "period_type": row["period_type"],
+                    "period_start": row["period_start"].isoformat() if hasattr(row["period_start"], "isoformat") else row["period_start"],
+                    "period_end": row["period_end"].isoformat() if hasattr(row["period_end"], "isoformat") else row["period_end"],
+                    "owner_id": row["owner_id"],
+                    "owner_name": row["owner_name"],
+                    "success_metrics": row["success_metrics"],
+                    "expected_result": row["expected_result"],
+                    "status": row["status"],
+                    "confidence": row["confidence"],
+                    "updated_at": iso_or_none(row["updated_at"]),
+                    "updated_at_text": format_datetime_ru(row["updated_at"]),
+                }
+                for row in goal_rows
+            ],
+            "stats": {
+                "sources_total": sources_total,
+                "work_items_total": work_items_total,
+                "facts_total": facts_total,
+                "goals_total": goals_total,
+                "needs_review_total": needs_review_total,
+            },
+            "message": message,
+        }
+
+    with db_connect() as conn:
+        work_rows = conn.execute(
+            """
+            SELECT *
+            FROM work_items
+            ORDER BY COALESCE(deadline, period_end, period_start, updated_at) DESC, work_item_id DESC
+            LIMIT 500
+            """
+        ).fetchall()
+        fact_rows = conn.execute(
+            """
+            SELECT
+                fact_id,
+                source_artifact_id AS artifact_id,
+                fact_type,
+                person_id,
+                person_name,
+                title,
+                fact_text,
+                fact_date AS deadline,
+                'confirmed' AS status,
+                confidence,
+                created_at
+            FROM work_facts
+            ORDER BY fact_id DESC
+            LIMIT 250
+            """
+        ).fetchall()
+        goal_rows = conn.execute(
+            """
+            SELECT *
+            FROM chat_goals
+            ORDER BY COALESCE(period_end, updated_at) DESC, goal_id DESC
+            LIMIT 250
+            """
+        ).fetchall()
+        stats = {
+            "sources_total": conn.execute("SELECT COUNT(*) FROM source_artifacts").fetchone()[0],
+            "work_items_total": conn.execute("SELECT COUNT(*) FROM work_items").fetchone()[0],
+            "facts_total": conn.execute("SELECT COUNT(*) FROM work_facts").fetchone()[0],
+            "goals_total": conn.execute("SELECT COUNT(*) FROM chat_goals").fetchone()[0],
+            "needs_review_total": conn.execute(
+                "SELECT COUNT(*) FROM extracted_facts WHERE status IN ('needs_ai_review', 'needs_ocr')"
+            ).fetchone()[0],
+        }
+    return {
+        "work_items": [work_item_to_dict(row) for row in work_rows],
+        "facts": [fact_to_dict(row) for row in fact_rows],
+        "goals": [goal_to_dict(row) for row in goal_rows],
+        "stats": stats,
+        "message": message,
+    }
+
+
+def load_user_goals() -> list[dict[str, Any]]:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        g.id,
+                        g.goal_title,
+                        g.goal_text,
+                        g.goal_level,
+                        g.period_type,
+                        g.period_start,
+                        g.period_end,
+                        g.status,
+                        u.bitrix_user_id AS owner_id,
+                        u.full_name AS owner_name,
+                        g.success_metrics,
+                        g.expected_result,
+                        g.confidence,
+                        g.created_at,
+                        g.updated_at
+                    FROM user_goals g
+                    LEFT JOIN users u ON u.id = g.user_id
+                    ORDER BY COALESCE(g.period_end, g.updated_at::date) DESC, g.updated_at DESC
+                    LIMIT 500
+                    """
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "goal_id": str(row["id"]),
+                "goal_title": row["goal_title"],
+                "goal_text": row["goal_text"],
+                "goal_level": row["goal_level"],
+                "period_type": row["period_type"],
+                "period_start": row["period_start"].isoformat() if hasattr(row["period_start"], "isoformat") else row["period_start"],
+                "period_end": row["period_end"].isoformat() if hasattr(row["period_end"], "isoformat") else row["period_end"],
+                "owner_id": row["owner_id"],
+                "owner_name": row["owner_name"],
+                "success_metrics": row["success_metrics"],
+                "expected_result": row["expected_result"],
+                "status": row["status"],
+                "source_type": row["source_type"],
+                "is_confirmed": bool(row["is_confirmed"]),
+                "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+                "created_at": iso_or_none(row["created_at"]),
+                "updated_at": iso_or_none(row["updated_at"]),
+                "updated_at_text": format_datetime_ru(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM chat_goals
+            ORDER BY COALESCE(period_end, updated_at) DESC, goal_id DESC
+            LIMIT 500
+            """
+        ).fetchall()
+    return [goal_to_dict(row) for row in rows]
+
+
+def upsert_chat_messages(dialog_id: str, messages: list[dict[str, Any]]) -> None:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    chat_uuid = pg_chat_id_by_dialog(cur, dialog_id)
+                    if not chat_uuid:
+                        return
+                    for message in messages:
+                        message_id = to_int(message.get("id"))
+                        if message_id is None:
+                            continue
+                        message_date = first_non_empty(message.get("date"), message.get("DATE_CREATE"))
+                        parsed_date = parse_datetime(message_date) or datetime.now()
+                        message_day = parsed_date.date()
+                        author_bitrix_id = to_int(first_non_empty(message.get("author_id"), message.get("authorId")))
+                        author_uuid = pg_user_id_by_bitrix(cur, author_bitrix_id)
+                        files = message.get("files") if isinstance(message.get("files"), list) else []
+                        cur.execute(
+                            """
+                            INSERT INTO chat_messages (
+                                chat_id, bitrix_message_id, author_id, author_bitrix_user_id,
+                                message_text, message_date, message_day, has_files, raw_json, synced_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                            ON CONFLICT (bitrix_message_id, message_day) DO UPDATE SET
+                                author_id = EXCLUDED.author_id,
+                                author_bitrix_user_id = EXCLUDED.author_bitrix_user_id,
+                                message_text = EXCLUDED.message_text,
+                                message_date = EXCLUDED.message_date,
+                                has_files = EXCLUDED.has_files,
+                                raw_json = EXCLUDED.raw_json,
+                                synced_at = now()
+                            RETURNING id
+                            """,
+                            (
+                                chat_uuid,
+                                message_id,
+                                author_uuid,
+                                author_bitrix_id,
+                                message.get("text") or "",
+                                parsed_date,
+                                message_day,
+                                bool(files),
+                                pg_json(message.get("raw", message)),
+                            ),
+                        )
+                        message_uuid = cur.fetchone()["id"]
+                        cur.execute(
+                            "DELETE FROM chat_message_files WHERE message_id = %s AND message_day = %s",
+                            (message_uuid, message_day),
+                        )
+                        for file_item in files:
+                            file_id = first_non_empty(file_item.get("id"), file_item.get("ID"))
+                            cur.execute(
+                                """
+                                INSERT INTO chat_message_files (
+                                    message_id, message_day, chat_id, bitrix_file_id, file_name,
+                                    file_type, mime_type, file_size, download_url, raw_json
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """,
+                                (
+                                    message_uuid,
+                                    message_day,
+                                    chat_uuid,
+                                    str(file_id) if file_id is not None else None,
+                                    file_item.get("name"),
+                                    "image" if str(file_item.get("type") or file_item.get("extension") or "").lower() in {"image", "jpg", "jpeg", "png", "gif", "webp", "bmp"} else "other",
+                                    file_item.get("mimeType"),
+                                    to_int(file_item.get("size")),
+                                    file_item.get("urlDownload"),
+                                    pg_json(file_item),
+                                ),
+                            )
+        return
+    with db_connect() as conn:
+        for message in messages:
+            message_id = to_int(message.get("id"))
+            if message_id is None:
+                continue
+            message_date = first_non_empty(message.get("date"), message.get("DATE_CREATE"))
+            parsed_date = parse_datetime(message_date)
+            message_day = parsed_date.date().isoformat() if parsed_date else str(message_date or "")[:10]
+            conn.execute(
+                """
+                INSERT INTO chat_messages (
+                    dialog_id, message_id, chat_id, author_id, author_name,
+                    message_date, message_day, text, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dialog_id, message_id) DO UPDATE SET
+                    chat_id = excluded.chat_id,
+                    author_id = excluded.author_id,
+                    author_name = excluded.author_name,
+                    message_date = excluded.message_date,
+                    message_day = excluded.message_day,
+                    text = excluded.text,
+                    raw_json = excluded.raw_json
+                """,
+                (
+                    dialog_id,
+                    message_id,
+                    to_int(message.get("chat_id")),
+                    to_int(first_non_empty(message.get("author_id"), message.get("authorId"))),
+                    message.get("author_name"),
+                    message_date,
+                    message_day,
+                    message.get("text") or "",
+                    json.dumps(message.get("raw", message), ensure_ascii=False),
+                ),
+            )
+            conn.execute(
+                "DELETE FROM chat_message_files WHERE dialog_id = ? AND message_id = ?",
+                (dialog_id, message_id),
+            )
+            files = message.get("files") if isinstance(message.get("files"), list) else []
+            for file_item in files:
+                file_id = to_int(file_item.get("id"))
+                if file_id is None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO chat_message_files (
+                        dialog_id, message_id, file_id, name, extension, file_type,
+                        size, preview_url, show_url, download_url, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        dialog_id,
+                        message_id,
+                        file_id,
+                        file_item.get("name"),
+                        file_item.get("extension"),
+                        file_item.get("type"),
+                        to_int(file_item.get("size")),
+                        file_item.get("urlPreview"),
+                        file_item.get("urlShow"),
+                        file_item.get("urlDownload"),
+                        json.dumps(file_item, ensure_ascii=False),
+                    ),
+                )
+
+
+def load_chat_day(dialog_id: str, report_date: date) -> dict[str, Any]:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM chats WHERE dialog_id = %s", (dialog_id,))
+                chat = cur.fetchone()
+                if not chat:
+                    return {"chat": None, "date": report_date.isoformat(), "messages": [], "transcript": "Нет сообщений", "report": None}
+                cur.execute(
+                    """
+                    SELECT cm.*, u.full_name AS author_name
+                    FROM chat_messages cm
+                    LEFT JOIN users u ON u.id = cm.author_id
+                    WHERE cm.chat_id = %s AND cm.message_day = %s
+                    ORDER BY cm.message_date ASC, cm.bitrix_message_id ASC
+                    """,
+                    (chat["id"], report_date),
+                )
+                messages = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM chat_daily_reports
+                    WHERE chat_id = %s AND report_date = %s
+                    ORDER BY is_current DESC, version DESC NULLS LAST, generated_at DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (chat["id"], report_date),
+                )
+                report = cur.fetchone()
+                if report and not is_display_chat_report(report):
+                    report = None
+                cur.execute(
+                    """
+                    SELECT f.*, m.bitrix_message_id, m.message_date, o.ocr_text, o.ocr_status, o.error_text AS ocr_error_text, o.ocr_provider
+                    FROM chat_message_files f
+                    JOIN chat_messages m ON m.id = f.message_id AND m.message_day = f.message_day
+                    LEFT JOIN LATERAL (
+                        SELECT ocr_provider, ocr_text, ocr_status, error_text
+                        FROM chat_file_ocr
+                        WHERE file_id = f.id
+                        ORDER BY
+                            CASE ocr_provider WHEN 'manual' THEN 0 WHEN 'openai' THEN 1 ELSE 2 END,
+                            updated_at DESC
+                        LIMIT 1
+                    ) o ON TRUE
+                    WHERE f.chat_id = %s AND f.message_day = %s
+                    ORDER BY m.message_date ASC, m.bitrix_message_id ASC, f.bitrix_file_id ASC
+                    """,
+                    (chat["id"], report_date),
+                )
+                files = cur.fetchall()
+                text_status = chat_day_workflow_status(dialog_id, report_date, report_exists=is_display_chat_report(report))
+        files_by_message: dict[int, list[dict[str, Any]]] = {}
+        for file_row in files:
+            files_by_message.setdefault(file_row["bitrix_message_id"], []).append(
+                {
+                    "file_id": file_row["bitrix_file_id"],
+                    "name": file_row["file_name"],
+                    "extension": None,
+                    "type": file_row["file_type"],
+                    "mime_type": file_row["mime_type"],
+                    "size": file_row["file_size"],
+                    "preview_url": None,
+                    "show_url": None,
+                    "download_url": file_row["download_url"],
+                    "is_image": is_image_file_value(file_row["file_name"], file_row["file_type"], None),
+                    "ocr_provider": file_row["ocr_provider"],
+                    "ocr_status": file_row["ocr_status"],
+                    "ocr_text": file_row["ocr_text"],
+                    "ocr_error_text": file_row["ocr_error_text"],
+                }
+            )
+        report_dict = dict(report) if report else None
+        if report_dict:
+            report_dict["report_id"] = str(report_dict.get("id"))
+            raw_report = report_dict.get("raw_ai_json")
+            report_dict["report_text"] = (
+                raw_report.get("report_text")
+                if isinstance(raw_report, dict) and raw_report.get("report_text")
+                else report_dict.get("summary") or ""
+            )
+            report_dict["model"] = (
+                raw_report.get("model")
+                if isinstance(raw_report, dict) and raw_report.get("model")
+                else raw_report.get("source")
+                if isinstance(raw_report, dict) and raw_report.get("source")
+                else "postgres"
+            )
+        message_payload = [
+            {
+                "sequence_no": index,
+                "message_id": row["bitrix_message_id"],
+                "author_id": row["author_bitrix_user_id"],
+                "author_name": row["author_name"] or "Системное сообщение",
+                "message_date": iso_or_none(row["message_date"]),
+                "message_date_text": format_datetime_ru(row["message_date"]),
+                "text": row["message_text"] or "",
+                "files": files_by_message.get(row["bitrix_message_id"], []),
+            }
+            for index, row in enumerate(messages, start=1)
+        ]
+        return {
+            "chat": {
+                "dialog_id": chat["dialog_id"],
+                "chat_id": chat["bitrix_chat_id"],
+                "title": chat["chat_title"],
+                "is_excluded": 1 if chat["is_excluded"] else 0,
+            },
+            "date": report_date.isoformat(),
+            "messages": message_payload,
+            "transcript": build_chat_day_transcript(message_payload),
+            "report": report_dict,
+            "text_status": text_status,
+        }
+    date_text = report_date.isoformat()
+    with db_connect() as conn:
+        chat = conn.execute("SELECT * FROM chats WHERE dialog_id = ?", (dialog_id,)).fetchone()
+        messages = conn.execute(
+            """
+            SELECT *
+            FROM chat_messages
+            WHERE dialog_id = ? AND message_day = ?
+            ORDER BY message_date ASC, message_id ASC
+            """,
+            (dialog_id, date_text),
+        ).fetchall()
+        report = conn.execute(
+            """
+            SELECT *
+            FROM chat_daily_reports
+            WHERE dialog_id = ? AND report_date = ?
+            """,
+            (dialog_id, date_text),
+        ).fetchone()
+        if report and not is_display_chat_report(report):
+            report = None
+        files = conn.execute(
+            """
+            SELECT f.*, o.status AS ocr_status, o.ocr_text, o.error AS ocr_error_text
+            FROM chat_message_files f
+            JOIN chat_messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id
+            LEFT JOIN chat_file_ocr o
+              ON o.dialog_id = f.dialog_id AND o.message_id = f.message_id AND o.file_id = f.file_id
+            WHERE f.dialog_id = ? AND m.message_day = ?
+            ORDER BY m.message_date ASC, m.message_id ASC, f.file_id ASC
+            """,
+            (dialog_id, date_text),
+        ).fetchall()
+    files_by_message: dict[int, list[dict[str, Any]]] = {}
+    for file_row in files:
+        files_by_message.setdefault(file_row["message_id"], []).append(
+            {
+                "file_id": file_row["file_id"],
+                "name": file_row["name"],
+                "extension": file_row["extension"],
+                "type": file_row["file_type"],
+                "mime_type": None,
+                "size": file_row["size"],
+                "preview_url": file_row["preview_url"],
+                "show_url": file_row["show_url"],
+                "download_url": file_row["download_url"],
+                "is_image": str(file_row["file_type"] or file_row["extension"] or "").lower() in {"image", "jpg", "jpeg", "png", "gif", "webp", "bmp"},
+                "ocr_status": file_row["ocr_status"],
+                "ocr_text": file_row["ocr_text"],
+                "ocr_error_text": file_row["ocr_error_text"],
+            }
+        )
+    text_status = chat_day_workflow_status(dialog_id, report_date, report_exists=is_display_chat_report(report))
+    message_payload = [
+        {
+            "sequence_no": index,
+            "message_id": row["message_id"],
+            "author_id": row["author_id"],
+            "author_name": row["author_name"] or "Системное сообщение",
+            "message_date": row["message_date"],
+            "message_date_text": format_datetime_ru(row["message_date"]),
+            "text": row["text"] or "",
+            "files": files_by_message.get(row["message_id"], []),
+        }
+        for index, row in enumerate(messages, start=1)
+    ]
+    return {
+        "chat": dict(chat) if chat else None,
+        "date": date_text,
+        "messages": message_payload,
+        "transcript": build_chat_day_transcript(message_payload),
+        "report": dict(report) if report else None,
+        "text_status": text_status,
+    }
+
+
+def load_chat_period(dialog_id: str, date_from: date, date_to: date) -> dict[str, Any]:
+    if date_from == date_to:
+        return load_chat_day(dialog_id, date_to) | {
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "period_text": f"{format_date_ru(date_from)} - {format_date_ru(date_to)}",
+        }
+    days = [load_chat_day(dialog_id, day) for day in _daterange(date_from, date_to)]
+    chat = next((day.get("chat") for day in days if day.get("chat")), None)
+    messages: list[dict[str, Any]] = []
+    for day_payload in days:
+        messages.extend(day_payload.get("messages") or [])
+    messages.sort(key=lambda item: (str(item.get("message_date") or ""), to_int(item.get("message_id")) or 0))
+    for index, message in enumerate(messages, start=1):
+        message["sequence_no"] = index
+    total_images = sum(int(((day.get("text_status") or {}).get("image_files")) or 0) for day in days)
+    total_ocr_success = sum(int(((day.get("text_status") or {}).get("ocr_success")) or 0) for day in days)
+    total_ocr_pending = sum(int(((day.get("text_status") or {}).get("ocr_pending")) or 0) for day in days)
+    total_ocr_errors = sum(int(((day.get("text_status") or {}).get("ocr_errors")) or 0) for day in days)
+    is_processed = total_images == 0 or (total_ocr_success == total_images and total_ocr_pending == 0 and total_ocr_errors == 0)
+    status_text = "Готов к отчету" if is_processed else ("Ошибка OCR" if total_ocr_errors else "Не обработан")
+    return {
+        "chat": chat,
+        "date": date_to.isoformat(),
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "period_text": f"{format_date_ru(date_from)} - {format_date_ru(date_to)}",
+        "messages": messages,
+        "transcript": build_chat_day_transcript(messages),
+        "report": None,
+        "text_status": {
+            "status": "ready" if is_processed else ("ocr_error" if total_ocr_errors else "not_processed"),
+            "status_text": status_text,
+            "image_files": total_images,
+            "ocr_success": total_ocr_success,
+            "ocr_pending": total_ocr_pending,
+            "ocr_errors": total_ocr_errors,
+            "is_processed": is_processed,
+            "workflow_status": "ready" if is_processed else "not_processed",
+            "workflow_status_text": status_text,
+        },
+    }
+
+
+CHAT_REPORT_ITEM_KEYS = {
+    "previous_day_tasks": "previous_day_task",
+    "goals": "goal",
+    "actions": "action",
+    "decisions": "decision",
+    "risks": "risk",
+    "explicit_risks": "risk",
+    "blockers": "blocker",
+    "commitments": "commitment",
+    "questions": "question",
+    "unanswered_questions": "unanswered_question",
+    "bitrix_references": "bitrix_reference",
+    "results": "result",
+    "next_steps": "next_step",
+    "notes": "note",
+}
+
+
+def structured_chat_report_text(analysis: dict[str, Any]) -> str:
+    def clean(value: Any) -> str:
+        return str(value or "").strip()
+
+    def first_item_value(item: dict[str, Any], *keys: str) -> str:
+        return clean(first_non_empty(*(item.get(key) for key in keys)))
+
+    def status_text(value: Any) -> str:
+        mapping = {
+            "planned": "запланирована",
+            "in_progress": "в работе",
+            "done": "выполнена",
+            "blocked": "заблокирована",
+            "postponed": "перенесена",
+            "cancelled": "отменена",
+            "unknown": "статус неясен",
+            "requested": "запрошено",
+            "sent": "отправлено",
+            "checked": "проверено",
+            "agreed": "согласовано",
+            "answered": "есть ответ",
+            "unanswered": "без ответа",
+            "unclear": "неясно",
+            "no_info": "нет информации",
+            "partially_answered": "частично отвечено",
+            "partial": "частично",
+            "progress_on_underlying_topic": "движение по теме",
+            "low": "низкий",
+            "medium": "средний",
+            "high": "высокий",
+            "direct": "прямое подтверждение",
+            "inferred": "вывод из контекста",
+            "weak": "слабый сигнал",
+            "decision_needed": "нужно решение",
+            "info_needed": "нужна информация",
+            "confirmation": "нужно подтверждение",
+            "escalation": "эскалация",
+            "blocks_work": "блокирует работу",
+            "needed_soon": "нужно скоро",
+            "nice_to_have": "желательно",
+        }
+        raw = clean(value)
+        return mapping.get(raw, raw)
+
+    def append_detail(parts: list[str], label: str, value: Any) -> None:
+        text = clean(value)
+        if text:
+            parts.append(f"{label}: {text}")
+
+    def date_text(value: Any) -> str:
+        parsed = safe_parse_date(value)
+        if parsed:
+            return format_date_ru(parsed)
+        return clean(value)
+
+    def day_count_text(value: Any) -> str:
+        days = to_int(value) or 0
+        if days <= 0:
+            return ""
+        last_two = days % 100
+        last = days % 10
+        if 11 <= last_two <= 14:
+            unit = "дней"
+        elif last == 1:
+            unit = "день"
+        elif 2 <= last <= 4:
+            unit = "дня"
+        else:
+            unit = "дней"
+        return f"{days} {unit}"
+
+    def item_text(item: Any) -> str:
+        if isinstance(item, str):
+            return item.strip()
+        if not isinstance(item, dict):
+            return ""
+        return str(first_non_empty(
+            item.get("text"),
+            item.get("title"),
+            item.get("summary"),
+            item.get("reason"),
+            item.get("task_title"),
+            item.get("topic"),
+        ) or "").strip()
+
+    def formatted_item_text(key: str, item: Any) -> str:
+        if isinstance(item, str):
+            return item.strip()
+        if not isinstance(item, dict):
+            return ""
+        text = item_text(item)
+        if not text:
+            return ""
+
+        person = first_item_value(item, "person_name", "owner_name", "assignee_name", "asked_by", "decided_by")
+        deadline = clean(first_non_empty(item.get("deadline"), item.get("period_end")))
+        if key in {"goals", "next_steps"} and (not person or not deadline):
+            return ""
+        if key == "commitments" and not person:
+            return ""
+        if key == "risks" and (not person or not clean(item.get("reason"))):
+            return ""
+
+        parts: list[str] = []
+        if key == "previous_day_tasks":
+            status = clean(item.get("current_status"))
+            days_open = to_int(item.get("days_open"))
+            deadline_text = date_text(item.get("deadline"))
+            deadline_suffix = f" Срок {deadline_text}." if deadline_text else ""
+            if status == "no_info":
+                silence_days = day_count_text(days_open)
+                silence = f"[тишина {silence_days}] " if silence_days else "[тишина] "
+                return f"{silence}{person} — {text}.{deadline_suffix}".strip()
+            reason = clean(first_non_empty(item.get("status_reason"), item.get("risk_reason"), item.get("reason")))
+            reason_suffix = f": {reason}" if reason else ""
+            line = f"{person} — {text} → {status_text(status)}{reason_suffix}"
+            if not line.endswith((".", "!", "?")):
+                line += "."
+            if deadline_suffix:
+                line += deadline_suffix
+            return line.strip()
+        elif key == "goals":
+            append_detail(parts, "срок", deadline)
+        elif key == "commitments":
+            append_detail(parts, "поставлена", item.get("assigned_at"))
+            parts.append(f"срок: {deadline or 'не указан'}")
+            if item.get("same_day_deadline") is True:
+                parts.append("дедлайн день в день")
+            append_detail(parts, "тема", item.get("topic_tag"))
+            append_detail(parts, "выполнена", item.get("completed_at"))
+            append_detail(parts, "перенесена на", item.get("postponed_to"))
+            status = status_text(item.get("status"))
+            if status:
+                parts.append(f"статус: {status}")
+            risk = status_text(item.get("risk_level"))
+            if risk:
+                parts.append(f"риск: {risk}")
+            append_detail(parts, "причина риска", item.get("risk_reason"))
+        elif key == "actions":
+            status = status_text(item.get("action_status"))
+            if status:
+                parts.append(f"статус: {status}")
+        elif key == "questions":
+            append_detail(parts, "кому", first_non_empty(item.get("addressed_to_name"), item.get("addressed_to")))
+            answer_status = status_text(item.get("answer_status"))
+            if answer_status:
+                parts.append(f"ответ: {answer_status}")
+        elif key == "unanswered_questions":
+            append_detail(parts, "спросил", first_non_empty(item.get("asked_by_name"), item.get("asked_by")))
+            append_detail(parts, "кому", first_non_empty(item.get("addressed_to_name"), item.get("addressed_to")))
+            append_detail(parts, "тип", status_text(item.get("question_type")))
+            append_detail(parts, "критичность", status_text(item.get("criticality")))
+            append_detail(parts, "первый раз задан", item.get("first_asked_date"))
+            append_detail(parts, "повторов", item.get("times_asked"))
+            append_detail(parts, "почему", first_non_empty(item.get("reason"), item.get("status_reason")))
+        elif key in {"risks", "explicit_risks", "blockers"}:
+            append_detail(parts, "причина", item.get("reason"))
+            urgency = status_text(first_non_empty(item.get("urgency"), item.get("risk_level")))
+            if urgency:
+                parts.append(f"уровень: {urgency}")
+        elif key == "topics_discussed":
+            counters = item.get("counters") if isinstance(item.get("counters"), dict) else {}
+            counter_parts = []
+            for counter_key, label in (
+                ("commitments", "задач"),
+                ("results", "выполнений"),
+                ("decisions", "решений"),
+                ("questions", "вопросов"),
+                ("unanswered_questions", "без ответа"),
+            ):
+                count = to_int(counters.get(counter_key)) or 0
+                if count:
+                    counter_parts.append(f"{count} {label}")
+            append_detail(parts, "итог", item.get("outcome"))
+            if counter_parts:
+                parts.append(", ".join(counter_parts))
+        elif key == "next_steps":
+            append_detail(parts, "срок", deadline)
+            risk = status_text(item.get("risk_level"))
+            if risk:
+                parts.append(f"риск: {risk}")
+            append_detail(parts, "причина риска", item.get("risk_reason"))
+        elif key == "bitrix_references":
+            append_detail(parts, "Bitrix ID", item.get("bitrix_task_id"))
+
+        prefix = f"{person}: " if person else ""
+        suffix = f" ({'; '.join(parts)})" if parts else ""
+        return f"{prefix}{text}{suffix}"
+
+    def open_previous_tasks_as_next_steps() -> list[dict[str, Any]]:
+        rows = analysis.get("previous_day_tasks")
+        if not isinstance(rows, list):
+            return []
+        derived: list[dict[str, Any]] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            status = clean(item.get("current_status") or item.get("status"))
+            if status in CLOSED_CHAT_TAIL_STATUSES:
+                continue
+            text = item_text(item)
+            person = first_item_value(item, "person_name", "owner_name", "assignee_name")
+            deadline = clean(item.get("deadline"))
+            if not text or not person or not deadline:
+                continue
+            derived.append({
+                "text": text,
+                "person_name": person,
+                "deadline": deadline,
+                "risk_level": item.get("risk_level") or "medium",
+                "risk_reason": first_non_empty(
+                    item.get("status_reason"),
+                    item.get("risk_reason"),
+                    "перенесенная задача не закрыта в текущем отчете",
+                ),
+            })
+        return derived
+
+    def formatted_commitment_lines(rows: list[Any]) -> list[str]:
+        normalized = [item for item in rows if isinstance(item, dict)]
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        standalone: list[dict[str, Any]] = []
+        for item in normalized:
+            workflow_id = clean(item.get("workflow_id") or item.get("parent_task_id"))
+            if workflow_id:
+                grouped.setdefault(workflow_id, []).append(item)
+            else:
+                standalone.append(item)
+
+        values: list[str] = []
+        for workflow_id, items in grouped.items():
+            if len(items) < 2:
+                standalone.extend(items)
+                continue
+            owner = first_item_value(items[0], "person_name", "owner_name", "assignee_name")
+            topic = clean(first_non_empty(items[0].get("workflow_title"), items[0].get("topic_tag"), workflow_id))
+            values.append(f"{owner}: {topic} ({len(items)} шага)")
+            for item in items:
+                status = status_text(item.get("status"))
+                deadline = clean(item.get("deadline")) or "срок не указан"
+                same_day = "; дедлайн день в день" if item.get("same_day_deadline") is True else ""
+                values.append(f"  • {item_text(item)} -> {status}; {deadline}{same_day}")
+        values.extend(formatted_item_text("commitments", item) for item in standalone)
+        return [value for value in values if value]
+
+    derived_next_steps = open_previous_tasks_as_next_steps()
+    labels = [
+        ("previous_day_tasks", "Хвосты с прошлого дня"),
+        ("commitments", "Новые задачи дня"),
+        ("results", "Выполнено сегодня"),
+        ("questions", "Рабочие вопросы дня"),
+        ("unanswered_questions", "Вопросы без ответа"),
+        ("explicit_risks", "Явные риски из чата"),
+        ("decisions", "Принятые решения"),
+    ]
+    lines = ["Ежедневный отчет по чату"]
+    report_brief = clean(analysis.get("report_brief"))
+    if report_brief:
+        lines.extend(["", report_brief])
+    summary = clean(analysis.get("summary"))
+    if summary:
+        lines.extend(["", "Короткий вывод:", summary])
+    section_no = 1
+    for key, label in labels:
+        rows = analysis.get(key)
+        if key == "next_steps" and (not isinstance(rows, list) or not rows):
+            rows = derived_next_steps
+        if not isinstance(rows, list) or not rows:
+            if key == "previous_day_tasks":
+                lines.extend(["", f"{section_no}. {label}:", "Ничего не обнаружено"])
+                section_no += 1
+            continue
+        values = formatted_commitment_lines(rows) if key == "commitments" else [formatted_item_text(key, item) for item in rows]
+        values = [value for value in values if value]
+        if not values:
+            if key == "previous_day_tasks":
+                lines.extend(["", f"{section_no}. {label}:", "Ничего не обнаружено"])
+                section_no += 1
+            continue
+        lines.extend(["", f"{section_no}. {label}:"])
+        for value in values:
+            lines.append(value if value.startswith("  ") else f"- {value}")
+        section_no += 1
+    topics = analysis.get("topics_discussed")
+    if isinstance(topics, list) and topics:
+        values = [formatted_item_text("topics_discussed", item) for item in topics]
+        values = [value for value in values if value]
+        if values:
+            lines.extend(["", f"{section_no}. Темы дня:"])
+            for value in values:
+                lines.append(value if value.startswith("  ") else f"- {value}")
+    return "\n".join(lines).strip()
+
+
+def save_chat_report_items(cur: Any, report_id: Any, chat_id: Any, report_date: date, analysis: dict[str, Any]) -> None:
+    cur.execute("DELETE FROM chat_report_items WHERE chat_daily_report_id = %s", (report_id,))
+    for json_key, item_type in CHAT_REPORT_ITEM_KEYS.items():
+        items = analysis.get(json_key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            raw_item = item if isinstance(item, dict) else {"text": item}
+            if not isinstance(raw_item, dict):
+                continue
+            item_text = str(first_non_empty(
+                raw_item.get("text"),
+                raw_item.get("title"),
+                raw_item.get("summary"),
+                raw_item.get("reason"),
+                raw_item.get("task_title"),
+                raw_item.get("topic"),
+            ) or "").strip()
+            if not item_text:
+                continue
+            user = pg_get_user_by_name(cur, first_non_empty(raw_item.get("person_name"), raw_item.get("owner_name"), raw_item.get("assignee_name")))
+            bitrix_task_uuid = None
+            bitrix_task_id = to_int(first_non_empty(raw_item.get("bitrix_task_id"), raw_item.get("task_id")))
+            if bitrix_task_id is not None:
+                cur.execute("SELECT id FROM bitrix_tasks WHERE bitrix_task_id = %s", (bitrix_task_id,))
+                task_row = cur.fetchone()
+                bitrix_task_uuid = task_row["id"] if task_row else None
+            evidence_ids = []
+            for value in to_list(raw_item.get("evidence_message_ids")):
+                parsed = to_int(value)
+                if parsed is not None:
+                    evidence_ids.append(parsed)
+            confidence_raw = raw_item.get("confidence")
+            confidence_map = {"direct": 1.0, "inferred": 0.65, "weak": 0.35}
+            if isinstance(confidence_raw, str):
+                confidence = confidence_map.get(confidence_raw.strip().lower())
+            else:
+                confidence = confidence_raw
+            cur.execute(
+                """
+                INSERT INTO chat_report_items (
+                    chat_daily_report_id, chat_id, report_date, item_type,
+                    item_text, user_id, bitrix_task_id, confidence,
+                    evidence_message_ids, raw_json
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    report_id,
+                    chat_id,
+                    report_date,
+                    item_type,
+                    item_text,
+                    user["id"] if user else None,
+                    bitrix_task_uuid,
+                    confidence,
+                    evidence_ids or None,
+                    pg_json(raw_item),
+                ),
+            )
+
+
+def normalize_goal_level(value: Any, fallback_scope: Any = None) -> str:
+    raw = name_key(first_non_empty(value, fallback_scope))
+    if raw in {"company", "компания", "организация", "business"}:
+        return "company"
+    if raw in {"department", "team", "отдел", "команда", "подразделение"}:
+        return "department"
+    if raw in {"manager", "leader", "руководитель", "руководителя"}:
+        return "manager"
+    if raw in {"project", "проект", "проекта"}:
+        return "project"
+    if raw in {"employee", "person", "user", "сотрудник", "человек", "персона"}:
+        return "employee"
+    return "employee"
+
+
+def text_or_json(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def confidence_value(value: Any, default: float = 0.7) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(0.0, min(1.0, number))
+
+
+def percent_value(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(str(value).replace("%", "").replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(100.0, number))
+
+
+def normalize_goal_status(value: Any) -> str | None:
+    raw = name_key(value)
+    if raw in {"draft", "черновик"}:
+        return "draft"
+    if raw in {"active", "in_progress", "progress", "в работе", "активна", "активная", "started"}:
+        return "active"
+    if raw in {"done", "completed", "complete", "выполнено", "выполнена", "закрыто", "закрыта", "достигнута"}:
+        return "done"
+    if raw in {"cancelled", "canceled", "cancel", "отменено", "отменена", "неактуально", "неактуальна"}:
+        return "cancelled"
+    if raw in {"archived", "архив", "архивная"}:
+        return "archived"
+    return None
+
+
+def extracted_goal_count(analysis: dict[str, Any]) -> int:
+    goals = analysis.get("goals")
+    if not isinstance(goals, list):
+        return 0
+    return sum(
+        1
+        for item in goals
+        if isinstance(item, (dict, str))
+        and str((first_non_empty(item.get("text"), item.get("title"), item.get("goal_title")) if isinstance(item, dict) else item) or "").strip()
+    )
+
+
+def extracted_task_count(analysis: dict[str, Any]) -> int:
+    total = 0
+    for key in ("commitments", "next_steps", "previous_day_tasks"):
+        items = analysis.get(key)
+        if isinstance(items, list):
+            total += sum(1 for item in items if isinstance(item, (dict, str)))
+    return total
+
+
+def extracted_fact_count(analysis: dict[str, Any]) -> int:
+    total = 0
+    for key in ("results", "actions", "decisions"):
+        items = analysis.get(key)
+        if isinstance(items, list):
+            total += sum(1 for item in items if isinstance(item, (dict, str)))
+    return total
+
+
+def pg_save_goal_from_chat_report(
+    cur: Any,
+    chat_id: Any,
+    report_id: Any,
+    report_date: date,
+    goal: dict[str, Any],
+    ai_request_id: Any = None,
+) -> Any | None:
+    title = str(first_non_empty(goal.get("text"), goal.get("title"), goal.get("goal_title")) or "").strip()
+    if not title:
+        return None
+
+    goal_level = normalize_goal_level(goal.get("goal_level"), goal.get("scope"))
+    owner_name = first_non_empty(goal.get("person_name"), goal.get("owner_name"), goal.get("responsible_name"))
+    owner = pg_get_user_by_name(cur, owner_name)
+    owner_id = owner["id"] if owner and goal_level == "employee" else None
+    manager_id = None
+    if goal_level == "employee" and owner:
+        manager_id = owner.get("manager_id")
+    elif goal_level == "manager" and owner:
+        manager_id = owner.get("id")
+    elif goal_level in {"department", "project"} and owner:
+        manager_id = owner.get("id")
+
+    period_start = (
+        safe_parse_date(first_non_empty(goal.get("period_start"), goal.get("assigned_at"), goal.get("set_at")))
+        or report_date
+    )
+    period_end = (
+        safe_parse_date(first_non_empty(goal.get("period_end"), goal.get("deadline"), goal.get("end_date")))
+        or period_start
+    )
+    if period_end < period_start:
+        period_end = period_start
+    period_type = normalize_period_type(goal.get("period_type"), period_start, period_end)
+    status = str(goal.get("status") or "active").strip()
+    if status not in {"draft", "active", "done", "cancelled", "archived"}:
+        status = "active"
+    raw_goal = dict(goal)
+    raw_goal.update({
+        "chat_id": str(chat_id),
+        "chat_daily_report_id": str(report_id),
+        "report_date": report_date.isoformat(),
+    })
+    confidence = confidence_value(goal.get("confidence"))
+    goal_text = text_or_json(first_non_empty(goal.get("description"), goal.get("goal_text"), goal.get("text")))
+    success_metrics = text_or_json(goal.get("success_metrics"))
+    expected_result = text_or_json(goal.get("expected_result"))
+
+    cur.execute(
+        """
+        SELECT id
+        FROM user_goals
+        WHERE source_type = 'chat'
+          AND lower(goal_title) = lower(%s)
+          AND goal_level = %s
+          AND period_start = %s
+          AND period_end = %s
+          AND user_id IS NOT DISTINCT FROM %s
+          AND manager_id IS NOT DISTINCT FROM %s
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (title, goal_level, period_start, period_end, owner_id, manager_id),
+    )
+    existing = cur.fetchone()
+    if existing:
+        cur.execute(
+            """
+            UPDATE user_goals
+            SET goal_text = %s,
+                period_type = %s,
+                success_metrics = %s,
+                expected_result = %s,
+                status = %s,
+                confidence = GREATEST(COALESCE(confidence, 0), %s),
+                updated_at = now()
+            WHERE id = %s
+            RETURNING id
+            """,
+            (goal_text, period_type, success_metrics, expected_result, status, confidence, existing["id"]),
+        )
+        goal_id = cur.fetchone()["id"]
+    else:
+        cur.execute(
+            """
+            INSERT INTO user_goals (
+                user_id, manager_id, goal_title, goal_text, goal_level,
+                period_type, period_start, period_end, success_metrics,
+                expected_result, status, source_type, confidence, is_confirmed
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'chat', %s, FALSE)
+            RETURNING id
+            """,
+            (
+                owner_id,
+                manager_id,
+                title,
+                goal_text,
+                goal_level,
+                period_type,
+                period_start,
+                period_end,
+                success_metrics,
+                expected_result,
+                status,
+                confidence,
+            ),
+        )
+        goal_id = cur.fetchone()["id"]
+
+    if ai_request_id:
+        cur.execute(
+            """
+            INSERT INTO ai_request_artifacts (
+                ai_request_id, chat_id, goal_id, chat_daily_report_id
+            )
+            SELECT %s, %s, %s, %s
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM ai_request_artifacts
+                WHERE ai_request_id = %s
+                  AND goal_id = %s
+                  AND chat_daily_report_id = %s
+            )
+            """,
+            (ai_request_id, chat_id, goal_id, report_id, ai_request_id, goal_id, report_id),
+        )
+    return goal_id
+
+
+def save_chat_goals_from_analysis(
+    cur: Any,
+    chat_id: Any,
+    report_id: Any,
+    report_date: date,
+    analysis: dict[str, Any],
+    ai_request_id: Any = None,
+) -> int:
+    goals = analysis.get("goals")
+    if not isinstance(goals, list):
+        return 0
+    saved_ids: set[str] = set()
+    for item in goals:
+        raw_goal = item if isinstance(item, dict) else {"text": item}
+        if not isinstance(raw_goal, dict):
+            continue
+        goal_id = pg_save_goal_from_chat_report(cur, chat_id, report_id, report_date, raw_goal, ai_request_id)
+        if goal_id:
+            saved_ids.add(str(goal_id))
+    return len(saved_ids)
+
+
+def goal_update_text(update: dict[str, Any]) -> str:
+    return str(first_non_empty(
+        update.get("progress_text"),
+        update.get("text"),
+        update.get("summary"),
+        update.get("reason"),
+        update.get("status_reason"),
+    ) or "").strip()
+
+
+def pg_goal_by_id(cur: Any, goal_id: Any) -> dict[str, Any] | None:
+    if not goal_id:
+        return None
+    try:
+        goal_uuid = str(UUID(str(goal_id)))
+    except (TypeError, ValueError):
+        return None
+    cur.execute(
+        """
+        SELECT id, user_id, manager_id, goal_title, goal_level, period_start,
+               period_end, status, success_metrics, expected_result
+        FROM user_goals
+        WHERE id = %s
+        """,
+        (goal_uuid,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def pg_match_goal_for_update(cur: Any, update: dict[str, Any], report_date: date) -> dict[str, Any] | None:
+    direct = pg_goal_by_id(cur, first_non_empty(update.get("goal_id"), update.get("matched_goal_id")))
+    if direct:
+        return direct
+
+    title = str(first_non_empty(update.get("goal_title"), update.get("title"), update.get("text")) or "").strip()
+    if not title:
+        return None
+
+    owner = pg_get_user_by_name(cur, first_non_empty(update.get("person_name"), update.get("owner_name"), update.get("responsible_name")))
+    goal_level = normalize_goal_level(update.get("goal_level"), update.get("scope")) if first_non_empty(update.get("goal_level"), update.get("scope")) else None
+    params: list[Any] = [title, report_date, report_date]
+    filters = [
+        "lower(goal_title) = lower(%s)",
+        "period_start <= %s",
+        "period_end >= %s",
+        "status IN ('draft','active')",
+    ]
+    if owner:
+        filters.append("(user_id = %s OR manager_id = %s)")
+        params.extend([owner["id"], owner["id"]])
+    if goal_level:
+        filters.append("goal_level = %s")
+        params.append(goal_level)
+    cur.execute(
+        f"""
+        SELECT id, user_id, manager_id, goal_title, goal_level, period_start,
+               period_end, status, success_metrics, expected_result
+        FROM user_goals
+        WHERE {' AND '.join(filters)}
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        tuple(params),
+    )
+    row = cur.fetchone()
+    if row:
+        return dict(row)
+
+    cur.execute(
+        """
+        SELECT id, user_id, manager_id, goal_title, goal_level, period_start,
+               period_end, status, success_metrics, expected_result
+        FROM user_goals
+        WHERE status IN ('draft','active')
+          AND period_start <= %s
+          AND period_end >= %s
+          AND (
+              lower(goal_title) LIKE lower(%s)
+              OR lower(%s) LIKE lower(goal_title)
+          )
+        ORDER BY similarity(goal_title, %s) DESC, updated_at DESC
+        LIMIT 1
+        """,
+        (report_date, report_date, f"%{title}%", title, title),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def conservative_goal_status_after(current_status: str, update: dict[str, Any], confidence: float) -> str:
+    proposed = normalize_goal_status(first_non_empty(update.get("status_after"), update.get("status"), update.get("new_status")))
+    is_completed = bool(update.get("is_completed") is True or update.get("completed") is True)
+    is_cancelled = bool(update.get("is_cancelled") is True or update.get("cancelled") is True)
+
+    if current_status in {"done", "cancelled", "archived"}:
+        return current_status
+    if confidence >= 0.75 and (is_cancelled or proposed == "cancelled"):
+        return "cancelled"
+    if confidence >= 0.80 and (is_completed or proposed == "done"):
+        return "done"
+    if current_status == "draft" and proposed == "active" and confidence >= 0.60:
+        return "active"
+    return current_status
+
+
+def save_goal_updates_from_analysis(
+    cur: Any,
+    chat_id: Any,
+    report_id: Any,
+    report_date: date,
+    analysis: dict[str, Any],
+) -> int:
+    updates = analysis.get("goal_updates")
+    if not isinstance(updates, list):
+        return 0
+    saved = 0
+    for item in updates:
+        update = item if isinstance(item, dict) else {"progress_text": item}
+        if not isinstance(update, dict):
+            continue
+        progress_text = goal_update_text(update)
+        if not progress_text:
+            continue
+        goal = pg_match_goal_for_update(cur, update, report_date)
+        if not goal:
+            continue
+        evidence_ids = []
+        for value in to_list(update.get("evidence_message_ids")):
+            parsed = to_int(value)
+            if parsed is not None:
+                evidence_ids.append(parsed)
+        confidence = confidence_value(update.get("confidence"), default=0.65)
+        status_before = goal["status"]
+        status_after = conservative_goal_status_after(status_before, update, confidence)
+        risk_level = str(update.get("risk_level") or "unknown").strip()
+        if risk_level not in {"low", "medium", "high", "unknown"}:
+            risk_level = "unknown"
+        cur.execute(
+            """
+            INSERT INTO goal_progress_events (
+                goal_id, chat_daily_report_id, chat_id, report_date,
+                status_before, status_after, progress_text, progress_percent,
+                metric_value, risk_level, confidence, evidence_message_ids, raw_json
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                goal["id"],
+                report_id,
+                chat_id,
+                report_date,
+                status_before,
+                status_after,
+                progress_text,
+                percent_value(update.get("progress_percent")),
+                text_or_json(first_non_empty(update.get("metric_value"), update.get("metric"), update.get("value"))),
+                risk_level,
+                confidence,
+                evidence_ids or None,
+                pg_json(update),
+            ),
+        )
+        saved += 1
+        if status_after != status_before:
+            cur.execute(
+                """
+                UPDATE user_goals
+                SET status = %s,
+                    updated_at = now()
+                WHERE id = %s
+                """,
+                (status_after, goal["id"]),
+            )
+    return saved
+
+
+def save_chat_daily_report(
+    dialog_id: str,
+    report_date: date,
+    report_text: str,
+    model: str,
+    raw: dict[str, Any] | None = None,
+    ai_request_id: Any = None,
+    prompt_id: Any = None,
+) -> None:
+    raw_payload = dict(raw or {})
+    raw_payload.setdefault("model", model)
+    if is_local_chat_report_payload(raw_payload):
+        return
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                chat_uuid = pg_chat_id_by_dialog(cur, dialog_id)
+                if not chat_uuid:
+                    return
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(version), 0) + 1 AS version
+                    FROM chat_daily_reports
+                    WHERE chat_id = %s AND report_date = %s
+                    """,
+                    (chat_uuid, report_date),
+                )
+                version = cur.fetchone()["version"]
+                analysis = (raw or {}).get("analysis") if isinstance(raw, dict) else None
+                goals_saved = 0
+                extracted_tasks = extracted_goals = extracted_facts = 0
+                if isinstance(analysis, dict):
+                    extracted_tasks = extracted_task_count(analysis)
+                    extracted_goals = extracted_goal_count(analysis)
+                    extracted_facts = extracted_fact_count(analysis)
+                cur.execute(
+                    """
+                    INSERT INTO chat_daily_reports (
+                        chat_id, report_date, version, is_current, ai_request_id, prompt_id, generated_at,
+                        messages_count, files_count, ocr_files_count,
+                        extracted_tasks_count, extracted_goals_count, extracted_facts_count,
+                        summary, raw_ai_json, status
+                    )
+                    SELECT %s, %s, %s, TRUE, %s, %s, now(),
+                           COUNT(DISTINCT m.id),
+                           COUNT(DISTINCT f.id),
+                           COUNT(DISTINCT o.id),
+                           %s, %s, %s,
+                           %s, %s, 'done'
+                    FROM chats c
+                    LEFT JOIN chat_messages m ON m.chat_id = c.id AND m.message_day = %s
+                    LEFT JOIN chat_message_files f ON f.chat_id = c.id AND f.message_day = %s
+                    LEFT JOIN chat_file_ocr o ON o.file_id = f.id AND o.ocr_status = 'success'
+                    WHERE c.id = %s
+                    GROUP BY c.id
+                    RETURNING id
+                    """,
+                    (
+                        chat_uuid,
+                        report_date,
+                        version,
+                        ai_request_id,
+                        prompt_id,
+                        extracted_tasks,
+                        extracted_goals,
+                        extracted_facts,
+                        report_text,
+                        pg_json(raw_payload),
+                        report_date,
+                        report_date,
+                        chat_uuid,
+                    ),
+                )
+                report_id = cur.fetchone()["id"]
+                if isinstance(analysis, dict):
+                    save_chat_report_items(cur, report_id, chat_uuid, report_date, analysis)
+                    goals_saved = save_chat_goals_from_analysis(cur, chat_uuid, report_id, report_date, analysis, ai_request_id)
+                    save_goal_updates_from_analysis(cur, chat_uuid, report_id, report_date, analysis)
+                    if goals_saved != extracted_goals:
+                        cur.execute(
+                            """
+                            UPDATE chat_daily_reports
+                            SET extracted_goals_count = %s
+                            WHERE id = %s
+                            """,
+                            (goals_saved, report_id),
+                        )
+        return
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_daily_reports (
+                dialog_id, report_date, report_text, model, generated_at, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dialog_id, report_date) DO UPDATE SET
+                report_text = excluded.report_text,
+                model = excluded.model,
+                generated_at = excluded.generated_at,
+                raw_json = excluded.raw_json
+            """,
+            (
+                dialog_id,
+                report_date.isoformat(),
+                report_text,
+                model,
+                datetime.now().isoformat(),
+                json.dumps(raw or {}, ensure_ascii=False),
+            ),
+        )
+
+
+def _delta_text(current: int, previous: int) -> str:
+    delta = current - previous
+    if delta > 0:
+        return f"+{delta}"
+    return str(delta)
+
+
+def _format_digest_items(items: list[dict[str, Any]], empty: str = "Ничего не обнаружено") -> list[str]:
+    if not items:
+        return [empty]
+    return [f"- {item['text']}" for item in items]
+
+
+def build_chat_overall_daily_report_payload(report_date: date) -> dict[str, Any]:
+    if not postgres_enabled():
+        raise ValueError("Сводный отчет по чатам доступен только в PostgreSQL.")
+
+    previous_date = report_date - timedelta(days=1)
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id, r.chat_id, c.dialog_id, c.chat_title, r.messages_count,
+                       r.extracted_goals_count, r.extracted_tasks_count, r.extracted_facts_count,
+                       r.summary, r.raw_ai_json
+                FROM chat_daily_reports r
+                JOIN chats c ON c.id = r.chat_id
+                WHERE r.report_date = %s
+                  AND r.is_current = TRUE
+                  AND c.is_excluded = FALSE
+                ORDER BY c.chat_title NULLS LAST, c.dialog_id
+                """,
+                (report_date,),
+            )
+            reports = cur.fetchall()
+            report_ids = [row["id"] for row in reports]
+
+            item_counts: dict[str, int] = {}
+            top_items: dict[str, list[dict[str, Any]]] = {key: [] for key in ("result", "commitment", "next_step", "risk", "blocker", "unanswered_question", "goal")}
+            if report_ids:
+                cur.execute(
+                    """
+                    SELECT item_type, COUNT(*) AS count
+                    FROM chat_report_items
+                    WHERE chat_daily_report_id = ANY(%s)
+                    GROUP BY item_type
+                    """,
+                    (report_ids,),
+                )
+                item_counts = {row["item_type"]: row["count"] for row in cur.fetchall()}
+                cur.execute(
+                    """
+                    SELECT i.item_type, i.item_text, i.confidence, c.chat_title,
+                           u.full_name AS user_name, i.evidence_message_ids
+                    FROM chat_report_items i
+                    JOIN chats c ON c.id = i.chat_id
+                    LEFT JOIN users u ON u.id = i.user_id
+                    WHERE i.chat_daily_report_id = ANY(%s)
+                      AND i.item_type = ANY(%s)
+                    ORDER BY
+                        CASE i.item_type
+                            WHEN 'risk' THEN 1
+                            WHEN 'blocker' THEN 2
+                            WHEN 'unanswered_question' THEN 3
+                            WHEN 'result' THEN 4
+                            WHEN 'commitment' THEN 5
+                            WHEN 'next_step' THEN 6
+                            ELSE 7
+                        END,
+                        i.confidence DESC NULLS LAST,
+                        i.created_at
+                    """,
+                    (report_ids, list(top_items.keys())),
+                )
+                for row in cur.fetchall():
+                    bucket = top_items.get(row["item_type"])
+                    if bucket is not None and len(bucket) < 12:
+                        owner = f"{row['user_name']}: " if row["user_name"] else ""
+                        chat_title = row["chat_title"] or "чат"
+                        bucket.append({
+                            "text": f"{owner}{row['item_text']} ({chat_title})",
+                            "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+                            "evidence_message_ids": row["evidence_message_ids"] or [],
+                        })
+
+            cur.execute(
+                """
+                SELECT e.report_date, e.status_before, e.status_after, e.progress_text,
+                       e.progress_percent, e.risk_level, e.confidence,
+                       g.goal_title, g.goal_level, u.full_name AS owner_name, c.chat_title
+                FROM goal_progress_events e
+                JOIN user_goals g ON g.id = e.goal_id
+                LEFT JOIN users u ON u.id = g.user_id
+                LEFT JOIN chats c ON c.id = e.chat_id
+                WHERE e.report_date = %s
+                ORDER BY
+                    CASE e.risk_level WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+                    e.created_at
+                """,
+                (report_date,),
+            )
+            goal_events = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT report_date, chats_count, messages_count, goals_created_count,
+                       goal_updates_count, commitments_count, results_count, next_steps_count,
+                       risks_count, blockers_count, unresolved_questions_count,
+                       done_goal_updates_count, high_risk_goal_updates_count
+                FROM chat_overall_daily_reports
+                WHERE report_date = %s
+                  AND is_current = TRUE
+                """,
+                (previous_date,),
+            )
+            previous = cur.fetchone()
+
+    stats = {
+        "chats_count": len(reports),
+        "messages_count": sum(int(row["messages_count"] or 0) for row in reports),
+        "goals_created_count": item_counts.get("goal", 0),
+        "goal_updates_count": len(goal_events),
+        "commitments_count": item_counts.get("commitment", 0),
+        "results_count": item_counts.get("result", 0),
+        "next_steps_count": item_counts.get("next_step", 0),
+        "risks_count": item_counts.get("risk", 0),
+        "blockers_count": item_counts.get("blocker", 0),
+        "unresolved_questions_count": item_counts.get("unanswered_question", 0),
+        "done_goal_updates_count": sum(1 for row in goal_events if row["status_after"] == "done"),
+        "high_risk_goal_updates_count": sum(1 for row in goal_events if row["risk_level"] == "high"),
+    }
+    previous_stats = {
+        key: int(previous[key] or 0) if previous else 0
+        for key in stats
+    }
+    dynamics = {
+        key: {
+            "current": value,
+            "previous": previous_stats.get(key, 0),
+            "delta": value - previous_stats.get(key, 0),
+        }
+        for key, value in stats.items()
+    }
+
+    positives = []
+    for item in top_items["result"][:8]:
+        positives.append(item)
+    for row in goal_events:
+        if row["status_after"] == "done":
+            positives.append({"text": f"Цель закрыта: {row['goal_title']} - {row['progress_text']}"})
+    positives = positives[:10]
+
+    problems = []
+    for item in top_items["risk"][:8]:
+        problems.append(item)
+    for item in top_items["blocker"][:5]:
+        problems.append(item)
+    for row in goal_events:
+        if row["risk_level"] == "high":
+            owner = f"{row['owner_name']}: " if row["owner_name"] else ""
+            problems.append({"text": f"{owner}{row['goal_title']} - {row['progress_text']}"})
+    problems = problems[:12]
+
+    work_in_progress = []
+    for item in top_items["commitment"][:8]:
+        work_in_progress.append(item)
+    for item in top_items["next_step"][:8]:
+        work_in_progress.append(item)
+    work_in_progress = work_in_progress[:12]
+
+    not_done = []
+    for item in top_items["unanswered_question"][:8]:
+        not_done.append(item)
+    not_done.extend(problems[:6])
+    not_done = not_done[:12]
+
+    goal_event_payload = [
+        {
+            "goal_title": row["goal_title"],
+            "goal_level": row["goal_level"],
+            "owner_name": row["owner_name"],
+            "chat_title": row["chat_title"],
+            "status_before": row["status_before"],
+            "status_after": row["status_after"],
+            "progress_text": row["progress_text"],
+            "progress_percent": float(row["progress_percent"]) if row["progress_percent"] is not None else None,
+            "risk_level": row["risk_level"],
+            "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+        }
+        for row in goal_events
+    ]
+
+    summary = (
+        f"За {format_date_ru(report_date)} обработано чатов: {stats['chats_count']}, "
+        f"сообщений: {stats['messages_count']}. "
+        f"Результатов: {stats['results_count']}, задач/обязательств: {stats['commitments_count']}, "
+        f"следующих шагов: {stats['next_steps_count']}, рисков: {stats['risks_count']}, "
+        f"обновлений целей: {stats['goal_updates_count']}."
+    )
+    dynamics_summary = (
+        "Динамика к предыдущему дню: "
+        f"результаты {_delta_text(stats['results_count'], previous_stats['results_count'])}, "
+        f"риски {_delta_text(stats['risks_count'], previous_stats['risks_count'])}, "
+        f"следующие шаги {_delta_text(stats['next_steps_count'], previous_stats['next_steps_count'])}, "
+        f"обновления целей {_delta_text(stats['goal_updates_count'], previous_stats['goal_updates_count'])}."
+    )
+    positives_summary = "\n".join(_format_digest_items(positives, "Нет явных положительных результатов."))
+    problems_summary = "\n".join(_format_digest_items(problems, "Нет явных проблем и высоких рисков."))
+
+    lines = [
+        "Ежедневный отчет по чатам",
+        "",
+        summary,
+        dynamics_summary,
+        "",
+        "Что делается:",
+        *_format_digest_items(work_in_progress),
+        "",
+        "Что не делается / требует внимания:",
+        *_format_digest_items(not_done),
+        "",
+        "Что хорошо:",
+        *_format_digest_items(positives, "Нет явных положительных результатов."),
+        "",
+        "Что плохо:",
+        *_format_digest_items(problems, "Нет явных проблем и высоких рисков."),
+        "",
+        "Динамика целей:",
+        *_format_digest_items(
+            [
+                {
+                    "text": (
+                        f"{row['goal_title']}: {row['status_before']} -> {row['status_after']}; "
+                        f"{row['progress_percent']}%; риск {row['risk_level']}; {row['progress_text']}"
+                    )
+                }
+                for row in goal_event_payload
+            ],
+            "Нет обновлений целей за день.",
+        ),
+    ]
+
+    raw_json = {
+        "report_date": report_date.isoformat(),
+        "stats": stats,
+        "previous_date": previous_date.isoformat(),
+        "previous_stats": previous_stats,
+        "dynamics": dynamics,
+        "chats": [
+            {
+                "dialog_id": row["dialog_id"],
+                "chat_title": row["chat_title"],
+                "messages_count": row["messages_count"],
+                "extracted_goals_count": row["extracted_goals_count"],
+                "extracted_tasks_count": row["extracted_tasks_count"],
+                "extracted_facts_count": row["extracted_facts_count"],
+            }
+            for row in reports
+        ],
+        "top_items": top_items,
+        "goal_updates": goal_event_payload,
+        "work_in_progress": work_in_progress,
+        "not_done": not_done,
+        "positives": positives,
+        "problems": problems,
+    }
+    return {
+        "report_date": report_date,
+        **stats,
+        "summary": summary,
+        "dynamics_summary": dynamics_summary,
+        "positives_summary": positives_summary,
+        "problems_summary": problems_summary,
+        "report_text": "\n".join(lines).strip(),
+        "raw_json": raw_json,
+    }
+
+
+def save_chat_overall_daily_report(report_date: date) -> dict[str, Any]:
+    payload = build_chat_overall_daily_report_payload(report_date)
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(version), 0) + 1 AS version
+                    FROM chat_overall_daily_reports
+                    WHERE report_date = %s
+                    """,
+                    (report_date,),
+                )
+                version = cur.fetchone()["version"]
+                cur.execute(
+                    """
+                    INSERT INTO chat_overall_daily_reports (
+                        report_date, version, is_current, generated_at,
+                        chats_count, messages_count, goals_created_count, goal_updates_count,
+                        commitments_count, results_count, next_steps_count, risks_count,
+                        blockers_count, unresolved_questions_count, done_goal_updates_count,
+                        high_risk_goal_updates_count, summary, dynamics_summary,
+                        positives_summary, problems_summary, raw_json
+                    ) VALUES (
+                        %s, %s, TRUE, now(),
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s
+                    )
+                    RETURNING *
+                    """,
+                    (
+                        report_date,
+                        version,
+                        payload["chats_count"],
+                        payload["messages_count"],
+                        payload["goals_created_count"],
+                        payload["goal_updates_count"],
+                        payload["commitments_count"],
+                        payload["results_count"],
+                        payload["next_steps_count"],
+                        payload["risks_count"],
+                        payload["blockers_count"],
+                        payload["unresolved_questions_count"],
+                        payload["done_goal_updates_count"],
+                        payload["high_risk_goal_updates_count"],
+                        payload["summary"],
+                        payload["dynamics_summary"],
+                        payload["positives_summary"],
+                        payload["problems_summary"],
+                        pg_json({**payload["raw_json"], "report_text": payload["report_text"]}),
+                    ),
+                )
+                row = cur.fetchone()
+    return chat_overall_daily_report_to_dict(row)
+
+
+def chat_overall_daily_report_to_dict(row: Any) -> dict[str, Any]:
+    raw = row.get("raw_json") if isinstance(row, dict) else row["raw_json"]
+    report_text = raw.get("report_text") if isinstance(raw, dict) else None
+    return {
+        "report_id": str(row["id"]),
+        "report_date": row["report_date"].isoformat() if hasattr(row["report_date"], "isoformat") else row["report_date"],
+        "date_text": format_date_ru(row["report_date"]),
+        "version": row["version"],
+        "is_current": bool(row["is_current"]),
+        "generated_at": iso_or_none(row["generated_at"]),
+        "generated_at_text": format_datetime_ru(row["generated_at"]),
+        "chats_count": row["chats_count"],
+        "messages_count": row["messages_count"],
+        "goals_created_count": row["goals_created_count"],
+        "goal_updates_count": row["goal_updates_count"],
+        "commitments_count": row["commitments_count"],
+        "results_count": row["results_count"],
+        "next_steps_count": row["next_steps_count"],
+        "risks_count": row["risks_count"],
+        "blockers_count": row["blockers_count"],
+        "unresolved_questions_count": row["unresolved_questions_count"],
+        "done_goal_updates_count": row["done_goal_updates_count"],
+        "high_risk_goal_updates_count": row["high_risk_goal_updates_count"],
+        "summary": row["summary"],
+        "dynamics_summary": row["dynamics_summary"],
+        "positives_summary": row["positives_summary"],
+        "problems_summary": row["problems_summary"],
+        "report_text": report_text or row["summary"] or "",
+        "raw_json": raw,
+    }
+
+
+def load_chat_overall_daily_report(report_date: date) -> dict[str, Any] | None:
+    if not postgres_enabled():
+        return None
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM chat_overall_daily_reports
+                WHERE report_date = %s
+                  AND is_current = TRUE
+                """,
+                (report_date,),
+            )
+            row = cur.fetchone()
+    return chat_overall_daily_report_to_dict(row) if row else None
+
+
+def list_chat_overall_daily_reports(limit: int = 30) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    limit = max(1, min(int(limit or 30), 100))
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM chat_overall_daily_reports
+                WHERE is_current = TRUE
+                ORDER BY report_date DESC, version DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+    return [chat_overall_daily_report_to_dict(row) for row in rows]
+
+
+STARTUP_CHAT_WEEKLY_PERIOD = (date(2026, 3, 30), date(2026, 4, 5))
+REPORT_PLACEHOLDER_START_DATE = date(2026, 3, 30)
+_PLACEHOLDER_SYNCED_THROUGH: date | None = None
+
+
+CHAT_OVERALL_WEEKLY_PROMPT = """Ты делаешь недельный управленческий отчет по корпоративным чатам.
+
+Главная задача: обработать ежедневные отчеты этой недели так, чтобы руководитель понял, что реально произошло за неделю, что конкретно делать дальше, кто владелец каждого действия, какой срок и как проверить результат.
+
+Входные данные:
+- daily_chat_reports: ежедневные отчеты чатов за неделю. Это главный источник истины.
+- Внутри каждого daily_chat_reports есть summary, items и analysis_compact. Именно там лежат цели, задачи, факты выполнения, планы, риски, вопросы и переносы.
+- goal_progress_events: динамика целей за неделю.
+- daily_overall_reports: счетчики и дневная динамика.
+
+Критически важное правило сохранения данных:
+- Нельзя терять задачи, цели, планы, риски и незакрытые вопросы из ежедневных отчетов.
+- Все незавершенные задачи из daily_chat_reports должны перейти в недельный отчет в hanging_tasks_by_owner или not_done.
+- Все цели, которые не закрыты явно, должны перейти в hanging_goals или final_goals.
+- Все планы/next_step/commitment/previous_day_task из ежедневных отчетов должны быть отражены: если выполнены - в positives_summary/closed_small_goals, если не выполнены или статус неясен - в hanging_tasks_by_owner/not_done/work_in_progress.
+- Если задача повторяется несколько дней, объедини ее в один человеческий пункт, но обязательно сохрани ответственного, период, исходные даты и текущий статус.
+- Если в ежедневном отчете есть срок, сохрани срок. Если срока нет, напиши "срок не указан".
+- Если в ежедневном отчете есть статус, сохрани статус. Если статуса нет, напиши "статус не указан".
+
+Как писать:
+- Пиши человеческим управленческим языком, короткими понятными фразами.
+- Не пиши техническую выгрузку и не используй формат с разделителями вроде "дата | ответственный | статус".
+- Каждый пункт должен быть понятен без открытия исходного чата: кто, что сделал или не сделал, по какой задаче/цели, какой срок, какой статус, откуда это взято.
+- Самый важный блок отчета - "Что делать на следующей неделе". Он должен быть списком конкретных проверяемых действий, а не общим абзацем.
+- Каждая рекомендация должна иметь 5 частей: владелец; действие; объект/задача; срок или "срок не указан"; критерий готовности/что проверить.
+- Если рекомендация не привязана к конкретной задаче, цели, риску, вопросу или человеку из входных данных, не включай ее.
+- Не делай общие выводы без факта. Нельзя писать "команда работала хорошо", если нет конкретных закрытий/результатов.
+- Не придумывай факты. Если данных недостаточно, так и напиши.
+- Не используй слово "хвост". Пиши "незакрытая задача", "открытая тема", "неподтвержденный результат", "нет реакции".
+
+Обязательные управленческие разделы:
+1. summary - итог недели в 3-6 предложениях: что двигалось, что закрыто, что осталось открытым.
+2. dynamics_summary - динамика недели: что улучшалось/ухудшалось по дням, где риски повторялись, какие задачи тянулись несколько дней.
+3. top_performers - кто хорошо поработал. Только по фактам выполненных задач, закрытых целей, решений, результатов. Для каждого: имя + конкретные факты.
+4. weak_performers - кто работал слабо или создал риск. Только по фактам: не закрыл задачу, не дал ответ, сорвал срок, оставил статус неясным.
+5. responded_to_feedback - кто отреагировал на замечания/вопросы/риски и чем это подтверждено.
+6. no_response_to_feedback - где нет реакции на замечание, вопрос, риск или поставленную задачу. Укажи ответственного, дату и что именно осталось без реакции.
+7. hanging_tasks_by_owner - все незакрытые задачи по ответственным. Это самый важный раздел для следующего понедельника.
+8. hanging_goals - все цели, которые не закрыты явно или имеют риск/неясный прогресс.
+9. work_in_progress - что находится в работе и должно перейти дальше.
+10. not_done - что не сделано, зависло, перенесено или имеет неясный статус.
+11. closed_small_goals - маленькие закрытые цели/конкретные результаты недели.
+12. final_goals - цели недели и периода, которые были сформулированы или уточнены.
+13. key_goal_dynamics - динамика целей: прогресс, риск, статус до/после.
+14. positives_summary - что хорошо, с конкретными фактами.
+15. problems_summary - что плохо, что не делается, где нет реакции или риск.
+16. next_week_action_plan - главный список действий на следующую неделю. Формат каждого пункта: "Владелец: действие; объект; срок; критерий проверки; источник/дата".
+17. recommendations - краткие управленческие выводы из action plan. Если можешь, верни теми же пунктами, что next_week_action_plan.
+
+Правило "перехода дальше":
+- Недельный отчет будет использоваться как контекст для следующего понедельника.
+- Поэтому открытые задачи и цели должны быть записаны так, чтобы следующий ежедневный отчет мог проверить их выполнение.
+- Формулировка открытой задачи должна сохранять смысл ежедневного отчета: ответственный, действие, объект работы, срок, статус, источник/дата.
+
+Верни строго JSON без markdown и без пояснений вне JSON.
+
+Формат JSON:
+{
+  "summary": "человеческий итог недели",
+  "dynamics_summary": "динамика недели по задачам, целям, рискам и реакциям",
+  "positives_summary": "что хорошо, с фактами",
+  "problems_summary": "что плохо/не сделано/без реакции, с фактами",
+  "next_week_action_plan": ["владелец: конкретное действие; объект/задача; срок; критерий проверки; источник/дата"],
+  "recommendations": "короткий список конкретных действий на следующий понедельник, можно строками с маркерами",
+  "work_in_progress": ["ответственный: что в работе; срок; статус; источник/дата"],
+  "not_done": ["ответственный: что не сделано или статус неясен; срок; источник/дата"],
+  "key_goal_dynamics": ["цель: владелец; прогресс; риск; статус; источник/дата"],
+  "top_performers": ["имя: почему хорошо; конкретные закрытые задачи/результаты"],
+  "weak_performers": ["имя: почему слабо; конкретные незакрытые задачи/риски"],
+  "responded_to_feedback": ["имя: на что отреагировал; чем подтверждено"],
+  "no_response_to_feedback": ["имя: на что нет реакции; дата; почему важно"],
+  "final_goals": ["цель: владелец; период; метрика/ожидаемый результат; источник/дата"],
+  "closed_small_goals": ["что закрыто; ответственный; дата; подтверждение"],
+  "hanging_goals": ["цель: владелец; что не закрыто; риск; следующий контроль"],
+  "hanging_tasks_by_owner": ["ответственный: задача; статус; срок; что проверить в понедельник"],
+  "chat_highlights": [
+    {"chat_title":"название чата", "summary":"кратко что важно", "risk_level":"low|medium|high"}
+  ]
+}
+"""
+
+
+CHAT_WEEKLY_MANDATORY_LOGIC = """
+Обязательная логика недельного отчета:
+- Это НЕ пересказ сообщений и НЕ сводка одного дня. Это ИИ-обработка daily_chat_reports за всю неделю.
+- Для каждого вывода используй только дневные отчеты недели: daily_chat_reports, их items, analysis_compact и goal_progress_events.
+- Формат должен быть близок к ежедневному отчету: сначала конкретные действия и контроль, затем динамика, затем что хорошо/плохо и открытые задачи.
+- Главные разделы отчета: кто работал хорошо, кто работал слабо, кто реагировал на замечания, кто не реагировал, какие задачи висят, какие цели висят.
+- Нельзя терять ни одну незавершенную задачу, цель, план, риск или unanswered_question из daily_chat_reports. Они должны попасть в not_done, work_in_progress, hanging_tasks_by_owner или hanging_goals.
+- "Кто работал хорошо" заполняй только по фактам result/action/decision или закрытым goal_progress_events со статусом done.
+- "Кто не реагировал" заполняй по unanswered_question, risk, blocker, high risk goal events, повторяющимся переносам и отсутствию закрывающего результата по ранее поставленной задаче.
+- "Задачи висят" заполняй по commitment, next_step, previous_day_task, risk/blocker и любым пунктам со статусом не done/sent. Обязательно указывай ответственного, дату, контекст, срок или "срок не указан".
+- "Цели висят" заполняй по goal_progress_events, где status_after не done, risk_level high/medium или прогресс не подтверждает закрытие цели.
+- "next_week_action_plan" и "Рекомендации" должны быть конкретными: кому, что сделать, по какой задаче/цели, к какому сроку и какой результат проверить. Нельзя писать общие фразы.
+- Если надежных данных по человеку нет, не оценивай человека. Пиши "нет надежных данных", а не придумывай.
+- Верни строго JSON с ключами summary, dynamics_summary, positives_summary, problems_summary, next_week_action_plan, recommendations, work_in_progress, not_done, key_goal_dynamics, top_performers, weak_performers, responded_to_feedback, no_response_to_feedback, final_goals, closed_small_goals, hanging_goals, hanging_tasks_by_owner, chat_highlights.
+"""
+
+
+def normalize_weekly_analysis(analysis: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(analysis) if isinstance(analysis, dict) else {}
+    required_list_keys = [
+        "work_in_progress",
+        "not_done",
+        "key_goal_dynamics",
+        "top_performers",
+        "weak_performers",
+        "responded_to_feedback",
+        "no_response_to_feedback",
+        "final_goals",
+        "closed_small_goals",
+        "hanging_goals",
+        "hanging_tasks_by_owner",
+        "next_week_action_plan",
+        "chat_highlights",
+    ]
+    required_text_keys = [
+        "summary",
+        "dynamics_summary",
+        "positives_summary",
+        "problems_summary",
+        "recommendations",
+    ]
+    for key in required_text_keys:
+        if not str(normalized.get(key) or "").strip():
+            normalized[key] = fallback.get(key)
+    for key in required_list_keys:
+        value = normalized.get(key)
+        if not isinstance(value, list) or not value:
+            if key == "next_week_action_plan" and isinstance(normalized.get("recommendations"), str):
+                normalized[key] = [
+                    line.strip("- \t")
+                    for line in str(normalized.get("recommendations") or "").splitlines()
+                    if line.strip("- \t")
+                ]
+            else:
+                normalized[key] = fallback.get(key, [])
+        elif key in {"work_in_progress", "not_done", "hanging_goals", "hanging_tasks_by_owner", "key_goal_dynamics"}:
+            seen = {json.dumps(item, ensure_ascii=False, sort_keys=True, default=str) for item in value}
+            merged = list(value)
+            for item in fallback.get(key, []):
+                marker = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+                if marker not in seen:
+                    merged.append(item)
+                    seen.add(marker)
+            normalized[key] = merged
+    return normalized
+
+
+def collect_chat_weekly_inputs(period_start: date, period_end: date) -> dict[str, Any]:
+    if not postgres_enabled():
+        raise ValueError("Недельный отчет по чатам доступен только в PostgreSQL.")
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id, r.report_date, r.chat_id, c.dialog_id, c.chat_title,
+                       r.messages_count, r.extracted_goals_count, r.extracted_tasks_count,
+                       r.extracted_facts_count, r.summary, r.raw_ai_json
+                FROM chat_daily_reports r
+                JOIN chats c ON c.id = r.chat_id
+                WHERE r.report_date BETWEEN %s AND %s
+                  AND r.is_current = TRUE
+                  AND c.is_excluded = FALSE
+                ORDER BY r.report_date, c.chat_title NULLS LAST, c.dialog_id
+                """,
+                (period_start, period_end),
+            )
+            daily_reports = cur.fetchall()
+            report_ids = [row["id"] for row in daily_reports]
+            items_by_report: dict[str, list[dict[str, Any]]] = {}
+            if report_ids:
+                cur.execute(
+                    """
+                    SELECT i.chat_daily_report_id, i.item_type, i.item_text, i.confidence,
+                           u.full_name AS user_name, i.evidence_message_ids, i.raw_json
+                    FROM chat_report_items i
+                    LEFT JOIN users u ON u.id = i.user_id
+                    WHERE i.chat_daily_report_id = ANY(%s)
+                      AND i.item_type = ANY(%s)
+                    ORDER BY i.report_date, i.item_type, i.created_at
+                    """,
+                    (
+                        report_ids,
+                        [
+                            "goal", "action", "decision", "commitment", "result", "next_step",
+                            "risk", "blocker", "question", "unanswered_question", "previous_day_task",
+                        ],
+                    ),
+                )
+                for row in cur.fetchall():
+                    items_by_report.setdefault(str(row["chat_daily_report_id"]), []).append({
+                        "item_type": row["item_type"],
+                        "item_text": row["item_text"],
+                        "user_name": row["user_name"],
+                        "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+                        "evidence_message_ids": row["evidence_message_ids"] or [],
+                        "raw_json": row["raw_json"] if isinstance(row["raw_json"], dict) else {},
+                    })
+            cur.execute(
+                """
+                SELECT e.report_date, e.status_before, e.status_after, e.progress_text,
+                       e.progress_percent, e.risk_level, e.confidence,
+                       g.goal_title, g.goal_level, u.full_name AS owner_name,
+                       c.dialog_id, c.chat_title
+                FROM goal_progress_events e
+                JOIN user_goals g ON g.id = e.goal_id
+                LEFT JOIN users u ON u.id = g.user_id
+                LEFT JOIN chats c ON c.id = e.chat_id
+                WHERE e.report_date BETWEEN %s AND %s
+                ORDER BY e.report_date, c.chat_title NULLS LAST, g.goal_title, e.created_at
+                """,
+                (period_start, period_end),
+            )
+            goal_events = cur.fetchall()
+            cur.execute(
+                """
+                SELECT *
+                FROM chat_overall_daily_reports
+                WHERE report_date BETWEEN %s AND %s
+                  AND is_current = TRUE
+                ORDER BY report_date
+                """,
+                (period_start, period_end),
+            )
+            daily_overall = cur.fetchall()
+
+    reports_payload = []
+    for row in daily_reports:
+        raw = row["raw_ai_json"] if isinstance(row["raw_ai_json"], dict) else {}
+        analysis = raw.get("analysis") if isinstance(raw.get("analysis"), dict) else {}
+        report_items = items_by_report.get(str(row["id"]), [])
+        reports_payload.append({
+            "report_id": str(row["id"]),
+            "date": row["report_date"].isoformat(),
+            "dialog_id": row["dialog_id"],
+            "chat_title": row["chat_title"] or row["dialog_id"],
+            "messages_count": int(row["messages_count"] or 0),
+            "summary": row["summary"],
+            "counts": {
+                "goals": int(row["extracted_goals_count"] or 0),
+                "tasks": int(row["extracted_tasks_count"] or 0),
+                "facts": int(row["extracted_facts_count"] or 0),
+            },
+            "items": report_items[:80],
+            "analysis_compact": {
+                "goals": analysis.get("goals", [])[:20] if isinstance(analysis.get("goals"), list) else [],
+                "results": analysis.get("results", [])[:30] if isinstance(analysis.get("results"), list) else [],
+                "risks": analysis.get("risks", [])[:30] if isinstance(analysis.get("risks"), list) else [],
+                "next_steps": analysis.get("next_steps", [])[:30] if isinstance(analysis.get("next_steps"), list) else [],
+                "goal_updates": analysis.get("goal_updates", [])[:30] if isinstance(analysis.get("goal_updates"), list) else [],
+            },
+        })
+
+    goal_events_payload = [
+        {
+            "date": row["report_date"].isoformat(),
+            "dialog_id": row["dialog_id"],
+            "chat_title": row["chat_title"],
+            "goal_title": row["goal_title"],
+            "goal_level": row["goal_level"],
+            "owner_name": row["owner_name"],
+            "status_before": row["status_before"],
+            "status_after": row["status_after"],
+            "progress_text": row["progress_text"],
+            "progress_percent": float(row["progress_percent"]) if row["progress_percent"] is not None else None,
+            "risk_level": row["risk_level"],
+            "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+        }
+        for row in goal_events
+    ]
+    daily_overall_payload = [
+        {
+            "date": row["report_date"].isoformat(),
+            "chats_count": row["chats_count"],
+            "messages_count": row["messages_count"],
+            "goals_created_count": row["goals_created_count"],
+            "goal_updates_count": row["goal_updates_count"],
+            "commitments_count": row["commitments_count"],
+            "results_count": row["results_count"],
+            "next_steps_count": row["next_steps_count"],
+            "risks_count": row["risks_count"],
+            "blockers_count": row["blockers_count"],
+            "unresolved_questions_count": row["unresolved_questions_count"],
+            "summary": row["summary"],
+            "dynamics_summary": row["dynamics_summary"],
+            "positives_summary": row["positives_summary"],
+            "problems_summary": row["problems_summary"],
+        }
+        for row in daily_overall
+    ]
+    prev_start, prev_end = previous_week_bounds_for_report(period_start)
+    previous_week_report = load_chat_overall_weekly_report(prev_start, prev_end)
+    return {
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "daily_chat_reports": reports_payload,
+        "daily_overall_reports": daily_overall_payload,
+        "goal_progress_events": goal_events_payload,
+        "previous_week_report": previous_week_report,
+    }
+
+
+def validate_chat_weekly_report_period(period_start: date, period_end: date) -> None:
+    if not postgres_enabled():
+        raise ValueError("Недельный отчет по чатам доступен только в PostgreSQL.")
+    if not is_allowed_chat_weekly_period(period_start, period_end):
+        raise ValueError("Недельная сводка должна быть за полный период с понедельника по воскресенье.")
+    if period_end > latest_visible_report_date():
+        raise ValueError(
+            "Нельзя формировать недельную сводку, пока неделя не закрыта и все дни периода не доступны для отчетов."
+        )
+
+    expected_dates = [period_start + timedelta(days=offset) for offset in range((period_end - period_start).days + 1)]
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.report_date,
+                       COUNT(*) AS reports_count,
+                       COALESCE(SUM(r.messages_count), 0) AS messages_count
+                FROM chat_daily_reports r
+                JOIN chats c ON c.id = r.chat_id
+                WHERE r.report_date BETWEEN %s AND %s
+                  AND r.is_current = TRUE
+                  AND c.is_excluded = FALSE
+                GROUP BY r.report_date
+                ORDER BY r.report_date
+                """,
+                (period_start, period_end),
+            )
+            daily_chat_rows = cur.fetchall()
+            daily_chat_dates = {row["report_date"] for row in daily_chat_rows}
+
+            cur.execute(
+                """
+                SELECT COUNT(*) AS reports_count, COALESCE(SUM(messages_count), 0) AS messages_count
+                FROM chat_daily_reports r
+                JOIN chats c ON c.id = r.chat_id
+                WHERE r.report_date BETWEEN %s AND %s
+                  AND r.is_current = TRUE
+                  AND c.is_excluded = FALSE
+                """,
+                (period_start, period_end),
+            )
+            chat_reports_summary = cur.fetchone()
+
+    missing_dates = [value for value in expected_dates if value not in daily_chat_dates]
+    if missing_dates:
+        missing_text = ", ".join(format_date_ru(value) for value in missing_dates)
+        raise ValueError(
+            "Нельзя сформировать недельную сводку: не хватает ежедневных отчетов чатов "
+            f"за даты {missing_text}."
+        )
+
+    if int(chat_reports_summary["reports_count"] or 0) == 0:
+        raise ValueError("Нельзя сформировать недельную сводку: за выбранную неделю нет дневных отчетов чатов.")
+    if int(chat_reports_summary["messages_count"] or 0) == 0:
+        raise ValueError("Нельзя сформировать недельную сводку: за выбранную неделю нет сообщений в дневных отчетах чатов.")
+
+
+def local_weekly_chat_summary(input_payload: dict[str, Any]) -> dict[str, Any]:
+    daily_reports = input_payload.get("daily_chat_reports") or []
+    daily_overall = input_payload.get("daily_overall_reports") or []
+    goal_events = input_payload.get("goal_progress_events") or []
+    chats: dict[str, dict[str, Any]] = {}
+    people: dict[str, dict[str, Any]] = {}
+    concrete_results: list[str] = []
+    concrete_risks: list[str] = []
+    concrete_work: list[str] = []
+    not_done: list[str] = []
+    final_goals: list[str] = []
+    closed_small_goals: list[str] = []
+    hanging_goals: list[str] = []
+    hanging_tasks_by_owner: list[str] = []
+    responded_to_feedback: list[str] = []
+    no_response_to_feedback: list[str] = []
+    recommendations: list[str] = []
+
+    def readable(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.count("?") >= max(4, len(text) // 4):
+            return ""
+        return text
+
+    def raw_value(item: dict[str, Any], *keys: str) -> Any:
+        raw = item.get("raw_json") if isinstance(item.get("raw_json"), dict) else {}
+        return first_non_empty(*(raw.get(key) for key in keys), *(item.get(key) for key in keys))
+
+    def owner_name(item: dict[str, Any]) -> str:
+        return readable(first_non_empty(
+            item.get("user_name"),
+            raw_value(item, "person_name", "owner_name", "assignee_name", "responsible_name"),
+        )) or "Ответственный не указан"
+
+    def item_deadline(item: dict[str, Any], fallback_date: str | None = None) -> str:
+        deadline = readable(raw_value(item, "deadline", "period_end", "due_date", "date_to", "target_date"))
+        return deadline or fallback_date or "срок не указан"
+
+    def item_status(item: dict[str, Any]) -> str:
+        status = readable(raw_value(item, "status", "action_status", "result", "state"))
+        mapping = {
+            "done": "выполнено",
+            "sent": "отправлено",
+            "in_progress": "в работе",
+            "planned": "запланировано",
+            "blocked": "заблокировано",
+            "unknown": "статус не указан",
+        }
+        return mapping.get(status, status or "статус не указан")
+
+    def evidence_text(item: dict[str, Any]) -> str:
+        ids = item.get("evidence_message_ids") or []
+        return f"сообщения {', '.join(str(value) for value in ids[:4])}" if ids else "доказательства в отчете дня"
+
+    def human_deadline(deadline: str) -> str:
+        return "срок в чате не зафиксирован" if deadline == "срок не указан" else deadline
+
+    def concrete_line(report: dict[str, Any], item: dict[str, Any], *, default_deadline: str | None = None) -> str:
+        text = readable(item.get("item_text")) or readable(raw_value(item, "text", "title", "summary", "reason"))
+        if not text:
+            return ""
+        date_text = report.get("date") or "дата не указана"
+        chat_title = report.get("chat_title") or report.get("dialog_id") or "чат не указан"
+        owner = owner_name(item)
+        deadline = item_deadline(item, default_deadline)
+        status = item_status(item)
+        return (
+            f"{date_text}. {owner}: {text}. Чат: {chat_title}. "
+            f"Статус/договоренность: {status}. Срок: {human_deadline(deadline)}. Источник: {evidence_text(item)}."
+        )
+
+    def recommendation_from_line(owner: str, line: str) -> str:
+        context = line
+        if ". Источник:" in context:
+            context = context.split(". Источник:", 1)[0].strip()
+        date_context = ""
+        if ". " in context:
+            possible_date, rest = context.split(". ", 1)
+            if len(possible_date) == 10 and possible_date[4] == "-" and possible_date[7] == "-":
+                date_context = possible_date
+                context = rest
+        if ". Чат:" in context:
+            main_context, tail = context.split(". Чат:", 1)
+            chat_title = tail.split(". Статус", 1)[0].strip()
+            chat_context = f"Чат: {chat_title}." if chat_title else ""
+        else:
+            main_context = context
+            chat_context = ""
+        issue_text = main_context
+        if ": " in issue_text:
+            issue_text = issue_text.split(": ", 1)[1]
+        issue_text = issue_text.rstrip(" ?.!")
+        lower_issue = issue_text.lower()
+        if "аудит" in lower_issue or "фин/бух" in lower_issue or "бухгалтер" in lower_issue:
+            action = "запросить финальный статус по аудиту: что уже закрыто, что осталось, кто закрывает и дата полного завершения"
+        elif "денис" in lower_issue or "заполн" in lower_issue and "документ" in lower_issue:
+            action = "запросить заполненный документ или конкретную причину, почему документ не готов"
+        elif "дополнительные сделанные действия" in lower_issue or "писать дополнительные" in lower_issue:
+            action = "зафиксировать правило отчетности для Артура: какие действия он обязан писать ежедневно и в каком формате"
+        elif "обратн" in lower_issue and "партнер" in lower_issue:
+            action = "дожать обратную связь партнеров и записать итог: приняли корректировку, что нужно изменить, кто следующий исполнитель"
+        elif "цен" in lower_issue or "скид" in lower_issue:
+            action = "зафиксировать ежедневный результат по ценам и скидкам: что изменено, по каким артикулам, какой ожидаемый эффект"
+        elif "ларетто" in lower_issue:
+            action = "вывести контроль Ларетто в конкретный чек-лист: текущий статус, ответственный, следующий шаг, срок"
+        else:
+            action = "получить короткий статус: сделано, не сделано, что мешает, какой следующий шаг"
+
+        if "срок в чате не зафиксирован" in line:
+            deadline_action = "Срок: назначить конкретную дату закрытия."
+        else:
+            deadline_action = "Срок: проверить в уже указанную дату и зафиксировать результат."
+        date_part = f" Дата проблемы: {date_context}." if date_context else ""
+        return (
+            f"{owner}: {action}. Основание: {issue_text}.{date_part} "
+            f"{deadline_action} {chat_context}".strip()
+        )
+
+    def person_stats(name: str | None) -> dict[str, Any]:
+        key = readable(name) or "Ответственный не указан"
+        return people.setdefault(key, {
+            "results": [],
+            "risks": [],
+            "tasks": [],
+            "responses": [],
+            "no_response": [],
+        })
+
+    def remember_unique(bucket: list[str], value: str, limit: int = 500) -> None:
+        if value and value not in bucket and len(bucket) < limit:
+            bucket.append(value)
+
+    for report in daily_reports:
+        chat_title = report.get("chat_title") or report.get("dialog_id") or "чат"
+        chats.setdefault(chat_title, {"results": 0, "risks": 0, "messages": 0})
+        chats[chat_title]["messages"] += int(report.get("messages_count") or 0)
+        for item in report.get("items") or []:
+            item_type = item.get("item_type")
+            owner = owner_name(item)
+            stats = person_stats(owner)
+            line = concrete_line(report, item)
+            if not line:
+                continue
+            if item_type in {"result", "action", "decision"}:
+                chats[chat_title]["results"] += 1
+                remember_unique(concrete_results, line)
+                stats["results"].append(line)
+                stats["responses"].append(line)
+                remember_unique(closed_small_goals, line)
+                remember_unique(responded_to_feedback, line)
+            elif item_type in {"risk", "blocker"}:
+                chats[chat_title]["risks"] += 1
+                remember_unique(concrete_risks, line)
+                stats["risks"].append(line)
+                stats["no_response"].append(line)
+                remember_unique(no_response_to_feedback, line)
+            elif item_type in {"commitment", "next_step", "previous_day_task"}:
+                remember_unique(concrete_work, line)
+                stats["tasks"].append(line)
+                if item_status(item) not in {"выполнено", "отправлено"}:
+                    remember_unique(hanging_tasks_by_owner, line)
+            elif item_type in {"question", "unanswered_question"}:
+                stats["no_response"].append(line)
+                remember_unique(not_done, line)
+                remember_unique(no_response_to_feedback, line)
+            elif item_type == "goal":
+                remember_unique(final_goals, line)
+    high_goal_risks = [
+        (
+            f"{event.get('date')}. {event.get('owner_name') or 'Ответственный не указан'}: цель "
+            f"'{event.get('goal_title')}' остается в работе. Статус: {event.get('status_before')} -> {event.get('status_after')}. "
+            f"Прогресс: {event.get('progress_percent') if event.get('progress_percent') is not None else 'не указан'}%. "
+            f"Риск: {event.get('risk_level') or 'не указан'}. Контекст: {event.get('progress_text')}"
+        )
+        for event in goal_events
+        if event.get("risk_level") == "high"
+    ]
+    not_done.extend(high_goal_risks[:10])
+    for event in goal_events:
+        owner = event.get("owner_name") or "Ответственный не указан"
+        stats = person_stats(owner)
+        goal_line = (
+            f"{event.get('date')}. {owner}: цель '{event.get('goal_title')}'. "
+            f"Уровень: {event.get('goal_level') or 'не указан'}. Статус: {event.get('status_before')} -> {event.get('status_after')}. "
+            f"Прогресс: {event.get('progress_percent') if event.get('progress_percent') is not None else 'не указан'}%. "
+            f"Риск: {event.get('risk_level') or 'не указан'}. Факт: {event.get('progress_text')}"
+        )
+        if event.get("status_after") == "done":
+            stats["results"].append(goal_line)
+            stats["responses"].append(goal_line)
+            remember_unique(closed_small_goals, goal_line)
+        elif event.get("risk_level") == "high":
+            stats["risks"].append(goal_line)
+            stats["no_response"].append(goal_line)
+            remember_unique(hanging_goals, goal_line)
+            remember_unique(no_response_to_feedback, goal_line)
+        else:
+            remember_unique(hanging_goals, goal_line)
+    top_performers = [
+        (
+            f"{name} | конкретные результаты: {len(data['results'])}; реакции: {len(data['responses'])}; "
+            f"лучший факт: {data['results'][0] if data['results'] else data['responses'][0]}"
+        )
+        for name, data in sorted(people.items(), key=lambda item: (len(item[1]["results"]), len(item[1]["responses"])), reverse=True)
+        if data["results"] or data["responses"]
+    ][:10]
+    weak_performers = [
+        (
+            f"{name} | риски/блокеры: {len(data['risks'])}; без реакции: {len(data['no_response'])}; "
+            f"открытые задачи: {len(data['tasks'])}; главная незакрытая тема: "
+            f"{(data['risks'] or data['no_response'] or data['tasks'])[0]}"
+        )
+        for name, data in sorted(people.items(), key=lambda item: (len(item[1]["risks"]), len(item[1]["no_response"]), len(item[1]["tasks"])), reverse=True)
+        if data["risks"] or data["no_response"] or data["tasks"]
+    ][:10]
+    for name, data in sorted(people.items()):
+        if data["risks"] or data["no_response"]:
+            main_issue = (data["risks"] or data["no_response"] or data["tasks"])[0]
+            recommendations.append(recommendation_from_line(name, main_issue))
+    total_messages = sum(int(row.get("messages_count") or 0) for row in daily_overall) or sum(int(row.get("messages_count") or 0) for row in daily_reports)
+    total_results = sum(int(row.get("results_count") or 0) for row in daily_overall)
+    total_risks = sum(int(row.get("risks_count") or 0) for row in daily_overall)
+    total_goal_updates = len(goal_events)
+    summary = (
+        f"За неделю обработано дневных отчетов чатов: {len(daily_reports)}, "
+        f"сообщений: {total_messages}, результатов: {total_results}, "
+        f"рисков: {total_risks}, обновлений целей: {total_goal_updates}."
+    )
+    dynamics_summary = (
+        "Динамика недели: "
+        + "; ".join(
+            f"{row.get('date')}: результаты {row.get('results_count', 0)}, риски {row.get('risks_count', 0)}, цели {row.get('goal_updates_count', 0)}"
+            for row in daily_overall
+        )
+    )
+    positives_summary = "\n".join(f"- {item}" for item in concrete_results[:12]) or "Нет явных положительных результатов."
+    problems_summary = "\n".join(f"- {item}" for item in (concrete_risks[:10] + high_goal_risks[:6])) or "Нет явных проблем."
+    recommendations_text = "\n".join(f"- {item}" for item in recommendations[:12]) or "- Назначить ответственных, сроки и ожидаемый результат по каждой открытой теме."
+    chat_highlights = [
+        {
+            "chat_title": title,
+            "summary": f"сообщений {data['messages']}, результатов {data['results']}, рисков {data['risks']}",
+            "risk_level": "high" if data["risks"] >= 5 else "medium" if data["risks"] else "low",
+        }
+        for title, data in chats.items()
+    ]
+    return {
+        "summary": summary,
+        "dynamics_summary": dynamics_summary,
+        "positives_summary": positives_summary,
+        "problems_summary": problems_summary,
+        "next_week_action_plan": recommendations[:12] or ["Назначить ответственных, сроки и ожидаемый результат по каждой открытой теме."],
+        "recommendations": recommendations_text,
+        "work_in_progress": concrete_work,
+        "not_done": not_done,
+        "key_goal_dynamics": [
+            (
+                f"{event.get('date')}. {event.get('owner_name') or 'Ответственный не указан'}: цель '{event.get('goal_title')}'. "
+                f"Статус: {event.get('status_before')} -> {event.get('status_after')}. "
+                f"Прогресс: {event.get('progress_percent') if event.get('progress_percent') is not None else 'не указан'}%. "
+                f"Риск: {event.get('risk_level') or 'не указан'}. Факт: {event.get('progress_text')}"
+            )
+            for event in goal_events
+        ],
+        "top_performers": top_performers or ["Нет надежных данных, чтобы выделить лучших исполнителей."],
+        "weak_performers": weak_performers or ["Нет надежных данных, чтобы выделить слабую работу по людям."],
+        "responded_to_feedback": responded_to_feedback[:12] or ["Нет явных подтверждений реакции на замечания."],
+        "no_response_to_feedback": no_response_to_feedback[:12] or ["Нет явных замечаний без реакции."],
+        "final_goals": final_goals or ["Итоговые цели недели явно не выделены."],
+        "closed_small_goals": closed_small_goals or ["Маленькие закрытые цели явно не выделены."],
+        "hanging_goals": hanging_goals or ["Нет явных зависших целей."],
+        "hanging_tasks_by_owner": hanging_tasks_by_owner or ["Нет явных зависших задач по ответственным."],
+        "chat_highlights": chat_highlights,
+    }
+
+
+def generate_weekly_chat_summary_with_ai(
+    period_start: date,
+    period_end: date,
+    input_payload: dict[str, Any],
+    request_type: str = "chat_overall_weekly_analysis",
+) -> tuple[dict[str, Any], Any, Any, str, dict[str, Any] | None]:
+    api_key = llm_api_key()
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    fallback_analysis = local_weekly_chat_summary(input_payload)
+    if not api_key:
+        return fallback_analysis, None, None, "local-weekly-chat-summary", None
+    prompt_id = None
+    prompt_text = CHAT_OVERALL_WEEKLY_PROMPT
+    prompt_category_key = "chat_weekly_report" if request_type == "chat_weekly_analysis" else "chat_overall_weekly_report"
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            prompt_id, configured_prompt = pg_active_prompt(cur, prompt_category_key, CHAT_OVERALL_WEEKLY_PROMPT)
+            prompt_text = configured_prompt or CHAT_OVERALL_WEEKLY_PROMPT
+    scope_text = (
+        "Это недельный отчет по одному конкретному чату. Оценивай людей, реакции, висящие задачи и цели только внутри этого чата."
+        if request_type == "chat_weekly_analysis"
+        else "Это недельный отчет по всем корпоративным чатам. Сравнивай чаты и людей только по данным входных дневных отчетов."
+    )
+    full_prompt = (
+        prompt_text.strip()
+        + "\n\n"
+        + CHAT_WEEKLY_MANDATORY_LOGIC.strip()
+        + "\n\n"
+        + scope_text
+        + "\n\nПравило динамики:\n"
+        + "- Используй previous_week_report как базовую точку сравнения.\n"
+        + "- Используй daily_chat_reports и daily_overall_reports только за текущие 7 дней.\n"
+        + "- Явно фиксируй: что тянется с прошлой недели без сдвига, что сдвинулось, что закрыто."
+        + "\n\nПериод: "
+        + f"{period_start.isoformat()} - {period_end.isoformat()}\n\n"
+        + "Входные данные:\n"
+        + json.dumps(input_payload, ensure_ascii=False, default=str)
+    )
+    started_at = datetime.now()
+    raw: dict[str, Any] | None = None
+    ai_request_id = None
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                ai_request_id = pg_insert_ai_request(
+                    cur,
+                    request_type,
+                    prompt_id,
+                    full_prompt,
+                    "openai",
+                    model,
+                    {
+                        "period_start": period_start.isoformat(),
+                        "period_end": period_end.isoformat(),
+                        "weekly_input": input_payload,
+                    },
+                    started_at,
+                )
+    try:
+        response = llm_post_with_retry(
+            llm_api_url("/chat/completions"),
+            headers=llm_auth_headers(api_key),
+            payload={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "Ты операционный аналитик. Возвращай только валидный JSON."},
+                    {"role": "user", "content": full_prompt},
+                ],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        raw = response.json()
+        content = raw["choices"][0]["message"]["content"]
+        analysis = extract_json_object(content)
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    pg_finish_ai_request(cur, ai_request_id, "success", started_at, response_text=content, response_json=analysis, raw_response_json=raw)
+        return normalize_weekly_analysis(analysis, fallback_analysis), ai_request_id, prompt_id, model, raw
+    except Exception as exc:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    pg_finish_ai_request(cur, ai_request_id, "error", started_at, raw_response_json=raw or {"error": str(exc)}, error_text=str(exc))
+        raise
+
+
+def weekly_report_text(analysis: dict[str, Any], period_start: date, period_end: date) -> str:
+    def lines_from(value: Any, empty: str) -> list[str]:
+        if isinstance(value, list):
+            return [f"- {str(item if not isinstance(item, dict) else item.get('summary') or item.get('text') or item).strip()}" for item in value if str(item).strip()] or [empty]
+        text = str(value or "").strip()
+        return text.splitlines() if text else [empty]
+
+    action_plan = analysis.get("next_week_action_plan")
+    if not action_plan:
+        action_plan = analysis.get("hanging_tasks_by_owner") or analysis.get("recommendations")
+    lines = [
+        "Еженедельная сводка по чатам",
+        f"Период: {format_date_ru(period_start)} - {format_date_ru(period_end)}",
+        "",
+        "Что делать на следующей неделе:",
+        *lines_from(action_plan, "Нет конкретных действий для контроля."),
+        "",
+        "Короткий итог:",
+        str(analysis.get("summary") or "Нет данных."),
+        "",
+        "Динамика по дням:",
+        str(analysis.get("dynamics_summary") or "Нет данных по динамике."),
+        "",
+        "Открытые задачи по ответственным:",
+        *lines_from(analysis.get("hanging_tasks_by_owner"), "Нет явных зависших задач по ответственным."),
+        "",
+        "Что не сделано / не подтверждено:",
+        *lines_from(analysis.get("not_done"), "Нет данных."),
+        "",
+        "Цели, которые требуют контроля:",
+        *lines_from(analysis.get("hanging_goals"), "Нет явных зависших целей."),
+        "",
+        "Что находится в работе:",
+        *lines_from(analysis.get("work_in_progress"), "Нет данных."),
+        "",
+        "Кто хорошо поработал:",
+        *lines_from(analysis.get("top_performers"), "Нет надежных данных."),
+        "",
+        "Кто не очень:",
+        *lines_from(analysis.get("weak_performers"), "Нет надежных данных."),
+        "",
+        "Кто реагировал на замечания:",
+        *lines_from(analysis.get("responded_to_feedback"), "Нет явных подтверждений реакции."),
+        "",
+        "Кто не реагировал:",
+        *lines_from(analysis.get("no_response_to_feedback"), "Нет явных замечаний без реакции."),
+        "",
+        "Что хорошо:",
+        *lines_from(analysis.get("positives_summary"), "Нет данных."),
+        "",
+        "Что плохо:",
+        *lines_from(analysis.get("problems_summary"), "Нет данных."),
+        "",
+        "Динамика целей:",
+        *lines_from(analysis.get("key_goal_dynamics"), "Нет обновлений целей."),
+        "",
+        "Итоговые цели недели:",
+        *lines_from(analysis.get("final_goals"), "Итоговые цели явно не выделены."),
+        "",
+        "Закрытые маленькие цели:",
+        *lines_from(analysis.get("closed_small_goals"), "Маленькие закрытые цели явно не выделены."),
+        "",
+        "Дополнительные рекомендации:",
+        *lines_from(analysis.get("recommendations"), "Нет рекомендаций."),
+    ]
+    return "\n".join(lines).strip()
+
+
+def save_chat_overall_weekly_report(period_start: date, period_end: date) -> dict[str, Any]:
+    validate_chat_weekly_report_period(period_start, period_end)
+    if not is_startup_chat_weekly_period(period_start, period_end):
+        prev_start, prev_end = previous_week_bounds_for_report(period_start)
+        prev_report = load_chat_overall_weekly_report(prev_start, prev_end)
+        if not prev_report:
+            raise ValueError(
+                "Нельзя сформировать недельный общий отчет, пока не сформирован предыдущий недельный отчет. "
+                f"Сначала сформируйте отчет за {format_date_ru(prev_start)} - {format_date_ru(prev_end)}."
+            )
+    input_payload = collect_chat_weekly_inputs(period_start, period_end)
+    analysis, ai_request_id, prompt_id, model, raw_response = generate_weekly_chat_summary_with_ai(period_start, period_end, input_payload)
+    daily_reports = input_payload["daily_chat_reports"]
+    daily_overall = input_payload["daily_overall_reports"]
+    goal_events = input_payload["goal_progress_events"]
+    distinct_chats = {row["dialog_id"] for row in daily_reports}
+    stats = {
+        "days_count": (period_end - period_start).days + 1,
+        "chats_count": len(distinct_chats),
+        "daily_reports_count": len(daily_reports),
+        "messages_count": sum(int(row.get("messages_count") or 0) for row in daily_reports),
+        "goals_created_count": sum(int(row.get("goals_created_count") or 0) for row in daily_overall),
+        "goal_updates_count": len(goal_events),
+        "commitments_count": sum(int(row.get("commitments_count") or 0) for row in daily_overall),
+        "results_count": sum(int(row.get("results_count") or 0) for row in daily_overall),
+        "next_steps_count": sum(int(row.get("next_steps_count") or 0) for row in daily_overall),
+        "risks_count": sum(int(row.get("risks_count") or 0) for row in daily_overall),
+        "blockers_count": sum(int(row.get("blockers_count") or 0) for row in daily_overall),
+        "unresolved_questions_count": sum(int(row.get("unresolved_questions_count") or 0) for row in daily_overall),
+        "done_goal_updates_count": sum(1 for event in goal_events if event.get("status_after") == "done"),
+        "high_risk_goal_updates_count": sum(1 for event in goal_events if event.get("risk_level") == "high"),
+    }
+    report_text = weekly_report_text(analysis, period_start, period_end)
+    raw_json = {
+        "source": "openai" if ai_request_id else "local_fallback",
+        "model": model,
+        "analysis": analysis,
+        "weekly_input": input_payload,
+        "raw_response": raw_response,
+        "report_text": report_text,
+    }
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE chat_overall_weekly_reports
+                    SET is_current = FALSE
+                    WHERE period_start = %s
+                      AND period_end = %s
+                      AND is_current = TRUE
+                    """,
+                    (period_start, period_end),
+                )
+                cur.execute(
+                    "SELECT COALESCE(MAX(version), 0) + 1 AS version FROM chat_overall_weekly_reports WHERE period_start = %s AND period_end = %s",
+                    (period_start, period_end),
+                )
+                version = cur.fetchone()["version"]
+                cur.execute(
+                    """
+                    INSERT INTO chat_overall_weekly_reports (
+                        period_start, period_end, version, is_current, ai_request_id, prompt_id,
+                        generated_at, days_count, chats_count, daily_reports_count, messages_count,
+                        goals_created_count, goal_updates_count, commitments_count, results_count,
+                        next_steps_count, risks_count, blockers_count, unresolved_questions_count,
+                        done_goal_updates_count, high_risk_goal_updates_count, summary,
+                        dynamics_summary, positives_summary, problems_summary, recommendations, raw_json
+                    ) VALUES (
+                        %s, %s, %s, TRUE, %s, %s, now(),
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s
+                    )
+                    RETURNING *
+                    """,
+                    (
+                        period_start,
+                        period_end,
+                        version,
+                        ai_request_id,
+                        prompt_id,
+                        stats["days_count"],
+                        stats["chats_count"],
+                        stats["daily_reports_count"],
+                        stats["messages_count"],
+                        stats["goals_created_count"],
+                        stats["goal_updates_count"],
+                        stats["commitments_count"],
+                        stats["results_count"],
+                        stats["next_steps_count"],
+                        stats["risks_count"],
+                        stats["blockers_count"],
+                        stats["unresolved_questions_count"],
+                        stats["done_goal_updates_count"],
+                        stats["high_risk_goal_updates_count"],
+                        analysis.get("summary"),
+                        analysis.get("dynamics_summary"),
+                        analysis.get("positives_summary"),
+                        analysis.get("problems_summary"),
+                        analysis.get("recommendations"),
+                        pg_json(raw_json),
+                    ),
+                )
+                row = cur.fetchone()
+    return chat_overall_weekly_report_to_dict(row)
+
+
+def chat_overall_weekly_report_to_dict(row: Any) -> dict[str, Any]:
+    raw = row.get("raw_json") if isinstance(row, dict) else row["raw_json"]
+    return {
+        "report_id": str(row["id"]),
+        "period_start": row["period_start"].isoformat() if hasattr(row["period_start"], "isoformat") else row["period_start"],
+        "period_end": row["period_end"].isoformat() if hasattr(row["period_end"], "isoformat") else row["period_end"],
+        "period_text": f"{format_date_ru(row['period_start'])} - {format_date_ru(row['period_end'])}",
+        "version": row["version"],
+        "is_current": bool(row["is_current"]),
+        "ai_request_id": str(row["ai_request_id"]) if row["ai_request_id"] else None,
+        "generated_at": iso_or_none(row["generated_at"]),
+        "generated_at_text": format_datetime_ru(row["generated_at"]),
+        "days_count": row["days_count"],
+        "chats_count": row["chats_count"],
+        "daily_reports_count": row["daily_reports_count"],
+        "messages_count": row["messages_count"],
+        "goals_created_count": row["goals_created_count"],
+        "goal_updates_count": row["goal_updates_count"],
+        "commitments_count": row["commitments_count"],
+        "results_count": row["results_count"],
+        "next_steps_count": row["next_steps_count"],
+        "risks_count": row["risks_count"],
+        "blockers_count": row["blockers_count"],
+        "unresolved_questions_count": row["unresolved_questions_count"],
+        "done_goal_updates_count": row["done_goal_updates_count"],
+        "high_risk_goal_updates_count": row["high_risk_goal_updates_count"],
+        "summary": row["summary"],
+        "dynamics_summary": row["dynamics_summary"],
+        "positives_summary": row["positives_summary"],
+        "problems_summary": row["problems_summary"],
+        "recommendations": row["recommendations"],
+        "report_text": raw.get("report_text") if isinstance(raw, dict) else row["summary"],
+        "raw_json": raw,
+    }
+
+
+def collect_chat_weekly_inputs_for_chat(dialog_id: str, period_start: date, period_end: date) -> dict[str, Any]:
+    if not postgres_enabled():
+        raise ValueError("Недельный отчет по чату доступен только в PostgreSQL.")
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM chats WHERE dialog_id = %s", (dialog_id,))
+            chat = cur.fetchone()
+            if chat is None:
+                raise ValueError(f"Чат {dialog_id} не найден")
+            cur.execute(
+                """
+                SELECT r.id, r.report_date, r.chat_id, c.dialog_id, c.chat_title,
+                       r.messages_count, r.extracted_goals_count, r.extracted_tasks_count,
+                       r.extracted_facts_count, r.summary, r.raw_ai_json
+                FROM chat_daily_reports r
+                JOIN chats c ON c.id = r.chat_id
+                WHERE r.chat_id = %s
+                  AND r.report_date BETWEEN %s AND %s
+                  AND r.is_current = TRUE
+                ORDER BY r.report_date
+                """,
+                (chat["id"], period_start, period_end),
+            )
+            daily_reports = cur.fetchall()
+            report_ids = [row["id"] for row in daily_reports]
+            items_by_report: dict[str, list[dict[str, Any]]] = {}
+            item_counts_by_date: dict[str, dict[str, int]] = {}
+            if report_ids:
+                cur.execute(
+                    """
+                    SELECT i.chat_daily_report_id, i.report_date, i.item_type, i.item_text, i.confidence,
+                           u.full_name AS user_name, i.evidence_message_ids, i.raw_json
+                    FROM chat_report_items i
+                    LEFT JOIN users u ON u.id = i.user_id
+                    WHERE i.chat_daily_report_id = ANY(%s)
+                    ORDER BY i.report_date, i.item_type, i.created_at
+                    """,
+                    (report_ids,),
+                )
+                for row in cur.fetchall():
+                    report_date = row["report_date"].isoformat()
+                    item_counts_by_date.setdefault(report_date, {})
+                    item_counts_by_date[report_date][row["item_type"]] = item_counts_by_date[report_date].get(row["item_type"], 0) + 1
+                    items_by_report.setdefault(str(row["chat_daily_report_id"]), []).append({
+                        "item_type": row["item_type"],
+                        "item_text": row["item_text"],
+                        "user_name": row["user_name"],
+                        "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+                        "evidence_message_ids": row["evidence_message_ids"] or [],
+                        "raw_json": row["raw_json"] if isinstance(row["raw_json"], dict) else {},
+                    })
+            cur.execute(
+                """
+                SELECT e.report_date, e.status_before, e.status_after, e.progress_text,
+                       e.progress_percent, e.risk_level, e.confidence,
+                       g.goal_title, g.goal_level, u.full_name AS owner_name,
+                       c.dialog_id, c.chat_title
+                FROM goal_progress_events e
+                JOIN user_goals g ON g.id = e.goal_id
+                LEFT JOIN users u ON u.id = g.user_id
+                LEFT JOIN chats c ON c.id = e.chat_id
+                WHERE e.chat_id = %s
+                  AND e.report_date BETWEEN %s AND %s
+                ORDER BY e.report_date, g.goal_title, e.created_at
+                """,
+                (chat["id"], period_start, period_end),
+            )
+            goal_events = cur.fetchall()
+
+    reports_payload = []
+    for row in daily_reports:
+        raw = row["raw_ai_json"] if isinstance(row["raw_ai_json"], dict) else {}
+        analysis = raw.get("analysis") if isinstance(raw.get("analysis"), dict) else {}
+        reports_payload.append({
+            "report_id": str(row["id"]),
+            "date": row["report_date"].isoformat(),
+            "dialog_id": row["dialog_id"],
+            "chat_title": row["chat_title"] or row["dialog_id"],
+            "messages_count": int(row["messages_count"] or 0),
+            "summary": row["summary"],
+            "counts": {
+                "goals": int(row["extracted_goals_count"] or 0),
+                "tasks": int(row["extracted_tasks_count"] or 0),
+                "facts": int(row["extracted_facts_count"] or 0),
+            },
+            "items": items_by_report.get(str(row["id"]), [])[:120],
+            "analysis_compact": {
+                "goals": analysis.get("goals", [])[:20] if isinstance(analysis.get("goals"), list) else [],
+                "results": analysis.get("results", [])[:30] if isinstance(analysis.get("results"), list) else [],
+                "risks": analysis.get("risks", [])[:30] if isinstance(analysis.get("risks"), list) else [],
+                "next_steps": analysis.get("next_steps", [])[:30] if isinstance(analysis.get("next_steps"), list) else [],
+                "goal_updates": analysis.get("goal_updates", [])[:30] if isinstance(analysis.get("goal_updates"), list) else [],
+            },
+        })
+
+    goal_events_payload = [
+        {
+            "date": row["report_date"].isoformat(),
+            "dialog_id": row["dialog_id"],
+            "chat_title": row["chat_title"],
+            "goal_title": row["goal_title"],
+            "goal_level": row["goal_level"],
+            "owner_name": row["owner_name"],
+            "status_before": row["status_before"],
+            "status_after": row["status_after"],
+            "progress_text": row["progress_text"],
+            "progress_percent": float(row["progress_percent"]) if row["progress_percent"] is not None else None,
+            "risk_level": row["risk_level"],
+            "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+        }
+        for row in goal_events
+    ]
+    daily_overall_payload = []
+    for report in reports_payload:
+        counts = item_counts_by_date.get(report["date"], {})
+        daily_goal_events = [event for event in goal_events_payload if event["date"] == report["date"]]
+        daily_overall_payload.append({
+            "date": report["date"],
+            "chats_count": 1,
+            "messages_count": report["messages_count"],
+            "goals_created_count": counts.get("goal", 0),
+            "goal_updates_count": len(daily_goal_events),
+            "commitments_count": counts.get("commitment", 0),
+            "results_count": counts.get("result", 0),
+            "next_steps_count": counts.get("next_step", 0),
+            "risks_count": counts.get("risk", 0),
+            "blockers_count": counts.get("blocker", 0),
+            "unresolved_questions_count": counts.get("unanswered_question", 0),
+            "summary": report["summary"],
+            "dynamics_summary": "",
+            "positives_summary": "",
+            "problems_summary": "",
+        })
+    previous_week_report = load_previous_chat_weekly_context(dialog_id, period_start)
+    return {
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "dialog_id": dialog_id,
+        "chat_title": reports_payload[0]["chat_title"] if reports_payload else dialog_id,
+        "daily_chat_reports": reports_payload,
+        "daily_overall_reports": daily_overall_payload,
+        "goal_progress_events": goal_events_payload,
+        "previous_week_report": previous_week_report,
+    }
+
+
+def validate_chat_weekly_report_period_for_chat(dialog_id: str, period_start: date, period_end: date) -> None:
+    if not postgres_enabled():
+        raise ValueError("Недельный отчет по чату доступен только в PostgreSQL.")
+    if not is_allowed_chat_weekly_period(period_start, period_end):
+        raise ValueError("Недельный отчет чата должен быть за полный период с понедельника по воскресенье.")
+    if period_end > latest_visible_report_date():
+        raise ValueError("Нельзя формировать недельный отчет чата, пока неделя не закрыта.")
+    payload = collect_chat_weekly_inputs_for_chat(dialog_id, period_start, period_end)
+    if not payload["daily_chat_reports"]:
+        raise ValueError("Нельзя сформировать недельный отчет чата: за выбранную неделю нет дневных отчетов.")
+
+
+def save_chat_weekly_report(dialog_id: str, period_start: date, period_end: date, force: bool = False) -> dict[str, Any]:
+    validate_chat_weekly_report_period_for_chat(dialog_id, period_start, period_end)
+    input_payload = collect_chat_weekly_inputs_for_chat(dialog_id, period_start, period_end)
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM chats WHERE dialog_id = %s", (dialog_id,))
+            chat = cur.fetchone()
+    if chat is None:
+        raise ValueError(f"Чат {dialog_id} не найден")
+    if not force:
+        current = load_chat_weekly_report(dialog_id, period_start, period_end)
+        if current:
+            return current
+    analysis, ai_request_id, prompt_id, model, raw_response = generate_weekly_chat_summary_with_ai(
+        period_start,
+        period_end,
+        input_payload,
+        request_type="chat_weekly_analysis",
+    )
+    daily_reports = input_payload["daily_chat_reports"]
+    daily_overall = input_payload["daily_overall_reports"]
+    goal_events = input_payload["goal_progress_events"]
+    stats = {
+        "days_count": (period_end - period_start).days + 1,
+        "daily_reports_count": len(daily_reports),
+        "messages_count": sum(int(row.get("messages_count") or 0) for row in daily_reports),
+        "goals_created_count": sum(int(row.get("goals_created_count") or 0) for row in daily_overall),
+        "goal_updates_count": len(goal_events),
+        "commitments_count": sum(int(row.get("commitments_count") or 0) for row in daily_overall),
+        "results_count": sum(int(row.get("results_count") or 0) for row in daily_overall),
+        "next_steps_count": sum(int(row.get("next_steps_count") or 0) for row in daily_overall),
+        "risks_count": sum(int(row.get("risks_count") or 0) for row in daily_overall),
+        "blockers_count": sum(int(row.get("blockers_count") or 0) for row in daily_overall),
+        "unresolved_questions_count": sum(int(row.get("unresolved_questions_count") or 0) for row in daily_overall),
+        "done_goal_updates_count": sum(1 for event in goal_events if event.get("status_after") == "done"),
+        "high_risk_goal_updates_count": sum(1 for event in goal_events if event.get("risk_level") == "high"),
+    }
+    report_text = weekly_report_text(analysis, period_start, period_end)
+    raw_json = {
+        "source": "openai" if ai_request_id else "local_fallback",
+        "model": model,
+        "analysis": analysis,
+        "weekly_input": input_payload,
+        "raw_response": raw_response,
+        "report_text": report_text,
+    }
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE chat_weekly_reports
+                    SET is_current = FALSE
+                    WHERE chat_id = %s AND period_start = %s AND period_end = %s AND is_current = TRUE
+                    """,
+                    (chat["id"], period_start, period_end),
+                )
+                cur.execute(
+                    "SELECT COALESCE(MAX(version), 0) + 1 AS version FROM chat_weekly_reports WHERE chat_id = %s AND period_start = %s AND period_end = %s",
+                    (chat["id"], period_start, period_end),
+                )
+                version = cur.fetchone()["version"]
+                cur.execute(
+                    """
+                    INSERT INTO chat_weekly_reports (
+                        chat_id, period_start, period_end, version, is_current, ai_request_id, prompt_id,
+                        generated_at, days_count, daily_reports_count, messages_count,
+                        goals_created_count, goal_updates_count, commitments_count, results_count,
+                        next_steps_count, risks_count, blockers_count, unresolved_questions_count,
+                        done_goal_updates_count, high_risk_goal_updates_count, summary,
+                        dynamics_summary, positives_summary, problems_summary, recommendations, raw_json
+                    ) VALUES (
+                        %s, %s, %s, %s, TRUE, %s, %s, now(),
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s, %s, %s
+                    )
+                    RETURNING *
+                    """,
+                    (
+                        chat["id"], period_start, period_end, version, ai_request_id, prompt_id,
+                        stats["days_count"], stats["daily_reports_count"], stats["messages_count"],
+                        stats["goals_created_count"], stats["goal_updates_count"], stats["commitments_count"],
+                        stats["results_count"], stats["next_steps_count"], stats["risks_count"],
+                        stats["blockers_count"], stats["unresolved_questions_count"],
+                        stats["done_goal_updates_count"], stats["high_risk_goal_updates_count"],
+                        analysis.get("summary"), analysis.get("dynamics_summary"),
+                        analysis.get("positives_summary"), analysis.get("problems_summary"),
+                        analysis.get("recommendations"), pg_json(raw_json),
+                    ),
+                )
+                row = cur.fetchone()
+    return chat_weekly_report_to_dict(row, dialog_id=dialog_id, chat_title=chat["chat_title"])
+
+
+def _json_text_to_weekly_analysis(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    analysis = parsed.get("analysis") if isinstance(parsed.get("analysis"), dict) else parsed
+    return analysis if isinstance(analysis, dict) else None
+
+
+def _clean_weekly_text_field(value: Any, key: str) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = _json_text_to_weekly_analysis(text)
+    if parsed is not None:
+        nested = parsed.get(key)
+        return str(nested).strip() if nested is not None and str(nested).strip() else None
+    return text
+
+
+def _chat_weekly_report_text(row: Any, raw: Any) -> str:
+    raw_report_text = raw.get("report_text") if isinstance(raw, dict) else None
+    parsed_report = _json_text_to_weekly_analysis(raw_report_text)
+    raw_analysis = raw.get("analysis") if isinstance(raw, dict) and isinstance(raw.get("analysis"), dict) else {}
+    analysis = parsed_report or raw_analysis or {}
+    if not analysis and isinstance(raw_report_text, str) and raw_report_text.strip():
+        return raw_report_text.strip()
+    for key in ("summary", "dynamics_summary", "positives_summary", "problems_summary", "recommendations"):
+        if not str(analysis.get(key) or "").strip():
+            row_value = row.get(key) if hasattr(row, "get") else row[key]
+            cleaned = _clean_weekly_text_field(row_value, key)
+            if cleaned:
+                analysis[key] = cleaned
+    return weekly_report_text(analysis, row["period_start"], row["period_end"])
+
+
+def chat_weekly_report_to_dict(row: Any, dialog_id: str | None = None, chat_title: str | None = None) -> dict[str, Any]:
+    raw = row.get("raw_json") if isinstance(row, dict) else row["raw_json"]
+    report_text = _chat_weekly_report_text(row, raw)
+    return {
+        "report_id": str(row["id"]),
+        "report_kind": "weekly",
+        "dialog_id": dialog_id,
+        "chat_title": chat_title,
+        "period_start": row["period_start"].isoformat() if hasattr(row["period_start"], "isoformat") else row["period_start"],
+        "period_end": row["period_end"].isoformat() if hasattr(row["period_end"], "isoformat") else row["period_end"],
+        "date": row["period_end"].isoformat() if hasattr(row["period_end"], "isoformat") else row["period_end"],
+        "date_text": format_date_ru(row["period_end"]),
+        "period_text": f"{format_date_ru(row['period_start'])} - {format_date_ru(row['period_end'])}",
+        "version": row["version"],
+        "is_current": bool(row["is_current"]),
+        "ai_request_id": str(row["ai_request_id"]) if row["ai_request_id"] else None,
+        "generated_at": iso_or_none(row["generated_at"]),
+        "generated_at_text": format_datetime_ru(row["generated_at"]),
+        "days_count": row["days_count"],
+        "daily_reports_count": row["daily_reports_count"],
+        "messages_count": row["messages_count"],
+        "goals_created_count": row["goals_created_count"],
+        "goal_updates_count": row["goal_updates_count"],
+        "commitments_count": row["commitments_count"],
+        "results_count": row["results_count"],
+        "next_steps_count": row["next_steps_count"],
+        "risks_count": row["risks_count"],
+        "blockers_count": row["blockers_count"],
+        "unresolved_questions_count": row["unresolved_questions_count"],
+        "done_goal_updates_count": row["done_goal_updates_count"],
+        "high_risk_goal_updates_count": row["high_risk_goal_updates_count"],
+        "summary": _clean_weekly_text_field(row["summary"], "summary"),
+        "dynamics_summary": _clean_weekly_text_field(row["dynamics_summary"], "dynamics_summary"),
+        "positives_summary": _clean_weekly_text_field(row["positives_summary"], "positives_summary"),
+        "problems_summary": _clean_weekly_text_field(row["problems_summary"], "problems_summary"),
+        "recommendations": _clean_weekly_text_field(row["recommendations"], "recommendations"),
+        "report_text": report_text,
+        "raw_json": raw,
+    }
+
+
+def load_chat_weekly_report(dialog_id: str, period_start: date, period_end: date) -> dict[str, Any] | None:
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.*, c.dialog_id, c.chat_title
+                FROM chat_weekly_reports r
+                JOIN chats c ON c.id = r.chat_id
+                WHERE c.dialog_id = %s
+                  AND r.period_start = %s
+                  AND r.period_end = %s
+                  AND r.is_current = TRUE
+                """,
+                (dialog_id, period_start, period_end),
+            )
+            row = cur.fetchone()
+    return chat_weekly_report_to_dict(row, dialog_id=row["dialog_id"], chat_title=row["chat_title"]) if row else None
+
+
+def load_previous_chat_weekly_context(dialog_id: str, target_date: date) -> dict[str, Any] | None:
+    if not postgres_enabled():
+        return None
+    period_start, period_end = previous_week_bounds_for_report(target_date)
+    return load_chat_weekly_report(dialog_id, period_start, period_end)
+
+
+def compact_previous_week_report_for_prompt(previous_week_report: dict[str, Any] | None, max_chars: int = 5000) -> str:
+    if not previous_week_report:
+        return "Недельный отчет по этому чату за предыдущую неделю еще не сформирован."
+    raw = previous_week_report.get("raw_json") if isinstance(previous_week_report, dict) else {}
+    analysis = raw.get("analysis") if isinstance(raw, dict) and isinstance(raw.get("analysis"), dict) else {}
+    text_fallback = weekly_open_items_from_report_text(previous_week_report.get("report_text") or (raw.get("report_text") if isinstance(raw, dict) else ""))
+    weekly_control = {
+        "next_week_action_plan": analysis.get("next_week_action_plan") or text_fallback.get("next_week_action_plan") or [],
+        "hanging_tasks_by_owner": analysis.get("hanging_tasks_by_owner") or text_fallback.get("hanging_tasks_by_owner") or [],
+        "not_done": analysis.get("not_done") or text_fallback.get("not_done") or [],
+        "hanging_goals": analysis.get("hanging_goals") or text_fallback.get("hanging_goals") or [],
+        "work_in_progress": analysis.get("work_in_progress") or text_fallback.get("work_in_progress") or [],
+    }
+    blocks: list[str] = [
+        f"Период: {previous_week_report.get('period_text') or '-'}",
+        f"Сводка: {str(previous_week_report.get('summary') or '').strip() or 'Нет данных.'}",
+        "Открытые задачи и контроль на понедельник:",
+        json.dumps(weekly_control, ensure_ascii=False, default=str, indent=2),
+        f"Проблемы: {str(previous_week_report.get('problems_summary') or '').strip() or 'Нет данных.'}",
+        f"Рекомендации: {str(previous_week_report.get('recommendations') or '').strip() or 'Нет данных.'}",
+    ]
+    text = "\n".join(blocks).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n[сокращено]"
+
+
+def compact_previous_week_report_for_payload(previous_week_report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not previous_week_report:
+        return None
+    raw = previous_week_report.get("raw_json") if isinstance(previous_week_report, dict) else {}
+    analysis = raw.get("analysis") if isinstance(raw, dict) and isinstance(raw.get("analysis"), dict) else {}
+    text_fallback = weekly_open_items_from_report_text(previous_week_report.get("report_text") or (raw.get("report_text") if isinstance(raw, dict) else ""))
+    return {
+        "report_id": previous_week_report.get("report_id"),
+        "period_start": previous_week_report.get("period_start"),
+        "period_end": previous_week_report.get("period_end"),
+        "period_text": previous_week_report.get("period_text"),
+        "summary": previous_week_report.get("summary"),
+        "problems_summary": previous_week_report.get("problems_summary"),
+        "recommendations": previous_week_report.get("recommendations"),
+        "next_week_action_plan": analysis.get("next_week_action_plan") or text_fallback.get("next_week_action_plan") or [],
+        "hanging_tasks_by_owner": analysis.get("hanging_tasks_by_owner") or text_fallback.get("hanging_tasks_by_owner") or [],
+        "not_done": analysis.get("not_done") or text_fallback.get("not_done") or [],
+        "hanging_goals": analysis.get("hanging_goals") or text_fallback.get("hanging_goals") or [],
+        "work_in_progress": analysis.get("work_in_progress") or text_fallback.get("work_in_progress") or [],
+    }
+
+
+def generate_chat_weekly_reports_for_period(period_start: date, period_end: date) -> dict[str, Any]:
+    if not postgres_enabled():
+        raise ValueError("Недельные отчеты по чатам доступны только в PostgreSQL.")
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT c.dialog_id
+                FROM chat_daily_reports r
+                JOIN chats c ON c.id = r.chat_id
+                WHERE r.report_date BETWEEN %s AND %s
+                  AND r.is_current = TRUE
+                  AND c.is_excluded = FALSE
+                ORDER BY c.dialog_id
+                """,
+                (period_start, period_end),
+            )
+            chats = cur.fetchall()
+    reports = []
+    errors = []
+    for chat in chats:
+        try:
+            reports.append(save_chat_weekly_report(chat["dialog_id"], period_start, period_end, force=False))
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"dialog_id": chat["dialog_id"], "error": str(exc)})
+    return {"reports_generated": len(reports), "errors": errors[:50], "reports": reports}
+
+
+def load_chat_overall_weekly_report(period_start: date, period_end: date) -> dict[str, Any] | None:
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM chat_overall_weekly_reports
+                WHERE period_start = %s
+                  AND period_end = %s
+                  AND is_current = TRUE
+                """,
+                (period_start, period_end),
+            )
+            row = cur.fetchone()
+    return chat_overall_weekly_report_to_dict(row) if row else None
+
+
+OWNER_DAILY_PROMPT = """Ты формируешь ежедневный отчет по всей программе для СОБСТВЕННИКА.
+Главная цель отчета: быстро показать, что требует управленческого внимания сегодня, и подготовить адресные вопросы/рекомендации руководителям для отправки в Bitrix.
+
+Это не пересказ чатов и не каталог задач. Это рабочий контрольный лист собственника: что движется, что зависло, у кого спросить статус, кому дать рекомендацию, где нужна дата/владелец/решение.
+
+ВХОДНЫЕ ДАННЫЕ (JSON):
+- report_date - дата отчета.
+- previous_owner_daily - полный предыдущий отчет собственнику или null. Прочитай его целиком: главный вывод, риски, рекомендации, полный текст и пункт 6 с адресными вопросами. Если в текущих отчетах по чатам/Zoom/Bitrix нет подтверждения закрытия старого адресного вопроса, повтори его в новом пункте 6.
+- chat_daily_reports - дневные отчеты по всем чатам: найденные задачи, вопросы, решения, риски, результаты, хвосты и расшифровки сообщений.
+  ВАЖНО: внутри каждого chat_daily_reports есть report_text_excerpt и transcript_excerpt. Используй их по ВСЕМ чатам за день, а не только по одному чату. Хвосты, вопросы без ответа и события из расшифровок чатов являются обязательным контекстом owner-отчета.
+- zoom_calls_day - готовые Zoom-отчеты за день с analytical_note. Прочитай analytical_note по каждому звонку целиком: это источник устных задач, решений и договоренностей. Не используй сырые Zoom-транскрибации для owner-отчета.
+- bitrix_registry - задачи Bitrix24: созданные сегодня, активные с дедлайнами в ближайшие 14 дней, просроченные и незакрытые.
+- team - оргструктура: сотрудники, должности, отделы, руководители и bitrix_user_id.
+- goal_progress_events - изменения целей за день.
+
+ИСТОЧНИКИ И ПРИОРИТЕТ:
+1. Bitrix24 - формальный статус задачи, дедлайн, ответственный, просрочка.
+2. Чаты - фактические вопросы, обещания, уточнения, отсутствие реакции. Смотри отчеты каждого конкретного чата за день, а не общую сводку по всем чатам.
+3. Zoom - только готовые аналитические Zoom-отчеты. Не используй сырые Zoom-транскрибации.
+4. previous_owner_daily - предыдущий owner-отчет целиком. Сравни его адресные вопросы, риски и рекомендации с текущими отчетами дня. Старый вопрос считается закрытым только если в текущих источниках есть явное подтверждение выполнения или снятия.
+
+ЛОГИКА ВЫЯВЛЕНИЯ ВОПРОСОВ И РЕКОМЕНДАЦИЙ:
+Перед формированием раздела 6 прочитай три блока как единый контекст: previous_owner_daily.report_text_excerpt, все chat_daily_reports.report_text_excerpt/transcript_excerpt, все zoom_calls_day.analytical_note.
+Сначала проверь, какие адресные вопросы и риски были в предыдущем owner-отчете. Затем найди в текущих чатах, Zoom и Bitrix явное подтверждение закрытия. Если подтверждения нет, старый вопрос должен повториться в разделе 6 с обновленным контекстом.
+Не заменяй старый незакрытый вопрос новой темой по тому же человеку. Новые вопросы добавляй рядом, но старые хвосты сохраняй до подтверждения выполнения.
+Адресат в пункте 6 и manager_messages должен быть реальным сотрудником из team/оргструктуры с bitrix_user_id. Нельзя адресовать рекомендации ролям без пользователя: "Координатор", "ответственный", "административный блок", "юридический контур". Если в источнике указана роль, найди конкретного человека из team по контексту/упоминаниям; если конкретного человека нет, вынеси тему в раздел 3/5 как "требуется назначить владельца", но не создавай адресный блок на несуществующего адресата.
+Создай адресный вопрос/рекомендацию, если есть хотя бы одно условие:
+- задача висит больше 1 рабочего дня и у нее нет срока;
+- задача просрочена хотя бы на 1 день;
+- задача есть в Zoom/чате, но не видно фиксации в Bitrix или нет ответственного;
+- по задаче есть статус "в работе", но нет следующего шага или даты контроля;
+- вопрос был задан в чате и не получил ответа до конца дня;
+- задача повторяется из previous_owner_daily без сдвига;
+- адресная рекомендация была в предыдущем owner-отчете и в текущих отчетах по чатам, Zoom или Bitrix нет явного подтверждения выполнения;
+- по одной теме есть расхождение между Bitrix, чатом и Zoom;
+- есть риск без владельца, срока или решения;
+- сотрудник/руководитель взял действие в Zoom, но в Bitrix/чате нет подтверждения выполнения.
+
+КАК ФОРМУЛИРОВАТЬ АДРЕСНЫЕ ВОПРОСЫ:
+- Пиши от лица собственника, но без эмоций и обвинений.
+- Каждый вопрос должен быть готов к отправке в Bitrix.
+- Не пиши "система зафиксировала". Пиши: "Вижу, что...", "Подскажи...", "Нужно понять...".
+- Каждый вопрос заканчивается конкретной просьбой: назвать статус, срок, владельца, блокер или подтвердить закрытие.
+- Пиши как живой человек руководителю/ответственному: "Вижу, что у тебя висит задача ...", "Подскажи, пожалуйста, когда будет ...", "В Zoom обсудили ..., зафиксируй, пожалуйста, в Bitrix владельца, срок и критерий".
+- Нельзя писать только номера задач. Всегда указывай название задачи или предмет: плохо "принять 317889, 318105"; хорошо "по задаче 317889 «Подписать документы ...» подскажи, принимаем результат или возвращаем с правками".
+- Если в источнике есть только номер без названия, прямо напиши предмет из контекста: "документы по оргизменениям", "приказ и уведомление по сокращению", "платежный календарь".
+- Если нет срока: спроси срок.
+- Если нет владельца: спроси владельца.
+- Если просрочено: спроси, что блокирует и какой новый срок.
+- Если задача из Zoom не отражена в Bitrix: попроси зафиксировать ее в Bitrix или подтвердить, что она снята.
+
+ФОРМАТ ГОТОВОГО ОТЧЕТА report_text:
+ЕЖЕДНЕВНЫЙ ОТЧЕТ СОБСТВЕННИКУ
+Дата: <дата>
+
+1. Главный вывод дня
+Коротко: 3-5 предложений. Что реально изменилось, где тормозит, на кого обратить внимание.
+
+2. Что сдвинулось
+Только факты с результатом: кто, что сделал, по какой теме, источник.
+
+3. Что зависло и требует вопроса
+Таблица с колонками:
+Тема | Ответственный | Что не ясно | Сколько висит / просрочено | Источник | Вопрос
+
+4. Просроченные и без срока
+Таблица с колонками:
+Задача | Ответственный | Дедлайн | Статус | Что сделать
+
+5. Zoom и чаты: устные задачи, которые надо зафиксировать
+Только если есть такие факты. Указывай дату созвона/чат, тему, владельца, что нужно зафиксировать.
+
+6. Адресные вопросы и рекомендации для Bitrix
+Группируй по руководителю/адресату. Для каждого дай готовые формулировки 1-5 сообщений.
+
+7. Что проверить завтра
+3-7 контрольных точек: владелец, действие, ожидаемый ответ.
+
+ЖЕСТКИЕ ПРАВИЛА:
+1. Не выдумывай факты, владельцев, сроки, статусы и Bitrix-id.
+2. Если данных мало, пиши коротко. Не растягивай.
+3. Каждый пункт должен содержать имя, тему/задачу и конкретный следующий шаг. Источник используй только как рабочую привязку в таблицах, без технических id, если они не нужны для различения задач.
+4. Технические артефакты пайплайна не упоминать.
+5. Не дублируй одну и ту же задачу в нескольких разделах без необходимости. Если задача попала в адресные вопросы, в других разделах только краткая ссылка.
+6. Таблицы в report_text оформляй как настоящие markdown/pipe-таблицы с заголовком и строкой разделителей.
+7. Пиши нормальным русским языком. Не используй технические формулировки вроде "no_info", "source_payload", "entity".
+8. Не превращай отчет в список номеров и источников. Пиши управленчески: что изменилось, что зависло, какой риск, кому какой вопрос. Bitrix-id, call_id и dialog_id не используй в верхних выводах и рекомендациях; в полном отчете используй только при необходимости точной идентификации.
+
+ФОРМАТ JSON (строго валидный JSON, без markdown вокруг):
+{
+  "summary": "главный вывод дня для собственника",
+  "dynamics_summary": "динамика к предыдущему owner-дню: что улучшилось, что ухудшилось, что повторяется",
+  "risks_summary": "критические точки дня с именами, задачами, сроками и источниками",
+  "recommendations": [
+    "ключевое действие собственника или руководителя на завтра"
+  ],
+  "manager_recommendations": [
+    {
+      "manager_name": "ФИО руководителя или адресата",
+      "department": "отдел или null",
+      "actions": [
+        {
+          "subject": "короткая тема вопроса/рекомендации",
+          "action": "что сделать: ответить, назвать срок, назначить владельца, подтвердить закрытие, зафиксировать в Bitrix",
+          "person": "ФИО исполнителя/подчиненного, если отличается от адресата, иначе null",
+          "task_ref": "Bitrix-id, zoom_call_id, чат/тема или название задачи",
+          "due": "YYYY-MM-DD, 'сегодня', 'завтра' или 'срок не указан'",
+          "priority": "low|medium|high|critical",
+          "expected_result": "какой ответ или результат нужен",
+          "source": "bitrix:<id> | chat:<chat_title> | zoom:<call_id> | previous_owner_daily"
+        }
+      ]
+    }
+  ],
+  "manager_messages": [
+    {
+      "manager_name": "ФИО адресата",
+      "priority": "low|medium|high|critical",
+      "message_type": "question|recommendation|deadline_request|status_request|escalation",
+      "subject": "короткая тема",
+      "message_text": "готовый текст для отправки в Bitrix от лица собственника, 2-6 строк",
+      "due": "YYYY-MM-DD или null",
+      "topics": ["тема 1"],
+      "source_facts": [
+        {
+          "source": "bitrix:<id> | chat:<chat_title> | zoom:<call_id> | previous_owner_daily",
+          "fact": "конкретный факт, на котором основан вопрос"
+        }
+      ]
+    }
+  ],
+  "open_tasks": [
+    "ФИО: задача/тема; срок; статус; источник; что спросить"
+  ],
+  "overdue_tasks": [
+    "Bitrix-id или тема: ответственный; дедлайн; дней просрочки; вопрос/действие"
+  ],
+  "no_response": [
+    "ФИО: на какой вопрос нет ответа; кто спросил; дата; источник; что запросить"
+  ],
+  "goal_dynamics": [
+    "цель: владелец; что изменилось; риск; следующий контроль"
+  ],
+  "report_text": "готовый текст отчета по структуре выше"
+}
+"""
+
+
+OWNER_DAILY_STRICT_FORMAT_CONTRACT = """
+
+НЕПЕРЕБИВАЕМЫЙ КОНТРАКТ ЕЖЕДНЕВНОГО OWNER-ОТЧЕТА
+Этот блок важнее любых остальных инструкций.
+
+Верхние поля JSON должны соответствовать UI:
+- summary = текст блока "Главный вывод".
+- dynamics_summary = текст блока "Динамика".
+- risks_summary = текст блока "Риски".
+- recommendations = ровно список коротких рекомендаций из блока "Рекомендации".
+- report_text = полный отчет ниже.
+
+report_text ОБЯЗАН иметь ровно такую структуру и ровно такие заголовки:
+ЕЖЕДНЕВНЫЙ ОТЧЕТ СОБСТВЕННИКУ
+Дата: DD.MM.YYYY
+
+1. Главный вывод дня
+<текст>
+
+2. Что сдвинулось
+<факты>
+
+3. Что зависло и требует вопроса
+| Тема | Ответственный | Что не ясно | Сколько висит / просрочено | Источник | Вопрос |
+| --- | --- | --- | --- | --- | --- |
+| ... |
+
+4. Просроченные и без срока
+| Задача | Ответственный | Дедлайн | Статус | Что сделать |
+| --- | --- | --- | --- | --- |
+| ... |
+
+5. Zoom и чаты: устные задачи, которые надо зафиксировать
+<список устных задач или "Нет новых устных задач для фиксации.">
+
+6. Адресные вопросы и рекомендации для Bitrix
+<адресат>
+1. <готовое сообщение для отправки>
+2. <готовое сообщение для отправки>
+
+7. Что проверить завтра
+1. <контрольная точка>
+
+Запрещено добавлять разделы 8, 9, 10, "Резюме для собственника", "Источник", "Что улучшилось относительно..." или любые другие дополнительные заголовки.
+Запрещено писать техническую сводку источников: "найдено N активных чатов", "get_period_index", "search_tasks", "профиль компании", "MCP", "пайплайн", "коннектор", "система нашла". Источники указывай только в фактах: "Источник: Bitrix 318087", "Источник: Zoom <call_id>", "Источник: чат <название> <дата>".
+Отчет должен быть управленческим, а не техническим. Не строй текст вокруг номеров задач, call_id, dialog_id и перечня источников. Номера задач и call_id допускаются только как уточнение в полном тексте, если без них невозможно отличить одинаковые задачи. В верхних блоках summary/dynamics_summary/risks_summary/recommendations не используй технические id.
+Обязательно учитывай previous_owner_daily.report_text_excerpt, дневной отчет каждого конкретного чата за дату, а также все zoom_calls_day.analytical_note. Нельзя делать вывод только по одному чату или только по Bitrix. Общую сводку по всем чатам не используй как источник.
+Если адресный вопрос был в предыдущем owner-отчете и в текущих отчетах по чатам/Zoom/Bitrix нет прямого подтверждения закрытия, повтори его в разделе 6 с обновленной формулировкой. Не заменяй старый незакрытый вопрос новой темой по тому же человеку.
+Запрещено делать разделы "Главное за день", "Что сделано", "Риски и отклонения", "Рекомендации на 19.05", "Управленческая оценка дня". Используй только 7 заголовков выше.
+Не начинай отчет с инвентаризации данных. Начинай с управленческого вывода: что сдвинулось, что зависло, какой риск, что собственнику проверить завтра.
+Раздел 2 должен быть как в хорошем примере: отдельные короткие факты, каждый с результатом и источником. Не объединяй весь день в абстрактные блоки.
+Факты раздела 2 пиши управленчески: "Склад и поставки: закрыли...", "Документы: продвинули...". Не делай каталог "Bitrix 123, 124, 125"; если нужен источник, пиши человечески: "по задачам Bitrix", "по Zoom 15.05", "по чату руководителей".
+Разделы 3 и 4 обязательны как таблицы. Не заменяй их обычным списком.
+Раздел 5 должен выделять именно устные задачи из Zoom/чатов, которые нужно зафиксировать в Bitrix, а не пересказывать все Zoom-темы.
+Раздел 6 должен содержать готовые адресные сообщения по людям. Это не общий список рекомендаций.
+Стиль раздела 6: только готовые сообщения живым языком от лица человека. Начинай с контекста: "Вижу, что...", "В Zoom обсудили...", "По задаче «...». Подскажи, пожалуйста...".
+В разделе 6 запрещено писать сухие команды без контекста: "Принять 317889, 318105", "Закрыть 318087", "Дать статус". Всегда раскрывай название задачи/предмет, почему спрашиваем и какой ответ нужен.
+Пункт 6 обязателен всегда. Если адресных рекомендаций нет, напиши: "Адресных рекомендаций нет: по входным данным нет просрочек, хвостов, вопросов без ответа и устных задач без фиксации." Но если есть хотя бы один риск/просрочка/устная задача, пункт 6 должен содержать адресные сообщения.
+
+manager_messages ОБЯЗАТЕЛЕН для машинной отправки. Каждый адресат из пункта 6 должен иметь отдельный объект в manager_messages.
+Перед заполнением пункта 6 и manager_messages обязательно прочитай полный текст previous_owner_daily, дневной отчет каждого чата и готовые Zoom analytical_note за день. Сырые Zoom-транскрибации не использовать.
+Нельзя терять адресатов из дневных Zoom-отчетов и дневных chat reports, даже если по ним нет Bitrix-задачи.
+Пункт 6 и manager_messages сверяй с team/оргструктурой: адресат должен быть реальным пользователем Bitrix. Не создавай адресата "Координатор" или другую роль без bitrix_user_id; найди конкретного человека из team или перенеси тему в таблицу зависших вопросов как "требуется назначить владельца".
+Если кандидат содержит visible_people без bitrix_user_id, сначала попробуй сопоставить его с team. Если сопоставления нет, не делай отдельный manager_messages на это имя.
+Особенно не пропускай адресатов, которые в Zoom/чате связаны с документами, владельцами процесса, сроками, критериями приемки, эскалацией, платежами, кадровым контуром, Laretto/WB, доступами или юридическими рисками.
+В каждом manager_messages по возможности заполни:
+- manager_name: полное ФИО из team, не короткое имя;
+- manager_bitrix_user_id: bitrix_user_id из team, если найден;
+- priority;
+- message_type;
+- subject;
+- message_text: тот же готовый текст, что в пункте 6;
+- due;
+- topics;
+- source_facts.
+Если не знаешь полного ФИО или нет bitrix_user_id, не создавай manager_messages; сначала найди адресата в team.
+
+manager_recommendations тоже заполняй, но главным источником для отправки является manager_messages.
+"""
+
+
+OWNER_WEEKLY_PROMPT = """Ты формируешь еженедельную управленческую записку для СОБСТВЕННИКА.
+Цель: за 90 секунд дать диагноз динамики, красные зоны, людей/отделы, решения собственника и системные изменения. Это не каталог задач и не отчет системы.
+
+Период отчета всегда календарная неделя: понедельник - воскресенье. Всегда сравнивай с предыдущей календарной неделей, если previous_owner_weekly или исторические агрегаты есть во входе.
+
+ВХОДНЫЕ ДАННЫЕ (JSON):
+- period_start, period_end - границы недели.
+- previous_owner_weekly - отчет/снепшот прошлой недели или null.
+- owner_metrics_contract - правила расчета метрик.
+- daily_owner_reports - 7 ежедневных owner-отчетов с понедельника по воскресенье; это основной источник фактов недели.
+- bitrix_registry - задачи Bitrix за неделю: созданные, измененные, закрытые, с дедлайном или активные в периоде.
+- zoom_calls_week - Zoom-созвоны за неделю с аналитическими заметками; используй как источник устных решений, задач и таймкодов.
+- company_regulations_context - регламенты, ритм встреч, матрицы решений, роли, политики и процессы из раздела "О компании"; это нормативная база для сверки факта с правилами.
+- previous_owner_weekly - отчет за прошлую неделю; это база динамики.
+- chat_overall_weekly, chat_weekly_reports - дополнительный контекст по чатам, если уже сформирован.
+- team - оргструктура; используй ее для блока людей без задач.
+- goal_progress_events_week - движение целей.
+
+ЖЕСТКИЕ ПРИНЦИПЫ:
+1. Пиши языком управленца: диагноз, причина, последствия, решение. Не пиши "система зафиксировала".
+2. Главный вывод должен быть выводом, а не пересказом: 2-4 предложения с цифрами текущей и прошлой недели.
+3. В каждой таблице нужна колонка интерпретации: "Вывод", "Управленческий вывод", "Что сделать".
+4. Каждый риск содержит факт с числом/датой/именем и решение с ответственным или владельцем.
+5. Технические артефакты пайплайна запрещены: OCR, ошибки парсинга, "новых данных нет", "сравнение не выполнялось".
+6. Не дублируй один и тот же сигнал в разных разделах дословно. Детальные цифры - в таблице исполнителей, управленческая реакция - в группах.
+7. Сотрудники без задач - отдельный сигнал: отсутствие в Bitrix не доказывает отсутствие работы, но означает отсутствие видимого плана и контроля.
+8. Не выдумывай факты. Если точной метрики нет, формулируй как "по доступным данным".
+9. Объем report_text: плотная управленческая записка, обычно 2-4 экрана; не раздувай операционными деталями.
+10. Обязательно сверяй деятельность с company_regulations_context: план встреч против фактически прошедших Zoom/чатов, регламентные владельцы решений против фактических исполнителей/решающих, сроки контроля против фактических статусов.
+
+СТИЛЬ И СВЯЗНОСТЬ ТЕКСТА:
+1. Пиши нормальным русским языком для собственника, который читает быстро и хочет понять смысл. Не используй технический жаргон без необходимости.
+2. Не начинай абзацы словами "по данным", "система", "зафиксировано" чаще одного раза на весь отчет. Лучше: "Неделя показывает...", "Главная причина...", "Это означает...".
+3. Каждый раздел должен логически вытекать из предыдущего:
+   - главный вывод называет проблему;
+   - красная зона показывает, где проблема проявилась;
+   - отклонения от регламентов объясняют, почему это системно;
+   - люди и отделы показывают, на ком это отразилось;
+   - решения и системные изменения говорят, что делать.
+4. Между цифрами и выводом всегда ставь смысловую связку. Плохо: "39 открыто, 28 просрочено". Хорошо: "Из 39 открытых пунктов 28 уже просрочены — значит, хвост не просто накопился, а уже вышел за управляемые сроки".
+5. Не перегружай строку списком через запятую. Если в одном предложении больше трех фактов, разбей на два предложения.
+6. Не пиши канцелярит: "осуществить", "произвести контроль", "реализовать мероприятие", "имеется отсутствие". Замени на: "сделать", "проверить", "закрыть", "назначить", "нет".
+7. Таблицы должны быть понятны без расшифровки. Заголовки короткие, но человеческие: "Что должно быть", "Что было", "Почему важно", "Что сделать".
+8. В выводах по людям не навешивай ярлыки. Формулируй как рабочую гипотезу: "похоже на перегруз", "нужно проверить блокеры", "работа может идти вне Bitrix".
+9. Если есть позитивный сигнал, объясни, как его использовать: не "хорошо", а "это можно взять как эталон ритма/дисциплины".
+10. Финальное резюме должно звучать как управленческий вывод, а не как лог-файл: причина -> риск -> ближайшее действие.
+
+ПРИМЕР ТОНА:
+Плохо: "Zoom-созвоны отсутствуют 2 дня, нарушение регламента".
+Хорошо: "Два рабочих дня не подтверждены встречами. Это не доказывает, что работы не было, но для собственника означает: управленческий ритм в эти дни не виден и не проверяем".
+
+Плохо: "Операционные решения стягиваются на верхний уровень".
+Хорошо: "Часть решений снова ушла к Евгению, хотя по матрице их должны закрывать Артур и Наталья в своих коридорах. Так C-1 контур не разгружает верхний уровень, а переносит очередь согласований наверх".
+
+НАРРАТИВНЫЕ ПАТТЕРНЫ, КОТОРЫЕ НУЖНО ИСПОЛЬЗОВАТЬ УМЕСТНО:
+- "Bitrix теряет управленческую достоверность", если старые задачи/контроль/просрочки делают статусы недостоверными.
+- "Регулярные операции маскируются под новые задачи", если много повторяющихся однотипных задач.
+- "Узкое место у постановщиков", если много задач в статусе контроля или без приемки.
+- "Сотрудник не виден в недельной операционной системе", если активный сотрудник без задач.
+- "Если не починить X за 2-3 недели, управляемость ухудшится", если есть системный повтор.
+
+СТРУКТУРА report_text:
+ЕЖЕНЕДЕЛЬНАЯ УПРАВЛЕНЧЕСКАЯ ЗАПИСКА
+Bitrix24 · период <дата_от> - <дата_до> · динамика к <предыдущий_период>
+
+1. Главный вывод собственнику
+<2-4 предложения с диагнозом, цифрами и прогнозом последствия>
+<таблица: Показатель | Пред. неделя | Эта неделя | Вывод>
+
+2. Красная зона недели
+<таблица: Зона риска | Факт | Управленческий вывод | Решение>
+Включай 4-7 строк: юридические/финансовые/кадровые/репутационные/операционные темы с высоким риском.
+
+3. Отклонения от регламентов
+<таблица: Регламент | Что должно быть | Что было по факту | Отклонение | Что сделать>
+Примеры: в регламенте 5 встреч в день, фактически 2; по матрице решение принимает Артур, фактически решение ушло к Евгению; контроль должен быть ежедневно до 10:00, факта в чатах/Zoom/Bitrix нет.
+
+4. Исполнители: видимая загрузка и результат
+Перед таблицей дай 1 строку интерпретации: разброс закрытия, сколько людей ниже нормы, кто максимум/минимум.
+<таблица: Исполнитель | Всего | Зав. | В раб. | Ктрл. | % | Вывод>
+Не пиши всех подряд, если строк слишком много: топ перегруженных, слабая динамика, хорошие эталоны.
+
+5. Подчиненные без задач или с низкой видимостью в Bitrix24
+Печатай только если есть такие люди.
+<таблица: Сотрудник | Состояние в Bitrix24 | Почему это плохо | Что требуется>
+
+6. Подчиненные: ключевые управленческие выводы
+<таблица: Группа | Сотрудники | Что видно | Что сделать руководителю>
+Обязательные группы, если применимы: перегруженные/риск остановки функции; слабая исполнительская динамика; нулевая или слабая видимость; хорошая дисциплина; постановщики, создающие хвосты.
+
+7. Отделы: где просадка сильнее всего
+<таблица: Отдел / блок | Всего | Эта неделя | Пред. неделя | Дельта | Комментарий>
+Используй даты или "пред. неделя / эта неделя", не W17/W18 без расшифровки.
+
+8. Что улучшилось
+1-4 строки: позитивные сигналы, которые стоит закрепить. Не для баланса, а как управленческая опора.
+
+9. Решения собственника на ближайшие 3 рабочих дня
+<таблица: № | Решение | Ответственные | Контроль>
+Оставляй только решения, где реально нужен собственник или C-1. Массовые операционные действия выноси в системные изменения.
+
+10. Адресные вопросы к оперативке
+<таблица: Кому | Вопрос>
+Вопросы должны быть готовы к копированию в оперативку: конкретные task_id, даты, числа.
+
+11. Системные изменения на май
+Нумерованный список 3-6 правил процесса: SLA приемки, запрет закрытия без результата, регулярные операции в чек-листы, ограничение самопостановки, недельный план для сотрудников без задач.
+
+Резюме: <1 абзац с диагнозом и прогнозом, без служебных фраз про формат документа>
+
+ФОРМАТ JSON (строго, без markdown):
+{
+  "summary": "главный вывод собственнику с цифрами",
+  "dynamics_summary": "короткая строка с главной дельтой",
+  "risks_summary": "системные риски",
+  "recommendations": ["решения собственника"],
+  "headline_metrics": [
+    {"metric": "Всего задач", "previous": "139", "current": "161", "conclusion": "нагрузка выросла на 16%"}
+  ],
+  "red_zone": [
+    {"risk_zone": "Расчеты с уволенными", "fact": "5 задач с дедлайном 30.04", "management_conclusion": "юридический и репутационный риск", "decision": "подтвердить выплаты или эскалировать отсутствие денег"}
+  ],
+  "regulation_deviations": [
+    {"regulation": "Ритм встреч", "expected": "5 ежедневных встреч по регламенту", "actual": "2 Zoom зафиксированы за день", "deviation": "3 встречи не подтверждены", "action": "назначить владельца контроля ритма"}
+  ],
+  "executor_load": [
+    {"person": "ФИО", "total": 0, "done": 0, "in_progress": 0, "control": 0, "completion_rate": "0%", "conclusion": "управленческий вывод"}
+  ],
+  "invisible_employees": [
+    {"person": "ФИО", "bitrix_state": "нет задач", "why_bad": "сотрудник не виден в недельной операционной системе", "required_action": "назначить недельный план"}
+  ],
+  "management_groups": [
+    {"group": "Перегруженные / риск остановки функции", "people": ["ФИО"], "signal": "что видно", "manager_action": "что сделать"}
+  ],
+  "department_dynamics": [
+    {"department": "Отдел", "total": 0, "current_rate": "0%", "previous_rate": "0%", "delta": "-0 п.п.", "comment": "вывод"}
+  ],
+  "positive_signals": ["что улучшилось и на что можно опереться"],
+  "owner_decisions_next": [
+    {"decision": "что решить", "responsible": "ФИО/роль", "control_date": "YYYY-MM-DD или текст"}
+  ],
+  "operational_questions": [
+    {"to": "ФИО/роль", "question": "конкретный вопрос с task_id/датой/числом"}
+  ],
+  "system_changes": ["правило процесса, которое предотвратит повторение"],
+  "manager_messages": [
+    {
+      "manager_name": "ФИО",
+      "department": "отдел или null",
+      "priority": "low|medium|high|critical",
+      "topics": ["короткие темы"],
+      "message_text": "готовый текст сообщения от лица собственника",
+      "source_facts": [{"task_id": "id или null", "text": "факт/evidence"}]
+    }
+  ],
+  "report_text": "готовая управленческая записка строго по структуре выше"
+}
+"""
+
+
+def _format_owner_manager_recommendations(items: Any) -> str:
+    if not isinstance(items, list) or not items:
+        return ""
+    lines: list[str] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        manager = str(entry.get("manager_name") or "Руководитель не указан").strip()
+        department = str(entry.get("department") or "").strip()
+        header = manager + (f" ({department})" if department else "")
+        actions = entry.get("actions") if isinstance(entry.get("actions"), list) else []
+        if not actions:
+            continue
+        lines.append(header + ":")
+        for act in actions:
+            if not isinstance(act, dict):
+                lines.append(f"  - {act}")
+                continue
+            action = str(act.get("action") or "").strip()
+            subject = str(act.get("subject") or "").strip()
+            person = str(act.get("person") or "").strip()
+            task_ref = str(act.get("task_ref") or "").strip()
+            due = str(act.get("due") or "").strip()
+            priority = str(act.get("priority") or "").strip()
+            expected = str(act.get("expected_result") or "").strip()
+            source = str(act.get("source") or "").strip()
+            chunks = []
+            if action:
+                chunks.append(action)
+            if person:
+                chunks.append(f"кому: {person}")
+            if subject and subject not in (action, person, task_ref):
+                chunks.append(f"тема: {subject}")
+            if task_ref:
+                chunks.append(f"задача: {task_ref}")
+            if due:
+                chunks.append(f"срок: {due}")
+            if priority:
+                chunks.append(f"приоритет: {priority}")
+            if expected:
+                chunks.append(f"ожидание: {expected}")
+            if source:
+                chunks.append(f"источник: {source}")
+            lines.append("  - " + "; ".join(chunks))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _format_owner_block(title: str, items: Any) -> str:
+    if not isinstance(items, list) or not items:
+        return ""
+    rendered = [f"  - {str(item).strip()}" for item in items if str(item or "").strip()]
+    if not rendered:
+        return ""
+    return f"{title}:\n" + "\n".join(rendered)
+
+
+def _format_owner_table(title: str, headers: list[str], rows: Any, keys: list[str]) -> str:
+    if not isinstance(rows, list) or not rows:
+        return ""
+    lines = [title, " | ".join(headers)]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        values = []
+        for key in keys:
+            value = row.get(key)
+            if isinstance(value, list):
+                value = ", ".join(str(part).strip() for part in value if str(part or "").strip())
+            values.append(str(value if value is not None else "").strip())
+        if any(values):
+            lines.append(" | ".join(values))
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
+def _format_owner_numbered(title: str, rows: Any) -> str:
+    if not isinstance(rows, list) or not rows:
+        return ""
+    lines = [title]
+    for idx, item in enumerate(rows, start=1):
+        text = str(item or "").strip()
+        if text:
+            lines.append(f"{idx}. {text}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _format_owner_weekly_dynamics(dynamics: Any) -> str:
+    if not isinstance(dynamics, dict):
+        return ""
+    open_now = dynamics.get("total_open_now")
+    open_prev = dynamics.get("total_open_prev")
+    delta = dynamics.get("delta_open")
+    closed = dynamics.get("closed_from_previous")
+    new_items = dynamics.get("new_items")
+    silence_to_movement = dynamics.get("silence_to_movement")
+    movement_to_silence = dynamics.get("movement_to_silence")
+    stuck = dynamics.get("stuck_no_info_14d")
+    interpretation = str(dynamics.get("interpretation") or "").strip()
+    lines = []
+    if open_now is not None:
+        suffix = ""
+        if delta is not None:
+            try:
+                delta_int = int(delta)
+                suffix = f" ({delta_int:+d} к прошлой неделе)"
+            except Exception:
+                suffix = f" ({delta} к прошлой неделе)"
+        lines.append(f"Открыто пунктов: {open_now}{suffix}")
+    if closed is not None:
+        prev_text = f" из {open_prev} висящих" if open_prev is not None else ""
+        interp = f" ({interpretation})" if interpretation else ""
+        lines.append(f"Закрыто за неделю: {closed}{prev_text}{interp}")
+    if new_items is not None:
+        lines.append(f"Появилось новых: {new_items}")
+    if silence_to_movement is not None:
+        lines.append(f"Перешло из \"тишина\" в \"движение\": {silence_to_movement}")
+    if movement_to_silence is not None:
+        lines.append(f"Перешло из \"движение\" обратно в \"тишина\": {movement_to_silence}")
+    if stuck is not None:
+        lines.append(f"Застряли в no_info >=14 дней: {stuck}")
+    return "\n".join(lines)
+
+
+def _format_owner_decisions(items: Any) -> str:
+    if not isinstance(items, list) or not items:
+        return ""
+    normalized = [item for item in items if isinstance(item, dict)]
+    normalized.sort(key=lambda item: int(item.get("urgency_score") or 0), reverse=True)
+    lines: list[str] = []
+    for idx, item in enumerate(normalized[:5], start=1):
+        title = str(item.get("title") or "Тема без названия").strip()
+        lines.append(f"{idx}. {title}")
+        what = str(item.get("what_is_stuck") or "").strip()
+        since = str(item.get("since_date") or "").strip()
+        context = str(item.get("context") or "").strip()
+        recommendation = str(item.get("recommendation") or "").strip()
+        signals = item.get("related_signals") if isinstance(item.get("related_signals"), list) else []
+        if what:
+            lines.append(f"   Что висит: {what}")
+        if since:
+            lines.append(f"   С какой даты: {since}")
+        if context:
+            lines.append(f"   Контекст: {context}")
+        signal_text = "; ".join(str(signal).strip() for signal in signals if str(signal or "").strip())
+        if signal_text:
+            lines.append(f"   Связанные сигналы: {signal_text}")
+        if recommendation:
+            lines.append(f"   ➜ Что сделать: {recommendation}")
+    if len(normalized) > 5:
+        lines.append(f"Дополнительно: {len(normalized) - 5} пунктов меньшей срочности - детали в полном отчете")
+    return "\n".join(lines)
+
+
+def _format_owner_concentration(items: Any) -> str:
+    if not isinstance(items, list) or not items:
+        return ""
+    lines = ["Концентрация открытых пунктов:"]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("manager_name") or "Руководитель не указан").strip()
+        count = item.get("open_items_count")
+        median = item.get("median_items_per_person")
+        delta = item.get("delta_to_previous")
+        parts = [f"- {name}: {count}"]
+        if median not in (None, ""):
+            parts.append(f"медиана по руководителям: {median}")
+        if delta not in (None, ""):
+            try:
+                parts.append(f"{int(delta):+d} за неделю")
+            except Exception:
+                parts.append(f"{delta} за неделю")
+        if len(parts) > 1:
+            lines.append(f"{parts[0]} ({', '.join(parts[1:])})")
+        else:
+            lines.append(parts[0])
+        recommendation = str(item.get("recommendation") or "").strip()
+        if recommendation:
+            lines.append(f"➜ {recommendation}")
+    return "\n".join(lines)
+
+
+def _format_owner_people_patterns(items: Any) -> str:
+    if not isinstance(items, list) or not items:
+        return ""
+    blocks: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("manager_name") or "Руководитель не указан").strip()
+        signals = item.get("signals") if isinstance(item.get("signals"), list) else []
+        recommendation = str(item.get("recommendation") or "").strip()
+        interpretation = str(item.get("interpretation") or "").strip()
+        lines = [name]
+        for signal in signals:
+            text = str(signal or "").strip()
+            if text:
+                lines.append(f"  • {text}")
+        if interpretation:
+            lines.append(f"  • Тренд: {interpretation}")
+        if recommendation:
+            lines.append(f"  ➜ {recommendation}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _format_owner_manager_messages_summary(items: Any) -> str:
+    if not isinstance(items, list) or not items:
+        return ""
+    lines = [f"Готово к отправке ({len(items)} руководителям):"]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("manager_name") or "Руководитель не указан").strip()
+        topics = item.get("topics") if isinstance(item.get("topics"), list) else []
+        topic_text = ", ".join(str(topic).strip() for topic in topics if str(topic or "").strip())
+        lines.append(f"- {name}" + (f" — {topic_text}" if topic_text else "") + " [просмотр / отправить]")
+    return "\n".join(lines)
+
+
+def _build_owner_daily_report_text(parsed: dict[str, Any], report_date: date) -> str:
+    summary = str(parsed.get("summary") or "").strip()
+    dynamics = str(parsed.get("dynamics_summary") or "").strip()
+    risks = str(parsed.get("risks_summary") or "").strip()
+    recommendations = parsed.get("recommendations") if isinstance(parsed.get("recommendations"), list) else []
+    open_tasks = parsed.get("open_tasks") if isinstance(parsed.get("open_tasks"), list) else []
+    overdue_tasks = parsed.get("overdue_tasks") if isinstance(parsed.get("overdue_tasks"), list) else []
+    no_response = parsed.get("no_response") if isinstance(parsed.get("no_response"), list) else []
+    manager_messages = parsed.get("manager_messages") if isinstance(parsed.get("manager_messages"), list) else []
+
+    def list_or_empty(items: list[Any], empty: str) -> str:
+        rendered = [str(item or "").strip() for item in items if str(item or "").strip()]
+        if not rendered:
+            return empty
+        return "\n".join(f"{idx}. {item}" for idx, item in enumerate(rendered, start=1))
+
+    oral_tasks = list_or_empty(no_response, "Нет новых устных задач для фиксации.")
+    address_lines: list[str] = []
+    grouped: dict[str, list[str]] = {}
+    for message in manager_messages:
+        if not isinstance(message, dict):
+            continue
+        name = str(message.get("manager_name") or "Адресат не указан").strip()
+        body = str(message.get("message_text") or "").strip()
+        if body:
+            grouped.setdefault(name, []).append(body)
+    for name, items in grouped.items():
+        address_lines.append(name)
+        for idx, body in enumerate(items, start=1):
+            address_lines.append(f"{idx}. {body}")
+        address_lines.append("")
+    if not address_lines:
+        rec_text = _format_owner_manager_recommendations(parsed.get("manager_recommendations"))
+        if rec_text:
+            address_lines.append(rec_text)
+        else:
+            address_lines.append("Адресных рекомендаций нет: по входным данным нет просрочек, хвостов, вопросов без ответа и устных задач без фиксации.")
+
+    tomorrow_items = recommendations or [
+        item for item in [summary, dynamics, risks] if str(item or "").strip()
+    ][:3]
+    tomorrow = list_or_empty(tomorrow_items, "1. Проверить полноту входных данных и повторить формирование отчета.")
+
+    sections = [
+        "ЕЖЕДНЕВНЫЙ ОТЧЕТ СОБСТВЕННИКУ",
+        f"Дата: {report_date.strftime('%d.%m.%Y')}",
+        "",
+        "1. Главный вывод дня",
+        summary or "Недостаточно данных для главного вывода.",
+        "",
+        "2. Что сдвинулось",
+        dynamics or "Недостаточно данных по сдвигам за день.",
+        "",
+        "3. Что зависло и требует вопроса",
+        "| Тема | Ответственный | Что не ясно | Сколько висит / просрочено | Источник | Вопрос |",
+        "| --- | --- | --- | --- | --- | --- |",
+        "| См. открытые задачи | Ответственные из источников | Нужны владелец, срок или статус | См. источники | Bitrix/чаты/Zoom | Подтвердить статус и следующий шаг |" if not open_tasks else "\n".join(
+            f"| {str(item).replace('|', '/')} |  |  |  |  |  |" for item in open_tasks
+        ),
+        "",
+        "4. Просроченные и без срока",
+        "| Задача | Ответственный | Дедлайн | Статус | Что сделать |",
+        "| --- | --- | --- | --- | --- |",
+        "| Просроченных/бессрочных задач не выделено |  |  |  |  |" if not overdue_tasks else "\n".join(
+            f"| {str(item).replace('|', '/')} |  |  |  |  |" for item in overdue_tasks
+        ),
+        "",
+        "5. Zoom и чаты: устные задачи, которые надо зафиксировать",
+        oral_tasks,
+        "",
+        "6. Адресные вопросы и рекомендации для Bitrix",
+        "\n".join(address_lines).strip(),
+        "",
+        "7. Что проверить завтра",
+        tomorrow,
+    ]
+    return "\n".join(str(line) for line in sections).strip()
+
+
+OWNER_DAILY_REQUIRED_HEADINGS = [
+    "ЕЖЕДНЕВНЫЙ ОТЧЕТ СОБСТВЕННИКУ",
+    "1. Главный вывод дня",
+    "2. Что сдвинулось",
+    "3. Что зависло и требует вопроса",
+    "4. Просроченные и без срока",
+    "5. Zoom и чаты: устные задачи, которые надо зафиксировать",
+    "6. Адресные вопросы и рекомендации для Bitrix",
+    "7. Что проверить завтра",
+]
+
+
+def owner_daily_report_text_has_required_structure(text: Any) -> bool:
+    value = str(text or "")
+    if not value.strip():
+        return False
+    positions: list[int] = []
+    for heading in OWNER_DAILY_REQUIRED_HEADINGS:
+        pos = value.find(heading)
+        if pos < 0:
+            return False
+        positions.append(pos)
+    if positions != sorted(positions):
+        return False
+    if re.search(r"(?m)^8\.\s|^9\.\s|^10\.\s|^Источник\s*:", value):
+        return False
+    forbidden_patterns = [
+        r"get_period_index",
+        r"search_tasks",
+        r"\bMCP\b",
+        r"коннектор",
+        r"пайплайн",
+        r"найдено:\s*\d+",
+        r"\d+\s+активн\w*\s+чат",
+        r"управленческая оценка дня",
+        r"главное за день",
+        r"риски и отклонения",
+    ]
+    lowered = value.lower()
+    for pattern in forbidden_patterns:
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            return False
+    return True
+
+
+def _append_owner_daily_address_section_if_missing(text: str, parsed: dict[str, Any]) -> str:
+    if "6. Адресные вопросы и рекомендации для Bitrix" in text:
+        return text
+    messages = parsed.get("manager_messages") if isinstance(parsed.get("manager_messages"), list) else []
+    lines = ["6. Адресные вопросы и рекомендации для Bitrix"]
+    if messages:
+        grouped: dict[str, list[str]] = {}
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            name = str(message.get("manager_name") or "Адресат не указан").strip()
+            body = str(message.get("message_text") or "").strip()
+            if body:
+                grouped.setdefault(name, []).append(body)
+        for name, items in grouped.items():
+            lines.append(name)
+            for idx, body in enumerate(items, start=1):
+                lines.append(f"{idx}. {body}")
+    else:
+        lines.append("Адресных рекомендаций нет: по входным данным нет просрочек, хвостов, вопросов без ответа и устных задач без фиксации.")
+    insert = "\n\n".join([line for line in lines if line.strip()])
+    marker = "\n7. Что проверить завтра"
+    if marker in text:
+        return text.replace(marker, "\n\n" + insert + marker, 1)
+    return text.rstrip() + "\n\n" + insert
+
+
+def sanitize_owner_daily_report_text(text: Any, parsed: dict[str, Any], report_date: date) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return _build_owner_daily_report_text(parsed, report_date)
+    lines = [
+        line
+        for line in value.splitlines()
+        if not re.match(r"^\s*Источник\s*:", line, flags=re.IGNORECASE)
+    ]
+    value = "\n".join(lines).strip()
+    extra_match = re.search(r"(?m)^8\.\s", value)
+    if extra_match:
+        value = value[:extra_match.start()].rstrip()
+    value = _append_owner_daily_address_section_if_missing(value, parsed)
+    value = _replace_owner_daily_address_section(value, parsed.get("manager_messages") if isinstance(parsed.get("manager_messages"), list) else [])
+    if owner_daily_report_text_has_required_structure(value):
+        return value
+    return _build_owner_daily_report_text(parsed, report_date)
+
+
+def _owner_daily_source_label(candidate: dict[str, Any]) -> str:
+    source_type = str(candidate.get("source_type") or "")
+    source_ref = str(candidate.get("source_ref") or "")
+    if source_type.startswith("chat"):
+        return f"отчет по чату {source_ref.removeprefix('chat:')}".strip()
+    if source_type.startswith("zoom"):
+        return f"Zoom {source_ref.removeprefix('zoom:')}".strip()
+    if source_type.startswith("bitrix"):
+        return source_ref.replace("bitrix:", "Bitrix ").strip()
+    return source_ref or source_type or "источник"
+
+
+def _owner_daily_candidate_manager(candidate: dict[str, Any]) -> dict[str, Any] | None:
+    fact = str(candidate.get("fact") or "").strip().lower()
+    fact_for_owner = re.sub(r"^\[[^\]]+\]\s*", "", fact).strip()
+    mentions = candidate.get("mentioned_people")
+    if isinstance(mentions, list):
+        for item in mentions:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("manager_name") or "").strip()
+            parts = [part.strip().lower() for part in name.split() if len(part.strip()) >= 3]
+            if not parts:
+                continue
+            first = parts[0]
+            last = parts[-1]
+            if (
+                fact_for_owner.startswith(first)
+                or fact_for_owner.startswith(last)
+                or fact_for_owner.startswith(f"{first} {last}")
+                or fact_for_owner.startswith(f"{last} {first}")
+            ):
+                return item
+        for item in mentions:
+            if isinstance(item, dict) and str(item.get("manager_name") or "").strip():
+                return item
+    visible = candidate.get("visible_people")
+    if isinstance(visible, list):
+        for name in visible:
+            text = str(name or "").strip()
+            if text:
+                return {"manager_name": text, "manager_bitrix_user_id": None}
+    return None
+
+
+def _owner_team_name_index(team: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    index: list[dict[str, Any]] = []
+    for member in team or []:
+        if not isinstance(member, dict):
+            continue
+        bitrix_id = to_int(member.get("user_id") or member.get("manager_bitrix_user_id"))
+        name = str(member.get("name") or member.get("manager_name") or "").strip()
+        if bitrix_id is None or not name:
+            continue
+        parts = [part.strip().lower() for part in name.split() if len(part.strip()) >= 3]
+        index.append({
+            "manager_name": name,
+            "manager_bitrix_user_id": bitrix_id,
+            "department": member.get("department"),
+            "work_position": member.get("work_position"),
+            "parts": parts,
+        })
+    return index
+
+
+def _owner_resolve_manager_from_team(name: Any, text: Any, team_index: list[dict[str, Any]]) -> dict[str, Any] | None:
+    raw_name = str(name or "").strip()
+    raw_text = str(text or "").strip().lower()
+    name_l = raw_name.lower()
+    if not raw_name:
+        return None
+    blocked = {
+        "координатор",
+        "адресат не указан",
+        "руководитель не указан",
+        "ответственный не указан",
+        "требуется назначение",
+    }
+    if name_l in blocked:
+        raw_name = ""
+        name_l = ""
+    for member in team_index:
+        member_name = str(member.get("manager_name") or "")
+        member_l = member_name.lower()
+        parts = member.get("parts") if isinstance(member.get("parts"), list) else []
+        first = parts[0] if parts else ""
+        last = parts[-1] if parts else ""
+        first_stem = first[:4] if len(first) >= 4 else first
+        last_stem = last[:6] if len(last) >= 6 else last
+        raw_tokens = [part for part in re.findall(r"[а-яёa-z]{3,}", name_l, flags=re.IGNORECASE)]
+        raw_tokens_match = bool(raw_tokens) and all(token in member_l for token in raw_tokens)
+        if (
+            raw_name
+            and (
+                name_l == member_l
+                or name_l in member_l
+                or member_l in name_l
+                or raw_tokens_match
+                or (first and first in name_l and last and last in name_l)
+                or (first_stem and last_stem and first_stem in name_l and last_stem in name_l)
+            )
+        ):
+            return member
+    for member in team_index:
+        parts = member.get("parts") if isinstance(member.get("parts"), list) else []
+        if not parts:
+            continue
+        first = parts[0]
+        last = parts[-1]
+        first_stem = first[:4] if len(first) >= 4 else first
+        last_stem = last[:6] if len(last) >= 6 else last
+        full = " ".join(parts)
+        parts_hit_count = sum(1 for part in parts if part in raw_text)
+        if full in raw_text or parts_hit_count >= min(2, len(parts)) or (first_stem and last_stem and first_stem in raw_text and last_stem in raw_text):
+            return member
+    return None
+
+
+def _normalize_owner_daily_manager_messages(messages: Any, team: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(messages, list):
+        return []
+    team_index = _owner_team_name_index(team)
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        text = str(message.get("message_text") or "").strip()
+        if not text:
+            continue
+        source_facts = message.get("source_facts") if isinstance(message.get("source_facts"), list) else []
+        source_blob = " ".join(
+            str(item.get("fact") or item.get("source") or "")
+            for item in source_facts
+            if isinstance(item, dict)
+        )
+        manager = _owner_resolve_manager_from_team(
+            message.get("manager_name"),
+            " ".join([text, str(message.get("subject") or ""), source_blob]),
+            team_index,
+        )
+        if not manager:
+            continue
+        bitrix_id = to_int(manager.get("manager_bitrix_user_id"))
+        if bitrix_id is None:
+            continue
+        subject = str(message.get("subject") or "").strip()[:500]
+        key = (bitrix_id, re.sub(r"\s+", " ", text.lower())[:220])
+        if key in seen:
+            continue
+        seen.add(key)
+        item = dict(message)
+        item["manager_name"] = manager.get("manager_name")
+        item["manager_bitrix_user_id"] = bitrix_id
+        if not subject:
+            topics = item.get("topics") if isinstance(item.get("topics"), list) else []
+            subject = ", ".join(str(topic).strip() for topic in topics if str(topic or "").strip())[:500]
+        item["subject"] = subject or None
+        normalized.append(item)
+    return normalized
+
+
+def _owner_daily_message_from_candidate(candidate: dict[str, Any]) -> dict[str, Any] | None:
+    manager = _owner_daily_candidate_manager(candidate)
+    if not manager:
+        return None
+    fact = re.sub(r"\s+", " ", str(candidate.get("fact") or "").strip())
+    if not fact:
+        return None
+    subject = str(candidate.get("subject") or "").strip() or fact[:120]
+    source_label = _owner_daily_source_label(candidate)
+    priority = str(candidate.get("priority") or "medium").strip().lower()
+    if priority not in {"low", "medium", "high", "critical"}:
+        priority = "medium"
+    if len(fact) > 420:
+        fact = fact[:417].rstrip() + "..."
+    message_type = "status_request"
+    if re.search(r"(без ответа|когда|кто отвечает|ответствен|срок)", fact, re.IGNORECASE):
+        message_type = "question"
+    elif re.search(r"(зафикс|bitrix|битрикс|zoom)", fact, re.IGNORECASE):
+        message_type = "deadline_request"
+    message_text = (
+        f"Вижу хвост из {source_label}: «{fact}». "
+        "Подскажи, пожалуйста, какой сейчас статус, кто владелец и какой срок или следующий шаг нужно зафиксировать в Bitrix?"
+    )
+    return {
+        "manager_name": str(manager.get("manager_name") or "").strip(),
+        "manager_bitrix_user_id": manager.get("manager_bitrix_user_id"),
+        "priority": priority,
+        "message_type": message_type,
+        "subject": subject[:500],
+        "message_text": message_text,
+        "due": None,
+        "topics": [subject[:200]],
+        "source_facts": [{
+            "source": source_label,
+            "source_type": candidate.get("source_type"),
+            "source_ref": candidate.get("source_ref"),
+            "fact": fact,
+        }],
+    }
+
+
+def _owner_daily_report_contains_candidate(report_text: Any, messages: list[Any], candidate: dict[str, Any]) -> bool:
+    haystack = str(report_text or "")
+    for message in messages:
+        if isinstance(message, dict):
+            haystack += "\n" + str(message.get("manager_name") or "")
+            haystack += "\n" + str(message.get("subject") or "")
+            haystack += "\n" + str(message.get("message_text") or "")
+    haystack = haystack.lower()
+    fact = re.sub(r"\s+", " ", str(candidate.get("fact") or "").strip()).lower()
+    subject = str(candidate.get("subject") or "").strip().lower()
+    generic_subjects = {
+        "хвосты с прошлого дня",
+        "вопросы без ответа",
+        "chat_daily_report_text",
+        "zoom transcript",
+    }
+    if subject and subject not in generic_subjects and len(subject) >= 12 and subject in haystack:
+        return True
+    compact_fact = fact[:160].strip()
+    if len(compact_fact) >= 40 and compact_fact in haystack:
+        return True
+    meaningful = [
+        token
+        for token in re.findall(r"[а-яёa-z0-9]{5,}", fact, flags=re.IGNORECASE)
+        if token not in {
+            "новых", "данных", "задача", "задачи", "вопрос", "отчетов", "bitrix", "zoom",
+            "тишина", "перешел", "предыдущих", "отчетов", "подскажи", "пожалуйста",
+            "статус", "владелец", "какой", "нужно", "зафиксировать",
+        }
+    ]
+    if meaningful:
+        hits = sum(1 for token in meaningful[:12] if token in haystack)
+        return hits >= min(5, len(meaningful))
+    return False
+
+
+def _replace_owner_daily_address_section(report_text: str, messages: list[dict[str, Any]]) -> str:
+    if "6. Адресные вопросы и рекомендации для Bitrix" not in report_text or "7. Что проверить завтра" not in report_text:
+        return report_text
+    grouped: dict[str, list[str]] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        name = str(message.get("manager_name") or "").strip()
+        body = str(message.get("message_text") or "").strip()
+        if name and body:
+            grouped.setdefault(name, []).append(body)
+    lines = ["6. Адресные вопросы и рекомендации для Bitrix"]
+    if grouped:
+        for name, bodies in grouped.items():
+            lines.append(name)
+            for idx, body in enumerate(bodies, start=1):
+                lines.append(f"{idx}. {body}")
+            lines.append("")
+    else:
+        lines.append("Адресных рекомендаций нет: по входным данным нет просрочек, хвостов, вопросов без ответа и устных задач без фиксации.")
+    section = "\n".join(lines).rstrip()
+    return re.sub(
+        r"6\. Адресные вопросы и рекомендации для Bitrix[\s\S]*?(?=\n7\. Что проверить завтра)",
+        section + "\n",
+        report_text,
+        count=1,
+    )
+
+
+def ensure_owner_daily_addressable_messages(parsed: dict[str, Any], input_payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(parsed, dict):
+        return parsed
+    team = input_payload.get("team") if isinstance(input_payload, dict) and isinstance(input_payload.get("team"), list) else []
+    parsed["manager_messages"] = _normalize_owner_daily_manager_messages(parsed.get("manager_messages"), team)
+    parsed["report_text"] = _replace_owner_daily_address_section(str(parsed.get("report_text") or ""), parsed["manager_messages"])
+    return parsed
+
+
+def repair_owner_daily_report_with_llm(
+    api_key: str,
+    model: str,
+    parsed: dict[str, Any],
+    input_payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
+    report_date = safe_parse_date(input_payload.get("report_date")) or date.today()
+    repair_prompt = (
+        OWNER_DAILY_STRICT_FORMAT_CONTRACT.strip()
+        + "\n\nПерепиши JSON ежедневного owner-отчета в правильный формат. "
+        "Сохрани факты, Bitrix-id, Zoom call_id, имена, сроки и адресные сообщения. "
+        "Не добавляй новые факты. Удали технические упоминания инструментов, количества найденных источников и служебные разделы. "
+        "Обязательно сверь пункт 6 и manager_messages с addressable_context: адресаты из Zoom/чатов не должны пропасть. "
+        "Перепиши адресные сообщения живым языком: с названием задачи/предметом, контекстом и просьбой назвать статус/срок/блокер/владельца. "
+        "Запрещены сухие строки вида 'Принять 317889, 318105' без названий задач и контекста. "
+        "Верни только валидный JSON с теми же верхними полями: summary, dynamics_summary, risks_summary, recommendations, "
+        "manager_recommendations, manager_messages, open_tasks, overdue_tasks, no_response, goal_dynamics, report_text.\n\n"
+        "Исходный JSON:\n"
+        + json.dumps(parsed, ensure_ascii=False, default=str)
+        + "\n\naddressable_context:\n"
+        + json.dumps(input_payload.get("addressable_context") or [], ensure_ascii=False, default=str)
+        + "\n\nДата отчета: "
+        + report_date.isoformat()
+    )
+    raw: dict[str, Any] | None = None
+    try:
+        response = llm_post_with_retry(
+            llm_api_url("/chat/completions"),
+            llm_auth_headers(api_key),
+            {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "Ты редактор управленческого owner-отчета. Возвращай только валидный JSON."},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        raw = response.json()
+        content = response_output_text(raw).strip()
+        repaired = extract_json_object(content)
+        if not isinstance(repaired, dict) or not repaired:
+            return parsed, raw, content
+        repaired_result = dict(parsed)
+        for key in [
+            "summary",
+            "dynamics_summary",
+            "risks_summary",
+            "report_text",
+        ]:
+            if str(repaired.get(key) or "").strip():
+                repaired_result[key] = str(repaired.get(key) or "").strip()
+        for key in [
+            "recommendations",
+            "manager_recommendations",
+            "manager_messages",
+            "open_tasks",
+            "overdue_tasks",
+            "no_response",
+            "goal_dynamics",
+        ]:
+            if isinstance(repaired.get(key), list):
+                repaired_result[key] = repaired.get(key)
+        repaired_result["report_text"] = sanitize_owner_daily_report_text(repaired_result.get("report_text"), repaired_result, report_date)
+        return repaired_result, raw, content
+    except Exception:
+        return parsed, raw, None
+
+
+def _build_owner_weekly_report_text(parsed: dict[str, Any], period_start: date, period_end: date) -> str:
+    prev_start, prev_end = previous_week_bounds_for_report(period_start)
+    sections = [
+        "ЕЖЕНЕДЕЛЬНАЯ УПРАВЛЕНЧЕСКАЯ ЗАПИСКА",
+        f"Bitrix24 · период {format_date_ru(period_start)} - {format_date_ru(period_end)} · динамика к {format_date_ru(prev_start)} - {format_date_ru(prev_end)}",
+        "",
+        "1. Главный вывод собственнику",
+        str(parsed.get("summary") or parsed.get("dynamics_summary") or "Данных для управленческого вывода недостаточно.").strip(),
+    ]
+    metrics = _format_owner_table(
+        "",
+        ["Показатель", "Пред. неделя", "Эта неделя", "Вывод"],
+        parsed.get("headline_metrics"),
+        ["metric", "previous", "current", "conclusion"],
+    )
+    if metrics:
+        sections.extend(["", metrics])
+    else:
+        dynamics = _format_owner_weekly_dynamics(parsed.get("weekly_dynamics")) or str(parsed.get("dynamics_summary") or "").strip()
+        if dynamics:
+            sections.extend(["", dynamics])
+    red_zone = _format_owner_table(
+        "2. Красная зона недели",
+        ["Зона риска", "Факт", "Управленческий вывод", "Решение"],
+        parsed.get("red_zone"),
+        ["risk_zone", "fact", "management_conclusion", "decision"],
+    )
+    if red_zone:
+        sections.extend(["", red_zone])
+    regulation_deviations = _format_owner_table(
+        "3. Отклонения от регламентов",
+        ["Регламент", "Что должно быть", "Что было по факту", "Отклонение", "Что сделать"],
+        parsed.get("regulation_deviations"),
+        ["regulation", "expected", "actual", "deviation", "action"],
+    )
+    if regulation_deviations:
+        sections.extend(["", regulation_deviations])
+    executor_rows = parsed.get("executor_load")
+    executor_intro = ""
+    if isinstance(executor_rows, list) and executor_rows:
+        rates = []
+        for item in executor_rows:
+            if not isinstance(item, dict):
+                continue
+            raw = str(item.get("completion_rate") or "").replace("%", "").replace(",", ".").strip()
+            try:
+                rates.append(float(raw))
+            except Exception:
+                pass
+        if rates:
+            below = sum(1 for rate in rates if rate < 50)
+            executor_intro = f"Разброс закрытия: {min(rates):.0f}% - {max(rates):.0f}%; ниже 50% — {below} исполнителей."
+    executors = _format_owner_table(
+        "4. Исполнители: видимая загрузка и результат",
+        ["Исполнитель", "Всего", "Зав.", "В раб.", "Ктрл.", "%", "Вывод"],
+        executor_rows,
+        ["person", "total", "done", "in_progress", "control", "completion_rate", "conclusion"],
+    )
+    if executors:
+        sections.extend(["", "4. Исполнители: видимая загрузка и результат"])
+        if executor_intro:
+            sections.append(executor_intro)
+        sections.append("Исполнитель | Всего | Зав. | В раб. | Ктрл. | % | Вывод")
+        for item in executor_rows:
+            if isinstance(item, dict):
+                sections.append(" | ".join(str(item.get(key) if item.get(key) is not None else "").strip() for key in ["person", "total", "done", "in_progress", "control", "completion_rate", "conclusion"]))
+    invisible = _format_owner_table(
+        "5. Подчиненные без задач или с низкой видимостью в Bitrix24",
+        ["Сотрудник", "Состояние в Bitrix24", "Почему это плохо", "Что требуется"],
+        parsed.get("invisible_employees"),
+        ["person", "bitrix_state", "why_bad", "required_action"],
+    )
+    if invisible:
+        sections.extend(["", invisible])
+    groups = _format_owner_table(
+        "6. Подчиненные: ключевые управленческие выводы",
+        ["Группа", "Сотрудники", "Что видно", "Что сделать руководителю"],
+        parsed.get("management_groups"),
+        ["group", "people", "signal", "manager_action"],
+    )
+    if groups:
+        sections.extend(["", groups])
+    departments = _format_owner_table(
+        "7. Отделы: где просадка сильнее всего",
+        ["Отдел / блок", "Всего", "Эта неделя", "Пред. неделя", "Дельта", "Комментарий"],
+        parsed.get("department_dynamics"),
+        ["department", "total", "current_rate", "previous_rate", "delta", "comment"],
+    )
+    if departments:
+        sections.extend(["", departments])
+    positives = _format_owner_block("8. Что улучшилось", parsed.get("positive_signals"))
+    if positives:
+        sections.extend(["", positives])
+    decisions = _format_owner_table(
+        "9. Решения собственника на ближайшие 3 рабочих дня",
+        ["№", "Решение", "Ответственные", "Контроль"],
+        [
+            {
+                "num": idx,
+                "decision": item.get("decision"),
+                "responsible": item.get("responsible"),
+                "control_date": item.get("control_date"),
+            }
+            for idx, item in enumerate(parsed.get("owner_decisions_next") or [], start=1)
+            if isinstance(item, dict)
+        ],
+        ["num", "decision", "responsible", "control_date"],
+    )
+    if decisions:
+        sections.extend(["", decisions])
+    questions = _format_owner_table(
+        "10. Адресные вопросы к оперативке",
+        ["Кому", "Вопрос"],
+        parsed.get("operational_questions"),
+        ["to", "question"],
+    )
+    if questions:
+        sections.extend(["", questions])
+    changes = _format_owner_numbered("11. Системные изменения на май", parsed.get("system_changes"))
+    if changes:
+        sections.extend(["", changes])
+    risks = str(parsed.get("risks_summary") or "").strip()
+    if risks:
+        sections.extend(["", f"Резюме: {risks}"])
+    messages = _format_owner_manager_messages_summary(parsed.get("manager_messages"))
+    if messages:
+        sections.extend(["", messages])
+    return "\n".join(line for line in sections if line is not None).strip()
+
+
+def _ai_owner_report(prompt_category: str, fallback_prompt: str, input_payload: dict[str, Any], request_type: str) -> tuple[dict[str, Any], Any, Any, str]:
+    api_key = llm_api_key()
+    model = llm_model_for_request(request_type)
+    base = {
+        "summary": "Недостаточно данных для автоматического отчета.",
+        "dynamics_summary": "Динамика не рассчитана.",
+        "risks_summary": "Риски не выделены.",
+        "recommendations": ["Проверить полноту входных данных и повторить формирование отчета."],
+        "manager_recommendations": [],
+        "open_tasks": [],
+        "overdue_tasks": [],
+        "no_response": [],
+        "goal_dynamics": [],
+        "week_vs_previous": {"better": [], "worse": [], "stuck": []},
+        "weekly_dynamics": {},
+        "anomalies": [],
+        "owner_decisions": [],
+        "concentration": [],
+        "people_patterns": [],
+        "manager_messages": [],
+        "headline_metrics": [],
+        "red_zone": [],
+        "regulation_deviations": [],
+        "executor_load": [],
+        "invisible_employees": [],
+        "management_groups": [],
+        "department_dynamics": [],
+        "positive_signals": [],
+        "owner_decisions_next": [],
+        "operational_questions": [],
+        "system_changes": [],
+        "top_performers": [],
+        "weak_performers": [],
+        "hanging_tasks_by_owner": [],
+        "hanging_goals": [],
+        "overdue_bitrix": [],
+        "report_text": "Недостаточно данных для автоматического отчета.",
+    }
+    if not api_key:
+        return base, None, None, "local-owner-fallback"
+    prompt_id = None
+    prompt_text = fallback_prompt
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            prompt_id, configured_prompt = pg_active_prompt(cur, prompt_category, fallback_prompt)
+            prompt_text = configured_prompt or fallback_prompt
+    effective_prompt_text = prompt_text
+    if request_type == "owner_daily_report":
+        effective_prompt_text = prompt_text.rstrip() + OWNER_DAILY_STRICT_FORMAT_CONTRACT
+    full_prompt = (
+        effective_prompt_text.strip()
+        + "\n\nВходные данные:\n"
+        + json.dumps(input_payload, ensure_ascii=False, default=str)
+    )
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                started_at = datetime.now(MSK_TZ)
+                ai_request_id = pg_insert_ai_request(
+                    cur,
+                    request_type=request_type,
+                    prompt_id=prompt_id,
+                    prompt_text=effective_prompt_text,
+                    provider=llm_provider_name(),
+                    model=model,
+                    input_payload=input_payload,
+                    started_at=started_at,
+                )
+                try:
+                    response = llm_post_with_retry(
+                        llm_api_url("/chat/completions"),
+                        llm_auth_headers(api_key),
+                        {
+                            "model": model,
+                            "messages": [
+                                {"role": "system", "content": "Ты пишешь управленческие отчеты для собственника. Возвращай только валидный JSON по запрошенной схеме."},
+                                {"role": "user", "content": full_prompt},
+                            ],
+                            "temperature": 0.1,
+                            "response_format": {"type": "json_object"},
+                        },
+                        timeout=90,
+                    )
+                    response.raise_for_status()
+                    raw = response.json()
+                    content = response_output_text(raw).strip()
+                    repair_raw: dict[str, Any] | None = None
+                    repair_content: str | None = None
+                    try:
+                        parsed = extract_json_object(content)
+                    except Exception:
+                        parsed = {}
+                    if isinstance(parsed, dict) and parsed:
+                        manager_recs = parsed.get("manager_recommendations")
+                        if not isinstance(manager_recs, list):
+                            manager_recs = []
+                        result = {
+                            "summary": str(parsed.get("summary") or base["summary"]),
+                            "dynamics_summary": str(parsed.get("dynamics_summary") or base["dynamics_summary"]),
+                            "risks_summary": str(parsed.get("risks_summary") or base["risks_summary"]),
+                            "recommendations": parsed.get("recommendations") if isinstance(parsed.get("recommendations"), list) else base["recommendations"],
+                            "manager_recommendations": manager_recs,
+                            "open_tasks": parsed.get("open_tasks") if isinstance(parsed.get("open_tasks"), list) else [],
+                            "overdue_tasks": parsed.get("overdue_tasks") if isinstance(parsed.get("overdue_tasks"), list) else [],
+                            "no_response": parsed.get("no_response") if isinstance(parsed.get("no_response"), list) else [],
+                            "goal_dynamics": parsed.get("goal_dynamics") if isinstance(parsed.get("goal_dynamics"), list) else [],
+                            "week_vs_previous": parsed.get("week_vs_previous") if isinstance(parsed.get("week_vs_previous"), dict) else base["week_vs_previous"],
+                            "weekly_dynamics": parsed.get("weekly_dynamics") if isinstance(parsed.get("weekly_dynamics"), dict) else base["weekly_dynamics"],
+                            "anomalies": parsed.get("anomalies") if isinstance(parsed.get("anomalies"), list) else [],
+                            "owner_decisions": parsed.get("owner_decisions") if isinstance(parsed.get("owner_decisions"), list) else [],
+                            "concentration": parsed.get("concentration") if isinstance(parsed.get("concentration"), list) else [],
+                            "people_patterns": parsed.get("people_patterns") if isinstance(parsed.get("people_patterns"), list) else [],
+                            "manager_messages": parsed.get("manager_messages") if isinstance(parsed.get("manager_messages"), list) else [],
+                            "headline_metrics": parsed.get("headline_metrics") if isinstance(parsed.get("headline_metrics"), list) else [],
+                            "red_zone": parsed.get("red_zone") if isinstance(parsed.get("red_zone"), list) else [],
+                            "regulation_deviations": parsed.get("regulation_deviations") if isinstance(parsed.get("regulation_deviations"), list) else [],
+                            "executor_load": parsed.get("executor_load") if isinstance(parsed.get("executor_load"), list) else [],
+                            "invisible_employees": parsed.get("invisible_employees") if isinstance(parsed.get("invisible_employees"), list) else [],
+                            "management_groups": parsed.get("management_groups") if isinstance(parsed.get("management_groups"), list) else [],
+                            "department_dynamics": parsed.get("department_dynamics") if isinstance(parsed.get("department_dynamics"), list) else [],
+                            "positive_signals": parsed.get("positive_signals") if isinstance(parsed.get("positive_signals"), list) else [],
+                            "owner_decisions_next": parsed.get("owner_decisions_next") if isinstance(parsed.get("owner_decisions_next"), list) else [],
+                            "operational_questions": parsed.get("operational_questions") if isinstance(parsed.get("operational_questions"), list) else [],
+                            "system_changes": parsed.get("system_changes") if isinstance(parsed.get("system_changes"), list) else [],
+                            "top_performers": parsed.get("top_performers") if isinstance(parsed.get("top_performers"), list) else [],
+                            "weak_performers": parsed.get("weak_performers") if isinstance(parsed.get("weak_performers"), list) else [],
+                            "hanging_tasks_by_owner": parsed.get("hanging_tasks_by_owner") if isinstance(parsed.get("hanging_tasks_by_owner"), list) else [],
+                            "hanging_goals": parsed.get("hanging_goals") if isinstance(parsed.get("hanging_goals"), list) else [],
+                            "overdue_bitrix": parsed.get("overdue_bitrix") if isinstance(parsed.get("overdue_bitrix"), list) else [],
+                            "report_text": str(parsed.get("report_text") or "").strip(),
+                        }
+                        if not result["report_text"]:
+                            if request_type == "owner_weekly_report":
+                                ps = input_payload.get("period_start")
+                                pe = input_payload.get("period_end")
+                                ps_d = safe_parse_date(ps) or date.today()
+                                pe_d = safe_parse_date(pe) or ps_d
+                                result["report_text"] = _build_owner_weekly_report_text(result, ps_d, pe_d)
+                            else:
+                                d = safe_parse_date(input_payload.get("report_date")) or date.today()
+                                result["report_text"] = _build_owner_daily_report_text(result, d)
+                        elif request_type == "owner_daily_report":
+                            d = safe_parse_date(input_payload.get("report_date")) or date.today()
+                            if not owner_daily_report_text_has_required_structure(result["report_text"]):
+                                result, repair_raw, repair_content = repair_owner_daily_report_with_llm(api_key, model, result, input_payload)
+                            result = ensure_owner_daily_addressable_messages(result, input_payload)
+                            result["report_text"] = sanitize_owner_daily_report_text(result["report_text"], result, d)
+                            result["report_text_repaired"] = bool(repair_raw)
+                    else:
+                        plain = (content or "").strip()
+                        result = dict(base)
+                        result["summary"] = plain[:1200] if plain else base["summary"]
+                        result["report_text"] = plain or base["report_text"]
+                    pg_finish_ai_request(
+                        cur,
+                        ai_request_id,
+                        "success",
+                        started_at,
+                        response_text=content,
+                        response_json=result,
+                        raw_response_json={**raw, "repair_response": repair_raw, "repair_content": repair_content} if repair_raw else raw,
+                    )
+                    return result, ai_request_id, prompt_id, model
+                except Exception as exc:  # noqa: BLE001
+                    pg_finish_ai_request(cur, ai_request_id, "error", started_at, error_text=str(exc))
+                    return base, ai_request_id, prompt_id, "local-owner-fallback"
+
+
+def _compact_team_for_owner_prompt(team: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for member in team or []:
+        if not member:
+            continue
+        if not (member.get("active") or member.get("manager_name") or member.get("name")):
+            continue
+        compact.append({
+            "user_id": member.get("user_id"),
+            "name": member.get("name"),
+            "work_position": member.get("work_position"),
+            "manager_id": member.get("manager_id"),
+            "manager_name": member.get("manager_name"),
+            "department": member.get("departments_text"),
+            "is_active": bool(member.get("active")),
+        })
+    return compact
+
+
+def _compact_chat_daily_for_owner_prompt(report_date: date) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id AS report_id, c.dialog_id, c.chat_title,
+                       r.summary, r.messages_count,
+                       r.extracted_goals_count, r.extracted_tasks_count, r.extracted_facts_count,
+                       r.raw_ai_json
+                FROM chat_daily_reports r
+                JOIN chats c ON c.id = r.chat_id
+                WHERE r.report_date = %s
+                  AND r.is_current = TRUE
+                  AND c.is_excluded = FALSE
+                ORDER BY c.chat_title NULLS LAST, c.dialog_id
+                """,
+                (report_date,),
+            )
+            rows = cur.fetchall()
+            report_ids = [row["report_id"] for row in rows]
+            items_by_report: dict[Any, list[dict[str, Any]]] = {rid: [] for rid in report_ids}
+            if report_ids:
+                cur.execute(
+                    """
+                    SELECT i.chat_daily_report_id, i.item_type, i.item_text, i.confidence,
+                           u.full_name AS user_name, i.evidence_message_ids
+                    FROM chat_report_items i
+                    LEFT JOIN users u ON u.id = i.user_id
+                    WHERE i.chat_daily_report_id = ANY(%s)
+                    ORDER BY i.created_at
+                    """,
+                    (report_ids,),
+                )
+                for ir in cur.fetchall():
+                    items_by_report.setdefault(ir["chat_daily_report_id"], []).append({
+                        "type": ir["item_type"],
+                        "text": ir["item_text"],
+                        "user": ir["user_name"],
+                        "confidence": float(ir["confidence"]) if ir["confidence"] is not None else None,
+                    })
+    compact: list[dict[str, Any]] = []
+    for row in rows:
+        raw = row["raw_ai_json"] if isinstance(row["raw_ai_json"], dict) else {}
+        analysis = raw.get("analysis") if isinstance(raw, dict) else None
+        report_text = str(raw.get("report_text") or row["summary"] or "").strip() if isinstance(raw, dict) else str(row["summary"] or "").strip()
+        transcript_excerpt = ""
+        messages_excerpt: list[dict[str, Any]] = []
+        try:
+            chat_day = load_chat_day(row["dialog_id"], report_date)
+            transcript_excerpt = str(chat_day.get("transcript") or "").strip()
+            for message in (chat_day.get("messages") or [])[:120]:
+                if not isinstance(message, dict):
+                    continue
+                text = str(message.get("text") or "").strip()
+                files = message.get("files") if isinstance(message.get("files"), list) else []
+                ocr_texts = [
+                    str(file_item.get("ocr_text") or "").strip()
+                    for file_item in files
+                    if isinstance(file_item, dict) and str(file_item.get("ocr_text") or "").strip()
+                ]
+                if not text and not ocr_texts:
+                    continue
+                messages_excerpt.append({
+                    "time": message.get("message_date_text") or message.get("message_date"),
+                    "author": message.get("author_name"),
+                    "text": text[:1200],
+                    "ocr": "\n".join(ocr_texts)[:2000],
+                })
+        except Exception:
+            transcript_excerpt = ""
+        compact.append({
+            "dialog_id": row["dialog_id"],
+            "chat_title": row["chat_title"],
+            "summary": row["summary"],
+            "messages_count": row["messages_count"],
+            "extracted_goals_count": row["extracted_goals_count"],
+            "extracted_tasks_count": row["extracted_tasks_count"],
+            "extracted_facts_count": row["extracted_facts_count"],
+            "items": items_by_report.get(row["report_id"], []),
+            "analysis_compact": analysis if isinstance(analysis, dict) else None,
+            "report_text_excerpt": report_text[:30000],
+            "transcript_excerpt": transcript_excerpt[:30000],
+            "messages_excerpt": messages_excerpt,
+        })
+    return compact
+
+
+def _compact_goal_events_for_day(report_date: date) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT e.report_date, e.status_before, e.status_after, e.progress_text,
+                       e.progress_percent, e.risk_level, e.confidence,
+                       g.goal_title, g.goal_level, u.full_name AS owner_name, c.chat_title
+                FROM goal_progress_events e
+                JOIN user_goals g ON g.id = e.goal_id
+                LEFT JOIN users u ON u.id = g.user_id
+                LEFT JOIN chats c ON c.id = e.chat_id
+                WHERE e.report_date = %s
+                ORDER BY
+                    CASE e.risk_level WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+                    e.created_at
+                """,
+                (report_date,),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "goal_title": row["goal_title"],
+            "goal_level": row["goal_level"],
+            "owner_name": row["owner_name"],
+            "chat_title": row["chat_title"],
+            "status_before": row["status_before"],
+            "status_after": row["status_after"],
+            "progress_text": row["progress_text"],
+            "progress_percent": float(row["progress_percent"]) if row["progress_percent"] is not None else None,
+            "risk_level": row["risk_level"],
+        }
+        for row in rows
+    ]
+
+
+def _compact_goal_events_for_period(period_start: date, period_end: date) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT e.report_date, e.status_before, e.status_after, e.progress_text,
+                       e.progress_percent, e.risk_level,
+                       g.goal_title, g.goal_level, u.full_name AS owner_name, c.chat_title
+                FROM goal_progress_events e
+                JOIN user_goals g ON g.id = e.goal_id
+                LEFT JOIN users u ON u.id = g.user_id
+                LEFT JOIN chats c ON c.id = e.chat_id
+                WHERE e.report_date BETWEEN %s AND %s
+                ORDER BY e.report_date, e.created_at
+                """,
+                (period_start, period_end),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "report_date": row["report_date"].isoformat() if hasattr(row["report_date"], "isoformat") else str(row["report_date"]),
+            "goal_title": row["goal_title"],
+            "goal_level": row["goal_level"],
+            "owner_name": row["owner_name"],
+            "chat_title": row["chat_title"],
+            "status_before": row["status_before"],
+            "status_after": row["status_after"],
+            "progress_text": row["progress_text"],
+            "progress_percent": float(row["progress_percent"]) if row["progress_percent"] is not None else None,
+            "risk_level": row["risk_level"],
+        }
+        for row in rows
+    ]
+
+
+def _compact_bitrix_registry_for_owner(registry_payload: dict[str, Any]) -> dict[str, Any]:
+    tasks = registry_payload.get("tasks") if isinstance(registry_payload, dict) else None
+    if not isinstance(tasks, list):
+        return {"tasks": [], "stats": registry_payload.get("stats") if isinstance(registry_payload, dict) else None}
+    compact: list[dict[str, Any]] = []
+    for task in tasks:
+        compact.append({
+            "task_id": task.get("task_id") or task.get("id"),
+            "title": task.get("title") or task.get("name"),
+            "status": task.get("status_text") or task.get("status"),
+            "deadline": task.get("deadline_text") or task.get("deadline"),
+            "is_overdue": bool(task.get("is_overdue")),
+            "is_completed": bool(task.get("is_completed")),
+            "responsible_name": task.get("responsible_name") or task.get("responsible"),
+            "responsible_id": task.get("responsible_id"),
+            "creator_name": task.get("creator_name"),
+            "created_date": task.get("created_date_text") or task.get("created_date"),
+            "url": task.get("url"),
+        })
+    return {
+        "tasks": compact[:200],
+        "stats": registry_payload.get("stats"),
+    }
+
+
+def _owner_team_mentions(text: Any, team: list[dict[str, Any]], limit: int = 8) -> list[dict[str, Any]]:
+    value = str(text or "").lower()
+    if not value:
+        return []
+    mentions: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for member in team:
+        bitrix_id = to_int(member.get("user_id"))
+        name = str(member.get("name") or "").strip()
+        if bitrix_id is None or not name or bitrix_id in seen:
+            continue
+        parts = [part.strip().lower() for part in name.split() if len(part.strip()) >= 3]
+        if not parts:
+            continue
+        first = parts[0]
+        last = parts[-1]
+        full = " ".join(parts)
+        first_stem = first[:4] if len(first) >= 4 else first
+        last_stem = last[:6] if len(last) >= 6 else last
+        parts_hit_count = sum(1 for part in parts if part in value)
+        if (
+            full in value
+            or parts_hit_count >= min(2, len(parts))
+            or (first_stem and last_stem and first_stem in value and last_stem in value)
+        ):
+            seen.add(bitrix_id)
+            mentions.append({
+                "manager_name": name,
+                "manager_bitrix_user_id": bitrix_id,
+                "work_position": member.get("work_position"),
+                "department": member.get("department"),
+            })
+            if len(mentions) >= limit:
+                break
+    return mentions
+
+
+def _owner_visible_person_mentions(text: Any, team_mentions: list[dict[str, Any]], limit: int = 10) -> list[str]:
+    value = str(text or "")
+    if not value:
+        return []
+    known = {str(item.get("manager_name") or "").strip().lower() for item in team_mentions}
+    names: list[str] = []
+    patterns = [
+        r"\b[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\b",
+        r"\b(?:Евгений|Артур|Наталья|Сергей|Дмитрий|Анастасия|Оксана|Елизавета|Софья|Денис|Анна|Марианна|Олеся|Бахтиёр)\b",
+    ]
+    blocked = {
+        "чат руководителей",
+        "новых данных",
+        "рабочих встреч",
+        "координатор",
+        "ответственный не",
+    }
+    for pattern in patterns:
+        for match in re.finditer(pattern, value):
+            name = match.group(0).strip()
+            name_lower = name.lower()
+            if (
+                not name
+                or name_lower in known
+                or name in names
+                or name_lower in blocked
+                or name_lower.startswith("чат ")
+            ):
+                continue
+            names.append(name)
+            if len(names) >= limit:
+                return names
+    return names
+
+
+def _owner_address_candidate(
+    source_type: str,
+    source_ref: str,
+    fact: Any,
+    team: list[dict[str, Any]],
+    subject: Any = None,
+    priority: str = "medium",
+    required_action: str = "Проверить статус, владельца, срок и критерий результата.",
+) -> dict[str, Any] | None:
+    fact_text = str(fact or "").strip()
+    if not fact_text:
+        return None
+    mention_source = " ".join([str(subject or ""), fact_text])
+    mentions = _owner_team_mentions(mention_source, team)
+    return {
+        "source_type": source_type,
+        "source_ref": source_ref,
+        "subject": str(subject or "").strip()[:300],
+        "fact": fact_text[:1800],
+        "mentioned_people": mentions,
+        "visible_people": _owner_visible_person_mentions(mention_source, mentions),
+        "priority": priority if priority in {"low", "medium", "high", "critical"} else "medium",
+        "required_action": required_action,
+    }
+
+
+def _iter_owner_analysis_facts(analysis: Any) -> Iterable[tuple[str, str, str]]:
+    if not isinstance(analysis, dict):
+        return []
+    keys = [
+        "commitments",
+        "tasks",
+        "next_steps",
+        "unanswered_questions",
+        "questions",
+        "explicit_risks",
+        "risks",
+        "decisions",
+        "results",
+        "previous_day_tasks",
+        "mentions",
+    ]
+    facts: list[tuple[str, str, str]] = []
+    for key in keys:
+        values = analysis.get(key)
+        if not isinstance(values, list):
+            continue
+        for item in values[:40]:
+            if isinstance(item, dict):
+                text = first_non_empty(
+                    item.get("text"),
+                    item.get("question"),
+                    item.get("risk"),
+                    item.get("decision"),
+                    item.get("reason"),
+                    item.get("expected_result"),
+                )
+                people = " ".join(
+                    str(item.get(field) or "")
+                    for field in [
+                        "person_name",
+                        "addressed_to",
+                        "addressed_to_name",
+                        "asked_by",
+                        "decided_by",
+                        "mentioned_person_name",
+                    ]
+                )
+                subject = first_non_empty(item.get("topic_tag"), item.get("subject"), item.get("workflow_title"), key)
+                fact = " ".join(part for part in [str(people).strip(), str(text or "").strip()] if part)
+                if fact:
+                    facts.append((key, str(subject or key), fact))
+            elif str(item or "").strip():
+                facts.append((key, key, str(item).strip()))
+    return facts
+
+
+def _owner_report_text_action_lines(text: Any) -> list[tuple[str, str]]:
+    value = str(text or "")
+    if not value:
+        return []
+    lines: list[tuple[str, str]] = []
+    current_section = ""
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        section_match = re.match(r"^\d+\.\s+(.+?)[.:]?$", line)
+        if section_match:
+            current_section = section_match.group(1).strip()
+            continue
+        cleaned = re.sub(r"^[-*]\s*", "", line).strip()
+        if len(cleaned) < 25:
+            continue
+        if re.match(r"^\d{2}\.\d{2}\.\d{4},\s+чат\b", cleaned, flags=re.IGNORECASE):
+            continue
+        if not re.search(
+            r"(тишина|вопрос|без ответа|хвост|подтверд|когда|срок|назнач|ответствен|зафикс|задач|документ|переподпис|битрикс|bitrix|zoom|нужно|надо|должен|должна|сделать|проверить)",
+            cleaned,
+            re.IGNORECASE,
+        ):
+            continue
+        lines.append((current_section or "chat_daily_report_text", cleaned[:1800]))
+    return lines[:80]
+
+
+def _build_owner_daily_addressable_context(
+    chat_daily_reports: list[dict[str, Any]],
+    zoom_calls_day: list[dict[str, Any]],
+    bitrix_registry: dict[str, Any],
+    team: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(candidate: dict[str, Any] | None) -> None:
+        if not candidate:
+            return
+        key = (str(candidate.get("source_ref") or ""), str(candidate.get("fact") or "")[:220])
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(candidate)
+
+    for report in chat_daily_reports:
+        source_ref = f"chat:{report.get('chat_title') or report.get('dialog_id')}"
+        for item in report.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type in {"result", "fact"}:
+                continue
+            priority = "high" if item_type in {"risk", "blocker", "unanswered_question"} else "medium"
+            add(_owner_address_candidate(
+                "chat_daily_report",
+                source_ref,
+                item.get("text"),
+                team,
+                subject=item_type,
+                priority=priority,
+                required_action="Если пункт требует действия, включить адресный вопрос/рекомендацию в раздел 6 owner-отчета.",
+            ))
+        for key, subject, fact in _iter_owner_analysis_facts(report.get("analysis_compact")):
+            if key in {"results"}:
+                continue
+            priority = "high" if key in {"unanswered_questions", "explicit_risks", "risks"} else "medium"
+            add(_owner_address_candidate(
+                "chat_daily_analysis",
+                source_ref,
+                fact,
+                team,
+                subject=subject,
+                priority=priority,
+                required_action="Проверить, нужен ли адресный вопрос в Bitrix; если нужен, не потерять адресата.",
+            ))
+        for section, line in _owner_report_text_action_lines(report.get("report_text_excerpt")):
+            add(_owner_address_candidate(
+                "chat_daily_report_text",
+                source_ref,
+                line,
+                team,
+                subject=section,
+                priority="high" if re.search(r"(без ответа|тишина|хвост|срок|ответствен|переподпис)", line, re.IGNORECASE) else "medium",
+                required_action="Это хвост/вопрос из текста дневного отчета чата: включить в раздел 6 как адресный вопрос, если тема не закрыта.",
+            ))
+        for section, line in _owner_report_text_action_lines(report.get("transcript_excerpt")):
+            add(_owner_address_candidate(
+                "chat_transcript_text",
+                source_ref,
+                line,
+                team,
+                subject=section or "расшифровка чата",
+                priority="high" if re.search(r"(вопрос|когда|срок|ответствен|подтверд|нужно|зафикс|переподпис|документ|платеж)", line, re.IGNORECASE) else "medium",
+                required_action="Это действие/вопрос из расшифровки чата за день: сверить с chat daily report и не потерять в owner-отчете.",
+            ))
+
+    for call in zoom_calls_day:
+        source_ref = f"zoom:{call.get('zoom_call_id') or call.get('zoom_uuid')}"
+        note = str(call.get("analytical_note") or "")
+        analysis = call.get("analysis") if isinstance(call.get("analysis"), dict) else None
+        for key, subject, fact in _iter_owner_analysis_facts(analysis):
+            priority = "high" if key in {"unanswered_questions", "explicit_risks", "risks", "tasks", "commitments"} else "medium"
+            add(_owner_address_candidate(
+                "zoom_report_analysis",
+                source_ref,
+                fact,
+                team,
+                subject=subject or call.get("topic"),
+                priority=priority,
+                required_action="Если это устная задача/решение/риск из Zoom, включить в раздел 5 и адресное сообщение в раздел 6.",
+            ))
+        action_lines = [
+            line.strip(" -\t")
+            for line in note.splitlines()
+            if line.strip()
+            and len(line.strip()) >= 30
+            and (
+                re.search(r"\b(должен|нужно|зафикс|провер|подтверд|назнач|срок|владел|ответствен|решить|соглас|передать|закрыть)\w*", line, re.IGNORECASE)
+                or _owner_team_mentions(line, team, limit=1)
+            )
+        ]
+        for line in action_lines[:35]:
+            add(_owner_address_candidate(
+                "zoom_report_text",
+                source_ref,
+                line,
+                team,
+                subject=call.get("topic"),
+                priority="high" if re.search(r"\b(риск|срок|проср|блок|владел|ответствен)\w*", line, re.IGNORECASE) else "medium",
+                required_action="Не потерять Zoom-контекст: при наличии владельца/адресата добавить адресное сообщение в раздел 6.",
+            ))
+
+    tasks = bitrix_registry.get("tasks") if isinstance(bitrix_registry, dict) else []
+    if isinstance(tasks, list):
+        for task in tasks[:80]:
+            if not isinstance(task, dict):
+                continue
+            if not (task.get("is_overdue") or not str(task.get("deadline") or "").strip()):
+                continue
+            fact = (
+                f"Bitrix {task.get('task_id')}: {task.get('title')}; "
+                f"ответственный: {task.get('responsible_name')}; срок: {task.get('deadline') or 'срок не указан'}; "
+                f"статус: {task.get('status')}"
+            )
+            add(_owner_address_candidate(
+                "bitrix_registry",
+                f"bitrix:{task.get('task_id')}",
+                fact,
+                team,
+                subject=task.get("title"),
+                priority="high" if task.get("is_overdue") else "medium",
+                required_action="Если задача просрочена или без срока, включить адресный вопрос ответственному в раздел 6.",
+            ))
+    return candidates[:250]
+
+
+def load_previous_owner_daily_report(report_date: date) -> dict[str, Any] | None:
+    if not postgres_enabled():
+        return None
+    ensure_owner_reports_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM owner_daily_reports
+                WHERE report_date < %s
+                  AND is_current = TRUE
+                ORDER BY report_date DESC, version DESC
+                LIMIT 1
+                """,
+                (report_date,),
+            )
+            row = cur.fetchone()
+    return owner_daily_report_to_dict(row) if row else None
+
+
+def _previous_owner_daily_compact(report_date: date) -> dict[str, Any] | None:
+    record = load_previous_owner_daily_report(report_date)
+    if not record:
+        return None
+    raw_json = record.get("raw_json") if isinstance(record.get("raw_json"), dict) else {}
+    analysis = raw_json.get("analysis") if isinstance(raw_json.get("analysis"), dict) else {}
+    return {
+        "report_date": record.get("report_date"),
+        "summary": record.get("summary"),
+        "dynamics_summary": record.get("dynamics_summary"),
+        "risks_summary": record.get("risks_summary"),
+        "recommendations": record.get("recommendations"),
+        "manager_messages": analysis.get("manager_messages") if isinstance(analysis.get("manager_messages"), list) else [],
+        "report_text_excerpt": str(record.get("report_text") or "")[:50000],
+    }
+
+
+def _build_owner_daily_input(report_date: date) -> dict[str, Any]:
+    deadline_to = (report_date + timedelta(days=14)).isoformat()
+    registry_with_deadline = registry_response_payload({
+        "page": "1",
+        "page_size": "200",
+        "deadline_from": report_date.isoformat(),
+        "deadline_to": deadline_to,
+    })
+    registry_created = registry_response_payload({
+        "page": "1",
+        "page_size": "200",
+        "created_from": report_date.isoformat(),
+        "created_to": report_date.isoformat(),
+    })
+    seen_ids: set[Any] = set()
+    merged_tasks: list[dict[str, Any]] = []
+    for source in (registry_created.get("tasks") or [], registry_with_deadline.get("tasks") or []):
+        for task in source:
+            tid = task.get("task_id") or task.get("id")
+            key = (tid, task.get("title"))
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            merged_tasks.append(task)
+    merged_payload = {
+        "tasks": merged_tasks[:200],
+        "stats": registry_with_deadline.get("stats") or registry_created.get("stats"),
+    }
+    chat_daily_reports = _compact_chat_daily_for_owner_prompt(report_date)
+    zoom_calls_day = _compact_zoom_calls_for_owner_prompt(report_date, report_date)
+    bitrix_registry = _compact_bitrix_registry_for_owner(merged_payload)
+    team = _compact_team_for_owner_prompt(load_team_members())
+    addressable_context = _build_owner_daily_addressable_context(
+        chat_daily_reports,
+        zoom_calls_day,
+        bitrix_registry,
+        team,
+    )
+    return {
+        "report_date": report_date.isoformat(),
+        "previous_owner_daily": _previous_owner_daily_compact(report_date),
+        "chat_daily_reports": chat_daily_reports,
+        "zoom_calls_day": zoom_calls_day,
+        "addressable_context": addressable_context[:320],
+        "goal_progress_events": _compact_goal_events_for_day(report_date),
+        "bitrix_registry": bitrix_registry,
+        "team": team,
+    }
+
+
+def save_owner_daily_report(report_date: date) -> dict[str, Any]:
+    ensure_owner_reports_schema()
+    if report_date > REPORT_PLACEHOLDER_START_DATE:
+        prev_day = report_date - timedelta(days=1)
+        prev_owner = load_owner_daily_report(prev_day)
+        if not prev_owner:
+            raise ValueError(
+                "Нельзя сформировать ежедневный отчет собственника, пока не сформирован отчет за предыдущий день. "
+                f"Сначала сформируйте отчет за {format_date_ru(prev_day)}."
+            )
+    input_payload = _build_owner_daily_input(report_date)
+    analysis, ai_request_id, prompt_id, model = _ai_owner_report(
+        "owner_daily_report",
+        OWNER_DAILY_PROMPT,
+        input_payload,
+        "owner_daily_report",
+    )
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("UPDATE owner_daily_reports SET is_current = FALSE WHERE report_date = %s AND is_current = TRUE", (report_date,))
+                cur.execute("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM owner_daily_reports WHERE report_date = %s", (report_date,))
+                version = int(cur.fetchone()["version"])
+                cur.execute(
+                    """
+                    INSERT INTO owner_daily_reports (
+                        report_date, version, is_current, ai_request_id, prompt_id, generated_at,
+                        summary, dynamics_summary, risks_summary, recommendations, report_text, raw_json
+                    ) VALUES (%s, %s, TRUE, %s, %s, now(), %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        report_date,
+                        version,
+                        ai_request_id,
+                        prompt_id,
+                        analysis["summary"],
+                        analysis["dynamics_summary"],
+                        analysis["risks_summary"],
+                        "\n".join(f"- {item}" for item in (analysis.get("recommendations") or [])),
+                        analysis["report_text"],
+                        pg_json({"model": model, "input": input_payload, "analysis": analysis}),
+                    ),
+                )
+                row = cur.fetchone()
+                _save_owner_daily_manager_messages(cur, row["id"], report_date, analysis)
+    return {
+        "report_id": str(row["id"]),
+        "report_date": report_date.isoformat(),
+        "date_text": format_date_ru(report_date),
+        "version": row["version"],
+        "generated_at_text": format_datetime_ru(row["generated_at"]),
+        "summary": row["summary"],
+        "dynamics_summary": row["dynamics_summary"],
+        "risks_summary": row["risks_summary"],
+        "recommendations": row["recommendations"],
+        "report_text": row["report_text"],
+    }
+
+
+def _compact_chat_weekly_for_owner_prompt(period_start: date, period_end: date) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id AS report_id, c.dialog_id, c.chat_title, r.summary,
+                       r.dynamics_summary, r.positives_summary, r.problems_summary,
+                       r.recommendations, r.messages_count, r.results_count,
+                       r.commitments_count, r.risks_count, r.blockers_count,
+                       r.unresolved_questions_count, r.raw_json
+                FROM chat_weekly_reports r
+                JOIN chats c ON c.id = r.chat_id
+                WHERE r.period_start = %s
+                  AND r.period_end = %s
+                  AND r.is_current = TRUE
+                  AND c.is_excluded = FALSE
+                ORDER BY c.chat_title NULLS LAST, c.dialog_id
+                """,
+                (period_start, period_end),
+            )
+            rows = cur.fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        raw = row["raw_json"] if isinstance(row["raw_json"], dict) else {}
+        analysis = raw.get("analysis") if isinstance(raw, dict) else None
+        out.append({
+            "dialog_id": row["dialog_id"],
+            "chat_title": row["chat_title"],
+            "summary": row["summary"],
+            "dynamics_summary": row["dynamics_summary"],
+            "positives_summary": row["positives_summary"],
+            "problems_summary": row["problems_summary"],
+            "recommendations": row["recommendations"],
+            "messages_count": row["messages_count"],
+            "results_count": row["results_count"],
+            "commitments_count": row["commitments_count"],
+            "risks_count": row["risks_count"],
+            "blockers_count": row["blockers_count"],
+            "unresolved_questions_count": row["unresolved_questions_count"],
+            "analysis": analysis if isinstance(analysis, dict) else None,
+        })
+    return out
+
+
+def _compact_daily_owner_reports_for_period(period_start: date, period_end: date) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT report_date, summary, dynamics_summary, risks_summary, recommendations
+                FROM owner_daily_reports
+                WHERE report_date BETWEEN %s AND %s
+                  AND is_current = TRUE
+                ORDER BY report_date
+                """,
+                (period_start, period_end),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "report_date": row["report_date"].isoformat() if hasattr(row["report_date"], "isoformat") else str(row["report_date"]),
+            "summary": row["summary"],
+            "dynamics_summary": row["dynamics_summary"],
+            "risks_summary": row["risks_summary"],
+            "recommendations": row["recommendations"],
+        }
+        for row in rows
+    ]
+
+
+def _owner_weekly_daily_manifest(period_start: date, period_end: date, daily_reports: list[dict[str, Any]]) -> dict[str, Any]:
+    expected_dates = [day.isoformat() for day in _daterange(period_start, period_end)]
+    actual_dates = {
+        str(report.get("report_date") or "").strip()
+        for report in daily_reports
+        if str(report.get("report_date") or "").strip()
+    }
+    missing_dates = [day for day in expected_dates if day not in actual_dates]
+    return {
+        "required_count": len(expected_dates),
+        "actual_count": len(actual_dates),
+        "expected_dates": expected_dates,
+        "missing_dates": missing_dates,
+        "is_complete": not missing_dates and len(actual_dates) == len(expected_dates),
+    }
+
+
+def _compact_zoom_calls_for_owner_prompt(period_start: date, period_end: date) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    ensure_zoom_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT zc.id, zc.zoom_uuid, zc.call_date, zc.topic, zc.technical_topic,
+                       zc.start_time_msk, zc.end_time_msk, zc.duration_min,
+                       zc.analytical_note, zc.raw_json,
+                       COUNT(DISTINCT zcts.id) AS transcript_segments_count,
+                       COALESCE(
+                           jsonb_agg(DISTINCT zcp.participant_name)
+                           FILTER (WHERE zcp.participant_name IS NOT NULL),
+                           '[]'::jsonb
+                       ) AS participants_json
+                FROM zoom_calls zc
+                LEFT JOIN zoom_call_participants zcp ON zcp.call_id = zc.id
+                LEFT JOIN zoom_call_transcript_segments zcts ON zcts.call_id = zc.id
+                WHERE zc.call_date BETWEEN %s AND %s
+                GROUP BY zc.id
+                ORDER BY zc.call_date, zc.start_time_msk NULLS LAST
+                """,
+                (period_start, period_end),
+            )
+            rows = cur.fetchall()
+    compact: list[dict[str, Any]] = []
+    for row in rows:
+        note = str(row["analytical_note"] or "").strip()
+        raw = row["raw_json"] if isinstance(row["raw_json"], dict) else {}
+        ai_report = raw.get("ai_report") if isinstance(raw.get("ai_report"), dict) else {}
+        analysis = ai_report.get("analysis") if isinstance(ai_report.get("analysis"), dict) else None
+        compact.append({
+            "zoom_call_id": str(row["id"]),
+            "zoom_uuid": row["zoom_uuid"],
+            "call_date": row["call_date"].isoformat() if hasattr(row["call_date"], "isoformat") else str(row["call_date"]),
+            "topic": row["topic"] or row["technical_topic"],
+            "start_time_msk": row["start_time_msk"].isoformat() if hasattr(row["start_time_msk"], "isoformat") else str(row["start_time_msk"] or ""),
+            "end_time_msk": row["end_time_msk"].isoformat() if hasattr(row["end_time_msk"], "isoformat") else str(row["end_time_msk"] or ""),
+            "duration_min": row["duration_min"],
+            "participants": row["participants_json"] if isinstance(row["participants_json"], list) else [],
+            "transcript_segments_count": row["transcript_segments_count"],
+            "has_zoom_report": bool(note),
+            "analytical_note": note[:30000],
+            "analysis": analysis,
+        })
+    return compact
+
+
+def _compact_company_regulations_for_owner_prompt(limit: int = 12) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    ensure_company_profile_schema()
+    keywords = [
+        "регламент",
+        "ритм",
+        "встреч",
+        "планер",
+        "контроль",
+        "матрица",
+        "решени",
+        "процесс",
+        "ответствен",
+        "роль",
+        "sla",
+        "порядок",
+        "политик",
+    ]
+    where_parts = []
+    params: list[Any] = []
+    for keyword in keywords:
+        where_parts.append("(lower(f.name) LIKE %s OR lower(f.content) LIKE %s)")
+        pattern = f"%{keyword}%"
+        params.extend([pattern, pattern])
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT f.id, f.name, f.content, f.updated_at, cds.source_url, cds.google_file_id
+                FROM company_folders f
+                LEFT JOIN company_drive_sources cds ON cds.folder_id = f.id
+                WHERE length(btrim(f.content)) > 0
+                  AND ({' OR '.join(where_parts)})
+                ORDER BY
+                    CASE
+                        WHEN lower(f.name) LIKE '%%регламент%%' THEN 1
+                        WHEN lower(f.name) LIKE '%%ритм%%' OR lower(f.name) LIKE '%%встреч%%' THEN 2
+                        WHEN lower(f.name) LIKE '%%матрица%%' THEN 3
+                        ELSE 4
+                    END,
+                    f.updated_at DESC
+                LIMIT %s
+                """,
+                (*params, limit),
+            )
+            rows = cur.fetchall()
+    regulations: list[dict[str, Any]] = []
+    for row in rows:
+        content = str(row["content"] or "").strip()
+        regulations.append({
+            "folder_id": str(row["id"]),
+            "google_file_id": row.get("google_file_id"),
+            "name": row["name"],
+            "source_url": row.get("source_url"),
+            "updated_at": row["updated_at"].isoformat() if hasattr(row["updated_at"], "isoformat") else str(row["updated_at"] or ""),
+            "content_excerpt": content[:12000],
+        })
+    return regulations
+
+
+def _build_owner_weekly_input(period_start: date, period_end: date) -> dict[str, Any]:
+    overall_weekly = load_chat_overall_weekly_report(period_start, period_end)
+    prev_start, prev_end = previous_week_bounds_for_report(period_start)
+    previous_owner = load_owner_weekly_report(prev_start, prev_end)
+    daily_owner_reports = _compact_daily_owner_reports_for_period(period_start, period_end)
+    registry = registry_response_payload({
+        "page": "1",
+        "page_size": "300",
+        "date_from": period_start.isoformat(),
+        "date_to": period_end.isoformat(),
+    })
+    return {
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "previous_owner_weekly": {
+            "period_start": previous_owner.get("period_start"),
+            "period_end": previous_owner.get("period_end"),
+            "summary": previous_owner.get("summary"),
+            "dynamics_summary": previous_owner.get("dynamics_summary"),
+            "risks_summary": previous_owner.get("risks_summary"),
+            "recommendations": previous_owner.get("recommendations"),
+            "analysis": (previous_owner.get("raw_json") or {}).get("analysis") if isinstance(previous_owner.get("raw_json"), dict) else None,
+        } if previous_owner else None,
+        "owner_metrics_contract": {
+            "week_period": "monday_to_sunday",
+            "dedupe_key": "task_id, fallback normalized(title+person+date)",
+            "target_report_style": "weekly_management_memo",
+            "required_comparisons": [
+                "total tasks current vs previous",
+                "real completion rate current vs previous",
+                "in_progress/control queue current vs previous",
+                "overdue current vs previous",
+                "self-assigned share if creator=responsible is available",
+            ],
+            "required_management_sections": [
+                "headline_metrics",
+                "red_zone",
+                "executor_load",
+                "invisible_employees",
+                "management_groups",
+                "department_dynamics",
+                "regulation_deviations",
+                "positive_signals",
+                "owner_decisions_next",
+                "operational_questions",
+                "system_changes",
+            ],
+            "stuck_no_info_days_for_weekly": 14,
+            "owner_decisions_limit": 5,
+            "owner_decision_filters": [
+                "strategic company/finance/legal/org/key_direction/owner_evidence",
+                "age_days >= 5 or overdue_days > 0",
+                "no clear C-1 owner or owner not coping",
+                "requires owner assignment/approval/escalation/resource unblock",
+            ],
+            "urgency_score": {
+                "overdue_exists": 30,
+                "overdue_days_multiplier_capped": "overdue_days * 5, max 50",
+                "silence_days_gt_7": 20,
+                "goal_level_company": 15,
+                "finance_legal_org_evidence": 10,
+                "linked_unanswered_questions": 10,
+            },
+            "people_pattern_triggers": {
+                "completion_rate_low": "closed / (closed + still_open) < 0.20",
+                "question_ignore_rate": "answered / addressed < 0.50",
+                "absence_pattern": "last_active_date >= 3 working days ago",
+                "activity_drop": "current activity < 60% of 4w average",
+                "decision_avoidance": "3+ postponed answers without close",
+            },
+        },
+        "chat_overall_weekly": overall_weekly,
+        "chat_weekly_reports": _compact_chat_weekly_for_owner_prompt(period_start, period_end),
+        "daily_owner_reports_manifest": _owner_weekly_daily_manifest(period_start, period_end, daily_owner_reports),
+        "daily_owner_reports": daily_owner_reports,
+        "zoom_calls_week": _compact_zoom_calls_for_owner_prompt(period_start, period_end),
+        "company_regulations_context": _compact_company_regulations_for_owner_prompt(),
+        "goal_progress_events_week": _compact_goal_events_for_period(period_start, period_end),
+        "bitrix_registry": _compact_bitrix_registry_for_owner(registry),
+        "team": _compact_team_for_owner_prompt(load_team_members()),
+    }
+
+
+def _save_owner_weekly_manager_messages(
+    cur: Any,
+    owner_weekly_report_id: Any,
+    period_start: date,
+    period_end: date,
+    analysis: dict[str, Any],
+) -> None:
+    messages = analysis.get("manager_messages")
+    if not isinstance(messages, list) or not messages:
+        return
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        manager_name = str(message.get("manager_name") or "").strip()
+        text = str(message.get("message_text") or "").strip()
+        if not manager_name or not text:
+            continue
+        manager = pg_get_user_by_bitrix_id(cur, message.get("manager_bitrix_user_id")) or pg_get_user_by_name(cur, manager_name)
+        if not manager:
+            continue
+        priority = str(message.get("priority") or "medium").strip().lower()
+        if priority not in {"low", "medium", "high", "critical"}:
+            priority = "medium"
+        topics = message.get("topics") if isinstance(message.get("topics"), list) else []
+        subject = ", ".join(str(topic).strip() for topic in topics if str(topic or "").strip())[:500] or None
+        cur.execute(
+            """
+            INSERT INTO owner_manager_recommendations (
+                source_scope, owner_weekly_report_id, period_start, period_end,
+                manager_user_id, manager_bitrix_user_id,
+                recommendation_type, priority, subject, recommendation_text, source_payload, status
+            ) VALUES (
+                'owner_weekly', %s, %s, %s,
+                %s, %s,
+                'followup', %s, %s, %s, %s, 'new'
+            )
+            """,
+            (
+                owner_weekly_report_id,
+                period_start,
+                period_end,
+                manager["id"],
+                manager.get("bitrix_user_id"),
+                priority,
+                subject,
+                text,
+                pg_json({
+                    "source": "owner_weekly_manager_message",
+                    "manager_name": manager_name,
+                    "topics": topics,
+                    "source_facts": message.get("source_facts") if isinstance(message.get("source_facts"), list) else [],
+                }),
+            ),
+        )
+
+
+def _save_owner_daily_manager_messages(
+    cur: Any,
+    owner_daily_report_id: Any,
+    report_date: date,
+    analysis: dict[str, Any],
+) -> None:
+    messages = analysis.get("manager_messages")
+    if not isinstance(messages, list) or not messages:
+        messages = []
+        recommendations = analysis.get("manager_recommendations")
+        if isinstance(recommendations, list):
+            for group in recommendations:
+                if not isinstance(group, dict):
+                    continue
+                manager_name = str(group.get("manager_name") or "").strip()
+                actions = group.get("actions") if isinstance(group.get("actions"), list) else []
+                for action in actions:
+                    if not isinstance(action, dict):
+                        continue
+                    subject = str(action.get("subject") or action.get("task_ref") or "").strip()
+                    text = str(action.get("action") or "").strip()
+                    expected = str(action.get("expected_result") or "").strip()
+                    if manager_name and text:
+                        messages.append({
+                            "manager_name": manager_name,
+                            "manager_bitrix_user_id": group.get("manager_bitrix_user_id"),
+                            "priority": action.get("priority") or "medium",
+                            "message_type": "question",
+                            "subject": subject,
+                            "message_text": f"{text}" + (f"\nНужный результат: {expected}" if expected else ""),
+                            "due": action.get("due"),
+                            "topics": [subject] if subject else [],
+                            "source_facts": [{"source": action.get("source"), "fact": action.get("task_ref")}],
+                        })
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        manager_name = str(message.get("manager_name") or "").strip()
+        text = str(message.get("message_text") or "").strip()
+        if not manager_name or not text:
+            continue
+        manager = pg_get_user_by_bitrix_id(cur, message.get("manager_bitrix_user_id")) or pg_get_user_by_name(cur, manager_name)
+        if not manager:
+            continue
+        priority = str(message.get("priority") or "medium").strip().lower()
+        if priority not in {"low", "medium", "high", "critical"}:
+            priority = "medium"
+        message_type = str(message.get("message_type") or "question").strip().lower()
+        recommendation_type = "followup"
+        if message_type in {"recommendation"}:
+            recommendation_type = "action"
+        elif message_type in {"escalation"}:
+            recommendation_type = "risk"
+        elif message_type in {"status_request", "deadline_request", "question"}:
+            recommendation_type = "followup"
+        subject = str(message.get("subject") or "").strip()[:500] or None
+        topics = message.get("topics") if isinstance(message.get("topics"), list) else []
+        if not subject:
+            subject = ", ".join(str(topic).strip() for topic in topics if str(topic or "").strip())[:500] or None
+        due_date = safe_parse_date(message.get("due"))
+        cur.execute(
+            """
+            INSERT INTO owner_manager_recommendations (
+                source_scope, owner_daily_report_id, report_date,
+                manager_user_id, manager_bitrix_user_id,
+                recommendation_type, priority, subject, recommendation_text,
+                due_date, source_payload, status
+            ) VALUES (
+                'owner_daily', %s, %s,
+                %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, 'new'
+            )
+            """,
+            (
+                owner_daily_report_id,
+                report_date,
+                manager["id"],
+                manager.get("bitrix_user_id"),
+                recommendation_type,
+                priority,
+                subject,
+                text,
+                due_date,
+                pg_json({
+                    "source": "owner_daily_manager_message",
+                    "manager_name": manager_name,
+                    "manager_bitrix_user_id": message.get("manager_bitrix_user_id"),
+                    "message_type": message_type,
+                    "topics": topics,
+                    "source_facts": message.get("source_facts") if isinstance(message.get("source_facts"), list) else [],
+                }),
+            ),
+        )
+
+
+def save_owner_weekly_report(period_start: date, period_end: date) -> dict[str, Any]:
+    ensure_owner_reports_schema()
+    if not is_startup_chat_weekly_period(period_start, period_end):
+        prev_start, prev_end = previous_week_bounds_for_report(period_start)
+        prev_owner = load_owner_weekly_report(prev_start, prev_end)
+        if not prev_owner:
+            raise ValueError(
+                "Нельзя сформировать недельный отчет собственника, пока не сформирован предыдущий недельный отчет собственника. "
+                f"Сначала сформируйте отчет за {format_date_ru(prev_start)} - {format_date_ru(prev_end)}."
+            )
+    input_payload = _build_owner_weekly_input(period_start, period_end)
+    daily_manifest = input_payload.get("daily_owner_reports_manifest") if isinstance(input_payload, dict) else None
+    if isinstance(daily_manifest, dict) and not daily_manifest.get("is_complete"):
+        missing = ", ".join(str(day) for day in (daily_manifest.get("missing_dates") or []))
+        raise ValueError(
+            "Нельзя сформировать недельный отчет собственника без 7 ежедневных owner-отчетов "
+            f"за период {format_date_ru(period_start)} - {format_date_ru(period_end)}. "
+            f"Не хватает дат: {missing or 'не определено'}."
+        )
+    analysis, ai_request_id, prompt_id, model = _ai_owner_report(
+        "owner_weekly_report",
+        OWNER_WEEKLY_PROMPT,
+        input_payload,
+        "owner_weekly_report",
+    )
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE owner_weekly_reports SET is_current = FALSE WHERE period_start = %s AND period_end = %s AND is_current = TRUE",
+                    (period_start, period_end),
+                )
+                cur.execute(
+                    "SELECT COALESCE(MAX(version), 0) + 1 AS version FROM owner_weekly_reports WHERE period_start = %s AND period_end = %s",
+                    (period_start, period_end),
+                )
+                version = int(cur.fetchone()["version"])
+                cur.execute(
+                    """
+                    INSERT INTO owner_weekly_reports (
+                        period_start, period_end, version, is_current, ai_request_id, prompt_id, generated_at,
+                        summary, dynamics_summary, risks_summary, recommendations, report_text, raw_json
+                    ) VALUES (%s, %s, %s, TRUE, %s, %s, now(), %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        period_start,
+                        period_end,
+                        version,
+                        ai_request_id,
+                        prompt_id,
+                        analysis["summary"],
+                        analysis["dynamics_summary"],
+                        analysis["risks_summary"],
+                        "\n".join(f"- {item}" for item in (analysis.get("recommendations") or [])),
+                        analysis["report_text"],
+                        pg_json({"model": model, "input": input_payload, "analysis": analysis}),
+                    ),
+                )
+                row = cur.fetchone()
+                _save_owner_weekly_manager_messages(cur, row["id"], period_start, period_end, analysis)
+    return {
+        "report_id": str(row["id"]),
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "period_text": f"{format_date_ru(period_start)} - {format_date_ru(period_end)}",
+        "version": row["version"],
+        "generated_at_text": format_datetime_ru(row["generated_at"]),
+        "summary": row["summary"],
+        "dynamics_summary": row["dynamics_summary"],
+        "risks_summary": row["risks_summary"],
+        "recommendations": row["recommendations"],
+        "report_text": row["report_text"],
+    }
+
+
+MANUAL_REPORT_EDIT_CONFIG: dict[str, dict[str, Any]] = {
+    "chat_daily": {
+        "table": "chat_daily_reports",
+        "raw_column": "raw_ai_json",
+        "identity_columns": ["chat_id", "report_date"],
+        "copy_columns": [
+            "chat_id", "report_date", "version", "is_current", "ai_request_id", "prompt_id", "generated_at",
+            "messages_count", "files_count", "ocr_files_count", "extracted_tasks_count", "extracted_goals_count",
+            "extracted_facts_count", "summary", "raw_ai_json", "status",
+        ],
+        "editable_columns": ["summary"],
+    },
+    "chat_weekly": {
+        "table": "chat_weekly_reports",
+        "raw_column": "raw_json",
+        "identity_columns": ["chat_id", "period_start", "period_end"],
+        "copy_columns": [
+            "chat_id", "period_start", "period_end", "version", "is_current", "ai_request_id", "prompt_id",
+            "generated_at", "days_count", "daily_reports_count", "messages_count", "goals_created_count",
+            "goal_updates_count", "commitments_count", "results_count", "next_steps_count", "risks_count",
+            "blockers_count", "unresolved_questions_count", "done_goal_updates_count", "high_risk_goal_updates_count",
+            "summary", "dynamics_summary", "positives_summary", "problems_summary", "recommendations", "raw_json",
+        ],
+        "editable_columns": ["summary", "dynamics_summary", "positives_summary", "problems_summary", "recommendations"],
+    },
+    "chat_overall_daily": {
+        "table": "chat_overall_daily_reports",
+        "raw_column": "raw_json",
+        "identity_columns": ["report_date"],
+        "copy_columns": [
+            "report_date", "version", "is_current", "generated_at", "chats_count", "messages_count",
+            "goals_created_count", "goal_updates_count", "commitments_count", "results_count", "next_steps_count",
+            "risks_count", "blockers_count", "unresolved_questions_count", "done_goal_updates_count",
+            "high_risk_goal_updates_count", "summary", "dynamics_summary", "positives_summary", "problems_summary", "raw_json",
+        ],
+        "editable_columns": ["summary", "dynamics_summary", "positives_summary", "problems_summary"],
+    },
+    "chat_overall_weekly": {
+        "table": "chat_overall_weekly_reports",
+        "raw_column": "raw_json",
+        "identity_columns": ["period_start", "period_end"],
+        "copy_columns": [
+            "period_start", "period_end", "version", "is_current", "ai_request_id", "prompt_id", "generated_at",
+            "days_count", "chats_count", "daily_reports_count", "messages_count", "goals_created_count",
+            "goal_updates_count", "commitments_count", "results_count", "next_steps_count", "risks_count",
+            "blockers_count", "unresolved_questions_count", "done_goal_updates_count", "high_risk_goal_updates_count",
+            "summary", "dynamics_summary", "positives_summary", "problems_summary", "recommendations", "raw_json",
+        ],
+        "editable_columns": ["summary", "dynamics_summary", "positives_summary", "problems_summary", "recommendations"],
+    },
+    "owner_daily": {
+        "table": "owner_daily_reports",
+        "raw_column": "raw_json",
+        "identity_columns": ["report_date"],
+        "copy_columns": [
+            "report_date", "version", "is_current", "ai_request_id", "prompt_id", "generated_at",
+            "summary", "dynamics_summary", "risks_summary", "recommendations", "report_text", "raw_json",
+        ],
+        "editable_columns": ["summary", "dynamics_summary", "risks_summary", "recommendations", "report_text"],
+    },
+    "owner_weekly": {
+        "table": "owner_weekly_reports",
+        "raw_column": "raw_json",
+        "identity_columns": ["period_start", "period_end"],
+        "copy_columns": [
+            "period_start", "period_end", "version", "is_current", "ai_request_id", "prompt_id", "generated_at",
+            "summary", "dynamics_summary", "risks_summary", "recommendations", "report_text", "raw_json",
+        ],
+        "editable_columns": ["summary", "dynamics_summary", "risks_summary", "recommendations", "report_text"],
+    },
+}
+
+
+def _manual_report_payload(payload: dict[str, Any], editable_columns: list[str]) -> dict[str, str]:
+    fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else payload
+    out: dict[str, str] = {}
+    for key in editable_columns:
+        if key in fields:
+            out[key] = str(fields.get(key) or "").strip()
+    report_text = fields.get("report_text") if isinstance(fields, dict) else None
+    if "report_text" not in out and report_text is not None:
+        out["report_text"] = str(report_text or "").strip()
+    return out
+
+
+def save_manual_report_edit(report_type: str, report_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    config = MANUAL_REPORT_EDIT_CONFIG.get(report_type)
+    if not config:
+        raise ValueError("Некорректный тип отчета для ручного редактирования.")
+    try:
+        report_uuid = UUID(str(report_id))
+    except ValueError as exc:
+        raise ValueError("Некорректный id отчета.") from exc
+    table = config["table"]
+    raw_column = config["raw_column"]
+    identity_columns = config["identity_columns"]
+    copy_columns = config["copy_columns"]
+    editable_columns = config["editable_columns"]
+    edits = _manual_report_payload(payload, editable_columns)
+    if "report_text" in edits and "summary" in editable_columns and "summary" not in edits:
+        edits["summary"] = edits["report_text"]
+    if not edits:
+        raise ValueError("Нет полей для сохранения.")
+
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT * FROM {table} WHERE id = %s", (report_uuid,))
+                current = cur.fetchone()
+                if not current:
+                    raise ValueError("Отчет не найден.")
+                identity_where = " AND ".join(f"{column} = %s" for column in identity_columns)
+                identity_values = [current[column] for column in identity_columns]
+                cur.execute(
+                    f"UPDATE {table} SET is_current = FALSE WHERE {identity_where} AND is_current = TRUE",
+                    identity_values,
+                )
+                cur.execute(
+                    f"SELECT COALESCE(MAX(version), 0) + 1 AS version FROM {table} WHERE {identity_where}",
+                    identity_values,
+                )
+                version = int(cur.fetchone()["version"])
+                raw = current[raw_column] if isinstance(current[raw_column], dict) else {}
+                raw = dict(raw or {})
+                raw["source"] = "manual_edit"
+                raw["manual_edit"] = {
+                    "previous_report_id": str(current["id"]),
+                    "previous_version": int(current["version"] or 1),
+                    "edited_at": msk_now().isoformat(),
+                    "fields": edits,
+                }
+                if "report_text" in edits:
+                    raw["report_text"] = edits["report_text"]
+                select_values: list[Any] = []
+                select_exprs: list[str] = []
+                for column in copy_columns:
+                    if column == "version":
+                        select_exprs.append("%s")
+                        select_values.append(version)
+                    elif column == "is_current":
+                        select_exprs.append("TRUE")
+                    elif column == "generated_at":
+                        select_exprs.append("now()")
+                    elif column == "ai_request_id":
+                        select_exprs.append("NULL")
+                    elif column == "prompt_id":
+                        select_exprs.append("NULL")
+                    elif column == raw_column:
+                        select_exprs.append("%s")
+                        select_values.append(pg_json(raw))
+                    elif column in edits:
+                        select_exprs.append("%s")
+                        select_values.append(edits[column])
+                    else:
+                        select_exprs.append(column)
+                cur.execute(
+                    f"""
+                    INSERT INTO {table} ({", ".join(copy_columns)})
+                    SELECT {", ".join(select_exprs)}
+                    FROM {table}
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (*select_values, report_uuid),
+                )
+                row = cur.fetchone()
+    return manual_report_row_to_dict(report_type, row)
+
+
+def delete_manual_report(report_type: str, report_id: str) -> dict[str, Any]:
+    config = MANUAL_REPORT_EDIT_CONFIG.get(report_type)
+    if not config:
+        raise ValueError("Некорректный тип отчета для удаления.")
+    try:
+        report_uuid = UUID(str(report_id))
+    except ValueError as exc:
+        raise ValueError("Некорректный id отчета.") from exc
+
+    table = config["table"]
+    identity_columns = config["identity_columns"]
+    deleted_row: Any = None
+    restored_row: Any = None
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT * FROM {table} WHERE id = %s", (report_uuid,))
+                current = cur.fetchone()
+                if not current:
+                    raise ValueError("Отчет не найден.")
+                identity_where = " AND ".join(f"{column} = %s" for column in identity_columns)
+                identity_values = [current[column] for column in identity_columns]
+                was_current = bool(current.get("is_current"))
+                cur.execute(f"DELETE FROM {table} WHERE id = %s RETURNING *", (report_uuid,))
+                deleted_row = cur.fetchone()
+                if was_current:
+                    cur.execute(
+                        f"""
+                        SELECT *
+                        FROM {table}
+                        WHERE {identity_where}
+                        ORDER BY version DESC, generated_at DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        identity_values,
+                    )
+                    restored_row = cur.fetchone()
+                    if restored_row:
+                        cur.execute(
+                            f"UPDATE {table} SET is_current = TRUE WHERE id = %s RETURNING *",
+                            (restored_row["id"],),
+                        )
+                        restored_row = cur.fetchone()
+
+    return {
+        "deleted": True,
+        "deleted_report_id": str(deleted_row["id"]),
+        "restored_report": manual_report_row_to_dict(report_type, restored_row) if restored_row else None,
+    }
+
+
+def manual_report_row_to_dict(report_type: str, row: Any) -> dict[str, Any]:
+    if report_type == "chat_overall_daily":
+        return chat_overall_daily_report_to_dict(row)
+    if report_type == "chat_overall_weekly":
+        return chat_overall_weekly_report_to_dict(row)
+    if report_type == "owner_daily":
+        return owner_daily_report_to_dict(row)
+    if report_type == "owner_weekly":
+        return owner_weekly_report_to_dict(row)
+    raw_column = "raw_ai_json" if report_type == "chat_daily" else "raw_json"
+    raw = row[raw_column] if isinstance(row[raw_column], dict) else {}
+    return {
+        "report_id": str(row["id"]),
+        "report_kind": "daily" if report_type == "chat_daily" else "weekly",
+        "version": int(row["version"] or 1),
+        "generated_at": iso_or_none(row["generated_at"]),
+        "generated_at_text": format_datetime_ru(row["generated_at"]),
+        "summary": row["summary"],
+        "report_text": raw.get("report_text") if isinstance(raw, dict) and raw.get("report_text") else row["summary"],
+        "raw_json": raw,
+    }
+
+
+def ensure_chat_daily_for_day(report_date: date, force: bool = False) -> dict[str, Any]:
+    if not postgres_enabled():
+        return {"generated": 0, "errors": [], "skipped": 0}
+    finalization_error = chat_day_finalization_error(report_date)
+    if finalization_error:
+        raise ValueError(finalization_error)
+    chats = [chat for chat in load_chats() if not chat.get("is_excluded")]
+    process_chat_image_ocr_for_period(report_date, report_date, force=False, dialog_id=None)
+    generated = 0
+    skipped = 0
+    errors: list[dict[str, Any]] = []
+    for chat in chats:
+        dialog_id = chat.get("dialog_id")
+        if not dialog_id:
+            continue
+        try:
+            day = load_chat_day(dialog_id, report_date)
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"dialog_id": dialog_id, "stage": "load_chat_day", "error": str(exc)})
+            continue
+        existing_report = day.get("report") or {}
+        if not force and is_real_ai_chat_report(existing_report):
+            skipped += 1
+            continue
+        try:
+            generate_ai_chat_report(dialog_id, report_date, force=force)
+            generated += 1
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"dialog_id": dialog_id, "stage": "generate_ai_chat_report", "error": str(exc)})
+    missing = find_missing_chat_daily_reports(report_date)
+    return {"generated": generated, "skipped": skipped, "errors": errors, "missing": missing}
+
+
+def find_missing_chat_daily_reports(report_date: date) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.dialog_id, c.chat_title, COUNT(m.id) AS messages_count
+                FROM chats c
+                LEFT JOIN chat_messages m ON m.chat_id = c.id AND m.message_day = %s
+                LEFT JOIN chat_daily_reports r
+                 ON r.chat_id = c.id
+                 AND r.report_date = %s
+                 AND r.is_current = TRUE
+                 AND r.status IN ('done', 'no_data')
+                WHERE c.is_excluded = FALSE
+                  AND r.id IS NULL
+                GROUP BY c.id, c.dialog_id, c.chat_title
+                ORDER BY c.chat_title NULLS LAST, c.dialog_id
+                """,
+                (report_date, report_date),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "dialog_id": row["dialog_id"],
+            "chat_title": row["chat_title"],
+            "messages_count": int(row["messages_count"] or 0),
+        }
+        for row in rows
+    ]
+
+
+def ensure_chat_overall_daily_for_day(report_date: date, force: bool = False) -> dict[str, Any] | None:
+    if not postgres_enabled():
+        return None
+    if not force:
+        existing = load_chat_overall_daily_report(report_date)
+        if existing:
+            return existing
+    return save_chat_overall_daily_report(report_date)
+
+
+def ensure_chat_weekly_for_period(period_start: date, period_end: date, force: bool = False) -> dict[str, Any]:
+    if not postgres_enabled():
+        return {"reports_generated": 0, "errors": []}
+    if not is_allowed_chat_weekly_period(period_start, period_end):
+        raise ValueError("Недельный период должен быть с понедельника по воскресенье.")
+    chats = [chat for chat in load_chats() if not chat.get("is_excluded")]
+    reports = []
+    errors: list[dict[str, Any]] = []
+    for chat in chats:
+        dialog_id = chat.get("dialog_id")
+        if not dialog_id:
+            continue
+        if not force:
+            existing = load_chat_weekly_report(dialog_id, period_start, period_end)
+            if existing:
+                reports.append(existing)
+                continue
+        try:
+            reports.append(save_chat_weekly_report(dialog_id, period_start, period_end, force=force))
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"dialog_id": dialog_id, "error": str(exc)})
+    return {"reports_generated": len(reports), "errors": errors[:50], "reports": reports}
+
+
+def ensure_chat_overall_weekly_for_period(period_start: date, period_end: date, force: bool = False) -> dict[str, Any] | None:
+    if not postgres_enabled():
+        return None
+    if not force:
+        existing = load_chat_overall_weekly_report(period_start, period_end)
+        if existing:
+            return existing
+    return save_chat_overall_weekly_report(period_start, period_end)
+
+
+def zoom_credentials_status(account_key: str = "ZOOM_ACC2") -> dict[str, Any]:
+    load_dotenv(override=True)
+    required = [
+        f"{account_key}_ACCOUNT_ID",
+        f"{account_key}_CLIENT_ID",
+        f"{account_key}_CLIENT_SECRET",
+    ]
+    missing = [key for key in required if not os.getenv(key, "").strip()]
+    return {"account_key": account_key, "configured": not missing, "missing": missing}
+
+
+def ensure_zoom_reports_for_period(
+    period_start: date,
+    period_end: date,
+    force: bool = False,
+    sync: bool = True,
+    account_key: str = "ZOOM_ACC2",
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "account_key": account_key,
+        "configured": False,
+        "sync": None,
+        "calls_found": 0,
+        "reports_generated": 0,
+        "reports_skipped": 0,
+        "reports_without_transcript": 0,
+        "missing": [],
+        "errors": [],
+    }
+    if not postgres_enabled():
+        result["message"] = "PostgreSQL не включен, Zoom-отчеты недоступны."
+        return result
+    credentials = zoom_credentials_status(account_key)
+    result["configured"] = bool(credentials["configured"])
+    if not credentials["configured"]:
+        result["missing"] = credentials["missing"]
+        result["message"] = "Zoom не настроен, шаг Zoom пропущен."
+        return result
+
+    ensure_zoom_schema()
+    if sync:
+        try:
+            result["sync"] = sync_zoom_calls(period_start, period_end, account_key=account_key)
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append({"stage": "sync_zoom_calls", "error": str(exc)})
+
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, analytical_note, transcript_text
+                FROM zoom_calls
+                WHERE call_date BETWEEN %s AND %s
+                ORDER BY call_date ASC, start_time_msk ASC
+                """,
+                (period_start, period_end),
+            )
+            rows = cur.fetchall()
+
+    result["calls_found"] = len(rows)
+    for row in rows:
+        call_id = str(row["id"])
+        if str(row.get("analytical_note") or "").strip() and not force:
+            result["reports_skipped"] += 1
+            continue
+        if force and str(row.get("analytical_note") or "").strip():
+            delete_zoom_call_report(call_id)
+        try:
+            generate_zoom_call_report_if_needed(call_id)
+            call = load_zoom_call_detail(call_id)
+            if call and str(call.get("analytical_note") or "").strip():
+                result["reports_generated"] += 1
+            else:
+                result["reports_without_transcript"] += 1
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append({"stage": "generate_zoom_call_report", "call_id": call_id, "error": str(exc)})
+    result["missing"] = find_missing_zoom_reports(period_start, period_end)
+    return result
+
+
+def find_missing_zoom_reports(period_start: date, period_end: date) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    ensure_zoom_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, zoom_uuid, call_date, topic, technical_topic, duration_min,
+                       length(btrim(COALESCE(transcript_text, ''))) AS transcript_chars
+                FROM zoom_calls
+                WHERE call_date BETWEEN %s AND %s
+                  AND length(btrim(COALESCE(analytical_note, ''))) = 0
+                ORDER BY call_date ASC, start_time_msk ASC
+                """,
+                (period_start, period_end),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "zoom_call_id": str(row["id"]),
+            "zoom_uuid": row["zoom_uuid"],
+            "call_date": row["call_date"].isoformat() if hasattr(row["call_date"], "isoformat") else str(row["call_date"]),
+            "topic": row["topic"] or row["technical_topic"],
+            "duration_min": row["duration_min"],
+            "has_transcript": int(row["transcript_chars"] or 0) > 0,
+        }
+        for row in rows
+    ]
+
+
+class OwnerPipelinePrerequisitesError(ValueError):
+    def __init__(self, message: str, cascade_result: dict[str, Any]):
+        super().__init__(message)
+        self.cascade_result = cascade_result
+
+
+def owner_daily_prerequisite_errors(cascade_result: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    zoom = cascade_result.get("zoom") if isinstance(cascade_result.get("zoom"), dict) else {}
+    chat_daily = cascade_result.get("chat_daily") if isinstance(cascade_result.get("chat_daily"), dict) else {}
+    zoom_errors = zoom.get("errors") if isinstance(zoom.get("errors"), list) else []
+    zoom_missing = zoom.get("missing") if isinstance(zoom.get("missing"), list) else []
+    chat_errors = chat_daily.get("errors") if isinstance(chat_daily.get("errors"), list) else []
+    chat_missing = chat_daily.get("missing") if isinstance(chat_daily.get("missing"), list) else []
+    if zoom_errors:
+        errors.append(f"Zoom: ошибок формирования/синхронизации {len(zoom_errors)}.")
+    if zoom_missing:
+        with_transcript = sum(1 for item in zoom_missing if item.get("has_transcript"))
+        without_transcript = len(zoom_missing) - with_transcript
+        detail = f"Zoom: без аналитического отчета {len(zoom_missing)} созвонов"
+        if with_transcript:
+            detail += f", из них с transcript {with_transcript}"
+        if without_transcript:
+            detail += f", без transcript {without_transcript}"
+        errors.append(detail + ".")
+    if chat_errors:
+        errors.append(f"Чаты: ошибок генерации отчетов {len(chat_errors)}.")
+    if chat_missing:
+        errors.append(f"Чаты: нет daily-отчета по {len(chat_missing)} активным чатам.")
+    return errors
+
+
+def cascade_owner_daily(report_date: date, force: bool = False) -> dict[str, Any]:
+    if not postgres_enabled():
+        raise ValueError("Owner-отчеты доступны только в PostgreSQL.")
+    finalization_error = chat_day_finalization_error(report_date)
+    if finalization_error:
+        raise ValueError(finalization_error)
+    if report_date > latest_visible_report_date():
+        raise ValueError("Нельзя формировать owner-отчет за будущую или еще не закрытую дату.")
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    sync_info: dict[str, Any] = {}
+    if webhook_base:
+        try:
+            sync_info = sync_all_chat_dialogs_for_period(report_date, report_date, webhook_base, generate_reports=False)
+        except Exception as exc:  # noqa: BLE001
+            sync_info = {"error": str(exc)}
+    zoom_result = ensure_zoom_reports_for_period(report_date, report_date, force=force)
+    chat_daily_result = ensure_chat_daily_for_day(report_date, force=force)
+    partial_result = {
+        "report_date": report_date.isoformat(),
+        "sync_info": sync_info,
+        "zoom": zoom_result,
+        "chat_daily": chat_daily_result,
+    }
+    prerequisite_errors = owner_daily_prerequisite_errors(partial_result)
+    if prerequisite_errors:
+        raise OwnerPipelinePrerequisitesError(
+            "Owner-отчет не сформирован: сначала нужно закрыть источники. " + " ".join(prerequisite_errors),
+            partial_result,
+        )
+    owner = save_owner_daily_report(report_date)
+    return {
+        "report_date": report_date.isoformat(),
+        "sync_info": sync_info,
+        "zoom": zoom_result,
+        "chat_daily": chat_daily_result,
+        "owner_daily": owner,
+    }
+
+
+def cascade_owner_weekly(period_start: date, period_end: date, force: bool = False) -> dict[str, Any]:
+    if not postgres_enabled():
+        raise ValueError("Owner-отчеты доступны только в PostgreSQL.")
+    if not is_allowed_chat_weekly_period(period_start, period_end):
+        raise ValueError("Недельный период должен быть с понедельника по воскресенье.")
+    if period_end > latest_visible_report_date():
+        raise ValueError("Нельзя формировать owner-отчет за будущий или еще не закрытый период.")
+    days = _daterange(period_start, period_end)
+    daily_pipeline_results: list[dict[str, Any]] = []
+    for day in days:
+        try:
+            daily_pipeline_results.append(cascade_owner_daily(day, force=False))
+        except OwnerPipelinePrerequisitesError as exc:
+            daily_pipeline_results.append({
+                "report_date": day.isoformat(),
+                "error": str(exc),
+                "cascade": exc.cascade_result,
+            })
+        except Exception as exc:  # noqa: BLE001
+            daily_pipeline_results.append({"report_date": day.isoformat(), "error": str(exc)})
+    daily_errors = [item for item in daily_pipeline_results if item.get("error")]
+    if daily_errors:
+        raise OwnerPipelinePrerequisitesError(
+            f"Недельный owner-отчет не сформирован: дневная цепочка неполная, дней с ошибками {len(daily_errors)}.",
+            {
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "daily_chain": daily_pipeline_results,
+            },
+        )
+    chat_weekly_result = ensure_chat_weekly_for_period(period_start, period_end, force=force)
+    overall_weekly = ensure_chat_overall_weekly_for_period(period_start, period_end, force=force or bool(chat_weekly_result.get("reports_generated")))
+    owner_weekly = save_owner_weekly_report(period_start, period_end)
+    return {
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "daily_chain": daily_pipeline_results,
+        "chat_weekly": chat_weekly_result,
+        "chat_overall_weekly": overall_weekly,
+        "owner_weekly": owner_weekly,
+    }
+
+
+def owner_daily_report_to_dict(row: Any) -> dict[str, Any]:
+    generated_at = row.get("generated_at") if hasattr(row, "get") else None
+    if generated_at is None and hasattr(row, "get"):
+        generated_at = row.get("created_at")
+    raw_json = row.get("raw_json") if hasattr(row, "get") else row["raw_json"] if "raw_json" in row else None
+    return {
+        "report_id": str(row["id"]),
+        "report_date": row["report_date"].isoformat(),
+        "date_text": format_date_ru(row["report_date"]),
+        "version": int(row["version"] or 1),
+        "generated_at_text": format_datetime_ru(generated_at),
+        "summary": row.get("summary") if hasattr(row, "get") else row["summary"],
+        "dynamics_summary": row.get("dynamics_summary") if hasattr(row, "get") else row["dynamics_summary"],
+        "risks_summary": row.get("risks_summary") if hasattr(row, "get") else row["risks_summary"],
+        "recommendations": row.get("recommendations") if hasattr(row, "get") else row["recommendations"],
+        "report_text": (row.get("report_text") if hasattr(row, "get") else row["report_text"]) or "",
+        "raw_json": raw_json if isinstance(raw_json, dict) else {},
+    }
+
+
+def owner_weekly_report_to_dict(row: Any) -> dict[str, Any]:
+    generated_at = row.get("generated_at") if hasattr(row, "get") else None
+    if generated_at is None and hasattr(row, "get"):
+        generated_at = row.get("created_at")
+    raw_json = row.get("raw_json") if hasattr(row, "get") else row["raw_json"] if "raw_json" in row else None
+    return {
+        "report_id": str(row["id"]),
+        "period_start": row["period_start"].isoformat(),
+        "period_end": row["period_end"].isoformat(),
+        "period_text": f"{format_date_ru(row['period_start'])} - {format_date_ru(row['period_end'])}",
+        "version": int(row["version"] or 1),
+        "generated_at_text": format_datetime_ru(generated_at),
+        "summary": row.get("summary") if hasattr(row, "get") else row["summary"],
+        "dynamics_summary": row.get("dynamics_summary") if hasattr(row, "get") else row["dynamics_summary"],
+        "risks_summary": row.get("risks_summary") if hasattr(row, "get") else row["risks_summary"],
+        "recommendations": row.get("recommendations") if hasattr(row, "get") else row["recommendations"],
+        "report_text": (row.get("report_text") if hasattr(row, "get") else row["report_text"]) or "",
+        "raw_json": raw_json if isinstance(raw_json, dict) else {},
+    }
+
+
+def list_owner_daily_reports(limit: int = 50) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit or 50), 200))
+    ensure_owner_reports_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM owner_daily_reports
+                WHERE is_current = TRUE
+                ORDER BY report_date DESC, version DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+    return [owner_daily_report_to_dict(row) for row in rows]
+
+
+def list_owner_weekly_reports(limit: int = 50) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit or 50), 200))
+    ensure_owner_reports_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM owner_weekly_reports
+                WHERE is_current = TRUE
+                ORDER BY period_start DESC, period_end DESC, version DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+    return [owner_weekly_report_to_dict(row) for row in rows]
+
+
+def load_owner_daily_report(report_date: date) -> dict[str, Any] | None:
+    ensure_owner_reports_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM owner_daily_reports
+                WHERE report_date = %s
+                  AND is_current = TRUE
+                LIMIT 1
+                """,
+                (report_date,),
+            )
+            row = cur.fetchone()
+    return owner_daily_report_to_dict(row) if row else None
+
+
+def load_owner_daily_report_by_id(report_id: str) -> dict[str, Any] | None:
+    ensure_owner_reports_schema()
+    report_uuid = UUID(str(report_id))
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM owner_daily_reports
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (report_uuid,),
+            )
+            row = cur.fetchone()
+    return owner_daily_report_to_dict(row) if row else None
+
+
+def load_owner_weekly_report(period_start: date, period_end: date) -> dict[str, Any] | None:
+    ensure_owner_reports_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM owner_weekly_reports
+                WHERE period_start = %s
+                  AND period_end = %s
+                  AND is_current = TRUE
+                LIMIT 1
+                """,
+                (period_start, period_end),
+            )
+            row = cur.fetchone()
+    return owner_weekly_report_to_dict(row) if row else None
+
+
+def load_owner_weekly_report_by_id(report_id: str) -> dict[str, Any] | None:
+    ensure_owner_reports_schema()
+    report_uuid = UUID(str(report_id))
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM owner_weekly_reports
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (report_uuid,),
+            )
+            row = cur.fetchone()
+    return owner_weekly_report_to_dict(row) if row else None
+
+
+def format_owner_daily_report_for_bitrix(report: dict[str, Any]) -> str:
+    header = f"Ежедневный отчет {report.get('date_text') or report.get('report_date')}"
+    version = report.get("version")
+    if version:
+        header += f" · версия {version}"
+    parts = [f"[B]{header}[/B]"]
+    sections = [
+        ("SUMMARY", report.get("summary")),
+        ("DYNAMICS", report.get("dynamics_summary")),
+        ("RISKS", report.get("risks_summary")),
+        ("RECOMMENDATIONS", report.get("recommendations")),
+        ("ПОЛНЫЙ ТЕКСТ ОТЧЕТА", report.get("report_text")),
+    ]
+    for title, text in sections:
+        text = str(text or "").strip()
+        if text:
+            parts.append(f"\n[B]{title}[/B]\n{text}")
+    return "\n".join(parts)
+
+
+def owner_report_kind_title(report_kind: str) -> str:
+    return "Еженедельный отчет" if report_kind == "weekly" else "Ежедневный отчет"
+
+
+def owner_report_display_period(report: dict[str, Any], report_kind: str) -> str:
+    if report_kind == "weekly":
+        return str(report.get("period_text") or f"{report.get('period_start')} - {report.get('period_end')}")
+    return str(report.get("date_text") or report.get("report_date") or "")
+
+
+def owner_report_pdf_filename(report: dict[str, Any], report_kind: str) -> str:
+    if report_kind == "weekly":
+        start = str(report.get("period_start") or "period-start")
+        end = str(report.get("period_end") or "period-end")
+        return f"owner_weekly_report_{start}_{end}.pdf"
+    report_date = str(report.get("report_date") or "date")
+    return f"owner_daily_report_{report_date}.pdf"
+
+
+def load_owner_recommendations_for_bitrix(report_id: str, report_kind: str) -> dict[int, str]:
+    ensure_owner_reports_schema()
+    report_uuid = UUID(str(report_id))
+    if report_kind not in {"daily", "weekly"}:
+        raise ValueError("Неподдерживаемый тип owner-отчета.")
+    id_column = "owner_weekly_report_id" if report_kind == "weekly" else "owner_daily_report_id"
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT manager_bitrix_user_id, recommendation_text
+                FROM owner_manager_recommendations
+                WHERE {id_column} = %s
+                  AND manager_bitrix_user_id IS NOT NULL
+                  AND status NOT IN ('cancelled', 'done')
+                ORDER BY
+                  CASE priority
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    ELSE 4
+                  END,
+                  created_at
+                """,
+                (report_uuid,),
+            )
+            rows = cur.fetchall()
+    recommendations: dict[int, list[str]] = {}
+    for row in rows:
+        user_id = to_int(row.get("manager_bitrix_user_id"))
+        text = str(row.get("recommendation_text") or "").strip()
+        if user_id is None or not text:
+            continue
+        recommendations.setdefault(user_id, []).append(text)
+    return {user_id: "\n".join(items) for user_id, items in recommendations.items()}
+
+
+def load_owner_daily_recommendations_for_bitrix(report_id: str) -> dict[int, str]:
+    return load_owner_recommendations_for_bitrix(report_id, "daily")
+
+
+def is_bitrix_no_access_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "ERROR_NO_ACCESS" in text or "Вы не можете отправлять сообщения указанному получателю" in text
+
+
+def load_owner_report_by_id(report_id: str, report_kind: str) -> dict[str, Any] | None:
+    if report_kind == "daily":
+        return load_owner_daily_report_by_id(report_id)
+    if report_kind == "weekly":
+        return load_owner_weekly_report_by_id(report_id)
+    raise ValueError("Неподдерживаемый тип owner-отчета.")
+
+
+def normalize_bitrix_recipient_ids(recipient_ids: list[Any]) -> list[int]:
+    normalized_ids: list[int] = []
+    for item in recipient_ids:
+        user_id = to_int(item)
+        if user_id is not None and user_id not in normalized_ids:
+            normalized_ids.append(user_id)
+    if not normalized_ids:
+        raise ValueError("Выберите хотя бы одного получателя.")
+    return normalized_ids
+
+
+def bitrix_webhook_client() -> BitrixClient:
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if not webhook_base:
+        raise ValueError("Укажите BITRIX_WEBHOOK_BASE в .env для отправки в Bitrix.")
+    return BitrixClient(webhook_base)
+
+
+def send_owner_report_recommendations_to_bitrix(
+    report_id: str,
+    report_kind: str,
+    recipient_ids: list[Any],
+    recipient_recommendations: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    report = load_owner_report_by_id(report_id, report_kind)
+    if not report:
+        raise ValueError(f"{owner_report_kind_title(report_kind)} не найден.")
+    normalized_ids = normalize_bitrix_recipient_ids(recipient_ids)
+    client = bitrix_webhook_client()
+    recommendation_texts = load_owner_recommendations_for_bitrix(report_id, report_kind)
+    if isinstance(recipient_recommendations, dict):
+        for key, value in recipient_recommendations.items():
+            user_id = to_int(key)
+            text = str(value or "").strip()
+            if user_id is not None and text:
+                recommendation_texts[user_id] = text
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for user_id in normalized_ids:
+        message = str(recommendation_texts.get(user_id) or "").strip()
+        if not message:
+            errors.append({"user_id": user_id, "error": "Для получателя нет адресной рекомендации."})
+            continue
+        try:
+            response = client.call_with_fallback(
+                "im.message.add",
+                {"DIALOG_ID": str(user_id), "MESSAGE": message},
+                prefer_api=True,
+            )
+            results.append({"user_id": user_id, "channel": "bitrix_im", "response": response.get("result")})
+        except Exception as exc:  # noqa: BLE001
+            if not is_bitrix_no_access_error(exc):
+                errors.append({"user_id": user_id, "error": str(exc)})
+                continue
+            try:
+                response = client.call_with_fallback(
+                    "im.notify.personal.add",
+                    {"USER_ID": user_id, "MESSAGE": message},
+                    prefer_api=True,
+                )
+                results.append({"user_id": user_id, "channel": "bitrix_notification", "response": response.get("result")})
+            except Exception as notify_exc:  # noqa: BLE001
+                errors.append({
+                    "user_id": user_id,
+                    "error": (
+                        "Нет доступа к личному диалогу Bitrix, и персональное уведомление тоже не отправлено. "
+                        f"im.message.add: {exc}; im.notify.personal.add: {notify_exc}"
+                    ),
+                })
+    return {
+        "report": report,
+        "report_kind": report_kind,
+        "sent": len(results),
+        "failed": len(errors),
+        "results": results,
+        "errors": errors,
+    }
+
+
+def send_owner_daily_report_to_bitrix(
+    report_id: str,
+    recipient_ids: list[Any],
+    recipient_recommendations: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return send_owner_report_recommendations_to_bitrix(report_id, "daily", recipient_ids, recipient_recommendations)
+
+
+def reportlab_font_paths() -> tuple[str, str]:
+    regular_candidates = [
+        Path("C:/Windows/Fonts/arial.ttf"),
+        Path("C:/Windows/Fonts/DejaVuSans.ttf"),
+    ]
+    bold_candidates = [
+        Path("C:/Windows/Fonts/arialbd.ttf"),
+        Path("C:/Windows/Fonts/DejaVuSans-Bold.ttf"),
+    ]
+    regular = next((str(path) for path in regular_candidates if path.exists()), "")
+    bold = next((str(path) for path in bold_candidates if path.exists()), regular)
+    if not regular:
+        raise RuntimeError("Не найден TTF-шрифт для кириллицы: Arial или DejaVuSans.")
+    return regular, bold
+
+
+def clean_report_markdown(text: Any) -> str:
+    return (
+        str(text or "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\u00a0", " ")
+        .strip()
+    )
+
+
+def report_inline_text(text: str) -> str:
+    return re.sub(r"\*\*([^*]+)\*\*", r"\1", text).strip()
+
+
+def is_markdown_table_line(line: str) -> bool:
+    stripped = line.strip()
+    if "|" not in stripped:
+        return False
+    return len(split_markdown_table_row(stripped)) >= 2
+
+
+def is_markdown_table_separator(line: str) -> bool:
+    stripped = line.strip().strip("|").strip()
+    return bool(stripped) and all(ch in "-:| " for ch in stripped)
+
+
+def split_markdown_table_row(line: str) -> list[str]:
+    return [report_inline_text(cell.strip()) for cell in line.strip().strip("|").split("|")]
+
+
+def build_owner_report_pdf(report: dict[str, Any], report_kind: str) -> bytes:
+    from io import BytesIO
+
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    regular_font, bold_font = reportlab_font_paths()
+    if "ReportSans" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont("ReportSans", regular_font))
+    if "ReportSansBold" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont("ReportSansBold", bold_font))
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=16 * mm,
+        leftMargin=16 * mm,
+        topMargin=16 * mm,
+        bottomMargin=16 * mm,
+        title=f"{owner_report_kind_title(report_kind)} {owner_report_display_period(report, report_kind)}",
+    )
+    styles = getSampleStyleSheet()
+    base = ParagraphStyle(
+        "ReportBase",
+        parent=styles["BodyText"],
+        fontName="ReportSans",
+        fontSize=9.5,
+        leading=14,
+        textColor=colors.HexColor("#1f2937"),
+        alignment=TA_LEFT,
+        spaceAfter=5,
+    )
+    title_style = ParagraphStyle("ReportTitle", parent=base, fontName="ReportSansBold", fontSize=20, leading=25, textColor=colors.HexColor("#111827"), spaceAfter=8)
+    subtitle_style = ParagraphStyle("ReportSubtitle", parent=base, fontSize=11, leading=15, textColor=colors.HexColor("#64748b"), spaceAfter=12)
+    section_style = ParagraphStyle("ReportSection", parent=base, fontName="ReportSansBold", fontSize=13.5, leading=18, textColor=colors.HexColor("#111827"), spaceBefore=10, spaceAfter=6)
+    h_style = ParagraphStyle("ReportHeading", parent=base, fontName="ReportSansBold", fontSize=12, leading=16, textColor=colors.HexColor("#111827"), spaceBefore=8, spaceAfter=4)
+    bullet_style = ParagraphStyle("ReportBullet", parent=base, leftIndent=10, firstLineIndent=-6)
+    small_style = ParagraphStyle("ReportSmall", parent=base, fontSize=8.5, leading=12, textColor=colors.HexColor("#475569"))
+
+    story: list[Any] = []
+    story.append(Paragraph(owner_report_kind_title(report_kind), title_style))
+    story.append(Paragraph(owner_report_display_period(report, report_kind), subtitle_style))
+    if report.get("version"):
+        story.append(Paragraph(f"Версия: {report.get('version')} · Сформирован: {report.get('generated_at_text') or '-'}", small_style))
+        story.append(Spacer(1, 6))
+
+    summary_rows = [
+        ("Главный вывод", report.get("summary")),
+        ("Динамика", report.get("dynamics_summary")),
+        ("Риски", report.get("risks_summary")),
+        ("Рекомендации", report.get("recommendations")),
+    ]
+    for title, text in summary_rows:
+        cleaned = clean_report_markdown(text)
+        if not cleaned:
+            continue
+        story.append(Paragraph(title, section_style))
+        story.append(Paragraph(report_inline_text(cleaned).replace("\n", "<br/>"), base))
+
+    full_text = clean_report_markdown(report.get("report_text"))
+    if full_text:
+        story.append(PageBreak())
+        story.append(Paragraph("Полный текст отчета", title_style))
+        table_lines: list[str] = []
+
+        def flush_table() -> None:
+            nonlocal table_lines
+            if not table_lines:
+                return
+            rows = [
+                split_markdown_table_row(line)
+                for line in table_lines
+                if not is_markdown_table_separator(line)
+            ]
+            rows = [row for row in rows if len(row) >= 2 and any(row)]
+            table_lines = []
+            if not rows:
+                return
+            col_count = max(len(row) for row in rows)
+            normalized = [row + [""] * (col_count - len(row)) for row in rows]
+            page_width = A4[0] - doc.leftMargin - doc.rightMargin
+            col_widths = [page_width / col_count] * col_count
+            table_data = [
+                [Paragraph(cell.replace("\n", "<br/>"), small_style if row_index else ParagraphStyle("TableHeader", parent=small_style, fontName="ReportSansBold", textColor=colors.white)) for cell in row]
+                for row_index, row in enumerate(normalized)
+            ]
+            table = Table(table_data, colWidths=col_widths, repeatRows=1)
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#334155")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#f8fafc")),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#cbd5e1")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story.append(Spacer(1, 5))
+            story.append(table)
+            story.append(Spacer(1, 8))
+
+        for raw_line in full_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                flush_table()
+                story.append(Spacer(1, 4))
+                continue
+            if is_markdown_table_line(line):
+                table_lines.append(line)
+                continue
+            flush_table()
+            heading = re.match(r"^(#{1,6})\s+(.+)$", line)
+            if heading:
+                story.append(Paragraph(report_inline_text(heading.group(2)), h_style))
+                continue
+            bullet = re.match(r"^[-*—]\s+(.+)$", line)
+            if bullet:
+                story.append(Paragraph(f"• {report_inline_text(bullet.group(1))}", bullet_style))
+                continue
+            story.append(Paragraph(report_inline_text(line), base))
+        flush_table()
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def bitrix_storage_id_for_reports(client: BitrixClient) -> int:
+    env_value = to_int(os.getenv("BITRIX_REPORTS_STORAGE_ID", ""))
+    if env_value is not None:
+        return env_value
+    data = client.call_with_fallback("disk.storage.getlist", {}, prefer_api=False)
+    storages = data.get("result") if isinstance(data, dict) else None
+    if isinstance(storages, dict):
+        storages = list(storages.values())
+    if not isinstance(storages, list) or not storages:
+        raise RuntimeError("Bitrix не вернул доступные хранилища Диска.")
+    preferred = None
+    for item in storages:
+        if not isinstance(item, dict):
+            continue
+        entity_type = str(item.get("ENTITY_TYPE") or item.get("entityType") or "").lower()
+        if entity_type in {"user", "common"}:
+            preferred = item
+            break
+    preferred = preferred or next((item for item in storages if isinstance(item, dict)), None)
+    storage_id = to_int((preferred or {}).get("ID") or (preferred or {}).get("id"))
+    if storage_id is None:
+        raise RuntimeError("Не удалось определить ID хранилища Bitrix Disk.")
+    return storage_id
+
+
+def upload_pdf_to_bitrix_disk(client: BitrixClient, filename: str, pdf_bytes: bytes, recipient_ids: list[int]) -> dict[str, Any]:
+    storage_id = bitrix_storage_id_for_reports(client)
+    rights = [{"TASK_ID": 79, "ACCESS_CODE": f"U{user_id}"} for user_id in recipient_ids]
+    payload = {
+        "id": storage_id,
+        "data": {"NAME": filename},
+        "fileContent": [filename, base64.b64encode(pdf_bytes).decode("ascii")],
+        "generateUniqueName": True,
+    }
+    if rights:
+        payload["rights"] = rights
+    data = client.call_with_fallback("disk.storage.uploadfile", payload, prefer_api=False)
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        raise RuntimeError("Bitrix не вернул данные загруженного PDF.")
+    file_id = to_int(result.get("ID") or result.get("id"))
+    if file_id is None:
+        raise RuntimeError("Bitrix не вернул ID загруженного PDF.")
+    return result
+
+
+def send_owner_report_pdf_to_bitrix(report_id: str, report_kind: str, recipient_ids: list[Any]) -> dict[str, Any]:
+    report = load_owner_report_by_id(report_id, report_kind)
+    if not report:
+        raise ValueError(f"{owner_report_kind_title(report_kind)} не найден.")
+    normalized_ids = normalize_bitrix_recipient_ids(recipient_ids)
+    client = bitrix_webhook_client()
+    pdf_bytes = build_owner_report_pdf(report, report_kind)
+    filename = owner_report_pdf_filename(report, report_kind)
+    uploaded_file = upload_pdf_to_bitrix_disk(client, filename, pdf_bytes, normalized_ids)
+    file_id = to_int(uploaded_file.get("ID") or uploaded_file.get("id"))
+    if file_id is None:
+        raise RuntimeError("Не удалось определить ID PDF после загрузки.")
+    message = f"{owner_report_kind_title(report_kind)}: {owner_report_display_period(report, report_kind)}. Полный отчет во вложении PDF."
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for user_id in normalized_ids:
+        try:
+            response = client.call_with_fallback(
+                "im.disk.file.commit",
+                {"DIALOG_ID": str(user_id), "FILE_ID": [file_id], "MESSAGE": message},
+                prefer_api=True,
+            )
+            results.append({"user_id": user_id, "channel": "bitrix_im_file", "response": response.get("result")})
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"user_id": user_id, "error": str(exc)})
+    return {
+        "report": report,
+        "report_kind": report_kind,
+        "filename": filename,
+        "file_id": file_id,
+        "pdf_size": len(pdf_bytes),
+        "sent": len(results),
+        "failed": len(errors),
+        "results": results,
+        "errors": errors,
+    }
+
+
+def is_monday_to_sunday_period(period_start: date, period_end: date) -> bool:
+    return period_start.weekday() == 0 and period_end == period_start + timedelta(days=6)
+
+
+def is_startup_chat_weekly_period(period_start: date, period_end: date) -> bool:
+    return (period_start, period_end) == STARTUP_CHAT_WEEKLY_PERIOD
+
+
+def is_allowed_chat_weekly_period(period_start: date, period_end: date) -> bool:
+    return is_monday_to_sunday_period(period_start, period_end)
+
+
+def list_chat_overall_weekly_reports(limit: int = 20) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit or 20), 100))
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM chat_overall_weekly_reports
+                WHERE is_current = TRUE
+                ORDER BY period_start DESC, version DESC
+                LIMIT 200
+                """,
+            )
+            rows = cur.fetchall()
+    reports = []
+    for row in rows:
+        if not is_allowed_chat_weekly_period(row["period_start"], row["period_end"]):
+            continue
+        reports.append(chat_overall_weekly_report_to_dict(row))
+        if len(reports) >= limit:
+            break
+    return reports
+
+
+STATUS_LABELS = {
+    1: "Новая",
+    2: "Ждет выполнения",
+    3: "В работе",
+    4: "Ждет контроля",
+    5: "Завершена",
+    6: "Отложена",
+    7: "Отклонена",
+}
+
+STATUS_LABELS_V3 = {
+    "pending": "Ждет выполнения",
+    "inProgress": "В работе",
+    "in_progress": "В работе",
+    "supposedlyCompleted": "Ждет контроля",
+    "supposedly_completed": "Ждет контроля",
+    "completed": "Завершена",
+    "deferred": "Отложена",
+    "declined": "Отклонена",
+    "new": "Новая",
+}
+
+
+def first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def nested_get(data: dict[str, Any], dotted_key: str) -> Any:
+    current: Any = data
+    for key in dotted_key.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+        if current is None:
+            return None
+    return current
+
+
+def pick(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in data and data[key] not in (None, ""):
+            return data[key]
+        if "." in key:
+            value = nested_get(data, key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def to_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def to_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, set):
+        return list(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+                return parsed if isinstance(parsed, list) else [parsed]
+            except json.JSONDecodeError:
+                pass
+        return [piece.strip() for piece in stripped.split(",") if piece.strip()]
+    return [value]
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    candidates = [text]
+    if " " in text and "T" not in text:
+        candidates.append(text.replace(" ", "T"))
+
+    for candidate in candidates:
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def make_aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=LOCAL_TZ)
+    return dt
+
+
+def normalize_status(status_code: Any) -> dict[str, Any]:
+    if isinstance(status_code, str):
+        cleaned = status_code.strip()
+        if cleaned:
+            return {
+                "code": cleaned,
+                "label": STATUS_LABELS_V3.get(cleaned, cleaned),
+            }
+    code = to_int(status_code)
+    return {
+        "code": code if code is not None else status_code,
+        "label": STATUS_LABELS.get(code, "Неизвестно"),
+    }
+
+
+def is_fallback_person_name(name: Any) -> bool:
+    if not name:
+        return True
+    text = str(name).strip().lower()
+    return text.startswith("user ") or text.startswith("пользователь ")
+
+
+def format_person_name(profile: dict[str, Any], fallback_name: Any = None) -> str | None:
+    first = first_non_empty(pick(profile, "NAME", "name"))
+    last = first_non_empty(pick(profile, "LAST_NAME", "lastName"))
+    second = first_non_empty(pick(profile, "SECOND_NAME", "secondName"))
+    full_from_profile = " ".join(str(x).strip() for x in (first, second, last) if x).strip()
+    if full_from_profile:
+        return full_from_profile
+
+    fallback_text = str(fallback_name).strip() if fallback_name is not None else ""
+    if fallback_text and not is_fallback_person_name(fallback_text):
+        return fallback_text
+    return None
+
+
+def normalize_person_label(name: Any, person_id: int | None) -> str:
+    if name and not is_fallback_person_name(name):
+        return str(name).strip()
+    if person_id:
+        return f"Пользователь {person_id}"
+    return "Не назначен"
+
+
+def repair_db_status_labels() -> None:
+    """Fix labels written before the app used proper UTF-8 Russian strings."""
+    with db_connect() as conn:
+        for table in ("tasks", "task_snapshots"):
+            rows = conn.execute(
+                f"SELECT rowid AS db_rowid, status_code, raw_json FROM {table}"
+            ).fetchall()
+            for row in rows:
+                status = normalize_status(row["status_code"])
+                raw_json = row["raw_json"]
+                if raw_json:
+                    try:
+                        record = json.loads(raw_json)
+                        record_status = record.get("status")
+                        if isinstance(record_status, dict):
+                            record_status["label"] = status["label"]
+                            record_status["code"] = status["code"]
+                        raw_json = json.dumps(record, ensure_ascii=False)
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+                conn.execute(
+                    f"UPDATE {table} SET status_label = ?, raw_json = ? WHERE rowid = ?",
+                    (status["label"], raw_json, row["db_rowid"]),
+                )
+
+
+def repair_db_checklist_counts() -> None:
+    with db_connect() as conn:
+        for table in ("tasks", "task_snapshots"):
+            rows = conn.execute(
+                f"SELECT rowid AS db_rowid, raw_json FROM {table}"
+            ).fetchall()
+            for row in rows:
+                try:
+                    record = json.loads(row["raw_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                counts = task_counts(record)
+                conn.execute(
+                    f"UPDATE {table} SET checklist_count = ? WHERE rowid = ?",
+                    (counts["checklist_count"], row["db_rowid"]),
+                )
+
+
+def repair_db_chat_columns() -> None:
+    with db_connect() as conn:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(chats)").fetchall()
+        }
+        if "is_excluded" not in columns:
+            conn.execute("ALTER TABLE chats ADD COLUMN is_excluded INTEGER DEFAULT 0")
+
+
+def format_datetime_ru(value: Any) -> str:
+    if value in (None, ""):
+        return "-"
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return str(value)
+    return parsed.strftime("%d.%m.%Y %H:%M")
+
+
+def format_date_ru(value: Any) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        if isinstance(value, date):
+            parsed = value
+        else:
+            parsed = date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return str(value)
+    return parsed.strftime("%d.%m.%Y")
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    markers = (
+        "query_limit_exceeded",
+        "too many requests",
+        "service temporarily unavailable",
+        "429",
+        "503",
+    )
+    return any(marker in message for marker in markers)
+
+
+def period_bounds(date_from: date, date_to: date) -> tuple[datetime, datetime]:
+    start = datetime.combine(date_from, dt_time.min)
+    end = datetime.combine(date_to, dt_time.max)
+    start_aw = make_aware(start) or start
+    end_aw = make_aware(end) or end
+    return start_aw, end_aw
+
+
+def is_dt_in_period(value: datetime | None, start: datetime, end: datetime) -> bool:
+    if value is None:
+        return False
+    return start <= value <= end
+
+
+def base_task_matches_period(base_task: dict[str, Any], start: datetime, end: datetime) -> bool:
+    created = make_aware(parse_datetime(pick(base_task, "created", "CREATED_DATE")))
+    changed = make_aware(parse_datetime(pick(base_task, "changed", "CHANGED_DATE")))
+    closed = make_aware(parse_datetime(pick(base_task, "closed", "CLOSED_DATE")))
+    deadline = make_aware(parse_datetime(pick(base_task, "deadline", "DEADLINE")))
+
+    # Include by any key event date inside period.
+    if any(
+        is_dt_in_period(point, start, end)
+        for point in (created, changed, closed, deadline)
+    ):
+        return True
+
+    # Include by active interval overlap: task existed during period.
+    if created is not None:
+        active_start = created
+        active_end = closed
+        if active_start <= end and (active_end is None or active_end >= start):
+            return True
+
+    return False
+
+
+def base_task_created_in_period(base_task: dict[str, Any], start: datetime, end: datetime) -> bool:
+    created = make_aware(parse_datetime(pick(base_task, "created", "createdDate", "CREATED_DATE")))
+    return is_dt_in_period(created, start, end)
+
+
+def is_unfinished_status_code(status_code: Any) -> bool:
+    if status_code is None or status_code == "":
+        return True
+    if isinstance(status_code, str):
+        normalized = status_code.strip().lower().replace("_", "").replace(" ", "")
+        return normalized not in {"5", "completed", "complete", "done", "7", "declined", "rejected"}
+    numeric_status = to_int(status_code)
+    if numeric_status is not None:
+        return numeric_status not in {5, 7}
+    return True
+
+
+def load_unfinished_registry_task_ids() -> list[int]:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT bitrix_task_id
+                    FROM bitrix_tasks
+                    WHERE closed_at_bitrix IS NULL
+                      AND COALESCE(status, '') NOT IN ('5', '7', 'completed', 'declined')
+                    ORDER BY COALESCE(updated_at_bitrix, created_at_bitrix, created_at) DESC
+                    LIMIT 1000
+                    """
+                )
+                return [int(row["bitrix_task_id"]) for row in cur.fetchall() if row["bitrix_task_id"] is not None]
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT task_id
+            FROM tasks
+            WHERE (closed_date IS NULL OR closed_date = '')
+              AND COALESCE(status_code, '') NOT IN ('5', '7', 'completed', 'declined')
+            ORDER BY COALESCE(changed_date, created_date, first_seen_at) DESC
+            LIMIT 1000
+            """
+        ).fetchall()
+    return [int(row["task_id"]) for row in rows if row["task_id"] is not None]
+
+
+def merge_tasks_by_id(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[int, dict[str, Any]] = {}
+    order: list[int] = []
+    for task in tasks:
+        task_id = extract_task_id(task)
+        if task_id is None:
+            continue
+        if task_id not in merged:
+            order.append(task_id)
+        merged[task_id] = task
+    return [merged[task_id] for task_id in order]
+
+
+def week_code_today() -> str:
+    iso = date.today().isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def default_period() -> tuple[date, date]:
+    today = msk_today()
+    return today - timedelta(days=7), today
+
+
+def parse_date_field(value: str, field_name: str) -> date:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"Некорректная дата в поле {field_name}")
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        pass
+    # Support RU-like inputs: DD.MM and DD.MM.YYYY
+    parts = raw.split(".")
+    if len(parts) == 2:
+        day_text, month_text = parts
+        try:
+            return date(msk_today().year, int(month_text), int(day_text))
+        except ValueError as exc:
+            raise ValueError(f"Некорректная дата в поле {field_name}") from exc
+    if len(parts) == 3:
+        day_text, month_text, year_text = parts
+        try:
+            year = int(year_text)
+            if year < 100:
+                year += 2000
+            return date(year, int(month_text), int(day_text))
+        except ValueError as exc:
+            raise ValueError(f"Некорректная дата в поле {field_name}") from exc
+    raise ValueError(f"Некорректная дата в поле {field_name}")
+
+
+def parse_period(date_from_text: str, date_to_text: str, max_days: int = 30) -> tuple[date, date]:
+    date_from = parse_date_field(date_from_text, "date_from")
+    date_to = parse_date_field(date_to_text, "date_to")
+    if date_to < date_from:
+        raise ValueError("Дата окончания не может быть раньше даты начала")
+    days_count = (date_to - date_from).days + 1
+    if days_count > max_days:
+        raise ValueError(f"Период не может быть длиннее {max_days} дней")
+    return date_from, date_to
+
+
+def parse_week_code(week_code: str) -> tuple[date, date]:
+    if "-W" not in week_code:
+        raise ValueError("Формат недели должен быть YYYY-Www")
+    year_text, week_text = week_code.split("-W", 1)
+    year = int(year_text)
+    week = int(week_text)
+    monday = date.fromisocalendar(year, week, 1)
+    sunday = monday + timedelta(days=6)
+    return monday, sunday
+
+
+class BitrixClient:
+    def __init__(self, webhook_base: str):
+        base = webhook_base.strip().rstrip("/")
+        if not base:
+            raise ValueError("BITRIX_WEBHOOK_BASE пустой")
+        self.webhook_base = base
+        self.session = requests.Session()
+        self.user_cache: dict[int, dict[str, Any]] = {}
+        self.department_cache: dict[int, dict[str, Any]] = {}
+        self.methods_cache: set[str] | None = None
+        self.scopes_cache: set[str] | None = None
+        self.request_delay = float(os.getenv("BITRIX_REQUEST_DELAY", "0.55"))
+        self.max_retries = int(os.getenv("BITRIX_MAX_RETRIES", "7"))
+
+    def _url(self, method: str, use_api: bool) -> str:
+        base = self.webhook_base
+        if use_api and "/rest/" in base and "/rest/api/" not in base:
+            base = base.replace("/rest/", "/rest/api/")
+        return f"{base}/{method}"
+
+    def call(self, method: str, payload: dict[str, Any] | None = None, use_api: bool = False) -> dict[str, Any]:
+        url = self._url(method, use_api=use_api)
+        response = self.session.post(url, json=payload or {}, timeout=60)
+        if not response.ok:
+            raise RuntimeError(f"{method}: HTTP {response.status_code} {response.text[:500]}")
+        data = response.json()
+        if isinstance(data, dict) and "error" in data:
+            err = data.get("error")
+            err_desc = data.get("error_description")
+            raise RuntimeError(f"{method}: {err} ({err_desc})")
+        if not isinstance(data, dict):
+            raise RuntimeError(f"{method}: неожиданный формат ответа")
+        return data
+
+    def call_with_fallback(
+        self,
+        method: str,
+        payload: dict[str, Any] | None = None,
+        prefer_api: bool = False,
+    ) -> dict[str, Any]:
+        attempts = [prefer_api, not prefer_api]
+        last_error: Exception | None = None
+        tried = set()
+        for use_api in attempts:
+            if use_api in tried:
+                continue
+            tried.add(use_api)
+            try:
+                return self.call(method, payload=payload, use_api=use_api)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"{method}: вызов завершился ошибкой без деталей")
+
+    def call_with_retry(
+        self,
+        method: str,
+        payload: dict[str, Any] | None = None,
+        use_api: bool = False,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self.call(method, payload=payload, use_api=use_api)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if not is_rate_limit_error(exc):
+                    raise
+                if attempt >= self.max_retries:
+                    raise
+                backoff = min(1.5 * (attempt + 1), 10.0)
+                time.sleep(backoff)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"{method}: исчерпаны попытки повтора")
+
+    def batch_commands(self, commands: dict[str, str]) -> dict[str, Any]:
+        if not commands:
+            return {"result": {}, "errors": {}}
+        data = self.call_with_retry("batch", {"halt": 0, "cmd": commands}, use_api=False)
+        batch_result = data.get("result", {})
+        result = batch_result.get("result", {}) if isinstance(batch_result, dict) else {}
+        errors = batch_result.get("result_error", {}) if isinstance(batch_result, dict) else {}
+        return {
+            "result": result if isinstance(result, dict) else {},
+            "errors": errors if isinstance(errors, dict) else {},
+        }
+
+    @staticmethod
+    def _is_method_missing_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        markers = (
+            "error_method_not_found",
+            "method not found",
+            "no such method",
+            "method is not defined",
+            "метод не найден",
+        )
+        return any(marker in message for marker in markers)
+
+    def get_available_methods(self) -> set[str]:
+        if self.methods_cache is not None:
+            return self.methods_cache
+        methods: set[str] = set()
+        for payload in ({"full": True}, {}):
+            try:
+                data = self.call_with_fallback("methods", payload, prefer_api=False)
+                raw = data.get("result", [])
+                if isinstance(raw, list):
+                    methods.update(str(item) for item in raw if isinstance(item, str))
+                elif isinstance(raw, dict):
+                    for value in raw.values():
+                        if isinstance(value, list):
+                            methods.update(str(item) for item in value if isinstance(item, str))
+                if methods:
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        self.methods_cache = methods
+        return methods
+
+    def get_scopes(self) -> set[str]:
+        if self.scopes_cache is not None:
+            return self.scopes_cache
+        scopes: set[str] = set()
+        for method_name in ("scope", "scope.json"):
+            try:
+                data = self.call(method_name, payload={}, use_api=False)
+                raw = data.get("result", [])
+                if isinstance(raw, list):
+                    scopes = {str(item) for item in raw if isinstance(item, str)}
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        self.scopes_cache = scopes
+        return scopes
+
+    @staticmethod
+    def _extract_task_page(data: dict[str, Any]) -> list[dict[str, Any]]:
+        result = data.get("result", data)
+        raw_items: list[Any] = []
+        if isinstance(result, list):
+            raw_items = result
+        elif isinstance(result, dict):
+            for key in ("tasks", "items", "list"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    raw_items = value
+                    break
+            if not raw_items:
+                numeric_values: list[Any] = []
+                for key, value in result.items():
+                    if str(key).isdigit():
+                        numeric_values.append(value)
+                if numeric_values:
+                    raw_items = numeric_values
+
+        page: list[dict[str, Any]] = []
+        for item in raw_items:
+            if isinstance(item, dict):
+                page.append(item)
+                continue
+            if isinstance(item, (list, tuple)):
+                if len(item) >= 2 and isinstance(item[1], dict):
+                    converted = dict(item[1])
+                    if "ID" not in converted and "id" not in converted:
+                        converted["ID"] = item[0]
+                    page.append(converted)
+                elif len(item) == 1 and isinstance(item[0], dict):
+                    page.append(item[0])
+        return page
+
+    @staticmethod
+    def _extract_list_result(data: dict[str, Any], *keys: str) -> list[dict[str, Any]]:
+        result = data.get("result", data)
+        raw_items: Any = result
+        if isinstance(result, dict):
+            raw_items = []
+            for key in keys:
+                value = result.get(key)
+                if isinstance(value, list):
+                    raw_items = value
+                    break
+            if not raw_items:
+                for key in ("items", "users", "list"):
+                    value = result.get(key)
+                    if isinstance(value, list):
+                        raw_items = value
+                        break
+        if not isinstance(raw_items, list):
+            return []
+        return [item for item in raw_items if isinstance(item, dict)]
+
+    def list_recent_chats(self) -> list[dict[str, Any]]:
+        chats_by_dialog: dict[str, dict[str, Any]] = {}
+        limit = 200
+        max_pages = int(os.getenv("BITRIX_CHAT_MAX_PAGES", "20"))
+        for page in range(max_pages):
+            payload = {
+                "SKIP_OPENLINES": "Y",
+                "SKIP_DIALOG": "Y",
+                "SKIP_CHAT": "N",
+                "SKIP_UNDISTRIBUTED_OPENLINES": "Y",
+                "ONLY_COPILOT": "N",
+                "ONLY_CHANNEL": "N",
+                "OFFSET": page * limit,
+                "LIMIT": limit,
+            }
+            data = self.call_with_fallback("im.recent.list", payload, prefer_api=True)
+            items = self._extract_list_result(data, "items")
+            if not items:
+                break
+            for item in items:
+                dialog_id = str(first_non_empty(item.get("id"), item.get("dialog_id"), item.get("dialogId")) or "")
+                chat_id = to_int(first_non_empty(item.get("chat_id"), item.get("chatId")))
+                item_type = str(item.get("type") or "").lower()
+                if not dialog_id and chat_id is not None:
+                    dialog_id = f"chat{chat_id}"
+                if not (dialog_id.startswith("chat") or dialog_id.startswith("sg")):
+                    continue
+                if item_type in {"user", "private", "dialog"}:
+                    continue
+                chats_by_dialog[dialog_id] = item
+            if len(items) < limit:
+                break
+            time.sleep(self.request_delay)
+        return list(chats_by_dialog.values())
+
+    def get_dialog_users(self, dialog_id: str) -> list[dict[str, Any]]:
+        users: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        limit = 200
+        offset = 0
+        while True:
+            payload = {
+                "DIALOG_ID": dialog_id,
+                "SKIP_EXTERNAL": "Y",
+                "LIMIT": limit,
+                "OFFSET": offset,
+            }
+            data = self.call_with_fallback("im.dialog.users.list", payload, prefer_api=True)
+            page = self._extract_list_result(data, "users")
+            if not page:
+                break
+            for user in page:
+                user_id = to_int(user.get("id"))
+                if user_id is None or user_id in seen_ids:
+                    continue
+                seen_ids.add(user_id)
+                users.append(user)
+            if len(page) < limit:
+                break
+            offset += limit
+            time.sleep(self.request_delay)
+        return users
+
+    def list_users(self, active_only: bool = True) -> list[dict[str, Any]]:
+        users: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        start: int | None = 0
+        max_pages = int(os.getenv("BITRIX_USER_MAX_PAGES", "50"))
+        for _ in range(max_pages):
+            payload: dict[str, Any] = {
+                "sort": "LAST_NAME",
+                "order": "ASC",
+            }
+            if active_only:
+                payload["FILTER"] = {"ACTIVE": True}
+            if start is not None:
+                payload["start"] = start
+            data = self.call_with_fallback("user.get", payload, prefer_api=False)
+            items = self._extract_list_result(data)
+            if not items:
+                break
+            for item in items:
+                user_id = to_int(first_non_empty(item.get("ID"), item.get("id")))
+                if user_id is None or user_id in seen_ids:
+                    continue
+                seen_ids.add(user_id)
+                users.append(item)
+            next_value = data.get("next")
+            if next_value is None:
+                result = data.get("result")
+                if isinstance(result, dict):
+                    next_value = result.get("next")
+            start = to_int(next_value)
+            if start is None:
+                break
+            time.sleep(self.request_delay)
+        return users
+
+    def search_dialog_messages_for_day(self, dialog_id: str, target_date: date) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+        try:
+            return self._search_dialog_messages_for_day(dialog_id, target_date)
+        except Exception:
+            return self._get_dialog_messages_for_day(dialog_id, target_date)
+
+    def get_dialog_messages_for_period(self, dialog_id: str, date_from: date, date_to: date) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+        messages: list[dict[str, Any]] = []
+        users_by_id: dict[int, dict[str, Any]] = {}
+        files_by_id: dict[int, dict[str, Any]] = {}
+        last_id: int | None = None
+        limit = 50
+        max_pages = int(os.getenv("BITRIX_CHAT_MESSAGE_MAX_PAGES", "200"))
+
+        for _ in range(max_pages):
+            payload: dict[str, Any] = {"DIALOG_ID": dialog_id, "LIMIT": limit}
+            if last_id is not None:
+                payload["LAST_ID"] = last_id
+            data = self.call_with_fallback("im.dialog.messages.get", payload, prefer_api=True)
+            result = data.get("result", {})
+            page_messages = self._extract_list_result(data, "messages")
+            raw_users = result.get("users", []) if isinstance(result, dict) else []
+            raw_files = result.get("files", []) if isinstance(result, dict) else []
+            if isinstance(raw_users, list):
+                for user in raw_users:
+                    if isinstance(user, dict):
+                        user_id = to_int(user.get("id"))
+                        if user_id is not None:
+                            users_by_id[user_id] = user
+            if isinstance(raw_files, list):
+                for file_item in raw_files:
+                    if isinstance(file_item, dict):
+                        file_id = to_int(file_item.get("id"))
+                        if file_id is not None:
+                            files_by_id[file_id] = file_item
+            if not page_messages:
+                break
+
+            oldest_id = None
+            reached_older_than_period = False
+            for message in page_messages:
+                message_id = to_int(message.get("id"))
+                if message_id is not None:
+                    oldest_id = message_id if oldest_id is None else min(oldest_id, message_id)
+                parsed = parse_datetime(message.get("date"))
+                if parsed is None:
+                    continue
+                message_day = parsed.date()
+                if date_from <= message_day <= date_to:
+                    messages.append(message)
+                elif message_day < date_from:
+                    reached_older_than_period = True
+
+            if oldest_id is None or reached_older_than_period:
+                break
+            if len(page_messages) < limit:
+                break
+            last_id = oldest_id
+            time.sleep(self.request_delay)
+
+        messages.sort(key=lambda item: (parse_datetime(item.get("date")) or datetime.min, to_int(item.get("id")) or 0))
+        return messages, users_by_id, files_by_id
+
+    def _search_dialog_messages_for_day(self, dialog_id: str, target_date: date) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+        messages: list[dict[str, Any]] = []
+        users_by_id: dict[int, dict[str, Any]] = {}
+        files_by_id: dict[int, dict[str, Any]] = {}
+        last_id: int | None = None
+        limit = 200
+        while True:
+            payload: dict[str, Any] = {
+                "DIALOG_ID": dialog_id,
+                "DATE": f"{target_date.isoformat()}T00:00:00",
+                "ORDER": {"ID": "ASC"},
+                "LIMIT": limit,
+            }
+            if last_id is not None:
+                payload["LAST_ID"] = last_id
+            data = self.call_with_fallback("im.dialog.messages.search", payload, prefer_api=True)
+            result = data.get("result", {})
+            page_messages = self._extract_list_result(data, "messages")
+            raw_users = result.get("users", []) if isinstance(result, dict) else []
+            raw_files = result.get("files", []) if isinstance(result, dict) else []
+            if isinstance(raw_users, list):
+                for user in raw_users:
+                    if isinstance(user, dict):
+                        user_id = to_int(user.get("id"))
+                        if user_id is not None:
+                            users_by_id[user_id] = user
+            if isinstance(raw_files, list):
+                for file_item in raw_files:
+                    if isinstance(file_item, dict):
+                        file_id = to_int(file_item.get("id"))
+                        if file_id is not None:
+                            files_by_id[file_id] = file_item
+            if not page_messages:
+                break
+            messages.extend(page_messages)
+            next_last_id = to_int(page_messages[-1].get("id"))
+            if next_last_id is None or next_last_id == last_id or len(page_messages) < limit:
+                break
+            last_id = next_last_id
+            time.sleep(self.request_delay)
+        return messages, users_by_id, files_by_id
+
+    def _get_dialog_messages_for_day(self, dialog_id: str, target_date: date) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+        messages: list[dict[str, Any]] = []
+        users_by_id: dict[int, dict[str, Any]] = {}
+        files_by_id: dict[int, dict[str, Any]] = {}
+        last_id: int | None = None
+        limit = 50
+        max_pages = int(os.getenv("BITRIX_CHAT_MESSAGE_MAX_PAGES", "80"))
+        saw_target_day = False
+        for _ in range(max_pages):
+            payload: dict[str, Any] = {"DIALOG_ID": dialog_id, "LIMIT": limit}
+            if last_id is not None:
+                payload["LAST_ID"] = last_id
+            data = self.call_with_fallback("im.dialog.messages.get", payload, prefer_api=True)
+            result = data.get("result", {})
+            page_messages = self._extract_list_result(data, "messages")
+            raw_users = result.get("users", []) if isinstance(result, dict) else []
+            raw_files = result.get("files", []) if isinstance(result, dict) else []
+            if isinstance(raw_users, list):
+                for user in raw_users:
+                    if isinstance(user, dict):
+                        user_id = to_int(user.get("id"))
+                        if user_id is not None:
+                            users_by_id[user_id] = user
+            if isinstance(raw_files, list):
+                for file_item in raw_files:
+                    if isinstance(file_item, dict):
+                        file_id = to_int(file_item.get("id"))
+                        if file_id is not None:
+                            files_by_id[file_id] = file_item
+            if not page_messages:
+                break
+
+            oldest_id = None
+            reached_older_day = False
+            for message in page_messages:
+                message_id = to_int(message.get("id"))
+                if message_id is not None:
+                    oldest_id = message_id if oldest_id is None else min(oldest_id, message_id)
+                parsed = parse_datetime(message.get("date"))
+                if parsed is None:
+                    continue
+                message_day = parsed.date()
+                if message_day == target_date:
+                    saw_target_day = True
+                    messages.append(message)
+                elif message_day < target_date and (saw_target_day or not messages):
+                    reached_older_day = True
+
+            if oldest_id is None or reached_older_day:
+                break
+            if len(page_messages) < limit:
+                break
+            last_id = oldest_id
+            time.sleep(self.request_delay)
+
+        messages.sort(key=lambda item: to_int(item.get("id")) or 0)
+        return messages, users_by_id, files_by_id
+
+    def _list_tasks_v2(self) -> list[dict[str, Any]]:
+        tasks: list[dict[str, Any]] = []
+        start = 0
+        while True:
+            payload = {
+                "order": {"ACTIVITY_DATE": "desc"},
+                "select": [
+                    "ID",
+                    "TITLE",
+                    "DESCRIPTION",
+                    "STATUS",
+                    "REAL_STATUS",
+                    "DEADLINE",
+                    "CREATED_DATE",
+                    "CHANGED_DATE",
+                    "CLOSED_DATE",
+                    "RESPONSIBLE_ID",
+                    "CREATED_BY",
+                    "ACCOMPLICES",
+                    "AUDITORS",
+                    "GROUP_ID",
+                    "PRIORITY",
+                    "MARK",
+                ],
+                "params": {
+                    "WITH_RESULT_INFO": True,
+                    "WITH_TIMER_INFO": True,
+                    "WITH_PARSED_DESCRIPTION": True,
+                },
+                "start": start,
+            }
+            data = self.call_with_fallback("tasks.task.list", payload, prefer_api=False)
+            page_tasks = self._extract_task_page(data)
+            tasks.extend(page_tasks)
+
+            next_start = data.get("next")
+            if next_start is None:
+                if len(page_tasks) < 50:
+                    break
+                start += 50
+            else:
+                next_value = to_int(next_start)
+                if next_value is None:
+                    break
+                start = next_value
+            time.sleep(self.request_delay)
+        return tasks
+
+    def _list_tasks_v3(self, stop_before: datetime | None = None) -> list[dict[str, Any]]:
+        tasks: list[dict[str, Any]] = []
+
+        last_id: int | None = None
+        seen_last_ids: set[int] = set()
+
+        while True:
+            payload: dict[str, Any] = {
+                "order": {"id": "desc"},
+                "select": [
+                    "id",
+                    "title",
+                    "description",
+                    "status",
+                    "deadline",
+                    "created",
+                    "changed",
+                    "closed",
+                    "responsibleId",
+                    "creatorId",
+                    "chatId",
+                    "groupId",
+                    "priority",
+                    "mark",
+                    "fileIds",
+                ],
+            }
+            if last_id is not None:
+                payload["filter"] = [["id", "<", last_id]]
+
+            data = self.call_with_retry("tasks.task.list", payload=payload, use_api=True)
+            page_tasks = self._extract_task_page(data)
+            if not page_tasks:
+                break
+
+            tasks.extend(page_tasks)
+            if stop_before is not None:
+                oldest_page_date: datetime | None = None
+                for item in page_tasks:
+                    dates = [
+                        make_aware(parse_datetime(pick(item, "created", "CREATED_DATE"))),
+                        make_aware(parse_datetime(pick(item, "changed", "CHANGED_DATE"))),
+                        make_aware(parse_datetime(pick(item, "closed", "CLOSED_DATE"))),
+                        make_aware(parse_datetime(pick(item, "deadline", "DEADLINE"))),
+                    ]
+                    valid_dates = [dt for dt in dates if dt is not None]
+                    if valid_dates:
+                        item_latest = max(valid_dates)
+                        if oldest_page_date is None or item_latest < oldest_page_date:
+                            oldest_page_date = item_latest
+                if oldest_page_date is not None and oldest_page_date < stop_before:
+                    break
+
+            ids = [to_int(first_non_empty(item.get("id"), item.get("ID"))) for item in page_tasks]
+            valid_ids = [item_id for item_id in ids if item_id is not None]
+            if not valid_ids:
+                break
+            next_last_id = min(valid_ids)
+            if next_last_id in seen_last_ids:
+                break
+            seen_last_ids.add(next_last_id)
+            last_id = next_last_id
+
+            time.sleep(self.request_delay)
+        return tasks
+
+    def _list_tasks_legacy_item(self) -> list[dict[str, Any]]:
+        tasks: list[dict[str, Any]] = []
+        page_num = 1
+        seen_page_signature: set[tuple[Any, ...]] = set()
+        while True:
+            payload = {
+                "ORDER": {"ACTIVITY_DATE": "desc"},
+                "SELECT": [
+                    "ID",
+                    "TITLE",
+                    "DESCRIPTION",
+                    "STATUS",
+                    "REAL_STATUS",
+                    "DEADLINE",
+                    "CREATED_DATE",
+                    "CHANGED_DATE",
+                    "CLOSED_DATE",
+                    "RESPONSIBLE_ID",
+                    "CREATED_BY",
+                    "ACCOMPLICES",
+                    "AUDITORS",
+                    "GROUP_ID",
+                    "PRIORITY",
+                    "MARK",
+                ],
+                "PARAMS": {
+                    "NAV_PARAMS": {"nPageSize": 50, "iNumPage": page_num},
+                },
+            }
+            data = self.call_with_fallback("task.item.list", payload, prefer_api=False)
+            page_tasks = self._extract_task_page(data)
+            if not page_tasks:
+                break
+
+            signature = tuple(
+                first_non_empty(task.get("ID"), task.get("id"))
+                for task in page_tasks[:5]
+            )
+            if signature in seen_page_signature:
+                break
+            seen_page_signature.add(signature)
+
+            tasks.extend(page_tasks)
+            if len(page_tasks) < 50:
+                break
+            page_num += 1
+            time.sleep(self.request_delay)
+        return tasks
+
+    def _list_tasks_legacy_ctasks(self) -> list[dict[str, Any]]:
+        payload_variants = (
+            {
+                "order": {"ACTIVITY_DATE": "desc"},
+                "select": ["*"],
+            },
+            {
+                "ORDER": {"ACTIVITY_DATE": "desc"},
+                "SELECT": ["*"],
+            },
+        )
+        for payload in payload_variants:
+            try:
+                data = self.call_with_fallback("task.ctasks.getlist", payload, prefer_api=False)
+                page_tasks = self._extract_task_page(data)
+                if page_tasks:
+                    return page_tasks
+            except Exception:  # noqa: BLE001
+                continue
+        return []
+
+    @staticmethod
+    def _extract_result_items(data: dict[str, Any], *keys: str) -> list[Any]:
+        result = data.get("result", data)
+        if isinstance(result, list):
+            return result
+        if not isinstance(result, dict):
+            return []
+        for key in keys:
+            value = result.get(key)
+            if isinstance(value, list):
+                return value
+        return []
+
+    @staticmethod
+    def _extract_item(data: dict[str, Any], *keys: str) -> dict[str, Any]:
+        result = data.get("result", data)
+        if isinstance(result, dict):
+            for key in keys:
+                value = result.get(key)
+                if isinstance(value, dict):
+                    return value
+            return result
+        return {}
+
+    def list_tasks(self, stop_before: datetime | None = None) -> list[dict[str, Any]]:
+        scopes = self.get_scopes()
+        if "tasks" in scopes:
+            try:
+                return self._list_tasks_v3(stop_before=stop_before)
+            except Exception:
+                pass
+
+        if not scopes:
+            try:
+                return self._list_tasks_v3(stop_before=stop_before)
+            except Exception:
+                pass
+
+        methods = self.get_available_methods()
+        prefer_legacy = (
+            methods
+            and "tasks.task.list" not in methods
+            and ("task.item.list" in methods or "task.ctasks.getlist" in methods)
+        )
+        if not prefer_legacy:
+            try:
+                return self._list_tasks_v2()
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_method_missing_error(exc):
+                    raise
+
+        for getter in (self._list_tasks_legacy_item, self._list_tasks_legacy_ctasks):
+            try:
+                legacy_tasks = getter()
+                if legacy_tasks:
+                    return legacy_tasks
+            except Exception:  # noqa: BLE001
+                continue
+        raise RuntimeError(
+            "Метод получения списка задач недоступен. Проверь права вебхука и доступные методы."
+        )
+
+    def get_task_details(self, task_id: int) -> dict[str, Any]:
+        scopes = self.get_scopes()
+        if "tasks" in scopes:
+            payload_v3 = {
+                "id": task_id,
+                "select": [
+                    "id",
+                    "title",
+                    "description",
+                    "status",
+                    "deadline",
+                    "changed",
+                    "closed",
+                    "activity",
+                    "responsible.id",
+                    "responsible.name",
+                    "creator.id",
+                    "creator.name",
+                    "chat.id",
+                    "chat.entityId",
+                    "chat.entityType",
+                    "fileIds",
+                    "groupId",
+                    "priority",
+                    "mark",
+                    "containsChecklist",
+                    "containsResults",
+                ],
+            }
+            try:
+                data = self.call("tasks.task.get", payload=payload_v3, use_api=True)
+                return self._extract_item(data, "item", "task")
+            except Exception:
+                pass
+
+        payload_new = {
+            "id": task_id,
+            "select": [
+                "id",
+                "title",
+                "description",
+                "status",
+                "realStatus",
+                "deadline",
+                "createdDate",
+                "changedDate",
+                "closedDate",
+                "responsible.id",
+                "responsible.name",
+                "creator.id",
+                "creator.name",
+                "chat.id",
+                "chat.entityId",
+                "chat.entityType",
+                "fileIds",
+                "checklist",
+                "containsChecklist",
+                "containsResults",
+            ],
+        }
+        try:
+            data = self.call_with_fallback("tasks.task.get", payload_new, prefer_api=True)
+            return self._extract_item(data, "item", "task")
+        except Exception:  # noqa: BLE001
+            for method_name, payload_old in (
+                ("tasks.task.get", {"taskId": task_id}),
+                ("task.item.getdata", {"TASKID": task_id}),
+                ("task.item.getdata", {"taskId": task_id}),
+            ):
+                try:
+                    data = self.call_with_fallback(method_name, payload_old, prefer_api=False)
+                    return self._extract_item(data, "task", "item", "result")
+                except Exception:  # noqa: BLE001
+                    continue
+            return {}
+
+    def enrich_tasks_v3_batch(self, base_tasks: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+        enriched: dict[int, dict[str, Any]] = {}
+        scopes = self.get_scopes()
+        if "tasks" not in scopes:
+            return enriched
+
+        select = [
+            "id",
+            "title",
+            "description",
+            "status",
+            "deadline",
+            "changed",
+            "closed",
+            "activity",
+            "responsible.id",
+            "responsible.name",
+            "creator.id",
+            "creator.name",
+            "chat.id",
+            "chat.entityId",
+            "chat.entityType",
+            "fileIds",
+            "groupId",
+            "priority",
+            "mark",
+            "containsChecklist",
+            "containsResults",
+        ]
+
+        tasks_with_ids = [(extract_task_id(task), task) for task in base_tasks]
+        task_ids = [task_id for task_id, _ in tasks_with_ids if task_id is not None]
+        for offset in range(0, len(task_ids), 50):
+            chunk = task_ids[offset : offset + 50]
+            cmd: dict[str, str] = {}
+            for task_id in chunk:
+                params = "&".join([f"select[]={field}" for field in select])
+                cmd[f"t{task_id}"] = f"tasks.task.get?id={task_id}&{params}"
+            try:
+                data = self.call_with_retry("batch", {"halt": 0, "cmd": cmd}, use_api=False)
+            except Exception:
+                continue
+
+            result = data.get("result", {}).get("result", {})
+            if not isinstance(result, dict):
+                continue
+            for key, value in result.items():
+                task_id = to_int(key[1:]) if key.startswith("t") else None
+                if task_id is None:
+                    continue
+                item = self._extract_item({"result": value}, "item", "task")
+                if item:
+                    enriched[task_id] = item
+            time.sleep(self.request_delay)
+        return enriched
+
+    def get_task_results_v3(self, task_id: int) -> dict[str, Any]:
+        payload_v3 = {"filter": [["taskId", "=", int(task_id)]]}
+        try:
+            return self.call_with_retry("tasks.task.result.list", payload_v3, use_api=True)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc), "result": []}
+
+    def get_task_related_batch(
+        self,
+        base_tasks: list[dict[str, Any]],
+        details_map: dict[int, dict[str, Any]],
+    ) -> dict[int, dict[str, dict[str, Any]]]:
+        related: dict[int, dict[str, dict[str, Any]]] = {}
+        commands: dict[str, str] = {}
+
+        def flush() -> None:
+            nonlocal commands
+            if not commands:
+                return
+            batch = self.batch_commands(commands)
+            results = batch.get("result", {})
+            errors = batch.get("errors", {})
+            for key, value in results.items():
+                prefix, _, task_id_text = key.partition("_")
+                task_id = to_int(task_id_text)
+                if task_id is None:
+                    continue
+                section = {
+                    "c": "comments",
+                    "r": "result",
+                    "h": "history",
+                    "cl": "checklist",
+                }.get(prefix)
+                if section is None:
+                    continue
+                related.setdefault(task_id, {})[section] = {"result": value}
+            for key, value in errors.items():
+                prefix, _, task_id_text = key.partition("_")
+                task_id = to_int(task_id_text)
+                if task_id is None:
+                    continue
+                section = {
+                    "c": "comments",
+                    "r": "result",
+                    "h": "history",
+                    "cl": "checklist",
+                }.get(prefix)
+                if section is None:
+                    continue
+                related.setdefault(task_id, {})[section] = {"error": str(value), "result": []}
+            commands = {}
+            time.sleep(self.request_delay)
+
+        for base_task in base_tasks:
+            task_id = extract_task_id(base_task)
+            if task_id is None:
+                continue
+            details = details_map.get(task_id, {})
+            chat_id = extract_chat_id(details) or to_int(pick(base_task, "chatId", "CHAT_ID"))
+
+            if chat_id is not None:
+                commands[f"c_{task_id}"] = "im.dialog.messages.get?" + urlencode(
+                    {"DIALOG_ID": f"chat{chat_id}", "LIMIT": 200}
+                )
+            else:
+                related.setdefault(task_id, {})["comments"] = {
+                    "warning": "Нет chat.id для чтения переписки задачи",
+                    "result": [],
+                }
+
+            commands[f"r_{task_id}"] = "tasks.task.result.list?" + urlencode({"taskId": task_id})
+            commands[f"h_{task_id}"] = "tasks.task.history.list?" + urlencode({"taskId": task_id})
+            commands[f"cl_{task_id}"] = "task.checklistitem.getlist?" + urlencode({"TASKID": task_id})
+
+            if len(commands) >= 50:
+                flush()
+        flush()
+        return related
+
+    def get_task_results(self, task_id: int) -> dict[str, Any]:
+        scopes = self.get_scopes()
+        if "tasks" in scopes:
+            payload_v3 = {"filter": [["taskId", "=", int(task_id)]]}
+            try:
+                return self.call_with_retry("tasks.task.result.list", payload_v3, use_api=True)
+            except Exception as exc:  # noqa: BLE001
+                return {"error": str(exc), "result": []}
+
+        payload = {"taskId": task_id}
+        try:
+            return self.call_with_fallback("tasks.task.result.list", payload, prefer_api=True)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc), "result": []}
+
+    def get_task_history(self, task_id: int) -> dict[str, Any]:
+        scopes = self.get_scopes()
+        if "task" not in scopes and "tasks" in scopes:
+            return {"warning": "История задач доступна в REST v2 (`task` scope)", "result": []}
+        payload = {"taskId": task_id}
+        try:
+            return self.call_with_fallback("tasks.task.history.list", payload, prefer_api=False)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc), "result": []}
+
+    def get_task_checklist(self, task_id: int) -> dict[str, Any]:
+        scopes = self.get_scopes()
+        if "task" not in scopes and "tasks" in scopes:
+            return {"warning": "Чек-лист доступен в REST v2 (`task` scope)", "result": []}
+        for payload in ({"TASKID": task_id}, {"taskId": task_id}):
+            try:
+                return self.call_with_fallback("task.checklistitem.getlist", payload, prefer_api=False)
+            except Exception:  # noqa: BLE001
+                continue
+        return {"error": "checklist unavailable", "result": []}
+
+    def get_task_comments(self, task_id: int, chat_id: int | None) -> dict[str, Any]:
+        # Preferred path for new task card.
+        if chat_id is not None:
+            payloads = (
+                {"DIALOG_ID": f"chat{chat_id}", "LIMIT": 200},
+                {"dialogId": f"chat{chat_id}", "limit": 200},
+            )
+            for payload in payloads:
+                try:
+                    data = self.call_with_fallback("im.dialog.messages.get", payload, prefer_api=True)
+                    data["source"] = "im.dialog.messages.get"
+                    return data
+                except Exception:  # noqa: BLE001
+                    continue
+
+        # Fallback for legacy task card / legacy methods.
+        legacy_calls = (
+            ("task.commentitem.getlist", {"TASKID": task_id}),
+            ("task.commentitem.getlist", {"taskId": task_id}),
+            ("task.ctaskcommentitem.getlist", {"TASKID": task_id}),
+            ("task.ctaskcommentitem.getlist", {"taskId": task_id}),
+        )
+        for method_name, payload in legacy_calls:
+            try:
+                data = self.call_with_fallback(method_name, payload, prefer_api=False)
+                data["source"] = method_name
+                return data
+            except Exception:  # noqa: BLE001
+                continue
+
+        if chat_id is None:
+            return {"warning": "Комментарии недоступны: нет chat id и нет legacy-метода", "result": []}
+        return {"error": "Сообщения чата недоступны", "result": []}
+
+    def get_user(self, user_id: int | None) -> dict[str, Any]:
+        if user_id is None:
+            return {}
+        if user_id in self.user_cache:
+            return self.user_cache[user_id]
+
+        payloads = (
+            {"ID": user_id},
+            {"id": user_id},
+            {"filter": {"ID": user_id}},
+        )
+        profile: dict[str, Any] = {}
+        for payload in payloads:
+            for _ in range(2):
+                try:
+                    data = self.call_with_fallback("user.get", payload, prefer_api=False)
+                    result = data.get("result", [])
+                    if isinstance(result, list) and result:
+                        profile = result[0] if isinstance(result[0], dict) else {}
+                        break
+                    if isinstance(result, dict):
+                        profile = result
+                        break
+                except Exception:  # noqa: BLE001
+                    time.sleep(0.1)
+                    continue
+            if profile:
+                break
+        if profile:
+            self.user_cache[user_id] = profile
+        return profile
+
+    def get_department(self, department_id: int | None) -> dict[str, Any]:
+        if department_id is None:
+            return {}
+        if department_id in self.department_cache:
+            return self.department_cache[department_id]
+
+        payloads = (
+            {"ID": department_id},
+            {"id": department_id},
+            {"filter": {"ID": department_id}},
+        )
+        department: dict[str, Any] = {}
+        for payload in payloads:
+            try:
+                data = self.call_with_fallback("department.get", payload, prefer_api=False)
+                result = data.get("result", [])
+                if isinstance(result, list) and result:
+                    department = result[0] if isinstance(result[0], dict) else {}
+                    break
+                if isinstance(result, dict):
+                    department = result
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        self.department_cache[department_id] = department
+        return department
+
+
+def extract_task_id(task: dict[str, Any]) -> int | None:
+    return to_int(pick(task, "id", "ID"))
+
+
+def extract_chat_id(details: dict[str, Any]) -> int | None:
+    chat_direct = pick(details, "chat.id", "CHAT_ID", "chatId")
+    if chat_direct is not None:
+        return to_int(chat_direct)
+    chat = details.get("chat")
+    if isinstance(chat, dict):
+        return to_int(first_non_empty(chat.get("id"), chat.get("ID")))
+    return None
+
+
+def extract_files(base_task: dict[str, Any], details: dict[str, Any]) -> list[Any]:
+    return to_list(
+        first_non_empty(
+            pick(details, "fileIds", "files", "FILES"),
+            pick(base_task, "UF_TASK_WEBDAV_FILES", "fileIds"),
+        )
+    )
+
+
+def resolve_person(client: BitrixClient, person_id: int | None, fallback_name: Any = None) -> dict[str, Any]:
+    profile = client.get_user(person_id) if person_id is not None else {}
+    display_name = format_person_name(profile, fallback_name=fallback_name)
+
+    department_ids = [to_int(dep) for dep in to_list(pick(profile, "UF_DEPARTMENT"))]
+    normalized_departments = [dep for dep in department_ids if dep is not None]
+
+    departments: list[dict[str, Any]] = []
+    manager_name: str | None = None
+    manager_id: int | None = None
+    for dep_id in normalized_departments:
+        department = client.get_department(dep_id)
+        dep_name = first_non_empty(pick(department, "NAME", "name"), f"Отдел {dep_id}")
+        dep_head_id = to_int(pick(department, "UF_HEAD", "head"))
+        departments.append({"id": dep_id, "name": dep_name, "head_id": dep_head_id})
+        if dep_head_id and manager_id is None:
+            manager_id = dep_head_id
+            manager_profile = client.get_user(dep_head_id)
+            manager_name = format_person_name(manager_profile)
+            if not manager_name:
+                manager_name = f"Пользователь {dep_head_id}"
+
+    return {
+        "id": person_id,
+        "name": display_name or (f"Пользователь {person_id}" if person_id else None),
+        "email": pick(profile, "EMAIL", "email"),
+        "departments": departments,
+        "manager": {"id": manager_id, "name": manager_name},
+    }
+
+
+def extract_collection(data: dict[str, Any], *keys: str) -> list[Any]:
+    result = data.get("result", data)
+    if isinstance(result, list):
+        return result
+    if not isinstance(result, dict):
+        return []
+    for key in keys:
+        value = result.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            dict_values = list(value.values())
+            if all(isinstance(item, dict) for item in dict_values):
+                return dict_values
+    return []
+
+
+def build_task_record(client: BitrixClient, base_task: dict[str, Any]) -> dict[str, Any]:
+    task_id = extract_task_id(base_task)
+    if task_id is None:
+        raise ValueError("Получена задача без ID")
+
+    details = client.get_task_details(task_id)
+    results_raw = client.get_task_results(task_id)
+    history_raw = client.get_task_history(task_id)
+    checklist_raw = client.get_task_checklist(task_id)
+    chat_id = extract_chat_id(details)
+    comments_raw = client.get_task_comments(task_id, chat_id)
+
+    creator_id = to_int(
+        first_non_empty(
+            pick(details, "creator.id", "creatorId", "CREATED_BY"),
+            pick(base_task, "CREATED_BY", "createdBy", "creatorId"),
+        )
+    )
+    responsible_id = to_int(
+        first_non_empty(
+            pick(details, "responsible.id", "responsibleId", "RESPONSIBLE_ID"),
+            pick(base_task, "RESPONSIBLE_ID", "responsibleId", "responsibleId"),
+        )
+    )
+
+    creator = resolve_person(client, creator_id, fallback_name=pick(details, "creator.name"))
+    responsible = resolve_person(client, responsible_id, fallback_name=pick(details, "responsible.name"))
+
+    status_code = first_non_empty(
+        pick(details, "status", "realStatus", "STATUS", "REAL_STATUS"),
+        pick(base_task, "REAL_STATUS", "STATUS", "status"),
+    )
+    status = normalize_status(status_code)
+
+    deadline = first_non_empty(
+        pick(details, "deadline", "DEADLINE"),
+        pick(base_task, "DEADLINE", "deadline"),
+    )
+    closed_date = first_non_empty(
+        pick(details, "closedDate", "closed", "CLOSED_DATE"),
+        pick(base_task, "CLOSED_DATE", "closed"),
+    )
+
+    departments = responsible.get("departments", [])
+    manager = responsible.get("manager", {})
+
+    return {
+        "task_id": task_id,
+        "title": first_non_empty(pick(details, "title", "TITLE"), pick(base_task, "TITLE", "title")),
+        "description": first_non_empty(
+            pick(details, "description", "DESCRIPTION"),
+            pick(base_task, "DESCRIPTION", "description"),
+        ),
+        "creator": {
+            "id": creator.get("id"),
+            "name": creator.get("name"),
+            "email": creator.get("email"),
+        },
+        "responsible": {
+            "id": responsible.get("id"),
+            "name": responsible.get("name"),
+            "email": responsible.get("email"),
+        },
+        "department": [dep.get("name") for dep in departments if dep.get("name")],
+        "manager": manager,
+        "deadline": deadline,
+        "closed_date": closed_date,
+        "status": status,
+        "result": {
+            "items": extract_collection(results_raw, "items", "results", "list"),
+            "raw": results_raw,
+        },
+        "comments": {
+            "chat_id": chat_id,
+            "items": extract_collection(comments_raw, "messages", "items", "list"),
+            "raw": comments_raw,
+        },
+        "checklist": {
+            "items": extract_collection(checklist_raw, "items", "list", "checklist"),
+            "raw": checklist_raw,
+        },
+        "history": {
+            "items": extract_collection(history_raw, "history", "items", "list"),
+            "raw": history_raw,
+        },
+        "files": extract_files(base_task, details),
+        "priority": first_non_empty(
+            pick(details, "priority", "PRIORITY"),
+            pick(base_task, "PRIORITY", "priority"),
+        ),
+        "mark": first_non_empty(pick(details, "mark", "MARK"), pick(base_task, "MARK", "mark")),
+        "dates": {
+            "created": first_non_empty(
+                pick(details, "createdDate", "created", "CREATED_DATE"),
+                pick(base_task, "CREATED_DATE", "created"),
+            ),
+            "changed": first_non_empty(
+                pick(details, "changedDate", "changed", "CHANGED_DATE"),
+                pick(base_task, "CHANGED_DATE", "changed"),
+            ),
+        },
+        "raw": {
+            "base": base_task,
+            "details": details,
+        },
+    }
+
+
+def resolve_people_map(client: BitrixClient, tasks: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    ids: set[int] = set()
+    for task in tasks:
+        for key in ("responsibleId", "RESPONSIBLE_ID", "creatorId", "CREATED_BY", "createdBy"):
+            person_id = to_int(pick(task, key))
+            if person_id is not None:
+                ids.add(person_id)
+
+    people: dict[int, dict[str, Any]] = {}
+    for person_id in sorted(ids):
+        people[person_id] = resolve_person(client, person_id)
+        time.sleep(client.request_delay)
+    return people
+
+
+def build_fast_task_record(
+    client: BitrixClient,
+    base_task: dict[str, Any],
+    people: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    task_id = extract_task_id(base_task)
+    if task_id is None:
+        raise ValueError("Получена задача без ID")
+
+    creator_id = to_int(first_non_empty(pick(base_task, "creatorId", "CREATED_BY", "createdBy")))
+    responsible_id = to_int(first_non_empty(pick(base_task, "responsibleId", "RESPONSIBLE_ID")))
+
+    creator = people.get(creator_id or -1) or resolve_person(client, creator_id)
+    responsible = people.get(responsible_id or -1) or resolve_person(client, responsible_id)
+
+    status = normalize_status(first_non_empty(pick(base_task, "status", "REAL_STATUS", "STATUS")))
+    deadline = first_non_empty(pick(base_task, "deadline", "DEADLINE"))
+    closed_date = first_non_empty(pick(base_task, "closed", "CLOSED_DATE"))
+    chat_id = to_int(pick(base_task, "chatId", "CHAT_ID"))
+
+    departments = responsible.get("departments", [])
+
+    return {
+        "task_id": task_id,
+        "title": first_non_empty(pick(base_task, "title", "TITLE")),
+        "description": first_non_empty(pick(base_task, "description", "DESCRIPTION")),
+        "creator": {
+            "id": creator.get("id"),
+            "name": creator.get("name"),
+            "email": creator.get("email"),
+        },
+        "responsible": {
+            "id": responsible.get("id"),
+            "name": responsible.get("name"),
+            "email": responsible.get("email"),
+        },
+        "department": [dep.get("name") for dep in departments if dep.get("name")],
+        "manager": responsible.get("manager", {}),
+        "deadline": deadline,
+        "closed_date": closed_date,
+        "status": status,
+        "result": {"items": [], "raw": {"skipped": "Быстрый режим: результаты задач не загружались"}},
+        "comments": {
+            "chat_id": chat_id,
+            "items": [],
+            "raw": {"skipped": "Быстрый режим: комментарии не загружались"},
+        },
+        "checklist": {"items": [], "raw": {"skipped": "Быстрый режим: чек-листы не загружались"}},
+        "history": {"items": [], "raw": {"skipped": "Быстрый режим: история не загружалась"}},
+        "files": extract_files(base_task, {}),
+        "priority": first_non_empty(pick(base_task, "PRIORITY", "priority")),
+        "mark": first_non_empty(pick(base_task, "MARK", "mark")),
+        "dates": {
+            "created": first_non_empty(pick(base_task, "created", "CREATED_DATE")),
+            "changed": first_non_empty(pick(base_task, "changed", "CHANGED_DATE")),
+        },
+        "raw": {
+            "base": base_task,
+            "details": {},
+        },
+    }
+
+
+def build_audit_task_record(
+    client: BitrixClient,
+    base_task: dict[str, Any],
+    people: dict[int, dict[str, Any]],
+    details_map: dict[int, dict[str, Any]],
+    related_map: dict[int, dict[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    task_id = extract_task_id(base_task)
+    if task_id is None:
+        raise ValueError("Получена задача без ID")
+
+    details = details_map.get(task_id) or {}
+    chat_id = extract_chat_id(details) or to_int(pick(base_task, "chatId", "CHAT_ID"))
+    related = related_map.get(task_id, {})
+    comments_raw = related.get("comments") or {"warning": "Переписка не загружена", "result": []}
+    results_raw = related.get("result") or {"warning": "Результаты не загружены", "result": []}
+    history_raw = related.get("history") or {"warning": "История не загружена", "result": []}
+    checklist_raw = related.get("checklist") or {"warning": "Чек-лист не загружен", "result": []}
+
+    creator_id = to_int(
+        first_non_empty(
+            pick(details, "creator.id", "creatorId", "CREATED_BY"),
+            pick(base_task, "CREATED_BY", "createdBy", "creatorId"),
+        )
+    )
+    responsible_id = to_int(
+        first_non_empty(
+            pick(details, "responsible.id", "responsibleId", "RESPONSIBLE_ID"),
+            pick(base_task, "RESPONSIBLE_ID", "responsibleId"),
+        )
+    )
+    creator = people.get(creator_id or -1) or resolve_person(client, creator_id, fallback_name=pick(details, "creator.name"))
+    responsible = people.get(responsible_id or -1) or resolve_person(client, responsible_id, fallback_name=pick(details, "responsible.name"))
+
+    status = normalize_status(
+        first_non_empty(
+            pick(details, "status", "realStatus", "STATUS", "REAL_STATUS"),
+            pick(base_task, "REAL_STATUS", "STATUS", "status"),
+        )
+    )
+    deadline = first_non_empty(pick(details, "deadline", "DEADLINE"), pick(base_task, "DEADLINE", "deadline"))
+    closed_date = first_non_empty(pick(details, "closedDate", "closed", "CLOSED_DATE"), pick(base_task, "CLOSED_DATE", "closed"))
+    departments = responsible.get("departments", [])
+
+    return {
+        "task_id": task_id,
+        "title": first_non_empty(pick(details, "title", "TITLE"), pick(base_task, "TITLE", "title")),
+        "description": first_non_empty(pick(details, "description", "DESCRIPTION"), pick(base_task, "DESCRIPTION", "description")),
+        "creator": {"id": creator.get("id"), "name": creator.get("name"), "email": creator.get("email")},
+        "responsible": {"id": responsible.get("id"), "name": responsible.get("name"), "email": responsible.get("email")},
+        "department": [dep.get("name") for dep in departments if dep.get("name")],
+        "manager": responsible.get("manager", {}),
+        "deadline": deadline,
+        "closed_date": closed_date,
+        "status": status,
+        "result": {"items": extract_collection(results_raw, "items", "results", "list"), "raw": results_raw},
+        "comments": {
+            "chat_id": chat_id,
+            "items": extract_collection(comments_raw, "messages", "items", "list"),
+            "raw": comments_raw,
+        },
+        "checklist": {
+            "items": extract_collection(checklist_raw, "items", "list", "checklist"),
+            "raw": checklist_raw,
+        },
+        "history": {
+            "items": extract_collection(history_raw, "history", "items", "list"),
+            "raw": history_raw,
+        },
+        "files": extract_files(base_task, details),
+        "priority": first_non_empty(pick(details, "priority", "PRIORITY"), pick(base_task, "PRIORITY", "priority")),
+        "mark": first_non_empty(pick(details, "mark", "MARK"), pick(base_task, "MARK", "mark")),
+        "dates": {
+            "created": first_non_empty(pick(details, "createdDate", "created", "CREATED_DATE"), pick(base_task, "CREATED_DATE", "created")),
+            "changed": first_non_empty(pick(details, "changedDate", "changed", "CHANGED_DATE"), pick(base_task, "CHANGED_DATE", "changed")),
+        },
+        "raw": {"base": base_task, "details": details},
+    }
+
+
+def is_completed(task: dict[str, Any]) -> bool:
+    raw_status_code = task.get("status", {}).get("code")
+    if isinstance(raw_status_code, str):
+        normalized = raw_status_code.strip().lower()
+        if normalized in {"completed", "supposedlycompleted", "supposedly_completed"}:
+            return True
+    status_code = to_int(raw_status_code)
+    if status_code == 5:
+        return True
+    return parse_datetime(task.get("closed_date")) is not None
+
+
+def is_overdue(task: dict[str, Any], now_dt: datetime) -> bool:
+    if is_completed(task):
+        return False
+    deadline_dt = make_aware(parse_datetime(task.get("deadline")))
+    if deadline_dt is None:
+        return False
+    return deadline_dt < now_dt
+
+
+def build_week_summary(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    now_dt = make_aware(datetime.now()) or datetime.now()
+    total = len(tasks)
+    completed = 0
+    overdue = 0
+    status_counter: Counter[str] = Counter()
+    responsible_rows_map: dict[str, dict[str, Any]] = {}
+    creator_rows_map: dict[str, dict[str, Any]] = {}
+
+    for task in tasks:
+        status_label = str(task.get("status", {}).get("label") or "Неизвестно")
+        status_counter[status_label] += 1
+
+        responsible_id = to_int(task.get("responsible", {}).get("id"))
+        raw_name = task.get("responsible", {}).get("name")
+        responsible_name = normalize_person_label(raw_name, responsible_id)
+        if responsible_id is not None:
+            key = f"id:{responsible_id}"
+        else:
+            key = f"name:{responsible_name}"
+
+        existing = responsible_rows_map.get(key)
+        if existing is None:
+            responsible_rows_map[key] = {
+                "id": responsible_id,
+                "name": responsible_name,
+                "count": 1,
+            }
+        else:
+            existing["count"] += 1
+            if is_fallback_person_name(existing.get("name")) and not is_fallback_person_name(responsible_name):
+                existing["name"] = responsible_name
+
+        if is_completed(task):
+            completed += 1
+        if is_overdue(task, now_dt):
+            overdue += 1
+
+        creator_id = to_int(task.get("creator", {}).get("id"))
+        creator_raw_name = task.get("creator", {}).get("name")
+        creator_name = normalize_person_label(creator_raw_name, creator_id)
+        if creator_id is not None:
+            creator_key = f"id:{creator_id}"
+        else:
+            creator_key = f"name:{creator_name}"
+        creator_existing = creator_rows_map.get(creator_key)
+        if creator_existing is None:
+            creator_rows_map[creator_key] = {
+                "id": creator_id,
+                "name": creator_name,
+                "count": 1,
+            }
+        else:
+            creator_existing["count"] += 1
+            if is_fallback_person_name(creator_existing.get("name")) and not is_fallback_person_name(creator_name):
+                creator_existing["name"] = creator_name
+
+    completion_rate = round((completed / total) * 100, 2) if total else 0.0
+    open_tasks = total - completed
+
+    status_rows = [{"status": status, "count": count} for status, count in status_counter.most_common()]
+    responsible_rows = sorted(
+        list(responsible_rows_map.values()),
+        key=lambda item: (-int(item.get("count", 0)), str(item.get("name", ""))),
+    )
+    creator_rows = sorted(
+        list(creator_rows_map.values()),
+        key=lambda item: (-int(item.get("count", 0)), str(item.get("name", ""))),
+    )
+
+    return {
+        "total_tasks": total,
+        "completed_tasks": completed,
+        "open_tasks": open_tasks,
+        "overdue_tasks": overdue,
+        "completion_rate_percent": completion_rate,
+        "status_counts": status_rows,
+        "responsible_counts": responsible_rows,
+        "creator_counts": creator_rows,
+    }
+
+
+def deduplicate_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    by_task_id: dict[Any, dict[str, Any]] = {}
+    duplicates_removed = 0
+
+    for record in records:
+        task_id = record.get("task_id")
+        if task_id is None:
+            continue
+        if task_id not in by_task_id:
+            by_task_id[task_id] = record
+            continue
+
+        duplicates_removed += 1
+        current = by_task_id[task_id]
+        current_has_error = "error" in current
+        incoming_has_error = "error" in record
+        if current_has_error and not incoming_has_error:
+            by_task_id[task_id] = record
+
+    unique_records: list[dict[str, Any]] = []
+    seen_task_ids: set[Any] = set()
+    for item in records:
+        task_id = item.get("task_id")
+        if task_id is None:
+            unique_records.append(item)
+            continue
+        if task_id in seen_task_ids:
+            continue
+        seen_task_ids.add(task_id)
+        unique_records.append(by_task_id[task_id])
+
+    return unique_records, duplicates_removed
+
+
+def build_period_export(date_from: date, date_to: date, webhook_base: str) -> tuple[dict[str, Any], str]:
+    client = BitrixClient(webhook_base)
+    period_start, period_end = period_bounds(date_from, date_to)
+    lookback_days = int(os.getenv("BITRIX_LOOKBACK_DAYS", "30"))
+    stop_before = period_start - timedelta(days=lookback_days)
+    base_tasks_all = client.list_tasks(stop_before=stop_before)
+    bitrix_task_ids = {
+        task_id
+        for task_id in (extract_task_id(task) for task in base_tasks_all)
+        if task_id is not None
+    }
+    created_tasks = [task for task in base_tasks_all if base_task_created_in_period(task, period_start, period_end)]
+    created_task_ids = {
+        task_id
+        for task_id in (extract_task_id(task) for task in created_tasks)
+        if task_id is not None
+    }
+    unfinished_task_ids = load_unfinished_registry_task_ids()
+    refreshed_unfinished_tasks: list[dict[str, Any]] = []
+    for task_id in unfinished_task_ids:
+        if task_id in created_task_ids:
+            continue
+        details = client.get_task_details(task_id)
+        if not details:
+            time.sleep(client.request_delay)
+            continue
+        if "id" not in details and "ID" not in details:
+            details["id"] = task_id
+        refreshed_unfinished_tasks.append(details)
+        bitrix_task_ids.add(task_id)
+        time.sleep(client.request_delay)
+    base_tasks = merge_tasks_by_id(created_tasks + refreshed_unfinished_tasks)
+    export_mode = os.getenv("BITRIX_EXPORT_MODE", "audit").strip().lower()
+    if export_mode not in {"fast", "audit", "full"}:
+        export_mode = "audit"
+    sync_run_id = create_sync_run(date_from, date_to, export_mode)
+
+    records: list[dict[str, Any]] = []
+    try:
+        if export_mode == "fast":
+            people = resolve_people_map(client, base_tasks)
+            for base_task in base_tasks:
+                try:
+                    records.append(build_fast_task_record(client, base_task, people))
+                except Exception as exc:  # noqa: BLE001
+                    task_id = extract_task_id(base_task)
+                    records.append({"task_id": task_id, "error": str(exc), "raw": {"base": base_task}})
+        elif export_mode == "audit":
+            people = resolve_people_map(client, base_tasks)
+            details_map = client.enrich_tasks_v3_batch(base_tasks)
+            related_map = client.get_task_related_batch(base_tasks, details_map)
+            for base_task in base_tasks:
+                try:
+                    records.append(build_audit_task_record(client, base_task, people, details_map, related_map))
+                except Exception as exc:  # noqa: BLE001
+                    task_id = extract_task_id(base_task)
+                    records.append({"task_id": task_id, "error": str(exc), "raw": {"base": base_task}})
+                time.sleep(client.request_delay)
+        else:
+            for base_task in base_tasks:
+                try:
+                    records.append(build_task_record(client, base_task))
+                except Exception as exc:  # noqa: BLE001
+                    task_id = extract_task_id(base_task)
+                    records.append({"task_id": task_id, "error": str(exc), "raw": {"base": base_task}})
+                time.sleep(client.request_delay)
+
+        records, duplicates_removed = deduplicate_records(records)
+        upsert_task_records(records, sync_run_id=sync_run_id)
+        deleted_task_ids = reconcile_deleted_tasks(client, date_from, date_to, bitrix_task_ids)
+        summary = build_week_summary(records)
+        summary["error_tasks"] = len([item for item in records if "error" in item])
+        summary["duplicates_removed"] = duplicates_removed
+        summary["deleted_tasks"] = len(deleted_task_ids)
+        finish_sync_run(sync_run_id, "success", len(base_tasks_all), len(base_tasks))
+    except Exception as exc:
+        finish_sync_run(sync_run_id, "error", len(base_tasks_all), len(base_tasks), str(exc))
+        raise
+
+    export_payload = {
+        "generated_at": datetime.now().isoformat(),
+        "period": {
+            "days_count": (date_to - date_from).days + 1,
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "selection_rule": "Задача попадает в период, если дата создания, изменения, закрытия или дедлайн внутри периода, либо задача была активна в этот интервал.",
+        },
+        "meta": {
+            "scanned_tasks_total": len(base_tasks_all),
+            "matched_tasks_total": len(base_tasks),
+            "created_tasks_total": len(created_tasks),
+            "unfinished_tasks_checked_total": len(refreshed_unfinished_tasks),
+            "deleted_tasks_total": len(deleted_task_ids),
+            "deleted_task_ids": deleted_task_ids,
+            "export_mode": export_mode,
+            "export_mode_note": (
+                "audit/full: загружены детали, комментарии, чек-листы и доступная история по задачам периода"
+                if export_mode in {"audit", "full"}
+                else "fast: загружены список задач и профили пользователей"
+            ),
+            "lookback_days": lookback_days,
+        },
+        "summary": summary,
+        "tasks": records,
+    }
+
+    export_filename = (
+        f"bitrix_tasks_{date_from.isoformat()}_{date_to.isoformat()}_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+    export_path = EXPORT_DIR / export_filename
+    with export_path.open("w", encoding="utf-8") as fp:
+        json.dump(export_payload, fp, ensure_ascii=False, indent=2)
+    return export_payload, export_filename
+
+
+def build_week_export(week_code: str, webhook_base: str) -> tuple[dict[str, Any], str]:
+    date_from, date_to = parse_week_code(week_code)
+    return build_period_export(date_from, date_to, webhook_base)
+
+
+def load_task_records_for_period(date_from: date, date_to: date) -> list[dict[str, Any]]:
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT raw_json, status
+                    FROM bitrix_tasks
+                    WHERE
+                        created_at_bitrix::date BETWEEN %s AND %s
+                        OR updated_at_bitrix::date BETWEEN %s AND %s
+                        OR closed_at_bitrix::date BETWEEN %s AND %s
+                        OR deadline_at::date BETWEEN %s AND %s
+                        OR (
+                            created_at_bitrix::date <= %s
+                            AND (closed_at_bitrix IS NULL OR closed_at_bitrix::date >= %s)
+                        )
+                    ORDER BY COALESCE(deadline_at, updated_at_bitrix, created_at_bitrix) DESC, bitrix_task_id DESC
+                    """,
+                    (date_from, date_to, date_from, date_to, date_from, date_to, date_from, date_to, date_to, date_from),
+                )
+                rows = cur.fetchall()
+
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            record = row["raw_json"]
+            if isinstance(record, str):
+                try:
+                    record = json.loads(record)
+                except json.JSONDecodeError:
+                    continue
+            if not isinstance(record, dict):
+                continue
+            status = record.get("status")
+            if isinstance(status, dict):
+                normalized = normalize_status(first_non_empty(status.get("code"), row["status"]))
+                status["code"] = normalized["code"]
+                status["label"] = normalized["label"]
+            records.append(record)
+        return records
+
+    where_sql = db_period_where()
+    with db_connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT raw_json, status_code
+            FROM tasks
+            WHERE {where_sql}
+            ORDER BY COALESCE(deadline, changed_date, created_date) DESC, task_id DESC
+            """,
+            db_period_params(date_from, date_to),
+        ).fetchall()
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            record = json.loads(row["raw_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        status = record.get("status")
+        if isinstance(status, dict):
+            normalized = normalize_status(first_non_empty(status.get("code"), row["status_code"]))
+            status["code"] = normalized["code"]
+            status["label"] = normalized["label"]
+        records.append(record)
+    return records
+
+
+def build_registry_export(date_from: date, date_to: date) -> tuple[dict[str, Any], str]:
+    records = load_task_records_for_period(date_from, date_to)
+    summary = build_week_summary(records)
+    export_payload = {
+        "generated_at": datetime.now().isoformat(),
+        "source": "postgres_registry",
+        "period": {
+            "days_count": (date_to - date_from).days + 1,
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "selection_rule": "JSON сформирован из локального реестра PostgreSQL по тем же датам: создание, изменение, закрытие, дедлайн или активность задачи в периоде.",
+        },
+        "meta": {
+            "matched_tasks_total": len(records),
+            "note": "Повторное скачивание не обращается к Bitrix. Чтобы получить свежие статусы, сначала нажмите обновление из Bitrix.",
+        },
+        "summary": summary,
+        "tasks": records,
+    }
+    export_filename = (
+        f"bitrix_registry_{date_from.isoformat()}_{date_to.isoformat()}_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+    export_path = EXPORT_DIR / export_filename
+    with export_path.open("w", encoding="utf-8") as fp:
+        json.dump(export_payload, fp, ensure_ascii=False, indent=2)
+    return export_payload, export_filename
+
+
+def row_to_task(row: Any) -> dict[str, Any]:
+    return {
+        "task_id": row["task_id"],
+        "title": row["title"],
+        "status_code": row["status_code"],
+        "status_label": row["status_label"],
+        "responsible_id": row["responsible_id"],
+        "responsible_name": row["responsible_name"],
+        "creator_id": row["creator_id"],
+        "creator_name": row["creator_name"],
+        "created_date": row["created_date"],
+        "created_date_text": format_datetime_ru(row["created_date"]),
+        "deadline": row["deadline"],
+        "deadline_text": format_datetime_ru(row["deadline"]),
+        "closed_date": row["closed_date"],
+        "closed_date_text": format_datetime_ru(row["closed_date"]),
+        "comments_count": row["comments_count"] or 0,
+        "results_count": row["results_count"] or 0,
+        "history_count": row["history_count"] or 0,
+        "checklist_count": row["checklist_count"] or 0,
+        "last_synced_at": row["last_synced_at"],
+        "last_synced_at_text": format_datetime_ru(row["last_synced_at"]),
+    }
+
+
+def registry_response_payload(args: Any) -> dict[str, Any]:
+    default_from, default_to = default_period()
+    date_from = args.get("date_from", default_from.isoformat()).strip()
+    date_to = args.get("date_to", default_to.isoformat()).strip()
+    filters = {
+        "q": args.get("q", "").strip(),
+        "status": args.get("status", "").strip(),
+        "responsible_id": args.get("responsible_id", "").strip(),
+        "created_from": args.get("created_from", "").strip(),
+        "created_to": args.get("created_to", "").strip(),
+        "deadline_from": args.get("deadline_from", "").strip(),
+        "deadline_to": args.get("deadline_to", "").strip(),
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+    rows, stats = load_registry(
+        search=filters["q"],
+        status=filters["status"],
+        responsible_id=filters["responsible_id"],
+        created_from=filters["created_from"],
+        created_to=filters["created_to"],
+        deadline_from=filters["deadline_from"],
+        deadline_to=filters["deadline_to"],
+        period_from=filters["date_from"],
+        period_to=filters["date_to"],
+    )
+    last_sync = stats.get("last_sync")
+    return {
+        "tasks": [row_to_task(row) for row in rows],
+        "stats": {
+            "total": stats["total"],
+            "filtered_total": stats["filtered_total"],
+            "by_status": [
+                {"status": row["status"], "count": row["count"]}
+                for row in stats["by_status"]
+            ],
+            "last_sync": dict(last_sync) if last_sync else None,
+        },
+        "filters": filters,
+    }
+
+
+def build_chat_record(chat: dict[str, Any], members: list[dict[str, Any]]) -> dict[str, Any]:
+    dialog_id = str(first_non_empty(chat.get("id"), chat.get("dialog_id"), chat.get("dialogId")) or "")
+    chat_id = to_int(first_non_empty(chat.get("chat_id"), chat.get("chatId")))
+    if not dialog_id and chat_id is not None:
+        dialog_id = f"chat{chat_id}"
+    avatar = chat.get("avatar") if isinstance(chat.get("avatar"), dict) else {}
+    message = chat.get("message") if isinstance(chat.get("message"), dict) else {}
+    avatar_url = avatar.get("url") if isinstance(avatar, dict) else None
+    if not isinstance(avatar_url, str):
+        avatar_url = None
+    return {
+        "dialog_id": dialog_id,
+        "chat_id": chat_id,
+        "title": first_non_empty(chat.get("title"), chat.get("name"), dialog_id),
+        "type": chat.get("type"),
+        "avatar_url": avatar_url,
+        "last_message_date": first_non_empty(message.get("date") if isinstance(message, dict) else None, chat.get("date_message")),
+        "last_activity_date": first_non_empty(chat.get("date_last_activity"), chat.get("date_update")),
+        "members": members,
+        "raw": chat,
+    }
+
+
+def sync_bitrix_chats(webhook_base: str) -> dict[str, Any]:
+    client = BitrixClient(webhook_base)
+    recent_chats = client.list_recent_chats()
+    records: list[dict[str, Any]] = []
+    skipped_personal = 0
+    skipped_small = 0
+    errors: list[dict[str, str]] = []
+
+    for chat in recent_chats:
+        dialog_id = str(first_non_empty(chat.get("id"), chat.get("dialog_id"), chat.get("dialogId")) or "")
+        chat_id = to_int(first_non_empty(chat.get("chat_id"), chat.get("chatId")))
+        if not dialog_id and chat_id is not None:
+            dialog_id = f"chat{chat_id}"
+        if not (dialog_id.startswith("chat") or dialog_id.startswith("sg")):
+            skipped_personal += 1
+            continue
+        try:
+            members = client.get_dialog_users(dialog_id)
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"dialog_id": dialog_id, "error": str(exc)})
+            continue
+        if len(members) < 3:
+            skipped_small += 1
+            continue
+        records.append(build_chat_record(chat, members))
+        time.sleep(client.request_delay)
+
+    upsert_chat_records(records)
+    return {
+        "scanned": len(recent_chats),
+        "saved": len(records),
+        "skipped_personal": skipped_personal,
+        "skipped_small": skipped_small,
+        "errors": errors[:20],
+        "chats": load_chats(),
+    }
+
+
+def sync_chat_messages_for_day(dialog_id: str, target_date: date, webhook_base: str) -> dict[str, Any]:
+    client = BitrixClient(webhook_base)
+    messages, users_by_id, files_by_id = client.search_dialog_messages_for_day(dialog_id, target_date)
+    normalized = normalize_chat_messages(messages, users_by_id, files_by_id)
+    upsert_chat_messages(dialog_id, normalized)
+    return load_chat_day(dialog_id, target_date) | {"synced_count": len(normalized)}
+
+
+def normalize_chat_messages(messages: list[dict[str, Any]], users_by_id: dict[int, dict[str, Any]], files_by_id: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        author_id = to_int(first_non_empty(message.get("author_id"), message.get("authorId")))
+        user = users_by_id.get(author_id or -1, {})
+        file_ids = []
+        params = message.get("params")
+        if isinstance(params, dict):
+            file_ids = [to_int(item) for item in to_list(params.get("FILE_ID"))]
+        message_files = [
+            files_by_id[file_id]
+            for file_id in file_ids
+            if file_id is not None and file_id in files_by_id
+        ]
+        normalized.append(
+            {
+                "id": message.get("id"),
+                "chat_id": message.get("chat_id"),
+                "author_id": author_id,
+                "author_name": first_non_empty(user.get("name"), message.get("author_name"), "Системное сообщение"),
+                "date": message.get("date"),
+                "text": message.get("text") or "",
+                "files": message_files,
+                "raw": message,
+            }
+        )
+    return normalized
+
+
+def sync_chat_messages_for_period(dialog_id: str, date_from: date, date_to: date, webhook_base: str) -> dict[str, Any]:
+    client = BitrixClient(webhook_base)
+    messages, users_by_id, files_by_id = client.get_dialog_messages_for_period(dialog_id, date_from, date_to)
+    normalized = normalize_chat_messages(messages, users_by_id, files_by_id)
+    upsert_chat_messages(dialog_id, normalized)
+    by_date: dict[str, int] = {}
+    for message in normalized:
+        parsed = parse_datetime(first_non_empty(message.get("date"), message.get("DATE_CREATE")))
+        if not parsed:
+            continue
+        message_day = parsed.date().isoformat()
+        by_date[message_day] = by_date.get(message_day, 0) + 1
+    upsert_chat_day_syncs(dialog_id, date_from, date_to, by_date)
+    return load_chat_period(dialog_id, date_from, date_to) | {
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "days_synced": (date_to - date_from).days + 1,
+        "synced_count": len(normalized),
+        "synced_by_date": by_date,
+        "message": (
+            f"Загрузка сообщений за {format_date_ru(date_from)} - {format_date_ru(date_to)} завершена: "
+            f"{len(normalized)} сообщений за {(date_to - date_from).days + 1} дн."
+        ),
+    }
+
+
+def _transcript_value(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text else "null"
+
+
+def _transcript_multiline(prefix: str, value: Any) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return [f"{prefix}(пусто)"]
+    return [f"{prefix}{line}" if line else prefix.rstrip() for line in text.splitlines()]
+
+
+def build_chat_day_transcript(messages: list[dict[str, Any]]) -> str:
+    if not messages:
+        return "Нет сообщений"
+
+    blocks: list[str] = []
+    for fallback_index, message in enumerate(messages, start=1):
+        sequence_no = to_int(message.get("sequence_no")) or fallback_index
+        author_name = str(message.get("author_name") or "Системное сообщение").strip()
+        author_id = message.get("author_id")
+        text = str(message.get("text") or "").strip()
+        files = message.get("files") if isinstance(message.get("files"), list) else []
+
+        lines = [
+            f"Сообщение #{sequence_no:03d}",
+            f"sequence_no={sequence_no}",
+            f"message_id={_transcript_value(message.get('message_id'))}",
+            f"date={_transcript_value(message.get('message_date') or message.get('message_date_text'))}",
+            f"author={author_name}",
+            f"author_id={_transcript_value(author_id)}",
+            "text:",
+            text if text else "(нет текста)",
+        ]
+
+        if not files:
+            lines.append("attachments: none")
+            blocks.append("\n".join(lines))
+            continue
+
+        lines.append("attachments:")
+        for attachment_no, file_item in enumerate(files, start=1):
+            file_name = _transcript_value(file_item.get("name") or file_item.get("file_name"))
+            file_id = _transcript_value(file_item.get("file_id"))
+            file_type = _transcript_value(file_item.get("type") or file_item.get("file_type"))
+            mime_type = _transcript_value(file_item.get("mime_type"))
+            ocr_status = _transcript_value(file_item.get("ocr_status") or ("pending" if file_item.get("is_image") else "not_applicable"))
+            ocr_text = str(file_item.get("ocr_text") or "").strip()
+            is_image = bool(file_item.get("is_image"))
+
+            lines.extend(
+                [
+                    f"- attachment_no={attachment_no}",
+                    f"  file_id={file_id}",
+                    f"  file_name={file_name}",
+                    f"  file_type={file_type}",
+                    f"  mime_type={mime_type}",
+                    f"  belongs_to_message_sequence_no={sequence_no}",
+                    f"  belongs_to_author={author_name}",
+                    f"  belongs_to_author_id={_transcript_value(author_id)}",
+                    f"  ocr_status={ocr_status}",
+                ]
+            )
+            if is_image:
+                lines.append(f"  OCR изображения, отправленного автором {author_name}:")
+                if ocr_status in {"success", "done"} and ocr_text:
+                    lines.extend(_transcript_multiline("    ", ocr_text))
+                else:
+                    lines.append("    (OCR отсутствует или еще не завершен)")
+            elif ocr_text:
+                lines.append("  extracted_text:")
+                lines.extend(_transcript_multiline("    ", ocr_text))
+
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
+
+
+def compact_previous_chat_daily_report_for_prompt(dialog_id: str, target_date: date, max_chars: int = 12000) -> dict[str, Any]:
+    previous_date = target_date - timedelta(days=1)
+    previous_day = load_chat_day(dialog_id, previous_date)
+    report = previous_day.get("report") or {}
+    raw = report.get("raw_ai_json") or report.get("raw") or {}
+    analysis = raw.get("analysis") if isinstance(raw, dict) else None
+    payload = {
+        "report_date": previous_date.isoformat(),
+        "summary": report.get("summary") or report.get("report_text") or "",
+        "analysis": analysis if isinstance(analysis, dict) else None,
+    }
+    text = json.dumps(payload, ensure_ascii=False, default=str, indent=2)
+    if len(text) <= max_chars:
+        return payload
+    return {
+        "report_date": previous_date.isoformat(),
+        "summary": str(payload["summary"])[:4000],
+        "analysis_truncated": True,
+        "analysis_excerpt": text[:max_chars],
+    }
+
+
+def format_previous_chat_daily_report_for_prompt(payload: dict[str, Any]) -> str:
+    if not payload.get("summary") and not payload.get("analysis") and not payload.get("analysis_excerpt"):
+        return "Отчет предыдущего дня не найден."
+    return json.dumps(payload, ensure_ascii=False, default=str, indent=2)
+
+
+def ensure_zoom_call_reports_for_chat_prompt(target_date: date, max_calls: int = 20) -> list[str]:
+    if not postgres_enabled():
+        return []
+    ensure_zoom_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, analytical_note
+                FROM zoom_calls
+                WHERE call_date = %s
+                ORDER BY start_time_msk ASC
+                LIMIT %s
+                """,
+                (target_date, max_calls),
+            )
+            rows = cur.fetchall()
+
+    generated_call_ids: list[str] = []
+    for row in rows:
+        call_id = str(row["id"])
+        if str(row.get("analytical_note") or "").strip():
+            continue
+        generate_zoom_call_report_if_needed(call_id)
+        generated_call_ids.append(call_id)
+    return generated_call_ids
+
+
+def load_zoom_calls_for_chat_prompt(target_date: date, max_calls: int = 20) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    ensure_zoom_schema()
+    ensured_call_ids = ensure_zoom_call_reports_for_chat_prompt(target_date, max_calls=max_calls)
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT zc.*, COALESCE(
+                    jsonb_agg(
+                        jsonb_build_object(
+                            'name', zcp.participant_name,
+                            'email', zcp.participant_email
+                        )
+                        ORDER BY zcp.participant_name NULLS LAST, zcp.participant_email NULLS LAST
+                    ) FILTER (WHERE zcp.id IS NOT NULL),
+                    '[]'::jsonb
+                ) AS participants_json
+                FROM zoom_calls zc
+                LEFT JOIN zoom_call_participants zcp ON zcp.call_id = zc.id
+                WHERE zc.call_date = %s
+                GROUP BY zc.id
+                ORDER BY zc.start_time_msk ASC
+                LIMIT %s
+                """,
+                (target_date, max_calls),
+            )
+            rows = cur.fetchall()
+
+    calls: list[dict[str, Any]] = []
+    for row in rows:
+        analytical_note = str(row.get("analytical_note") or "").strip()
+        calls.append(
+            {
+                "zoom_call_id": str(row["id"]),
+                "zoom_uuid": row.get("zoom_uuid"),
+                "date": target_date.isoformat(),
+                "start_time_msk": iso_or_none(row.get("start_time_msk")),
+                "end_time_msk": iso_or_none(row.get("end_time_msk")),
+                "topic": row.get("topic") or "",
+                "technical_topic": row.get("technical_topic") or "",
+                "participants": dedupe_zoom_participants(row.get("participants_json") or []),
+                "analytical_note": analytical_note,
+                "has_zoom_report": bool(analytical_note),
+                "zoom_report_generated_before_chat": str(row["id"]) in ensured_call_ids,
+            }
+        )
+    return calls
+
+
+def format_zoom_calls_for_chat_prompt(calls: list[dict[str, Any]]) -> str:
+    if not calls:
+        return "За дату отчета Zoom-созвоны не найдены."
+    chunks: list[str] = []
+    for index, call in enumerate(calls, start=1):
+        participants = ", ".join(
+            str(item.get("name") or item.get("email") or "").strip()
+            for item in call.get("participants") or []
+            if item.get("name") or item.get("email")
+        )
+        chunks.append(
+            "\n".join(
+                [
+                    f"Zoom call #{index}",
+                    f"zoom_call_id={call.get('zoom_call_id')}",
+                    f"zoom_uuid={call.get('zoom_uuid') or 'null'}",
+                    f"date={call.get('date')}",
+                    f"start_time_msk={call.get('start_time_msk') or 'null'}",
+                    f"end_time_msk={call.get('end_time_msk') or 'null'}",
+                    f"topic={call.get('topic') or 'Без темы'}",
+                    f"technical_topic={call.get('technical_topic') or 'Без темы'}",
+                    f"participants={participants or 'не указаны'}",
+                    f"has_zoom_report={str(bool(call.get('has_zoom_report'))).lower()}",
+                    "zoom_report:",
+                    call.get("analytical_note") or "(Zoom-отчет отсутствует)",
+                ]
+            )
+        )
+    return "\n\n".join(chunks)
+
+
+def sync_all_chat_dialogs_for_day(target_date: date, webhook_base: str, generate_reports: bool = True) -> dict[str, Any]:
+    chats_payload = sync_bitrix_chats(webhook_base)
+    chats = chats_payload.get("chats", [])
+    synced = 0
+    reports = 0
+    errors: list[dict[str, str]] = []
+
+    for chat in chats:
+        dialog_id = str(chat.get("dialog_id") or "").strip()
+        if not dialog_id:
+            continue
+        try:
+            sync_chat_messages_for_day(dialog_id, target_date, webhook_base)
+            synced += 1
+            if generate_reports:
+                generate_ai_chat_report(dialog_id, target_date, force=False)
+                reports += 1
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"dialog_id": dialog_id, "error": str(exc)})
+
+    return {
+        "date": target_date.isoformat(),
+        "chats_scanned": len(chats),
+        "chats_synced": synced,
+        "reports_generated": reports,
+        "errors": errors[:50],
+        "chats": load_chats(),
+    }
+
+
+def sync_all_chat_dialogs_for_period(date_from: date, date_to: date, webhook_base: str, generate_reports: bool = True) -> dict[str, Any]:
+    chats_payload = sync_bitrix_chats(webhook_base)
+    all_chats = chats_payload.get("chats", [])
+    chats = [chat for chat in all_chats if not chat.get("is_excluded")]
+    synced = 0
+    messages_synced = 0
+    reports = 0
+    errors: list[dict[str, str]] = []
+
+    for chat in chats:
+        dialog_id = str(chat.get("dialog_id") or "").strip()
+        if not dialog_id:
+            continue
+        try:
+            sync_result = sync_chat_messages_for_period(dialog_id, date_from, date_to, webhook_base)
+            synced += (date_to - date_from).days + 1
+            messages_synced += int(sync_result.get("synced_count") or 0)
+            if generate_reports:
+                current_date = date_from
+                while current_date <= date_to:
+                    generate_ai_chat_report(dialog_id, current_date, force=False)
+                    reports += 1
+                    current_date += timedelta(days=1)
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"dialog_id": dialog_id, "period": f"{date_from.isoformat()}..{date_to.isoformat()}", "error": str(exc)})
+
+    return {
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "days": (date_to - date_from).days + 1,
+        "chats_scanned": len(chats),
+        "chats_excluded": len(all_chats) - len(chats),
+        "chat_days_synced": synced,
+        "messages_synced": messages_synced,
+        "reports_generated": reports,
+        "errors": errors[:50],
+        "chats": load_chats(),
+    }
+
+
+def missing_chat_messages_period(default_days: int = 30) -> tuple[date, date]:
+    end_date = msk_today()
+    fallback_start = max(REPORT_PLACEHOLDER_START_DATE, end_date - timedelta(days=default_days - 1))
+    if not postgres_enabled():
+        return fallback_start, end_date
+    ensure_chat_day_syncs_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(MIN(next_date), %s) AS date_from
+                FROM (
+                    SELECT
+                        CASE
+                            WHEN MAX(s.sync_date) IS NULL THEN %s
+                            ELSE LEAST(MAX(s.sync_date) + INTERVAL '1 day', %s::date)
+                        END::date AS next_date
+                    FROM chats c
+                    LEFT JOIN chat_day_syncs s ON s.chat_id = c.id
+                    WHERE c.is_excluded = FALSE
+                      AND c.members_count >= 3
+                    GROUP BY c.id
+                ) missing
+                """,
+                (fallback_start, fallback_start, end_date),
+            )
+            row = cur.fetchone()
+    date_from = row["date_from"] if row and row["date_from"] else fallback_start
+    if date_from > end_date:
+        date_from = end_date
+    return date_from, end_date
+
+
+def heuristic_chat_report(chat_day: dict[str, Any]) -> str:
+    messages = chat_day.get("messages", [])
+    if not messages:
+        return (
+            "ИИ-отчет\n\n"
+            "Сообщений за день нет.\n\n"
+            "Что обсуждали: нет сообщений.\n"
+            "Выполненные задачи: не обнаружены.\n"
+            "Качество работы: оценить невозможно, так как коммуникации в чате не было.\n"
+            "Соответствие цели: нет данных для оценки.\n"
+            "Риски и следующие шаги: проверить, велась ли работа в другом канале."
+        )
+
+    authors = Counter(message.get("author_name") or "Системное сообщение" for message in messages)
+    text = "\n".join(str(message.get("text") or "") for message in messages).lower()
+    task_markers = ("готов", "сделал", "сделано", "закрыл", "выполнил", "отправил", "проверил")
+    risk_markers = ("проблем", "ошиб", "не могу", "срочно", "задерж", "не работает", "нет доступа")
+    done_hits = sum(text.count(marker) for marker in task_markers)
+    risk_hits = sum(text.count(marker) for marker in risk_markers)
+    active_people = ", ".join(f"{name} ({count})" for name, count in authors.most_common(5))
+    quality = "хорошо" if done_hits >= risk_hits else "требует внимания"
+    return (
+        "ИИ-отчет\n\n"
+        f"Активность: {len(messages)} сообщений, участников в обсуждении: {len(authors)}. Самые активные: {active_people}.\n"
+        f"Что обсуждали: основные темы нужно уточнять по расшифровке; в переписке найдено {done_hits} маркеров выполненной работы и {risk_hits} маркеров рисков.\n"
+        f"Какие задачи выполнили: по сообщениям обнаружены признаки завершенных действий: {done_hits}. Детали смотрите в расшифровке дня.\n"
+        f"Насколько хорошо поработали: {quality}.\n"
+        "Соответствие цели: если цель чата — оперативная координация, переписка соответствует ей при наличии конкретных решений и закрытых действий.\n"
+        "Риски и следующие шаги: проверьте сообщения с вопросами, задержками и доступами; зафиксируйте ответственных по незакрытым темам."
+    )
+
+
+OPEN_CHAT_TAIL_STATUSES = {"planned", "in_progress", "blocked", "postponed", "unknown", "unclear", "no_info", "partially_answered", "unanswered"}
+CLOSED_CHAT_TAIL_STATUSES = {"done", "cancelled", "answered"}
+
+
+def chat_tail_status(item: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    return "unknown"
+
+
+def normalize_chat_tail_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^\s*[^:;]{1,80}:\s+", "", text)
+    text = re.sub(r"\s*;\s*(?:срок|критерий проверки|источник)\s*:[^;]+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*\((?:тип|срок|было|сейчас|почему|риск)[^)]+\)\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" .;")
+    return text
+
+
+def canonical_chat_tail_text(value: Any) -> str:
+    text = normalize_chat_tail_text(value).lower()
+    replacements = {
+        "фондовая политика": "фондовая политика",
+        "юридического согласования": "юридическое согласование",
+        "рабочих встреч в zoom": "правило zoom",
+        "удаленные рабочие столы": "удаленные рабочие столы",
+        "альбери 2.0": "стратегические документы",
+    }
+    for needle, canonical in replacements.items():
+        if needle in text:
+            return canonical
+    text = re.sub(r"\b(проверить|проверить к|подтвердить|назначить|определить|зафиксировать|инициировать|установить)\b", "", text)
+    text = re.sub(r"\d{1,2}\.\d{1,2}(?:\.\d{4})?", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" .;:-")
+    return text
+
+
+def chat_tail_key(item: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(item.get("person_name") or item.get("addressed_to_name") or "").strip().lower(),
+        "tail",
+        canonical_chat_tail_text(first_non_empty(item.get("text"), item.get("reason"), item.get("summary"))),
+    )
+
+
+def append_chat_tail(tails: list[dict[str, Any]], seen: set[tuple[str, str, str]], item: dict[str, Any]) -> None:
+    text = normalize_chat_tail_text(first_non_empty(item.get("text"), item.get("reason"), item.get("summary")))
+    person = str(first_non_empty(item.get("person_name"), item.get("addressed_to_name")) or "").strip()
+    if not text or not person:
+        return
+    if str(item.get("item_type") or "").strip().lower() == "risk":
+        return
+    person_key = person.strip().lower()
+    if person_key in {"команда", "компания"} or person_key.startswith("юридическое согласование"):
+        return
+    normalized = dict(item)
+    normalized["text"] = text
+    normalized["person_name"] = person
+    normalized["task_id"] = normalized.get("task_id") or hashlib.sha1(
+        "|".join(chat_tail_key(normalized)).encode("utf-8")
+    ).hexdigest()[:16]
+    key = chat_tail_key(normalized)
+    if key in seen:
+        return
+    seen.add(key)
+    tails.append(normalized)
+
+
+def _tail_from_weekly_line(line: Any, item_type: str, source_report_date: str) -> dict[str, Any] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+    source_year = None
+    try:
+        source_year = date.fromisoformat(source_report_date).year
+    except Exception:
+        source_year = None
+    deadline = None
+    deadline_match = re.search(r"(?:срок|до|к)\s*[:—-]?\s*(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?", text, flags=re.IGNORECASE)
+    if deadline_match:
+        day = int(deadline_match.group(1))
+        month = int(deadline_match.group(2))
+        year = int(deadline_match.group(3) or source_year or msk_today().year)
+        try:
+            deadline = date(year, month, day).isoformat()
+        except ValueError:
+            deadline = None
+    person_name = "Команда"
+    body = text
+    if ":" in text:
+        left, right = text.split(":", 1)
+        if left.strip() and right.strip():
+            person_name = left.strip()
+            body = right.strip()
+    return {
+        "text": body,
+        "person_name": person_name,
+        "deadline": deadline,
+        "previous_status": "no_info",
+        "item_type": item_type,
+        "days_open": 1,
+        "risk_level": "medium",
+        "risk_reason": "Перенесено из недельного отчета предыдущей недели",
+        "source_report_date": source_report_date,
+        "evidence_message_ids": [],
+    }
+
+
+def _weekly_report_section_lines(text: Any, headings: tuple[str, ...], max_items: int = 80) -> list[str]:
+    report_text = str(text or "").replace("\r\n", "\n").strip()
+    if not report_text:
+        return []
+    lines = report_text.splitlines()
+    start_index: int | None = None
+    normalized_headings = tuple(heading.lower() for heading in headings)
+    for index, line in enumerate(lines):
+        clean = line.strip().strip(":").lower()
+        clean = re.sub(r"^\d{1,2}[.)]\s*", "", clean)
+        if any(clean.startswith(heading) for heading in normalized_headings):
+            start_index = index + 1
+            break
+    if start_index is None:
+        return []
+
+    items: list[str] = []
+    current: list[str] = []
+    for raw_line in lines[start_index:]:
+        line = raw_line.strip()
+        if not line:
+            if current:
+                items.append(" ".join(current).strip())
+                current = []
+            continue
+        is_bullet = line.startswith(("- ", "* ", "• "))
+        numbered_heading = bool(re.match(r"^\d{1,2}[.)]\s+\S", line)) and not is_bullet
+        looks_like_heading = numbered_heading or (
+            not is_bullet
+            and len(line) <= 120
+            and not line.endswith((".", ";", ","))
+        )
+        if looks_like_heading:
+            break
+        if is_bullet:
+            if current:
+                items.append(" ".join(current).strip())
+            current = [line[2:].strip()]
+        elif current:
+            current.append(line)
+        elif re.match(r"^\d{1,2}[.)]\s+", line):
+            current = [re.sub(r"^\d{1,2}[.)]\s+", "", line).strip()]
+    if current:
+        items.append(" ".join(current).strip())
+    return [item for item in items if item][:max_items]
+
+
+def weekly_open_items_from_report_text(report_text: Any) -> dict[str, list[str]]:
+    return {
+        "next_week_action_plan": _weekly_report_section_lines(
+            report_text,
+            (
+                "что делать на следующей неделе",
+                "план действий на следующую неделю",
+                "рекомендации",
+                "дополнительные рекомендации",
+            ),
+        ),
+        "not_done": _weekly_report_section_lines(
+            report_text,
+            (
+                "что не сделано",
+                "что не сделано / не подтверждено",
+                "что не делается",
+                "проблемы недели",
+            ),
+        ),
+        "hanging_tasks_by_owner": _weekly_report_section_lines(
+            report_text,
+            (
+                "открытые задачи по ответственным",
+                "задачи, которые висят",
+                "задачи, которые висят по итогу недели",
+            ),
+        ),
+        "hanging_goals": _weekly_report_section_lines(
+            report_text,
+            (
+                "цели, которые требуют контроля",
+                "цели, которые висят",
+            ),
+        ),
+        "work_in_progress": _weekly_report_section_lines(
+            report_text,
+            (
+                "что находится в работе",
+                "что делается",
+            ),
+        ),
+    }
+
+
+def daily_tail_items_from_report_text(report_text: Any, source_report_date: str) -> list[dict[str, Any]]:
+    sections = (
+        _weekly_report_section_lines(report_text, ("хвосты с прошлого дня",), max_items=120)
+        + _weekly_report_section_lines(report_text, ("план выполнения задач/целей",), max_items=120)
+        + _weekly_report_section_lines(report_text, ("что контролировать на следующем отчете",), max_items=120)
+    )
+    tails: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for line in sections:
+        tail = _tail_from_weekly_line(line, "task", source_report_date)
+        if not tail:
+            continue
+        tail["source_type"] = "previous_report_text"
+        tail["risk_reason"] = "Восстановлено из текстового отчета предыдущего дня без структурного analysis"
+        key = chat_tail_key(tail)
+        if key in seen:
+            continue
+        seen.add(key)
+        tails.append(tail)
+    return tails
+
+
+def load_previous_chat_tail_tasks(dialog_id: str, target_date: date) -> list[dict[str, Any]]:
+    previous_date = target_date - timedelta(days=1)
+    previous_day = load_chat_day(dialog_id, previous_date)
+    report = previous_day.get("report") or {}
+    raw = report.get("raw_ai_json") or report.get("raw") or {}
+    analysis = raw.get("analysis") if isinstance(raw, dict) else None
+    if not isinstance(analysis, dict):
+        report_text = report.get("report_text") or report.get("summary") or ""
+        return daily_tail_items_from_report_text(report_text, previous_date.isoformat())
+    if not analysis:
+        report_text = report.get("report_text") or report.get("summary") or ""
+        recovered = daily_tail_items_from_report_text(report_text, previous_date.isoformat())
+        if recovered:
+            return recovered
+
+    tails: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for item in analysis.get("previous_day_tasks") or []:
+        if not isinstance(item, dict):
+            continue
+        status = chat_tail_status(item, "current_status", "status", "answer_status")
+        if status in CLOSED_CHAT_TAIL_STATUSES:
+            continue
+        days_open = to_int(item.get("days_open")) or 1
+        append_chat_tail(tails, seen, {
+            "text": item.get("text"),
+            "person_name": item.get("person_name"),
+            "deadline": item.get("deadline"),
+            "previous_status": status,
+            "item_type": item.get("item_type") or "task",
+            "days_open": days_open + 1,
+            "risk_level": item.get("risk_level") or ("medium" if status in {"no_info", "blocked", "postponed", "unknown"} else "low"),
+            "risk_reason": first_non_empty(item.get("risk_reason"), item.get("status_reason"), item.get("reason")),
+            "source_report_date": previous_date.isoformat(),
+            "evidence_message_ids": to_list(item.get("evidence_message_ids")),
+        })
+
+    for item in analysis.get("commitments") or []:
+        if not isinstance(item, dict):
+            continue
+        status = chat_tail_status(item, "status")
+        if status in CLOSED_CHAT_TAIL_STATUSES:
+            continue
+        append_chat_tail(tails, seen, {
+            "text": item.get("text"),
+            "person_name": item.get("person_name"),
+            "deadline": item.get("deadline"),
+            "previous_status": status,
+            "item_type": item.get("item_type") or "task",
+            "days_open": 1,
+            "risk_level": item.get("risk_level") or ("medium" if status in {"blocked", "postponed", "unknown"} else "low"),
+            "risk_reason": item.get("risk_reason"),
+            "source_report_date": previous_date.isoformat(),
+            "evidence_message_ids": to_list(item.get("evidence_message_ids")),
+        })
+
+    for item in analysis.get("next_steps") or []:
+        if not isinstance(item, dict):
+            continue
+        append_chat_tail(tails, seen, {
+            "text": item.get("text"),
+            "person_name": item.get("person_name"),
+            "deadline": item.get("deadline"),
+            "previous_status": "planned",
+            "item_type": item.get("item_type") or "task",
+            "days_open": 1,
+            "risk_level": item.get("risk_level") or "low",
+            "risk_reason": item.get("risk_reason"),
+            "source_report_date": previous_date.isoformat(),
+            "evidence_message_ids": to_list(item.get("evidence_message_ids")),
+        })
+
+    for item in analysis.get("risks") or []:
+        if not isinstance(item, dict):
+            continue
+        status = chat_tail_status(item, "status", "current_status", "answer_status")
+        if status in CLOSED_CHAT_TAIL_STATUSES:
+            continue
+        risk_text = first_non_empty(item.get("text"), item.get("risk"), item.get("reason"), item.get("summary"))
+        if not risk_text:
+            continue
+        append_chat_tail(tails, seen, {
+            "text": risk_text,
+            "person_name": first_non_empty(item.get("person_name"), item.get("owner_name"), item.get("responsible_name"), "Компания"),
+            "deadline": item.get("deadline"),
+            "previous_status": status or "open_risk",
+            "item_type": "risk",
+            "days_open": (to_int(item.get("days_open")) or 0) + 1,
+            "risk_level": item.get("risk_level") or item.get("level") or "medium",
+            "risk_reason": first_non_empty(item.get("reason"), item.get("risk_reason"), "Открытый риск из предыдущего дневного отчета"),
+            "source_report_date": previous_date.isoformat(),
+            "evidence_message_ids": to_list(item.get("evidence_message_ids")),
+        })
+
+    for item in analysis.get("questions") or []:
+        if not isinstance(item, dict):
+            continue
+        status = chat_tail_status(item, "answer_status")
+        if status in CLOSED_CHAT_TAIL_STATUSES:
+            continue
+        append_chat_tail(tails, seen, {
+            "text": item.get("text"),
+            "person_name": first_non_empty(item.get("addressed_to_name"), item.get("person_name")),
+            "deadline": item.get("deadline") or previous_date.isoformat(),
+            "previous_status": status,
+            "item_type": "question",
+            "days_open": 1,
+            "risk_level": item.get("risk_level") or "medium",
+            "risk_reason": item.get("risk_reason") or "ответа в переписке за день нет",
+            "source_report_date": previous_date.isoformat(),
+            "evidence_message_ids": to_list(item.get("evidence_message_ids")),
+        })
+
+    for item in analysis.get("unanswered_questions") or []:
+        if not isinstance(item, dict):
+            continue
+        append_chat_tail(tails, seen, {
+            "text": item.get("text"),
+            "person_name": first_non_empty(item.get("person_name"), item.get("addressed_to_name")),
+            "deadline": item.get("deadline") or previous_date.isoformat(),
+            "previous_status": "unanswered",
+            "item_type": "question",
+            "days_open": 1,
+            "risk_level": item.get("urgency") or item.get("risk_level") or "medium",
+            "risk_reason": item.get("reason") or "ответа в переписке за день нет",
+            "source_report_date": previous_date.isoformat(),
+            "evidence_message_ids": to_list(item.get("evidence_message_ids")),
+        })
+
+    if target_date.weekday() == 0:
+        weekly_context = load_previous_chat_weekly_context(dialog_id, target_date)
+        if weekly_context:
+            weekly_date = str(weekly_context.get("period_end") or "")
+            raw_weekly = weekly_context.get("raw_json") if isinstance(weekly_context, dict) else {}
+            weekly_analysis = raw_weekly.get("analysis") if isinstance(raw_weekly, dict) else {}
+            text_fallback = weekly_open_items_from_report_text(
+                weekly_context.get("report_text") or (raw_weekly.get("report_text") if isinstance(raw_weekly, dict) else "")
+            )
+            next_week_action_plan = weekly_analysis.get("next_week_action_plan") if isinstance(weekly_analysis, dict) else []
+            hanging_tasks = weekly_analysis.get("hanging_tasks_by_owner") if isinstance(weekly_analysis, dict) else []
+            not_done = weekly_analysis.get("not_done") if isinstance(weekly_analysis, dict) else []
+            work_in_progress = weekly_analysis.get("work_in_progress") if isinstance(weekly_analysis, dict) else []
+            hanging_goals = weekly_analysis.get("hanging_goals") if isinstance(weekly_analysis, dict) else []
+            next_week_action_plan = next_week_action_plan or text_fallback.get("next_week_action_plan") or []
+            hanging_tasks = hanging_tasks or text_fallback.get("hanging_tasks_by_owner") or []
+            not_done = not_done or text_fallback.get("not_done") or []
+            work_in_progress = work_in_progress or text_fallback.get("work_in_progress") or []
+            hanging_goals = hanging_goals or text_fallback.get("hanging_goals") or []
+            if isinstance(next_week_action_plan, list):
+                for line in next_week_action_plan:
+                    tail_item = _tail_from_weekly_line(line, "task", weekly_date)
+                    if tail_item:
+                        tail_item["risk_reason"] = "Понедельничный перенос из блока next_week_action_plan недельного отчета"
+                        tail_item["source_type"] = "previous_weekly_report"
+                        append_chat_tail(tails, seen, tail_item)
+            if isinstance(hanging_tasks, list):
+                for line in hanging_tasks:
+                    tail_item = _tail_from_weekly_line(line, "task", weekly_date)
+                    if tail_item:
+                        tail_item["source_type"] = "previous_weekly_report"
+                        append_chat_tail(tails, seen, tail_item)
+            if isinstance(not_done, list):
+                for line in not_done:
+                    tail_item = _tail_from_weekly_line(line, "task", weekly_date)
+                    if tail_item:
+                        tail_item["risk_reason"] = "Понедельничный перенос из блока not_done недельного отчета"
+                        tail_item["source_type"] = "previous_weekly_report"
+                        append_chat_tail(tails, seen, tail_item)
+            if isinstance(work_in_progress, list):
+                for line in work_in_progress:
+                    tail_item = _tail_from_weekly_line(line, "task", weekly_date)
+                    if tail_item:
+                        tail_item["previous_status"] = "in_progress"
+                        tail_item["risk_reason"] = "Понедельничный перенос открытой работы из недельного отчета"
+                        tail_item["source_type"] = "previous_weekly_report"
+                        append_chat_tail(tails, seen, tail_item)
+            if isinstance(hanging_goals, list):
+                for line in hanging_goals:
+                    tail_item = _tail_from_weekly_line(line, "goal", weekly_date)
+                    if tail_item:
+                        tail_item["source_type"] = "previous_weekly_report"
+                        append_chat_tail(tails, seen, tail_item)
+
+    return tails
+
+
+def format_previous_chat_tail_tasks_for_prompt(tails: list[dict[str, Any]]) -> str:
+    if not tails:
+        return "Ничего не обнаружено"
+    return json.dumps(tails, ensure_ascii=False, indent=2, default=str)
+
+
+def compact_previous_chat_tail_tasks_for_prompt(
+    tails: list[dict[str, Any]],
+    max_items: int = 60,
+    max_chars: int = 24000,
+) -> list[dict[str, Any]]:
+    if not tails:
+        return []
+
+    risk_score = {"high": 3, "medium": 2, "low": 1}
+
+    def sort_key(item: dict[str, Any]) -> tuple[int, int, int]:
+        risk = str(item.get("risk_level") or "").strip().lower()
+        days_open = to_int(item.get("days_open")) or 0
+        item_type = str(item.get("item_type") or "").strip().lower()
+        type_score = 2 if item_type in {"task", "goal"} else 1
+        return (risk_score.get(risk, 0), days_open, type_score)
+
+    ordered = sorted((item for item in tails if isinstance(item, dict)), key=sort_key, reverse=True)
+    limited: list[dict[str, Any]] = []
+    for item in ordered[:max_items]:
+        limited.append(item)
+
+    while limited:
+        encoded = json.dumps(limited, ensure_ascii=False, default=str)
+        if len(encoded) <= max_chars:
+            break
+        limited.pop()
+    return limited
+
+
+def merge_unseen_previous_day_tasks(
+    all_previous_tails: list[dict[str, Any]],
+    analyzed_previous_tails: Any,
+) -> list[dict[str, Any]]:
+    analyzed_list = analyzed_previous_tails if isinstance(analyzed_previous_tails, list) else []
+    merged: list[dict[str, Any]] = [item for item in analyzed_list if isinstance(item, dict)]
+    previous_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for tail in all_previous_tails:
+        if isinstance(tail, dict):
+            previous_by_key[chat_tail_key(tail)] = tail
+
+    seen: set[tuple[str, str, str]] = set()
+    for item in merged:
+        key = chat_tail_key(item)
+        previous = previous_by_key.get(key)
+        if previous:
+            previous_days_open = to_int(previous.get("days_open")) or 0
+            current_days_open = to_int(item.get("days_open")) or 0
+            if previous_days_open > current_days_open:
+                item["days_open"] = previous_days_open
+        seen.add(key)
+
+    for tail in all_previous_tails:
+        if not isinstance(tail, dict):
+            continue
+        key = chat_tail_key(tail)
+        if key in seen:
+            continue
+        carried = dict(tail)
+        carried["current_status"] = carried.get("current_status") or "no_info"
+        carried["status_reason"] = carried.get("status_reason") or "Автоперенос: хвост не попал в окно анализа текущего дня."
+        merged.append(carried)
+        seen.add(key)
+    return merged
+
+
+def load_active_goals_for_chat_prompt(dialog_id: str, report_date: date) -> list[dict[str, Any]]:
+    if not postgres_enabled():
+        return []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT g.id,
+                       g.goal_title,
+                       g.goal_text,
+                       g.goal_level,
+                       g.period_type,
+                       g.period_start,
+                       g.period_end,
+                       g.success_metrics,
+                       g.expected_result,
+                       g.status,
+                       g.confidence,
+                       u.full_name AS owner_name,
+                       m.full_name AS manager_name,
+                       (
+                           SELECT e.progress_text
+                           FROM goal_progress_events e
+                           WHERE e.goal_id = g.id
+                           ORDER BY e.report_date DESC, e.created_at DESC
+                           LIMIT 1
+                       ) AS last_progress_text,
+                       (
+                           SELECT e.status_after
+                           FROM goal_progress_events e
+                           WHERE e.goal_id = g.id
+                           ORDER BY e.report_date DESC, e.created_at DESC
+                           LIMIT 1
+                       ) AS last_status_after
+                FROM chats c
+                JOIN user_goals g ON g.status IN ('draft','active')
+                LEFT JOIN users u ON u.id = g.user_id
+                LEFT JOIN users m ON m.id = g.manager_id
+                WHERE c.dialog_id = %s
+                  AND g.period_start <= %s
+                  AND g.period_end >= %s
+                  AND (
+                      g.goal_level IN ('company','department','project')
+                      OR g.user_id IN (
+                          SELECT cm.user_id
+                          FROM chat_members cm
+                          WHERE cm.chat_id = c.id
+                            AND cm.is_active = TRUE
+                            AND cm.user_id IS NOT NULL
+                      )
+                      OR g.manager_id IN (
+                          SELECT cm.user_id
+                          FROM chat_members cm
+                          WHERE cm.chat_id = c.id
+                            AND cm.is_active = TRUE
+                            AND cm.user_id IS NOT NULL
+                      )
+                  )
+                ORDER BY
+                    CASE g.goal_level
+                        WHEN 'company' THEN 1
+                        WHEN 'project' THEN 2
+                        WHEN 'department' THEN 3
+                        WHEN 'manager' THEN 4
+                        ELSE 5
+                    END,
+                    g.period_end,
+                    g.goal_title
+                LIMIT 80
+                """,
+                (dialog_id, report_date, report_date),
+            )
+            rows = cur.fetchall()
+    goals: list[dict[str, Any]] = []
+    for row in rows:
+        goals.append({
+            "goal_id": str(row["id"]),
+            "goal_title": row["goal_title"],
+            "goal_level": row["goal_level"],
+            "owner_name": row["owner_name"],
+            "manager_name": row["manager_name"],
+            "period_type": row["period_type"],
+            "period_start": row["period_start"].isoformat() if row["period_start"] else None,
+            "period_end": row["period_end"].isoformat() if row["period_end"] else None,
+            "success_metrics": row["success_metrics"],
+            "expected_result": row["expected_result"],
+            "status": row["status"],
+            "last_progress_text": row["last_progress_text"],
+            "last_status_after": row["last_status_after"],
+            "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+        })
+    return goals
+
+
+def format_active_goals_for_prompt(goals: list[dict[str, Any]]) -> str:
+    if not goals:
+        return "Нет активных целей для проверки."
+    return json.dumps(goals, ensure_ascii=False, indent=2, default=str)
+
+
+DEFAULT_CHAT_ANALYSIS_PROMPT = """Ты выполняешь ежедневный управленческий разбор корпоративного чата.
+
+Нужен максимально сухой управленческий отчет. Не пересказ чата, не общая аналитика, не список обсуждений.
+
+Входные данные, которые нужно анализировать:
+- `Дата` - дата отчета. Все относительные сроки ("сегодня", "завтра", "к понедельнику") нормализуй относительно этой даты.
+- `Чат` - конкретный корпоративный чат, по которому формируется отчет.
+- `Хвосты с прошлого дня` - незакрытые задачи, вопросы, договоренности и риски из предыдущего дневного отчета по этому же чату.
+- `Отчет предыдущего дня` - полный управленческий отчет за предыдущий календарный день по этому же чату. Используй его для проверки, что перешло в хвосты, что закрыто, а что зависло без движения.
+- `Недельный контекст предыдущей недели` - фоновые цели и открытые задачи недели, особенно важен в понедельник.
+- `Активные цели для проверки` - цели, которые нужно сверить с текущей перепиской и Zoom.
+- `Zoom-отчеты текущего дня` - готовые управленческие отчеты по Zoom-созвонам за дату отчета из раздела "Zoom созвоны". Перед анализом чата отсутствующие Zoom-отчеты должны быть сформированы отдельно. В chat_analysis не передается сырая транскрибация Zoom; используй только готовый Zoom-отчет и бери из него только то, что относится к этому чату: задачи участников чата, выполнение/перенос их задач, решения по темам чата, риски и контрольные точки.
+- `Расшифровка` - дневная переписка чата. Вложения-картинки уже должны быть преобразованы в OCR-текст внутри блока `attachments`; анализируй именно текст, а не изображение.
+
+В итоговом текстовом отчете будут показаны только разделы:
+1. Хвосты с прошлого дня.
+2. Найденные цели.
+3. Найденные задачи.
+4. Факт выполнения задач/целей.
+5. План выполнения задач/целей.
+6. Риски.
+
+Кроме структурного JSON обязательно верни поле `report_text` - готовый человекочитаемый отчет для интерфейса. `report_text` должен быть содержательным, как управленческая записка: короткий вывод, источник данных, затем разделы 1-6. Это не пересказ чата, а собранный управленческий результат из JSON.
+
+Главный фильтр:
+- Нельзя упускать управленчески значимые факты. Фиксируй все цели, задачи, договоренности, выполненные действия, выполненные встречи с целью/результатом, планы, переносы и риски.
+- В `Хвосты с прошлого дня` передаются все незакрытые `previous_day_tasks`, `next_steps` и `risks` предыдущего дневного отчета. Это контрольный список, а не только строгие задачи.
+- Если в контексте есть `Хвосты с прошлого дня`, обязательно проверь каждый хвост по переписке текущего дня и Zoom-отчетам текущего дня, затем верни его в `previous_day_tasks`.
+- Нельзя выбрасывать хвост только потому, что у него нет срока или он был риском, а не задачей. Если явного закрытия в текущем дне нет, верни его в `previous_day_tasks` со статусом `no_info`; для риска используй `item_type = "risk"`.
+- Если дата отчета - понедельник, `Хвосты с прошлого дня` дополнительно содержат открытые задачи из недельного отчета предыдущей недели: `next_week_action_plan`, `hanging_tasks_by_owner`, `not_done`, `work_in_progress`, `hanging_goals`.
+- Для понедельника обязательно обработай эти недельные открытые задачи по тем же правилам, что и обычные хвосты: проверь по чату и Zoom текущего дня, верни каждый пункт в `previous_day_tasks` со статусом `done|in_progress|postponed|blocked|no_info|cancelled`.
+- Недельный пункт нельзя удалить из `previous_day_tasks`, если в понедельник нет явного закрытия или отмены. Если движения нет, ставь `current_status = "no_info"` и объясняй, что подтверждения за понедельник нет.
+- Если недельный пункт содержит конкретный следующий шаг, владельца и срок, но в понедельник нет реакции, добавь риск или контрольный `next_steps` с тем же владельцем и сроком.
+- Хвосты нельзя удалять из памяти без явного основания в текущем дне. Если нет движения, помечай `current_status = "no_info"` и повышай риск только при просрочке/блокере.
+- У каждой цели, задачи и следующего шага обязательно должны быть владелец (`person_name`) и период: дата постановки (`period_start` или `assigned_at`) и дата окончания (`period_end` или `deadline`).
+- Если нет ответственного или срока, не добавляй новый пункт в `goals`, `commitments` или `next_steps`, но уже переданный хвост все равно должен остаться в `previous_day_tasks`, пока нет явного закрытия/отмены.
+- В человекочитаемом `report_text` каждый пункт разделов "Найденные задачи", "План выполнения задач/целей" и "Что контролировать на следующем отчете" должен явно содержать ответственного и срок. Нельзя писать общий план только по датам без владельца у каждого действия.
+- Если факт важен, но нет срока для задачи, добавь его в `results` или `risks`, а не выбрасывай.
+- Для целей уровня компании, отдела, руководителя, сотрудника или проекта обязательно укажи `goal_level`: "company", "department", "manager", "employee" или "project". В `person_name` пиши конкретного владельца, "Компания", название отдела/команды или проекта.
+- Если задача важная, но у нее нет срока или ответственного, не превращай ее в задачу; добавь ее в `risks` только если можно указать владельца риска и причину.
+- Риск без владельца (`person_name`) и причины (`reason`) не добавляй.
+- Размытые формулировки задач считаются риском только если это влияет на срок/результат или повторяется без прогресса. Не дублируй одинаковый риск в каждом пункте; агрегируй в один риск на владельца/тему.
+- Задачи из текущего дня должны находиться по двум источникам: переписка чата + Zoom-отчеты текущего дня. Если задача поставлена в Zoom-отчете, но относится к этому чату/участникам, добавь ее в `commitments` с `source_type = "zoom"` и `evidence_zoom_call_ids`.
+- Факт выполнения задач определяй по совокупности переписки и Zoom-отчетов: если выполнение подтверждено в Zoom-отчете, а в чате не написано, все равно фиксируй `results` с источником Zoom.
+- Риски оценивай поименно и в целом: некорректная постановка задачи, отсутствие срока/ответственного, перенос без новой даты, просрочка, отсутствие реакции на хвост, противоречие между чатом и Zoom.
+
+Жесткие правила:
+1. Анализируй только предоставленные входные данные: расшифровку чата, OCR-текст вложений, готовые Zoom-отчеты текущего дня, хвосты и отчет предыдущего дня, активные цели и недельный контекст. Не используй догадки и внешние знания. Не используй сырую Zoom-транскрибацию в chat_analysis.
+2. Не пиши summary, оценку работы, блокеры, заметки и общий контекст, если это не цель/задача/факт/план/риск. Вопросы и договоренности фиксируй в JSON, чтобы незакрытые пункты переходили в хвосты следующего дня, но отдельный текстовый раздел вопросов не нужен.
+3. Не добавляй встречи как цели или задачи, если нет явного ожидаемого результата, ответственного и срока. Но если встреча была выполнена и у нее указана цель/результат, обязательно добавь ее в `results`.
+4. Не добавляй действия как задачи, если они уже выполнены и не имеют управленческого срока; обязательно добавь такие пункты в `results`, если есть ответственный или понятный владелец: человек, команда или отдел.
+5. Не выдумывай ответственных, дедлайны, даты постановки, Bitrix ID, статусы и результаты.
+6. Если в чате сказано "сегодня", используй дату анализа из контекста как срок или дату выполнения. Если сказано "завтра", используй следующий календарный день после даты анализа.
+7. Для доказательств из чата используй `message_id` из расшифровки в `evidence_message_ids`. Не используй `sequence_no` как доказательство.
+8. Если доказательство находится в OCR вложения, указывай `message_id` сообщения, внутри которого лежит вложение.
+9. Для доказательств из Zoom используй `zoom_call_id` в `evidence_zoom_call_ids`; в `source_detail` укажи раздел/пункт Zoom-отчета и таймкод, если он есть в Zoom-отчете.
+10. В `confidence` ставь число от 0 до 1: 0.9-1.0 для прямого текста, 0.6-0.8 для уверенного вывода из контекста, ниже 0.6 для слабого сигнала.
+11. Один вопрос в списке вопросов = один отдельный контрольный пункт. Если задали 6 вопросов и ответили на 3, верни 3 закрытых и 3 незакрытых пункта отдельно.
+12. Фразы "обсудим завтра", "вернемся завтра", "посмотрим завтра", "завтра решим", "когда будет готово - напиши", "после ответа вернемся" являются хвостами/договоренностями на контроль.
+13. Рабочие вопросы фиксируй по одному: один вопрос = один объект в `questions`. Если вопрос не закрыт, дополнительно добавь его в `unanswered_questions`.
+14. Если руководитель явно просит обязательный формат отчета дня (например: "факт, рефлексия, планы"), добавь в `risks` пункт дисциплины отчетности по тем участникам, кто не дал обязательный ответ до конца дня.
+15. Если в чате или Zoom есть технический сбой доступа/подключения, фиксируй как `blocker` или `risk` с владельцем и влиянием.
+16. Для спорных или не до конца подтвержденных фактов используй пометку в `results.text`: `[self-reported]`, `[confirmed-by-chat]` или `[confirmed-by-zoom]`.
+
+Как заполнять основные разделы:
+- `previous_day_tasks`: каждый хвост из блока "Хвосты с прошлого дня". Для каждого хвоста определи текущий статус по сегодняшней переписке: "done", "in_progress", "postponed", "blocked", "no_info", "cancelled". Если в текущей переписке нет явного закрытия или движения, ставь "no_info".
+- `goals`: только явно поставленные цели или ожидаемые результаты с владельцем, уровнем цели, периодом, метриками успеха и ожидаемым результатом.
+- `commitments`: конкретные задачи, поручения и обязательства с ответственным и сроком, найденные в чате или Zoom текущего дня.
+- `results`: факт выполнения цели, задачи, встречи, договоренности или рабочего действия. Указывай ответственного или владельца ("Команда", "Отдел продаж", конкретный человек). Не пропускай выполненные пункты только потому, что это встреча.
+- `results`: для каждой встречи указывай результат встречи, а не только факт проведения.
+- `next_steps`: только дальнейшие действия с ответственным и сроком. Если шаг размытый, добавь `risk_level` и `risk_reason`.
+- `risks`: только управленческие риски с владельцем, причиной и уровнем риска. Отдельно фиксируй поименные риски, а общий риск для компании пиши как `person_name = "Компания"`.
+- `questions`: рабочие вопросы, по одному объекту на каждый вопрос, даже если они были одним списком.
+- `unanswered_questions`: вопросы, по которым нет явного ответа/решения/закрывающего действия в текущем дне.
+- `decisions`: фиксируй принятые решения и `decision_pending` (что требуется решить, кто владелец решения, срок решения).
+
+Типы хвостов и договоренностей:
+- `task`: обычная задача.
+- `question`: вопрос, на который нужен ответ.
+- `discussion_commitment`: договоренность обсудить/вернуться к теме.
+- `access_pending`: ожидание доступа/подписи/КЭП.
+- `document_pending`: ожидание документа/акта/файла.
+- `decision_pending`: ожидание решения/согласования.
+- `payment_pending`: ожидание оплаты.
+- `risk`: риск, требующий контроля.
+
+Правила для задач в `commitments`:
+- `assigned_at`: дата, когда задача была поставлена или стала обязательством. Если неизвестно, null.
+- `deadline`: обязательный срок выполнения в формате YYYY-MM-DD.
+- `completed_at`: дата выполнения, если задача выполнена. Если не выполнена, null.
+- `postponed_to`: новая дата переноса. Если перенесли без даты, null, `status` = "postponed", `risk_level` = "medium" или "high".
+- `status`: "planned", "in_progress", "done", "blocked", "postponed", "cancelled" или "unknown".
+- `risk_level`: "low", "medium", "high" или "unknown".
+- `risk_reason`: почему есть риск; если риска нет, null.
+- Если `text` задачи начинается с "продолжить", "контролировать", "управлять" или содержит только процесс без результата, это не низкий риск. Укажи `risk_level` = "medium" и `risk_reason` = "размытая формулировка, нужен конкретный измеримый результат".
+
+Стиль:
+- Формулируй коротко: "Закрыть отчетность", "Подготовить заявку на закупку", "Согласовать алгоритм подсчета".
+- Вместо "продолжить контроль X" по возможности формулируй проверяемый результат: "проверить X и зафиксировать отклонения", "подготовить отчет по X", "согласовать X". Если из чата нельзя понять результат, оставь исходную формулировку и пометь риск размытости.
+- Не дублируй имя внутри `text`, оно уже есть в `person_name`.
+- Не объединяй разные задачи одного человека в один пункт.
+- Не добавляй пункты "для информации".
+- Дедуплицируй однотипные хвосты/вопросы: если это один и тот же смысл разными словами, оставь один объект с самым полным текстом.
+
+Правила для `report_text`:
+- Пиши по-русски, без JSON внутри строки.
+- Начни с заголовка: `Ежедневный отчет по чату «...название...» за DD.MM.YYYY`.
+- Далее дай `Короткий вывод`: 3-5 предложений о сути дня, но без потери конкретики.
+- Далее дай `Источник`: чат, dialog_id, дата, количество сообщений, количество OCR-вложений, использованные Zoom/Bitrix источники.
+- Разделы строго: `1. Хвосты с прошлого дня`, `2. Найденные цели`, `3. Найденные задачи`, `4. Факт выполнения задач/целей`, `5. План выполнения задач/целей`, `6. Риски`, `7. Что контролировать на следующем отчете`.
+- Если новых сообщений нет, но есть `previous_day_tasks`, не пиши, что отчет пустой. Главный смысл такого дня - отсутствие реакции по перенесенным задачам.
+- Для дня без сообщений, но с хвостами, формат должен быть как полноценный ежедневный управленческий отчет, а не короткая заглушка:
+  - в `Короткий вывод` напиши, что новых данных нет, но хвосты остаются без движения;
+  - в `Источник` перечисли чат, dialog_id, дату, сообщения/OCR/Zoom и использованные предыдущий отчет/недельный контекст;
+  - в `1. Хвосты с прошлого дня` перечисли все незакрытые хвосты со статусом `no_info`;
+  - в `2. Найденные цели` укажи новые цели, а если новых нет, но есть активные/перенесенные цели, напиши, что активными остаются цели из предыдущих отчетов;
+  - в `3. Найденные задачи` явно раздели "новых задач нет" и "задачи из предыдущего отчета остаются на контроле";
+  - в `5. План выполнения задач/целей` повтори план по владельцам и срокам из незакрытых хвостов;
+  - в `6. Риски` сохрани риски из предыдущего отчета, если нет данных об их снятии;
+  - в `7. Что контролировать на следующем отчете` перечисли все контрольные пункты по владельцам и срокам.
+- В разделе `3. Найденные задачи` можно написать "Новых задач из текущей переписки нет", но обязательно сошлись на разделы 1 и 7, если там есть перенесенные задачи.
+- В задачах группируй по владельцам, но не выдумывай владельцев и сроки. Если владелец или срок неизвестен, не превращай пункт в задачу.
+- В разделе `5. План выполнения задач/целей` не группируй действия только по сроку без адресата. Каждый пункт плана пиши отдельной строкой с владельцем: `До DD.MM.YYYY: Ответственный - действие`. Если в одну дату несколько действий, у каждого действия должен быть свой ответственный. Если ответственный неизвестен, не включай пункт в план как задачу; добавь риск неопределенности владельца.
+- В разделе `5. План выполнения задач/целей` при наличии `previous_day_tasks` или `next_steps` нельзя писать "планов не найдено". Перечисли контрольные действия по владельцам и срокам из незакрытых хвостов.
+- В разделе `7. Что контролировать на следующем отчете` каждый контрольный пункт тоже должен содержать владельца и срок: `Ответственный - что проверить к DD.MM.YYYY`.
+- В фактах выполнения не пиши “нет подтверждений”, если в Zoom или Bitrix есть подтверждения выполнения за этот день.
+- Если в чате не было обсуждения, но были OCR-документы, прямо скажи: “в чате не было операционной дискуссии, но OCR-документы задали управленческую повестку”.
+- Не добавляй факты из источников, которые не переданы во входных данных.
+
+Верни строго валидный JSON без markdown и без пояснений вокруг JSON.
+
+Формат ответа:
+{
+  "summary": "",
+  "report_text": "",
+  "quality_assessment": "",
+  "previous_day_tasks": [
+    {
+      "text": "хвост, задача, вопрос или договоренность с прошлого дня",
+      "person_name": "ответственный или владелец хвоста",
+      "deadline": "YYYY-MM-DD или null",
+      "item_type": "task|question|discussion_commitment|access_pending|document_pending|decision_pending|payment_pending|risk",
+      "previous_status": "planned|in_progress|blocked|postponed|unknown|unanswered|partially_answered|no_info",
+      "current_status": "done|in_progress|postponed|blocked|no_info|cancelled",
+      "status_reason": "почему такой статус по переписке текущего дня",
+      "days_open": 1,
+      "risk_level": "low|medium|high|unknown",
+      "risk_reason": "почему есть риск или null",
+      "confidence": 0.0,
+      "evidence_message_ids": [123],
+      "evidence_zoom_call_ids": ["uuid"],
+      "source_type": "chat|ocr|zoom|previous_report|mixed",
+      "source_detail": "сообщение, OCR или раздел/пункт Zoom-отчета/таймкод"
+    }
+  ],
+  "goals": [
+    {
+      "text": "конкретная цель или ожидаемый результат",
+      "person_name": "владелец: имя, Компания, отдел/команда или проект",
+      "goal_level": "company|department|manager|employee|project",
+      "scope": "company|department|manager|employee|project",
+      "assigned_at": "YYYY-MM-DD или null",
+      "period_type": "day|week|month|quarter|year|project",
+      "period_start": "YYYY-MM-DD",
+      "period_end": "YYYY-MM-DD",
+      "deadline": "YYYY-MM-DD",
+      "success_metrics": "измеримые критерии успеха или null",
+      "expected_result": "ожидаемый итог или null",
+      "confidence": 0.0,
+      "evidence_message_ids": [123]
+    }
+  ],
+  "commitments": [
+    {
+      "text": "конкретная задача, поручение или обязательство",
+      "person_name": "ответственный",
+      "assigned_at": "YYYY-MM-DD или null",
+      "deadline": "YYYY-MM-DD",
+      "completed_at": "YYYY-MM-DD или null",
+      "postponed_to": "YYYY-MM-DD или null",
+      "status": "planned|in_progress|done|blocked|postponed|cancelled|unknown",
+      "risk_level": "low|medium|high|unknown",
+      "risk_reason": "почему есть риск или null",
+      "confidence": 0.0,
+      "evidence_message_ids": [123],
+      "evidence_zoom_call_ids": ["uuid"],
+      "source_type": "chat|ocr|zoom|mixed",
+      "source_detail": "сообщение, OCR или раздел/пункт Zoom-отчета/таймкод"
+    }
+  ],
+  "actions": [],
+  "results": [
+    {
+      "text": "факт выполнения цели или задачи",
+      "person_name": "ответственный",
+      "confidence": 0.0,
+      "evidence_message_ids": [123],
+      "evidence_zoom_call_ids": ["uuid"],
+      "source_type": "chat|ocr|zoom|mixed",
+      "source_detail": "сообщение, OCR или раздел/пункт Zoom-отчета/таймкод"
+    }
+  ],
+  "questions": [
+    {
+      "text": "один рабочий вопрос",
+      "person_name": "кто задал вопрос",
+      "addressed_to_name": "кто должен ответить или null",
+      "deadline": "YYYY-MM-DD или null",
+      "answer_status": "answered|partially_answered|unanswered|blocked|postponed|unclear",
+      "answer_message_ids": [124],
+      "risk_level": "low|medium|high|unknown",
+      "risk_reason": "почему есть риск или null",
+      "confidence": 0.0,
+      "evidence_message_ids": [123]
+    }
+  ],
+  "unanswered_questions": [
+    {
+      "text": "один вопрос без полного ответа",
+      "person_name": "кто должен ответить или владелец вопроса",
+      "asked_by_name": "кто спросил",
+      "deadline": "YYYY-MM-DD или null",
+      "reason": "почему вопрос не закрыт",
+      "urgency": "low|medium|high|unknown",
+      "confidence": 0.0,
+      "evidence_message_ids": [123]
+    }
+  ],
+  "decisions": [],
+  "risks": [
+    {
+      "text": "конкретный риск",
+      "person_name": "владелец риска или ответственный за снятие риска",
+      "reason": "почему это риск",
+      "risk_level": "low|medium|high|unknown",
+      "confidence": 0.0,
+      "evidence_message_ids": [123],
+      "evidence_zoom_call_ids": ["uuid"],
+      "source_type": "chat|ocr|zoom|previous_report|mixed",
+      "source_detail": "сообщение, OCR или раздел/пункт Zoom-отчета/таймкод"
+    }
+  ],
+  "blockers": [],
+  "bitrix_references": [],
+  "next_steps": [
+    {
+      "text": "конкретное дальнейшее действие",
+      "person_name": "ответственный",
+      "deadline": "YYYY-MM-DD",
+      "risk_level": "low|medium|high|unknown",
+      "risk_reason": "почему есть риск или null",
+      "confidence": 0.0,
+      "evidence_message_ids": [123],
+      "evidence_zoom_call_ids": ["uuid"],
+      "source_type": "chat|ocr|zoom|mixed",
+      "source_detail": "сообщение, OCR или раздел/пункт Zoom-отчета/таймкод"
+    }
+  ],
+  "goal_updates": [
+    {
+      "goal_id": "uuid активной цели или null",
+      "goal_title": "название цели",
+      "person_name": "владелец или ответственный",
+      "goal_level": "company|department|manager|employee|project",
+      "status_after": "draft|active|done|cancelled|archived",
+      "progress_text": "что произошло по цели сегодня",
+      "progress_percent": 0.0,
+      "metric_value": "значение метрики или null",
+      "risk_level": "low|medium|high|unknown",
+      "is_completed": false,
+      "is_cancelled": false,
+      "confidence": 0.0,
+      "evidence_message_ids": [123]
+    }
+  ],
+  "notes": []
+}
+
+Если по разделу нет управленческих данных с обязательными полями, верни пустой массив. Не добавляй разделы вне указанной схемы."""
+
+
+CHAT_GOAL_EXTRACTION_CONTRACT = """Дополнительное обязательное правило для целей:
+- Если в `goals` есть цель, верни ее в расширенной форме без изменения общей схемы отчета: `text`, `person_name`, `goal_level`, `scope`, `assigned_at`, `period_type`, `period_start`, `period_end`, `deadline`, `success_metrics`, `expected_result`, `confidence`, `evidence_message_ids`.
+- `goal_level` выбирай строго из: `company`, `department`, `manager`, `employee`, `project`.
+- `assigned_at` и `period_start` - дата постановки цели; если в чате сказано "сегодня", используй дату анализа.
+- `period_end` и `deadline` - дата окончания цели; не выдумывай дату, если ее нельзя вывести из текста или относительной даты.
+- `success_metrics` - измеримые критерии успеха; `expected_result` - конкретный ожидаемый итог. Если в чате этого нет, ставь null.
+"""
+
+
+CHAT_GOAL_UPDATE_CONTRACT = """Дополнительное обязательное правило для обновления существующих целей:
+- В контексте есть блок `Активные цели для проверки`. Для каждой цели, по которой в текущей расшифровке есть прогресс, выполнение, отмена, перенос, риск или числовая метрика, верни объект в `goal_updates`.
+- Если по активной цели в текущем дне нет новой информации, не возвращай ее в `goal_updates`.
+- Всегда используй `goal_id` из активной цели, если цель совпала.
+- Не ставь `status_after = "done"`, если нет явного факта достижения ожидаемого результата или закрытия метрик успеха.
+- Не ставь `status_after = "cancelled"`, если нет прямого текста об отмене, неактуальности или прекращении цели.
+- Для частичного прогресса, риска или плана оставляй `status_after = "active"`.
+- `progress_text` должен кратко объяснять, что именно изменилось по цели на основании сегодняшнего чата.
+
+Формат элемента `goal_updates`:
+{
+  "goal_id": "uuid активной цели или null",
+  "goal_title": "название цели",
+  "person_name": "владелец или ответственный",
+  "goal_level": "company|department|manager|employee|project",
+  "status_after": "draft|active|done|cancelled|archived",
+  "progress_text": "что произошло по цели сегодня",
+  "progress_percent": 0.0 или null,
+  "metric_value": "значение метрики или null",
+  "risk_level": "low|medium|high|unknown",
+  "is_completed": true|false,
+  "is_cancelled": true|false,
+  "confidence": 0.0,
+  "evidence_message_ids": [123]
+}
+"""
+
+
+DEFAULT_CHAT_ANALYSIS_PROMPT = """Ты извлекаешь факты из корпоративного чата за один день для следующего уровня агрегации.
+
+Это не аналитический отчет и не рекомендации. Не оценивай качество работы, не формулируй цели, не выводи риски из молчания или просрочек. Верни только проверяемые факты из входных данных.
+
+Входные блоки:
+- `Дата` - дата отчета. Относительные даты нормализуй относительно нее.
+- `Чат` - чат, по которому идет извлечение.
+- `Хвосты с прошлого дня` - контрольный список незакрытых задач/вопросов/договоренностей из предыдущего отчета.
+- `Отчет предыдущего дня` - используй только для связывания повторных вопросов и хвостов.
+- `Zoom-отчеты текущего дня` - готовые Zoom-отчеты. Бери только факты, относящиеся к этому чату, его участникам или темам.
+- `Расшифровка` - сообщения чата и OCR-текст вложений.
+
+Обязательные правила:
+1. Анализируй только переданные данные. Не используй внешние знания и не выдумывай владельцев, сроки, статусы или ответы.
+2. Каждый управленческий факт должен иметь `evidence_message_ids`. Если факт взят только из Zoom, `evidence_message_ids` может быть пустым, но обязательно укажи `evidence_zoom_call_ids`.
+3. `source_type` всегда одно из: `chat`, `ocr`, `zoom`, `mixed`, `previous_report`.
+4. `confidence` всегда строка: `direct` если прямо сказано, `inferred` если вывод из контекста, `weak` если косвенный сигнал.
+5. Не возвращай `goals`, `goal_updates`, `next_steps`, `blockers`, `quality_assessment`, `report_text`, `summary`, `notes`.
+6. Новые задачи дня возвращай только в `commitments`. Не дублируй их в `next_steps`.
+7. Явные риски возвращай только в `explicit_risks`. Не добавляй вычисленные риски вида "задача висит", "нет реакции", "срок близко": это посчитает следующий уровень.
+8. Все, что выполнено сегодня, возвращай в `results`. Если результат закрывает хвост, заполни `closes_previous_task_id` или `links_to_previous_task_id` из входного хвоста, если такой id/ключ есть; если id нет, укажи текстовую связь в `links_to_previous_task_text`.
+9. Для каждого хвоста из `Хвосты с прошлого дня` верни объект в `previous_day_tasks`: `done`, `in_progress`, `partial`, `progress_on_underlying_topic`, `postponed`, `blocked`, `no_info` или `cancelled`. Если явного движения нет, ставь `no_info`. `in_progress` ставь только при прямом evidence именно по этой задаче, а не по близкой теме. Если двигается смежная/нижестоящая тема, но формальная задача не закрыта, ставь `partial` или `progress_on_underlying_topic`. Если есть перенос без новой даты, ставь `postponed`, не `in_progress`.
+10. Если вопрос из предыдущего отчета повторяется, не создавай новый смысл: увеличь `times_asked`, сохрани `first_asked_date` и добавь текущие evidence.
+11. Один вопрос = один объект в `questions`. Если он не закрыт полным ответом в пределах дня, дополнительно добавь этот же объект с тем же `question_id` и тем же `text` в `unanswered_questions`; не переформулируй текст.
+12. Решение != задача. В `decisions` добавляй только явно принятое решение с исходом; обсуждение без исхода уходит в `topics_discussed`.
+13. Если у новой задачи срок равен дате отчета, поставь `same_day_deadline = true`; иначе `false`.
+14. Для связанных шагов одного процесса заполняй один `workflow_id`, короткий `workflow_title` и `topic_tag`. Например: переделать документы -> прогнать через промпт -> отправить юристу.
+15. Верни `person_day_index`: по каждому человеку собери его роли за день: ответственный задач, адресат вопроса, автор решения, упоминания. Это фактический индекс для агрегатора, не аналитика.
+16. Верни `report_brief`: одну строку строго в формате ежедневного отчета, без заголовка, без блока источников и без общего вывода:
+`DD.MM.YYYY, чат "Название". Активность: N сообщений, M новых задач, R выполнения, D решения. Хвосты: X из Y без движения. Вопросы без ответа: Q.`
+Если есть OCR-вложения или Zoom-отчеты, учитывай их только в фактах и счетчиках, но не добавляй в `report_brief` отдельный блок `Источник`.
+17. Не возвращай `report_text` даже если входной пример или предыдущий отчет содержит длинный человекочитаемый текст. Человекочитаемый отчет строится приложением из структурных полей.
+18. Для ежедневного отчета по чату не формируй разделы `Дата`, `Чат`, `Dialog ID`, `Источник`, `Короткий вывод`, `Риски`, `Контроль на следующий отчет`. Нужный пользовательский формат: заголовок, строка активности, затем разделы `Хвосты с прошлого дня`, `Новые задачи дня` при наличии, `Выполнено сегодня`, `Рабочие вопросы дня`, `Вопросы без ответа` при наличии, `Принятые решения`, `Темы дня`.
+19. Не превращай смежную тему из Zoom-отчета в движение по хвосту, если нет прямого факта именно по этому хвосту. В таком случае ставь `current_status = "no_info"`, чтобы в отчете пункт остался как `[тишина]`.
+20. Для каждого хвоста копируй `days_open` из входного блока `Хвосты с прошлого дня`. Это уже увеличенный приложением счетчик дней без движения. Не обнуляй его и не ставь `null`.
+
+Верни строго валидный JSON без markdown:
+{
+  "previous_day_tasks": [
+    {
+      "task_id": "стабильный id/ключ из входного хвоста или null",
+      "text": "задача, вопрос или договоренность с прошлого дня",
+      "person_name": "ответственный или владелец",
+      "deadline": "YYYY-MM-DD или null",
+      "item_type": "task|question|discussion_commitment|access_pending|document_pending|decision_pending|payment_pending|risk",
+      "previous_status": "planned|in_progress|blocked|postponed|unknown|unanswered|partially_answered|no_info",
+      "current_status": "done|in_progress|partial|progress_on_underlying_topic|postponed|blocked|no_info|cancelled",
+      "status_reason": "коротко почему такой статус",
+      "days_open": 1,
+      "links_to_previous_task_id": "id/ключ или null",
+      "confidence": "direct|inferred|weak",
+      "evidence_message_ids": [123],
+      "evidence_zoom_call_ids": ["uuid"],
+      "source_type": "chat|ocr|zoom|mixed|previous_report"
+    }
+  ],
+  "commitments": [
+    {
+      "task_id": "стабильный id, если есть, иначе null",
+      "text": "конкретная новая задача",
+      "person_name": "ответственный",
+      "assigned_at": "YYYY-MM-DD или null",
+      "deadline": "YYYY-MM-DD или null",
+      "same_day_deadline": true,
+      "workflow_id": "общий id процесса или null",
+      "workflow_title": "название процесса или null",
+      "topic_tag": "короткий тег темы",
+      "status": "planned|in_progress|done|blocked|postponed|cancelled|unknown",
+      "links_to_previous_task_id": "id/ключ или null",
+      "links_to_previous_task_text": "если это продолжение хвоста без id, иначе null",
+      "confidence": "direct|inferred|weak",
+      "evidence_message_ids": [123],
+      "evidence_zoom_call_ids": ["uuid"],
+      "source_type": "chat|ocr|zoom|mixed"
+    }
+  ],
+  "results": [
+    {
+      "text": "что выполнено сегодня",
+      "person_name": "кто выполнил или владелец результата",
+      "completed_at": "YYYY-MM-DD или null",
+      "closes_previous_task_id": "id/ключ или null",
+      "closes_commitment_id": "id/ключ или null",
+      "links_to_previous_task_text": "если закрывает хвост без id, иначе null",
+      "confidence": "direct|inferred|weak",
+      "evidence_message_ids": [123],
+      "evidence_zoom_call_ids": ["uuid"],
+      "source_type": "chat|ocr|zoom|mixed"
+    }
+  ],
+  "questions": [
+    {
+      "question_id": "стабильный id, если повторяется, иначе null",
+      "text": "один рабочий вопрос",
+      "asked_by": "кто спросил",
+      "asked_at_message_id": 123,
+      "addressed_to": "кто должен ответить или null",
+      "question_type": "decision_needed|info_needed|confirmation|escalation",
+      "answer_status": "answered|partially_answered|unanswered|blocked|postponed|unclear",
+      "answer_message_ids": [124],
+      "confidence": "direct|inferred|weak",
+      "evidence_message_ids": [123],
+      "source_type": "chat|ocr|mixed"
+    }
+  ],
+  "unanswered_questions": [
+    {
+      "question_id": "стабильный id, если повторяется, иначе null",
+      "text": "вопрос без полного ответа",
+      "asked_by": "кто спросил",
+      "asked_at_message_id": 123,
+      "addressed_to": "конкретный человек или null",
+      "question_type": "decision_needed|info_needed|confirmation|escalation",
+      "criticality": "blocks_work|needed_soon|nice_to_have",
+      "first_asked_date": "YYYY-MM-DD",
+      "times_asked": 1,
+      "reason": "почему вопрос не закрыт",
+      "confidence": "direct|inferred|weak",
+      "evidence_message_ids": [123],
+      "source_type": "chat|ocr|mixed"
+    }
+  ],
+  "explicit_risks": [
+    {
+      "text": "явно проговоренный риск",
+      "person_name": "владелец снятия риска или null",
+      "reason": "почему это риск, только из текста",
+      "risk_level": "low|medium|high|unknown",
+      "confidence": "direct|inferred|weak",
+      "evidence_message_ids": [123],
+      "evidence_zoom_call_ids": ["uuid"],
+      "source_type": "chat|ocr|zoom|mixed"
+    }
+  ],
+  "decisions": [
+    {
+      "text": "принятое решение",
+      "decided_by": "кто принял или подтвердил",
+      "decision_date": "YYYY-MM-DD",
+      "confidence": "direct|inferred|weak",
+      "evidence_message_ids": [123],
+      "evidence_zoom_call_ids": ["uuid"],
+      "source_type": "chat|ocr|zoom|mixed"
+    }
+  ],
+  "participants_activity": [
+    {
+      "person_name": "участник",
+      "messages_count": 0,
+      "questions_addressed_to_them": 0,
+      "questions_answered_by_them": 0,
+      "tasks_assigned_to_them_today": 0,
+      "tasks_completed_by_them_today": 0
+    }
+  ],
+  "topics_discussed": [
+    {
+      "topic": "смысловой тред дня",
+      "message_ids": [123],
+      "outcome": "discussed_without_decision|decided|escalated|dropped"
+    }
+  ],
+  "person_day_index": [
+    {
+      "person_name": "человек",
+      "assigned_commitment_ids": ["task_id"],
+      "addressed_question_ids": ["question_id"],
+      "decision_ids": ["decision_id"],
+      "mention_message_ids": [123]
+    }
+  ],
+  "report_brief": "DD.MM.YYYY, чат \"Название\". Активность: N сообщений, M новых задач, R выполнения, D решения. Хвосты: X из Y без движения. Вопросы без ответа: Q.",
+  "mentions": [
+    {
+      "message_id": 123,
+      "mentioned_person_name": "кого упомянули",
+      "mentioned_by": "кто упомянул",
+      "reason": "зачем упомянули"
+    }
+  ]
+}
+
+Если данных для массива нет, верни пустой массив. Не добавляй поля верхнего уровня вне схемы."""
+
+
+def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = False) -> dict[str, Any]:
+    finalization_error = chat_day_finalization_error(target_date)
+    if finalization_error:
+        raise ValueError(finalization_error)
+    if target_date > REPORT_PLACEHOLDER_START_DATE:
+        previous_date = target_date - timedelta(days=1)
+        previous_day = load_chat_day(dialog_id, previous_date)
+        previous_report = previous_day.get("report")
+        if not is_completed_chat_day_report(previous_report):
+            raise ValueError(
+                "Нельзя сформировать отчет за эту дату, пока не сформирован отчет за предыдущий день. "
+                f"Сначала сформируйте отчет за {format_date_ru(previous_date)}."
+            )
+    chat_day = load_chat_day(dialog_id, target_date)
+    if is_real_ai_chat_report(chat_day.get("report")) and not force:
+        return chat_day
+    text_status = chat_day.get("text_status") or {}
+    if not text_status.get("is_processed"):
+        process_chat_image_ocr_for_period(target_date, target_date, force=False, dialog_id=dialog_id)
+        chat_day = load_chat_day(dialog_id, target_date)
+        text_status = chat_day.get("text_status") or {}
+        if not text_status.get("is_processed"):
+            raise ValueError(
+                "Чат еще не обработан: OCR изображений не завершен. "
+                f"Статус: {text_status.get('status_text') or 'Не обработан'}."
+            )
+
+    api_key = llm_api_key()
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    transcript = chat_day["transcript"]
+    previous_day_tasks = load_previous_chat_tail_tasks(dialog_id, target_date)
+    previous_day_tasks_for_prompt = compact_previous_chat_tail_tasks_for_prompt(previous_day_tasks, max_items=60, max_chars=24000)
+    previous_day_tasks_text = format_previous_chat_tail_tasks_for_prompt(previous_day_tasks_for_prompt)
+    previous_day_report_payload = compact_previous_chat_daily_report_for_prompt(dialog_id, target_date)
+    previous_day_report_text = format_previous_chat_daily_report_for_prompt(previous_day_report_payload)
+    previous_week_report = load_previous_chat_weekly_context(dialog_id, target_date)
+    previous_week_text = compact_previous_week_report_for_prompt(previous_week_report, max_chars=5000)
+    previous_week_payload = compact_previous_week_report_for_payload(previous_week_report)
+    zoom_calls_for_prompt = load_zoom_calls_for_chat_prompt(target_date)
+    zoom_calls_text = format_zoom_calls_for_chat_prompt(zoom_calls_for_prompt)
+    if not api_key:
+        raise ValueError("Для ИИ-отчета по чату укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+    transcript_for_ai = transcript[:60000]
+    prompt_id = None
+    base_prompt = DEFAULT_CHAT_ANALYSIS_PROMPT
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                prompt_id, configured_prompt = pg_active_prompt(cur, "chat_analysis", DEFAULT_CHAT_ANALYSIS_PROMPT)
+                base_prompt = configured_prompt or DEFAULT_CHAT_ANALYSIS_PROMPT
+    prompt = (
+        base_prompt.strip()
+        + "\n\n"
+        + "Контекст анализа:\n"
+        f"Дата: {target_date.isoformat()}\n"
+        f"Чат: {(chat_day.get('chat') or {}).get('title') or dialog_id}\n\n"
+        f"Хвосты с прошлого дня:\n{previous_day_tasks_text}\n\n"
+        f"Отчет предыдущего дня:\n{previous_day_report_text}\n\n"
+        f"Недельный контекст предыдущей недели:\n{previous_week_text}\n\n"
+        f"Zoom-отчеты текущего дня:\n{zoom_calls_text}\n\n"
+        f"Расшифровка:\n{transcript_for_ai}"
+    )
+    message_order = [
+        {
+            "sequence_no": item.get("sequence_no"),
+            "message_id": item.get("message_id"),
+            "message_date": item.get("message_date"),
+            "author_id": item.get("author_id"),
+            "author_name": item.get("author_name"),
+            "attachments": [
+                {
+                    "file_id": file_item.get("file_id"),
+                    "file_name": file_item.get("name") or file_item.get("file_name"),
+                    "file_type": file_item.get("type") or file_item.get("file_type"),
+                    "ocr_status": file_item.get("ocr_status"),
+                    "has_ocr_text": bool(file_item.get("ocr_text")),
+                }
+                for file_item in (item.get("files") or [])
+            ],
+        }
+        for item in (chat_day.get("messages") or [])
+    ]
+    started_at = datetime.now()
+    ai_request_id = None
+    raw: dict[str, Any] | None = None
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                ai_request_id = pg_insert_ai_request(
+                    cur,
+                    "chat_daily_analysis",
+                    prompt_id,
+                    prompt,
+                    "openai",
+                    model,
+                    {
+                        "dialog_id": dialog_id,
+                        "chat": chat_day.get("chat"),
+                        "report_date": target_date.isoformat(),
+                        "transcript_format": "ordered_message_blocks_v2",
+                        "messages_count": len(chat_day.get("messages") or []),
+                        "message_order": message_order,
+                        "previous_day_tasks": previous_day_tasks_for_prompt,
+                        "previous_day_tasks_total": len(previous_day_tasks),
+                        "previous_day_tasks_used": len(previous_day_tasks_for_prompt),
+                        "previous_day_report": previous_day_report_payload,
+                        "previous_week_report": previous_week_payload,
+                        "zoom_calls": zoom_calls_for_prompt,
+                        "zoom_calls_count": len(zoom_calls_for_prompt),
+                        "zoom_source_type": "standalone_zoom_reports_analytical_note",
+                        "zoom_raw_transcripts_included": False,
+                        "transcript": transcript_for_ai,
+                        "transcript_truncated": len(transcript) > len(transcript_for_ai),
+                    },
+                    started_at,
+                )
+
+    try:
+        response = llm_post_with_retry(
+            llm_api_url("/chat/completions"),
+            headers=llm_auth_headers(api_key),
+            payload={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "Ты аналитик операционной команды. Возвращай только валидный JSON по запрошенной схеме."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=max(180, int(os.getenv("OPENAI_TIMEOUT_SECONDS", "180"))),
+        )
+        response.raise_for_status()
+        raw = response.json()
+        content = raw["choices"][0]["message"]["content"]
+        analysis = extract_json_object(content)
+        analysis["previous_day_tasks"] = merge_unseen_previous_day_tasks(
+            previous_day_tasks,
+            analysis.get("previous_day_tasks"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        if postgres_enabled() and ai_request_id:
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        pg_finish_ai_request(
+                            cur,
+                            ai_request_id,
+                            "error",
+                            started_at,
+                            raw_response_json=raw if isinstance(raw, dict) else {"error": str(exc)},
+                            error_text=str(exc),
+                        )
+        raise
+
+    if postgres_enabled() and ai_request_id:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    pg_finish_ai_request(
+                        cur,
+                        ai_request_id,
+                        "success",
+                        started_at,
+                        response_text=content,
+                        response_json=analysis,
+                        raw_response_json=raw,
+                    )
+    report_text = structured_chat_report_text(analysis)
+    save_chat_daily_report(
+        dialog_id,
+        target_date,
+        report_text,
+        model,
+        {
+            "source": "chat_structured_report",
+            "model": model,
+            "analysis": analysis,
+            "raw_response": raw,
+            "ai_request_id": str(ai_request_id) if ai_request_id else None,
+            "transcript_format": "ordered_message_blocks_v2",
+            "previous_day_tasks_input": previous_day_tasks,
+            "previous_day_report_input": previous_day_report_payload,
+            "zoom_calls_input": zoom_calls_for_prompt,
+            "zoom_source_type": "standalone_zoom_reports_analytical_note",
+            "zoom_raw_transcripts_included": False,
+        },
+        ai_request_id=ai_request_id,
+        prompt_id=prompt_id,
+    )
+
+    return load_chat_day(dialog_id, target_date)
+
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "change-this-secret")
+app.jinja_env.filters["dt_ru"] = format_datetime_ru
+if not postgres_enabled():
+    init_db()
+    repair_db_chat_columns()
+    repair_db_status_labels()
+    repair_db_checklist_counts()
+
+
+MCP_SSE_SESSIONS: dict[str, Queue[str]] = {}
+
+
+def mcp_auth_ok(path_token: str | None = None) -> bool:
+    expected = os.getenv("MCP_SHARED_SECRET", "").strip()
+    if not expected:
+        return os.getenv("MCP_ALLOW_UNAUTHENTICATED", "").strip() == "1"
+    if path_token and path_token == expected:
+        return True
+    auth_header = request.headers.get("Authorization", "").strip()
+    return auth_header == f"Bearer {expected}"
+
+
+def mcp_auth_error():
+    return jsonify({
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32001, "message": "MCP authentication required."},
+    }), 401
+
+
+def mcp_sse_event(event: str, data: str) -> str:
+    lines = [f"event: {event}"]
+    lines.extend(f"data: {line}" for line in data.splitlines() or [""])
+    return "\n".join(lines) + "\n\n"
+
+
+@app.get("/mcp")
+@app.get("/mcp/<path:path_token>")
+def mcp_info(path_token: str | None = None):
+    if not mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    return jsonify({
+        "name": "employee-analytics-context",
+        "transport": "http-json-rpc",
+        "endpoint": "/mcp",
+        "auth": "shared-secret" if os.getenv("MCP_SHARED_SECRET", "").strip() else "none",
+        "methods": ["initialize", "tools/list", "tools/call"],
+    })
+
+
+@app.post("/mcp")
+@app.post("/mcp/<path:path_token>")
+def mcp_http(path_token: str | None = None):
+    if not mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    from mcp.context_server import handle_request
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Request body must be JSON."},
+        }), 400
+
+    response = handle_request(payload)
+    if response is None:
+        return ("", 202)
+    status_code = 200
+    if "error" in response:
+        code = response["error"].get("code")
+        status_code = 400 if code in {-32700, -32600, -32601, -32602} else 500
+    return jsonify(response), status_code
+
+
+@app.get("/sse")
+@app.get("/sse/<path:path_token>")
+def mcp_sse(path_token: str | None = None):
+    if not mcp_auth_ok(path_token):
+        return mcp_auth_error()
+
+    session_id = uuid4().hex
+    queue: Queue[str] = Queue()
+    MCP_SSE_SESSIONS[session_id] = queue
+    if path_token:
+        endpoint = url_for("mcp_sse_messages", session_id=session_id, path_token=path_token)
+    else:
+        endpoint = url_for("mcp_sse_messages", session_id=session_id)
+
+    @stream_with_context
+    def stream():
+        yield mcp_sse_event("endpoint", endpoint)
+        try:
+            while True:
+                try:
+                    yield queue.get(timeout=15)
+                except Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            MCP_SSE_SESSIONS.pop(session_id, None)
+
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/mcp/messages/<session_id>")
+@app.post("/mcp/messages/<session_id>/<path:path_token>")
+def mcp_sse_messages(session_id: str, path_token: str | None = None):
+    if not mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    queue = MCP_SSE_SESSIONS.get(session_id)
+    if queue is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32004, "message": "Unknown MCP SSE session."},
+        }), 404
+
+    from mcp.context_server import handle_request
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Request body must be JSON."},
+        }), 400
+
+    response = handle_request(payload)
+    if response is not None:
+        queue.put(mcp_sse_event("message", json.dumps(response, ensure_ascii=False)))
+    return ("", 202)
+
+
+@app.get("/")
+@app.get("/registry")
+@app.get("/reports")
+@app.get("/tasks/reports")
+@app.get("/tasks/registry")
+def index():
+    frontend_index = FRONTEND_DIST / "index.html"
+    if frontend_index.exists():
+        return send_from_directory(FRONTEND_DIST, "index.html")
+    return jsonify({
+        "error": "Frontend build was not found. Run start.ps1 to build the React interface."
+    }), 503
+
+
+@app.get("/assets/<path:filename>")
+def frontend_assets(filename: str):
+    return send_from_directory(FRONTEND_DIST / "assets", filename)
+
+
+@app.get("/favicon.ico")
+@app.get("/favicon.svg")
+@app.get("/favicon-16x16.png")
+@app.get("/favicon-32x32.png")
+@app.get("/favicon-64x64.png")
+def frontend_favicon():
+    return send_from_directory(FRONTEND_DIST, request.path.lstrip("/"))
+
+
+@app.get("/api/registry")
+def api_registry():
+    return jsonify(registry_response_payload(request.args))
+
+
+@app.get("/api/chats")
+def api_chats():
+    chats = load_chats()
+    return jsonify({"chats": chats, "total": len(chats)})
+
+
+@app.get("/api/team")
+def api_team():
+    team = load_team_members()
+    return jsonify({"team": team, "total": len(team)})
+
+
+@app.get("/api/zoom-calls")
+def api_zoom_calls():
+    return jsonify(load_zoom_calls_tree())
+
+
+@app.get("/api/zoom-calls/<call_id>")
+def api_zoom_call_detail(call_id: str):
+    call = load_zoom_call_detail(call_id)
+    if not call:
+        return jsonify({"error": "Zoom-созвон не найден."}), 404
+    return jsonify({"call": call})
+
+
+@app.post("/api/zoom-calls/<call_id>/report")
+def api_zoom_call_report_generate(call_id: str):
+    call = load_zoom_call_detail(call_id)
+    if not call:
+        return jsonify({"error": "Zoom-созвон не найден."}), 404
+    if (call.get("analytical_note") or "").strip():
+        return jsonify({"call": call, "message": "Отчет по созвону уже сформирован."})
+    try:
+        generate_zoom_call_report_if_needed(call_id)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка формирования отчета по Zoom: {exc}"}), 500
+    call = load_zoom_call_detail(call_id)
+    return jsonify({"call": call, "message": "Отчет по созвону сформирован."})
+
+
+@app.delete("/api/zoom-calls/<call_id>/report")
+def api_zoom_call_report_delete(call_id: str):
+    deleted = delete_zoom_call_report(call_id)
+    if not deleted:
+        return jsonify({"error": "Zoom-созвон не найден."}), 404
+    call = load_zoom_call_detail(call_id)
+    return jsonify({"deleted": True, "call": call, "message": "Отчет по созвону удален."})
+
+
+@app.post("/api/sync/full")
+def api_full_sync():
+    payload = request.get_json(silent=True) or request.form
+    default_from, default_to = default_period()
+    date_from_text = str(payload.get("date_from") or default_from.isoformat()).strip()
+    date_to_text = str(payload.get("date_to") or default_to.isoformat()).strip()
+    try:
+        date_from, date_to = parse_period(date_from_text, date_to_text, max_days=30)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if not webhook_base:
+        return jsonify({"error": "Укажите BITRIX_WEBHOOK_BASE в файле .env перед полной синхронизацией."}), 400
+
+    steps: list[dict[str, Any]] = []
+    try:
+        team_payload = sync_bitrix_team(webhook_base)
+        steps.append({
+            "source": "team",
+            "status": "success",
+            "message": f"Команда: сохранено {team_payload.get('saved', 0)} сотрудников.",
+        })
+
+        registry_payload, export_filename = build_period_export(date_from, date_to, webhook_base)
+        registry_meta = registry_payload.get("meta", {})
+        steps.append({
+            "source": "tasks",
+            "status": "success",
+            "message": (
+                f"Задачи: создано в периоде {registry_meta.get('created_tasks_total', 0)}, "
+                f"проверено незавершенных {registry_meta.get('unfinished_tasks_checked_total', 0)}."
+            ),
+        })
+
+        chats_payload = sync_all_chat_dialogs_for_period(date_from, date_to, webhook_base, generate_reports=False)
+        steps.append({
+            "source": "chats",
+            "status": "success",
+            "message": (
+                f"Чаты: обновлено связок чат-день {chats_payload.get('chat_days_synced', 0)}, "
+                f"сообщений сохранено {chats_payload.get('messages_synced', 0)}."
+            ),
+        })
+    except Exception as exc:  # noqa: BLE001
+        steps.append({"source": "full_sync", "status": "error", "message": str(exc)})
+        return jsonify({"error": f"Ошибка полной синхронизации: {exc}", "steps": steps}), 500
+
+    registry = registry_response_payload({
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+    })
+    team = load_team_members()
+    chats = load_chats()
+    message = (
+        f"Полное обновление завершено за {format_date_ru(date_from)} - {format_date_ru(date_to)}: "
+        f"команда {len(team)}, задач показано {registry.get('stats', {}).get('filtered_total', 0)}, "
+        f"чатов {len(chats)}."
+    )
+    return jsonify({
+        "message": message,
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "steps": steps,
+        "team": team,
+        "chats": chats,
+        "tasks": registry.get("tasks", []),
+        "stats": registry.get("stats"),
+        "filters": registry.get("filters"),
+        "export_filename": export_filename,
+        "download_url": url_for("download_export", filename=export_filename),
+    })
+
+
+@app.post("/api/zoom-calls/sync")
+def api_zoom_calls_sync():
+    date_from = parse_date_field(request.args.get("from") or "2026-01-01", "from")
+    date_to = parse_date_field(request.args.get("to") or msk_today().isoformat(), "to")
+    if date_to < date_from:
+        return jsonify({"error": "Дата окончания раньше даты начала."}), 400
+    result = sync_zoom_calls(date_from, date_to)
+    result["tree"] = load_zoom_calls_tree()
+    return jsonify(result)
+
+
+@app.post("/api/zoom-calls/sync-google-drive")
+def api_zoom_calls_sync_google_drive():
+    try:
+        result = sync_google_drive_call_transcripts()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Не удалось подтянуть transcript.txt из Google Drive: {exc}"}), 500
+    result["tree"] = load_zoom_calls_tree()
+    return jsonify(result)
+
+
+@app.get("/api/work-items")
+def api_work_items():
+    return jsonify({
+        "error": "Общий реестр задач удален из модели данных. Используйте /api/registry для Bitrix-задач и /api/chats для отчетов по чатам."
+    }), 410
+
+
+PROMPT_KEY_TO_CATEGORY = {
+    "daily": "chat_overall_daily_report",
+    "weekly": "chat_overall_weekly_report",
+    "monthly": "chat_weekly_report",
+    "quarterly": "quarterly_report",
+    "yearly": "weekly_report",
+    "chat_daily": "chat_analysis",
+    "chat_weekly": "chat_weekly_report",
+    "chats_daily_overall": "chat_overall_daily_report",
+    "chats_weekly_overall": "chat_overall_weekly_report",
+    "program_weekly": "weekly_report",
+    "owner_daily": "owner_daily_report",
+    "owner_weekly": "owner_weekly_report",
+    "zoom_processing": "zoom_processing",
+    "chat": "chat_analysis",
+    "img": "image_processing",
+}
+
+
+def resolve_prompt_category_key(prompt_key: str) -> str:
+    return PROMPT_KEY_TO_CATEGORY.get(prompt_key, prompt_key)
+
+
+PROMPT_CATEGORIES_DEFAULTS: list[tuple[str, str, str, int]] = [
+    ("daily_report", "Daily report", "Ежедневный отчет по программе", 10),
+    ("weekly_report", "Weekly report", "Еженедельный отчет по всей программе", 20),
+    ("monthly_report", "Monthly report", "Ежемесячный отчет", 30),
+    ("quarterly_report", "Quarterly report", "Ежеквартальный отчет", 40),
+    ("yearly_report", "Yearly report", "Ежегодный отчет", 50),
+    ("chat_analysis", "Chat analysis", "Ежедневный отчет по чату", 60),
+    ("chat_weekly_report", "Chat weekly report", "Еженедельный отчет по чату", 65),
+    ("chat_overall_daily_report", "Chats daily overall", "Ежедневный отчет по всем чатам", 66),
+    ("chat_overall_weekly_report", "Chats weekly overall", "Еженедельный отчет по всем чатам", 67),
+    ("owner_daily_report", "Owner daily report", "Ежедневный отчет для собственника", 68),
+    ("owner_weekly_report", "Owner weekly report", "Еженедельный отчет для собственника", 69),
+    ("zoom_processing", "Обработка Зумов", "Расшифровка и управленческий разбор Zoom-созвонов", 70),
+    ("image_processing", "Image processing", "OCR/обработка изображений", 71),
+]
+
+
+def ensure_prompt_categories(cur: Any) -> None:
+    for category_key, title, description, sort_order in PROMPT_CATEGORIES_DEFAULTS:
+        cur.execute(
+            """
+            INSERT INTO ai_prompt_categories (category_key, title, description, sort_order, is_active)
+            VALUES (%s, %s, %s, %s, TRUE)
+            ON CONFLICT (category_key) DO UPDATE
+            SET title = EXCLUDED.title,
+                description = EXCLUDED.description,
+                sort_order = EXCLUDED.sort_order,
+                is_active = TRUE,
+                updated_at = now()
+            """,
+            (category_key, title, description, sort_order),
+        )
+
+
+def ensure_owner_reports_schema() -> None:
+    if not postgres_enabled():
+        return
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            required_tables = (
+                "owner_daily_reports",
+                "owner_weekly_reports",
+                "owner_manager_recommendations",
+                "owner_recommendation_dispatches",
+            )
+            if all(pg_table_exists(cur, table_name) for table_name in required_tables):
+                return
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS owner_daily_reports (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        report_date date NOT NULL,
+                        version int NOT NULL,
+                        is_current boolean NOT NULL DEFAULT TRUE,
+                        ai_request_id uuid NULL,
+                        prompt_id uuid NULL,
+                        generated_at timestamptz NOT NULL DEFAULT now(),
+                        summary text NULL,
+                        dynamics_summary text NULL,
+                        risks_summary text NULL,
+                        recommendations text NULL,
+                        report_text text NULL,
+                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_owdr_current
+                        ON owner_daily_reports(report_date) WHERE is_current = TRUE;
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_owdr_date
+                        ON owner_daily_reports(report_date DESC);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS owner_weekly_reports (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        period_start date NOT NULL,
+                        period_end date NOT NULL,
+                        version int NOT NULL,
+                        is_current boolean NOT NULL DEFAULT TRUE,
+                        ai_request_id uuid NULL,
+                        prompt_id uuid NULL,
+                        generated_at timestamptz NOT NULL DEFAULT now(),
+                        summary text NULL,
+                        dynamics_summary text NULL,
+                        risks_summary text NULL,
+                        recommendations text NULL,
+                        report_text text NULL,
+                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_owwr_current
+                        ON owner_weekly_reports(period_start, period_end) WHERE is_current = TRUE;
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_owwr_period
+                        ON owner_weekly_reports(period_start DESC, period_end DESC);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS owner_manager_recommendations (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        source_scope text NOT NULL CHECK (source_scope IN ('owner_daily','owner_weekly','owner_monthly')),
+                        owner_daily_report_id uuid REFERENCES owner_daily_reports(id) ON DELETE CASCADE,
+                        owner_weekly_report_id uuid REFERENCES owner_weekly_reports(id) ON DELETE CASCADE,
+                        report_date date NULL,
+                        period_start date NULL,
+                        period_end date NULL,
+                        manager_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        manager_bitrix_user_id bigint NULL,
+                        employee_user_id uuid NULL REFERENCES users(id) ON DELETE SET NULL,
+                        employee_bitrix_user_id bigint NULL,
+                        recommendation_type text NOT NULL DEFAULT 'action' CHECK (recommendation_type IN ('action','followup','risk','goal','task')),
+                        priority text NOT NULL DEFAULT 'medium' CHECK (priority IN ('low','medium','high','critical')),
+                        subject text NULL,
+                        recommendation_text text NOT NULL,
+                        due_date date NULL,
+                        bitrix_task_id uuid NULL REFERENCES bitrix_tasks(id) ON DELETE SET NULL,
+                        bitrix_task_external_id bigint NULL,
+                        source_chat_id uuid NULL REFERENCES chats(id) ON DELETE SET NULL,
+                        source_goal_id uuid NULL REFERENCES user_goals(id) ON DELETE SET NULL,
+                        source_item_id uuid NULL REFERENCES chat_report_items(id) ON DELETE SET NULL,
+                        source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        status text NOT NULL DEFAULT 'new' CHECK (status IN ('new','queued','sent','acked','done','cancelled','error')),
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        updated_at timestamptz NOT NULL DEFAULT now(),
+                        CHECK (
+                            (source_scope = 'owner_daily' AND owner_daily_report_id IS NOT NULL)
+                            OR (source_scope = 'owner_weekly' AND owner_weekly_report_id IS NOT NULL)
+                            OR (source_scope = 'owner_monthly')
+                        )
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_omr_manager_status
+                        ON owner_manager_recommendations(manager_user_id, status, priority, created_at DESC);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_omr_daily_report
+                        ON owner_manager_recommendations(owner_daily_report_id)
+                        WHERE owner_daily_report_id IS NOT NULL;
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_omr_weekly_report
+                        ON owner_manager_recommendations(owner_weekly_report_id)
+                        WHERE owner_weekly_report_id IS NOT NULL;
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_omr_due_date
+                        ON owner_manager_recommendations(due_date)
+                        WHERE due_date IS NOT NULL;
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS owner_recommendation_dispatches (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        recommendation_id uuid NOT NULL REFERENCES owner_manager_recommendations(id) ON DELETE CASCADE,
+                        channel text NOT NULL CHECK (channel IN ('bitrix_task_comment','bitrix_im','bitrix_task_create','manual')),
+                        status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','sent','delivered','error','cancelled')),
+                        bitrix_entity_type text NULL,
+                        bitrix_entity_id bigint NULL,
+                        bitrix_message_id bigint NULL,
+                        payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        response_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        sent_by_user_id uuid NULL REFERENCES users(id) ON DELETE SET NULL,
+                        sent_at timestamptz NULL,
+                        error_text text NULL,
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        updated_at timestamptz NOT NULL DEFAULT now()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_ord_recommendation
+                        ON owner_recommendation_dispatches(recommendation_id, created_at DESC);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_ord_status
+                        ON owner_recommendation_dispatches(status, created_at DESC);
+                    """
+                )
+
+
+@app.get("/api/company-profile")
+def api_company_profile_get():
+    ensure_company_profile_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT title, content, updated_at
+                FROM company_profile
+                WHERE profile_key = 'main'
+                """
+            )
+            row = cur.fetchone()
+    return jsonify({"profile": company_profile_to_dict(row)})
+
+
+@app.put("/api/company-profile")
+def api_company_profile_put():
+    payload = request.get_json(silent=True) or {}
+    title = str(payload.get("title") or "О компании").strip() or "О компании"
+    content = str(payload.get("content") or "")
+    if len(content) > 500_000:
+        return jsonify({"error": "Текст слишком большой. Максимум 500 000 символов."}), 400
+
+    ensure_company_profile_schema()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO company_profile (profile_key, title, content, updated_at)
+                    VALUES ('main', %s, %s, now())
+                    ON CONFLICT (profile_key) DO UPDATE
+                    SET title = EXCLUDED.title,
+                        content = EXCLUDED.content,
+                        updated_at = now()
+                    RETURNING title, content, updated_at
+                    """,
+                    (title, content),
+                )
+                row = cur.fetchone()
+    return jsonify({"profile": company_profile_to_dict(row), "message": "Описание компании сохранено"})
+
+
+def load_company_folder_path(cur: Any, folder_id: str | None) -> list[dict[str, Any]]:
+    if not folder_id:
+        return []
+    cur.execute(
+        """
+        WITH RECURSIVE folder_path AS (
+            SELECT id, parent_id, name, 0 AS depth
+            FROM company_folders
+            WHERE id = %s
+            UNION ALL
+            SELECT parent.id, parent.parent_id, parent.name, folder_path.depth + 1
+            FROM company_folders parent
+            JOIN folder_path ON folder_path.parent_id = parent.id
+        )
+        SELECT id, name
+        FROM folder_path
+        ORDER BY depth DESC
+        """,
+        (folder_id,),
+    )
+    return [{"id": str(row["id"]), "name": row["name"]} for row in cur.fetchall()]
+
+
+def load_ai_instruction_folder_path(cur: Any, folder_id: str | None) -> list[dict[str, Any]]:
+    if not folder_id:
+        return []
+    cur.execute(
+        """
+        WITH RECURSIVE path AS (
+            SELECT id, parent_id, name, 0 AS depth
+            FROM ai_instruction_folders
+            WHERE id = %s
+            UNION ALL
+            SELECT parent.id, parent.parent_id, parent.name, path.depth + 1
+            FROM ai_instruction_folders parent
+            JOIN path ON path.parent_id = parent.id
+        )
+        SELECT id, name
+        FROM path
+        ORDER BY depth DESC
+        """,
+        (folder_id,),
+    )
+    return [{"id": str(row["id"]), "name": row["name"]} for row in cur.fetchall()]
+
+
+@app.get("/api/company-folders")
+def api_company_folders_get():
+    ensure_company_profile_schema()
+    folder_id = str(request.args.get("folder_id") or "").strip() or None
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            current = None
+            if folder_id:
+                cur.execute(
+                    """
+                    SELECT f.*, count(child.id) AS children_count,
+                           ds.google_file_id AS drive_google_file_id,
+                           ds.mime_type AS drive_mime_type,
+                           ds.source_url AS drive_source_url,
+                           ds.google_updated_at AS drive_google_updated_at,
+                           ds.raw_json AS drive_raw_json
+                    FROM company_folders f
+                    LEFT JOIN company_folders child ON child.parent_id = f.id
+                    LEFT JOIN company_drive_sources ds ON ds.folder_id = f.id
+                    WHERE f.id = %s
+                    GROUP BY f.id, ds.google_file_id, ds.mime_type, ds.source_url, ds.google_updated_at, ds.raw_json
+                    """,
+                    (folder_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Папка не найдена"}), 404
+                current = company_folder_to_dict(row)
+            if folder_id:
+                cur.execute(
+                    """
+                    SELECT f.*, count(child.id) AS children_count,
+                           ds.google_file_id AS drive_google_file_id,
+                           ds.mime_type AS drive_mime_type,
+                           ds.source_url AS drive_source_url,
+                           ds.google_updated_at AS drive_google_updated_at,
+                           ds.raw_json AS drive_raw_json
+                    FROM company_folders f
+                    LEFT JOIN company_folders child ON child.parent_id = f.id
+                    LEFT JOIN company_drive_sources ds ON ds.folder_id = f.id
+                    WHERE f.parent_id = %s
+                    GROUP BY f.id, ds.google_file_id, ds.mime_type, ds.source_url, ds.google_updated_at, ds.raw_json
+                    ORDER BY f.sort_order, lower(f.name), f.created_at
+                    """,
+                    (folder_id,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT f.*, count(child.id) AS children_count,
+                           ds.google_file_id AS drive_google_file_id,
+                           ds.mime_type AS drive_mime_type,
+                           ds.source_url AS drive_source_url,
+                           ds.google_updated_at AS drive_google_updated_at,
+                           ds.raw_json AS drive_raw_json
+                    FROM company_folders f
+                    LEFT JOIN company_folders child ON child.parent_id = f.id
+                    LEFT JOIN company_drive_sources ds ON ds.folder_id = f.id
+                    WHERE f.parent_id IS NULL
+                    GROUP BY f.id, ds.google_file_id, ds.mime_type, ds.source_url, ds.google_updated_at, ds.raw_json
+                    ORDER BY f.sort_order, lower(f.name), f.created_at
+                    """
+                )
+            children = [company_folder_to_dict(row) for row in cur.fetchall()]
+            path = load_company_folder_path(cur, folder_id)
+    return jsonify({"current": current, "children": children, "path": path})
+
+
+@app.post("/api/company-folders")
+def api_company_folders_post():
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name") or "").strip()
+    parent_id = str(payload.get("parent_id") or "").strip() or None
+    if not name:
+        return jsonify({"error": "Введите название папки"}), 400
+    if len(name) > 120:
+        return jsonify({"error": "Название папки слишком длинное"}), 400
+
+    ensure_company_profile_schema()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if parent_id:
+                    cur.execute("SELECT id FROM company_folders WHERE id = %s", (parent_id,))
+                    if not cur.fetchone():
+                        return jsonify({"error": "Родительская папка не найдена"}), 404
+                cur.execute(
+                    """
+                    SELECT COALESCE(max(sort_order), -1) + 1 AS next_order
+                    FROM company_folders
+                    WHERE (%s::uuid IS NULL AND parent_id IS NULL) OR parent_id = %s::uuid
+                    """,
+                    (parent_id, parent_id),
+                )
+                sort_order = cur.fetchone()["next_order"]
+                cur.execute(
+                    """
+                    INSERT INTO company_folders (parent_id, name, sort_order)
+                    VALUES (%s, %s, %s)
+                    RETURNING *, 0::bigint AS children_count
+                    """,
+                    (parent_id, name, sort_order),
+                )
+                folder = company_folder_to_dict(cur.fetchone())
+    return jsonify({"folder": folder, "message": "Папка создана"})
+
+
+@app.put("/api/company-folders/<folder_id>")
+def api_company_folders_put(folder_id: str):
+    payload = request.get_json(silent=True) or {}
+    name = payload.get("name")
+    content = payload.get("content")
+    updates = []
+    params: list[Any] = []
+    if name is not None:
+        normalized_name = str(name).strip()
+        if not normalized_name:
+            return jsonify({"error": "Введите название папки"}), 400
+        if len(normalized_name) > 120:
+            return jsonify({"error": "Название папки слишком длинное"}), 400
+        updates.append("name = %s")
+        params.append(normalized_name)
+    if content is not None:
+        normalized_content = str(content)
+        if len(normalized_content) > 500_000:
+            return jsonify({"error": "Текст слишком большой. Максимум 500 000 символов."}), 400
+        updates.append("content = %s")
+        params.append(normalized_content)
+    if not updates:
+        return jsonify({"error": "Нет данных для сохранения"}), 400
+
+    ensure_company_profile_schema()
+    params.append(folder_id)
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE company_folders
+                    SET {', '.join(updates)}, updated_at = now()
+                    WHERE id = %s
+                    RETURNING *, (
+                        SELECT count(*)
+                        FROM company_folders child
+                        WHERE child.parent_id = company_folders.id
+                    ) AS children_count
+                    """,
+                    tuple(params),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Папка не найдена"}), 404
+                folder = company_folder_to_dict(row)
+    return jsonify({"folder": folder, "message": "Сохранено"})
+
+
+@app.delete("/api/company-folders/<folder_id>")
+def api_company_folders_delete(folder_id: str):
+    ensure_company_profile_schema()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM company_folders WHERE id = %s RETURNING id", (folder_id,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Папка не найдена"}), 404
+    return jsonify({"message": "Папка удалена"})
+
+
+@app.post("/api/company-folders/sync-google-drive")
+def api_company_folders_sync_google_drive():
+    try:
+        result = sync_google_drive_company_documents()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"result": result, "message": "Данные из Google Drive подтянуты"})
+
+
+@app.get("/api/ai-instruction-folders")
+def api_ai_instruction_folders_get():
+    ensure_ai_instruction_schema()
+    folder_id = str(request.args.get("folder_id") or "").strip() or None
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            current = None
+            if folder_id:
+                cur.execute(
+                    """
+                    SELECT f.*, count(child.id) AS children_count
+                    FROM ai_instruction_folders f
+                    LEFT JOIN ai_instruction_folders child ON child.parent_id = f.id
+                    WHERE f.id = %s
+                    GROUP BY f.id
+                    """,
+                    (folder_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Папка не найдена"}), 404
+                current = ai_instruction_folder_to_dict(row)
+            if folder_id:
+                cur.execute(
+                    """
+                    SELECT f.*, count(child.id) AS children_count
+                    FROM ai_instruction_folders f
+                    LEFT JOIN ai_instruction_folders child ON child.parent_id = f.id
+                    WHERE f.parent_id = %s
+                    GROUP BY f.id
+                    ORDER BY f.sort_order, lower(f.name), f.created_at
+                    """,
+                    (folder_id,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT f.*, count(child.id) AS children_count
+                    FROM ai_instruction_folders f
+                    LEFT JOIN ai_instruction_folders child ON child.parent_id = f.id
+                    WHERE f.parent_id IS NULL
+                    GROUP BY f.id
+                    ORDER BY f.sort_order, lower(f.name), f.created_at
+                    """
+                )
+            children = [ai_instruction_folder_to_dict(row) for row in cur.fetchall()]
+            path = load_ai_instruction_folder_path(cur, folder_id)
+    return jsonify({"current": current, "children": children, "path": path})
+
+
+@app.post("/api/ai-instruction-folders")
+def api_ai_instruction_folders_post():
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name") or "").strip()
+    parent_id = str(payload.get("parent_id") or "").strip() or None
+    if not name:
+        return jsonify({"error": "Введите название папки"}), 400
+    if len(name) > 120:
+        return jsonify({"error": "Название папки слишком длинное"}), 400
+
+    ensure_ai_instruction_schema()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if parent_id:
+                    cur.execute("SELECT id FROM ai_instruction_folders WHERE id = %s", (parent_id,))
+                    if not cur.fetchone():
+                        return jsonify({"error": "Родительская папка не найдена"}), 404
+                cur.execute(
+                    """
+                    SELECT COALESCE(max(sort_order), -1) + 1 AS next_order
+                    FROM ai_instruction_folders
+                    WHERE (%s::uuid IS NULL AND parent_id IS NULL) OR parent_id = %s::uuid
+                    """,
+                    (parent_id, parent_id),
+                )
+                sort_order = cur.fetchone()["next_order"]
+                cur.execute(
+                    """
+                    INSERT INTO ai_instruction_folders (parent_id, name, sort_order)
+                    VALUES (%s, %s, %s)
+                    RETURNING *, 0::bigint AS children_count
+                    """,
+                    (parent_id, name, sort_order),
+                )
+                folder = ai_instruction_folder_to_dict(cur.fetchone())
+    return jsonify({"folder": folder, "message": "Папка создана"})
+
+
+@app.put("/api/ai-instruction-folders/<folder_id>")
+def api_ai_instruction_folders_put(folder_id: str):
+    payload = request.get_json(silent=True) or {}
+    name = payload.get("name")
+    content = payload.get("content")
+    updates = []
+    params: list[Any] = []
+    if name is not None:
+        normalized_name = str(name).strip()
+        if not normalized_name:
+            return jsonify({"error": "Введите название папки"}), 400
+        if len(normalized_name) > 120:
+            return jsonify({"error": "Название папки слишком длинное"}), 400
+        updates.append("name = %s")
+        params.append(normalized_name)
+    if content is not None:
+        normalized_content = str(content)
+        if len(normalized_content) > 500_000:
+            return jsonify({"error": "Текст слишком большой. Максимум 500 000 символов."}), 400
+        updates.append("content = %s")
+        params.append(normalized_content)
+    if not updates:
+        return jsonify({"error": "Нет данных для сохранения"}), 400
+
+    ensure_ai_instruction_schema()
+    params.append(folder_id)
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE ai_instruction_folders
+                    SET {', '.join(updates)}, updated_at = now()
+                    WHERE id = %s
+                    RETURNING *, (
+                        SELECT count(*)
+                        FROM ai_instruction_folders child
+                        WHERE child.parent_id = ai_instruction_folders.id
+                    ) AS children_count
+                    """,
+                    tuple(params),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Папка не найдена"}), 404
+                folder = ai_instruction_folder_to_dict(row)
+    return jsonify({"folder": folder, "message": "Сохранено"})
+
+
+@app.delete("/api/ai-instruction-folders/<folder_id>")
+def api_ai_instruction_folders_delete(folder_id: str):
+    ensure_ai_instruction_schema()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM ai_instruction_folders
+                    WHERE id = %s
+                    RETURNING id, parent_id, name
+                    """,
+                    (folder_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Папка не найдена"}), 404
+                default_names = {name.lower() for name, _, _ in AI_INSTRUCTION_DEFAULTS}
+                deleted_name = str(row["name"] or "").strip()
+                if row["parent_id"] is None and deleted_name.lower() in default_names:
+                    cur.execute(
+                        """
+                        INSERT INTO ai_instruction_deleted_defaults (name, deleted_at)
+                        VALUES (%s, now())
+                        ON CONFLICT (name) DO UPDATE SET deleted_at = EXCLUDED.deleted_at
+                        """,
+                        (deleted_name,),
+                    )
+    return jsonify({"message": "Папка удалена"})
+
+
+@app.get("/api/prompts")
+def api_prompts():
+    if not postgres_enabled():
+        return jsonify({"prompts": {}})
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            ensure_prompt_categories(cur)
+            cur.execute(
+                """
+                SELECT c.category_key, p.prompt_text, p.version, p.created_at
+                FROM ai_prompt_categories c
+                LEFT JOIN ai_prompts p ON p.category_id = c.id AND p.is_active = TRUE
+                WHERE c.is_active = TRUE
+                ORDER BY c.sort_order
+                """
+            )
+            rows = cur.fetchall()
+    reverse = {value: key for key, value in PROMPT_KEY_TO_CATEGORY.items()}
+    prompts = {
+        reverse.get(row["category_key"], row["category_key"]): {
+            "category_key": row["category_key"],
+            "text": row["prompt_text"],
+            "version": row["version"],
+            "created_at": iso_or_none(row["created_at"]),
+        }
+        for row in rows
+    }
+    return jsonify({"prompts": prompts})
+
+
+@app.get("/api/ai-requests")
+def api_ai_requests_list():
+    if not postgres_enabled():
+        return jsonify({"requests": [], "message": "PostgreSQL не включен."})
+    limit = to_int(request.args.get("limit")) or 50
+    limit = max(1, min(limit, 200))
+    request_type = str(request.args.get("request_type") or "").strip()
+    status = str(request.args.get("status") or "").strip()
+    where_parts = []
+    params: list[Any] = []
+    if request_type:
+        where_parts.append("request_type = %s")
+        params.append(request_type)
+    if status:
+        where_parts.append("status = %s")
+        params.append(status)
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    id, request_type, provider, model, status,
+                    started_at, finished_at, duration_ms, created_at,
+                    error_text, prompt_text_snapshot, input_payload,
+                    response_text, response_json, raw_response_json
+                FROM ai_requests
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (*params, limit),
+            )
+            rows = cur.fetchall()
+    payload = []
+    for row in rows:
+        payload.append(
+            {
+                "id": str(row["id"]),
+                "request_type": row["request_type"],
+                "provider": row["provider"],
+                "model": row["model"],
+                "status": row["status"],
+                "started_at": iso_or_none(row["started_at"]),
+                "finished_at": iso_or_none(row["finished_at"]),
+                "created_at": iso_or_none(row["created_at"]),
+                "created_at_text": format_datetime_ru(row["created_at"]),
+                "duration_ms": row["duration_ms"],
+                "error_text": row["error_text"],
+                "prompt_text_snapshot": row["prompt_text_snapshot"],
+                "input_payload": row["input_payload"] or {},
+                "response_text": row["response_text"] or "",
+                "response_json": row["response_json"] or {},
+                "raw_response_json": row["raw_response_json"] or {},
+            }
+        )
+    return jsonify({"requests": payload})
+
+
+@app.get("/api/prompts/history")
+def api_prompts_history():
+    if not postgres_enabled():
+        return jsonify({"history": []})
+    prompt_key = str(request.args.get("prompt_key") or request.args.get("key") or "").strip()
+    category_key = resolve_prompt_category_key(prompt_key)
+    if not category_key:
+        return jsonify({"error": "prompt_key is required."}), 400
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            ensure_prompt_categories(cur)
+            cur.execute(
+                """
+                SELECT id, category_key
+                FROM ai_prompt_categories
+                WHERE category_key = %s
+                """,
+                (category_key,),
+            )
+            category = cur.fetchone()
+            if not category:
+                return jsonify({"error": f"Unknown prompt category: {category_key}"}), 400
+            cur.execute(
+                """
+                SELECT
+                    p.id,
+                    p.prompt_key,
+                    p.title,
+                    p.prompt_text,
+                    p.version,
+                    p.is_active,
+                    p.created_at,
+                    COUNT(r.id) AS ai_requests_count
+                FROM ai_prompts p
+                LEFT JOIN ai_requests r ON r.prompt_id = p.id
+                WHERE p.category_id = %s
+                GROUP BY p.id
+                ORDER BY p.version DESC, p.created_at DESC
+                """,
+                (category["id"],),
+            )
+            rows = cur.fetchall()
+    history = [
+        {
+            "id": str(row["id"]),
+            "prompt_key": row["prompt_key"],
+            "title": row["title"],
+            "text": row["prompt_text"] or "",
+            "version": row["version"],
+            "is_active": bool(row["is_active"]),
+            "created_at": iso_or_none(row["created_at"]),
+            "ai_requests_count": int(row["ai_requests_count"] or 0),
+        }
+        for row in rows
+    ]
+    return jsonify({"category_key": category_key, "prompt_key": prompt_key, "history": history})
+
+
+@app.post("/api/prompts")
+def api_prompts_save():
+    if not postgres_enabled():
+        return jsonify({"error": "PostgreSQL is required for prompt storage."}), 400
+    payload = request.get_json(silent=True) or request.form
+    prompt_key = str(payload.get("prompt_key") or payload.get("key") or "").strip()
+    prompt_text = str(payload.get("prompt_text") or payload.get("text") or "").strip()
+    category_key = resolve_prompt_category_key(prompt_key)
+    if not category_key or not prompt_text:
+        return jsonify({"error": "prompt_key and prompt_text are required."}), 400
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                ensure_prompt_categories(cur)
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM ai_prompt_categories
+                    WHERE category_key = %s
+                    """,
+                    (category_key,),
+                )
+                category = cur.fetchone()
+                if not category:
+                    return jsonify({"error": f"Unknown prompt category: {category_key}"}), 400
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(version), 0) + 1 AS version
+                    FROM ai_prompts
+                    WHERE category_id = %s
+                    """,
+                    (category["id"],),
+                )
+                version = cur.fetchone()["version"]
+                cur.execute(
+                    """
+                    INSERT INTO ai_prompts (
+                        category_id, prompt_key, title, prompt_text, version, is_active
+                    ) VALUES (%s, %s, %s, %s, %s, TRUE)
+                    RETURNING id
+                    """,
+                    (category["id"], prompt_key or category_key, category_key, prompt_text, version),
+                )
+                prompt_id = cur.fetchone()["id"]
+    return jsonify({"saved": True, "prompt_id": str(prompt_id), "version": version})
+
+
+@app.delete("/api/prompts/<prompt_id>")
+def api_prompt_delete(prompt_id: str):
+    if not postgres_enabled():
+        return jsonify({"error": "PostgreSQL is required for prompt storage."}), 400
+    try:
+        prompt_uuid = UUID(prompt_id)
+    except ValueError:
+        return jsonify({"error": "Некорректный id промта."}), 400
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT p.id, p.version, p.is_active, c.category_key
+                    FROM ai_prompts p
+                    JOIN ai_prompt_categories c ON c.id = p.category_id
+                    WHERE p.id = %s
+                    """,
+                    (str(prompt_uuid),),
+                )
+                prompt = cur.fetchone()
+                if not prompt:
+                    return jsonify({"error": "Промт не найден."}), 404
+                if prompt["is_active"]:
+                    return jsonify({
+                        "error": "Нельзя удалить активную версию промта. Сначала сохраните новую версию или удалите только старые неактивные версии."
+                    }), 400
+                cur.execute("DELETE FROM ai_prompts WHERE id = %s", (str(prompt_uuid),))
+    return jsonify({
+        "deleted": True,
+        "prompt_id": str(prompt_uuid),
+        "category_key": prompt["category_key"],
+        "version": prompt["version"],
+    })
+
+
+@app.post("/api/work-items/sync")
+def api_work_items_sync():
+    return jsonify({
+        "error": "Общий реестр задач удален из модели данных. Bitrix-задачи синхронизируются через /api/registry/sync."
+    }), 410
+
+
+@app.post("/api/work-items/analyze-chats")
+def api_work_items_analyze_chats():
+    return jsonify({
+        "error": "ИИ-анализ чатов больше не создает общий реестр задач. Используйте /api/chats/daily-sync или /api/chats/<dialog_id>/report."
+    }), 410
+
+
+@app.post("/api/chats/images/process")
+def api_chats_images_process():
+    payload = request.get_json(silent=True) or request.form
+    date_from_text = str(payload.get("date_from", date.today().isoformat())).strip()
+    date_to_text = str(payload.get("date_to", date_from_text)).strip()
+    dialog_id = str(payload.get("dialog_id", "")).strip() or None
+    force = str(payload.get("force", "")).lower() in {"1", "true", "y", "yes"}
+    try:
+        date_from, date_to = parse_period(date_from_text, date_to_text, max_days=31)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+    if date_from > msk_today() or date_to > msk_today():
+        return jsonify({"error": "Нельзя обрабатывать чаты за будущую дату."}), 400
+    try:
+        return jsonify(process_chat_image_ocr_for_period(date_from, date_to, force=force, dialog_id=dialog_id))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка OCR вложений: {exc}"}), 500
+
+
+@app.post("/api/work-items/analyze-attachments")
+def api_work_items_analyze_attachments():
+    payload = request.get_json(silent=True) or request.form
+    date_from_text = str(payload.get("date_from", date.today().isoformat())).strip()
+    date_to_text = str(payload.get("date_to", date_from_text)).strip()
+    dialog_id = str(payload.get("dialog_id", "")).strip() or None
+    force = str(payload.get("force", "")).lower() in {"1", "true", "y", "yes"}
+    try:
+        date_from, date_to = parse_period(date_from_text, date_to_text, max_days=31)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+    if date_from > msk_today() or date_to > msk_today():
+        return jsonify({"error": "Нельзя обрабатывать чаты за будущую дату."}), 400
+    try:
+        result = process_chat_image_ocr_for_period(date_from, date_to, force=force, dialog_id=dialog_id)
+        if dialog_id and date_from == date_to:
+            chat_day = load_chat_day(dialog_id, date_from)
+            before_report = chat_day.get("report")
+            status = chat_day.get("text_status") or {}
+            chat_day["ocr"] = result.get("ocr", {})
+            if not chat_day.get("messages") and not is_real_ai_chat_report(chat_day.get("report")) and not is_real_ai_chat_report(before_report):
+                finalization_error = chat_day_finalization_error(date_from)
+                chat_day["message"] = finalization_error or "Готов к отчету: сообщений и изображений нет."
+            else:
+                chat_day["message"] = (
+                    f"{status.get('workflow_status_text') or status.get('text_ready_status_text') or status.get('status_text', 'Готов к отчету')}: изображений {status.get('image_files', 0)}, "
+                    f"OCR готово {status.get('ocr_success', 0)}, ошибок {status.get('ocr_errors', 0)}."
+                )
+            return jsonify(chat_day)
+        return jsonify(result)
+    except ValueError as exc:
+        if dialog_id and date_from == date_to:
+            chat_day = load_chat_day(dialog_id, date_from)
+            status = chat_day.get("text_status") or {}
+            chat_day["ocr"] = {"processed": 0, "skipped": 0, "errors": [{"error": str(exc)}], "dialog_id": dialog_id}
+            chat_day["message"] = (
+                f"{status.get('workflow_status_text') or status.get('text_ready_status_text') or status.get('status_text', 'Не обработан')}: изображений {status.get('image_files', 0)}. "
+                f"OCR не запущен: {exc}"
+            )
+            return jsonify(chat_day)
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка OCR вложений: {exc}"}), 500
+
+
+@app.post("/api/chats/<path:dialog_id>/analyze-work")
+def api_chat_analyze_work(dialog_id: str):
+    return jsonify({
+        "error": "Общий разбор чата в work_items удален. Используйте ежедневный отчет чата: /api/chats/<dialog_id>/report."
+    }), 410
+
+
+@app.patch("/api/reports/<report_type>/<report_id>")
+def api_report_manual_edit(report_type: str, report_id: str):
+    payload = request.get_json(silent=True) or {}
+    try:
+        report = save_manual_report_edit(report_type, report_id, payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка сохранения ручной правки отчета: {exc}"}), 500
+    return jsonify({
+        "report": report,
+        "message": f"Ручная версия отчета сохранена: версия {report.get('version')}.",
+    })
+
+
+@app.delete("/api/reports/<report_type>/<report_id>")
+def api_report_delete(report_type: str, report_id: str):
+    try:
+        result = delete_manual_report(report_type, report_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка удаления отчета: {exc}"}), 500
+    return jsonify({**result, "message": "Отчет удален."})
+
+
+@app.get("/api/chat-goals")
+def api_chat_goals():
+    goals = load_user_goals()
+    q = str(request.args.get("q", "")).strip().lower()
+    goal_level = str(request.args.get("goal_level", "")).strip()
+    period_type = str(request.args.get("period_type", "")).strip()
+    status = str(request.args.get("status", "")).strip()
+    source_type = str(request.args.get("source_type", "")).strip()
+    owner_id = to_int(request.args.get("owner_id"))
+
+    def matches(goal: dict[str, Any]) -> bool:
+        if q:
+            haystack = " ".join(
+                str(goal.get(key) or "")
+                for key in ("goal_title", "goal_text", "owner_name", "success_metrics", "expected_result")
+            ).lower()
+            if q not in haystack:
+                return False
+        if goal_level and goal.get("goal_level") != goal_level:
+            return False
+        if period_type and goal.get("period_type") != period_type:
+            return False
+        if status and goal.get("status") != status:
+            return False
+        if source_type and goal.get("source_type") != source_type:
+            return False
+        if owner_id is not None and goal.get("owner_id") != owner_id:
+            return False
+        return True
+
+    filtered_goals = [goal for goal in goals if matches(goal)]
+    stats = {
+        "total": len(goals),
+        "filtered_total": len(filtered_goals),
+        "company": sum(1 for goal in filtered_goals if goal.get("goal_level") == "company"),
+        "employee": sum(1 for goal in filtered_goals if goal.get("goal_level") == "employee"),
+        "active": sum(1 for goal in filtered_goals if goal.get("status") == "active"),
+        "manual": sum(1 for goal in filtered_goals if goal.get("source_type") == "manual"),
+        "from_chats": sum(1 for goal in filtered_goals if goal.get("source_type") in {"chat", "ocr", "ai"}),
+    }
+    return jsonify({"goals": filtered_goals, "total": len(filtered_goals), "stats": stats})
+
+
+@app.post("/api/chat-goals")
+def api_chat_goals_create():
+    payload = request.get_json(silent=True) or request.form
+    goal_title = str(payload.get("goal_title", "")).strip()
+    if not goal_title:
+        return jsonify({"error": "Укажите название цели."}), 400
+    goal_level = str(payload.get("goal_level") or "employee").strip()
+    period_type = str(payload.get("period_type") or "month").strip()
+    status = str(payload.get("status") or "active").strip()
+    period_start = str(payload.get("period_start") or date.today().isoformat()).strip()
+    period_end = str(payload.get("period_end") or period_start).strip()
+    allowed_goal_levels = {"company", "department", "manager", "employee", "project"}
+    allowed_period_types = {"day", "week", "month", "quarter", "year", "project"}
+    allowed_statuses = {"draft", "active", "done", "cancelled", "archived"}
+    if goal_level not in allowed_goal_levels:
+        return jsonify({"error": "Некорректный уровень цели."}), 400
+    if period_type not in allowed_period_types:
+        return jsonify({"error": "Некорректный период цели."}), 400
+    if status not in allowed_statuses:
+        return jsonify({"error": "Некорректный статус цели."}), 400
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                owner_id = pg_user_id_by_bitrix(cur, payload.get("owner_id")) if goal_level != "company" else None
+                cur.execute(
+                    """
+                    INSERT INTO user_goals (
+                        user_id, goal_title, goal_text, goal_level, period_type,
+                        period_start, period_end, success_metrics, expected_result,
+                        status, source_type, confidence, is_confirmed, confirmed_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'manual', 1.0, TRUE, now())
+                    """,
+                    (
+                        owner_id,
+                        goal_title,
+                        payload.get("goal_text"),
+                        goal_level,
+                        period_type,
+                        period_start,
+                        period_end,
+                        payload.get("success_metrics"),
+                        payload.get("expected_result"),
+                        status,
+                    ),
+                )
+        goals = load_user_goals()
+        return jsonify({"goals": goals, "total": len(goals), "message": "Цель сохранена в PostgreSQL."})
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_goals (
+                dialog_id, goal_title, goal_text, period_type, period_start, period_end,
+                owner_id, owner_name, success_metrics, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.get("dialog_id"),
+                goal_title,
+                payload.get("goal_text"),
+                period_type,
+                period_start,
+                period_end,
+                to_int(payload.get("owner_id")) if goal_level != "company" else None,
+                payload.get("owner_name"),
+                payload.get("success_metrics"),
+                status,
+                now,
+                now,
+            ),
+        )
+    goals = load_user_goals()
+    return jsonify({"goals": goals, "total": len(goals), "message": "Цель сохранена."})
+
+
+@app.post("/api/team/sync")
+def api_team_sync():
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if not webhook_base:
+        return jsonify({"error": "Укажите BITRIX_WEBHOOK_BASE в файле .env перед синхронизацией команды."}), 400
+    try:
+        payload = sync_bitrix_team(webhook_base)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка синхронизации команды Bitrix: {exc}"}), 500
+    payload["message"] = f"Синхронизация команды завершена: сохранено {payload['saved']} сотрудников."
+    return jsonify(payload)
+
+
+@app.post("/api/chats/sync")
+def api_chats_sync():
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if not webhook_base:
+        return jsonify({"error": "Укажите BITRIX_WEBHOOK_BASE в файле .env перед запуском синхронизации чатов."}), 400
+    date_from, date_to = missing_chat_messages_period(default_days=30)
+    try:
+        payload = sync_all_chat_dialogs_for_period(date_from, date_to, webhook_base, generate_reports=False)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка синхронизации чатов Bitrix: {exc}"}), 500
+    payload["message"] = (
+        f"Обновление чатов за {format_date_ru(date_from)} - {format_date_ru(date_to)} завершено: "
+        f"обновлено связок чат-день {payload['chat_days_synced']} за {payload['days']} дн., "
+        f"сообщений сохранено {payload.get('messages_synced', 0)}, "
+        f"исключено чатов {payload['chats_excluded']}."
+    )
+    return jsonify(payload)
+
+
+@app.post("/api/chats/<path:dialog_id>/exclude")
+def api_chat_exclude(dialog_id: str):
+    payload = request.get_json(silent=True) or request.form
+    is_excluded = str(payload.get("is_excluded", "true")).lower() in {"1", "true", "y", "yes"}
+    chat = set_chat_excluded(dialog_id, is_excluded)
+    if chat is None:
+        return jsonify({"error": "Чат не найден в локальном реестре."}), 404
+    return jsonify({
+        "chat": chat,
+        "chats": load_chats(),
+        "message": f"Чат {'исключен' if is_excluded else 'включен'}: {chat.get('title') or dialog_id}",
+    })
+
+
+@app.post("/api/chats/daily-sync")
+def api_chats_daily_sync():
+    payload = request.get_json(silent=True) or request.form
+    date_from_text = payload.get("date_from", payload.get("date", date.today().isoformat())).strip()
+    date_to_text = payload.get("date_to", date_from_text).strip()
+    generate_reports = str(payload.get("generate_reports", "true")).lower() in {"1", "true", "y", "yes"}
+    try:
+        date_from = parse_date_field(date_from_text, "date_from")
+        date_to = parse_date_field(date_to_text, "date_to")
+    except ValueError:
+        return jsonify({"error": "Некорректная дата."}), 400
+    if date_to < date_from:
+        return jsonify({"error": "Дата окончания периода не может быть раньше даты начала."}), 400
+    if (date_to - date_from).days > 31:
+        return jsonify({"error": "Период синхронизации чатов не должен превышать 32 дня."}), 400
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if not webhook_base:
+        return jsonify({"error": "Укажите BITRIX_WEBHOOK_BASE в файле .env перед синхронизацией чатов."}), 400
+    try:
+        result = sync_all_chat_dialogs_for_period(date_from, date_to, webhook_base, generate_reports=generate_reports)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка синхронизации чатов Bitrix за период: {exc}"}), 500
+    result["message"] = (
+        f"Синхронизация чатов за {format_date_ru(date_from)} - {format_date_ru(date_to)} завершена: "
+        f"обновлено связок чат-день {result['chat_days_synced']} за {result['days']} дн., "
+        f"сообщений сохранено {result.get('messages_synced', 0)}, "
+        f"сводок сформировано {result['reports_generated']}, "
+        f"исключено чатов {result['chats_excluded']}."
+    )
+    return jsonify(result)
+
+
+@app.get("/api/chats/overall-daily-report")
+def api_chats_overall_daily_report_get():
+    date_text = request.args.get("date", latest_visible_report_date().isoformat()).strip()
+    try:
+        report_date = parse_date_field(date_text, "date")
+    except ValueError:
+        return jsonify({"error": "Некорректная дата."}), 400
+    report = load_chat_overall_daily_report(report_date)
+    if not report:
+        return jsonify({"report": None, "message": "Сводный отчет по чатам за дату еще не сформирован."})
+    return jsonify({"report": report})
+
+
+@app.get("/api/chats/overall-daily-reports")
+def api_chats_overall_daily_reports_list():
+    try:
+        limit = int(request.args.get("limit", "30"))
+    except ValueError:
+        return jsonify({"error": "Некорректный лимит."}), 400
+    return jsonify({"reports": list_chat_overall_daily_reports(limit)})
+
+
+@app.post("/api/chats/overall-daily-report")
+def api_chats_overall_daily_report_post():
+    payload = request.get_json(silent=True) or request.form
+    date_text = payload.get("date", latest_visible_report_date().isoformat()).strip()
+    try:
+        report_date = parse_date_field(date_text, "date")
+    except ValueError:
+        return jsonify({"error": "Некорректная дата."}), 400
+    if report_date > latest_visible_report_date():
+        return jsonify({"error": "Нельзя формировать сводный отчет по чатам за будущую или еще не закрытую дату."}), 400
+    try:
+        report = save_chat_overall_daily_report(report_date)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка формирования сводного отчета по чатам: {exc}"}), 500
+    return jsonify({"report": report, "message": f"Сводный отчет по чатам за {format_date_ru(report_date)} сформирован."})
+
+
+@app.get("/api/chats/overall-weekly-report")
+def api_chats_overall_weekly_report_get():
+    start_text = request.args.get("period_start", "").strip()
+    end_text = request.args.get("period_end", "").strip()
+    if not start_text or not end_text:
+        today = latest_visible_report_date()
+        period_start = today - timedelta(days=today.weekday())
+        period_end = period_start + timedelta(days=6)
+    else:
+        try:
+            period_start = parse_date_field(start_text, "period_start")
+            period_end = parse_date_field(end_text, "period_end")
+        except ValueError:
+            return jsonify({"error": "Некорректный период."}), 400
+    if not is_allowed_chat_weekly_period(period_start, period_end):
+        return jsonify({"error": "Недельная сводка должна быть за полный период с понедельника по воскресенье."}), 400
+    report = load_chat_overall_weekly_report(period_start, period_end)
+    if not report:
+        return jsonify({"report": None, "message": "Еженедельная сводка по чатам за период еще не сформирована."})
+    return jsonify({"report": report})
+
+
+@app.get("/api/chats/overall-weekly-reports")
+def api_chats_overall_weekly_reports_list():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except ValueError:
+        return jsonify({"error": "Некорректный лимит."}), 400
+    return jsonify({"reports": list_chat_overall_weekly_reports(limit)})
+
+
+@app.post("/api/chats/overall-weekly-report")
+def api_chats_overall_weekly_report_post():
+    payload = request.get_json(silent=True) or request.form
+    start_text = str(payload.get("period_start") or "").strip()
+    end_text = str(payload.get("period_end") or "").strip()
+    if not start_text or not end_text:
+        return jsonify({"error": "period_start and period_end are required."}), 400
+    try:
+        period_start = parse_date_field(start_text, "period_start")
+        period_end = parse_date_field(end_text, "period_end")
+    except ValueError:
+        return jsonify({"error": "Некорректный период."}), 400
+    if not is_allowed_chat_weekly_period(period_start, period_end):
+        return jsonify({"error": "Недельная сводка должна быть за полный период с понедельника по воскресенье."}), 400
+    try:
+        per_chat_result = generate_chat_weekly_reports_for_period(period_start, period_end)
+        report = save_chat_overall_weekly_report(period_start, period_end)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка формирования еженедельной сводки по чатам: {exc}"}), 500
+    return jsonify({
+        "report": report,
+        "per_chat_reports": per_chat_result,
+        "message": (
+            f"Еженедельная сводка по чатам за {format_date_ru(period_start)} - {format_date_ru(period_end)} сформирована. "
+            f"Недельных отчетов по отдельным чатам: {per_chat_result.get('reports_generated', 0)}."
+        ),
+    })
+
+
+@app.post("/api/owner/daily-report")
+def api_owner_daily_report_post():
+    payload = request.get_json(silent=True) or request.form
+    date_text = str(payload.get("date") or latest_visible_report_date().isoformat()).strip()
+    force = str(payload.get("force", "")).lower() in {"1", "true", "y", "yes"}
+    cascade = str(payload.get("cascade", "1")).lower() not in {"0", "false", "n", "no"}
+    try:
+        report_date = parse_date_field(date_text, "date")
+    except ValueError:
+        return jsonify({"error": "Некорректная дата."}), 400
+    if report_date > latest_visible_report_date():
+        return jsonify({"error": "Нельзя формировать отчет собственника за будущую или еще не закрытую дату."}), 400
+    try:
+        if cascade:
+            cascade_result = cascade_owner_daily(report_date, force=force)
+            report = cascade_result["owner_daily"]
+            return jsonify({
+                "report": report,
+                "cascade": cascade_result,
+                "message": f"Ежедневный отчет собственника за {format_date_ru(report_date)} сформирован (с автокаскадом).",
+            })
+        report = save_owner_daily_report(report_date)
+    except OwnerPipelinePrerequisitesError as exc:
+        return jsonify({
+            "error": str(exc),
+            "cascade": exc.cascade_result,
+            "message": "Owner-отчет не сохранен: не все отчеты-источники готовы.",
+        }), 409
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка формирования owner daily: {exc}"}), 500
+    return jsonify({"report": report, "message": f"Ежедневный отчет собственника за {format_date_ru(report_date)} сформирован."})
+
+
+@app.get("/api/owner/daily-report")
+def api_owner_daily_report_get():
+    date_text = str(request.args.get("date") or latest_visible_report_date().isoformat()).strip()
+    try:
+        report_date = parse_date_field(date_text, "date")
+    except ValueError:
+        return jsonify({"error": "Некорректная дата."}), 400
+    report = load_owner_daily_report(report_date)
+    if not report:
+        return jsonify({"report": None, "message": "Ежедневный отчет собственника за дату еще не сформирован."})
+    return jsonify({"report": report})
+
+
+@app.get("/api/owner/daily-reports")
+def api_owner_daily_reports_list():
+    if not postgres_enabled():
+        return jsonify({"reports": [], "message": "PostgreSQL не включен, список owner-отчетов недоступен."})
+    limit = to_int(request.args.get("limit")) or 50
+    try:
+        return jsonify({"reports": list_owner_daily_reports(limit)})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка чтения owner daily reports: {exc}"}), 500
+
+
+@app.post("/api/owner/daily-reports/<report_id>/send")
+def api_owner_daily_report_send(report_id: str):
+    payload = request.get_json(silent=True) or {}
+    recipient_ids = payload.get("recipient_ids") or payload.get("recipients") or []
+    recipient_recommendations = payload.get("recipient_recommendations") or payload.get("recommendations_by_recipient")
+    if not isinstance(recipient_ids, list):
+        return jsonify({"error": "recipient_ids должен быть списком Bitrix user id."}), 400
+    if recipient_recommendations is not None and not isinstance(recipient_recommendations, dict):
+        return jsonify({"error": "recipient_recommendations должен быть объектом {bitrix_user_id: text}."}), 400
+    try:
+        result = send_owner_daily_report_to_bitrix(report_id, recipient_ids, recipient_recommendations)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка отправки отчета в Bitrix: {exc}"}), 500
+    if result["sent"]:
+        message = f"Отчет отправлен: {result['sent']} получател."
+        if result["failed"]:
+            message += f" Ошибок: {result['failed']}."
+    else:
+        first_error = (result.get("errors") or [{}])[0].get("error") or "нет доступа к выбранным получателям"
+        message = f"Отчет не отправлен. Ошибок: {result['failed']}. {first_error}"
+    return jsonify({**result, "message": message})
+
+
+@app.post("/api/owner/daily-reports/<report_id>/send-full")
+def api_owner_daily_report_send_full(report_id: str):
+    payload = request.get_json(silent=True) or {}
+    recipient_ids = payload.get("recipient_ids") or payload.get("recipients") or []
+    if not isinstance(recipient_ids, list):
+        return jsonify({"error": "recipient_ids должен быть списком Bitrix user id."}), 400
+    try:
+        result = send_owner_report_pdf_to_bitrix(report_id, "daily", recipient_ids)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка отправки PDF-отчета в Bitrix: {exc}"}), 500
+    if result["sent"]:
+        message = f"PDF-отчет отправлен: {result['sent']} получател."
+        if result["failed"]:
+            message += f" Ошибок: {result['failed']}."
+    else:
+        first_error = (result.get("errors") or [{}])[0].get("error") or "нет доступа к выбранным получателям"
+        message = f"PDF-отчет не отправлен. Ошибок: {result['failed']}. {first_error}"
+    return jsonify({**result, "message": message})
+
+
+@app.post("/api/owner/weekly-report")
+def api_owner_weekly_report_post():
+    payload = request.get_json(silent=True) or request.form
+    start_text = str(payload.get("period_start") or "").strip()
+    end_text = str(payload.get("period_end") or "").strip()
+    force = str(payload.get("force", "")).lower() in {"1", "true", "y", "yes"}
+    cascade = str(payload.get("cascade", "1")).lower() not in {"0", "false", "n", "no"}
+    if not start_text or not end_text:
+        return jsonify({"error": "period_start and period_end are required."}), 400
+    try:
+        period_start = parse_date_field(start_text, "period_start")
+        period_end = parse_date_field(end_text, "period_end")
+    except ValueError:
+        return jsonify({"error": "Некорректный период."}), 400
+    if not is_allowed_chat_weekly_period(period_start, period_end):
+        return jsonify({"error": "Недельный период должен быть с понедельника по воскресенье."}), 400
+    try:
+        if cascade:
+            cascade_result = cascade_owner_weekly(period_start, period_end, force=force)
+            report = cascade_result["owner_weekly"]
+            return jsonify({
+                "report": report,
+                "cascade": cascade_result,
+                "message": f"Еженедельный отчет собственника за {format_date_ru(period_start)} - {format_date_ru(period_end)} сформирован (с автокаскадом).",
+            })
+        report = save_owner_weekly_report(period_start, period_end)
+    except OwnerPipelinePrerequisitesError as exc:
+        return jsonify({
+            "error": str(exc),
+            "cascade": exc.cascade_result,
+            "message": "Owner weekly не сохранен: дневные отчеты-источники не готовы.",
+        }), 409
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка формирования owner weekly: {exc}"}), 500
+    return jsonify({"report": report, "message": f"Еженедельный отчет собственника за {format_date_ru(period_start)} - {format_date_ru(period_end)} сформирован."})
+
+
+@app.get("/api/owner/weekly-report")
+def api_owner_weekly_report_get():
+    start_text = str(request.args.get("period_start") or "").strip()
+    end_text = str(request.args.get("period_end") or "").strip()
+    if not start_text or not end_text:
+        return jsonify({"error": "period_start and period_end are required."}), 400
+    try:
+        period_start = parse_date_field(start_text, "period_start")
+        period_end = parse_date_field(end_text, "period_end")
+    except ValueError:
+        return jsonify({"error": "Некорректный период."}), 400
+    report = load_owner_weekly_report(period_start, period_end)
+    if not report:
+        return jsonify({"report": None, "message": "Еженедельный отчет собственника за период еще не сформирован."})
+    return jsonify({"report": report})
+
+
+@app.get("/api/owner/weekly-reports")
+def api_owner_weekly_reports_list():
+    if not postgres_enabled():
+        return jsonify({"reports": [], "message": "PostgreSQL не включен, список owner-отчетов недоступен."})
+    limit = to_int(request.args.get("limit")) or 50
+    try:
+        return jsonify({"reports": list_owner_weekly_reports(limit)})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка чтения owner weekly reports: {exc}"}), 500
+
+
+@app.post("/api/owner/weekly-reports/<report_id>/send")
+def api_owner_weekly_report_send(report_id: str):
+    payload = request.get_json(silent=True) or {}
+    recipient_ids = payload.get("recipient_ids") or payload.get("recipients") or []
+    recipient_recommendations = payload.get("recipient_recommendations") or payload.get("recommendations_by_recipient")
+    if not isinstance(recipient_ids, list):
+        return jsonify({"error": "recipient_ids должен быть списком Bitrix user id."}), 400
+    if recipient_recommendations is not None and not isinstance(recipient_recommendations, dict):
+        return jsonify({"error": "recipient_recommendations должен быть объектом {bitrix_user_id: text}."}), 400
+    try:
+        result = send_owner_report_recommendations_to_bitrix(report_id, "weekly", recipient_ids, recipient_recommendations)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка отправки отчета в Bitrix: {exc}"}), 500
+    if result["sent"]:
+        message = f"Рекомендации отправлены: {result['sent']} получател."
+        if result["failed"]:
+            message += f" Ошибок: {result['failed']}."
+    else:
+        first_error = (result.get("errors") or [{}])[0].get("error") or "нет доступа к выбранным получателям"
+        message = f"Рекомендации не отправлены. Ошибок: {result['failed']}. {first_error}"
+    return jsonify({**result, "message": message})
+
+
+@app.post("/api/owner/weekly-reports/<report_id>/send-full")
+def api_owner_weekly_report_send_full(report_id: str):
+    payload = request.get_json(silent=True) or {}
+    recipient_ids = payload.get("recipient_ids") or payload.get("recipients") or []
+    if not isinstance(recipient_ids, list):
+        return jsonify({"error": "recipient_ids должен быть списком Bitrix user id."}), 400
+    try:
+        result = send_owner_report_pdf_to_bitrix(report_id, "weekly", recipient_ids)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка отправки PDF-отчета в Bitrix: {exc}"}), 500
+    if result["sent"]:
+        message = f"PDF-отчет отправлен: {result['sent']} получател."
+        if result["failed"]:
+            message += f" Ошибок: {result['failed']}."
+    else:
+        first_error = (result.get("errors") or [{}])[0].get("error") or "нет доступа к выбранным получателям"
+        message = f"PDF-отчет не отправлен. Ошибок: {result['failed']}. {first_error}"
+    return jsonify({**result, "message": message})
+
+
+@app.post("/api/pipeline/run-day")
+def api_pipeline_run_day():
+    payload = request.get_json(silent=True) or request.form
+    date_text = str(payload.get("date") or latest_visible_report_date().isoformat()).strip()
+    force = str(payload.get("force", "")).lower() in {"1", "true", "y", "yes"}
+    try:
+        target_date = parse_date_field(date_text, "date")
+    except ValueError:
+        return jsonify({"error": "Некорректная дата."}), 400
+    if target_date > latest_visible_report_date():
+        return jsonify({"error": "Нельзя запускать дневной пайплайн за будущую или еще не закрытую дату."}), 400
+    try:
+        cascade_result = cascade_owner_daily(target_date, force=force)
+    except OwnerPipelinePrerequisitesError as exc:
+        return jsonify({
+            "error": str(exc),
+            "cascade": exc.cascade_result,
+            "message": "Дневной пайплайн остановлен: не все отчеты-источники готовы.",
+        }), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка дневного пайплайна: {exc}"}), 500
+    chat_daily = cascade_result.get("chat_daily") or {}
+    zoom = cascade_result.get("zoom") or {}
+    errors = list(chat_daily.get("errors") or [])
+    zoom_errors = list(zoom.get("errors") or [])
+    message = (
+        f"Дневной пайплайн выполнен за {format_date_ru(target_date)}. "
+        f"Zoom-звонков: {zoom.get('calls_found', 0)}, Zoom-отчетов: {zoom.get('reports_generated', 0)}, "
+        f"Сгенерировано chat_daily: {chat_daily.get('generated', 0)}, "
+        f"пропущено: {chat_daily.get('skipped', 0)}, ошибок: {len(errors) + len(zoom_errors)}."
+    )
+    return jsonify({
+        "date": target_date.isoformat(),
+        "zoom_calls_found": zoom.get("calls_found", 0),
+        "zoom_reports_generated": zoom.get("reports_generated", 0),
+        "zoom_reports_skipped": zoom.get("reports_skipped", 0),
+        "zoom_errors": zoom_errors,
+        "chat_reports_generated": chat_daily.get("generated", 0),
+        "chat_reports_skipped": chat_daily.get("skipped", 0),
+        "chat_reports_errors": errors,
+        "owner_daily_report": cascade_result.get("owner_daily"),
+        "cascade": cascade_result,
+        "message": message,
+    })
+
+
+@app.post("/api/pipeline/run-week")
+def api_pipeline_run_week():
+    payload = request.get_json(silent=True) or request.form
+    start_text = str(payload.get("period_start") or "").strip()
+    end_text = str(payload.get("period_end") or "").strip()
+    force = str(payload.get("force", "")).lower() in {"1", "true", "y", "yes"}
+    if not start_text or not end_text:
+        return jsonify({"error": "period_start and period_end are required."}), 400
+    try:
+        period_start = parse_date_field(start_text, "period_start")
+        period_end = parse_date_field(end_text, "period_end")
+    except ValueError:
+        return jsonify({"error": "Некорректный период."}), 400
+    if not is_allowed_chat_weekly_period(period_start, period_end):
+        return jsonify({"error": "Период должен быть с понедельника по воскресенье."}), 400
+    try:
+        cascade_result = cascade_owner_weekly(period_start, period_end, force=force)
+    except OwnerPipelinePrerequisitesError as exc:
+        return jsonify({
+            "error": str(exc),
+            "cascade": exc.cascade_result,
+            "message": "Недельный пайплайн остановлен: дневные отчеты-источники не готовы.",
+        }), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка недельного пайплайна: {exc}"}), 500
+    return jsonify({
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "per_chat_weekly": cascade_result.get("chat_weekly"),
+        "overall_weekly_report": cascade_result.get("chat_overall_weekly"),
+        "owner_weekly_report": cascade_result.get("owner_weekly"),
+        "cascade": cascade_result,
+        "message": f"Недельный пайплайн выполнен за {format_date_ru(period_start)} - {format_date_ru(period_end)}.",
+    })
+
+
+@app.get("/api/chats/<path:dialog_id>/day")
+def api_chat_day(dialog_id: str):
+    date_text = request.args.get("date", date.today().isoformat()).strip()
+    date_from_text = request.args.get("date_from", "").strip()
+    date_to_text = request.args.get("date_to", "").strip()
+    if date_from_text or date_to_text:
+        try:
+            date_from, date_to = parse_period(date_from_text or date_text, date_to_text or date_text, max_days=32)
+        except ValueError:
+            return jsonify({"error": "Некорректный период."}), 400
+        return jsonify(load_chat_period(dialog_id, date_from, date_to))
+    try:
+        report_date = parse_date_field(date_text, "date")
+    except ValueError:
+        return jsonify({"error": "Некорректная дата."}), 400
+    return jsonify(load_chat_day(dialog_id, report_date))
+
+
+@app.post("/api/chats/<path:dialog_id>/messages/sync")
+def api_chat_messages_sync(dialog_id: str):
+    payload = request.get_json(silent=True) or request.form
+    date_text = str(payload.get("date", date.today().isoformat())).strip()
+    date_from_text = str(payload.get("date_from", date_text)).strip()
+    date_to_text = str(payload.get("date_to", date_from_text)).strip()
+    try:
+        date_from, date_to = parse_period(date_from_text, date_to_text, max_days=32)
+    except ValueError:
+        return jsonify({"error": "Некорректный период."}), 400
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if not webhook_base:
+        return jsonify({"error": "Укажите BITRIX_WEBHOOK_BASE в файле .env перед загрузкой сообщений."}), 400
+    try:
+        return jsonify(sync_chat_messages_for_period(dialog_id, date_from, date_to, webhook_base))
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка загрузки сообщений Bitrix: {exc}"}), 500
+
+
+@app.post("/api/chats/<path:dialog_id>/images/process")
+def api_chat_images_process(dialog_id: str):
+    payload = request.get_json(silent=True) or request.form
+    date_text = payload.get("date", date.today().isoformat()).strip()
+    force = str(payload.get("force", "")).lower() in {"1", "true", "y", "yes"}
+    try:
+        report_date = parse_date_field(date_text, "date")
+    except ValueError:
+        return jsonify({"error": "Некорректная дата."}), 400
+    try:
+        process_chat_image_ocr_for_period(report_date, report_date, force=force, dialog_id=dialog_id)
+        result = load_chat_day(dialog_id, report_date)
+        status = result.get("text_status") or {}
+        result["message"] = (
+            f"{status.get('text_ready_status_text') or status.get('status_text', 'Готов к отчету')}: изображений {status.get('image_files', 0)}, "
+            f"OCR готово {status.get('ocr_success', 0)}, ошибок {status.get('ocr_errors', 0)}."
+        )
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка обработки картинок: {exc}"}), 500
+
+
+@app.post("/api/chats/<path:dialog_id>/report")
+def api_chat_report(dialog_id: str):
+    payload = request.get_json(silent=True) or request.form
+    date_text = payload.get("date", date.today().isoformat()).strip()
+    force = str(payload.get("force", "")).lower() in {"1", "true", "y", "yes"}
+    try:
+        report_date = date.fromisoformat(date_text)
+    except ValueError:
+        return jsonify({"error": "Некорректная дата."}), 400
+    try:
+        return jsonify(generate_ai_chat_report(dialog_id, report_date, force=force))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 500
+        if status_code in {429, 500, 502, 503, 504}:
+            return jsonify({
+                "error": (
+                    "ИИ-сервис временно недоступен, отчет не сформирован и не сохранен в БД. "
+                    "Повторите генерацию позже."
+                ),
+                "details": str(exc),
+            }), 503
+        return jsonify({"error": f"Ошибка генерации отчета: {exc}"}), 500
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка генерации отчета: {exc}"}), 500
+
+
+@app.delete("/api/chats/<path:dialog_id>/report")
+def api_chat_report_delete(dialog_id: str):
+    date_text = str(request.args.get("date") or "").strip()
+    if not date_text:
+        payload = request.get_json(silent=True) or {}
+        date_text = str(payload.get("date") or "").strip()
+    try:
+        report_date = parse_date_field(date_text, "date")
+    except ValueError:
+        return jsonify({"error": "Некорректная дата."}), 400
+
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    chat_id = pg_chat_id_by_dialog(cur, dialog_id)
+                    if not chat_id:
+                        return jsonify({"error": "Чат не найден."}), 404
+                    cur.execute(
+                        """
+                        DELETE FROM chat_daily_reports
+                        WHERE chat_id = %s AND report_date = %s
+                        RETURNING id
+                        """,
+                        (chat_id, report_date),
+                    )
+                    deleted_ids = [str(row["id"]) for row in cur.fetchall()]
+        if not deleted_ids:
+            return jsonify({"error": "Ежедневный отчет по чату за дату не найден."}), 404
+        result = load_chat_day(dialog_id, report_date)
+        result["deleted_report_ids"] = deleted_ids
+        result["message"] = f"Ежедневный отчет по чату за {format_date_ru(report_date)} удален."
+        return jsonify(result)
+
+    with db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM chat_daily_reports WHERE dialog_id = ? AND report_date = ?",
+            (dialog_id, report_date.isoformat()),
+        )
+        deleted_count = cur.rowcount
+    if not deleted_count:
+        return jsonify({"error": "Ежедневный отчет по чату за дату не найден."}), 404
+    result = load_chat_day(dialog_id, report_date)
+    result["deleted_report_ids"] = []
+    result["message"] = f"Ежедневный отчет по чату за {format_date_ru(report_date)} удален."
+    return jsonify(result)
+
+
+@app.get("/api/chats/<path:dialog_id>/weekly-report")
+def api_chat_weekly_report_get(dialog_id: str):
+    start_text = request.args.get("period_start", "").strip()
+    end_text = request.args.get("period_end", "").strip()
+    if not start_text or not end_text:
+        return jsonify({"error": "period_start and period_end are required."}), 400
+    try:
+        period_start = parse_date_field(start_text, "period_start")
+        period_end = parse_date_field(end_text, "period_end")
+    except ValueError:
+        return jsonify({"error": "Некорректный период."}), 400
+    report = load_chat_weekly_report(dialog_id, period_start, period_end)
+    if not report:
+        return jsonify({"report": None, "message": "Недельный отчет по чату за период еще не сформирован."})
+    return jsonify({"report": report})
+
+
+@app.post("/api/chats/<path:dialog_id>/weekly-report")
+def api_chat_weekly_report_post(dialog_id: str):
+    payload = request.get_json(silent=True) or request.form
+    start_text = str(payload.get("period_start") or "").strip()
+    end_text = str(payload.get("period_end") or "").strip()
+    force = str(payload.get("force", "")).lower() in {"1", "true", "y", "yes"}
+    if not start_text or not end_text:
+        return jsonify({"error": "period_start and period_end are required."}), 400
+    try:
+        period_start = parse_date_field(start_text, "period_start")
+        period_end = parse_date_field(end_text, "period_end")
+    except ValueError:
+        return jsonify({"error": "Некорректный период."}), 400
+    try:
+        report = save_chat_weekly_report(dialog_id, period_start, period_end, force=force)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка формирования недельного отчета по чату: {exc}"}), 500
+    return jsonify({
+        "report": report,
+        "message": f"Недельный отчет по чату за {format_date_ru(period_start)} - {format_date_ru(period_end)} сформирован.",
+    })
+
+
+@app.delete("/api/chats/<path:dialog_id>/weekly-report")
+def api_chat_weekly_report_delete(dialog_id: str):
+    start_text = str(request.args.get("period_start") or "").strip()
+    end_text = str(request.args.get("period_end") or "").strip()
+    if not start_text or not end_text:
+        payload = request.get_json(silent=True) or {}
+        start_text = start_text or str(payload.get("period_start") or "").strip()
+        end_text = end_text or str(payload.get("period_end") or "").strip()
+    if not start_text or not end_text:
+        return jsonify({"error": "period_start and period_end are required."}), 400
+    try:
+        period_start = parse_date_field(start_text, "period_start")
+        period_end = parse_date_field(end_text, "period_end")
+    except ValueError:
+        return jsonify({"error": "Некорректный период."}), 400
+    if period_end < period_start:
+        return jsonify({"error": "period_end must be greater than or equal to period_start."}), 400
+
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    chat_id = pg_chat_id_by_dialog(cur, dialog_id)
+                    if not chat_id:
+                        return jsonify({"error": "Чат не найден."}), 404
+                    cur.execute(
+                        """
+                        DELETE FROM chat_weekly_reports
+                        WHERE chat_id = %s AND period_start = %s AND period_end = %s
+                        RETURNING id
+                        """,
+                        (chat_id, period_start, period_end),
+                    )
+                    deleted_ids = [str(row["id"]) for row in cur.fetchall()]
+        if not deleted_ids:
+            return jsonify({"error": "Недельный отчет по чату за период не найден."}), 404
+        result = load_chat_period(dialog_id, period_start, period_end)
+        result["deleted_report_ids"] = deleted_ids
+        result["message"] = f"Недельный отчет по чату за {format_date_ru(period_start)} - {format_date_ru(period_end)} удален."
+        return jsonify(result)
+
+    return jsonify({"error": "Удаление недельных отчетов доступно только для PostgreSQL."}), 400
+
+
+@app.get("/task/<int:task_id>")
+@app.get("/api/task/<int:task_id>")
+def task_json(task_id: int):
+    if postgres_enabled():
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT raw_json FROM bitrix_tasks WHERE bitrix_task_id = %s", (task_id,))
+                row = cur.fetchone()
+        if row is None:
+            abort(404)
+        return jsonify(row["raw_json"])
+    with db_connect() as conn:
+        row = conn.execute("SELECT raw_json FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+    if row is None:
+        abort(404)
+    return app.response_class(row["raw_json"], mimetype="application/json")
+
+
+@app.post("/api/registry/sync")
+def api_registry_sync():
+    payload = request.get_json(silent=True) or request.form
+    date_from_text = payload.get("date_from", "").strip()
+    date_to_text = payload.get("date_to", "").strip()
+    try:
+        date_from, date_to = parse_period(date_from_text, date_to_text, max_days=30)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if not webhook_base:
+        return jsonify({"error": "Укажите BITRIX_WEBHOOK_BASE в файле .env перед запуском выгрузки."}), 400
+
+    try:
+        payload, export_filename = build_period_export(date_from, date_to, webhook_base)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Ошибка синхронизации Bitrix: {exc}"}), 500
+
+    response = registry_response_payload({
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+    })
+    response.update({
+        "message": (
+            "Синхронизация завершена: "
+            f"создано в периоде {payload.get('meta', {}).get('created_tasks_total', 0)}, "
+            f"проверено незавершенных {payload.get('meta', {}).get('unfinished_tasks_checked_total', 0)}, "
+            f"удалено из реестра {payload.get('meta', {}).get('deleted_tasks_total', 0)}."
+        ),
+        "export_filename": export_filename,
+        "download_url": url_for("download_export", filename=export_filename),
+    })
+    return jsonify(response)
+
+
+@app.get("/api/registry/export")
+def api_registry_export():
+    default_from, default_to = default_period()
+    date_from_text = request.args.get("date_from", default_from.isoformat()).strip()
+    date_to_text = request.args.get("date_to", default_to.isoformat()).strip()
+    try:
+        date_from, date_to = parse_period(date_from_text, date_to_text, max_days=30)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+
+    _, export_filename = build_registry_export(date_from, date_to)
+    return jsonify({
+        "export_filename": export_filename,
+        "download_url": url_for("download_export", filename=export_filename),
+    })
+
+
+@app.get("/download/<path:filename>")
+def download_export(filename: str):
+    file_path = (EXPORT_DIR / filename).resolve()
+    if file_path.parent != EXPORT_DIR.resolve():
+        abort(404)
+    if not file_path.exists():
+        abort(404)
+    return send_file(file_path, as_attachment=True, download_name=file_path.name, mimetype="application/json")
+
+
+if __name__ == "__main__":
+    debug = os.getenv("FLASK_DEBUG", "").strip() == "1"
+    app.run(host="127.0.0.1", port=5000, debug=debug, use_reloader=False)
