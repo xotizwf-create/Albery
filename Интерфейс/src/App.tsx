@@ -76,13 +76,6 @@ const chatDayWorkflowStatusClass = (status?: { status?: string; workflow_status?
 
 const moscowNow = () => new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Moscow" }));
 const moscowTodayIso = () => moscowNow().toISOString().slice(0, 10);
-const canFinalizeChatDate = (dateValue: string) => {
-  const today = moscowTodayIso();
-  if (dateValue > today) return false;
-  if (dateValue < today) return true;
-  return moscowNow().getHours() >= 19;
-};
-
 const renderInlineMarkdown = (text: string) => {
   const parts = text.split(/(\*\*[^*]+\*\*)/g);
   return parts.map((part, index) => {
@@ -3770,10 +3763,6 @@ export default function App() {
       setChatRegistryMessage("Нельзя формировать результаты за будущую дату.");
       return;
     }
-    if (!canFinalizeChatDate(chatActionDate)) {
-      setChatRegistryMessage("Отчет за текущий день можно сформировать только после 19:00 МСК.");
-      return;
-    }
     setChatRegistryLoading(true);
     setChatRegistryMessage("");
     try {
@@ -4054,10 +4043,6 @@ export default function App() {
   const generateChatOverallReport = async () => {
     if (chatActionDate > moscowTodayIso()) {
       setChatRegistryMessage("Нельзя формировать сводный отчет за будущую дату.");
-      return;
-    }
-    if (!canFinalizeChatDate(chatActionDate)) {
-      setChatRegistryMessage("Сводный отчет за текущий день можно сформировать только после 19:00 МСК.");
       return;
     }
     setChatOverallLoading(true);
@@ -4412,10 +4397,6 @@ export default function App() {
     if (!selectedChat) return;
     if (chatSummaryDate > moscowTodayIso()) {
       setChatDayMessage("Нельзя формировать результат за будущую дату.");
-      return;
-    }
-    if (!canFinalizeChatDate(chatSummaryDate)) {
-      setChatDayMessage("Отчет за текущий день можно сформировать только после 19:00 МСК.");
       return;
     }
     setChatDayLoading(true);

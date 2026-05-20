@@ -186,25 +186,17 @@ def is_future_day(value: date) -> bool:
 
 
 def can_finalize_chat_day(value: date) -> bool:
-    today = msk_today()
-    if value > today:
-        return False
-    if value < today:
-        return True
-    return msk_now().time() >= dt_time(19, 0)
+    return value <= msk_today()
 
 
 def chat_day_finalization_error(value: date) -> str | None:
     if is_future_day(value):
         return "Нельзя формировать результаты за будущую дату."
-    if value == msk_today() and not can_finalize_chat_day(value):
-        return "Отчет за текущий день можно сформировать только после 19:00 МСК."
     return None
 
 
 def latest_visible_report_date() -> date:
-    today = msk_today()
-    return today if can_finalize_chat_day(today) else today - timedelta(days=1)
+    return msk_today()
 
 
 def previous_week_bounds_for_report(value: date) -> tuple[date, date]:
