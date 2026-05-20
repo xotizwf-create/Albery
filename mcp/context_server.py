@@ -2838,7 +2838,7 @@ TOOLS: dict[str, dict[str, Any]] = {
 }
 
 
-READONLY_TOOL_NAMES: set[str] = {
+FAQ_TOOL_NAMES: set[str] = {
     "start_here_always_read_ai_instructions",
     "health",
     "get_context_guide",

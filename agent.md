@@ -77,13 +77,13 @@ MCP endpoint:
 https://mcp.m4s.ru/mcp/<MCP_SHARED_SECRET>
 ```
 
-Read-only MCP endpoint for external assistants with limited rights:
+FAQ MCP endpoint for external assistants with limited rights:
 
 ```text
-https://mcp.m4s.ru/mcp-readonly/<MCP_READONLY_SHARED_SECRET>
+https://mcp.m4s.ru/mcp-faq/<MCP_FAQ_SHARED_SECRET>
 ```
 
-The read-only endpoint exposes only company knowledge/regulations, Zoom calls/transcripts, org structure, AI instructions, source list, context guide, and health check tools. It does not expose Bitrix tasks, chats, report generation, report saving/deleting, OCR processing, compact exports, or instruction editing tools.
+The FAQ endpoint exposes only company knowledge/regulations, Zoom calls/transcripts (including stored Zoom call reports via `get_zoom_call_transcript`), org structure, AI instructions, source list, context guide, and health check tools. It does not expose Bitrix tasks, chats, report generation, report saving/deleting, OCR processing, compact exports, or instruction editing tools.
 
 ## Systemd
 
@@ -315,7 +315,7 @@ AUTO_SYNC_GOOGLE_DRIVE_ZOOM_TRANSCRIPTS=1
 
 MCP_SHARED_SECRET=...
 MCP_ALLOW_UNAUTHENTICATED=0
-MCP_READONLY_SHARED_SECRET=...
+MCP_FAQ_SHARED_SECRET=...
 
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_API_KEY=...
@@ -432,23 +432,25 @@ AUTO_SYNC_CHAT_GENERATE_REPORTS=1
 cd /var/www/albery && ./scripts/update_server.sh
 ```
 
-## Read-only MCP
+## FAQ MCP
 
-Use this URL for the limited MCP server:
+Use this URL for the limited FAQ MCP server:
 
 ```text
-https://mcp.m4s.ru/mcp-readonly/<MCP_READONLY_SHARED_SECRET>
+https://mcp.m4s.ru/mcp-faq/<MCP_FAQ_SHARED_SECRET>
 ```
 
 Set the secret in `/var/www/albery/.env`:
 
 ```env
-MCP_READONLY_SHARED_SECRET=...
+MCP_FAQ_SHARED_SECRET=...
 ```
 
 Allowed tools: `start_here_always_read_ai_instructions`, `health`, `get_context_guide`, `get_ai_instructions`, `list_available_sources`, `get_company_profile`, `list_company_files`, `get_company_file`, `search_company_knowledge`, `get_org_structure`, `list_zoom_calls`, `get_zoom_call_transcript`, `search_zoom_transcripts`.
 
-Unavailable there: Bitrix tasks, chats/messages, OCR processing, report reading/generation/saving/deleting, compact export, Bitrix refresh, and AI instruction editing.
+Scope: org structure, regulations/company knowledge, AI instructions, and Zoom calls (transcripts + stored Zoom call reports exposed via `get_zoom_call_transcript.analytical_note`).
+
+Unavailable there: Bitrix tasks, chats/messages, OCR processing, chat/owner report reading/generation/saving/deleting, compact export, Bitrix refresh, AI instruction editing, and Zoom report saving/deleting.
 
 Что делает `scripts/update_server.sh`:
 
