@@ -2739,86 +2739,15 @@ def ensure_zoom_schema() -> None:
     with pg_connect() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS zoom_calls (
-                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-                        zoom_account_key text NOT NULL,
-                        zoom_user_email text,
-                        zoom_meeting_id bigint,
-                        zoom_uuid text NOT NULL UNIQUE,
-                        topic text,
-                        technical_topic text,
-                        start_time_utc timestamptz NOT NULL,
-                        start_time_msk timestamptz NOT NULL,
-                        end_time_msk timestamptz,
-                        call_date date NOT NULL,
-                        duration_min int,
-                        timezone text,
-                        share_url text,
-                        analytical_note text NOT NULL DEFAULT '',
-                        transcript_text text NOT NULL DEFAULT '',
-                        transcript_format text NOT NULL DEFAULT 'vtt',
-                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-                        synced_at timestamptz NOT NULL DEFAULT now(),
-                        created_at timestamptz NOT NULL DEFAULT now(),
-                        updated_at timestamptz NOT NULL DEFAULT now()
-                    )
-                    """
-                )
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_zoom_calls_tree ON zoom_calls (call_date DESC, start_time_msk DESC)")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_zoom_calls_user ON zoom_calls (zoom_user_email)")
-                cur.execute("ALTER TABLE ai_requests DROP CONSTRAINT IF EXISTS ai_requests_request_type_check")
-                cur.execute(
-                    """
-                    ALTER TABLE ai_requests
-                    ADD CONSTRAINT ai_requests_request_type_check CHECK (request_type IN (
-                        'image_ocr','chat_daily_analysis','chat_weekly_analysis',
-                        'chat_overall_weekly_analysis','chat_overall_daily_report','user_daily_report',
-                        'owner_daily_report','owner_weekly_report',
-                        'weekly_report','monthly_report','quarterly_report',
-                        'yearly_report','memory_update','zoom_processing'
-                    ))
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS zoom_call_participants (
-                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-                        call_id uuid NOT NULL REFERENCES zoom_calls(id) ON DELETE CASCADE,
-                        participant_name text,
-                        participant_email text,
-                        participant_user_id text,
-                        join_time timestamptz,
-                        leave_time timestamptz,
-                        duration_seconds int,
-                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-                        created_at timestamptz NOT NULL DEFAULT now(),
-                        UNIQUE (call_id, participant_email, participant_name, join_time)
-                    )
-                    """
-                )
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_zoom_call_participants_call ON zoom_call_participants(call_id)")
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS zoom_call_transcript_segments (
-                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-                        call_id uuid NOT NULL REFERENCES zoom_calls(id) ON DELETE CASCADE,
-                        segment_index int NOT NULL,
-                        cue_index int NOT NULL,
-                        start_offset text,
-                        end_offset text,
-                        speaker text,
-                        text text NOT NULL,
-                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-                        created_at timestamptz NOT NULL DEFAULT now(),
-                        UNIQUE (call_id, segment_index, cue_index)
-                    )
-                    """
-                )
-                cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_zoom_call_transcript_call ON zoom_call_transcript_segments(call_id, segment_index, cue_index)"
-                )
+                required_tables = ("zoom_calls", "zoom_call_participants", "zoom_call_transcript_segments")
+                for table_name in required_tables:
+                    cur.execute("SELECT to_regclass(%s) IS NOT NULL AS exists", (f"public.{table_name}",))
+                    row = cur.fetchone()
+                    if not row or not row["exists"]:
+                        raise RuntimeError(
+                            f"PostgreSQL table public.{table_name} is missing. "
+                            "Apply database migrations before using Zoom calls."
+                        )
 
 
 def zoom_oauth_url() -> str:
