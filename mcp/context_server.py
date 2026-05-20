@@ -321,7 +321,7 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "answer with specific task titles, owners, statuses, deadlines, and sources; ask clarifying questions when evidence is missing",
             ],
             "daily_chat_report_creation": [
-                "get_ai_prompts(category_key='chat_analysis') and use the active prompt as the strict report contract",
+                "get_report_contract(category_key='chat_analysis') and use the active report contract exactly",
                 "get_ai_instructions() and read report-creation instructions",
                 "list_chats(date_from=report_date,date_to=report_date)",
                 "get_chat_ocr_status(dialog_id,report_date); if OCR is missing for images/PDF, call process_chat_ocr(dialog_id,date_from=report_date,date_to=report_date)",
@@ -329,10 +329,10 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "list_zoom_calls(date_from=report_date,date_to=report_date)",
                 "ensure every relevant or same-day Zoom call has a standalone Zoom report first; if analytical_note is empty, create/save the Zoom report before chat_analysis",
                 "get_chat_daily_report(dialog_id, previous_date)",
-                "save_chat_daily_report(dialog_id, report_date, analysis) after the MCP agent has generated the report itself using the active chat_analysis prompt and source data",
+                "save_chat_daily_report(dialog_id, report_date, analysis) after the MCP agent has generated the report itself using the active chat_analysis report contract and source data",
             ],
             "chat_weekly_report_creation": [
-                "get_ai_prompts(category_key='chat_weekly_report') and use the active prompt as the strict report contract",
+                "get_report_contract(category_key='chat_weekly_report') and use the active report contract exactly",
                 "get_ai_instructions() and read weekly chat report instructions",
                 "get_chat_daily_report(dialog_id, each report date) or generate missing daily reports first",
                 "get_chat_weekly_report(dialog_id, period_start, period_end) to check for an existing current weekly report",
@@ -369,7 +369,7 @@ def tool_start_here_always_read_ai_instructions(_: dict[str, Any]) -> dict[str, 
         "execution_contract": [
             "Treat every non-empty instruction as binding for the current user request.",
             "Do exactly what the relevant instruction says: source order, report format, required checks, save/read workflow, and stopping conditions.",
-            "If a specific report prompt is required by the instructions, call get_ai_prompts for that category before generating the report.",
+            "If a specific report contract is required by the instructions, call get_report_contract for that category before generating the report.",
             "If instructions require missing source checks, OCR, Zoom analysis, previous reports, or Bitrix refresh, complete those checks before conclusions.",
             "If the request conflicts with these instructions, explain the conflict and ask the user to update Настройки -> Инструкции для ИИ or confirm a one-off exception.",
             "If the user request is vague, ambiguous, or missing the needed scope, ask one concise clarifying question first. Do not infer dates, chats, people, report type, or whether to save/write unless the user said it clearly.",
@@ -377,7 +377,7 @@ def tool_start_here_always_read_ai_instructions(_: dict[str, Any]) -> dict[str, 
         ],
         "next_tool_guidance": [
             "Use get_context_guide for route selection and source rules.",
-            "Use get_ai_prompts when generating configured reports.",
+            "Use get_report_contract when generating configured reports.",
             "Use list_available_sources when freshness, availability, or row counts matter.",
         ],
     }
@@ -389,53 +389,50 @@ def tool_get_ai_instructions(_: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def tool_get_ai_prompts(args: dict[str, Any]) -> dict[str, Any]:
+def tool_get_report_contract(args: dict[str, Any]) -> dict[str, Any]:
     category_key = str(args.get("category_key") or "").strip()
-    include_inactive = bool(args.get("include_inactive", False))
-    limit = parse_limit(args, 50)
-    offset = parse_offset(args)
-
-    filters = ["c.is_active = TRUE"]
-    params: list[Any] = []
-    if category_key:
-        filters.append("c.category_key = %s")
-        params.append(category_key)
-    if not include_inactive:
-        filters.append("p.is_active = TRUE")
-    where_sql = "WHERE " + " AND ".join(filters)
-    params.extend([limit, offset])
+    if not category_key:
+        raise McpError(-32602, "Missing required argument: category_key")
 
     with connect() as conn:
         with conn.cursor() as cur:
             if not safe_table_exists(cur, "ai_prompt_categories") or not safe_table_exists(cur, "ai_prompts"):
-                return {"items": [], "limit": limit, "offset": offset, "message": "AI prompt tables do not exist yet."}
+                return {
+                    "category_key": category_key,
+                    "contract": None,
+                    "message": "Report contract tables do not exist yet.",
+                }
             cur.execute(
-                f"""
+                """
                 SELECT
                     c.category_key,
                     c.title AS category_title,
                     c.description AS category_description,
-                    p.id AS prompt_id,
-                    p.prompt_key,
-                    p.title AS prompt_title,
-                    p.prompt_text,
+                    p.id AS contract_id,
+                    p.prompt_key AS contract_key,
+                    p.title AS contract_title,
+                    p.prompt_text AS contract_text,
                     p.version,
-                    p.is_active,
                     p.created_at
                 FROM ai_prompt_categories c
                 JOIN ai_prompts p ON p.category_id = c.id
-                {where_sql}
-                ORDER BY c.sort_order, c.category_key, p.is_active DESC, p.version DESC, p.created_at DESC
-                LIMIT %s OFFSET %s
+                WHERE c.is_active = TRUE
+                  AND p.is_active = TRUE
+                  AND c.category_key = %s
+                ORDER BY p.version DESC, p.created_at DESC
+                LIMIT 1
                 """,
-                params,
+                (category_key,),
             )
-            rows = cur.fetchall()
+            row = cur.fetchone()
+
     return {
-        "items": rows,
-        "limit": limit,
-        "offset": offset,
-        "note": "Use the active prompt for the exact action. For daily chat reports use category_key='chat_analysis'.",
+        "category_key": category_key,
+        "contract": row,
+        "note": (
+            "Use contract_text as the exact report-generation contract. "
+            "For daily chat reports request category_key='chat_analysis'."
+        ),
     }
 
 
@@ -1915,7 +1912,7 @@ def tool_save_chat_daily_report(args: dict[str, Any]) -> dict[str, Any]:
     if status == "done" and not analysis:
         raise McpError(
             -32602,
-            "analysis is required for done daily reports. Call get_ai_prompts(category_key='chat_analysis') "
+            "analysis is required for done daily reports. Call get_report_contract(category_key='chat_analysis') "
             "and save the full structured JSON, including previous_day_tasks, commitments, next_steps, risks, etc.",
         )
     model = str(args.get("model") or "mcp-manual").strip()
@@ -2331,19 +2328,17 @@ TOOLS: dict[str, dict[str, Any]] = {
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "handler": tool_get_ai_instructions,
     },
-    "get_ai_prompts": {
-        "description": "Read active prompts from AI prompt settings. Use before generating a report so the model follows the configured prompt for the requested action.",
+    "get_report_contract": {
+        "description": "Read the active report-generation contract for a configured report category. Use this before creating daily, weekly, owner, or Zoom reports.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "category_key": {"type": "string", "description": "For daily chat reports use chat_analysis."},
-                "include_inactive": {"type": "boolean"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
-                "offset": {"type": "integer", "minimum": 0},
             },
+            "required": ["category_key"],
             "additionalProperties": False,
         },
-        "handler": tool_get_ai_prompts,
+        "handler": tool_get_report_contract,
     },
     "list_available_sources": {
         "description": "Show which known context tables exist and how many rows each has.",
@@ -2621,7 +2616,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_get_owner_reports,
     },
     "save_chat_daily_report": {
-        "description": "Save a generated daily report for one chat/date directly to PostgreSQL. Use after the MCP agent has analyzed chat OCR text, same-day Zoom reports, and previous-day report using the active chat_analysis prompt.",
+        "description": "Save a generated daily report for one chat/date directly to PostgreSQL. Use after the MCP agent has analyzed chat OCR text, same-day Zoom reports, and previous-day report using the active chat_analysis report contract.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2715,7 +2710,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_get_chat_weekly_report,
     },
     "save_chat_weekly_report": {
-        "description": "Save a generated weekly report for one chat directly to PostgreSQL. Use after the MCP agent has verified/generates missing daily reports, then analyzed the week using chat_weekly_report prompt.",
+        "description": "Save a generated weekly report for one chat directly to PostgreSQL. Use after the MCP agent has verified/generates missing daily reports, then analyzed the week using the chat_weekly_report report contract.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2724,7 +2719,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "period_end": {"type": "string", "description": "YYYY-MM-DD"},
                 "summary": {"type": "string"},
                 "report_text": {"type": "string"},
-                "analysis": {"type": "object", "description": "Structured weekly report JSON from chat_weekly_report prompt."},
+                "analysis": {"type": "object", "description": "Structured weekly report JSON from the chat_weekly_report report contract."},
                 "model": {"type": "string"},
                 "raw_input": {"type": "object"},
             },

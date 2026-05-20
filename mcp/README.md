@@ -7,7 +7,7 @@ Read-only MCP server for Claude Code / Claude Desktop. It exposes the local Post
 - `start_here_always_read_ai_instructions` - mandatory first tool for any company analysis/report/recommendation/answer; reads live rules from "Настройки -> Инструкции для ИИ" and returns the execution contract.
 - `health` - PostgreSQL connectivity check.
 - `get_context_guide` - navigation rules for using the database systematically after `start_here_always_read_ai_instructions`.
-- `get_ai_prompts` - read active prompts from AI prompt settings; for daily chat reports use `category_key=chat_analysis`.
+- `get_report_contract` - read the active report-generation contract; for daily chat reports use `category_key=chat_analysis`.
 - `list_available_sources` - table availability and row counts.
 - `list_periods` - recent dates with chat messages/reports.
 - `get_company_profile` - editable company profile text from PostgreSQL.
@@ -47,8 +47,8 @@ For new analysis requests, call `get_context_guide` after `start_here_always_rea
 - chat evidence: `list_chats`, then `get_chat_transcript`;
 - meeting evidence: `list_zoom_calls`, then `get_zoom_call_transcript` or `search_zoom_transcripts`.
 - recommendations and management answers: read `get_owner_reports(report_kind=daily)`, `get_owner_reports(report_kind=weekly)`, relevant chat reports, company knowledge, and concrete Bitrix tasks before answering.
-- daily chat report creation: `get_ai_instructions`, active `get_ai_prompts(category_key=chat_analysis)`, `get_chat_ocr_status`, `process_chat_ocr` if OCR is missing, `get_chat_transcript` with `include_ocr=true`, `list_zoom_calls`, `search_zoom_transcripts` with keywords from chat/OCR/tasks/risks, `get_zoom_call_transcript` for matches and for the only same-day call, previous `get_chat_daily_report`, then `save_chat_daily_report`.
-- weekly chat report creation: `get_ai_prompts(category_key=chat_weekly_report)`, verify/generate required daily reports, check existing report with `get_chat_weekly_report`, then save to `chat_weekly_reports` with `save_chat_weekly_report`.
+- daily chat report creation: `get_ai_instructions`, active `get_report_contract(category_key=chat_analysis)`, `get_chat_ocr_status`, `process_chat_ocr` if OCR is missing, `get_chat_transcript` with `include_ocr=true`, `list_zoom_calls`, `search_zoom_transcripts` with keywords from chat/OCR/tasks/risks, `get_zoom_call_transcript` for matches and for the only same-day call, previous `get_chat_daily_report`, then `save_chat_daily_report`.
+- weekly chat report creation: `get_report_contract(category_key=chat_weekly_report)`, verify/generate required daily reports, check existing report with `get_chat_weekly_report`, then save to `chat_weekly_reports` with `save_chat_weekly_report`.
 
 Zoom relevance for daily chat reports must be determined from transcript content, participants, and keywords from the chat/OCR context. Do not declare Zoom irrelevant after searching only the chat title, company name, or call topic.
 
