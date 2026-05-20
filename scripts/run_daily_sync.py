@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 LOG_DIR = Path(os.getenv("ALBERY_LOG_DIR", "/var/log/albery"))
 LOG_PATH = Path(os.getenv("ALBERY_DAILY_SYNC_LOG", str(LOG_DIR / "daily-sync.log")))
 
