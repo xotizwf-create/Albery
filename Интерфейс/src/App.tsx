@@ -29,6 +29,7 @@ import {
   CheckCircle2,
   CircleDashed,
   FileText,
+  FileSpreadsheet,
   FileCheck,
   AlertOctagon,
   PackageX,
@@ -539,6 +540,28 @@ type CompanyFolder = {
     }>;
   };
 };
+
+const SHEET_MIME_TYPES = new Set([
+  "application/vnd.google-apps.spreadsheet",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-excel",
+]);
+
+// Pick the tile icon by item type so folders, Google Sheets and Google Docs /
+// Word files are visually distinct instead of all looking like folders.
+function renderCompanyFolderIcon(folder: CompanyFolder) {
+  const driveSource = folder.drive_source;
+  if (!driveSource) {
+    return (
+      <Folder className="w-8 h-8 text-blue-500 group-hover:text-blue-600 mb-3" strokeWidth={2.2} />
+    );
+  }
+  if (SHEET_MIME_TYPES.has(driveSource.mime_type || "")) {
+    return <FileSpreadsheet className="w-8 h-8 text-emerald-600 mb-3" strokeWidth={2.2} />;
+  }
+  // Google Docs, .doc and .docx (and any other synced document).
+  return <FileText className="w-8 h-8 text-blue-600 mb-3" strokeWidth={2.2} />;
+}
 
 type AiInstructionFolder = {
   id: string;
@@ -3203,7 +3226,7 @@ export default function App() {
                         }}
                         className="flex-1 text-left"
                       >
-                        <Folder className="w-8 h-8 text-blue-500 group-hover:text-blue-600 mb-3" strokeWidth={2.2} />
+                        {renderCompanyFolderIcon(folder)}
                         <div>
                           {renamingCompanyFolderId === folder.id ? (
                             <input
