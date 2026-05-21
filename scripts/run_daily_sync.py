@@ -143,6 +143,7 @@ def main() -> int:
         log_event({"level": "error", "step": "bitrix", "status": "skipped", "error": "BITRIX_WEBHOOK_BASE is not set"})
 
     steps.extend([
+        ("zoom_recording_events", lambda: app.process_zoom_recording_event_queue(limit=100)),
         ("zoom_api_calls", lambda: app.sync_zoom_calls(zoom_from, zoom_to)),
         ("google_drive_company_instructions", app.sync_google_drive_company_documents),
     ])

@@ -3502,7 +3502,444 @@ def zoom_list_participants(session: requests.Session, meeting_uuid: str) -> tupl
         return participants, str(exc)
 
 
-def sync_zoom_calls(date_from: date, date_to: date, account_key: str = "ZOOM_ACC2") -> dict[str, Any]:
+def zoom_get_recording(session: requests.Session, meeting_uuid: str) -> dict[str, Any]:
+    response = session.get(
+        f"{zoom_api_base_url()}/meetings/{zoom_encoded_uuid(meeting_uuid)}/recordings",
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(f"Zoom recording error {response.status_code}: {response.text[:500]}")
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Zoom recording response has unexpected format")
+    return payload
+
+
+def zoom_transcript_files(meeting: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        file_item
+        for file_item in (meeting.get("recording_files") or [])
+        if file_item.get("file_type") == "TRANSCRIPT"
+        or file_item.get("recording_type") == "audio_transcript"
+    ]
+
+
+def zoom_transcript_file_key(file_item: dict[str, Any]) -> str:
+    return str(
+        first_non_empty(
+            file_item.get("id"),
+            file_item.get("recording_id"),
+            file_item.get("recording_start"),
+            file_item.get("download_url"),
+        )
+        or ""
+    ).strip()
+
+
+def stored_zoom_transcript_file_keys(raw_json: Any) -> set[str]:
+    if not isinstance(raw_json, dict):
+        return set()
+    keys: set[str] = set()
+    for item in raw_json.get("transcripts") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("file_id") or "").strip()
+        if not key and isinstance(item.get("file"), dict):
+            key = zoom_transcript_file_key(item["file"])
+        if key:
+            keys.add(key)
+    return keys
+
+
+def load_existing_zoom_call_state(cur: Any, zoom_uuid: str) -> dict[str, Any] | None:
+    cur.execute(
+        """
+        SELECT id, transcript_text, raw_json
+        FROM zoom_calls
+        WHERE zoom_uuid = %s
+        """,
+        (zoom_uuid,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def zoom_meeting_needs_transcript_sync(
+    transcript_files: list[dict[str, Any]],
+    existing: dict[str, Any] | None,
+    force: bool = False,
+) -> bool:
+    if force or existing is None:
+        return True
+    current_keys = {zoom_transcript_file_key(item) for item in transcript_files}
+    current_keys.discard("")
+    stored_keys = stored_zoom_transcript_file_keys(existing.get("raw_json"))
+    transcript_text = str(existing.get("transcript_text") or "").strip()
+    if current_keys and not transcript_text:
+        return True
+    return current_keys != stored_keys
+
+
+def upsert_zoom_recording_meeting(
+    cur: Any,
+    session: requests.Session,
+    account_key: str,
+    user: dict[str, Any],
+    meeting: dict[str, Any],
+    force: bool = False,
+) -> dict[str, Any]:
+    meeting_uuid = str(meeting.get("uuid") or "")
+    if not meeting_uuid:
+        return {"status": "skipped", "reason": "missing_uuid"}
+    tz_name = str(meeting.get("timezone") or "Europe/Moscow")
+    start_utc = parse_zoom_datetime(meeting.get("start_time"), "UTC")
+    if not start_utc:
+        return {"status": "skipped", "uuid": meeting_uuid, "reason": "missing_start_time"}
+    start_msk = start_utc.astimezone(MSK_TZ)
+    duration_min = to_int(meeting.get("duration")) or 0
+    end_msk = start_msk + timedelta(minutes=duration_min) if duration_min else None
+    transcript_files = zoom_transcript_files(meeting)
+    existing = load_existing_zoom_call_state(cur, meeting_uuid)
+    needs_transcript_sync = zoom_meeting_needs_transcript_sync(transcript_files, existing, force=force)
+    if existing is not None and not needs_transcript_sync:
+        return {
+            "status": "skipped_unchanged",
+            "uuid": meeting_uuid,
+            "transcript_files": len(transcript_files),
+        }
+
+    all_cues: list[dict[str, Any]] = []
+    transcript_payload: list[dict[str, Any]] = []
+    synced_transcript_files = 0
+    for segment_index, file_item in enumerate(
+        sorted(transcript_files, key=lambda item: item.get("recording_start") or ""),
+        start=1,
+    ):
+        download_url = file_item.get("download_url")
+        if not download_url:
+            continue
+        response = session.get(download_url, timeout=60)
+        if not response.ok:
+            transcript_payload.append(
+                {
+                    "file": file_item,
+                    "error": f"HTTP {response.status_code}: {response.text[:200]}",
+                }
+            )
+            continue
+        cues = parse_zoom_vtt(response.text)
+        for cue in cues:
+            cue["segment_index"] = segment_index
+        all_cues.extend(cues)
+        transcript_payload.append(
+            {
+                "file_id": file_item.get("id"),
+                "file_type": file_item.get("file_type"),
+                "recording_type": file_item.get("recording_type"),
+                "recording_start": file_item.get("recording_start"),
+                "recording_end": file_item.get("recording_end"),
+                "cue_count": len(cues),
+            }
+        )
+        synced_transcript_files += 1
+
+    participants, participant_error = zoom_list_participants(session, meeting_uuid)
+    if not participants:
+        participants = [
+            {
+                "name": user.get("display_name") or user.get("first_name") or user.get("email"),
+                "user_email": user.get("email"),
+                "user_id": user.get("id"),
+                "role": "host_fallback",
+            }
+        ]
+
+    raw_json = dict(meeting)
+    raw_json["zoom_user"] = user
+    raw_json["transcripts"] = transcript_payload
+    if participant_error:
+        raw_json["participants_error"] = participant_error
+
+    cur.execute(
+        """
+        INSERT INTO zoom_calls (
+            zoom_account_key, zoom_user_email, zoom_meeting_id, zoom_uuid,
+            topic, technical_topic, start_time_utc, start_time_msk,
+            end_time_msk, call_date, duration_min, timezone, share_url,
+            transcript_text, transcript_format, raw_json, synced_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'vtt', %s, now(), now())
+        ON CONFLICT (zoom_uuid) DO UPDATE SET
+            zoom_account_key = EXCLUDED.zoom_account_key,
+            zoom_user_email = EXCLUDED.zoom_user_email,
+            zoom_meeting_id = EXCLUDED.zoom_meeting_id,
+            topic = EXCLUDED.topic,
+            technical_topic = EXCLUDED.technical_topic,
+            start_time_utc = EXCLUDED.start_time_utc,
+            start_time_msk = EXCLUDED.start_time_msk,
+            end_time_msk = EXCLUDED.end_time_msk,
+            call_date = EXCLUDED.call_date,
+            duration_min = EXCLUDED.duration_min,
+            timezone = EXCLUDED.timezone,
+            share_url = EXCLUDED.share_url,
+            transcript_text = EXCLUDED.transcript_text,
+            transcript_format = EXCLUDED.transcript_format,
+            raw_json = EXCLUDED.raw_json,
+            synced_at = now(),
+            updated_at = now()
+        RETURNING id
+        """,
+        (
+            account_key,
+            user.get("email") or meeting.get("host_email"),
+            to_int(meeting.get("id")),
+            meeting_uuid,
+            meeting.get("topic"),
+            meeting.get("topic"),
+            start_utc,
+            start_msk,
+            end_msk,
+            start_msk.date(),
+            duration_min,
+            tz_name,
+            meeting.get("share_url"),
+            zoom_plain_transcript(all_cues),
+            pg_json(raw_json),
+        ),
+    )
+    call_id = cur.fetchone()["id"]
+    cur.execute("DELETE FROM zoom_call_participants WHERE call_id = %s", (call_id,))
+    cur.execute("DELETE FROM zoom_call_transcript_segments WHERE call_id = %s", (call_id,))
+    for participant in participants:
+        cur.execute(
+            """
+            INSERT INTO zoom_call_participants (
+                call_id, participant_name, participant_email, participant_user_id,
+                join_time, leave_time, duration_seconds, raw_json
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                call_id,
+                participant.get("name"),
+                participant.get("user_email") or participant.get("email"),
+                str(participant.get("user_id") or participant.get("id") or ""),
+                parse_zoom_datetime(participant.get("join_time"), tz_name),
+                parse_zoom_datetime(participant.get("leave_time"), tz_name),
+                to_int(participant.get("duration")),
+                pg_json(participant),
+            ),
+        )
+    for cue_index, cue in enumerate(all_cues, start=1):
+        cur.execute(
+            """
+            INSERT INTO zoom_call_transcript_segments (
+                call_id, segment_index, cue_index, start_offset, end_offset, speaker, text, raw_json
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (call_id, segment_index, cue_index) DO UPDATE SET
+                start_offset = EXCLUDED.start_offset,
+                end_offset = EXCLUDED.end_offset,
+                speaker = EXCLUDED.speaker,
+                text = EXCLUDED.text,
+                raw_json = EXCLUDED.raw_json
+            """,
+            (
+                call_id,
+                int(cue.get("segment_index") or 1),
+                cue_index,
+                cue.get("start"),
+                cue.get("end"),
+                cue.get("speaker"),
+                cue.get("text") or "",
+                pg_json(cue),
+            ),
+        )
+    return {
+        "status": "synced",
+        "uuid": meeting_uuid,
+        "transcript_files_synced": synced_transcript_files,
+        "segments_synced": len(all_cues),
+        "participant_error": participant_error,
+    }
+
+
+def sync_zoom_recording_by_uuid(meeting_uuid: str, account_key: str = "ZOOM_ACC2", force: bool = False) -> dict[str, Any]:
+    ensure_zoom_schema()
+    session = zoom_session(account_key)
+    meeting = zoom_get_recording(session, meeting_uuid)
+    user = {
+        "email": meeting.get("host_email"),
+        "id": meeting.get("host_id"),
+        "display_name": meeting.get("host_email"),
+    }
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                result = upsert_zoom_recording_meeting(cur, session, account_key, user, meeting, force=force)
+    return result
+
+
+def ensure_zoom_event_queue_schema() -> None:
+    if not postgres_enabled():
+        return
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            if pg_table_exists(cur, "public.zoom_recording_events"):
+                return
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS zoom_recording_events (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        event_name text NOT NULL,
+                        zoom_uuid text NOT NULL,
+                        status text NOT NULL DEFAULT 'queued'
+                            CHECK (status IN ('queued','processing','done','error','ignored')),
+                        attempts int NOT NULL DEFAULT 0,
+                        payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        error_text text NULL,
+                        received_at timestamptz NOT NULL DEFAULT now(),
+                        processed_at timestamptz NULL,
+                        updated_at timestamptz NOT NULL DEFAULT now()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_zoom_recording_events_status_received
+                        ON zoom_recording_events(status, received_at);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_zoom_recording_events_uuid_received
+                        ON zoom_recording_events(zoom_uuid, received_at DESC);
+                    """
+                )
+
+
+def zoom_event_secret_valid(secret: str) -> bool:
+    expected = os.getenv("ZOOM_EVENT_SECRET", "").strip()
+    if not expected:
+        return False
+    return hmac.compare_digest(secret, expected)
+
+
+def zoom_webhook_secret_token() -> str:
+    return os.getenv("ZOOM_WEBHOOK_SECRET_TOKEN", "").strip()
+
+
+def zoom_webhook_validation_response(payload: dict[str, Any]) -> dict[str, str] | None:
+    plain_token = pick(payload, "payload.plainToken", "plainToken")
+    secret_token = zoom_webhook_secret_token()
+    if not plain_token or not secret_token:
+        return None
+    encrypted = hmac.new(
+        secret_token.encode("utf-8"),
+        str(plain_token).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return {"plainToken": str(plain_token), "encryptedToken": encrypted}
+
+
+def extract_zoom_event_uuid(payload: dict[str, Any]) -> str:
+    value = first_non_empty(
+        pick(payload, "payload.object.uuid", "payload.object.UUID"),
+        pick(payload, "object.uuid", "object.UUID"),
+        pick(payload, "uuid", "UUID"),
+        pick(payload, "payload.object.id", "object.id", "id"),
+    )
+    return str(value or "").strip()
+
+
+def enqueue_zoom_recording_event(event_name: str, zoom_uuid: str, payload: dict[str, Any]) -> str:
+    ensure_zoom_event_queue_schema()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO zoom_recording_events (event_name, zoom_uuid, payload)
+                    VALUES (%s, %s, %s)
+                    RETURNING id
+                    """,
+                    (event_name, zoom_uuid, pg_json(payload)),
+                )
+                return str(cur.fetchone()["id"])
+
+
+def process_zoom_recording_event_queue(limit: int = 20) -> dict[str, Any]:
+    ensure_zoom_event_queue_schema()
+    limit = max(1, min(int(limit or 20), 100))
+    processed: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, event_name, zoom_uuid
+                FROM zoom_recording_events
+                WHERE status IN ('queued','error') AND attempts < 5
+                ORDER BY received_at ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+
+    for row in rows:
+        event_id = row["id"]
+        event_name = row["event_name"]
+        zoom_uuid = row["zoom_uuid"]
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE zoom_recording_events
+                        SET status = 'processing', attempts = attempts + 1, updated_at = now()
+                        WHERE id = %s AND status IN ('queued','error')
+                        """,
+                        (event_id,),
+                    )
+                    if cur.rowcount != 1:
+                        continue
+        try:
+            result = sync_zoom_recording_by_uuid(zoom_uuid, force=False)
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE zoom_recording_events
+                            SET status = 'done', error_text = NULL, processed_at = now(), updated_at = now()
+                            WHERE id = %s
+                            """,
+                            (event_id,),
+                        )
+            processed.append({"event_id": str(event_id), "event": event_name, **result})
+        except Exception as exc:  # noqa: BLE001
+            error_text = str(exc)
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE zoom_recording_events
+                            SET status = 'error', error_text = %s, updated_at = now()
+                            WHERE id = %s
+                            """,
+                            (error_text, event_id),
+                        )
+            errors.append({"event_id": str(event_id), "event": event_name, "zoom_uuid": zoom_uuid, "error": error_text})
+    return {"processed": processed, "errors": errors, "processed_count": len(processed), "error_count": len(errors)}
+
+
+def sync_zoom_calls(date_from: date, date_to: date, account_key: str = "ZOOM_ACC2", force: bool = False) -> dict[str, Any]:
     ensure_zoom_schema()
     session = zoom_session(account_key)
     users = zoom_list_users(session)
@@ -3515,6 +3952,8 @@ def sync_zoom_calls(date_from: date, date_to: date, account_key: str = "ZOOM_ACC
 
     synced_calls = 0
     synced_transcript_files = 0
+    skipped_unchanged = 0
+    skipped_missing = 0
     participant_errors: list[dict[str, Any]] = []
     seen_uuids: set[str] = set()
     with pg_connect() as conn:
@@ -3530,173 +3969,22 @@ def sync_zoom_calls(date_from: date, date_to: date, account_key: str = "ZOOM_ACC
                             if not meeting_uuid or meeting_uuid in seen_uuids:
                                 continue
                             seen_uuids.add(meeting_uuid)
-                            tz_name = str(meeting.get("timezone") or "Europe/Moscow")
-                            start_utc = parse_zoom_datetime(meeting.get("start_time"), "UTC")
-                            if not start_utc:
-                                continue
-                            start_msk = start_utc.astimezone(MSK_TZ)
-                            duration_min = to_int(meeting.get("duration")) or 0
-                            end_msk = start_msk + timedelta(minutes=duration_min) if duration_min else None
-                            transcript_files = [
-                                file_item
-                                for file_item in (meeting.get("recording_files") or [])
-                                if file_item.get("file_type") == "TRANSCRIPT"
-                                or file_item.get("recording_type") == "audio_transcript"
-                            ]
-                            all_cues: list[dict[str, Any]] = []
-                            transcript_payload: list[dict[str, Any]] = []
-                            for segment_index, file_item in enumerate(
-                                sorted(transcript_files, key=lambda item: item.get("recording_start") or ""),
-                                start=1,
-                            ):
-                                download_url = file_item.get("download_url")
-                                if not download_url:
-                                    continue
-                                response = session.get(download_url, timeout=60)
-                                if not response.ok:
-                                    transcript_payload.append(
-                                        {
-                                            "file": file_item,
-                                            "error": f"HTTP {response.status_code}: {response.text[:200]}",
-                                        }
-                                    )
-                                    continue
-                                cues = parse_zoom_vtt(response.text)
-                                for cue in cues:
-                                    cue["segment_index"] = segment_index
-                                all_cues.extend(cues)
-                                transcript_payload.append(
-                                    {
-                                        "file_id": file_item.get("id"),
-                                        "file_type": file_item.get("file_type"),
-                                        "recording_type": file_item.get("recording_type"),
-                                        "recording_start": file_item.get("recording_start"),
-                                        "recording_end": file_item.get("recording_end"),
-                                        "cue_count": len(cues),
-                                    }
-                                )
-                                synced_transcript_files += 1
-
-                            participants, participant_error = zoom_list_participants(session, meeting_uuid)
-                            if participant_error:
-                                participant_errors.append({"uuid": meeting_uuid, "error": participant_error})
-                            if not participants:
-                                participants = [
-                                    {
-                                        "name": user.get("display_name") or user.get("first_name") or user.get("email"),
-                                        "user_email": user.get("email"),
-                                        "user_id": user.get("id"),
-                                        "role": "host_fallback",
-                                    }
-                                ]
-
-                            raw_json = dict(meeting)
-                            raw_json["zoom_user"] = user
-                            raw_json["transcripts"] = transcript_payload
-                            if participant_error:
-                                raw_json["participants_error"] = participant_error
-
-                            cur.execute(
-                                """
-                                INSERT INTO zoom_calls (
-                                    zoom_account_key, zoom_user_email, zoom_meeting_id, zoom_uuid,
-                                    topic, technical_topic, start_time_utc, start_time_msk,
-                                    end_time_msk, call_date, duration_min, timezone, share_url,
-                                    transcript_text, transcript_format, raw_json, synced_at, updated_at
-                                )
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'vtt', %s, now(), now())
-                                ON CONFLICT (zoom_uuid) DO UPDATE SET
-                                    zoom_account_key = EXCLUDED.zoom_account_key,
-                                    zoom_user_email = EXCLUDED.zoom_user_email,
-                                    zoom_meeting_id = EXCLUDED.zoom_meeting_id,
-                                    topic = EXCLUDED.topic,
-                                    technical_topic = EXCLUDED.technical_topic,
-                                    start_time_utc = EXCLUDED.start_time_utc,
-                                    start_time_msk = EXCLUDED.start_time_msk,
-                                    end_time_msk = EXCLUDED.end_time_msk,
-                                    call_date = EXCLUDED.call_date,
-                                    duration_min = EXCLUDED.duration_min,
-                                    timezone = EXCLUDED.timezone,
-                                    share_url = EXCLUDED.share_url,
-                                    transcript_text = EXCLUDED.transcript_text,
-                                    transcript_format = EXCLUDED.transcript_format,
-                                    raw_json = EXCLUDED.raw_json,
-                                    synced_at = now(),
-                                    updated_at = now()
-                                RETURNING id
-                                """,
-                                (
-                                    account_key,
-                                    user.get("email"),
-                                    to_int(meeting.get("id")),
-                                    meeting_uuid,
-                                    meeting.get("topic"),
-                                    meeting.get("topic"),
-                                    start_utc,
-                                    start_msk,
-                                    end_msk,
-                                    start_msk.date(),
-                                    duration_min,
-                                    tz_name,
-                                    meeting.get("share_url"),
-                                    zoom_plain_transcript(all_cues),
-                                    pg_json(raw_json),
-                                ),
-                            )
-                            call_id = cur.fetchone()["id"]
-                            cur.execute("DELETE FROM zoom_call_participants WHERE call_id = %s", (call_id,))
-                            cur.execute("DELETE FROM zoom_call_transcript_segments WHERE call_id = %s", (call_id,))
-                            for participant in participants:
-                                cur.execute(
-                                    """
-                                    INSERT INTO zoom_call_participants (
-                                        call_id, participant_name, participant_email, participant_user_id,
-                                        join_time, leave_time, duration_seconds, raw_json
-                                    )
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                                    ON CONFLICT DO NOTHING
-                                    """,
-                                    (
-                                        call_id,
-                                        participant.get("name"),
-                                        participant.get("user_email") or participant.get("email"),
-                                        str(participant.get("user_id") or participant.get("id") or ""),
-                                        parse_zoom_datetime(participant.get("join_time"), tz_name),
-                                        parse_zoom_datetime(participant.get("leave_time"), tz_name),
-                                        to_int(participant.get("duration")),
-                                        pg_json(participant),
-                                    ),
-                                )
-                            for cue_index, cue in enumerate(all_cues, start=1):
-                                cur.execute(
-                                    """
-                                    INSERT INTO zoom_call_transcript_segments (
-                                        call_id, segment_index, cue_index, start_offset, end_offset, speaker, text, raw_json
-                                    )
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                                    ON CONFLICT (call_id, segment_index, cue_index) DO UPDATE SET
-                                        start_offset = EXCLUDED.start_offset,
-                                        end_offset = EXCLUDED.end_offset,
-                                        speaker = EXCLUDED.speaker,
-                                        text = EXCLUDED.text,
-                                        raw_json = EXCLUDED.raw_json
-                                    """,
-                                    (
-                                        call_id,
-                                        int(cue.get("segment_index") or 1),
-                                        cue_index,
-                                        cue.get("start"),
-                                        cue.get("end"),
-                                        cue.get("speaker"),
-                                        cue.get("text") or "",
-                                        pg_json(cue),
-                                    ),
-                                )
-                            synced_calls += 1
+                            result = upsert_zoom_recording_meeting(cur, session, account_key, user, meeting, force=force)
+                            if result["status"] == "synced":
+                                synced_calls += 1
+                                synced_transcript_files += int(result.get("transcript_files_synced") or 0)
+                                if result.get("participant_error"):
+                                    participant_errors.append({"uuid": meeting_uuid, "error": result["participant_error"]})
+                            elif result["status"] == "skipped_unchanged":
+                                skipped_unchanged += 1
+                            else:
+                                skipped_missing += 1
     return {
         "users_count": len(users),
         "calls_synced": synced_calls,
         "transcript_files_synced": synced_transcript_files,
+        "skipped_unchanged": skipped_unchanged,
+        "skipped_missing": skipped_missing,
         "participant_errors": participant_errors,
     }
 
@@ -18603,6 +18891,7 @@ AUTH_EXEMPT_PREFIXES = (
     "/sse",
     "/sse-faq",
     "/bitrix/events/",
+    "/zoom/events/",
 )
 
 
@@ -18653,7 +18942,7 @@ def canonical_web_redirect():
     current_host = request.host.split(":", 1)[0].lower()
     if current_host in {canonical_host, mcp_host}:
         return None
-    if request.path.startswith(("/mcp", "/mcp-faq", "/sse", "/sse-faq", "/bitrix/events/")) and mcp_host:
+    if request.path.startswith(("/mcp", "/mcp-faq", "/sse", "/sse-faq", "/bitrix/events/", "/zoom/events/")) and mcp_host:
         target_host = mcp_host
     else:
         target_host = canonical_host
@@ -19235,13 +19524,63 @@ def api_process_bitrix_task_events():
     return jsonify(process_bitrix_task_event_queue(limit=limit))
 
 
+@app.route("/zoom/events/<secret>", methods=["GET", "POST"])
+def zoom_recording_event_webhook(secret: str):
+    if not zoom_event_secret_valid(secret):
+        return jsonify({"error": "forbidden"}), 403
+    if request.method == "GET":
+        return jsonify({"ok": True, "message": "Zoom recording event endpoint is ready."})
+
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": True, "ignored": True, "reason": "invalid_payload"}), 200
+
+    event_name = str(payload.get("event") or "").strip()
+    if event_name == "endpoint.url_validation":
+        validation = zoom_webhook_validation_response(payload)
+        if not validation:
+            return jsonify({"error": "ZOOM_WEBHOOK_SECRET_TOKEN or plainToken is missing."}), 400
+        return jsonify(validation)
+
+    if event_name not in {"recording.transcript_completed", "recording.completed"}:
+        return jsonify({"ok": True, "event": event_name, "ignored": True, "reason": "unsupported_event"})
+
+    zoom_uuid = extract_zoom_event_uuid(payload)
+    if not zoom_uuid:
+        return jsonify({"ok": True, "event": event_name, "ignored": True, "reason": "zoom_uuid_not_found"}), 200
+
+    event_id = enqueue_zoom_recording_event(event_name, zoom_uuid, payload)
+    inline = str(os.getenv("ZOOM_EVENT_PROCESS_INLINE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    process_result = process_zoom_recording_event_queue(limit=5) if inline else None
+    return jsonify({
+        "ok": True,
+        "event_id": event_id,
+        "event": event_name,
+        "zoom_uuid": zoom_uuid,
+        "queued": True,
+        "processed_inline": inline,
+        "process_result": process_result,
+    })
+
+
+@app.post("/api/zoom-events/process")
+def api_process_zoom_recording_events():
+    secret = str(first_non_empty(request.args.get("secret"), request.headers.get("X-Zoom-Event-Secret")) or "")
+    if not zoom_event_secret_valid(secret):
+        return jsonify({"error": "forbidden"}), 403
+    payload = request.get_json(silent=True) or request.form
+    limit = to_int(payload.get("limit")) or 20
+    return jsonify(process_zoom_recording_event_queue(limit=limit))
+
+
 @app.post("/api/zoom-calls/sync")
 def api_zoom_calls_sync():
     date_from = parse_date_field(request.args.get("from") or "2026-01-01", "from")
     date_to = parse_date_field(request.args.get("to") or msk_today().isoformat(), "to")
+    force = str(request.args.get("force") or "").lower() in {"1", "true", "y", "yes"}
     if date_to < date_from:
         return jsonify({"error": "Дата окончания раньше даты начала."}), 400
-    result = sync_zoom_calls(date_from, date_to)
+    result = sync_zoom_calls(date_from, date_to, force=force)
     result["tree"] = load_zoom_calls_tree()
     return jsonify(result)
 
