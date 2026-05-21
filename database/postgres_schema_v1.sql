@@ -896,7 +896,21 @@ CREATE TABLE owner_manager_recommendations (
     source_goal_id             UUID REFERENCES user_goals(id) ON DELETE SET NULL,
     source_item_id             UUID REFERENCES chat_report_items(id) ON DELETE SET NULL,
     source_payload             JSONB NOT NULL DEFAULT '{}'::jsonb,
-    status                     TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new','queued','sent','acked','done','cancelled','error')),
+    expected_action            TEXT,
+    response_due_at            TIMESTAMPTZ,
+    execution_due_at           TIMESTAMPTZ,
+    feedback_chat_id           UUID REFERENCES chats(id) ON DELETE SET NULL,
+    feedback_dialog_id         TEXT,
+    current_interpretation     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    manager_review_required    BOOLEAN NOT NULL DEFAULT FALSE,
+    sent_at                    TIMESTAMPTZ,
+    last_response_at           TIMESTAMPTZ,
+    closed_at                  TIMESTAMPTZ,
+    status                     TEXT NOT NULL DEFAULT 'new' CHECK (status IN (
+                                'new','draft','queued','sent','seen','acked','accepted',
+                                'in_progress','needs_clarification','disagreed','delegated',
+                                'done','rejected','no_response','overdue',
+                                'requires_manager_review','cancelled','error')),
     created_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (
@@ -910,11 +924,14 @@ CREATE INDEX idx_omr_manager_status ON owner_manager_recommendations(manager_use
 CREATE INDEX idx_omr_daily_report ON owner_manager_recommendations(owner_daily_report_id) WHERE owner_daily_report_id IS NOT NULL;
 CREATE INDEX idx_omr_weekly_report ON owner_manager_recommendations(owner_weekly_report_id) WHERE owner_weekly_report_id IS NOT NULL;
 CREATE INDEX idx_omr_due_date ON owner_manager_recommendations(due_date) WHERE due_date IS NOT NULL;
+CREATE INDEX idx_omr_feedback_chat ON owner_manager_recommendations(feedback_chat_id, status, created_at DESC) WHERE feedback_chat_id IS NOT NULL;
+CREATE INDEX idx_omr_review_required ON owner_manager_recommendations(manager_review_required, updated_at DESC) WHERE manager_review_required = TRUE;
+CREATE INDEX idx_omr_response_due ON owner_manager_recommendations(response_due_at) WHERE response_due_at IS NOT NULL;
 
 CREATE TABLE owner_recommendation_dispatches (
     id                         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     recommendation_id          UUID NOT NULL REFERENCES owner_manager_recommendations(id) ON DELETE CASCADE,
-    channel                    TEXT NOT NULL CHECK (channel IN ('bitrix_task_comment','bitrix_im','bitrix_task_create','manual')),
+    channel                    TEXT NOT NULL CHECK (channel IN ('bitrix_task_comment','bitrix_im','bitrix_notification','bitrix_task_create','manual')),
     status                     TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','sent','delivered','error','cancelled')),
     bitrix_entity_type         TEXT,
     bitrix_entity_id           BIGINT,
@@ -930,6 +947,38 @@ CREATE TABLE owner_recommendation_dispatches (
 
 CREATE INDEX idx_ord_recommendation ON owner_recommendation_dispatches(recommendation_id, created_at DESC);
 CREATE INDEX idx_ord_status ON owner_recommendation_dispatches(status, created_at DESC);
+
+CREATE TABLE owner_recommendation_events (
+    id                         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    recommendation_id          UUID NOT NULL REFERENCES owner_manager_recommendations(id) ON DELETE CASCADE,
+    event_type                 TEXT NOT NULL CHECK (event_type IN
+                                ('created','sent','delivered','seen','employee_replied',
+                                 'ai_interpreted','status_changed','manager_reviewed',
+                                 'task_created','closed','source_found')),
+    author_type                TEXT NOT NULL DEFAULT 'system' CHECK (author_type IN ('system','ai','manager','employee')),
+    author_user_id             UUID REFERENCES users(id) ON DELETE SET NULL,
+    author_bitrix_user_id      BIGINT,
+    chat_id                    UUID REFERENCES chats(id) ON DELETE SET NULL,
+    dialog_id                  TEXT,
+    chat_message_id            UUID,
+    chat_message_day           DATE,
+    bitrix_message_id          BIGINT,
+    bitrix_task_id             UUID REFERENCES bitrix_tasks(id) ON DELETE SET NULL,
+    bitrix_task_external_id    BIGINT,
+    zoom_call_id               UUID REFERENCES zoom_calls(id) ON DELETE SET NULL,
+    old_status                 TEXT,
+    new_status                 TEXT,
+    event_text                 TEXT,
+    interpretation             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_payload             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    event_at                   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at                 TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_ore_recommendation_event_at ON owner_recommendation_events(recommendation_id, event_at DESC);
+CREATE INDEX idx_ore_status ON owner_recommendation_events(new_status, event_at DESC) WHERE new_status IS NOT NULL;
+CREATE INDEX idx_ore_chat_day ON owner_recommendation_events(chat_id, chat_message_day, event_at DESC) WHERE chat_id IS NOT NULL;
+CREATE INDEX idx_ore_bitrix_message ON owner_recommendation_events(bitrix_message_id, chat_message_day) WHERE bitrix_message_id IS NOT NULL;
 
 CREATE TABLE user_period_reports (
     id                           UUID PRIMARY KEY DEFAULT gen_random_uuid(),

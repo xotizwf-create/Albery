@@ -21,7 +21,7 @@ from psycopg.types.json import Jsonb
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -193,6 +193,9 @@ def tool_list_available_sources(_: dict[str, Any]) -> dict[str, Any]:
         "chat_weekly_reports",
         "owner_daily_reports",
         "owner_weekly_reports",
+        "owner_manager_recommendations",
+        "owner_recommendation_dispatches",
+        "owner_recommendation_events",
         "company_profile",
         "company_folders",
         "company_drive_sources",
@@ -285,9 +288,9 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "use_for": ["conversation evidence", "commitments", "decisions", "questions", "OCR from screenshots", "daily and weekly chat report storage"],
             },
             "owner_reports": {
-                "tools": ["get_previous_owner_daily_context", "get_owner_reports", "save_owner_daily_report", "save_owner_weekly_report"],
-                "tables": ["owner_daily_reports", "owner_weekly_reports"],
-                "use_for": ["recent owner context", "general daily reports for owner", "general weekly reports for owner", "owner-level report storage", "recommendation continuity"],
+                "tools": ["get_previous_owner_daily_context", "get_owner_reports", "save_owner_daily_report", "save_owner_weekly_report", "list_recommendations", "get_recommendation_feedback_context", "save_recommendation_event"],
+                "tables": ["owner_daily_reports", "owner_weekly_reports", "owner_manager_recommendations", "owner_recommendation_dispatches", "owner_recommendation_events"],
+                "use_for": ["recent owner context", "general daily reports for owner", "general weekly reports for owner", "owner-level report storage", "recommendation lifecycle", "recommendation feedback and statuses"],
             },
             "zoom_calls": {
                 "tools": ["list_zoom_calls", "get_zoom_call_transcript", "search_zoom_transcripts", "save_zoom_call_report", "delete_zoom_call_report"],
@@ -318,6 +321,7 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "get_owner_reports(report_kind='daily', limit=7)",
                 "get_owner_reports(report_kind='weekly', limit=4)",
                 "get_period_index(date_from,date_to) for the requested period",
+                "list_recommendations(status='open', date_from,date_to) and recommendation events for feedback continuity",
                 "search_tasks/search_messages/search_zoom_transcripts for concrete evidence",
                 "answer with specific task titles, owners, statuses, deadlines, and sources; ask clarifying questions when evidence is missing",
             ],
@@ -327,6 +331,7 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "list_chats(date_from=report_date,date_to=report_date)",
                 "get_chat_ocr_status(dialog_id,report_date); if OCR is missing for images/PDF, call process_chat_ocr(dialog_id,date_from=report_date,date_to=report_date)",
                 "get_chat_transcript(dialog_id,report_date,report_date,include_ocr=true)",
+                "get_recommendation_feedback_context(dialog_id,report_date) and compare recommendations against previous-day and current-day messages",
                 "list_zoom_calls(date_from=report_date,date_to=report_date)",
                 "ensure every relevant or same-day Zoom call has a standalone Zoom report first; if analytical_note is empty, create/save the Zoom report before chat_analysis",
                 "get_chat_daily_report(dialog_id, previous_date)",
@@ -1665,6 +1670,8 @@ CHAT_REPORT_ITEM_KEYS = {
     "blockers": "blocker",
     "bitrix_references": "bitrix_reference",
     "next_steps": "next_step",
+    "recommendation_feedback": "recommendation_feedback",
+    "strange_feedback": "strange_feedback",
     "notes": "note",
 }
 
@@ -1929,6 +1936,344 @@ def tool_get_owner_reports(args: dict[str, Any]) -> dict[str, Any]:
         "reports": reports,
         "rule": "Use these reports as continuity context before making recommendations or judging what is done/open/repeated.",
     }
+
+
+RECOMMENDATION_STATUSES = {
+    "new",
+    "draft",
+    "queued",
+    "sent",
+    "seen",
+    "acked",
+    "accepted",
+    "in_progress",
+    "needs_clarification",
+    "disagreed",
+    "delegated",
+    "done",
+    "rejected",
+    "no_response",
+    "overdue",
+    "requires_manager_review",
+    "cancelled",
+    "error",
+}
+
+OPEN_RECOMMENDATION_STATUSES = {
+    "new",
+    "draft",
+    "queued",
+    "sent",
+    "seen",
+    "acked",
+    "accepted",
+    "in_progress",
+    "needs_clarification",
+    "disagreed",
+    "delegated",
+    "no_response",
+    "overdue",
+    "requires_manager_review",
+    "error",
+}
+
+
+def tool_list_recommendations(args: dict[str, Any]) -> dict[str, Any]:
+    date_from = parse_date_arg(args, "date_from", required=False)
+    date_to = parse_date_arg(args, "date_to", required=False)
+    status = str(args.get("status") or "").strip()
+    dialog_id = str(args.get("dialog_id") or "").strip()
+    include_events = bool(args.get("include_events", True))
+    manager_bitrix_user_id = args.get("manager_bitrix_user_id")
+    employee_bitrix_user_id = args.get("employee_bitrix_user_id")
+    limit = parse_limit(args, 100)
+    offset = parse_offset(args)
+
+    filters = ["1=1"]
+    params: list[Any] = []
+    if date_from and date_to:
+        filters.append("COALESCE(r.report_date, r.period_start, r.created_at::date) BETWEEN %s AND %s")
+        params.extend([date_from, date_to])
+    elif date_from or date_to:
+        raise McpError(-32602, "date_from and date_to must be provided together")
+    if status:
+        if status == "open":
+            filters.append("r.status = ANY(%s::text[])")
+            params.append(sorted(OPEN_RECOMMENDATION_STATUSES))
+        else:
+            if status not in RECOMMENDATION_STATUSES:
+                raise McpError(-32602, f"Unknown recommendation status: {status}")
+            filters.append("r.status = %s")
+            params.append(status)
+    if dialog_id:
+        filters.append("(sc.dialog_id = %s OR fc.dialog_id = %s OR r.feedback_dialog_id = %s)")
+        params.extend([dialog_id, dialog_id, dialog_id])
+    if manager_bitrix_user_id not in (None, ""):
+        filters.append("r.manager_bitrix_user_id = %s")
+        params.append(int(manager_bitrix_user_id))
+    if employee_bitrix_user_id not in (None, ""):
+        filters.append("r.employee_bitrix_user_id = %s")
+        params.append(int(employee_bitrix_user_id))
+
+    params.extend([limit, offset])
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if not safe_table_exists(cur, "owner_manager_recommendations"):
+                return {"items": [], "events": [], "message": "Recommendation table does not exist."}
+            cur.execute(
+                f"""
+                SELECT
+                    r.id, r.source_scope, r.report_date, r.period_start, r.period_end,
+                    r.status, r.priority, r.recommendation_type, r.subject,
+                    r.recommendation_text, r.expected_action, r.due_date,
+                    r.response_due_at, r.execution_due_at, r.sent_at, r.last_response_at,
+                    r.manager_review_required, r.current_interpretation,
+                    mu.full_name AS manager_name,
+                    r.manager_bitrix_user_id,
+                    eu.full_name AS employee_name,
+                    r.employee_bitrix_user_id,
+                    sc.dialog_id AS source_dialog_id,
+                    sc.chat_title AS source_chat_title,
+                    fc.dialog_id AS feedback_dialog_id,
+                    fc.chat_title AS feedback_chat_title,
+                    r.source_payload, r.created_at, r.updated_at
+                FROM owner_manager_recommendations r
+                LEFT JOIN users mu ON mu.id = r.manager_user_id
+                LEFT JOIN users eu ON eu.id = r.employee_user_id
+                LEFT JOIN chats sc ON sc.id = r.source_chat_id
+                LEFT JOIN chats fc ON fc.id = r.feedback_chat_id
+                WHERE {' AND '.join(filters)}
+                ORDER BY r.manager_review_required DESC, r.updated_at DESC, r.created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                params,
+            )
+            items = cur.fetchall()
+            events: list[dict[str, Any]] = []
+            if include_events and items and safe_table_exists(cur, "owner_recommendation_events"):
+                ids = [str(item["id"]) for item in items]
+                cur.execute(
+                    """
+                    SELECT
+                        e.recommendation_id, e.event_type, e.author_type,
+                        u.full_name AS author_name, e.author_bitrix_user_id,
+                        e.dialog_id, c.chat_title, e.bitrix_message_id,
+                        e.chat_message_day, e.old_status, e.new_status,
+                        e.event_text, e.interpretation, e.source_payload, e.event_at
+                    FROM owner_recommendation_events e
+                    LEFT JOIN users u ON u.id = e.author_user_id
+                    LEFT JOIN chats c ON c.id = e.chat_id
+                    WHERE e.recommendation_id = ANY(%s::uuid[])
+                    ORDER BY e.event_at DESC
+                    LIMIT 500
+                    """,
+                    (ids,),
+                )
+                events = cur.fetchall()
+    return {
+        "items": items,
+        "events": events,
+        "limit": limit,
+        "offset": offset,
+        "rule": "Use recommendation events as the lifecycle log; do not infer final status from chat text without recording an event.",
+    }
+
+
+def tool_get_recommendation_feedback_context(args: dict[str, Any]) -> dict[str, Any]:
+    dialog_id = str(args.get("dialog_id") or "").strip()
+    if not dialog_id:
+        raise McpError(-32602, "Missing required argument: dialog_id")
+    report_date = parse_date_arg(args, "report_date")
+    previous_date = report_date - timedelta(days=1)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, dialog_id, chat_title FROM chats WHERE dialog_id = %s", (dialog_id,))
+            chat = cur.fetchone()
+            if not chat:
+                raise McpError(-32602, f"Unknown dialog_id: {dialog_id}")
+            cur.execute(
+                "SELECT user_id FROM chat_members WHERE chat_id = %s AND is_active = TRUE",
+                (chat["id"],),
+            )
+            member_ids = [str(row["user_id"]) for row in cur.fetchall()]
+            member_clause = "FALSE"
+            member_params: list[Any] = []
+            if member_ids:
+                member_clause = "(r.manager_user_id = ANY(%s::uuid[]) OR r.employee_user_id = ANY(%s::uuid[]))"
+                member_params = [member_ids, member_ids]
+            cur.execute(
+                f"""
+                SELECT
+                    r.id, r.status, r.priority, r.recommendation_type, r.subject,
+                    r.recommendation_text, r.expected_action, r.due_date,
+                    r.response_due_at, r.execution_due_at, r.sent_at, r.last_response_at,
+                    r.manager_review_required, r.current_interpretation,
+                    mu.full_name AS manager_name,
+                    eu.full_name AS employee_name,
+                    sc.dialog_id AS source_dialog_id,
+                    fc.dialog_id AS feedback_dialog_id
+                FROM owner_manager_recommendations r
+                LEFT JOIN users mu ON mu.id = r.manager_user_id
+                LEFT JOIN users eu ON eu.id = r.employee_user_id
+                LEFT JOIN chats sc ON sc.id = r.source_chat_id
+                LEFT JOIN chats fc ON fc.id = r.feedback_chat_id
+                WHERE (
+                    r.source_chat_id = %s
+                    OR r.feedback_chat_id = %s
+                    OR COALESCE(r.feedback_dialog_id, '') = %s
+                    OR {member_clause}
+                )
+                  AND (
+                    r.status = ANY(%s::text[])
+                    OR r.created_at::date BETWEEN %s AND %s
+                    OR r.sent_at::date BETWEEN %s AND %s
+                    OR r.last_response_at::date BETWEEN %s AND %s
+                  )
+                ORDER BY r.manager_review_required DESC, r.updated_at DESC
+                LIMIT 100
+                """,
+                [
+                    chat["id"],
+                    chat["id"],
+                    dialog_id,
+                    *member_params,
+                    sorted(OPEN_RECOMMENDATION_STATUSES),
+                    previous_date,
+                    report_date,
+                    previous_date,
+                    report_date,
+                    previous_date,
+                    report_date,
+                ],
+            )
+            recommendations = cur.fetchall()
+            events: list[dict[str, Any]] = []
+            if recommendations and safe_table_exists(cur, "owner_recommendation_events"):
+                ids = [str(item["id"]) for item in recommendations]
+                cur.execute(
+                    """
+                    SELECT recommendation_id, event_type, author_type, dialog_id,
+                           bitrix_message_id, chat_message_day, old_status, new_status,
+                           event_text, interpretation, source_payload, event_at
+                    FROM owner_recommendation_events
+                    WHERE recommendation_id = ANY(%s::uuid[])
+                    ORDER BY event_at DESC
+                    LIMIT 300
+                    """,
+                    (ids,),
+                )
+                events = cur.fetchall()
+    return {
+        "dialog_id": dialog_id,
+        "report_date": report_date,
+        "period_to_check": {"date_from": previous_date, "date_to": report_date},
+        "recommendations": recommendations,
+        "events": events,
+        "rule": (
+            "For daily chat reports, compare previous-day and current-day messages against these recommendations. "
+            "Unclear, evasive, contradictory, or off-topic replies must be marked as 'Странная обратная связь' "
+            "and saved with status requires_manager_review or needs_clarification."
+        ),
+    }
+
+
+def tool_save_recommendation_event(args: dict[str, Any]) -> dict[str, Any]:
+    recommendation_id = str(args.get("recommendation_id") or "").strip()
+    if not recommendation_id:
+        raise McpError(-32602, "Missing required argument: recommendation_id")
+    try:
+        recommendation_uuid = UUID(recommendation_id)
+    except ValueError as exc:
+        raise McpError(-32602, "recommendation_id must be a UUID") from exc
+    event_type = str(args.get("event_type") or "ai_interpreted").strip()
+    if event_type not in {"created", "sent", "delivered", "seen", "employee_replied", "ai_interpreted", "status_changed", "manager_reviewed", "task_created", "closed", "source_found"}:
+        raise McpError(-32602, f"Unknown event_type: {event_type}")
+    author_type = str(args.get("author_type") or "ai").strip()
+    if author_type not in {"system", "ai", "manager", "employee"}:
+        raise McpError(-32602, f"Unknown author_type: {author_type}")
+    new_status = str(args.get("new_status") or "").strip() or None
+    if new_status and new_status not in RECOMMENDATION_STATUSES:
+        raise McpError(-32602, f"Unknown recommendation status: {new_status}")
+    event_text = str(args.get("event_text") or "").strip() or None
+    interpretation = args.get("interpretation") if isinstance(args.get("interpretation"), dict) else {}
+    source_payload = args.get("source_payload") if isinstance(args.get("source_payload"), dict) else {}
+    dialog_id = str(args.get("dialog_id") or "").strip() or None
+    bitrix_message_id = args.get("bitrix_message_id")
+    chat_message_day = parse_date_arg(args, "chat_message_day", required=False)
+    author_bitrix_user_id = args.get("author_bitrix_user_id")
+
+    with connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, status FROM owner_manager_recommendations WHERE id = %s", (recommendation_uuid,))
+                recommendation = cur.fetchone()
+                if not recommendation:
+                    raise McpError(-32602, f"Unknown recommendation_id: {recommendation_id}")
+                chat_id = None
+                if dialog_id:
+                    cur.execute("SELECT id FROM chats WHERE dialog_id = %s", (dialog_id,))
+                    chat = cur.fetchone()
+                    chat_id = chat["id"] if chat else None
+                old_status = str(args.get("old_status") or recommendation.get("status") or "new")
+                cur.execute(
+                    """
+                    INSERT INTO owner_recommendation_events (
+                        recommendation_id, event_type, author_type, author_bitrix_user_id,
+                        chat_id, dialog_id, bitrix_message_id, chat_message_day,
+                        old_status, new_status, event_text, interpretation, source_payload
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        recommendation_uuid,
+                        event_type,
+                        author_type,
+                        int(author_bitrix_user_id) if author_bitrix_user_id not in (None, "") else None,
+                        chat_id,
+                        dialog_id,
+                        int(bitrix_message_id) if bitrix_message_id not in (None, "") else None,
+                        chat_message_day,
+                        old_status,
+                        new_status,
+                        event_text,
+                        jsonb_arg(interpretation),
+                        jsonb_arg(source_payload),
+                    ),
+                )
+                event_id = cur.fetchone()["id"]
+                if new_status:
+                    review_required = bool(args.get("manager_review_required")) or bool(interpretation.get("requires_manager_review")) or new_status == "requires_manager_review"
+                    cur.execute(
+                        """
+                        UPDATE owner_manager_recommendations
+                        SET status = %s,
+                            feedback_chat_id = COALESCE(feedback_chat_id, %s),
+                            feedback_dialog_id = COALESCE(feedback_dialog_id, %s),
+                            current_interpretation = CASE WHEN %s::jsonb = '{}'::jsonb THEN current_interpretation ELSE %s::jsonb END,
+                            manager_review_required = manager_review_required OR %s,
+                            last_response_at = CASE
+                                WHEN %s IN ('accepted','in_progress','needs_clarification','disagreed','delegated','done','requires_manager_review')
+                                THEN now()
+                                ELSE last_response_at
+                            END,
+                            closed_at = CASE WHEN %s IN ('done','rejected','cancelled') THEN COALESCE(closed_at, now()) ELSE closed_at END,
+                            updated_at = now()
+                        WHERE id = %s
+                        """,
+                        (
+                            new_status,
+                            chat_id,
+                            dialog_id,
+                            jsonb_arg(interpretation),
+                            jsonb_arg(interpretation),
+                            review_required,
+                            new_status,
+                            new_status,
+                            recommendation_uuid,
+                        ),
+                    )
+    return {"event_id": str(event_id), "recommendation_id": recommendation_id, "new_status": new_status}
 
 
 def tool_get_previous_owner_daily_context(args: dict[str, Any]) -> dict[str, Any]:
@@ -2891,6 +3236,62 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_owner_reports,
+    },
+    "list_recommendations": {
+        "description": "List addressable recommendations with lifecycle status and optional event history. Use this before checking recommendation feedback or repeated recommendations.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD"},
+                "status": {"type": "string", "description": "Use 'open' for all non-final statuses, or a concrete recommendation status."},
+                "dialog_id": {"type": "string"},
+                "manager_bitrix_user_id": {"type": "integer"},
+                "employee_bitrix_user_id": {"type": "integer"},
+                "include_events": {"type": "boolean"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_recommendations,
+    },
+    "get_recommendation_feedback_context": {
+        "description": "Read active recommendations and event history relevant to one chat/date. For daily chat reports, use before analyzing previous-day and current-day replies.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dialog_id": {"type": "string"},
+                "report_date": {"type": "string", "description": "YYYY-MM-DD"},
+            },
+            "required": ["dialog_id", "report_date"],
+            "additionalProperties": False,
+        },
+        "handler": tool_get_recommendation_feedback_context,
+    },
+    "save_recommendation_event": {
+        "description": "Append one lifecycle event for an addressable recommendation and optionally update its status. Use after interpreting a human reply.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recommendation_id": {"type": "string"},
+                "event_type": {"type": "string", "enum": ["created", "sent", "delivered", "seen", "employee_replied", "ai_interpreted", "status_changed", "manager_reviewed", "task_created", "closed", "source_found"]},
+                "author_type": {"type": "string", "enum": ["system", "ai", "manager", "employee"]},
+                "author_bitrix_user_id": {"type": "integer"},
+                "dialog_id": {"type": "string"},
+                "bitrix_message_id": {"type": "integer"},
+                "chat_message_day": {"type": "string", "description": "YYYY-MM-DD"},
+                "old_status": {"type": "string"},
+                "new_status": {"type": "string"},
+                "event_text": {"type": "string"},
+                "interpretation": {"type": "object"},
+                "source_payload": {"type": "object"},
+                "manager_review_required": {"type": "boolean"},
+            },
+            "required": ["recommendation_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_save_recommendation_event,
     },
     "get_previous_owner_daily_context": {
         "description": "Read only the previous calendar day's current owner daily report as continuity context for creating or checking a new owner daily report.",

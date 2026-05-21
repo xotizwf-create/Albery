@@ -25,6 +25,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "chat_day_syncs": "016_chat_day_syncs.sql",
     "bitrix_task_events": "018_bitrix_task_events.sql",
     "zoom_recording_events": "019_zoom_recording_events.sql",
+    "owner_recommendation_events": "020_recommendation_feedback_events.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {

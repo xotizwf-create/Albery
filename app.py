@@ -8378,6 +8378,8 @@ CHAT_REPORT_ITEM_KEYS = {
     "bitrix_references": "bitrix_reference",
     "results": "result",
     "next_steps": "next_step",
+    "recommendation_feedback": "recommendation_feedback",
+    "strange_feedback": "strange_feedback",
     "notes": "note",
 }
 
@@ -8566,6 +8568,17 @@ def structured_chat_report_text(analysis: dict[str, Any]) -> str:
             append_detail(parts, "причина риска", item.get("risk_reason"))
         elif key == "bitrix_references":
             append_detail(parts, "Bitrix ID", item.get("bitrix_task_id"))
+        elif key == "recommendation_feedback":
+            append_detail(parts, "рекомендация", item.get("recommendation_id"))
+            append_detail(parts, "статус", status_text(item.get("understood_status")))
+            append_detail(parts, "обязательство", item.get("commitment"))
+            append_detail(parts, "срок", item.get("deadline"))
+            append_detail(parts, "следующий шаг", item.get("next_action"))
+        elif key == "strange_feedback":
+            append_detail(parts, "рекомендация", item.get("recommendation_id"))
+            append_detail(parts, "причина", item.get("reason"))
+            append_detail(parts, "суть ответа", item.get("raw_answer_summary"))
+            append_detail(parts, "рекомендуемый статус", status_text(item.get("recommended_status")))
 
         prefix = f"{person}: " if person else ""
         suffix = f" ({'; '.join(parts)})" if parts else ""
@@ -8634,6 +8647,8 @@ def structured_chat_report_text(analysis: dict[str, Any]) -> str:
         ("results", "Выполнено сегодня"),
         ("questions", "Рабочие вопросы дня"),
         ("unanswered_questions", "Вопросы без ответа"),
+        ("recommendation_feedback", "Обратная связь по рекомендациям"),
+        ("strange_feedback", "Странная обратная связь"),
         ("explicit_risks", "Явные риски из чата"),
         ("decisions", "Принятые решения"),
     ]
@@ -9229,6 +9244,7 @@ def save_chat_daily_report(
                     save_chat_report_items(cur, report_id, chat_uuid, report_date, analysis)
                     goals_saved = save_chat_goals_from_analysis(cur, chat_uuid, report_id, report_date, analysis, ai_request_id)
                     save_goal_updates_from_analysis(cur, chat_uuid, report_id, report_date, analysis)
+                    save_recommendation_feedback_from_chat_analysis(cur, chat_uuid, dialog_id, report_date, report_id, analysis)
                     if goals_saved != extracted_goals:
                         cur.execute(
                             """
@@ -14488,6 +14504,108 @@ def load_owner_recommendations_for_bitrix(report_id: str, report_kind: str) -> d
     return {user_id: "\n".join(items) for user_id, items in recommendations.items()}
 
 
+def load_owner_recommendation_rows_for_bitrix(report_id: str, report_kind: str) -> dict[int, list[dict[str, Any]]]:
+    ensure_owner_reports_schema()
+    report_uuid = UUID(str(report_id))
+    if report_kind not in {"daily", "weekly"}:
+        raise ValueError("Неподдерживаемый тип owner-отчета.")
+    id_column = "owner_weekly_report_id" if report_kind == "weekly" else "owner_daily_report_id"
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, manager_bitrix_user_id, recommendation_text, priority, subject, status
+                FROM owner_manager_recommendations
+                WHERE {id_column} = %s
+                  AND manager_bitrix_user_id IS NOT NULL
+                  AND status NOT IN ('cancelled', 'done', 'rejected')
+                ORDER BY
+                  CASE priority
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    ELSE 4
+                  END,
+                  created_at
+                """,
+                (report_uuid,),
+            )
+            rows = cur.fetchall()
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        user_id = to_int(row.get("manager_bitrix_user_id"))
+        text = str(row.get("recommendation_text") or "").strip()
+        if user_id is None or not text:
+            continue
+        grouped.setdefault(user_id, []).append(dict(row))
+    return grouped
+
+
+def record_recommendation_dispatch_result(
+    rows: list[dict[str, Any]],
+    channel: str,
+    bitrix_user_id: int,
+    message: str,
+    response_payload: Any,
+    status: str,
+) -> None:
+    if not rows or not postgres_enabled():
+        return
+    response_value = response_payload if isinstance(response_payload, dict) else {"result": response_payload}
+    bitrix_message_id = to_int(response_payload) if not isinstance(response_payload, dict) else to_int(response_payload.get("message_id") or response_payload.get("ID") or response_payload.get("id"))
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for row in rows:
+                    recommendation_id = row.get("id")
+                    old_status = str(row.get("status") or "new")
+                    cur.execute(
+                        """
+                        INSERT INTO owner_recommendation_dispatches (
+                            recommendation_id, channel, status, bitrix_entity_type, bitrix_entity_id,
+                            bitrix_message_id, payload, response_payload, sent_at, error_text
+                        )
+                        VALUES (%s, %s, %s, 'user', %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            recommendation_id,
+                            channel,
+                            status,
+                            bitrix_user_id,
+                            bitrix_message_id,
+                            pg_json({"message": message}),
+                            pg_json(response_value),
+                            datetime.now() if status == "sent" else None,
+                            None if status == "sent" else str(response_value),
+                        ),
+                    )
+                    if status == "sent":
+                        cur.execute(
+                            """
+                            UPDATE owner_manager_recommendations
+                            SET status = 'sent', sent_at = COALESCE(sent_at, now()), updated_at = now()
+                            WHERE id = %s
+                            """,
+                            (recommendation_id,),
+                        )
+                        cur.execute(
+                            """
+                            INSERT INTO owner_recommendation_events (
+                                recommendation_id, event_type, author_type, author_bitrix_user_id,
+                                old_status, new_status, event_text, source_payload
+                            )
+                            VALUES (%s, 'sent', 'system', %s, %s, 'sent', %s, %s)
+                            """,
+                            (
+                                recommendation_id,
+                                bitrix_user_id,
+                                old_status,
+                                message,
+                                pg_json({"channel": channel, "response": response_value}),
+                            ),
+                        )
+
+
 def load_owner_daily_recommendations_for_bitrix(report_id: str) -> dict[int, str]:
     return load_owner_recommendations_for_bitrix(report_id, "daily")
 
@@ -14535,6 +14653,7 @@ def send_owner_report_recommendations_to_bitrix(
     normalized_ids = normalize_bitrix_recipient_ids(recipient_ids)
     client = bitrix_webhook_client()
     recommendation_texts = load_owner_recommendations_for_bitrix(report_id, report_kind)
+    recommendation_rows = load_owner_recommendation_rows_for_bitrix(report_id, report_kind)
     if isinstance(recipient_recommendations, dict):
         for key, value in recipient_recommendations.items():
             user_id = to_int(key)
@@ -14544,7 +14663,18 @@ def send_owner_report_recommendations_to_bitrix(
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     for user_id in normalized_ids:
-        message = str(recommendation_texts.get(user_id) or "").strip()
+        rows_for_user = recommendation_rows.get(user_id) or []
+        has_custom_text = isinstance(recipient_recommendations, dict) and (
+            str(user_id) in recipient_recommendations or user_id in recipient_recommendations
+        )
+        if rows_for_user and not has_custom_text:
+            message = "\n\n".join(
+                f"ID рекомендации: {row['id']}\n{str(row.get('recommendation_text') or '').strip()}"
+                for row in rows_for_user
+                if str(row.get("recommendation_text") or "").strip()
+            ).strip()
+        else:
+            message = str(recommendation_texts.get(user_id) or "").strip()
         if not message:
             errors.append({"user_id": user_id, "error": "Для получателя нет адресной рекомендации."})
             continue
@@ -14554,9 +14684,13 @@ def send_owner_report_recommendations_to_bitrix(
                 {"DIALOG_ID": str(user_id), "MESSAGE": message},
                 prefer_api=True,
             )
+            if rows_for_user:
+                record_recommendation_dispatch_result(rows_for_user, "bitrix_im", user_id, message, response.get("result"), "sent")
             results.append({"user_id": user_id, "channel": "bitrix_im", "response": response.get("result")})
         except Exception as exc:  # noqa: BLE001
             if not is_bitrix_no_access_error(exc):
+                if rows_for_user:
+                    record_recommendation_dispatch_result(rows_for_user, "bitrix_im", user_id, message, {"error": str(exc)}, "error")
                 errors.append({"user_id": user_id, "error": str(exc)})
                 continue
             try:
@@ -14565,8 +14699,19 @@ def send_owner_report_recommendations_to_bitrix(
                     {"USER_ID": user_id, "MESSAGE": message},
                     prefer_api=True,
                 )
+                if rows_for_user:
+                    record_recommendation_dispatch_result(rows_for_user, "bitrix_notification", user_id, message, response.get("result"), "sent")
                 results.append({"user_id": user_id, "channel": "bitrix_notification", "response": response.get("result")})
             except Exception as notify_exc:  # noqa: BLE001
+                if rows_for_user:
+                    record_recommendation_dispatch_result(
+                        rows_for_user,
+                        "bitrix_notification",
+                        user_id,
+                        message,
+                        {"im_message_error": str(exc), "notification_error": str(notify_exc)},
+                        "error",
+                    )
                 errors.append({
                     "user_id": user_id,
                     "error": (
@@ -18496,8 +18641,10 @@ DEFAULT_CHAT_ANALYSIS_PROMPT = """Ты извлекаешь факты из ко
 Входные блоки:
 - `Дата` - дата отчета. Относительные даты нормализуй относительно нее.
 - `Чат` - чат, по которому идет извлечение.
+- `Переписка предыдущего дня` - сообщения этого же чата за предыдущий календарный день. Используй только для проверки реакции на рекомендации, продолжения вопросов и связки ответа с рекомендацией; не извлекай из нее новые задачи текущего дня.
 - `Хвосты с прошлого дня` - контрольный список незакрытых задач/вопросов/договоренностей из предыдущего отчета.
 - `Отчет предыдущего дня` - используй только для связывания повторных вопросов и хвостов.
+- `Адресные рекомендации и обратная связь` - активные рекомендации, события отправки/ответов и текущая интерпретация статуса. По ним нужно проверить, как люди отреагировали в переписке предыдущего и текущего дня.
 - `Zoom-отчеты текущего дня` - готовые Zoom-отчеты. Бери только факты, относящиеся к этому чату, его участникам или темам.
 - `Расшифровка` - сообщения чата и OCR-текст вложений.
 
@@ -18524,6 +18671,9 @@ DEFAULT_CHAT_ANALYSIS_PROMPT = """Ты извлекаешь факты из ко
 18. Для ежедневного отчета по чату не формируй разделы `Дата`, `Чат`, `Dialog ID`, `Источник`, `Короткий вывод`, `Риски`, `Контроль на следующий отчет`. Нужный пользовательский формат: заголовок, строка активности, затем разделы `Хвосты с прошлого дня`, `Новые задачи дня` при наличии, `Выполнено сегодня`, `Рабочие вопросы дня`, `Вопросы без ответа` при наличии, `Принятые решения`, `Темы дня`.
 19. Не превращай смежную тему из Zoom-отчета в движение по хвосту, если нет прямого факта именно по этому хвосту. В таком случае ставь `current_status = "no_info"`, чтобы в отчете пункт остался как `[тишина]`.
 20. Для каждого хвоста копируй `days_open` из входного блока `Хвосты с прошлого дня`. Это уже увеличенный приложением счетчик дней без движения. Не обнуляй его и не ставь `null`.
+21. По блоку `Адресные рекомендации и обратная связь` верни `recommendation_feedback`: по каждой рекомендации, где есть явная реакция в переписке предыдущего или текущего дня, укажи статус реакции, evidence и следующий шаг.
+22. Если ответ на рекомендацию странный, противоречивый, уклончивый, без конкретного обязательства/срока, не по теме или не позволяет понять статус, обязательно верни объект в `strange_feedback` с пометкой `label = "Странная обратная связь"` и `requires_manager_review = true`.
+23. Не ставь `done` по рекомендации, если человек только написал общую фразу без проверяемого результата. Для неясных ответов используй `requires_manager_review` или `needs_clarification`.
 
 Верни строго валидный JSON без markdown:
 {
@@ -18668,10 +18818,295 @@ DEFAULT_CHAT_ANALYSIS_PROMPT = """Ты извлекаешь факты из ко
       "mentioned_by": "кто упомянул",
       "reason": "зачем упомянули"
     }
+  ],
+  "recommendation_feedback": [
+    {
+      "recommendation_id": "uuid рекомендации",
+      "person_name": "кто отреагировал",
+      "understood_status": "accepted|in_progress|needs_clarification|disagreed|delegated|done|no_response|overdue|requires_manager_review",
+      "summary": "что именно человек ответил и как это связано с рекомендацией",
+      "commitment": "обязательство или null",
+      "deadline": "YYYY-MM-DD или null",
+      "next_action": "что нужно сделать дальше",
+      "requires_manager_review": false,
+      "confidence": "direct|inferred|weak",
+      "evidence_message_ids": [123],
+      "source_type": "chat|ocr|mixed"
+    }
+  ],
+  "strange_feedback": [
+    {
+      "recommendation_id": "uuid рекомендации",
+      "label": "Странная обратная связь",
+      "person_name": "кто ответил",
+      "reason": "почему ответ неясный, странный или требует управленческой проверки",
+      "raw_answer_summary": "короткая суть ответа",
+      "recommended_status": "needs_clarification|requires_manager_review|disagreed|delegated",
+      "requires_manager_review": true,
+      "evidence_message_ids": [123],
+      "source_type": "chat|ocr|mixed"
+    }
   ]
 }
 
 Если данных для массива нет, верни пустой массив. Не добавляй поля верхнего уровня вне схемы."""
+
+
+OPEN_RECOMMENDATION_STATUSES = {
+    "new",
+    "draft",
+    "queued",
+    "sent",
+    "seen",
+    "acked",
+    "accepted",
+    "in_progress",
+    "needs_clarification",
+    "disagreed",
+    "delegated",
+    "no_response",
+    "overdue",
+    "requires_manager_review",
+    "error",
+}
+
+
+def load_recommendation_feedback_context_for_chat(dialog_id: str, target_date: date) -> dict[str, Any]:
+    if not postgres_enabled():
+        return {"recommendations": [], "events": []}
+    previous_date = target_date - timedelta(days=1)
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, dialog_id, chat_title FROM chats WHERE dialog_id = %s", (dialog_id,))
+            chat = cur.fetchone()
+            if not chat:
+                return {"recommendations": [], "events": []}
+            chat_id = chat["id"]
+            cur.execute(
+                """
+                SELECT user_id
+                FROM chat_members
+                WHERE chat_id = %s AND is_active = TRUE
+                """,
+                (chat_id,),
+            )
+            member_ids = [row["user_id"] for row in cur.fetchall()]
+            member_filter = "FALSE"
+            if member_ids:
+                member_filter = "(r.manager_user_id = ANY(%s::uuid[]) OR r.employee_user_id = ANY(%s::uuid[]))"
+                member_uuid_texts = [str(item) for item in member_ids]
+                params.extend([member_uuid_texts, member_uuid_texts])
+            cur.execute(
+                f"""
+                SELECT
+                    r.id, r.status, r.priority, r.recommendation_type, r.subject,
+                    r.recommendation_text, r.expected_action, r.due_date,
+                    r.response_due_at, r.execution_due_at, r.sent_at, r.last_response_at,
+                    r.manager_review_required, r.current_interpretation,
+                    mu.full_name AS manager_name,
+                    eu.full_name AS employee_name,
+                    sc.dialog_id AS source_dialog_id,
+                    sc.chat_title AS source_chat_title,
+                    fc.dialog_id AS feedback_dialog_id,
+                    fc.chat_title AS feedback_chat_title
+                FROM owner_manager_recommendations r
+                LEFT JOIN users mu ON mu.id = r.manager_user_id
+                LEFT JOIN users eu ON eu.id = r.employee_user_id
+                LEFT JOIN chats sc ON sc.id = r.source_chat_id
+                LEFT JOIN chats fc ON fc.id = r.feedback_chat_id
+                WHERE (
+                    r.source_chat_id = %s
+                    OR r.feedback_chat_id = %s
+                    OR COALESCE(r.feedback_dialog_id, '') = %s
+                    OR {member_filter}
+                )
+                  AND (
+                    r.status = ANY(%s::text[])
+                    OR r.created_at::date BETWEEN %s AND %s
+                    OR r.sent_at::date BETWEEN %s AND %s
+                    OR r.last_response_at::date BETWEEN %s AND %s
+                  )
+                ORDER BY r.manager_review_required DESC, r.last_response_at DESC NULLS LAST, r.created_at DESC
+                LIMIT 80
+                """,
+                [
+                    chat_id,
+                    chat_id,
+                    dialog_id,
+                    *([] if not member_ids else [member_uuid_texts, member_uuid_texts]),
+                    list(OPEN_RECOMMENDATION_STATUSES),
+                    previous_date,
+                    target_date,
+                    previous_date,
+                    target_date,
+                    previous_date,
+                    target_date,
+                ],
+            )
+            recommendations = cur.fetchall()
+            events: list[dict[str, Any]] = []
+            if recommendations:
+                recommendation_ids = [str(row["id"]) for row in recommendations]
+                cur.execute(
+                    """
+                    SELECT
+                        e.recommendation_id, e.event_type, e.author_type,
+                        e.author_bitrix_user_id, u.full_name AS author_name,
+                        e.dialog_id, c.chat_title, e.bitrix_message_id,
+                        e.chat_message_day, e.old_status, e.new_status,
+                        e.event_text, e.interpretation, e.source_payload, e.event_at
+                    FROM owner_recommendation_events e
+                    LEFT JOIN users u ON u.id = e.author_user_id
+                    LEFT JOIN chats c ON c.id = e.chat_id
+                    WHERE e.recommendation_id = ANY(%s::uuid[])
+                    ORDER BY e.event_at DESC
+                    LIMIT 300
+                    """,
+                    (recommendation_ids,),
+                )
+                events = cur.fetchall()
+    return {
+        "period_checked": {"date_from": previous_date.isoformat(), "date_to": target_date.isoformat()},
+        "chat": {"dialog_id": dialog_id, "chat_title": chat.get("chat_title") if chat else None},
+        "recommendations": recommendations,
+        "events": events,
+        "rule": (
+            "Проверь переписку предыдущего и текущего дня по этим рекомендациям. "
+            "Неясные, уклончивые или противоречивые ответы верни в strange_feedback с label='Странная обратная связь'."
+        ),
+    }
+
+
+def format_recommendation_feedback_context_for_prompt(context: dict[str, Any], max_chars: int = 20000) -> str:
+    recommendations = context.get("recommendations") if isinstance(context, dict) else []
+    events = context.get("events") if isinstance(context, dict) else []
+    if not recommendations:
+        return "Активных рекомендаций для проверки по этому чату не найдено."
+    payload = {
+        "period_checked": context.get("period_checked"),
+        "recommendations": recommendations,
+        "events": events,
+        "rule": context.get("rule"),
+    }
+    text = json.dumps(json_safe(payload), ensure_ascii=False, indent=2, default=str)
+    return text[:max_chars]
+
+
+def save_recommendation_feedback_from_chat_analysis(
+    cur: Any,
+    chat_id: Any,
+    dialog_id: str,
+    report_date: date,
+    report_id: Any,
+    analysis: dict[str, Any],
+) -> None:
+    status_values = {
+        "accepted",
+        "in_progress",
+        "needs_clarification",
+        "disagreed",
+        "delegated",
+        "done",
+        "no_response",
+        "overdue",
+        "requires_manager_review",
+    }
+
+    def evidence_ids(item: dict[str, Any]) -> list[int]:
+        raw = item.get("evidence_message_ids")
+        if not isinstance(raw, list):
+            return []
+        values: list[int] = []
+        for value in raw:
+            parsed = to_int(value)
+            if parsed is not None:
+                values.append(parsed)
+        return values
+
+    def insert_event(item: dict[str, Any], event_type: str, status_key: str, label: str) -> None:
+        recommendation_id = str(item.get("recommendation_id") or "").strip()
+        if not recommendation_id:
+            return
+        try:
+            recommendation_uuid = UUID(recommendation_id)
+        except (TypeError, ValueError):
+            return
+        cur.execute("SELECT id, status FROM owner_manager_recommendations WHERE id = %s", (recommendation_uuid,))
+        row = cur.fetchone()
+        if not row:
+            return
+        old_status = str(row.get("status") or "new")
+        new_status = str(item.get(status_key) or "").strip()
+        if new_status not in status_values:
+            new_status = "requires_manager_review" if event_type == "ai_interpreted" else old_status
+        review_required = bool(item.get("requires_manager_review")) or new_status == "requires_manager_review"
+        text = str(item.get("summary") or item.get("reason") or item.get("raw_answer_summary") or label).strip()
+        ids = evidence_ids(item)
+        source_payload = {
+            "source": "chat_daily_report",
+            "report_id": str(report_id),
+            "report_date": report_date.isoformat(),
+            "dialog_id": dialog_id,
+            "evidence_message_ids": ids,
+            "label": label,
+        }
+        cur.execute(
+            """
+            INSERT INTO owner_recommendation_events (
+                recommendation_id, event_type, author_type, chat_id, dialog_id,
+                old_status, new_status, event_text, interpretation, source_payload,
+                chat_message_day
+            )
+            VALUES (%s, %s, 'ai', %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                recommendation_uuid,
+                event_type,
+                chat_id,
+                dialog_id,
+                old_status,
+                new_status,
+                text,
+                pg_json(item),
+                pg_json(source_payload),
+                report_date,
+            ),
+        )
+        cur.execute(
+            """
+            UPDATE owner_manager_recommendations
+            SET status = %s,
+                feedback_chat_id = COALESCE(feedback_chat_id, %s),
+                feedback_dialog_id = COALESCE(feedback_dialog_id, %s),
+                current_interpretation = %s,
+                manager_review_required = manager_review_required OR %s,
+                last_response_at = CASE
+                    WHEN %s = ANY(ARRAY['accepted','in_progress','needs_clarification','disagreed','delegated','done','requires_manager_review'])
+                    THEN now()
+                    ELSE last_response_at
+                END,
+                closed_at = CASE WHEN %s IN ('done','rejected') THEN COALESCE(closed_at, now()) ELSE closed_at END,
+                updated_at = now()
+            WHERE id = %s
+            """,
+            (
+                new_status,
+                chat_id,
+                dialog_id,
+                pg_json(item),
+                review_required,
+                new_status,
+                new_status,
+                recommendation_uuid,
+            ),
+        )
+
+    for item in analysis.get("recommendation_feedback") or []:
+        if isinstance(item, dict):
+            insert_event(item, "ai_interpreted", "understood_status", "Обратная связь по рекомендации")
+    for item in analysis.get("strange_feedback") or []:
+        if isinstance(item, dict):
+            insert_event(item, "ai_interpreted", "recommended_status", "Странная обратная связь")
 
 
 def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = False) -> dict[str, Any]:
@@ -18704,11 +19139,16 @@ def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = Fal
     api_key = llm_api_key()
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
     transcript = chat_day["transcript"]
+    previous_date = target_date - timedelta(days=1)
+    previous_chat_day = load_chat_day(dialog_id, previous_date)
+    previous_transcript = str(previous_chat_day.get("transcript") or "Нет сообщений")
     previous_day_tasks = load_previous_chat_tail_tasks(dialog_id, target_date)
     previous_day_tasks_for_prompt = compact_previous_chat_tail_tasks_for_prompt(previous_day_tasks, max_items=60, max_chars=24000)
     previous_day_tasks_text = format_previous_chat_tail_tasks_for_prompt(previous_day_tasks_for_prompt)
     previous_day_report_payload = compact_previous_chat_daily_report_for_prompt(dialog_id, target_date)
     previous_day_report_text = format_previous_chat_daily_report_for_prompt(previous_day_report_payload)
+    recommendation_feedback_context = load_recommendation_feedback_context_for_chat(dialog_id, target_date)
+    recommendation_feedback_text = format_recommendation_feedback_context_for_prompt(recommendation_feedback_context)
     previous_week_report = load_previous_chat_weekly_context(dialog_id, target_date)
     previous_week_text = compact_previous_week_report_for_prompt(previous_week_report, max_chars=5000)
     previous_week_payload = compact_previous_week_report_for_payload(previous_week_report)
@@ -18716,7 +19156,8 @@ def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = Fal
     zoom_calls_text = format_zoom_calls_for_chat_prompt(zoom_calls_for_prompt)
     if not api_key:
         raise ValueError("Для ИИ-отчета по чату укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
-    transcript_for_ai = transcript[:60000]
+    previous_transcript_for_ai = previous_transcript[:30000]
+    transcript_for_ai = transcript[:50000]
     prompt_id = None
     base_prompt = DEFAULT_CHAT_ANALYSIS_PROMPT
     if postgres_enabled():
@@ -18730,8 +19171,10 @@ def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = Fal
         + "Контекст анализа:\n"
         f"Дата: {target_date.isoformat()}\n"
         f"Чат: {(chat_day.get('chat') or {}).get('title') or dialog_id}\n\n"
+        f"Переписка предыдущего дня ({previous_date.isoformat()}):\n{previous_transcript_for_ai}\n\n"
         f"Хвосты с прошлого дня:\n{previous_day_tasks_text}\n\n"
         f"Отчет предыдущего дня:\n{previous_day_report_text}\n\n"
+        f"Адресные рекомендации и обратная связь:\n{recommendation_feedback_text}\n\n"
         f"Недельный контекст предыдущей недели:\n{previous_week_text}\n\n"
         f"Zoom-отчеты текущего дня:\n{zoom_calls_text}\n\n"
         f"Расшифровка:\n{transcript_for_ai}"
@@ -18780,6 +19223,9 @@ def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = Fal
                         "previous_day_tasks_total": len(previous_day_tasks),
                         "previous_day_tasks_used": len(previous_day_tasks_for_prompt),
                         "previous_day_report": previous_day_report_payload,
+                        "previous_transcript": previous_transcript_for_ai,
+                        "previous_transcript_truncated": len(previous_transcript) > len(previous_transcript_for_ai),
+                        "recommendation_feedback_context": recommendation_feedback_context,
                         "previous_week_report": previous_week_payload,
                         "zoom_calls": zoom_calls_for_prompt,
                         "zoom_calls_count": len(zoom_calls_for_prompt),
@@ -18857,6 +19303,8 @@ def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = Fal
             "transcript_format": "ordered_message_blocks_v2",
             "previous_day_tasks_input": previous_day_tasks,
             "previous_day_report_input": previous_day_report_payload,
+            "previous_transcript_input_truncated": len(previous_transcript) > len(previous_transcript_for_ai),
+            "recommendation_feedback_context_input": recommendation_feedback_context,
             "zoom_calls_input": zoom_calls_for_prompt,
             "zoom_source_type": "standalone_zoom_reports_analytical_note",
             "zoom_raw_transcripts_included": False,
@@ -19671,6 +20119,7 @@ def ensure_owner_reports_schema() -> None:
                 "owner_weekly_reports",
                 "owner_manager_recommendations",
                 "owner_recommendation_dispatches",
+                "owner_recommendation_events",
             )
             if all(pg_table_exists(cur, table_name) for table_name in required_tables):
                 return
@@ -19765,7 +20214,22 @@ def ensure_owner_reports_schema() -> None:
                         source_goal_id uuid NULL REFERENCES user_goals(id) ON DELETE SET NULL,
                         source_item_id uuid NULL REFERENCES chat_report_items(id) ON DELETE SET NULL,
                         source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
-                        status text NOT NULL DEFAULT 'new' CHECK (status IN ('new','queued','sent','acked','done','cancelled','error')),
+                        expected_action text NULL,
+                        response_due_at timestamptz NULL,
+                        execution_due_at timestamptz NULL,
+                        feedback_chat_id uuid NULL REFERENCES chats(id) ON DELETE SET NULL,
+                        feedback_dialog_id text NULL,
+                        current_interpretation jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        manager_review_required boolean NOT NULL DEFAULT FALSE,
+                        sent_at timestamptz NULL,
+                        last_response_at timestamptz NULL,
+                        closed_at timestamptz NULL,
+                        status text NOT NULL DEFAULT 'new' CHECK (status IN (
+                            'new','draft','queued','sent','seen','acked','accepted',
+                            'in_progress','needs_clarification','disagreed','delegated',
+                            'done','rejected','no_response','overdue',
+                            'requires_manager_review','cancelled','error'
+                        )),
                         created_at timestamptz NOT NULL DEFAULT now(),
                         updated_at timestamptz NOT NULL DEFAULT now(),
                         CHECK (
@@ -19808,7 +20272,7 @@ def ensure_owner_reports_schema() -> None:
                     CREATE TABLE IF NOT EXISTS owner_recommendation_dispatches (
                         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
                         recommendation_id uuid NOT NULL REFERENCES owner_manager_recommendations(id) ON DELETE CASCADE,
-                        channel text NOT NULL CHECK (channel IN ('bitrix_task_comment','bitrix_im','bitrix_task_create','manual')),
+                        channel text NOT NULL CHECK (channel IN ('bitrix_task_comment','bitrix_im','bitrix_notification','bitrix_task_create','manual')),
                         status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','sent','delivered','error','cancelled')),
                         bitrix_entity_type text NULL,
                         bitrix_entity_id bigint NULL,
@@ -19833,6 +20297,50 @@ def ensure_owner_reports_schema() -> None:
                     """
                     CREATE INDEX IF NOT EXISTS idx_ord_status
                         ON owner_recommendation_dispatches(status, created_at DESC);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS owner_recommendation_events (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        recommendation_id uuid NOT NULL REFERENCES owner_manager_recommendations(id) ON DELETE CASCADE,
+                        event_type text NOT NULL CHECK (event_type IN (
+                            'created','sent','delivered','seen','employee_replied',
+                            'ai_interpreted','status_changed','manager_reviewed',
+                            'task_created','closed','source_found'
+                        )),
+                        author_type text NOT NULL DEFAULT 'system' CHECK (author_type IN ('system','ai','manager','employee')),
+                        author_user_id uuid NULL REFERENCES users(id) ON DELETE SET NULL,
+                        author_bitrix_user_id bigint NULL,
+                        chat_id uuid NULL REFERENCES chats(id) ON DELETE SET NULL,
+                        dialog_id text NULL,
+                        chat_message_id uuid NULL,
+                        chat_message_day date NULL,
+                        bitrix_message_id bigint NULL,
+                        bitrix_task_id uuid NULL REFERENCES bitrix_tasks(id) ON DELETE SET NULL,
+                        bitrix_task_external_id bigint NULL,
+                        zoom_call_id uuid NULL REFERENCES zoom_calls(id) ON DELETE SET NULL,
+                        old_status text NULL,
+                        new_status text NULL,
+                        event_text text NULL,
+                        interpretation jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        event_at timestamptz NOT NULL DEFAULT now(),
+                        created_at timestamptz NOT NULL DEFAULT now()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_ore_recommendation_event_at
+                        ON owner_recommendation_events(recommendation_id, event_at DESC);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_ore_status
+                        ON owner_recommendation_events(new_status, event_at DESC)
+                        WHERE new_status IS NOT NULL;
                     """
                 )
 
