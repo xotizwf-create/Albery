@@ -24,6 +24,7 @@ SERVER_NAME = "employee-analytics-context"
 SERVER_VERSION = "0.2.1"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
+ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
 TOOL_USAGE_CONTRACT = (
     "MANDATORY: before using this tool for company work, call "
     "start_here_always_read_ai_instructions. If the user request is vague, "
@@ -122,13 +123,13 @@ def parse_date_arg(args: dict[str, Any], name: str, required: bool = True) -> da
         raise McpError(-32602, f"{name} must use YYYY-MM-DD format") from exc
 
 
-def parse_limit(args: dict[str, Any], default: int = 100) -> int:
+def parse_limit(args: dict[str, Any], default: int = 100, max_limit: int = MAX_LIMIT) -> int:
     raw = args.get("limit", default)
     try:
         limit = int(raw)
     except (TypeError, ValueError) as exc:
         raise McpError(-32602, "limit must be an integer") from exc
-    return max(1, min(limit, MAX_LIMIT))
+    return max(1, min(limit, max_limit))
 
 
 def parse_offset(args: dict[str, Any]) -> int:
@@ -1283,7 +1284,7 @@ def tool_get_zoom_call_transcript(args: dict[str, Any]) -> dict[str, Any]:
     if not call_id and not zoom_uuid:
         raise McpError(-32602, "Missing required argument: call_id or zoom_uuid")
     include_full_text = bool(args.get("include_full_text", True))
-    limit = parse_limit(args, 500)
+    limit = parse_limit(args, 500, ZOOM_TRANSCRIPT_MAX_LIMIT)
     offset = parse_offset(args)
 
     with connect() as conn:
@@ -2607,7 +2608,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "call_id": {"type": "string"},
                 "zoom_uuid": {"type": "string"},
                 "include_full_text": {"type": "boolean"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
+                "limit": {"type": "integer", "minimum": 1, "maximum": ZOOM_TRANSCRIPT_MAX_LIMIT},
                 "offset": {"type": "integer", "minimum": 0},
             },
             "additionalProperties": False,
