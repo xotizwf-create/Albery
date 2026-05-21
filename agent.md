@@ -558,6 +558,68 @@ journalctl -u albery -n 120 --no-pager
 curl -I http://127.0.0.1:5002
 ```
 
+## Google Apps Script (Google Drive company sync)
+
+Код Apps Script, который отдаёт документы и дерево папок из Google Drive,
+лежит в репозитории и деплоится через `clasp` (а НЕ через `update_server.sh`).
+
+- Проект: `scripts/google_drive_company_sync_project/` (`Code.gs`, `appsscript.json`)
+- `.clasp.json` в корне: `scriptId = 1ga97W3bs386A00JokAHZyiQffEC1fFFjOoyzJm5GXUYkKjd3aXiRUoO9`
+- Логин clasp: владелец скрипта `xotizwf@gmail.com` (`clasp show-authorized-user`)
+- Прод web app deployment (это и есть `/exec` в `GOOGLE_APPS_SCRIPT_SYNC_URL`):
+  - deploymentId = `AKfycbwsEL8z_HAoNmLP9utV4HCtkNDAcgbaAxnWsZ1Njs7h4L6DcrmRzcehzxB1y070CarBgA`
+  - `/exec` URL = `https://script.google.com/macros/s/<deploymentId>/exec`
+
+Обновление кода Apps Script (обновляет существующий `/exec`, URL не меняется):
+
+```bash
+clasp push --force
+clasp redeploy AKfycbwsEL8z_HAoNmLP9utV4HCtkNDAcgbaAxnWsZ1Njs7h4L6DcrmRzcehzxB1y070CarBgA -d "что изменилось"
+clasp deployments   # проверить активную версию
+```
+
+ВАЖНО — почему раньше `/exec` отдавал 404 после CLI-деплоя:
+
+- Используйте `clasp redeploy <deploymentId>` (обновление на месте), а не
+  `clasp deploy` (создаёт НОВЫЙ deployment с другим URL).
+- В `appsscript.json` обязан быть блок `webapp`, иначе clasp создаёт версию
+  без web app entry point и `/exec` отдаёт 404:
+
+  ```json
+  "webapp": { "executeAs": "USER_DEPLOYING", "access": "ANYONE_ANONYMOUS" }
+  ```
+
+Проверка, что `/exec` живой (должен вернуть JSON `{"ok": true, ...}`, не HTML):
+
+```bash
+token=$(awk -F= '$1=="GOOGLE_APPS_SCRIPT_SYNC_TOKEN"{print $2; exit}' .env)
+url=$(awk -F= '$1=="GOOGLE_APPS_SCRIPT_SYNC_URL"{sub(/^[^=]*=/,""); print; exit}' .env)
+curl -sS -L "$url?token=$token" | head -c 200
+```
+
+Логика синхронизации (инкрементально, без перезаписи неизменных файлов):
+
+- сервер шлёт в Apps Script `known_files`/`known_folders` (id, имя, `updated_at`,
+  `parent_folder_id`, `path`); скрипт по ним помечает неизменные файлы
+  `unchanged: true` и НЕ выгружает их контент (DOC/XLS не конвертируются заново);
+- сервер обновляет `company_folders` только при реальном изменении
+  (сравнение `content_hash`, пути, родителя), иначе только `last_seen_at`;
+- структура Google Drive зеркалится: папки -> `company_drive_folders` +
+  `company_folders`, документы кладутся внутрь своих папок;
+- временный сбой конвертации (`document_errors`, напр. Drive rate limit) НЕ
+  удаляет уже синхронизированный документ — он подтянется на следующем прогоне.
+
+Запустить серверную синхронизацию вручную:
+
+```bash
+cd /var/www/albery
+.venv/bin/python - <<'PY'
+from dotenv import load_dotenv; load_dotenv("/var/www/albery/.env")
+import app, json
+print(json.dumps(app.sync_google_drive_company_documents(), ensure_ascii=False, default=str)[:600])
+PY
+```
+
 ## Frontend
 
 Папка:
