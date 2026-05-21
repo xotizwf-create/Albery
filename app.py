@@ -20378,6 +20378,9 @@ def google_drive_event_webhook(secret: str):
             try:
                 result = sync_google_drive_company_documents()
             except Exception as exc:  # noqa: BLE001
+                # Log so transient failures (e.g. a momentary Apps Script /exec
+                # hiccup) are diagnosable; returning 500 makes the trigger retry.
+                app.logger.exception("google-drive change webhook sync failed")
                 return jsonify({"ok": False, "error": str(exc)}), 500
             finally:
                 cur.execute("SELECT pg_advisory_unlock(%s)", (GOOGLE_DRIVE_SYNC_ADVISORY_LOCK_KEY,))

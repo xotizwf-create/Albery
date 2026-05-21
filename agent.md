@@ -620,6 +620,23 @@ print(json.dumps(app.sync_google_drive_company_documents(), ensure_ascii=False, 
 PY
 ```
 
+Авто-обновление по триггеру (near-realtime, ~1 минута):
+
+- В Apps Script стоит time-driven триггер `checkDriveChangesAndNotify`
+  (раз в минуту). Он считает лёгкую сигнатуру дерева папки (id, время правки,
+  имена, родители; БЕЗ контента) и пингует сервер ТОЛЬКО при реальном изменении.
+- Сервер: вебхук `POST /google-drive/events/<GOOGLE_DRIVE_EVENT_SECRET>` запускает
+  ту же инкрементальную синхронизацию под Postgres advisory-lock (не пересекается
+  с почасовым cron / ручной кнопкой; если занято — 409, триггер повторит).
+- Секрет: `.env` `GOOGLE_DRIVE_EVENT_SECRET` == `CHANGE_NOTIFY_URL` в `Code.gs`.
+- Триггер создаётся ОДИН раз вручную: открыть редактор скрипта, выбрать функцию
+  `setupDriveChangeTrigger`, нажать Run, пройти авторизацию (нужны scope
+  `script.scriptapp` и `drive`). Повторный запуск безопасен (старые триггеры
+  удаляются). Снять триггер: запустить `removeDriveChangeTriggers`.
+- Проверка вебхука: `curl https://mcp.m4s.ru/google-drive/events/<secret>` -> JSON
+  `{"ok": true, ...}`; `POST` туда же запускает синхронизацию и возвращает result.
+- Триггеры в Apps Script: https://script.google.com/home/triggers
+
 ## Frontend
 
 Папка:
