@@ -135,6 +135,7 @@ def main() -> int:
     if webhook_base:
         steps.extend([
             ("bitrix_team", lambda: app.sync_bitrix_team(webhook_base)),
+            ("bitrix_task_events", lambda: app.process_bitrix_task_event_queue(limit=100)),
             ("bitrix_tasks", lambda: app.build_period_export(bitrix_from, today, webhook_base)[0].get("meta", {})),
             ("bitrix_chat_messages", lambda: app.sync_all_chat_dialogs_for_period(chat_from, today, webhook_base, generate_reports=generate_chat_reports)),
         ])

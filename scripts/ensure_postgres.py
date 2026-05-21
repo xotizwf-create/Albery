@@ -23,6 +23,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "company_drive_sources": "014_company_drive_sources.sql",
     "ai_instruction_folders": "015_ai_instruction_folders.sql",
     "chat_day_syncs": "016_chat_day_syncs.sql",
+    "bitrix_task_events": "018_bitrix_task_events.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {

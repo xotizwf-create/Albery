@@ -3,6 +3,7 @@
 import json
 import hashlib
 import base64
+import hmac
 import html
 import mimetypes
 import os
@@ -1592,6 +1593,217 @@ def delete_task_records(task_ids: list[int]) -> int:
         conn.execute(f"DELETE FROM task_snapshots WHERE task_id IN ({placeholders})", task_ids)
         cur = conn.execute(f"DELETE FROM tasks WHERE task_id IN ({placeholders})", task_ids)
         return int(cur.rowcount)
+
+
+def ensure_bitrix_task_event_queue_schema() -> None:
+    if not postgres_enabled():
+        return
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            if pg_table_exists(cur, "public.bitrix_task_events"):
+                return
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bitrix_task_events (
+                        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        event_name text NOT NULL,
+                        bitrix_task_id bigint NOT NULL,
+                        status text NOT NULL DEFAULT 'queued'
+                            CHECK (status IN ('queued','processing','done','error','ignored')),
+                        attempts int NOT NULL DEFAULT 0,
+                        payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        error_text text NULL,
+                        received_at timestamptz NOT NULL DEFAULT now(),
+                        processed_at timestamptz NULL,
+                        updated_at timestamptz NOT NULL DEFAULT now()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_bitrix_task_events_status_received
+                        ON bitrix_task_events(status, received_at);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_bitrix_task_events_task_received
+                        ON bitrix_task_events(bitrix_task_id, received_at DESC);
+                    """
+                )
+
+
+def bitrix_event_secret_valid(secret: str) -> bool:
+    expected = os.getenv("BITRIX_EVENT_SECRET", "").strip()
+    if not expected:
+        return False
+    return hmac.compare_digest(secret, expected)
+
+
+def flatten_request_payload() -> dict[str, Any]:
+    json_payload = request.get_json(silent=True)
+    if isinstance(json_payload, dict):
+        return json_payload
+    payload: dict[str, Any] = {}
+    for key in request.form:
+        values = request.form.getlist(key)
+        payload[key] = values if len(values) > 1 else (values[0] if values else "")
+    for key in request.args:
+        if key not in payload:
+            values = request.args.getlist(key)
+            payload[key] = values if len(values) > 1 else (values[0] if values else "")
+    return payload
+
+
+def normalize_bitrix_event_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    lowered = text.lower()
+    if lowered == "ontaskadd":
+        return "OnTaskAdd"
+    if lowered == "ontaskupdate":
+        return "OnTaskUpdate"
+    if lowered == "ontaskdelete":
+        return "OnTaskDelete"
+    return text
+
+
+def extract_bitrix_event_task_id(payload: dict[str, Any]) -> int | None:
+    candidates = (
+        pick(payload, "data.FIELDS_AFTER.ID", "data.FIELDS_AFTER.TASK_ID"),
+        pick(payload, "data.FIELDS_BEFORE.ID", "data.FIELDS_BEFORE.TASK_ID"),
+        pick(payload, "data.TASK_ID", "data.ID", "task_id", "TASK_ID", "ID", "id"),
+    )
+    for value in candidates:
+        task_id = to_int(value)
+        if task_id is not None:
+            return task_id
+
+    for key, value in payload.items():
+        key_lower = str(key).lower()
+        if "data" not in key_lower:
+            continue
+        if "task" not in key_lower and not key_lower.endswith("[id]"):
+            continue
+        task_id = to_int(value[0] if isinstance(value, list) and value else value)
+        if task_id is not None:
+            return task_id
+    return None
+
+
+def enqueue_bitrix_task_event(event_name: str, task_id: int, payload: dict[str, Any]) -> str:
+    ensure_bitrix_task_event_queue_schema()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bitrix_task_events (event_name, bitrix_task_id, payload)
+                    VALUES (%s, %s, %s)
+                    RETURNING id
+                    """,
+                    (event_name, task_id, pg_json(payload)),
+                )
+                return str(cur.fetchone()["id"])
+
+
+def sync_bitrix_task_by_id(task_id: int, event_name: str = "manual") -> dict[str, Any]:
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if not webhook_base:
+        raise RuntimeError("BITRIX_WEBHOOK_BASE не задан")
+
+    normalized_event = normalize_bitrix_event_name(event_name)
+    if normalized_event == "OnTaskDelete":
+        deleted = delete_task_records([task_id])
+        return {"task_id": task_id, "event": normalized_event, "action": "deleted", "deleted": deleted}
+
+    client = BitrixClient(webhook_base)
+    details = client.get_task_details(task_id)
+    if not details:
+        deleted = delete_task_records([task_id])
+        return {
+            "task_id": task_id,
+            "event": normalized_event,
+            "action": "deleted_missing_or_inaccessible",
+            "deleted": deleted,
+        }
+    if "id" not in details and "ID" not in details:
+        details["id"] = task_id
+    record = build_task_record(client, details)
+    upsert_task_records([record], sync_run_id=None)
+    return {"task_id": task_id, "event": normalized_event, "action": "upserted"}
+
+
+def process_bitrix_task_event_queue(limit: int = 20) -> dict[str, Any]:
+    ensure_bitrix_task_event_queue_schema()
+    limit = max(1, min(int(limit or 20), 100))
+    processed: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, event_name, bitrix_task_id
+                FROM bitrix_task_events
+                WHERE status IN ('queued','error') AND attempts < 5
+                ORDER BY received_at ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+
+    for row in rows:
+        event_id = row["id"]
+        event_name = row["event_name"]
+        task_id = int(row["bitrix_task_id"])
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE bitrix_task_events
+                        SET status = 'processing', attempts = attempts + 1, updated_at = now()
+                        WHERE id = %s AND status IN ('queued','error')
+                        """,
+                        (event_id,),
+                    )
+                    if cur.rowcount != 1:
+                        continue
+        try:
+            result = sync_bitrix_task_by_id(task_id, event_name)
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE bitrix_task_events
+                            SET status = 'done', error_text = NULL, processed_at = now(), updated_at = now()
+                            WHERE id = %s
+                            """,
+                            (event_id,),
+                        )
+            processed.append({"event_id": str(event_id), **result})
+        except Exception as exc:  # noqa: BLE001
+            error_text = str(exc)
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE bitrix_task_events
+                            SET status = 'error', error_text = %s, updated_at = now()
+                            WHERE id = %s
+                            """,
+                            (error_text, event_id),
+                        )
+            errors.append({"event_id": str(event_id), "task_id": task_id, "event": event_name, "error": error_text})
+    return {"processed": processed, "errors": errors, "processed_count": len(processed), "error_count": len(errors)}
 
 
 def reconcile_deleted_tasks(
@@ -18390,6 +18602,7 @@ AUTH_EXEMPT_PREFIXES = (
     "/mcp-faq",
     "/sse",
     "/sse-faq",
+    "/bitrix/events/",
 )
 
 
@@ -18440,7 +18653,7 @@ def canonical_web_redirect():
     current_host = request.host.split(":", 1)[0].lower()
     if current_host in {canonical_host, mcp_host}:
         return None
-    if request.path.startswith(("/mcp", "/mcp-faq", "/sse", "/sse-faq")) and mcp_host:
+    if request.path.startswith(("/mcp", "/mcp-faq", "/sse", "/sse-faq", "/bitrix/events/")) and mcp_host:
         target_host = mcp_host
     else:
         target_host = canonical_host
@@ -18981,6 +19194,45 @@ def api_full_sync():
         "export_filename": export_filename,
         "download_url": url_for("download_export", filename=export_filename),
     })
+
+
+@app.route("/bitrix/events/tasks/<secret>", methods=["GET", "POST"])
+def bitrix_task_event_webhook(secret: str):
+    if not bitrix_event_secret_valid(secret):
+        return jsonify({"error": "forbidden"}), 403
+    if request.method == "GET":
+        return jsonify({"ok": True, "message": "Bitrix task event endpoint is ready."})
+
+    payload = flatten_request_payload()
+    event_name = normalize_bitrix_event_name(first_non_empty(payload.get("event"), payload.get("EVENT")))
+    if event_name not in {"OnTaskAdd", "OnTaskUpdate", "OnTaskDelete"}:
+        return jsonify({"ok": True, "event": event_name, "ignored": True, "reason": "unsupported_event"})
+    task_id = extract_bitrix_event_task_id(payload)
+    if task_id is None or task_id <= 0:
+        return jsonify({"ok": True, "event": event_name, "ignored": True, "reason": "task_id_not_found"}), 200
+
+    event_id = enqueue_bitrix_task_event(event_name, task_id, payload)
+    inline = str(os.getenv("BITRIX_TASK_EVENT_PROCESS_INLINE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    process_result = process_bitrix_task_event_queue(limit=5) if inline else None
+    return jsonify({
+        "ok": True,
+        "event_id": event_id,
+        "event": event_name,
+        "task_id": task_id,
+        "queued": True,
+        "processed_inline": inline,
+        "process_result": process_result,
+    })
+
+
+@app.post("/api/bitrix/task-events/process")
+def api_process_bitrix_task_events():
+    secret = str(first_non_empty(request.args.get("secret"), request.headers.get("X-Bitrix-Event-Secret")) or "")
+    if not bitrix_event_secret_valid(secret):
+        return jsonify({"error": "forbidden"}), 403
+    payload = request.get_json(silent=True) or request.form
+    limit = to_int(payload.get("limit")) or 20
+    return jsonify(process_bitrix_task_event_queue(limit=limit))
 
 
 @app.post("/api/zoom-calls/sync")
