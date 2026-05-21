@@ -651,8 +651,16 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
                     parent_id = root_id
                     if parent_google_folder_id and parent_google_folder_id != root_google_folder_id:
                         parent_id = google_folder_to_local.get(parent_google_folder_id, root_id)
+                    # path_parts holds the parent folder chain only; the file
+                    # name is appended below. Never fall back to `path` here:
+                    # `path` already includes the file name, which would double
+                    # it for root files ([] is falsy) and break the Apps Script
+                    # "unchanged" comparison, forcing a re-download every sync.
+                    document_path_parts = document.get("path_parts")
+                    if not isinstance(document_path_parts, list):
+                        document_path_parts = []
                     drive_path = google_drive_path_from_parts(
-                        document.get("path_parts") or document.get("path"),
+                        document_path_parts,
                         file_name=name,
                     )
                     existing_row = existing.get(google_file_id)
