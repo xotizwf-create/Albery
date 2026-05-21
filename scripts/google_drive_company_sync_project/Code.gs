@@ -3,6 +3,12 @@ const CALLS_FOLDER_ID = '11cy4HOs1IPOgrIsI9cVDZMnZ5i4UYgCG';
 const SYNC_TOKEN = 'C-NJb3jZB_PYpOAQZboPjcuL7zauBlOul1IYB6dt0dWslO2Rd70B6am-9teKP4aP';
 const TRANSCRIPT_FILE_NAME = 'transcript.txt';
 
+// Near-realtime sync: a 1-minute time-driven trigger checks the watched folder
+// and pings the server only when something actually changed. Run
+// setupDriveChangeTrigger() once from the editor to create the trigger.
+const CHANGE_NOTIFY_URL = 'https://mcp.m4s.ru/google-drive/events/jTL8ej_9dJuzaZAAFwYDV5nTh496n4Mytn-xT2W0Q_872nVX';
+const CHANGE_SIGNATURE_PROPERTY = 'companyFolderSignature';
+
 const MIME_GOOGLE_DOC = 'application/vnd.google-apps.document';
 const MIME_GOOGLE_SHEET = 'application/vnd.google-apps.spreadsheet';
 const MIME_DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
@@ -515,4 +521,96 @@ function jsonResponse(payload) {
   return ContentService
     .createTextOutput(JSON.stringify(payload))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ---------------------------------------------------------------------------
+// Near-realtime change detection
+// ---------------------------------------------------------------------------
+
+// Run this ONCE from the Apps Script editor (Run -> setupDriveChangeTrigger).
+// It authorizes the script and installs a time-driven trigger that fires every
+// minute. Safe to run again; it removes duplicate triggers first.
+function setupDriveChangeTrigger() {
+  removeDriveChangeTriggers();
+  ScriptApp.newTrigger('checkDriveChangesAndNotify')
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+  // Store the current state as the baseline so only future changes notify.
+  PropertiesService.getScriptProperties().setProperty(
+    CHANGE_SIGNATURE_PROPERTY,
+    computeFolderSignature()
+  );
+}
+
+function removeDriveChangeTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function (trigger) {
+    if (trigger.getHandlerFunction() === 'checkDriveChangesAndNotify') {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+// Trigger handler: compares a lightweight signature of the watched folder tree
+// (file/folder ids + last-updated times + names + parents, no file content)
+// against the previous run and pings the server only when it changed.
+function checkDriveChangesAndNotify() {
+  const props = PropertiesService.getScriptProperties();
+  const previous = props.getProperty(CHANGE_SIGNATURE_PROPERTY) || '';
+  const current = computeFolderSignature();
+  if (current === previous) {
+    return;
+  }
+  // Persist the new signature only after the server confirms receipt, so a
+  // transient failure is retried on the next minute instead of being lost.
+  if (notifyServerOfDriveChange()) {
+    props.setProperty(CHANGE_SIGNATURE_PROPERTY, current);
+  }
+}
+
+function notifyServerOfDriveChange() {
+  if (!CHANGE_NOTIFY_URL) {
+    return false;
+  }
+  try {
+    const response = UrlFetchApp.fetch(CHANGE_NOTIFY_URL, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({ source: 'drive_change_trigger', at: new Date().toISOString() }),
+      muteHttpExceptions: true,
+    });
+    const code = response.getResponseCode();
+    // 2xx = synced. 409 = server busy with another sync; keep old signature and
+    // retry next minute. Other codes also retry.
+    return code >= 200 && code < 300;
+  } catch (error) {
+    return false;
+  }
+}
+
+function computeFolderSignature() {
+  const parts = [];
+  collectSignature(DriveApp.getFolderById(FOLDER_ID), parts);
+  parts.sort();
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.MD5,
+    parts.join('|'),
+    Utilities.Charset.UTF_8
+  );
+  return Utilities.base64Encode(digest);
+}
+
+function collectSignature(folder, parts) {
+  const parentId = folder.getId();
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    const file = files.next();
+    parts.push('f:' + file.getId() + ':' + parentId + ':' + file.getLastUpdated().getTime() + ':' + file.getName());
+  }
+  const folders = folder.getFolders();
+  while (folders.hasNext()) {
+    const child = folders.next();
+    parts.push('d:' + child.getId() + ':' + parentId + ':' + child.getName());
+    collectSignature(child, parts);
+  }
 }

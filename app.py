@@ -4144,6 +4144,18 @@ def zoom_event_secret_valid(secret: str) -> bool:
     return hmac.compare_digest(secret, expected)
 
 
+def google_drive_event_secret_valid(secret: str) -> bool:
+    expected = os.getenv("GOOGLE_DRIVE_EVENT_SECRET", "").strip()
+    if not expected:
+        return False
+    return hmac.compare_digest(secret, expected)
+
+
+# Postgres advisory-lock key so a webhook-triggered company sync never overlaps
+# another sync (hourly cron, manual button, or a second webhook ping).
+GOOGLE_DRIVE_SYNC_ADVISORY_LOCK_KEY = 728145903
+
+
 def zoom_webhook_secret_token() -> str:
     return os.getenv("ZOOM_WEBHOOK_SECRET_TOKEN", "").strip()
 
@@ -19655,6 +19667,7 @@ AUTH_EXEMPT_PREFIXES = (
     "/sse-faq",
     "/bitrix/events/",
     "/zoom/events/",
+    "/google-drive/events/",
 )
 
 
@@ -19705,7 +19718,7 @@ def canonical_web_redirect():
     current_host = request.host.split(":", 1)[0].lower()
     if current_host in {canonical_host, mcp_host}:
         return None
-    if request.path.startswith(("/mcp", "/mcp-faq", "/sse", "/sse-faq", "/bitrix/events/", "/zoom/events/")) and mcp_host:
+    if request.path.startswith(("/mcp", "/mcp-faq", "/sse", "/sse-faq", "/bitrix/events/", "/zoom/events/", "/google-drive/events/")) and mcp_host:
         target_host = mcp_host
     else:
         target_host = canonical_host
@@ -20334,6 +20347,41 @@ def api_process_zoom_recording_events():
     payload = request.get_json(silent=True) or request.form
     limit = to_int(payload.get("limit")) or 20
     return jsonify(process_zoom_recording_event_queue(limit=limit))
+
+
+@app.route("/google-drive/events/<secret>", methods=["GET", "POST"])
+def google_drive_event_webhook(secret: str):
+    """Near-realtime company Drive sync.
+
+    The Apps Script time-driven trigger (every minute) pings this endpoint only
+    when it detects a real change (file created/updated/deleted/moved/renamed)
+    in the watched Google Drive folder. We then run the existing incremental
+    sync, so create/update/delete is reflected within ~1 minute.
+    """
+    if not google_drive_event_secret_valid(secret):
+        return jsonify({"error": "forbidden"}), 403
+    if request.method == "GET":
+        return jsonify({"ok": True, "message": "Google Drive change event endpoint is ready."})
+
+    inline = str(os.getenv("GOOGLE_DRIVE_EVENT_PROCESS_INLINE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    if not inline:
+        return jsonify({"ok": True, "processed_inline": False, "message": "Inline processing disabled."})
+
+    # Serialize across processes (hourly cron / manual button / other pings).
+    # If another sync holds the lock, return 409 so the Apps Script keeps its
+    # change marker and retries on the next minute instead of double-running.
+    with pg_connect() as lock_conn:
+        with lock_conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s) AS locked", (GOOGLE_DRIVE_SYNC_ADVISORY_LOCK_KEY,))
+            if not bool(cur.fetchone()["locked"]):
+                return jsonify({"ok": False, "busy": True, "message": "Company Drive sync already running."}), 409
+            try:
+                result = sync_google_drive_company_documents()
+            except Exception as exc:  # noqa: BLE001
+                return jsonify({"ok": False, "error": str(exc)}), 500
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (GOOGLE_DRIVE_SYNC_ADVISORY_LOCK_KEY,))
+    return jsonify({"ok": True, "processed_inline": True, "result": result})
 
 
 @app.post("/api/zoom-calls/sync")
