@@ -26,6 +26,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "bitrix_task_events": "018_bitrix_task_events.sql",
     "zoom_recording_events": "019_zoom_recording_events.sql",
     "owner_recommendation_events": "020_recommendation_feedback_events.sql",
+    "company_drive_folders": "021_company_drive_folders.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {

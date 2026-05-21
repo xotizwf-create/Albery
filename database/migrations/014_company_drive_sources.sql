@@ -14,3 +14,7 @@ CREATE TABLE IF NOT EXISTS company_drive_sources (
 
 CREATE INDEX IF NOT EXISTS idx_company_drive_sources_folder
     ON company_drive_sources(folder_id);
+
+ALTER TABLE company_drive_sources
+    ADD COLUMN IF NOT EXISTS parent_google_folder_id TEXT,
+    ADD COLUMN IF NOT EXISTS drive_path TEXT NOT NULL DEFAULT '';

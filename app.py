@@ -235,7 +235,7 @@ def ensure_company_profile_schema() -> None:
     with pg_connect() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
-                required_tables = ("company_profile", "company_folders", "company_drive_sources")
+                required_tables = ("company_profile", "company_folders", "company_drive_sources", "company_drive_folders")
                 for table_name in required_tables:
                     cur.execute("SELECT to_regclass(%s) IS NOT NULL AS exists", (f"public.{table_name}",))
                     row = cur.fetchone()
@@ -300,10 +300,26 @@ def google_drive_company_sync_config() -> tuple[str, str]:
     return sync_url, token
 
 
-def fetch_google_drive_company_payload() -> dict[str, Any]:
+def fetch_google_drive_company_payload(
+    known_files: dict[str, dict[str, Any]] | None = None,
+    known_folders: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     sync_url, token = google_drive_company_sync_config()
     timeout = int(os.getenv("GOOGLE_DRIVE_SYNC_TIMEOUT_SECONDS", "600") or "600")
-    response = requests.get(sync_url, params={"token": token}, timeout=timeout)
+    if known_files is not None or known_folders is not None:
+        try:
+            response = requests.post(
+                sync_url,
+                json={"token": token, "known_files": known_files or {}, "known_folders": known_folders or {}},
+                timeout=timeout,
+            )
+        except requests.RequestException:
+            response = requests.get(sync_url, params={"token": token}, timeout=timeout)
+        else:
+            if response.status_code in {404, 405}:
+                response = requests.get(sync_url, params={"token": token}, timeout=timeout)
+    else:
+        response = requests.get(sync_url, params={"token": token}, timeout=timeout)
     if not response.ok:
         raise RuntimeError(f"Google Apps Script вернул HTTP {response.status_code}: {response.text[:500]}")
     payload = response.json()
@@ -319,6 +335,17 @@ def fetch_google_drive_company_documents() -> list[dict[str, Any]]:
     if not isinstance(documents, list):
         raise RuntimeError("Google Apps Script вернул documents не в виде списка")
     return [doc for doc in documents if isinstance(doc, dict)]
+
+
+def google_drive_path_from_parts(value: Any, file_name: str | None = None) -> str:
+    if isinstance(value, list):
+        parts = [str(part).strip() for part in value if str(part).strip()]
+    else:
+        raw = str(value or "").strip()
+        parts = [part.strip() for part in raw.split("/") if part.strip()] if raw else []
+    if file_name:
+        parts = [*parts, file_name]
+    return " / ".join(parts)
 
 
 def google_drive_document_content(document: dict[str, Any]) -> str:
@@ -435,26 +462,165 @@ def parse_google_timestamp(value: Any) -> datetime | None:
         return None
 
 
+def google_timestamp_for_apps_script(value: Any) -> str:
+    if not isinstance(value, datetime):
+        return ""
+    current = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    return current.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def sync_google_drive_company_documents() -> dict[str, Any]:
-    payload = fetch_google_drive_company_payload()
+    ensure_company_profile_schema()
+    known_files: dict[str, dict[str, Any]] = {}
+    known_folders: dict[str, dict[str, Any]] = {}
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT google_file_id, name, google_updated_at, content_hash, parent_google_folder_id, drive_path
+                FROM company_drive_sources
+                """
+            )
+            for row in cur.fetchall():
+                known_files[str(row["google_file_id"])] = {
+                    "name": row["name"],
+                    "updated_at": google_timestamp_for_apps_script(row["google_updated_at"]),
+                    "content_hash": row["content_hash"] or "",
+                    "parent_folder_id": row["parent_google_folder_id"] or "",
+                    "path": row["drive_path"] or "",
+                }
+            cur.execute(
+                """
+                SELECT google_folder_id, name, parent_google_folder_id, drive_path
+                FROM company_drive_folders
+                """
+            )
+            for row in cur.fetchall():
+                known_folders[str(row["google_folder_id"])] = {
+                    "name": row["name"],
+                    "parent_folder_id": row["parent_google_folder_id"] or "",
+                    "path": row["drive_path"] or "",
+                }
+
+    payload = fetch_google_drive_company_payload(known_files=known_files, known_folders=known_folders)
     documents_raw = payload.get("documents", [])
     if not isinstance(documents_raw, list):
         raise RuntimeError("Google Apps Script вернул documents не в виде списка")
+    folders_raw = payload.get("folders")
+    has_folder_listing = isinstance(folders_raw, list)
+    folders = [folder for folder in folders_raw if isinstance(folder, dict)] if has_folder_listing else []
     documents = [doc for doc in documents_raw if isinstance(doc, dict)]
     document_errors = payload.get("document_errors", [])
     skipped_files = payload.get("skipped_files", [])
-    seen_ids: set[str] = set()
+    root_google_folder_id = str(payload.get("folder_id") or "").strip()
+    seen_file_ids: set[str] = set()
+    seen_folder_ids: set[str] = set()
     created = 0
     updated = 0
+    unchanged = 0
+    folders_created = 0
+    folders_updated = 0
+    folders_unchanged = 0
     skipped = 0
 
-    ensure_company_profile_schema()
     with pg_connect() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
                 root_id = ensure_company_drive_root(cur)
                 cur.execute("SELECT google_file_id, folder_id, content_hash FROM company_drive_sources")
                 existing = {str(row["google_file_id"]): row for row in cur.fetchall()}
+                cur.execute("SELECT google_folder_id, folder_id, name, parent_google_folder_id, drive_path FROM company_drive_folders")
+                existing_folders = {str(row["google_folder_id"]): row for row in cur.fetchall()}
+                google_folder_to_local: dict[str, str] = {
+                    google_id: str(row["folder_id"]) for google_id, row in existing_folders.items()
+                }
+
+                for folder in sorted(folders, key=lambda item: len(item.get("path_parts") or [])):
+                    google_folder_id = str(folder.get("id") or "").strip()
+                    name = str(folder.get("name") or "").strip()
+                    if not google_folder_id or not name:
+                        continue
+                    seen_folder_ids.add(google_folder_id)
+                    parent_google_folder_id = str(folder.get("parent_folder_id") or "").strip() or None
+                    parent_id = root_id
+                    if parent_google_folder_id and parent_google_folder_id != root_google_folder_id:
+                        parent_id = google_folder_to_local.get(parent_google_folder_id, root_id)
+                    drive_path = google_drive_path_from_parts(folder.get("path_parts") or folder.get("path"))
+                    source_url = str(folder.get("url") or "").strip() or None
+                    existing_folder = existing_folders.get(google_folder_id)
+                    if existing_folder:
+                        local_folder_id = str(existing_folder["folder_id"])
+                        metadata_changed = (
+                            str(existing_folder["name"] or "") != name
+                            or str(existing_folder["parent_google_folder_id"] or "") != (parent_google_folder_id or "")
+                            or str(existing_folder["drive_path"] or "") != drive_path
+                        )
+                        if metadata_changed:
+                            cur.execute(
+                                """
+                                UPDATE company_folders
+                                SET parent_id = %s, name = %s, updated_at = now()
+                                WHERE id = %s
+                                """,
+                                (parent_id, name, local_folder_id),
+                            )
+                            cur.execute(
+                                """
+                                UPDATE company_drive_folders
+                                SET name = %s,
+                                    parent_google_folder_id = %s,
+                                    source_url = %s,
+                                    drive_path = %s,
+                                    raw_json = %s,
+                                    last_seen_at = now(),
+                                    updated_at = now()
+                                WHERE google_folder_id = %s
+                                """,
+                                (name, parent_google_folder_id, source_url, drive_path, Jsonb(folder), google_folder_id),
+                            )
+                            folders_updated += 1
+                        else:
+                            cur.execute(
+                                """
+                                UPDATE company_drive_folders
+                                SET last_seen_at = now(), raw_json = %s
+                                WHERE google_folder_id = %s
+                                """,
+                                (Jsonb(folder), google_folder_id),
+                            )
+                            folders_unchanged += 1
+                    else:
+                        cur.execute(
+                            """
+                            SELECT COALESCE(max(sort_order), -1) + 1 AS next_order
+                            FROM company_folders
+                            WHERE parent_id = %s
+                            """,
+                            (parent_id,),
+                        )
+                        sort_order = cur.fetchone()["next_order"]
+                        cur.execute(
+                            """
+                            INSERT INTO company_folders (parent_id, name, content, sort_order)
+                            VALUES (%s, %s, '', %s)
+                            RETURNING id
+                            """,
+                            (parent_id, name, sort_order),
+                        )
+                        local_folder_id = str(cur.fetchone()["id"])
+                        cur.execute(
+                            """
+                            INSERT INTO company_drive_folders (
+                                google_folder_id, folder_id, parent_google_folder_id, name,
+                                source_url, drive_path, raw_json
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (google_folder_id, local_folder_id, parent_google_folder_id, name, source_url, drive_path, Jsonb(folder)),
+                        )
+                        google_folder_to_local[google_folder_id] = local_folder_id
+                        folders_created += 1
 
                 for document in documents:
                     google_file_id = str(document.get("id") or "").strip()
@@ -462,13 +628,19 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
                     if not google_file_id or not name:
                         skipped += 1
                         continue
-                    seen_ids.add(google_file_id)
+                    seen_file_ids.add(google_file_id)
 
-                    content = google_drive_document_structured_content(document)
-                    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
                     mime_type = str(document.get("mime_type") or "").strip()
                     source_url = str(document.get("url") or "").strip() or None
                     google_updated_at = parse_google_timestamp(document.get("updated_at"))
+                    parent_google_folder_id = str(document.get("parent_folder_id") or "").strip() or None
+                    parent_id = root_id
+                    if parent_google_folder_id and parent_google_folder_id != root_google_folder_id:
+                        parent_id = google_folder_to_local.get(parent_google_folder_id, root_id)
+                    drive_path = google_drive_path_from_parts(
+                        document.get("path_parts") or document.get("path"),
+                        file_name=name,
+                    )
                     existing_row = existing.get(google_file_id)
 
                     if existing_row:
@@ -476,16 +648,67 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
                         cur.execute("SELECT id FROM company_folders WHERE id = %s", (folder_id,))
                         if not cur.fetchone():
                             existing_row = None
+                        elif not parent_google_folder_id and not has_folder_listing:
+                            parent_id = folder_id
 
+                    is_unchanged_payload = bool(document.get("unchanged"))
                     if existing_row:
                         folder_id = str(existing_row["folder_id"])
+                        if is_unchanged_payload:
+                            cur.execute(
+                                """
+                                UPDATE company_drive_sources
+                                SET last_seen_at = now(), raw_json = %s
+                                WHERE google_file_id = %s
+                                """,
+                                (Jsonb(document), google_file_id),
+                            )
+                            unchanged += 1
+                            continue
+
+                        content = google_drive_document_structured_content(document)
+                        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                        metadata_changed = False
+                        cur.execute(
+                            """
+                            SELECT f.parent_id, f.name, ds.name AS source_name, ds.mime_type, ds.source_url,
+                                   ds.google_updated_at, ds.content_hash, ds.parent_google_folder_id, ds.drive_path
+                            FROM company_folders f
+                            JOIN company_drive_sources ds ON ds.folder_id = f.id
+                            WHERE ds.google_file_id = %s
+                            """,
+                            (google_file_id,),
+                        )
+                        current_row = cur.fetchone()
+                        if current_row:
+                            metadata_changed = (
+                                str(current_row["parent_id"]) != str(parent_id)
+                                or str(current_row["name"] or "") != name
+                                or str(current_row["mime_type"] or "") != mime_type
+                                or str(current_row["source_url"] or "") != str(source_url or "")
+                                or google_timestamp_for_apps_script(current_row["google_updated_at"]) != google_timestamp_for_apps_script(google_updated_at)
+                                or str(current_row["parent_google_folder_id"] or "") != str(parent_google_folder_id or "")
+                                or str(current_row["drive_path"] or "") != drive_path
+                                or str(current_row["content_hash"] or "") != content_hash
+                            )
+                        if not metadata_changed:
+                            cur.execute(
+                                """
+                                UPDATE company_drive_sources
+                                SET last_seen_at = now(), raw_json = %s
+                                WHERE google_file_id = %s
+                                """,
+                                (Jsonb(document), google_file_id),
+                            )
+                            unchanged += 1
+                            continue
                         cur.execute(
                             """
                             UPDATE company_folders
                             SET parent_id = %s, name = %s, content = %s, updated_at = now()
                             WHERE id = %s
                             """,
-                            (root_id, name, content, folder_id),
+                            (parent_id, name, content, folder_id),
                         )
                         cur.execute(
                             """
@@ -496,21 +719,38 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
                                 google_updated_at = %s,
                                 raw_json = %s,
                                 content_hash = %s,
+                                parent_google_folder_id = %s,
+                                drive_path = %s,
                                 last_seen_at = now(),
                                 updated_at = now()
                             WHERE google_file_id = %s
                             """,
-                            (name, mime_type, source_url, google_updated_at, Jsonb(document), content_hash, google_file_id),
+                            (
+                                name,
+                                mime_type,
+                                source_url,
+                                google_updated_at,
+                                Jsonb(document),
+                                content_hash,
+                                parent_google_folder_id,
+                                drive_path,
+                                google_file_id,
+                            ),
                         )
                         updated += 1
                     else:
+                        if is_unchanged_payload:
+                            skipped += 1
+                            continue
+                        content = google_drive_document_structured_content(document)
+                        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
                         cur.execute(
                             """
                             SELECT COALESCE(max(sort_order), -1) + 1 AS next_order
                             FROM company_folders
                             WHERE parent_id = %s
                             """,
-                            (root_id,),
+                            (parent_id,),
                         )
                         sort_order = cur.fetchone()["next_order"]
                         cur.execute(
@@ -519,22 +759,33 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
                             VALUES (%s, %s, %s, %s)
                             RETURNING id
                             """,
-                            (root_id, name, content, sort_order),
+                            (parent_id, name, content, sort_order),
                         )
                         folder_id = str(cur.fetchone()["id"])
                         cur.execute(
                             """
                             INSERT INTO company_drive_sources (
                                 google_file_id, folder_id, name, mime_type, source_url,
-                                google_updated_at, raw_json, content_hash
+                                google_updated_at, raw_json, content_hash, parent_google_folder_id, drive_path
                             )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             """,
-                            (google_file_id, folder_id, name, mime_type, source_url, google_updated_at, Jsonb(document), content_hash),
+                            (
+                                google_file_id,
+                                folder_id,
+                                name,
+                                mime_type,
+                                source_url,
+                                google_updated_at,
+                                Jsonb(document),
+                                content_hash,
+                                parent_google_folder_id,
+                                drive_path,
+                            ),
                         )
                         created += 1
 
-                if seen_ids:
+                if seen_file_ids:
                     cur.execute(
                         """
                         DELETE FROM company_folders
@@ -544,7 +795,7 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
                             WHERE google_file_id <> ALL(%s)
                         )
                         """,
-                        (list(seen_ids),),
+                        (list(seen_file_ids),),
                     )
                 else:
                     cur.execute(
@@ -555,12 +806,42 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
                     )
                 deleted = cur.rowcount
 
+                if has_folder_listing:
+                    if seen_folder_ids:
+                        cur.execute(
+                            """
+                            DELETE FROM company_folders
+                            WHERE id IN (
+                                SELECT folder_id
+                                FROM company_drive_folders
+                                WHERE google_folder_id <> ALL(%s)
+                            )
+                            """,
+                            (list(seen_folder_ids),),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            DELETE FROM company_folders
+                            WHERE id IN (SELECT folder_id FROM company_drive_folders)
+                            """
+                        )
+                    folders_deleted = cur.rowcount
+                else:
+                    folders_deleted = 0
+
     return {
         "documents_total": len(documents),
+        "folders_total": len(folders),
         "source_folder_id": payload.get("folder_id"),
         "created": created,
         "updated": updated,
+        "unchanged": unchanged,
         "deleted": deleted,
+        "folders_created": folders_created,
+        "folders_updated": folders_updated,
+        "folders_unchanged": folders_unchanged,
+        "folders_deleted": folders_deleted,
         "skipped": skipped,
         "document_errors": document_errors if isinstance(document_errors, list) else [],
         "document_errors_count": len(document_errors) if isinstance(document_errors, list) else 0,

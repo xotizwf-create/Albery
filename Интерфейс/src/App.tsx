@@ -2719,7 +2719,7 @@ export default function App() {
           ? ` Ошибок/пропусков ${importProblems}: ошибок конвертации ${result.document_errors_count ?? 0}, неподдержанных файлов ${result.skipped_files_count ?? 0}.`
           : "";
       setCompanyMessage(
-        `Google Drive: документов ${result.documents_total ?? 0}, создано ${result.created ?? 0}, обновлено ${result.updated ?? 0}, удалено ${result.deleted ?? 0}.${problemsText}`,
+        `Google Drive: папок ${result.folders_total ?? 0}, документов ${result.documents_total ?? 0}, создано ${result.created ?? 0}, обновлено ${result.updated ?? 0}, без изменений ${result.unchanged ?? 0}, удалено ${result.deleted ?? 0}.${problemsText}`,
       );
     } catch (error) {
       setCompanyMessage(error instanceof Error ? error.message : "Не удалось подтянуть данные из Google Drive");

@@ -28,34 +28,64 @@ function doGet(e) {
   if (token !== SYNC_TOKEN) {
     return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
   }
+  return buildCompanySyncResponse({});
+}
 
+function doPost(e) {
+  let payload = {};
+  try {
+    payload = e && e.postData && e.postData.contents
+      ? JSON.parse(e.postData.contents)
+      : {};
+  } catch (error) {
+    return jsonResponse({ ok: false, error: 'Invalid JSON payload' }, 400);
+  }
+
+  const token = String(payload.token || '');
+  if (token !== SYNC_TOKEN) {
+    return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
+  }
+
+  return buildCompanySyncResponse(payload);
+}
+
+function buildCompanySyncResponse(payload) {
+  const knownFiles = payload && payload.known_files ? payload.known_files : {};
   const folder = DriveApp.getFolderById(FOLDER_ID);
   const files = [];
-  collectFolderFiles(folder, files);
+  const folders = [];
+  collectFolderTree(folder, [], folders, files);
 
   const supportedFiles = files.filter((file) => SUPPORTED_MIME_TYPES.includes(file.getMimeType()));
   const documents = [];
   const document_errors = [];
-  supportedFiles.forEach((file) => {
+  supportedFiles.forEach((entry) => {
+    const file = entry.file;
     try {
-      documents.push(filePayload(file));
+      documents.push(filePayload(file, entry, knownFiles));
     } catch (error) {
       document_errors.push({
         id: file.getId(),
         name: file.getName(),
         mime_type: file.getMimeType(),
         url: file.getUrl(),
+        parent_folder_id: entry.parent_folder_id,
+        path_parts: entry.path_parts,
+        path: entry.path_parts.concat([file.getName()]).join(' / '),
         error: String(error && error.message ? error.message : error),
       });
     }
   });
   const skipped_files = files
-    .filter((file) => !SUPPORTED_MIME_TYPES.includes(file.getMimeType()))
-    .map((file) => ({
-      id: file.getId(),
-      name: file.getName(),
-      mime_type: file.getMimeType(),
-      url: file.getUrl(),
+    .filter((entry) => !SUPPORTED_MIME_TYPES.includes(entry.file.getMimeType()))
+    .map((entry) => ({
+      id: entry.file.getId(),
+      name: entry.file.getName(),
+      mime_type: entry.file.getMimeType(),
+      url: entry.file.getUrl(),
+      parent_folder_id: entry.parent_folder_id,
+      path_parts: entry.path_parts,
+      path: entry.path_parts.concat([entry.file.getName()]).join(' / '),
       reason: 'unsupported_mime_type',
     }));
 
@@ -68,6 +98,7 @@ function doGet(e) {
     folder_id: FOLDER_ID,
     calls_folder_id: CALLS_FOLDER_ID,
     synced_at: new Date().toISOString(),
+    folders,
     documents,
     document_errors,
     skipped_files,
@@ -75,16 +106,60 @@ function doGet(e) {
   });
 }
 
+function collectFolderTree(folder, pathParts, folders, files) {
+  const fileIterator = folder.getFiles();
+  while (fileIterator.hasNext()) {
+    files.push({
+      file: fileIterator.next(),
+      parent_folder_id: folder.getId(),
+      parent_folder_name: folder.getName(),
+      path_parts: pathParts.slice(),
+    });
+  }
+
+  const folderIterator = folder.getFolders();
+  while (folderIterator.hasNext()) {
+    const child = folderIterator.next();
+    const childPath = pathParts.concat([child.getName()]);
+    folders.push({
+      id: child.getId(),
+      name: child.getName(),
+      url: child.getUrl(),
+      updated_at: child.getLastUpdated().toISOString(),
+      parent_folder_id: folder.getId(),
+      parent_folder_name: folder.getName(),
+      path_parts: childPath,
+      path: childPath.join(' / '),
+    });
+    collectFolderTree(child, childPath, folders, files);
+  }
+}
+
 function collectFolderFiles(folder, files) {
   const fileIterator = folder.getFiles();
   while (fileIterator.hasNext()) {
-    files.push(fileIterator.next());
+    files.push({
+      file: fileIterator.next(),
+      parent_folder_id: folder.getId(),
+      parent_folder_name: folder.getName(),
+      path_parts: [],
+    });
   }
 
   const folderIterator = folder.getFolders();
   while (folderIterator.hasNext()) {
     collectFolderFiles(folderIterator.next(), files);
   }
+}
+
+function legacySkippedFilePayload(file) {
+  return {
+      id: file.getId(),
+      name: file.getName(),
+      mime_type: file.getMimeType(),
+      url: file.getUrl(),
+      reason: 'unsupported_mime_type',
+  };
 }
 
 function collectTranscriptFiles(folder, pathParts, transcripts) {
@@ -117,8 +192,35 @@ function collectTranscriptFiles(folder, pathParts, transcripts) {
   }
 }
 
-function filePayload(file) {
+function filePayload(file, entry, knownFiles) {
   const mimeType = file.getMimeType();
+  const updatedAt = file.getLastUpdated().toISOString();
+  const knownFile = knownFiles && knownFiles[file.getId()] ? knownFiles[file.getId()] : null;
+  const pathParts = entry && entry.path_parts ? entry.path_parts : [];
+  const parentFolderId = entry && entry.parent_folder_id ? entry.parent_folder_id : '';
+  const parentFolderName = entry && entry.parent_folder_name ? entry.parent_folder_name : '';
+  const fullPath = pathParts.concat([file.getName()]).join(' / ');
+  const unchanged = knownFile
+    && String(knownFile.updated_at || '') === updatedAt
+    && String(knownFile.name || '') === file.getName()
+    && String(knownFile.parent_folder_id || '') === parentFolderId
+    && String(knownFile.path || '') === fullPath;
+
+  if (unchanged) {
+    return {
+      id: file.getId(),
+      name: file.getName(),
+      mime_type: mimeType,
+      url: file.getUrl(),
+      updated_at: updatedAt,
+      parent_folder_id: parentFolderId,
+      parent_folder_name: parentFolderName,
+      path_parts: pathParts,
+      path: fullPath,
+      unchanged: true,
+    };
+  }
+
   let content = '';
   let contentFormat = 'text';
   let blocks = [];
@@ -151,7 +253,11 @@ function filePayload(file) {
     name: file.getName(),
     mime_type: mimeType,
     url: file.getUrl(),
-    updated_at: file.getLastUpdated().toISOString(),
+    updated_at: updatedAt,
+    parent_folder_id: parentFolderId,
+    parent_folder_name: parentFolderName,
+    path_parts: pathParts,
+    path: fullPath,
     content_format: contentFormat,
     converted_mime_type: convertedMimeType,
     content,
