@@ -1,5 +1,85 @@
 # Albery Server Context
 
+## Current Operating Rules / Актуальный Контекст
+
+This file is the first place to read in every new chat. It contains the current server context, deployment commands, webhook endpoints, cron schedule, and operational rules.
+
+Server access:
+
+- Server: `root@186.246.7.32`
+- Server project: `/var/www/albery`
+- Local project: `G:\OneDrive\Рабочий стол\Мои проекты\Евгений. Разработка`
+- The root password is stored only in local `.env` as `root_password`.
+- Do not print, quote, commit, or pass `root_password` through command-line arguments.
+- For automated server work from Codex, prefer Python/Paramiko: read `root_password` from local `.env` into memory and connect to `186.246.7.32` as `root`.
+- If already inside the server shell, run commands directly without `ssh root@...`.
+- Never commit `.env`; secrets stay only in local/server env files.
+
+Recent production changes:
+
+- Bitrix tasks now support near-realtime sync through outgoing Bitrix webhook:
+  - endpoint: `https://mcp.m4s.ru/bitrix/events/tasks/<BITRIX_EVENT_SECRET>`
+  - events: `OnTaskAdd`, `OnTaskUpdate`, `OnTaskDelete`
+  - queue table: `bitrix_task_events`
+  - migration: `database/migrations/018_bitrix_task_events.sql`
+  - unsupported Bitrix task comment events are accepted with `200 OK` and ignored.
+- Zoom recordings now use incremental sync:
+  - existing Zoom calls are skipped if the set of transcript files has not changed;
+  - old transcript segments are not deleted/recreated for unchanged recordings;
+  - manual/API/cron sync downloads only new or changed transcript files.
+- Zoom webhook support was added:
+  - endpoint: `https://mcp.m4s.ru/zoom/events/<ZOOM_EVENT_SECRET>`
+  - events: `recording.transcript_completed`, `recording.completed`
+  - validation event: `endpoint.url_validation`
+  - queue table: `zoom_recording_events`
+  - migration: `database/migrations/019_zoom_recording_events.sql`
+  - `ZOOM_WEBHOOK_SECRET_TOKEN` must be copied from Zoom Marketplace Event Subscriptions Secret Token.
+- Big external sync cron is daily at `18:00 Europe/Moscow`, not hourly:
+  - file: `/etc/cron.d/albery-daily-sync`
+  - logs: `/var/log/albery/daily-sync.log`, `/var/log/albery/daily-sync.cron.log`
+- Latest relevant commits:
+  - `096c85f Add Bitrix task event sync`
+  - `1f8c45d Add incremental Zoom recording sync`
+
+Important env keys:
+
+```env
+BITRIX_EVENT_SECRET=...
+BITRIX_TASK_EVENT_PROCESS_INLINE=1
+ZOOM_EVENT_SECRET=...
+ZOOM_WEBHOOK_SECRET_TOKEN=...
+ZOOM_EVENT_PROCESS_INLINE=1
+```
+
+Operational checks:
+
+```bash
+cd /var/www/albery
+git status --short
+git rev-parse --short HEAD
+systemctl status albery --no-pager
+tail -n 120 /var/log/albery/daily-sync.log
+tail -n 120 /var/log/albery/daily-sync.cron.log
+```
+
+Apply migrations/restart after deploy:
+
+```bash
+cd /var/www/albery && .venv/bin/python scripts/ensure_postgres.py && systemctl restart albery
+```
+
+Check webhook endpoints without printing secrets:
+
+```bash
+cd /var/www/albery
+bitrix_secret=$(awk -F= '$1=="BITRIX_EVENT_SECRET"{print $2; exit}' .env)
+zoom_secret=$(awk -F= '$1=="ZOOM_EVENT_SECRET"{print $2; exit}' .env)
+curl -sS "https://mcp.m4s.ru/bitrix/events/tasks/$bitrix_secret"
+curl -sS "https://mcp.m4s.ru/zoom/events/$zoom_secret"
+```
+
+Current GitHub branch: `main`. Push code changes to GitHub before or after server deployment so that future `./scripts/update_server.sh` does not overwrite manual server edits.
+
 Этот файл фиксирует рабочий контекст проекта, чтобы в новом чате сразу было понятно, где что лежит и какими командами обслуживать сервер.
 
 ## Репозиторий
