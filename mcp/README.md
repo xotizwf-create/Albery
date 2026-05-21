@@ -16,7 +16,8 @@ Read-only MCP server for Claude Code / Claude Desktop. It exposes the local Post
 - `search_company_knowledge` - search "О компании", including Google Drive mirrored documents.
 - `get_period_index` - compact period manifest with counts and top chats.
 - `get_org_structure` - departments, users, managers, memberships.
-- `search_tasks` - Bitrix task search.
+- `search_tasks` - Bitrix task search; rows include `comments_total_count` and `comments_human_count`.
+- `get_task_comments` - read the comment thread of one task by `bitrix_task_id`, with author names and BB-code-cleaned text (system notifications excluded unless `include_service=true`).
 - `list_chats` - active chat listing.
 - `search_messages` - raw chat message search.
 - `get_chat_transcript` - raw chat transcript by `dialog_id` and period, including OCR for image/PDF attachments.

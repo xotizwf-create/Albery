@@ -21,7 +21,7 @@ from psycopg.types.json import Jsonb
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.2.1"
+SERVER_VERSION = "0.3.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -255,7 +255,7 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
             "Always use concrete names and task titles. Do not write only 'task 318099' or 'Natalia task'; write 'task 318099: Сформировать реестр платежей' with responsible person, status, deadline, and source when available.",
             "For employee identity, managers, departments, and Bitrix user ids, use get_org_structure before person-specific filters.",
             "For a date period, call get_period_index before reading messages/tasks; it shows where data exists and which chats are active.",
-            "For task status, ownership, deadlines, and Bitrix work items, use search_tasks.",
+            "For task status, ownership, deadlines, and Bitrix work items, use search_tasks; when a task row shows comments_human_count > 0, read the actual discussion with get_task_comments(bitrix_task_id).",
             "For discussion evidence, commitments, blockers, decisions, and OCR from chat images, use list_chats then search_messages or get_chat_transcript.",
             "For meeting evidence, use list_zoom_calls first, then search_zoom_transcripts with topic keywords, then get_zoom_call_transcript for matching calls, and get_org_structure before generating a Zoom report.",
             "For cross-source reports over a bounded date range, use get_compact_export, then deepen with source-specific tools.",
@@ -275,9 +275,9 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "use_for": ["people", "roles", "managers", "departments", "Bitrix user ids"],
             },
             "bitrix_tasks": {
-                "tools": ["search_tasks"],
+                "tools": ["search_tasks", "get_task_comments"],
                 "tables": ["bitrix_tasks", "bitrix_task_members", "bitrix_task_snapshots"],
-                "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility"],
+                "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments"],
             },
             "bitrix_chats": {
                 "tools": ["list_chats", "search_messages", "get_chat_transcript", "get_chat_ocr_status", "process_chat_ocr", "get_chat_daily_report", "save_chat_daily_report", "get_chat_weekly_report", "save_chat_weekly_report"],
@@ -876,6 +876,82 @@ def tool_get_org_structure(args: dict[str, Any]) -> dict[str, Any]:
     return {"departments": departments, "users": users}
 
 
+# --- Bitrix task comments -------------------------------------------------
+# Task comments are stored inside bitrix_tasks.raw_json -> 'comments' -> 'items'
+# as Bitrix IM messages. Human comments have a real author_id (> 0) and empty
+# params; auto-generated notifications use author_id 0 or carry an ATTACH card.
+
+_BB_BR_RE = re.compile(r"\[BR\]", re.IGNORECASE)
+_BB_USER_RE = re.compile(r"\[USER=\d+\]\s*(.*?)\s*\[/USER\]", re.IGNORECASE | re.DOTALL)
+_BB_URL_NAMED_RE = re.compile(r"\[URL=[^\]]+\](.*?)\[/URL\]", re.IGNORECASE | re.DOTALL)
+_BB_URL_PLAIN_RE = re.compile(r"\[URL\](.*?)\[/URL\]", re.IGNORECASE | re.DOTALL)
+_BB_TIMESTAMP_RE = re.compile(r"\[TIMESTAMP=[^\]]+\]", re.IGNORECASE)
+_BB_DISK_RE = re.compile(r"\[DISK\s+FILE\s+ID=[^\]]+\]", re.IGNORECASE)
+_BB_BULLET_RE = re.compile(r"\[\*\]")
+# Only strip known Bitrix BB tags so that user-typed brackets like "[важно]" survive.
+_BB_KNOWN_TAG_RE = re.compile(
+    r"\[/?(?:B|I|U|S|BR|LIST|URL|USER|IMG|QUOTE|CODE|TABLE|TR|TD|P|SIZE|COLOR|"
+    r"FONT|DISK|RATING|PROGRESS|TIMESTAMP|ATTACH|SPOILER|ANCHOR|H[1-6])"
+    r"(?:[ =][^\]]*)?\]",
+    re.IGNORECASE,
+)
+_WS_INLINE_RE = re.compile(r"[ \t]+")
+_WS_NEWLINE_RE = re.compile(r"\n{3,}")
+
+
+def clean_bitrix_text(text: Any) -> str:
+    """Strip Bitrix BB-codes, keeping readable text (mentions, link labels)."""
+    if not text:
+        return ""
+    s = str(text)
+    s = _BB_BR_RE.sub("\n", s)
+    s = _BB_USER_RE.sub(lambda m: m.group(1) or "", s)
+    s = _BB_URL_NAMED_RE.sub(lambda m: m.group(1) or "", s)
+    s = _BB_URL_PLAIN_RE.sub(lambda m: m.group(1) or "", s)
+    s = _BB_TIMESTAMP_RE.sub("", s)
+    s = _BB_DISK_RE.sub("", s)
+    s = _BB_BULLET_RE.sub("\n• ", s)
+    s = _BB_KNOWN_TAG_RE.sub("", s)
+    s = _WS_INLINE_RE.sub(" ", s)
+    s = _WS_NEWLINE_RE.sub("\n\n", s)
+    return s.strip()
+
+
+def comment_author_id(item: dict[str, Any]) -> int | None:
+    raw = item.get("author_id", item.get("AUTHOR_ID"))
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_service_task_comment(item: dict[str, Any]) -> bool:
+    """True for auto-generated task notifications / status cards, not human text."""
+    if not isinstance(item, dict):
+        return True
+    if not comment_author_id(item):  # author_id 0 / missing => system message
+        return True
+    params = item.get("params")
+    if isinstance(params, dict) and ("ATTACH" in params or "ATTACH_ID" in params):
+        return True
+    return False
+
+
+def normalize_task_comment(item: dict[str, Any], names_by_id: dict[int, str]) -> dict[str, Any]:
+    author_id = comment_author_id(item)
+    raw_text = item.get("text") or item.get("MESSAGE") or item.get("POST_MESSAGE") or ""
+    return {
+        "comment_id": item.get("id") or item.get("ID"),
+        "author_bitrix_user_id": author_id,
+        "author_name": names_by_id.get(author_id) if author_id else None,
+        "created_at": item.get("date") or item.get("POST_DATE"),
+        "is_service": is_service_task_comment(item),
+        "text": clean_bitrix_text(raw_text),
+    }
+
+
 def tool_search_tasks(args: dict[str, Any]) -> dict[str, Any]:
     date_from = parse_date_arg(args, "date_from", required=False)
     date_to = parse_date_arg(args, "date_to", required=False)
@@ -913,7 +989,17 @@ def tool_search_tasks(args: dict[str, Any]) -> dict[str, Any]:
                     cu.bitrix_user_id AS creator_bitrix_user_id,
                     cu.full_name AS creator_name,
                     ru.bitrix_user_id AS responsible_bitrix_user_id,
-                    ru.full_name AS responsible_name
+                    ru.full_name AS responsible_name,
+                    COALESCE(jsonb_array_length(
+                        CASE WHEN jsonb_typeof(t.raw_json->'comments'->'items') = 'array'
+                             THEN t.raw_json->'comments'->'items' ELSE '[]'::jsonb END), 0)
+                        AS comments_total_count,
+                    (SELECT count(*) FROM jsonb_array_elements(
+                        CASE WHEN jsonb_typeof(t.raw_json->'comments'->'items') = 'array'
+                             THEN t.raw_json->'comments'->'items' ELSE '[]'::jsonb END) c
+                     WHERE COALESCE(NULLIF(c->>'author_id', '')::bigint, 0) <> 0
+                       AND NOT (jsonb_typeof(c->'params') = 'object' AND (c->'params') ? 'ATTACH'))
+                        AS comments_human_count
                 FROM bitrix_tasks t
                 LEFT JOIN users cu ON cu.id = t.creator_id
                 LEFT JOIN users ru ON ru.id = t.responsible_id
@@ -925,6 +1011,92 @@ def tool_search_tasks(args: dict[str, Any]) -> dict[str, Any]:
             )
             rows = cur.fetchall()
     return {"items": rows, "limit": limit, "offset": offset}
+
+
+def tool_get_task_comments(args: dict[str, Any]) -> dict[str, Any]:
+    raw_task_id = args.get("bitrix_task_id")
+    if raw_task_id in (None, ""):
+        raise McpError(-32602, "Missing required argument: bitrix_task_id")
+    try:
+        task_id = int(raw_task_id)
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "bitrix_task_id must be an integer") from exc
+
+    include_service = bool(args.get("include_service", False))
+    order = str(args.get("order") or "asc").lower()
+    if order not in ("asc", "desc"):
+        order = "asc"
+    limit = parse_limit(args, default=50)
+    offset = parse_offset(args)
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    t.bitrix_task_id, t.title, t.status, t.status_name,
+                    t.raw_json->'comments'->'items'   AS items,
+                    t.raw_json->'comments'->>'chat_id' AS chat_id,
+                    cu.full_name AS creator_name,
+                    ru.full_name AS responsible_name
+                FROM bitrix_tasks t
+                LEFT JOIN users cu ON cu.id = t.creator_id
+                LEFT JOIN users ru ON ru.id = t.responsible_id
+                WHERE t.bitrix_task_id = %s
+                """,
+                (task_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {
+                    "bitrix_task_id": task_id,
+                    "found": False,
+                    "items": [],
+                    "note": "Task not found in bitrix_tasks. Sync it first or check the id.",
+                }
+
+            items = row["items"] if isinstance(row["items"], list) else []
+            author_ids: set[int] = set()
+            for it in items:
+                if isinstance(it, dict):
+                    aid = comment_author_id(it)
+                    if aid:
+                        author_ids.add(aid)
+
+            names_by_id: dict[int, str] = {}
+            if author_ids:
+                cur.execute(
+                    "SELECT bitrix_user_id, full_name FROM users WHERE bitrix_user_id = ANY(%s)",
+                    (list(author_ids),),
+                )
+                for r in cur.fetchall():
+                    if r["bitrix_user_id"] is not None:
+                        names_by_id[int(r["bitrix_user_id"])] = r["full_name"]
+
+    normalized = [normalize_task_comment(it, names_by_id) for it in items if isinstance(it, dict)]
+    human = [c for c in normalized if not c["is_service"]]
+    pool = normalized if include_service else human
+    pool.sort(key=lambda c: c.get("created_at") or "", reverse=(order == "desc"))
+    page = pool[offset : offset + limit]
+
+    return {
+        "bitrix_task_id": row["bitrix_task_id"],
+        "found": True,
+        "title": row["title"],
+        "status": row["status_name"] or row["status"],
+        "creator_name": row["creator_name"],
+        "responsible_name": row["responsible_name"],
+        "chat_id": row["chat_id"],
+        "total_comments": len(normalized),
+        "human_comments": len(human),
+        "service_comments": len(normalized) - len(human),
+        "include_service": include_service,
+        "order": order,
+        "limit": limit,
+        "offset": offset,
+        "returned": len(page),
+        "items": page,
+    }
 
 
 def tool_list_chats(args: dict[str, Any]) -> dict[str, Any]:
@@ -2492,7 +2664,11 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_get_org_structure,
     },
     "search_tasks": {
-        "description": "Search Bitrix tasks by period, text, and responsible user.",
+        "description": (
+            "Search Bitrix tasks by period, text, and responsible user. Each row includes "
+            "comments_total_count and comments_human_count; when a task has human comments, "
+            "read them with get_task_comments(bitrix_task_id) for what people actually wrote."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2506,6 +2682,35 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_search_tasks,
+    },
+    "get_task_comments": {
+        "description": (
+            "Read the discussion/comments of one Bitrix task by bitrix_task_id (from search_tasks). "
+            "Returns human comments with author name, timestamp, and BB-code-cleaned text. "
+            "Auto-generated notifications (overdue reminders, status cards, completion notices) are "
+            "excluded by default; set include_service=true to include them. Use this to find what "
+            "people asked, decided, committed, or blocked on a task — search_tasks alone does not show it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Bitrix task id from search_tasks."},
+                "include_service": {
+                    "type": "boolean",
+                    "description": "Include system notifications and status-card messages. Default false.",
+                },
+                "order": {
+                    "type": "string",
+                    "enum": ["asc", "desc"],
+                    "description": "Chronological order by date. Default asc (oldest first).",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+            "required": ["bitrix_task_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_get_task_comments,
     },
     "list_chats": {
         "description": "List active non-excluded chats, optionally with message counts for a period.",
