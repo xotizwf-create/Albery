@@ -56,7 +56,7 @@ function buildCompanySyncResponse(payload) {
   const folders = [];
   collectFolderTree(folder, [], folders, files);
 
-  const supportedFiles = files.filter((file) => SUPPORTED_MIME_TYPES.includes(file.getMimeType()));
+  const supportedFiles = files.filter((entry) => SUPPORTED_MIME_TYPES.includes(entry.file.getMimeType()));
   const documents = [];
   const document_errors = [];
   supportedFiles.forEach((entry) => {
@@ -291,11 +291,29 @@ function temporaryConvertedFileId(file, targetMimeType) {
     title: '__sync_tmp__' + file.getName(),
     mimeType: targetMimeType,
   };
-  const converted = Drive.Files.copy(resource, file.getId(), { convert: true });
-  if (!converted || !converted.id) {
-    throw new Error('Failed to convert file: ' + file.getName());
+
+  // Drive.Files.copy can hit transient "User rate limit exceeded" / backend
+  // errors when many documents are converted in one run. Retry with backoff so
+  // a single full sync does not drop documents because of a momentary limit.
+  let lastError = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      const converted = Drive.Files.copy(resource, file.getId(), { convert: true });
+      if (converted && converted.id) {
+        return converted.id;
+      }
+      lastError = new Error('Failed to convert file: ' + file.getName());
+    } catch (error) {
+      lastError = error;
+      const message = String(error && error.message ? error.message : error);
+      const transient = /rate limit|ratelimit|userratelimitexceeded|backenderror|internal error|try again|temporar/i.test(message);
+      if (!transient) {
+        throw error;
+      }
+    }
+    Utilities.sleep(2000 * (attempt + 1));
   }
-  return converted.id;
+  throw lastError || new Error('Failed to convert file: ' + file.getName());
 }
 
 function trashTemporaryFile(fileId) {

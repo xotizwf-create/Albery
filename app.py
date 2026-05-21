@@ -799,7 +799,19 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
                         )
                         created += 1
 
-                if seen_file_ids:
+                # Keep documents that exist in Drive but failed transient
+                # extraction this run (e.g. Drive copy rate limit). They are not
+                # in `documents`, but deleting them would drop already-synced
+                # content only to recreate it on the next sync.
+                protected_file_ids = set(seen_file_ids)
+                if isinstance(document_errors, list):
+                    for err in document_errors:
+                        if isinstance(err, dict):
+                            err_id = str(err.get("id") or "").strip()
+                            if err_id:
+                                protected_file_ids.add(err_id)
+
+                if protected_file_ids:
                     cur.execute(
                         """
                         DELETE FROM company_folders
@@ -809,7 +821,7 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
                             WHERE google_file_id <> ALL(%s)
                         )
                         """,
-                        (list(seen_file_ids),),
+                        (list(protected_file_ids),),
                     )
                 else:
                     cur.execute(
