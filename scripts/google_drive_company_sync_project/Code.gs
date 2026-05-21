@@ -8,6 +8,11 @@ const TRANSCRIPT_FILE_NAME = 'transcript.txt';
 // setupDriveChangeTrigger() once from the editor to create the trigger.
 const CHANGE_NOTIFY_URL = 'https://mcp.m4s.ru/google-drive/events/jTL8ej_9dJuzaZAAFwYDV5nTh496n4Mytn-xT2W0Q_872nVX';
 const CHANGE_SIGNATURE_PROPERTY = 'companyFolderSignature';
+const CHANGE_SIGNATURE_SCHEMA_PROPERTY = 'companyFolderSignatureSchema';
+// Bump this whenever the change-detection logic changes. On the next run every
+// already-installed trigger sees a schema mismatch, forces one sync, and
+// re-baselines — so fixes self-heal without re-running setupDriveChangeTrigger.
+const CHANGE_SIGNATURE_SCHEMA = '2';
 
 const MIME_GOOGLE_DOC = 'application/vnd.google-apps.document';
 const MIME_GOOGLE_SHEET = 'application/vnd.google-apps.spreadsheet';
@@ -536,11 +541,11 @@ function setupDriveChangeTrigger() {
     .timeBased()
     .everyMinutes(1)
     .create();
-  // Store the current state as the baseline so only future changes notify.
-  PropertiesService.getScriptProperties().setProperty(
-    CHANGE_SIGNATURE_PROPERTY,
-    computeFolderSignature()
-  );
+  // Do NOT seed a baseline. The first trigger run will sync the current state,
+  // so any edits made before setup are picked up instead of being swallowed.
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(CHANGE_SIGNATURE_PROPERTY);
+  props.deleteProperty(CHANGE_SIGNATURE_SCHEMA_PROPERTY);
 }
 
 function removeDriveChangeTriggers() {
@@ -557,14 +562,19 @@ function removeDriveChangeTriggers() {
 function checkDriveChangesAndNotify() {
   const props = PropertiesService.getScriptProperties();
   const previous = props.getProperty(CHANGE_SIGNATURE_PROPERTY) || '';
+  const previousSchema = props.getProperty(CHANGE_SIGNATURE_SCHEMA_PROPERTY) || '';
   const current = computeFolderSignature();
-  if (current === previous) {
+  // Skip only when nothing changed AND the baseline was written by the current
+  // detection logic. A schema mismatch forces one sync so a stale/old baseline
+  // can never silently swallow an un-synced change.
+  if (previousSchema === CHANGE_SIGNATURE_SCHEMA && current === previous) {
     return;
   }
   // Persist the new signature only after the server confirms receipt, so a
   // transient failure is retried on the next minute instead of being lost.
   if (notifyServerOfDriveChange()) {
     props.setProperty(CHANGE_SIGNATURE_PROPERTY, current);
+    props.setProperty(CHANGE_SIGNATURE_SCHEMA_PROPERTY, CHANGE_SIGNATURE_SCHEMA);
   }
 }
 
