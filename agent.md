@@ -17,6 +17,10 @@ Server access:
 
 Recent production changes:
 
+- Bitrix task comments are now exposed through the main MCP connector:
+  - new tool `get_task_comments(bitrix_task_id, include_service?, order?, limit?, offset?)` reads `bitrix_tasks.raw_json -> 'comments' -> 'items'`, strips Bitrix BB-codes, resolves author names from `users`, and hides auto-generated notifications (overdue reminders, status cards, completion notices) unless `include_service=true`;
+  - `search_tasks` rows now also return `comments_total_count` and `comments_human_count` so the agent knows which tasks have real discussion;
+  - no DB migration; lives in `mcp/context_server.py` (MCP server version `0.3.0`); not exposed on the FAQ endpoint.
 - Bitrix tasks now support near-realtime sync through outgoing Bitrix webhook:
   - endpoint: `https://mcp.m4s.ru/bitrix/events/tasks/<BITRIX_EVENT_SECRET>`
   - events: `OnTaskAdd`, `OnTaskUpdate`, `OnTaskDelete`
@@ -38,6 +42,7 @@ Recent production changes:
   - file: `/etc/cron.d/albery-daily-sync`
   - logs: `/var/log/albery/daily-sync.log`, `/var/log/albery/daily-sync.cron.log`
 - Latest relevant commits:
+  - `90833c5 Expose Bitrix task comments via MCP`
   - `096c85f Add Bitrix task event sync`
   - `1f8c45d Add incremental Zoom recording sync`
 
