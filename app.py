@@ -306,6 +306,7 @@ def fetch_google_drive_company_payload(
 ) -> dict[str, Any]:
     sync_url, token = google_drive_company_sync_config()
     timeout = int(os.getenv("GOOGLE_DRIVE_SYNC_TIMEOUT_SECONDS", "600") or "600")
+    used_post = False
     if known_files is not None or known_folders is not None:
         try:
             response = requests.post(
@@ -313,16 +314,29 @@ def fetch_google_drive_company_payload(
                 json={"token": token, "known_files": known_files or {}, "known_folders": known_folders or {}},
                 timeout=timeout,
             )
+            used_post = True
         except requests.RequestException:
             response = requests.get(sync_url, params={"token": token}, timeout=timeout)
         else:
             if response.status_code in {404, 405}:
                 response = requests.get(sync_url, params={"token": token}, timeout=timeout)
+                used_post = False
     else:
         response = requests.get(sync_url, params={"token": token}, timeout=timeout)
     if not response.ok:
         raise RuntimeError(f"Google Apps Script вернул HTTP {response.status_code}: {response.text[:500]}")
-    payload = response.json()
+    try:
+        payload = response.json()
+    except ValueError:
+        if not used_post:
+            raise RuntimeError(f"Google Apps Script вернул не JSON: {response.text[:500]}")
+        response = requests.get(sync_url, params={"token": token}, timeout=timeout)
+        if not response.ok:
+            raise RuntimeError(f"Google Apps Script вернул HTTP {response.status_code}: {response.text[:500]}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Google Apps Script вернул не JSON: {response.text[:500]}") from exc
     if not isinstance(payload, dict) or not payload.get("ok"):
         error = payload.get("error") if isinstance(payload, dict) else "неожиданный формат ответа"
         raise RuntimeError(f"Google Apps Script error: {error}")
