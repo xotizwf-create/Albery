@@ -3016,15 +3016,113 @@ export default function App() {
   const renderCompanyDriveDocument = (folder: CompanyFolder) => {
     const blocks = folder.drive_source?.blocks || [];
     const hasBlocks = blocks.length > 0;
+    const renderDriveCellText = (value: string) =>
+      String(value || "")
+        .split(/<br\s*\/?>/i)
+        .map((line, index) => (
+          <React.Fragment key={index}>
+            {index > 0 && <br />}
+            {line}
+          </React.Fragment>
+        ));
+    const splitDriveMarkdownRow = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) return null;
+      const cells: string[] = [];
+      let current = "";
+      let escaped = false;
+      for (const char of trimmed.slice(1, -1)) {
+        if (escaped) {
+          current += char;
+          escaped = false;
+          continue;
+        }
+        if (char === "\\") {
+          escaped = true;
+          continue;
+        }
+        if (char === "|") {
+          cells.push(current.trim());
+          current = "";
+          continue;
+        }
+        current += char;
+      }
+      cells.push(current.trim());
+      return cells;
+    };
+    const isDriveMarkdownSeparator = (line: string) => {
+      const cells = splitDriveMarkdownRow(line);
+      return Boolean(cells?.length && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim())));
+    };
+    const renderDriveTable = (headers: string[], rows: string[][], key: React.Key) => {
+      const width = Math.max(headers.length, ...rows.map((row) => row.length), 1);
+      const normalizedHeaders = Array.from({ length: width }, (_, index) => headers[index] || `Колонка ${index + 1}`);
+      const normalizedRows = rows.map((row) => Array.from({ length: width }, (_, index) => row[index] || ""));
+      return (
+        <div key={key} className="space-y-4">
+          <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
+            <table className="min-w-full border-collapse text-left text-sm">
+              <thead className="bg-slate-50">
+                <tr>
+                  {normalizedHeaders.map((header, index) => (
+                    <th key={index} className="border-b border-slate-200 px-4 py-3 font-black text-slate-700 align-top">
+                      {renderDriveCellText(header)}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {normalizedRows.map((row, rowIndex) => (
+                  <tr key={rowIndex} className="odd:bg-white even:bg-slate-50/60">
+                    {normalizedHeaders.map((_, cellIndex) => (
+                      <td key={cellIndex} className="border-b border-slate-100 px-4 py-3 font-semibold text-slate-800 align-top">
+                        {renderDriveCellText(row[cellIndex] || "")}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    };
 
     if (!hasBlocks) {
+      const fallbackBlocks: React.ReactNode[] = [];
+      const tableLines: string[] = [];
+      const flushTable = () => {
+        if (!tableLines.length) return;
+        const rows = tableLines
+          .filter((line) => !isDriveMarkdownSeparator(line))
+          .map((line) => splitDriveMarkdownRow(line))
+          .filter((row): row is string[] => Boolean(row));
+        if (rows.length) {
+          fallbackBlocks.push(renderDriveTable(rows[0] || [], rows.slice(1), `fallback-table-${fallbackBlocks.length}`));
+        }
+        tableLines.length = 0;
+      };
+      (folder.content || "").split(/\r?\n/).forEach((line, index) => {
+        if (splitDriveMarkdownRow(line) || isDriveMarkdownSeparator(line)) {
+          tableLines.push(line);
+          return;
+        }
+        flushTable();
+        const text = line.trim();
+        if (!text) return;
+        fallbackBlocks.push(
+          <p key={`fallback-p-${index}`} className="text-[15px] font-semibold leading-7 text-slate-800 whitespace-pre-wrap">
+            {renderDriveCellText(text)}
+          </p>,
+        );
+      });
+      flushTable();
       return (
-        <div className="space-y-3 text-[15px] font-semibold leading-7 text-slate-800">
-          {(folder.content || "").split(/\n{2,}/).map((paragraph, index) => (
-            <p key={index} className="whitespace-pre-wrap">
-              {paragraph}
-            </p>
-          ))}
+        <div className="space-y-4">
+          {fallbackBlocks.length ? fallbackBlocks : (
+            <p className="text-[15px] font-semibold leading-7 text-slate-800">Документ пуст.</p>
+          )}
         </div>
       );
     }
@@ -3058,34 +3156,7 @@ export default function App() {
           if (block.type === "table") {
             const headers = block.headers || [];
             const rows = block.rows || [];
-            return (
-              <div key={blockIndex} className="space-y-4">
-                <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
-                  <table className="min-w-full border-collapse text-left text-sm">
-                    <thead className="bg-slate-50">
-                      <tr>
-                        {headers.map((header, index) => (
-                          <th key={index} className="border-b border-slate-200 px-4 py-3 font-black text-slate-700">
-                            {header || `Колонка ${index + 1}`}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.map((row, rowIndex) => (
-                        <tr key={rowIndex} className="odd:bg-white even:bg-slate-50/60">
-                          {headers.map((_, cellIndex) => (
-                            <td key={cellIndex} className="border-b border-slate-100 px-4 py-3 font-semibold text-slate-800 align-top">
-                              {row[cellIndex] || ""}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            );
+            return renderDriveTable(headers, rows, blockIndex);
           }
           return null;
         })}

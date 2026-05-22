@@ -3742,13 +3742,15 @@ def sync_google_drive_call_transcripts() -> dict[str, Any]:
                     cur.execute("DELETE FROM zoom_calls WHERE zoom_account_key = %s", (DRIVE_CALLS_ACCOUNT_KEY,))
                     removed_calls = cur.rowcount
 
-    return {
+    result = {
         "calls_synced": synced_calls,
         "transcript_files_synced": len(transcripts),
         "segments_synced": synced_segments,
         "participants_synced": synced_participants,
         "removed_calls": removed_calls,
     }
+    record_integration_sync_success("google_drive_zoom_transcripts", result)
+    return result
 
 
 def zoom_encoded_uuid(uuid_value: str) -> str:
@@ -4157,6 +4159,68 @@ def google_drive_event_secret_valid(secret: str) -> bool:
 GOOGLE_DRIVE_SYNC_ADVISORY_LOCK_KEY = 728145903
 
 
+def ensure_integration_sync_status_schema() -> None:
+    if not postgres_enabled():
+        return
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS integration_sync_status (
+                        sync_key text PRIMARY KEY,
+                        last_success_at timestamptz NULL,
+                        last_attempt_at timestamptz NOT NULL DEFAULT now(),
+                        status text NOT NULL DEFAULT 'unknown',
+                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        updated_at timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+
+
+def record_integration_sync_success(sync_key: str, payload: dict[str, Any] | None = None) -> None:
+    if not postgres_enabled():
+        return
+    ensure_integration_sync_status_schema()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO integration_sync_status (
+                        sync_key, last_success_at, last_attempt_at, status, raw_json, updated_at
+                    )
+                    VALUES (%s, now(), now(), 'success', %s, now())
+                    ON CONFLICT (sync_key) DO UPDATE SET
+                        last_success_at = EXCLUDED.last_success_at,
+                        last_attempt_at = EXCLUDED.last_attempt_at,
+                        status = EXCLUDED.status,
+                        raw_json = EXCLUDED.raw_json,
+                        updated_at = now()
+                    """,
+                    (sync_key, pg_json(payload or {})),
+                )
+
+
+def load_latest_integration_sync_success(sync_keys: list[str]) -> datetime | None:
+    if not postgres_enabled() or not sync_keys:
+        return None
+    ensure_integration_sync_status_schema()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT max(last_success_at) AS last_success_at
+                FROM integration_sync_status
+                WHERE sync_key = ANY(%s) AND status = 'success'
+                """,
+                (sync_keys,),
+            )
+            row = cur.fetchone()
+    return row["last_success_at"] if row else None
+
+
 def zoom_webhook_secret_token() -> str:
     return os.getenv("ZOOM_WEBHOOK_SECRET_TOKEN", "").strip()
 
@@ -4307,7 +4371,7 @@ def sync_zoom_calls(date_from: date, date_to: date, account_key: str = "ZOOM_ACC
                                 skipped_unchanged += 1
                             else:
                                 skipped_missing += 1
-    return {
+    result = {
         "users_count": len(users),
         "calls_synced": synced_calls,
         "transcript_files_synced": synced_transcript_files,
@@ -4315,6 +4379,8 @@ def sync_zoom_calls(date_from: date, date_to: date, account_key: str = "ZOOM_ACC
         "skipped_missing": skipped_missing,
         "participant_errors": participant_errors,
     }
+    record_integration_sync_success("zoom_api_calls", result)
+    return result
 
 
 def dedupe_zoom_participants(participants: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -4429,11 +4495,13 @@ def load_zoom_calls_tree() -> dict[str, Any]:
             month_payload["dates"] = dates
             months.append(month_payload)
         years.append({"year": year_payload["year"], "months": months})
+    latest_success_at = load_latest_integration_sync_success(["zoom_api_calls", "google_drive_zoom_transcripts"])
+    display_updated_at = latest_success_at or latest_synced_at
     return {
         "years": years,
         "total": len(rows),
-        "updated_at": iso_or_none(latest_synced_at),
-        "updated_at_text": format_datetime_msk_label(latest_synced_at),
+        "updated_at": iso_or_none(display_updated_at),
+        "updated_at_text": format_datetime_msk_label(display_updated_at),
     }
 
 
