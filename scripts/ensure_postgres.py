@@ -33,6 +33,10 @@ REQUIRED_FUNCTION_MIGRATIONS = {
     "ensure_chat_messages_partition": "017_fix_chat_message_partition_privileges.sql",
 }
 
+ALWAYS_APPLY_MIGRATIONS = [
+    "022_chats_personal_dialog_types.sql",
+]
+
 
 def normalize_postgres_url(database_url: str) -> str:
     normalized = database_url.strip()
@@ -109,6 +113,12 @@ def apply_required_migrations(database_url: str) -> None:
                 row = cur.fetchone()
                 if row and row[0]:
                     continue
+                migration_path = MIGRATIONS_DIR / migration_name
+                if not migration_path.exists():
+                    raise FileNotFoundError(f"Migration file not found: {migration_path}")
+                cur.execute(migration_path.read_text(encoding="utf-8"))
+                print(f"PostgreSQL migration applied: {migration_name}")
+            for migration_name in ALWAYS_APPLY_MIGRATIONS:
                 migration_path = MIGRATIONS_DIR / migration_name
                 if not migration_path.exists():
                     raise FileNotFoundError(f"Migration file not found: {migration_path}")

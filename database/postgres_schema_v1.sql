@@ -245,7 +245,7 @@ CREATE TABLE chats (
     dialog_id               TEXT NOT NULL UNIQUE,
     chat_title              TEXT,
     chat_type               TEXT NOT NULL DEFAULT 'unknown' CHECK (chat_type IN
-                                ('group','private','open','unknown')),
+                                ('group','private','open','user','dialog','unknown')),
     entity_type             TEXT,
     owner_id                UUID REFERENCES users(id) ON DELETE SET NULL,
     owner_bitrix_user_id    BIGINT,
