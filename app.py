@@ -17009,6 +17009,34 @@ def extract_collection(data: dict[str, Any], *keys: str) -> list[Any]:
     return []
 
 
+def extract_task_created_date(
+    details: dict[str, Any],
+    base_task: dict[str, Any],
+    history_raw: dict[str, Any] | None = None,
+) -> Any:
+    direct_value = first_non_empty(
+        pick(details, "createdDate", "created", "CREATED_DATE", "created_date", "dateCreate", "DATE_CREATE"),
+        pick(base_task, "createdDate", "created", "CREATED_DATE", "created_date", "dateCreate", "DATE_CREATE"),
+    )
+    if direct_value:
+        return direct_value
+
+    history_items = extract_collection(history_raw or {}, "history", "items", "list")
+    dated_items = [
+        item for item in history_items
+        if isinstance(item, dict) and first_non_empty(pick(item, "createdDate", "created", "date"))
+    ]
+    for item in dated_items:
+        if str(item.get("field") or "").strip().upper() == "NEW":
+            return first_non_empty(pick(item, "createdDate", "created", "date"))
+    if dated_items:
+        return min(
+            (first_non_empty(pick(item, "createdDate", "created", "date")) for item in dated_items),
+            key=lambda value: make_aware(parse_datetime(value)) or datetime.max.replace(tzinfo=LOCAL_TZ),
+        )
+    return None
+
+
 def build_task_record(client: BitrixClient, base_task: dict[str, Any]) -> dict[str, Any]:
     task_id = extract_task_id(base_task)
     if task_id is None:
@@ -17101,10 +17129,7 @@ def build_task_record(client: BitrixClient, base_task: dict[str, Any]) -> dict[s
         ),
         "mark": first_non_empty(pick(details, "mark", "MARK"), pick(base_task, "MARK", "mark")),
         "dates": {
-            "created": first_non_empty(
-                pick(details, "createdDate", "created", "CREATED_DATE"),
-                pick(base_task, "CREATED_DATE", "created"),
-            ),
+            "created": extract_task_created_date(details, base_task, history_raw),
             "changed": first_non_empty(
                 pick(details, "changedDate", "changed", "CHANGED_DATE"),
                 pick(base_task, "CHANGED_DATE", "changed"),
@@ -17185,7 +17210,7 @@ def build_fast_task_record(
         "priority": first_non_empty(pick(base_task, "PRIORITY", "priority")),
         "mark": first_non_empty(pick(base_task, "MARK", "mark")),
         "dates": {
-            "created": first_non_empty(pick(base_task, "created", "CREATED_DATE")),
+            "created": extract_task_created_date({}, base_task),
             "changed": first_non_empty(pick(base_task, "changed", "CHANGED_DATE")),
         },
         "raw": {
@@ -17268,7 +17293,7 @@ def build_audit_task_record(
         "priority": first_non_empty(pick(details, "priority", "PRIORITY"), pick(base_task, "PRIORITY", "priority")),
         "mark": first_non_empty(pick(details, "mark", "MARK"), pick(base_task, "MARK", "mark")),
         "dates": {
-            "created": first_non_empty(pick(details, "createdDate", "created", "CREATED_DATE"), pick(base_task, "CREATED_DATE", "created")),
+            "created": extract_task_created_date(details, base_task, history_raw),
             "changed": first_non_empty(pick(details, "changedDate", "changed", "CHANGED_DATE"), pick(base_task, "CHANGED_DATE", "changed")),
         },
         "raw": {"base": base_task, "details": details},
