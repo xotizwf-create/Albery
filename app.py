@@ -402,10 +402,27 @@ def google_drive_document_structured_content(document: dict[str, Any]) -> str:
         elif block_type == "table":
             title = str(block.get("title") or "Таблица").strip()
             markdown = str(block.get("markdown") or "").strip()
+            headers = block.get("headers") if isinstance(block.get("headers"), list) else []
+            rows = block.get("rows") if isinstance(block.get("rows"), list) else []
             records = block.get("records") if isinstance(block.get("records"), list) else []
             table_parts = [title]
             if markdown:
                 table_parts.append(markdown)
+            if headers and rows:
+                header_text = [str(item or "").strip() or f"Колонка {index + 1}" for index, item in enumerate(headers)]
+                exact_rows: list[str] = []
+                for row_index, row in enumerate(rows, start=1):
+                    if not isinstance(row, list):
+                        continue
+                    cells = []
+                    width = max(len(header_text), len(row))
+                    for cell_index in range(width):
+                        header = header_text[cell_index] if cell_index < len(header_text) else f"Колонка {cell_index + 1}"
+                        value = str(row[cell_index] if cell_index < len(row) else "").replace("<br>", "\n").strip()
+                        cells.append(f"{header}: {value if value else '∅'}")
+                    exact_rows.append(f"Строка {row_index}: " + " | ".join(cells))
+                if exact_rows:
+                    table_parts.append("Точная структура строк и столбцов:\n" + "\n".join(exact_rows))
             record_parts: list[str] = []
             for index, record in enumerate(records, start=1):
                 if not isinstance(record, dict):
