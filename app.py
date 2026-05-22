@@ -284,6 +284,7 @@ def company_folder_to_dict(row: Any) -> dict[str, Any]:
             "mime_type": row["drive_mime_type"],
             "source_url": row["drive_source_url"],
             "google_updated_at": iso_or_none(row["drive_google_updated_at"]),
+            "google_updated_at_text": format_datetime_msk_label(row["drive_google_updated_at"]),
             "blocks": raw_json.get("blocks", []) if isinstance(raw_json, dict) else [],
         }
     return payload
@@ -4353,6 +4354,8 @@ def zoom_call_row_payload(
         "participants": dedupe_zoom_participants(participants),
         "analytical_note": row.get("analytical_note") or "",
         "duration_min": row.get("duration_min"),
+        "synced_at": iso_or_none(row.get("synced_at")),
+        "synced_at_text": format_datetime_msk_label(row.get("synced_at")),
     }
     if include_transcript:
         payload["transcript_text"] = row.get("transcript_text") or ""
@@ -4383,7 +4386,11 @@ def load_zoom_calls_tree() -> dict[str, Any]:
             )
             rows = cur.fetchall()
     years_map: dict[int, dict[str, Any]] = {}
+    latest_synced_at = None
     for row in rows:
+        synced_at = row.get("synced_at")
+        if synced_at and (latest_synced_at is None or synced_at > latest_synced_at):
+            latest_synced_at = synced_at
         call_date = row["call_date"]
         year = call_date.year
         month = call_date.month
@@ -4422,7 +4429,12 @@ def load_zoom_calls_tree() -> dict[str, Any]:
             month_payload["dates"] = dates
             months.append(month_payload)
         years.append({"year": year_payload["year"], "months": months})
-    return {"years": years, "total": len(rows)}
+    return {
+        "years": years,
+        "total": len(rows),
+        "updated_at": iso_or_none(latest_synced_at),
+        "updated_at_text": format_datetime_msk_label(latest_synced_at),
+    }
 
 
 def load_zoom_call_detail(call_id: str) -> dict[str, Any] | None:
@@ -15598,7 +15610,24 @@ def format_datetime_ru(value: Any) -> str:
     parsed = parse_datetime(value)
     if parsed is None:
         return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=MSK_TZ)
+    else:
+        parsed = parsed.astimezone(MSK_TZ)
     return parsed.strftime("%d.%m.%Y %H:%M")
+
+
+def format_datetime_msk_label(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=MSK_TZ)
+    else:
+        parsed = parsed.astimezone(MSK_TZ)
+    return parsed.strftime("%d.%m.%Y в %H:%M МСК")
 
 
 def format_date_ru(value: Any) -> str:

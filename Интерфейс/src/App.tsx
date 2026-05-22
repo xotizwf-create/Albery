@@ -529,6 +529,7 @@ type CompanyFolder = {
     mime_type: string;
     source_url: string | null;
     google_updated_at: string | null;
+    google_updated_at_text?: string;
     blocks: Array<{
       type: string;
       text?: string;
@@ -753,6 +754,8 @@ type ZoomCall = {
   participants: ZoomParticipant[];
   analytical_note: string;
   duration_min: number | null;
+  synced_at?: string | null;
+  synced_at_text?: string;
   transcript_text?: string;
   segments?: ZoomTranscriptSegment[];
 };
@@ -771,6 +774,8 @@ type ZoomCallsTree = {
     }>;
   }>;
   total: number;
+  updated_at?: string | null;
+  updated_at_text?: string;
 };
 
 type ChatOverallDailyReport = {
@@ -3268,9 +3273,9 @@ export default function App() {
                               Открыть в Google Drive
                             </a>
                           )}
-                          {companyCurrentFolder.drive_source?.google_updated_at && (
+                          {companyCurrentFolder.drive_source?.google_updated_at_text && (
                             <span className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5">
-                              Обновлено: {companyCurrentFolder.drive_source.google_updated_at}
+                              Обновлено: {companyCurrentFolder.drive_source.google_updated_at_text}
                             </span>
                           )}
                           <span className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5">
@@ -3852,7 +3857,12 @@ export default function App() {
     setZoomCallsMessage("");
     try {
       const payload = await fetchJsonSafe("/api/zoom-calls", undefined, 60000);
-      setZoomCallsTree({ years: payload.years || [], total: payload.total || 0 });
+      setZoomCallsTree({
+        years: payload.years || [],
+        total: payload.total || 0,
+        updated_at: payload.updated_at || null,
+        updated_at_text: payload.updated_at_text || "",
+      });
     } catch (error) {
       setZoomCallsMessage(error instanceof Error ? error.message : "Не удалось загрузить зум-созвоны.");
     } finally {
@@ -3865,7 +3875,14 @@ export default function App() {
     setZoomCallsMessage("");
     try {
       const payload = await fetchJsonSafe("/api/zoom-calls/sync?from=2026-01-01", { method: "POST" }, 180000);
-      if (payload.tree) setZoomCallsTree({ years: payload.tree.years || [], total: payload.tree.total || 0 });
+      if (payload.tree) {
+        setZoomCallsTree({
+          years: payload.tree.years || [],
+          total: payload.tree.total || 0,
+          updated_at: payload.tree.updated_at || null,
+          updated_at_text: payload.tree.updated_at_text || "",
+        });
+      }
       const participantsWarning = payload.participant_errors?.length
         ? ` Участники по ${payload.participant_errors.length} созвонам недоступны в Zoom API, сохранен fallback.`
         : "";
@@ -3884,7 +3901,14 @@ export default function App() {
     setZoomCallsMessage("");
     try {
       const payload = await fetchJsonSafe("/api/zoom-calls/sync-google-drive", { method: "POST" }, 600000);
-      if (payload.tree) setZoomCallsTree({ years: payload.tree.years || [], total: payload.tree.total || 0 });
+      if (payload.tree) {
+        setZoomCallsTree({
+          years: payload.tree.years || [],
+          total: payload.tree.total || 0,
+          updated_at: payload.tree.updated_at || null,
+          updated_at_text: payload.tree.updated_at_text || "",
+        });
+      }
       setZoomCallsMessage(
         `transcript.txt из Google Drive подтянуты: созвонов ${payload.calls_synced || 0}; участников ${payload.participants_synced || 0}; реплик ${payload.segments_synced || 0}; удалено ${payload.removed_calls || 0}.`,
       );
@@ -5309,6 +5333,11 @@ export default function App() {
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2">
+                {zoomCallsTree.updated_at_text && (
+                  <span className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm font-bold text-slate-500">
+                    Обновлено: {zoomCallsTree.updated_at_text}
+                  </span>
+                )}
                 <button
                   onClick={syncDriveCallTranscripts}
                   disabled={zoomCallsLoading}
@@ -7751,6 +7780,11 @@ export default function App() {
                   <span className="px-3 py-1 rounded-md bg-slate-50 border border-slate-100">{selectedZoomCall.date_text}</span>
                   <span className="px-3 py-1 rounded-md bg-slate-50 border border-slate-100">{selectedZoomCall.time_text}</span>
                   <span className="px-3 py-1 rounded-md bg-slate-50 border border-slate-100">{selectedZoomCall.topic}</span>
+                  {selectedZoomCall.synced_at_text && (
+                    <span className="px-3 py-1 rounded-md bg-slate-50 border border-slate-100">
+                      Обновлено: {selectedZoomCall.synced_at_text}
+                    </span>
+                  )}
                 </div>
               </div>
               <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
