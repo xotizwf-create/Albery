@@ -1424,7 +1424,10 @@ def tool_process_chat_ocr(args: dict[str, Any]) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-MCP-Shared-Secret": os.getenv("MCP_SHARED_SECRET", "").strip(),
+        },
         method="POST",
     )
     try:
@@ -2915,7 +2918,10 @@ def tool_refresh_bitrix_context(args: dict[str, Any]) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-MCP-Shared-Secret": os.getenv("MCP_SHARED_SECRET", "").strip(),
+        },
         method="POST",
     )
     try:

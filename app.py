@@ -19866,6 +19866,17 @@ def auth_exempt_path(path: str) -> bool:
     return any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in AUTH_EXEMPT_PREFIXES)
 
 
+def internal_api_auth_ok() -> bool:
+    expected = os.getenv("MCP_SHARED_SECRET", "").strip()
+    if not expected:
+        return False
+    provided = first_non_empty(
+        request.headers.get("X-MCP-Shared-Secret"),
+        request.headers.get("X-Internal-Secret"),
+    )
+    return str(provided or "").strip() == expected
+
+
 def wants_json_response() -> bool:
     return request.path.startswith("/api/") or "application/json" in request.headers.get("Accept", "")
 
@@ -19896,6 +19907,8 @@ def require_admin_auth():
     if path == "/":
         return redirect("/main", code=302)
     if auth_exempt_path(path):
+        return None
+    if path == "/api/sync/full" and internal_api_auth_ok():
         return None
     if authenticated():
         return None
