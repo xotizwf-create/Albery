@@ -2411,7 +2411,7 @@ def upsert_chat_records(records: list[dict[str, Any]]) -> None:
                                 to_int(record.get("chat_id")),
                                 dialog_id,
                                 record.get("title"),
-                                record.get("type") if record.get("type") in {"group", "private", "open"} else "group",
+                                record.get("type") if record.get("type") in {"group", "private", "open", "user", "dialog"} else "group",
                                 parse_datetime(first_non_empty(record.get("last_activity_date"), record.get("last_message_date"))),
                                 len(members),
                                 pg_json(record.get("raw", record)),
@@ -16130,7 +16130,7 @@ class BitrixClient:
         for page in range(max_pages):
             payload = {
                 "SKIP_OPENLINES": "Y",
-                "SKIP_DIALOG": "Y",
+                "SKIP_DIALOG": "N",
                 "SKIP_CHAT": "N",
                 "SKIP_UNDISTRIBUTED_OPENLINES": "Y",
                 "ONLY_COPILOT": "N",
@@ -16148,10 +16148,6 @@ class BitrixClient:
                 item_type = str(item.get("type") or "").lower()
                 if not dialog_id and chat_id is not None:
                     dialog_id = f"chat{chat_id}"
-                if not (dialog_id.startswith("chat") or dialog_id.startswith("sg")):
-                    continue
-                if item_type in {"user", "private", "dialog"}:
-                    continue
                 chats_by_dialog[dialog_id] = item
             if len(items) < limit:
                 break
@@ -17791,17 +17787,15 @@ def sync_bitrix_chats(webhook_base: str) -> dict[str, Any]:
         chat_id = to_int(first_non_empty(chat.get("chat_id"), chat.get("chatId")))
         if not dialog_id and chat_id is not None:
             dialog_id = f"chat{chat_id}"
-        if not (dialog_id.startswith("chat") or dialog_id.startswith("sg")):
-            skipped_personal += 1
-            continue
         try:
             members = client.get_dialog_users(dialog_id)
         except Exception as exc:  # noqa: BLE001
+            members = []
             errors.append({"dialog_id": dialog_id, "error": str(exc)})
-            continue
+        if not (dialog_id.startswith("chat") or dialog_id.startswith("sg")):
+            skipped_personal += 1
         if len(members) < 3:
             skipped_small += 1
-            continue
         records.append(build_chat_record(chat, members))
         time.sleep(client.request_delay)
 

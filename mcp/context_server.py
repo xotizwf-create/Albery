@@ -1112,12 +1112,32 @@ def tool_list_chats(args: dict[str, Any]) -> dict[str, Any]:
     limit = parse_limit(args)
     offset = parse_offset(args)
 
-    params: list[Any] = []
+    join_params: list[Any] = []
+    filter_params: list[Any] = []
     filters = ["c.is_excluded = FALSE"]
     if query:
-        filters.append("(c.chat_title ILIKE %s OR c.dialog_id ILIKE %s)")
+        filters.append(
+            """
+            (
+                c.chat_title ILIKE %s
+                OR c.dialog_id ILIKE %s
+                OR EXISTS (
+                    SELECT 1
+                    FROM chat_members cmq
+                    JOIN users uq ON uq.id = cmq.user_id
+                    WHERE cmq.chat_id = c.id
+                      AND (
+                          uq.full_name ILIKE %s
+                          OR uq.email ILIKE %s
+                          OR uq.work_position ILIKE %s
+                          OR uq.bitrix_user_id::text = %s
+                      )
+                )
+            )
+            """
+        )
         like = f"%{query}%"
-        params.extend([like, like])
+        filter_params.extend([like, like, like, like, like, query])
     message_join = ""
     message_select = "0 AS period_messages_count"
     if date_from and date_to:
@@ -1125,10 +1145,10 @@ def tool_list_chats(args: dict[str, Any]) -> dict[str, Any]:
             LEFT JOIN chat_messages m
                 ON m.chat_id = c.id AND m.message_day BETWEEN %s AND %s
         """
-        params.extend([date_from, date_to])
+        join_params.extend([date_from, date_to])
         message_select = "count(m.id) AS period_messages_count"
 
-    params.extend([limit, offset])
+    params = [*join_params, *filter_params, limit, offset]
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1136,7 +1156,23 @@ def tool_list_chats(args: dict[str, Any]) -> dict[str, Any]:
                 SELECT
                     c.dialog_id, c.bitrix_chat_id, c.chat_title, c.chat_type,
                     c.members_count, c.last_message_at,
-                    {message_select}
+                    {message_select},
+                    COALESCE(
+                        (
+                            SELECT jsonb_agg(
+                                jsonb_build_object(
+                                    'bitrix_user_id', u.bitrix_user_id,
+                                    'full_name', u.full_name,
+                                    'work_position', u.work_position
+                                )
+                                ORDER BY u.full_name
+                            )
+                            FROM chat_members cm
+                            JOIN users u ON u.id = cm.user_id
+                            WHERE cm.chat_id = c.id
+                        ),
+                        '[]'::jsonb
+                    ) AS members
                 FROM chats c
                 {message_join}
                 WHERE {' AND '.join(filters)}
