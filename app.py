@@ -2509,7 +2509,6 @@ def load_chats() -> list[dict[str, Any]]:
                     """
                     SELECT *
                     FROM chats
-                    WHERE members_count >= 3
                     ORDER BY COALESCE(last_message_at, updated_at) DESC, chat_title
                     """
                 )
@@ -18179,7 +18178,6 @@ def missing_chat_messages_period(default_days: int = 30) -> tuple[date, date]:
                     FROM chats c
                     LEFT JOIN chat_day_syncs s ON s.chat_id = c.id
                     WHERE c.is_excluded = FALSE
-                      AND c.members_count >= 3
                     GROUP BY c.id
                 ) missing
                 """,
