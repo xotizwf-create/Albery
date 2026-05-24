@@ -5621,7 +5621,7 @@ export default function App() {
                   <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Команда</h2>
                   <p className="text-sm text-slate-500 font-medium mt-1">Сотрудники Bitrix, должности, подразделения и руководители</p>
                   <div className="mt-2 inline-flex items-center rounded-full border border-indigo-100 bg-indigo-50 px-3 py-1 text-[12px] font-bold text-indigo-700">
-                    Последнее обновление: {teamLastSyncedAtText || "еще не выполнялось"}
+                    Обновлено: {teamLastSyncedAtText || "еще не выполнялось"}
                   </div>
                 </div>
               </div>

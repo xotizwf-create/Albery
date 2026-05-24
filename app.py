@@ -20328,7 +20328,7 @@ def api_team():
         "team": team,
         "total": len(team),
         "last_synced_at": iso_or_none(latest_sync),
-        "last_synced_at_text": format_datetime_ru(latest_sync),
+        "last_synced_at_text": format_datetime_msk_label(latest_sync),
     })
 
 
@@ -21844,7 +21844,7 @@ def api_team_sync():
         if synced_at and (latest_sync is None or synced_at > latest_sync):
             latest_sync = synced_at
     payload["last_synced_at"] = iso_or_none(latest_sync)
-    payload["last_synced_at_text"] = format_datetime_ru(latest_sync)
+    payload["last_synced_at_text"] = format_datetime_msk_label(latest_sync)
     return jsonify(payload)
 
 
