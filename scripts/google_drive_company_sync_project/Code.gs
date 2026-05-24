@@ -39,6 +39,19 @@ function doGet(e) {
   if (token !== SYNC_TOKEN) {
     return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
   }
+  if (e && e.parameter && e.parameter.diag === '1') {
+    const props = PropertiesService.getScriptProperties();
+    return jsonResponse({
+      ok: true,
+      diag: true,
+      now: new Date().toISOString(),
+      last_trigger_run: props.getProperty('lastTriggerRun') || null,
+      last_trigger_result: props.getProperty('lastTriggerResult') || null,
+      last_notify_detail: props.getProperty('lastNotifyDetail') || null,
+      signature_schema: props.getProperty(CHANGE_SIGNATURE_SCHEMA_PROPERTY) || null,
+      notify_url_set: Boolean(CHANGE_NOTIFY_URL),
+    });
+  }
   return buildCompanySyncResponse({});
 }
 
@@ -561,6 +574,7 @@ function removeDriveChangeTriggers() {
 // against the previous run and pings the server only when it changed.
 function checkDriveChangesAndNotify() {
   const props = PropertiesService.getScriptProperties();
+  props.setProperty('lastTriggerRun', new Date().toISOString());
   const previous = props.getProperty(CHANGE_SIGNATURE_PROPERTY) || '';
   const previousSchema = props.getProperty(CHANGE_SIGNATURE_SCHEMA_PROPERTY) || '';
   const current = computeFolderSignature();
@@ -568,18 +582,23 @@ function checkDriveChangesAndNotify() {
   // detection logic. A schema mismatch forces one sync so a stale/old baseline
   // can never silently swallow an un-synced change.
   if (previousSchema === CHANGE_SIGNATURE_SCHEMA && current === previous) {
+    props.setProperty('lastTriggerResult', 'no_change');
     return;
   }
   // Persist the new signature only after the server confirms receipt, so a
   // transient failure is retried on the next minute instead of being lost.
-  if (notifyServerOfDriveChange()) {
+  const ok = notifyServerOfDriveChange();
+  props.setProperty('lastTriggerResult', 'notified=' + ok);
+  if (ok) {
     props.setProperty(CHANGE_SIGNATURE_PROPERTY, current);
     props.setProperty(CHANGE_SIGNATURE_SCHEMA_PROPERTY, CHANGE_SIGNATURE_SCHEMA);
   }
 }
 
 function notifyServerOfDriveChange() {
+  const props = PropertiesService.getScriptProperties();
   if (!CHANGE_NOTIFY_URL) {
+    props.setProperty('lastNotifyDetail', 'no_url');
     return false;
   }
   try {
@@ -590,10 +609,12 @@ function notifyServerOfDriveChange() {
       muteHttpExceptions: true,
     });
     const code = response.getResponseCode();
+    props.setProperty('lastNotifyDetail', 'code=' + code);
     // 2xx = synced. 409 = server busy with another sync; keep old signature and
     // retry next minute. Other codes also retry.
     return code >= 200 && code < 300;
   } catch (error) {
+    props.setProperty('lastNotifyDetail', 'error=' + (error && error.message ? error.message : String(error)));
     return false;
   }
 }
