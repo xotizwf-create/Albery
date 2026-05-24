@@ -2121,6 +2121,7 @@ export default function App() {
   const [teamRows, setTeamRows] = useState<TeamMemberRow[]>([]);
   const [teamLoading, setTeamLoading] = useState(false);
   const [teamMessage, setTeamMessage] = useState("");
+  const [teamLastSyncedAtText, setTeamLastSyncedAtText] = useState("");
   const [goalRows, setGoalRows] = useState<GoalRow[]>([]);
   const [goalStats, setGoalStats] = useState<GoalStats | null>(null);
   const [goalFilters, setGoalFilters] = useState<GoalFilters>({
@@ -2463,6 +2464,7 @@ export default function App() {
       if (!response.ok) throw new Error(payload.error || "Не удалось загрузить команду");
       const rows = payload.team || [];
       setTeamRows(rows);
+      setTeamLastSyncedAtText(payload.last_synced_at_text || "");
       return rows;
     } catch (error) {
       setTeamMessage(error instanceof Error ? error.message : "Не удалось загрузить команду");
@@ -3627,6 +3629,7 @@ export default function App() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Не удалось обновить команду из Bitrix");
       setTeamRows(payload.team || []);
+      setTeamLastSyncedAtText(payload.last_synced_at_text || "");
       setTeamMessage(payload.message || "Синхронизация команды завершена");
     } catch (error) {
       setTeamMessage(error instanceof Error ? error.message : "Не удалось обновить команду из Bitrix");
@@ -5617,6 +5620,9 @@ export default function App() {
                 <div>
                   <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Команда</h2>
                   <p className="text-sm text-slate-500 font-medium mt-1">Сотрудники Bitrix, должности, подразделения и руководители</p>
+                  <div className="mt-2 inline-flex items-center rounded-full border border-indigo-100 bg-indigo-50 px-3 py-1 text-[12px] font-bold text-indigo-700">
+                    Последнее обновление: {teamLastSyncedAtText || "еще не выполнялось"}
+                  </div>
                 </div>
               </div>
               <button

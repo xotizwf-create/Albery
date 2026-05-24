@@ -20319,7 +20319,17 @@ def api_chats():
 @app.get("/api/team")
 def api_team():
     team = load_team_members()
-    return jsonify({"team": team, "total": len(team)})
+    latest_sync = None
+    for member in team:
+        synced_at = parse_datetime(member.get("last_synced_at"))
+        if synced_at and (latest_sync is None or synced_at > latest_sync):
+            latest_sync = synced_at
+    return jsonify({
+        "team": team,
+        "total": len(team),
+        "last_synced_at": iso_or_none(latest_sync),
+        "last_synced_at_text": format_datetime_ru(latest_sync),
+    })
 
 
 @app.get("/api/zoom-calls")
@@ -20430,6 +20440,43 @@ def api_full_sync():
         "filters": registry.get("filters"),
         "export_filename": export_filename,
         "download_url": url_for("download_export", filename=export_filename),
+    })
+
+
+@app.route("/bitrix/events/team/<secret>", methods=["GET", "POST"])
+def bitrix_team_event_webhook(secret: str):
+    if not bitrix_event_secret_valid(secret):
+        return jsonify({"error": "forbidden"}), 403
+    if request.method == "GET":
+        return jsonify({"ok": True, "message": "Bitrix team event endpoint is ready."})
+
+    payload = flatten_request_payload()
+    event_name = normalize_bitrix_event_name(first_non_empty(payload.get("event"), payload.get("EVENT")))
+    supported_events = {
+        "OnAfterUserAdd",
+        "OnAfterUserUpdate",
+        "OnAfterUserDelete",
+        "OnAfterDepartmentAdd",
+        "OnAfterDepartmentUpdate",
+        "OnAfterDepartmentDelete",
+    }
+    if event_name and event_name not in supported_events:
+        return jsonify({"ok": True, "event": event_name, "ignored": True, "reason": "unsupported_event"}), 200
+
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if not webhook_base:
+        return jsonify({"ok": False, "error": "BITRIX_WEBHOOK_BASE is not configured."}), 500
+    try:
+        result = sync_bitrix_team(webhook_base)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    return jsonify({
+        "ok": True,
+        "event": event_name,
+        "processed_inline": True,
+        "saved": result.get("saved", 0),
+        "scanned": result.get("scanned", 0),
     })
 
 
@@ -21791,6 +21838,13 @@ def api_team_sync():
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"Ошибка синхронизации команды Bitrix: {exc}"}), 500
     payload["message"] = f"Синхронизация команды завершена: сохранено {payload['saved']} сотрудников."
+    latest_sync = None
+    for member in payload.get("team", []):
+        synced_at = parse_datetime(member.get("last_synced_at"))
+        if synced_at and (latest_sync is None or synced_at > latest_sync):
+            latest_sync = synced_at
+    payload["last_synced_at"] = iso_or_none(latest_sync)
+    payload["last_synced_at_text"] = format_datetime_ru(latest_sync)
     return jsonify(payload)
 
 
