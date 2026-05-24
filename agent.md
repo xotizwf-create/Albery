@@ -87,6 +87,94 @@ Current GitHub branch: `main`. Push code changes to GitHub before or after serve
 
 Этот файл фиксирует рабочий контекст проекта, чтобы в новом чате сразу было понятно, где что лежит и какими командами обслуживать сервер.
 
+## Git Branch Workflow / Правила Работы С Ветками
+
+`main` is the stable working branch. Do not make risky or experimental changes directly in `main`.
+
+Default workflow:
+
+```powershell
+git checkout main
+git pull origin main
+git checkout -b feature/my-change
+```
+
+Work in a separate branch for every task:
+
+- `feature/...` for new features;
+- `bugfix/...` for fixes;
+- `codex/...` for Cloud Codex work;
+- one branch should contain one logical task.
+
+Before committing:
+
+```powershell
+git status
+git diff
+```
+
+Commit and push the branch:
+
+```powershell
+git add .
+git commit -m "Describe the change"
+git push -u origin feature/my-change
+```
+
+Cloud Codex rule:
+
+- Cloud Codex should create a separate branch from the latest `main`;
+- Cloud Codex must not push directly to `main` unless explicitly asked;
+- after finishing, Cloud Codex should push the branch and show a diff summary;
+- merge into `main` only after review/confirmation.
+
+Recommended Cloud Codex prompt:
+
+```text
+Work in a new branch feature/my-change from the latest main.
+Do not push directly to main.
+After changes, show a diff summary and wait for confirmation before merge.
+```
+
+To inspect a remote branch created by Cloud Codex:
+
+```powershell
+git fetch origin
+git branch --track codex/some-branch origin/codex/some-branch
+git diff --stat main..origin/codex/some-branch
+git diff main..origin/codex/some-branch
+```
+
+To merge a checked branch into `main` locally:
+
+```powershell
+git checkout main
+git pull origin main
+git merge feature/my-change
+git push origin main
+```
+
+If Git reports conflicts, resolve the marked files manually, then:
+
+```powershell
+git add <resolved-files>
+git commit
+git push origin main
+```
+
+After a branch has been merged and is no longer needed:
+
+```powershell
+git branch -d feature/my-change
+git push origin --delete feature/my-change
+```
+
+Local PC auto-update rule:
+
+- the watcher script `scripts/watch_github_updates.ps1` checks `origin/main` and fast-forwards only `main`;
+- it does not automatically merge feature/codex branches into `main`;
+- if a new remote branch appears, inspect it first, then merge intentionally.
+
 ## Репозиторий
 
 - GitHub: `https://github.com/xotizwf-create/Albery.git`
