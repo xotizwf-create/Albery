@@ -4563,7 +4563,8 @@ def extract_zoom_operational_tasks_section(note: str) -> str:
                 collecting = True
             continue
         if re.match(
-            r"^\s*(?:[5-9][.)]|1[0-2][.)]|V[.)]?|VI[.)]?|VII[.)]?|VIII[.)]?|IX[.)]?)\s+(?!Ответственный:)\**",
+            r"^\s*(?:[5-9][.)]|1[0-2][.)]|V[.)]?|VI[.)]?|VII[.)]?|VIII[.)]?|IX[.)]?)\s+\**\s*"
+            r"(?:Поведенческие|Риски|Проблемы|Блокеры|Решения|Итоги|Вывод|Следующие|Контроль|Рекомендации)",
             line,
             re.IGNORECASE,
         ):

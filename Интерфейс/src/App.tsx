@@ -4105,7 +4105,7 @@ export default function App() {
         }
         continue;
       }
-      if (/^\s*(?:[5-9][.)]|1[0-2][.)]|V[.)]?|VI[.)]?|VII[.)]?|VIII[.)]?|IX[.)]?)\s+(?!Ответственный:)\**/i.test(line)) break;
+      if (/^\s*(?:[5-9][.)]|1[0-2][.)]|V[.)]?|VI[.)]?|VII[.)]?|VIII[.)]?|IX[.)]?)\s+\**\s*(?:Поведенческие|Риски|Проблемы|Блокеры|Решения|Итоги|Вывод|Следующие|Контроль|Рекомендации)/i.test(line)) break;
       sectionLines.push(raw.trimEnd());
     }
     return sectionLines.join("\n").trim();
