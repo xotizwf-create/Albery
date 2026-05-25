@@ -15579,10 +15579,23 @@ def send_owner_report_recommendations_to_bitrix(
     client = bitrix_webhook_client()
     recommendation_texts = load_owner_recommendations_for_bitrix(report_id, report_kind)
     recommendation_rows = load_owner_recommendation_rows_for_bitrix(report_id, report_kind)
+    def normalize_recommendation_message_text(value: Any) -> str:
+        lines = [
+            re.sub(r"\s+", " ", line).strip()
+            for line in str(value or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        ]
+        lines = [line for line in lines if line and not re.match(r"^текст рекомендаций$", line, re.IGNORECASE)]
+        result: list[str] = []
+        for index, line in enumerate(lines):
+            if index > 0 and re.match(r"^\d{1,2}[.)]\s+", line) and result and result[-1] != "":
+                result.append("")
+            result.append(line)
+        return "\n".join(result).strip()
+
     if isinstance(recipient_recommendations, dict):
         for key, value in recipient_recommendations.items():
             user_id = to_int(key)
-            text = str(value or "").strip()
+            text = normalize_recommendation_message_text(value)
             if user_id is not None and text:
                 recommendation_texts[user_id] = text
     results: list[dict[str, Any]] = []
@@ -15599,7 +15612,7 @@ def send_owner_report_recommendations_to_bitrix(
                 if str(row.get("recommendation_text") or "").strip()
             ).strip()
         else:
-            message = str(recommendation_texts.get(user_id) or "").strip()
+            message = normalize_recommendation_message_text(recommendation_texts.get(user_id))
         if not message:
             errors.append({"user_id": user_id, "error": "Для получателя нет адресной рекомендации."})
             continue

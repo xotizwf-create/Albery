@@ -1162,6 +1162,22 @@ const cleanRecommendationLine = (line: string) =>
     .replace(/\s+/g, " ")
     .trim();
 
+const normalizeRecommendationMessageText = (text: string) => {
+  const lines = String(text || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => cleanRecommendationLine(line))
+    .filter((line) => line && !/^текст рекомендаций$/i.test(line));
+  const result: string[] = [];
+  lines.forEach((line, index) => {
+    if (index > 0 && /^\d{1,2}[.)]\s+/.test(line) && result.length && result[result.length - 1] !== "") {
+      result.push("");
+    }
+    result.push(line);
+  });
+  return result.join("\n").trim();
+};
+
 const isOwnerAddressedRecommendationHeading = (line: string) => {
   const cleaned = cleanReportTextLine(line);
   return /^\d+\.\s*Адресные\s+(вопросы|рекомендации)/i.test(cleaned);
@@ -1218,7 +1234,7 @@ const extractOwnerRecommendationsByUser = (
     const cleaned = cleanRecommendationLine(text);
     if (!cleaned || isReportTableSeparatorLine(cleaned)) return;
     if (/^(текст рекомендаций|рекомендации|полный текст отчета|главный вывод|динамика|риски|темы дня)$/i.test(cleaned)) return;
-    result[userId] = [result[userId], cleaned].filter(Boolean).join("\n");
+    result[userId] = normalizeRecommendationMessageText([result[userId], cleaned].filter(Boolean).join("\n"));
   };
 
   lines.forEach((rawLine) => {
