@@ -783,6 +783,19 @@ type ZoomOperationalTasksPreview = {
     name: string;
     user_id: number;
   }>;
+  task_cards?: Array<{
+    recipient: {
+      name: string;
+      user_id: number;
+    } | null;
+    assignee_name: string;
+    title: string;
+    description: string;
+    deadline: string | null;
+    deadline_text: string;
+    tasks?: Array<Record<string, unknown>>;
+  }>;
+  unmatched_assignees?: string[];
   title: string;
   description: string;
   deadline: string | null;
@@ -4099,33 +4112,87 @@ export default function App() {
   };
 
   const cleanZoomOperationalSection = (section: string) => {
-    const sentenceCase = (value: string) => {
-      const text = value.trim().replace(/\.$/, "");
-      return text ? `${text.charAt(0).toUpperCase()}${text.slice(1)}` : text;
-    };
-    return String(section || "")
-      .split(/\r?\n/)
-      .map((raw) => {
-        const line = raw.trim();
-        if (!line) return "";
-        const match = line.match(
-          /^\s*(\d+)[.)]\s*(?:Ответственный:\s*.*?\.\s*)?Задача:\s*(.*?)\s*Срок:\s*(.*?)\.\s*Критерий результата:\s*(.*?)\.\s*(?:Статус:\s*.*?\.\s*)?(?:Источник:\s*.*)?$/i,
-        );
-        if (match) {
-          const [, number, taskText, deadlineText, resultText] = match;
-          return `${number}. ${sentenceCase(taskText)}. Критерий результата: ${resultText.trim().replace(/\.$/, "")}. Дедлайн - ${deadlineText.trim().replace(/\.$/, "")}.`;
-        }
-        return line
-          .replace(/^\s*(\d+)[.)]\s*/, "$1. ")
-          .replace(/Ответственный:\s*.*?\.\s*/i, "")
-          .replace(/Задача:\s*/i, "")
-          .replace(/\s*Срок:\s*/i, " Дедлайн - ")
-          .replace(/\s*Статус:\s*.*?(?:\.|$)/i, "")
-          .replace(/\s*Источник:\s*.*$/i, "")
-          .trim();
-      })
-      .filter(Boolean)
+    return parseLocalZoomOperationalTasks(section)
+      .map((task, index) => formatLocalZoomOperationalTask(task, index + 1))
       .join("\n");
+  };
+
+  const splitLocalZoomOperationalItems = (section: string) => {
+    const items: string[] = [];
+    String(section || "")
+      .split(/\r?\n/)
+      .map((raw) => raw.trim())
+      .filter(Boolean)
+      .forEach((line) => {
+        const markers = [...line.matchAll(/(?:^|\s)(\d+)[).]\s+/g)];
+        if (markers.length <= 1) {
+          items.push(line);
+          return;
+        }
+        markers.forEach((marker, index) => {
+          const start = marker.index || 0;
+          const end = index + 1 < markers.length ? markers[index + 1].index || line.length : line.length;
+          items.push(line.slice(start, end).trim());
+        });
+      });
+    return items;
+  };
+
+  const sentenceCaseLocal = (value: string) => {
+    const text = value.trim().replace(/\.$/, "");
+    return text ? `${text.charAt(0).toUpperCase()}${text.slice(1)}` : text;
+  };
+
+  const parseLocalZoomOperationalTasks = (section: string) => splitLocalZoomOperationalItems(section)
+    .map((raw, index) => {
+      let body = raw.replace(/^\s*\d+[.)]\s*/, "").trim();
+      let assigneeName = "Требует назначения";
+      const strictAssignee = body.match(/^Ответственный:\s*(.*?)\.\s*(.*)$/i);
+      if (strictAssignee) {
+        assigneeName = strictAssignee[1].trim();
+        body = strictAssignee[2].trim();
+      } else if (body.includes("—")) {
+        const parts = body.split("—");
+        assigneeName = parts.shift()?.trim() || assigneeName;
+        body = parts.join("—").trim();
+      } else if (body.includes(" - ")) {
+        const parts = body.split(" - ");
+        assigneeName = parts.shift()?.trim() || assigneeName;
+        body = parts.join(" - ").trim();
+      }
+      body = body.replace(/^Задача:\s*/i, "").trim();
+      const labels = [...body.matchAll(/(Срок|Критерий(?:\s+результата)?|Статус|Источник)\s*:/gi)];
+      const taskText = (labels.length ? body.slice(0, labels[0].index) : body).trim().replace(/\.$/, "");
+      const parts: Record<string, string> = {};
+      labels.forEach((label, labelIndex) => {
+        const key = label[1].toLowerCase().replace(/\s+/g, "_");
+        const start = (label.index || 0) + label[0].length;
+        const end = labelIndex + 1 < labels.length ? labels[labelIndex + 1].index || body.length : body.length;
+        parts[key] = body.slice(start, end).trim().replace(/\.$/, "");
+      });
+      if (!taskText) return null;
+      return {
+        number: index + 1,
+        assignee_name: assigneeName,
+        task_text: sentenceCaseLocal(taskText),
+        deadline_text: parts["срок"] || "срок не указан",
+        result_criteria: parts["критерий_результата"] || parts["критерий"] || "",
+      };
+    })
+    .filter(Boolean) as Array<{
+      number: number;
+      assignee_name: string;
+      task_text: string;
+      deadline_text: string;
+      result_criteria: string;
+    }>;
+
+  const formatLocalZoomOperationalTask = (
+    task: { task_text: string; deadline_text: string; result_criteria: string },
+    number: number,
+  ) => {
+    const criteria = task.result_criteria ? ` Критерий результата: ${task.result_criteria.replace(/\.$/, "")}.` : "";
+    return `${number}. ${task.task_text.replace(/\.$/, "")}.${criteria} Дедлайн - ${task.deadline_text.replace(/\.$/, "")}.`;
   };
 
   const zoomCallDispatchDeadline = (call: ZoomCall) => {
@@ -4140,34 +4207,69 @@ export default function App() {
     const rightText = String(right || "").trim().toLowerCase();
     if (!leftText || !rightText) return false;
     if (leftText === rightText) return true;
-    const leftTokens = leftText.split(/[\s,]+/).filter((token) => token.length > 1);
-    const rightTokens = rightText.split(/[\s,]+/).filter((token) => token.length > 1);
+    const aliases: Record<string, string> = {
+      "настя": "анастасия",
+      "дима": "дмитрий",
+      "саша": "александр",
+      "женя": "евгений",
+    };
+    const nameTokens = (value: string) => [...value.replaceAll("ё", "е").matchAll(/[a-zа-я0-9]+/gi)]
+      .map((match) => aliases[match[0]] || match[0]);
+    const leftTokens = nameTokens(leftText);
+    const rightTokens = nameTokens(rightText);
     const smaller = leftTokens.length <= rightTokens.length ? leftTokens : rightTokens;
-    const larger = new Set(leftTokens.length <= rightTokens.length ? rightTokens : leftTokens);
-    return smaller.length > 0 && smaller.every((token) => larger.has(token));
+    const larger = leftTokens.length <= rightTokens.length ? rightTokens : leftTokens;
+    return smaller.length > 0 && smaller.every((token) => (
+      token.length === 1 ? larger.some((candidate) => candidate.startsWith(token)) : larger.includes(token)
+    ));
   };
 
   const buildLocalZoomOperationalPreview = async (call: ZoomCall): Promise<ZoomOperationalTasksPreview> => {
     const operationalSection = extractZoomOperationalSection(call.analytical_note);
     if (!operationalSection) throw new Error("В отчете нет раздела «4. Операционные задачи».");
-    const cleanedSection = cleanZoomOperationalSection(operationalSection);
+    const operationalTasks = parseLocalZoomOperationalTasks(operationalSection);
+    const cleanedSection = operationalTasks.map((task, index) => formatLocalZoomOperationalTask(task, index + 1)).join("\n");
     if (!cleanedSection) throw new Error("В разделе «4. Операционные задачи» нет задач для отправки.");
     let members = teamRows;
     if (!members.length) members = await loadTeam();
-    const participantNames = call.participants.map((participant) => participant.name).filter(Boolean);
-    const recipients = members
-      .filter((member) => member.user_id && member.name && participantNames.some((participantName) => personNamesMatch(member.name, participantName)))
-      .map((member) => ({ name: member.name || `Пользователь ${member.user_id}`, user_id: member.user_id }));
-    if (!recipients.length) throw new Error("Не удалось сопоставить участников созвона с оргструктурой (team).");
     const periodText = call.time_text.includes("-")
       ? call.time_text.split(" ")[0]
       : call.start_time_msk && call.end_time_msk
         ? `${call.start_time_msk}-${call.end_time_msk}`
         : call.start_time_msk || "созвон";
     const deadline = zoomCallDispatchDeadline(call);
+    const title = `Итоги созвона ${periodText}`.trim();
+    const taskCardMap = new Map<string, NonNullable<ZoomOperationalTasksPreview["task_cards"]>[number]>();
+    operationalTasks.forEach((task) => {
+      const member = members.find((teamMember) => teamMember.user_id && teamMember.name && personNamesMatch(teamMember.name, task.assignee_name));
+      const recipient = member?.user_id ? { name: member.name || task.assignee_name, user_id: member.user_id } : null;
+      const key = recipient ? `user:${recipient.user_id}` : `name:${task.assignee_name}`;
+      const card = taskCardMap.get(key) || {
+        recipient,
+        assignee_name: task.assignee_name,
+        title,
+        description: "",
+        deadline: deadline.deadline,
+        deadline_text: deadline.deadline_text,
+        tasks: [],
+      };
+      card.tasks = [...(card.tasks || []), task as unknown as Record<string, unknown>];
+      taskCardMap.set(key, card);
+    });
+    const taskCards = [...taskCardMap.values()].map((card) => ({
+      ...card,
+      description: (card.tasks || []).map((task, index) => formatLocalZoomOperationalTask(task as any, index + 1)).join("\n"),
+    }));
+    const unmatchedAssignees = taskCards.filter((card) => !card.recipient).map((card) => card.assignee_name);
+    const recipients = taskCards
+      .map((card) => card.recipient)
+      .filter(Boolean) as Array<{ name: string; user_id: number }>;
+    if (!recipients.length) throw new Error("Не удалось сопоставить ответственных из раздела «4. Операционные задачи» с оргструктурой (team).");
     return {
       recipients,
-      title: `Итоги созвона ${periodText}`.trim(),
+      task_cards: taskCards,
+      unmatched_assignees: unmatchedAssignees,
+      title,
       description: [
         "Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс.",
         "",
@@ -8181,18 +8283,51 @@ export default function App() {
                 </div>
               </section>
 
-              <section className="grid gap-3 sm:grid-cols-[120px_1fr] text-sm">
-                <div className="font-black text-slate-400">Заголовок</div>
-                <div className="font-bold text-slate-900">{zoomDispatchPreview.title}</div>
-                <div className="font-black text-slate-400">Дедлайн</div>
-                <div className="font-bold text-slate-900">{zoomDispatchPreview.deadline_text}</div>
-              </section>
-
               <section>
-                <p className="text-xs font-black uppercase tracking-wider text-slate-400 mb-2">Описание</p>
-                <pre className="max-h-72 overflow-y-auto whitespace-pre-wrap rounded-xl border border-slate-100 bg-slate-50 p-4 text-[13px] leading-relaxed text-slate-800 font-sans">
-                  {zoomDispatchPreview.description}
-                </pre>
+                <p className="text-xs font-black uppercase tracking-wider text-slate-400 mb-2">Карточки задач</p>
+                <div className="space-y-3">
+                  {(zoomDispatchPreview.task_cards?.length
+                    ? zoomDispatchPreview.task_cards
+                    : [{
+                        recipient: zoomDispatchPreview.recipients[0] || null,
+                        assignee_name: zoomDispatchPreview.recipients[0]?.name || "Получатель",
+                        title: zoomDispatchPreview.title,
+                        description: zoomDispatchPreview.description,
+                        deadline: zoomDispatchPreview.deadline,
+                        deadline_text: zoomDispatchPreview.deadline_text,
+                      }]).map((card, index) => (
+                    <div key={`${card.recipient?.user_id || card.assignee_name}-${index}`} className="rounded-xl border border-slate-100 bg-white p-4 shadow-sm">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="min-w-0">
+                          <div className="text-xs font-black uppercase tracking-wider text-slate-400">Исполнитель</div>
+                          <div className="mt-1 inline-flex max-w-full items-center gap-1.5 rounded-lg bg-blue-50 px-3 py-1.5 text-xs font-black text-blue-700">
+                            <Users className="h-3.5 w-3.5 shrink-0" />
+                            <span className="truncate">{card.recipient?.name || card.assignee_name}</span>
+                          </div>
+                        </div>
+                        {!card.recipient && (
+                          <span className="rounded-lg bg-red-50 px-3 py-1.5 text-xs font-black text-red-600">
+                            Не найден Bitrix ID
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-4 grid gap-2 sm:grid-cols-[96px_1fr] text-sm">
+                        <div className="font-black text-slate-400">Заголовок</div>
+                        <div className="font-bold text-slate-900">{card.title}</div>
+                        <div className="font-black text-slate-400">Дедлайн</div>
+                        <div className="font-bold text-slate-900">{card.deadline_text}</div>
+                      </div>
+                      <pre className="mt-4 max-h-56 overflow-y-auto whitespace-pre-wrap rounded-xl border border-slate-100 bg-slate-50 p-4 text-[13px] leading-relaxed text-slate-800 font-sans">
+                        {card.description}
+                      </pre>
+                    </div>
+                  ))}
+                </div>
+                {zoomDispatchPreview.unmatched_assignees?.length ? (
+                  <div className="mt-3 rounded-xl bg-red-50 px-4 py-3 text-[13px] font-bold text-red-700">
+                    Не найдены в Bitrix: {zoomDispatchPreview.unmatched_assignees.join(", ")}
+                  </div>
+                ) : null}
               </section>
             </div>
 

@@ -1569,6 +1569,80 @@ def _sentence_case_ru(value: Any) -> str:
     return text[:1].upper() + text[1:] if text else text
 
 
+def _split_zoom_operational_task_items(section: str) -> list[str]:
+    text = str(section or "").strip()
+    if not text:
+        return []
+    items: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        markers = list(re.finditer(r"(?:^|\s)(\d+)[).]\s+", line))
+        if len(markers) <= 1:
+            items.append(line)
+            continue
+        for index, marker in enumerate(markers):
+            start = marker.start()
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(line)
+            item = line[start:end].strip()
+            if item:
+                items.append(item)
+    return items
+
+
+def _extract_zoom_labeled_parts(text: str) -> tuple[str, dict[str, str]]:
+    label_pattern = re.compile(r"(Срок|Критерий(?:\s+результата)?|Статус|Источник)\s*:", re.IGNORECASE)
+    matches = list(label_pattern.finditer(text))
+    if not matches:
+        return text.strip().strip(". "), {}
+    unlabeled = text[:matches[0].start()].strip().strip(". ")
+    labels: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        key = match.group(1).lower().replace(" ", "_")
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        labels[key] = text[match.end():end].strip().strip(". ")
+    return unlabeled, labels
+
+
+def _parse_zoom_operational_task_line(line: str, fallback_number: int) -> dict[str, Any] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+    match = re.match(r"^\s*(\d+)[.)]\s*(.*)$", text, re.DOTALL)
+    if match:
+        number = int(match.group(1)) if match.group(1).isdigit() else fallback_number
+        body = match.group(2).strip()
+    else:
+        number = fallback_number
+        body = text
+    assignee_name = ""
+    strict_assignee = re.match(r"^Ответственный:\s*(.*?)\.\s*(.*)$", body, re.IGNORECASE | re.DOTALL)
+    if strict_assignee:
+        assignee_name = strict_assignee.group(1).strip()
+        body = strict_assignee.group(2).strip()
+    elif "—" in body:
+        assignee_name, body = [part.strip() for part in body.split("—", 1)]
+    elif " - " in body:
+        assignee_name, body = [part.strip() for part in body.split(" - ", 1)]
+
+    body = re.sub(r"^Задача:\s*", "", body, flags=re.IGNORECASE).strip()
+    task_text, labels = _extract_zoom_labeled_parts(body)
+    if not task_text:
+        return None
+    return {
+        "number": number,
+        "assignee_name": _first_text_value(assignee_name, "Требует назначения"),
+        "bitrix_user_id": None,
+        "task_text": _sentence_case_ru(task_text),
+        "deadline_text": _first_text_value(labels.get("срок"), "срок не указан").rstrip("."),
+        "result_criteria": _first_text_value(labels.get("критерий_результата"), labels.get("критерий")).rstrip("."),
+        "status": _first_text_value(labels.get("статус"), "planned").rstrip("."),
+        "source": _first_text_value(labels.get("источник"), "").rstrip("."),
+        "raw": {"source_line": text},
+    }
+
+
 def _extract_zoom_operational_tasks_section(report_text: str) -> str:
     lines = str(report_text or "").strip().splitlines()
     collecting = False
@@ -1639,31 +1713,10 @@ def normalize_zoom_operational_tasks_for_raw_json(report_text: str, analysis: di
         return tasks
 
     section = _extract_zoom_operational_tasks_section(report_text)
-    for raw in section.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        match = re.match(
-            r"^\s*(\d+)[.)]\s*(?:Ответственный:\s*(.*?)\.\s*)?Задача:\s*(.*?)\s*"
-            r"Срок:\s*(.*?)\.\s*Критерий результата:\s*(.*?)\.\s*"
-            r"(?:Статус:\s*(.*?)\.\s*)?(?:Источник:\s*(.*))?$",
-            line,
-            re.IGNORECASE,
-        )
-        if not match:
-            continue
-        number, assignee_name, task_text, deadline_text, result_text, status, source = match.groups()
-        tasks.append({
-            "number": int(number),
-            "assignee_name": _first_text_value(assignee_name, "Требует назначения"),
-            "bitrix_user_id": None,
-            "task_text": _sentence_case_ru(task_text),
-            "deadline_text": str(deadline_text or "срок не указан").strip().rstrip("."),
-            "result_criteria": str(result_text or "").strip().rstrip("."),
-            "status": _first_text_value(status, "planned"),
-            "source": str(source or "").strip().rstrip("."),
-            "raw": {"source_line": line},
-        })
+    for raw in _split_zoom_operational_task_items(section):
+        parsed = _parse_zoom_operational_task_line(raw, len(tasks) + 1)
+        if parsed:
+            tasks.append(parsed)
     return tasks
 
 

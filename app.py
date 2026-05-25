@@ -4585,6 +4585,86 @@ def first_text_value(*values: Any) -> str:
     return ""
 
 
+def split_zoom_operational_task_items(section: str) -> list[str]:
+    text = str(section or "").strip()
+    if not text:
+        return []
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        markers = list(re.finditer(r"(?:^|\s)(\d+)[).]\s+", line))
+        if len(markers) <= 1:
+            lines.append(line)
+            continue
+        for index, marker in enumerate(markers):
+            start = marker.start()
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(line)
+            item = line[start:end].strip()
+            if item:
+                lines.append(item)
+    return lines
+
+
+def extract_zoom_labeled_parts(text: str) -> tuple[str, dict[str, str]]:
+    label_pattern = re.compile(r"(Срок|Критерий(?:\s+результата)?|Статус|Источник)\s*:", re.IGNORECASE)
+    matches = list(label_pattern.finditer(text))
+    if not matches:
+        return text.strip().strip(". "), {}
+    unlabeled_text = text[:matches[0].start()].strip().strip(". ")
+    labels: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        key = match.group(1).lower().replace(" ", "_")
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        value = text[match.end():end].strip().strip(". ")
+        labels[key] = value
+    return unlabeled_text, labels
+
+
+def parse_zoom_operational_task_line(line: str, fallback_number: int) -> dict[str, Any] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+    match = re.match(r"^\s*(\d+)[.)]\s*(.*)$", text, re.DOTALL)
+    if match:
+        number = to_int(match.group(1)) or fallback_number
+        body = match.group(2).strip()
+    else:
+        number = fallback_number
+        body = text
+
+    assignee_name = ""
+    strict_assignee = re.match(r"^Ответственный:\s*(.*?)\.\s*(.*)$", body, re.IGNORECASE | re.DOTALL)
+    if strict_assignee:
+        assignee_name = strict_assignee.group(1).strip()
+        body = strict_assignee.group(2).strip()
+    elif "—" in body:
+        assignee_name, body = [part.strip() for part in body.split("—", 1)]
+    elif " - " in body:
+        assignee_name, body = [part.strip() for part in body.split(" - ", 1)]
+
+    body = re.sub(r"^Задача:\s*", "", body, flags=re.IGNORECASE).strip()
+    task_text, labels = extract_zoom_labeled_parts(body)
+    result_criteria = first_text_value(labels.get("критерий_результата"), labels.get("критерий"))
+    deadline_text = first_text_value(labels.get("срок"), "срок не указан")
+    status = first_text_value(labels.get("статус"), "planned")
+    source = first_text_value(labels.get("источник"), "")
+    if not task_text:
+        return None
+    return {
+        "number": number,
+        "assignee_name": first_text_value(assignee_name, "Требует назначения"),
+        "bitrix_user_id": None,
+        "task_text": sentence_case_ru(task_text),
+        "deadline_text": deadline_text.strip().rstrip(".") or "срок не указан",
+        "result_criteria": result_criteria.strip().rstrip("."),
+        "status": status.strip().rstrip(".") or "planned",
+        "source": source.strip().rstrip("."),
+        "raw": {"source_line": text},
+    }
+
+
 def normalize_zoom_operational_tasks(
     section: str = "",
     analysis: dict[str, Any] | None = None,
@@ -4643,48 +4723,10 @@ def normalize_zoom_operational_tasks(
     if tasks:
         return tasks
 
-    for raw in str(section or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        match = re.match(
-            r"^\s*(\d+)[.)]\s*(?:Ответственный:\s*(.*?)\.\s*)?Задача:\s*(.*?)\s*"
-            r"Срок:\s*(.*?)\.\s*Критерий результата:\s*(.*?)\.\s*"
-            r"(?:Статус:\s*(.*?)\.\s*)?(?:Источник:\s*(.*))?$",
-            line,
-            re.IGNORECASE,
-        )
-        if match:
-            number, assignee_name, task_text, deadline_text, result_text, status, source = match.groups()
-            tasks.append({
-                "number": to_int(number) or len(tasks) + 1,
-                "assignee_name": first_text_value(assignee_name, "Требует назначения"),
-                "bitrix_user_id": None,
-                "task_text": sentence_case_ru(task_text),
-                "deadline_text": str(deadline_text or "срок не указан").strip().rstrip("."),
-                "result_criteria": str(result_text or "").strip().rstrip("."),
-                "status": first_text_value(status, "planned"),
-                "source": str(source or "").strip().rstrip("."),
-                "raw": {"source_line": line},
-            })
-            continue
-        cleaned = re.sub(r"^\s*(\d+)[.)]\s*", r"\1. ", line)
-        cleaned = re.sub(r"Ответственный:\s*.*?\.\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"Задача:\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*Срок:\s*", " Дедлайн - ", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*Статус:\s*.*?(?:\.|$)", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*Источник:\s*.*$", "", cleaned, flags=re.IGNORECASE)
-        tasks.append({
-            "number": len(tasks) + 1,
-            "assignee_name": "Требует назначения",
-            "bitrix_user_id": None,
-            "task_text": sentence_case_ru(cleaned),
-            "deadline_text": "срок не указан",
-            "result_criteria": "",
-            "status": "planned",
-            "source": "",
-            "raw": {"source_line": line},
-        })
+    for raw in split_zoom_operational_task_items(section):
+        parsed = parse_zoom_operational_task_line(raw, len(tasks) + 1)
+        if parsed:
+            tasks.append(parsed)
     return tasks
 
 
@@ -4731,12 +4773,88 @@ def person_names_match(left: Any, right: Any) -> bool:
         return False
     if left_text == right_text:
         return True
-    left_tokens = {token for token in re.split(r"[\s,]+", left_text) if len(token) > 1}
-    right_tokens = {token for token in re.split(r"[\s,]+", right_text) if len(token) > 1}
+    aliases = {
+        "настя": "анастасия",
+        "дима": "дмитрий",
+        "саша": "александр",
+        "женя": "евгений",
+    }
+
+    def name_tokens(value: str) -> list[str]:
+        normalized = value.replace("ё", "е")
+        return [aliases.get(token, token) for token in re.findall(r"[a-zа-я0-9]+", normalized, flags=re.IGNORECASE)]
+
+    left_tokens = name_tokens(left_text)
+    right_tokens = name_tokens(right_text)
     if not left_tokens or not right_tokens:
         return False
     smaller, larger = (left_tokens, right_tokens) if len(left_tokens) <= len(right_tokens) else (right_tokens, left_tokens)
-    return smaller.issubset(larger)
+
+    def token_matches(token: str) -> bool:
+        if len(token) == 1:
+            return any(candidate.startswith(token) for candidate in larger)
+        return token in larger
+
+    return all(token_matches(token) for token in smaller)
+
+
+def zoom_operational_task_card_description(tasks: list[dict[str, Any]]) -> str:
+    return format_zoom_operational_tasks_for_bitrix(tasks)
+
+
+def build_zoom_operational_task_cards(
+    tasks: list[dict[str, Any]],
+    team: list[dict[str, Any]],
+    title: str,
+    deadline: str | None,
+    deadline_text: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    cards_by_key: dict[str, dict[str, Any]] = {}
+    unmatched: list[str] = []
+    for task in tasks:
+        assignee_name = str(task.get("assignee_name") or "").strip()
+        bitrix_user_id = to_int(task.get("bitrix_user_id"))
+        matched_member: dict[str, Any] | None = None
+        if bitrix_user_id is not None:
+            for member in team:
+                if to_int(member.get("user_id")) == bitrix_user_id:
+                    matched_member = member
+                    break
+        if matched_member is None and assignee_name and assignee_name != "Требует назначения":
+            for member in team:
+                full_name = str(member.get("name") or "").strip()
+                member_id = to_int(member.get("user_id"))
+                if member_id is not None and full_name and person_names_match(full_name, assignee_name):
+                    matched_member = member
+                    break
+
+        if matched_member:
+            recipient = {
+                "name": str(matched_member.get("name") or assignee_name).strip(),
+                "user_id": to_int(matched_member.get("user_id")),
+            }
+            key = f"user:{recipient['user_id']}"
+        else:
+            recipient = None
+            key = f"name:{assignee_name or 'Требует назначения'}"
+            if assignee_name and assignee_name not in unmatched:
+                unmatched.append(assignee_name)
+
+        card = cards_by_key.setdefault(key, {
+            "recipient": recipient,
+            "assignee_name": assignee_name or "Требует назначения",
+            "title": title,
+            "description": "",
+            "deadline": deadline,
+            "deadline_text": deadline_text,
+            "tasks": [],
+        })
+        card["tasks"].append(task)
+
+    cards = list(cards_by_key.values())
+    for card in cards:
+        card["description"] = zoom_operational_task_card_description(card["tasks"])
+    return cards, unmatched
 
 
 def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = False) -> dict[str, Any]:
@@ -4752,20 +4870,7 @@ def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = 
     if require_webhook and not os.getenv("BITRIX_WEBHOOK_BASE", "").strip():
         raise ValueError("Укажите BITRIX_WEBHOOK_BASE в файле .env.")
 
-    participants = call.get("participants") or []
-    participant_names = [str(item.get("name") or "").strip() for item in participants if item.get("name")]
     team = load_team_members()
-    recipients = []
-    for member in team:
-        full_name = str(member.get("name") or "").strip()
-        bitrix_id = to_int(member.get("user_id"))
-        if bitrix_id is None or not full_name:
-            continue
-        if any(person_names_match(full_name, participant_name) for participant_name in participant_names):
-            recipients.append({"name": full_name, "user_id": bitrix_id})
-    if not recipients:
-        raise ValueError("Не удалось сопоставить участников созвона с оргструктурой (team).")
-
     time_text = str(call.get("time_text") or "").strip()
     if "-" in time_text:
         period_text = time_text.split(" ")[0]
@@ -4780,6 +4885,20 @@ def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = 
         f"{cleaned_section}"
     )
     deadline, deadline_text = zoom_dispatch_deadline(call)
+    task_cards, unmatched_assignees = build_zoom_operational_task_cards(
+        operational_tasks,
+        team,
+        title,
+        deadline,
+        deadline_text,
+    )
+    recipients = [
+        card["recipient"]
+        for card in task_cards
+        if isinstance(card.get("recipient"), dict) and to_int(card["recipient"].get("user_id")) is not None
+    ]
+    if not recipients:
+        raise ValueError("Не удалось сопоставить ответственных из раздела «4. Операционные задачи» с оргструктурой (team).")
     return {
         "call": call,
         "recipients": recipients,
@@ -4789,6 +4908,8 @@ def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = 
         "deadline_text": deadline_text,
         "operational_section": cleaned_section,
         "operational_tasks": operational_tasks,
+        "task_cards": task_cards,
+        "unmatched_assignees": unmatched_assignees,
     }
 
 
@@ -4802,6 +4923,8 @@ def preview_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
         "deadline_text": payload["deadline_text"],
         "operational_section": payload["operational_section"],
         "operational_tasks": payload["operational_tasks"],
+        "task_cards": payload["task_cards"],
+        "unmatched_assignees": payload["unmatched_assignees"],
     }
 
 
@@ -4813,32 +4936,61 @@ def dispatch_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
 def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[str, Any]:
     if not os.getenv("BITRIX_WEBHOOK_BASE", "").strip():
         raise ValueError("Укажите BITRIX_WEBHOOK_BASE в файле .env.")
+    task_cards = payload.get("task_cards") if isinstance(payload.get("task_cards"), list) else []
     recipients = payload.get("recipients") if isinstance(payload.get("recipients"), list) else []
     title = str(payload.get("title") or "").strip()
     description = str(payload.get("description") or "").strip()
     deadline = str(payload.get("deadline") or "").strip() or None
+    if task_cards:
+        recipients = []
+        for card in task_cards:
+            if not isinstance(card, dict):
+                continue
+            recipient = card.get("recipient") if isinstance(card.get("recipient"), dict) else None
+            if recipient:
+                recipients.append(recipient)
+        missing = [
+            str(card.get("assignee_name") or "Требует назначения")
+            for card in task_cards
+            if isinstance(card, dict) and not isinstance(card.get("recipient"), dict)
+        ]
+        if missing:
+            raise ValueError("Не найдены Bitrix-пользователи для ответственных: " + ", ".join(missing))
     if not recipients:
         raise ValueError("Нет получателей для отправки задачи.")
-    if not title:
+    if not title and not task_cards:
         raise ValueError("Не задан заголовок задачи.")
-    if not description:
+    if not description and not task_cards:
         raise ValueError("Не задано описание задачи.")
     client = bitrix_webhook_client()
     results: list[dict[str, Any]] = []
-    for recipient in recipients:
+    dispatch_items = task_cards if task_cards else [{"recipient": recipient, "title": title, "description": description, "deadline": deadline} for recipient in recipients]
+    for item in dispatch_items:
+        if not isinstance(item, dict):
+            continue
+        recipient = item.get("recipient") if isinstance(item.get("recipient"), dict) else None
+        if recipient is None:
+            continue
         bitrix_id = to_int(recipient.get("user_id") if isinstance(recipient, dict) else None)
         name = str(recipient.get("name") if isinstance(recipient, dict) else "" or "").strip()
+        item_title = str(item.get("title") or title).strip()
+        item_description = str(item.get("description") or description).strip()
+        item_deadline = str(item.get("deadline") or deadline or "").strip() or None
         if bitrix_id is None:
             raise ValueError(f"У получателя {name or recipient} нет Bitrix user_id.")
+        if not item_title:
+            raise ValueError(f"Не задан заголовок задачи для {name or recipient}.")
+        if not item_description:
+            raise ValueError(f"Не задано описание задачи для {name or recipient}.")
         task_payload = {
             "fields": {
-                "TITLE": title,
-                "DESCRIPTION": description,
+                "TITLE": item_title,
+                "DESCRIPTION": item_description,
                 "RESPONSIBLE_ID": bitrix_id,
             }
         }
-        if deadline:
-            task_payload["fields"]["DEADLINE"] = deadline
+        if item_deadline:
+            task_payload["fields"]["DEADLINE"] = item_deadline
         response = client.call_with_fallback("tasks.task.add", task_payload, prefer_api=True)
         result_payload = response.get("result") if isinstance(response, dict) else None
         task_id = result_payload.get("task", {}).get("id") if isinstance(result_payload, dict) else None
@@ -4848,6 +5000,7 @@ def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[st
             "name": name,
             "user_id": bitrix_id,
             "task_id": to_int(task_id) or task_id,
+            "title": item_title,
         })
         time.sleep(client.request_delay)
     return {
