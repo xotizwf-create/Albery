@@ -4720,14 +4720,15 @@ def normalize_zoom_operational_tasks(
             "source": first_text_value(item.get("source"), item.get("timecode"), ", ".join(evidence_times)),
             "raw": item.get("raw") if isinstance(item.get("raw"), dict) else item,
         })
-    if tasks:
-        return tasks
 
+    section_tasks: list[dict[str, Any]] = []
     for raw in split_zoom_operational_task_items(section):
-        parsed = parse_zoom_operational_task_line(raw, len(tasks) + 1)
+        parsed = parse_zoom_operational_task_line(raw, len(section_tasks) + 1)
         if parsed:
-            tasks.append(parsed)
-    return tasks
+            section_tasks.append(parsed)
+    if section_tasks and len(section_tasks) > len(tasks):
+        return section_tasks
+    return tasks or section_tasks
 
 
 def format_zoom_operational_tasks_for_bitrix(tasks: list[dict[str, Any]]) -> str:

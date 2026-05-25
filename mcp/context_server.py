@@ -1709,15 +1709,15 @@ def normalize_zoom_operational_tasks_for_raw_json(report_text: str, analysis: di
             "source": _first_text_value(item.get("source"), item.get("timecode"), ", ".join(evidence_times)).rstrip("."),
             "raw": item,
         })
-    if tasks:
-        return tasks
-
     section = _extract_zoom_operational_tasks_section(report_text)
+    section_tasks: list[dict[str, Any]] = []
     for raw in _split_zoom_operational_task_items(section):
-        parsed = _parse_zoom_operational_task_line(raw, len(tasks) + 1)
+        parsed = _parse_zoom_operational_task_line(raw, len(section_tasks) + 1)
         if parsed:
-            tasks.append(parsed)
-    return tasks
+            section_tasks.append(parsed)
+    if section_tasks and len(section_tasks) > len(tasks):
+        return section_tasks
+    return tasks or section_tasks
 
 
 def tool_save_zoom_call_report(args: dict[str, Any]) -> dict[str, Any]:
