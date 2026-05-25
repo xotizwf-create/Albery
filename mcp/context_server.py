@@ -1556,6 +1556,117 @@ def tool_get_zoom_call_transcript(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _first_text_value(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _sentence_case_ru(value: Any) -> str:
+    text = str(value or "").strip().rstrip(".")
+    return text[:1].upper() + text[1:] if text else text
+
+
+def _extract_zoom_operational_tasks_section(report_text: str) -> str:
+    lines = str(report_text or "").strip().splitlines()
+    collecting = False
+    section_lines: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not collecting:
+            if re.match(r"^\s*(?:4[.)]|IV[.)]?)\s*\**\s*Операционные задачи", line, re.IGNORECASE):
+                collecting = True
+            continue
+        if re.match(
+            r"^\s*(?:[5-9][.)]|1[0-2][.)]|V[.)]?|VI[.)]?|VII[.)]?|VIII[.)]?|IX[.)]?)\s+(?!Ответственный:)\**",
+            line,
+            re.IGNORECASE,
+        ):
+            break
+        section_lines.append(raw.rstrip())
+    return "\n".join(section_lines).strip()
+
+
+def normalize_zoom_operational_tasks_for_raw_json(report_text: str, analysis: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    source_items: list[Any] = []
+    if isinstance(analysis, dict):
+        for key in ("operational_tasks", "tasks"):
+            value = analysis.get(key)
+            if isinstance(value, list) and value:
+                source_items = value
+                break
+    for index, item in enumerate(source_items, start=1):
+        if not isinstance(item, dict):
+            continue
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), list) else []
+        evidence_times = [
+            str(evidence_item.get("time") or "").strip()
+            for evidence_item in evidence
+            if isinstance(evidence_item, dict) and str(evidence_item.get("time") or "").strip()
+        ]
+        task_text = _first_text_value(item.get("task_text"), item.get("task"), item.get("action"), item.get("text"))
+        if not task_text:
+            continue
+        tasks.append({
+            "number": int(item.get("number") or index) if str(item.get("number") or index).isdigit() else index,
+            "assignee_name": _first_text_value(
+                item.get("assignee_name"),
+                item.get("responsible"),
+                item.get("responsible_name"),
+                item.get("person_name"),
+                item.get("org_person"),
+                item.get("display_owner"),
+                item.get("owner"),
+                "Требует назначения",
+            ),
+            "bitrix_user_id": item.get("bitrix_user_id") or item.get("user_id"),
+            "task_text": _sentence_case_ru(task_text),
+            "deadline_text": _first_text_value(item.get("deadline_text"), item.get("deadline"), "срок не указан").rstrip("."),
+            "result_criteria": _first_text_value(
+                item.get("result_criteria"),
+                item.get("success_criteria"),
+                item.get("criteria"),
+                item.get("criterion"),
+            ).rstrip("."),
+            "status": _first_text_value(item.get("status"), "planned"),
+            "source": _first_text_value(item.get("source"), item.get("timecode"), ", ".join(evidence_times)).rstrip("."),
+            "raw": item,
+        })
+    if tasks:
+        return tasks
+
+    section = _extract_zoom_operational_tasks_section(report_text)
+    for raw in section.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = re.match(
+            r"^\s*(\d+)[.)]\s*(?:Ответственный:\s*(.*?)\.\s*)?Задача:\s*(.*?)\s*"
+            r"Срок:\s*(.*?)\.\s*Критерий результата:\s*(.*?)\.\s*"
+            r"(?:Статус:\s*(.*?)\.\s*)?(?:Источник:\s*(.*))?$",
+            line,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        number, assignee_name, task_text, deadline_text, result_text, status, source = match.groups()
+        tasks.append({
+            "number": int(number),
+            "assignee_name": _first_text_value(assignee_name, "Требует назначения"),
+            "bitrix_user_id": None,
+            "task_text": _sentence_case_ru(task_text),
+            "deadline_text": str(deadline_text or "срок не указан").strip().rstrip("."),
+            "result_criteria": str(result_text or "").strip().rstrip("."),
+            "status": _first_text_value(status, "planned"),
+            "source": str(source or "").strip().rstrip("."),
+            "raw": {"source_line": line},
+        })
+    return tasks
+
+
 def tool_save_zoom_call_report(args: dict[str, Any]) -> dict[str, Any]:
     call_id = str(args.get("call_id") or "").strip()
     zoom_uuid = str(args.get("zoom_uuid") or "").strip()
@@ -1576,10 +1687,12 @@ def tool_save_zoom_call_report(args: dict[str, Any]) -> dict[str, Any]:
     if status not in {"done", "error"}:
         raise McpError(-32602, "status must be done or error")
 
+    operational_tasks = normalize_zoom_operational_tasks_for_raw_json(report_text, analysis)
     report_payload = {
         "source": "mcp_save_zoom_call_report",
         "summary": summary,
         "report_text": report_text,
+        "operational_tasks": operational_tasks,
         "analysis": analysis,
         "raw_input": raw_input,
         "model": model or None,

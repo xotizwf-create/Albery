@@ -532,6 +532,15 @@ CREATE TABLE zoom_call_transcript_segments (
 
 CREATE INDEX idx_zoom_call_transcript_call ON zoom_call_transcript_segments(call_id, segment_index, cue_index);
 
+CREATE TABLE integration_sync_status (
+    sync_key             TEXT PRIMARY KEY,
+    last_success_at      TIMESTAMPTZ,
+    last_attempt_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status               TEXT NOT NULL DEFAULT 'unknown',
+    raw_json             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- =====================================================================
 -- Block 4: AI and prompts
 -- =====================================================================

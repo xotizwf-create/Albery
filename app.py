@@ -4179,19 +4179,11 @@ def ensure_integration_sync_status_schema() -> None:
     if not postgres_enabled():
         return
     with pg_connect() as conn:
-        with conn.transaction():
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS integration_sync_status (
-                        sync_key text PRIMARY KEY,
-                        last_success_at timestamptz NULL,
-                        last_attempt_at timestamptz NOT NULL DEFAULT now(),
-                        status text NOT NULL DEFAULT 'unknown',
-                        raw_json jsonb NOT NULL DEFAULT '{}'::jsonb,
-                        updated_at timestamptz NOT NULL DEFAULT now()
-                    )
-                    """
+        with conn.cursor() as cur:
+            if not pg_table_exists(cur, "public.integration_sync_status"):
+                raise RuntimeError(
+                    "PostgreSQL table public.integration_sync_status is missing. "
+                    "Apply database migrations before using integration sync status."
                 )
 
 
@@ -4435,6 +4427,7 @@ def zoom_call_row_payload(
         "technical_topic": row.get("technical_topic") or row.get("topic") or "Без темы",
         "participants": dedupe_zoom_participants(participants),
         "analytical_note": row.get("analytical_note") or "",
+        "raw_json": row.get("raw_json") or {},
         "duration_min": row.get("duration_min"),
         "synced_at": iso_or_none(row.get("synced_at")),
         "synced_at_text": format_datetime_msk_label(row.get("synced_at")),
@@ -4569,25 +4562,198 @@ def extract_zoom_operational_tasks_section(note: str) -> str:
             if re.match(r"^\s*(?:4[.)]|IV[.)]?)\s*\**\s*Операционные задачи", line, re.IGNORECASE):
                 collecting = True
             continue
-        if re.match(r"^\s*(?:[5-9][.)]|V[.)]?|VI[.)]?|VII[.)]?|VIII[.)]?|IX[.)]?)\s+\**", line, re.IGNORECASE):
+        if re.match(
+            r"^\s*(?:[5-9][.)]|1[0-2][.)]|V[.)]?|VI[.)]?|VII[.)]?|VIII[.)]?|IX[.)]?)\s+(?!Ответственный:)\**",
+            line,
+            re.IGNORECASE,
+        ):
             break
         section_lines.append(raw.rstrip())
     return "\n".join(section_lines).strip()
 
 
-def dispatch_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
+def sentence_case_ru(value: Any) -> str:
+    text = str(value or "").strip().rstrip(".")
+    return text[:1].upper() + text[1:] if text else text
+
+
+def first_text_value(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def normalize_zoom_operational_tasks(
+    section: str = "",
+    analysis: dict[str, Any] | None = None,
+    existing_tasks: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    source_items: list[Any] = []
+    if existing_tasks:
+        source_items = existing_tasks
+    elif isinstance(analysis, dict):
+        for key in ("operational_tasks", "tasks"):
+            value = analysis.get(key)
+            if isinstance(value, list) and value:
+                source_items = value
+                break
+    for index, item in enumerate(source_items, start=1):
+        if not isinstance(item, dict):
+            continue
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), list) else []
+        evidence_times = [
+            str(evidence_item.get("time") or "").strip()
+            for evidence_item in evidence
+            if isinstance(evidence_item, dict) and str(evidence_item.get("time") or "").strip()
+        ]
+        task_text = first_text_value(item.get("task_text"), item.get("task"), item.get("action"), item.get("text"))
+        result_criteria = first_text_value(
+            item.get("result_criteria"),
+            item.get("success_criteria"),
+            item.get("criteria"),
+            item.get("criterion"),
+        )
+        deadline_text = first_text_value(item.get("deadline_text"), item.get("deadline"), "срок не указан")
+        assignee_name = first_text_value(
+            item.get("assignee_name"),
+            item.get("responsible"),
+            item.get("responsible_name"),
+            item.get("person_name"),
+            item.get("org_person"),
+            item.get("display_owner"),
+            item.get("owner"),
+            "Требует назначения",
+        )
+        if not task_text:
+            continue
+        tasks.append({
+            "number": to_int(item.get("number")) or index,
+            "assignee_name": assignee_name,
+            "bitrix_user_id": to_int(first_non_empty(item.get("bitrix_user_id"), item.get("user_id"))),
+            "task_text": sentence_case_ru(task_text),
+            "deadline_text": deadline_text.strip().rstrip(".") or "срок не указан",
+            "result_criteria": result_criteria.strip().rstrip("."),
+            "status": first_text_value(item.get("status"), "planned"),
+            "source": first_text_value(item.get("source"), item.get("timecode"), ", ".join(evidence_times)),
+            "raw": item.get("raw") if isinstance(item.get("raw"), dict) else item,
+        })
+    if tasks:
+        return tasks
+
+    for raw in str(section or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = re.match(
+            r"^\s*(\d+)[.)]\s*(?:Ответственный:\s*(.*?)\.\s*)?Задача:\s*(.*?)\s*"
+            r"Срок:\s*(.*?)\.\s*Критерий результата:\s*(.*?)\.\s*"
+            r"(?:Статус:\s*(.*?)\.\s*)?(?:Источник:\s*(.*))?$",
+            line,
+            re.IGNORECASE,
+        )
+        if match:
+            number, assignee_name, task_text, deadline_text, result_text, status, source = match.groups()
+            tasks.append({
+                "number": to_int(number) or len(tasks) + 1,
+                "assignee_name": first_text_value(assignee_name, "Требует назначения"),
+                "bitrix_user_id": None,
+                "task_text": sentence_case_ru(task_text),
+                "deadline_text": str(deadline_text or "срок не указан").strip().rstrip("."),
+                "result_criteria": str(result_text or "").strip().rstrip("."),
+                "status": first_text_value(status, "planned"),
+                "source": str(source or "").strip().rstrip("."),
+                "raw": {"source_line": line},
+            })
+            continue
+        cleaned = re.sub(r"^\s*(\d+)[.)]\s*", r"\1. ", line)
+        cleaned = re.sub(r"Ответственный:\s*.*?\.\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"Задача:\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*Срок:\s*", " Дедлайн - ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*Статус:\s*.*?(?:\.|$)", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*Источник:\s*.*$", "", cleaned, flags=re.IGNORECASE)
+        tasks.append({
+            "number": len(tasks) + 1,
+            "assignee_name": "Требует назначения",
+            "bitrix_user_id": None,
+            "task_text": sentence_case_ru(cleaned),
+            "deadline_text": "срок не указан",
+            "result_criteria": "",
+            "status": "planned",
+            "source": "",
+            "raw": {"source_line": line},
+        })
+    return tasks
+
+
+def format_zoom_operational_tasks_for_bitrix(tasks: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for index, task in enumerate(tasks, start=1):
+        task_text = sentence_case_ru(task.get("task_text"))
+        result_criteria = str(task.get("result_criteria") or "").strip().rstrip(".")
+        deadline_text = str(task.get("deadline_text") or "срок не указан").strip().rstrip(".")
+        line = f"{index}. {task_text}."
+        if result_criteria:
+            line += f" Критерий результата: {result_criteria}."
+        line += f" Дедлайн - {deadline_text}."
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def clean_zoom_operational_tasks_section(section: str) -> str:
+    return format_zoom_operational_tasks_for_bitrix(normalize_zoom_operational_tasks(section=section))
+
+
+def zoom_call_operational_tasks(call: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_json = call.get("raw_json") if isinstance(call.get("raw_json"), dict) else {}
+    ai_report = raw_json.get("ai_report") if isinstance(raw_json.get("ai_report"), dict) else {}
+    existing = ai_report.get("operational_tasks") if isinstance(ai_report.get("operational_tasks"), list) else None
+    analysis = ai_report.get("analysis") if isinstance(ai_report.get("analysis"), dict) else None
+    section = extract_zoom_operational_tasks_section(call.get("analytical_note") or "")
+    return normalize_zoom_operational_tasks(section=section, analysis=analysis, existing_tasks=existing)
+
+
+def zoom_dispatch_deadline(call: dict[str, Any]) -> tuple[str | None, str]:
+    call_date = safe_parse_date(call.get("date"))
+    if call_date is None:
+        start = parse_datetime(call.get("start_time_msk"))
+        call_date = start.astimezone(MSK_TZ).date() if start else msk_today()
+    deadline_at = datetime.combine(call_date, dt_time(19, 0), tzinfo=MSK_TZ)
+    return deadline_at.isoformat(), f"{call_date.strftime('%d.%m.%Y')} 19:00 МСК"
+
+
+def person_names_match(left: Any, right: Any) -> bool:
+    left_text = str(left or "").strip().lower()
+    right_text = str(right or "").strip().lower()
+    if not left_text or not right_text:
+        return False
+    if left_text == right_text:
+        return True
+    left_tokens = {token for token in re.split(r"[\s,]+", left_text) if len(token) > 1}
+    right_tokens = {token for token in re.split(r"[\s,]+", right_text) if len(token) > 1}
+    if not left_tokens or not right_tokens:
+        return False
+    smaller, larger = (left_tokens, right_tokens) if len(left_tokens) <= len(right_tokens) else (right_tokens, left_tokens)
+    return smaller.issubset(larger)
+
+
+def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = False) -> dict[str, Any]:
     call = load_zoom_call_detail(call_id)
     if not call:
         raise ValueError("Zoom-созвон не найден.")
-    operational_section = extract_zoom_operational_tasks_section(call.get("analytical_note") or "")
-    if not operational_section:
-        raise ValueError("В отчете нет раздела «4. Операционные задачи».")
-    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
-    if not webhook_base:
+    operational_tasks = zoom_call_operational_tasks(call)
+    if not operational_tasks:
+        raise ValueError("В отчете нет структурированных задач или раздела «4. Операционные задачи».")
+    cleaned_section = format_zoom_operational_tasks_for_bitrix(operational_tasks)
+    if not cleaned_section:
+        raise ValueError("В разделе «4. Операционные задачи» нет задач для отправки.")
+    if require_webhook and not os.getenv("BITRIX_WEBHOOK_BASE", "").strip():
         raise ValueError("Укажите BITRIX_WEBHOOK_BASE в файле .env.")
 
     participants = call.get("participants") or []
-    participant_names = {str(item.get("name") or "").strip().lower() for item in participants if item.get("name")}
+    participant_names = [str(item.get("name") or "").strip() for item in participants if item.get("name")]
     team = load_team_members()
     recipients = []
     for member in team:
@@ -4595,7 +4761,7 @@ def dispatch_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
         bitrix_id = to_int(member.get("user_id"))
         if bitrix_id is None or not full_name:
             continue
-        if full_name.lower() in participant_names:
+        if any(person_names_match(full_name, participant_name) for participant_name in participant_names):
             recipients.append({"name": full_name, "user_id": bitrix_id})
     if not recipients:
         raise ValueError("Не удалось сопоставить участников созвона с оргструктурой (team).")
@@ -4611,31 +4777,87 @@ def dispatch_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
     description = (
         "Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс.\n\n"
         "Выделенные задачи с дедлайнами:\n"
-        f"{operational_section}"
+        f"{cleaned_section}"
     )
+    deadline, deadline_text = zoom_dispatch_deadline(call)
+    return {
+        "call": call,
+        "recipients": recipients,
+        "title": title,
+        "description": description,
+        "deadline": deadline,
+        "deadline_text": deadline_text,
+        "operational_section": cleaned_section,
+        "operational_tasks": operational_tasks,
+    }
 
+
+def preview_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
+    payload = build_zoom_operational_tasks_dispatch(call_id)
+    return {
+        "recipients": payload["recipients"],
+        "title": payload["title"],
+        "description": payload["description"],
+        "deadline": payload["deadline"],
+        "deadline_text": payload["deadline_text"],
+        "operational_section": payload["operational_section"],
+        "operational_tasks": payload["operational_tasks"],
+    }
+
+
+def dispatch_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
+    payload = build_zoom_operational_tasks_dispatch(call_id, require_webhook=True)
+    return dispatch_prepared_zoom_operational_tasks(payload)
+
+
+def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[str, Any]:
+    if not os.getenv("BITRIX_WEBHOOK_BASE", "").strip():
+        raise ValueError("Укажите BITRIX_WEBHOOK_BASE в файле .env.")
+    recipients = payload.get("recipients") if isinstance(payload.get("recipients"), list) else []
+    title = str(payload.get("title") or "").strip()
+    description = str(payload.get("description") or "").strip()
+    deadline = str(payload.get("deadline") or "").strip() or None
+    if not recipients:
+        raise ValueError("Нет получателей для отправки задачи.")
+    if not title:
+        raise ValueError("Не задан заголовок задачи.")
+    if not description:
+        raise ValueError("Не задано описание задачи.")
     client = bitrix_webhook_client()
     results: list[dict[str, Any]] = []
     for recipient in recipients:
-        payload = {
+        bitrix_id = to_int(recipient.get("user_id") if isinstance(recipient, dict) else None)
+        name = str(recipient.get("name") if isinstance(recipient, dict) else "" or "").strip()
+        if bitrix_id is None:
+            raise ValueError(f"У получателя {name or recipient} нет Bitrix user_id.")
+        task_payload = {
             "fields": {
                 "TITLE": title,
                 "DESCRIPTION": description,
-                "RESPONSIBLE_ID": recipient["user_id"],
+                "RESPONSIBLE_ID": bitrix_id,
             }
         }
-        response = client.call_with_fallback("tasks.task.add", payload, prefer_api=True)
+        if deadline:
+            task_payload["fields"]["DEADLINE"] = deadline
+        response = client.call_with_fallback("tasks.task.add", task_payload, prefer_api=True)
         result_payload = response.get("result") if isinstance(response, dict) else None
         task_id = result_payload.get("task", {}).get("id") if isinstance(result_payload, dict) else None
         if task_id is None and isinstance(result_payload, dict):
             task_id = result_payload.get("id")
         results.append({
-            "name": recipient["name"],
-            "user_id": recipient["user_id"],
+            "name": name,
+            "user_id": bitrix_id,
             "task_id": to_int(task_id) or task_id,
         })
         time.sleep(client.request_delay)
-    return {"sent": len(results), "results": results, "title": title}
+    return {
+        "sent": len(results),
+        "results": results,
+        "title": title,
+        "description": description,
+        "deadline": deadline,
+        "deadline_text": payload.get("deadline_text") or "",
+    }
 
 
 def delete_zoom_call_report(call_id: str) -> dict[str, Any] | None:
@@ -4765,6 +4987,8 @@ def generate_zoom_call_report_if_needed(call_id: str) -> None:
         report_text = str(analysis.get("report_text") or analysis.get("summary") or "").strip()
         if not report_text:
             report_text = content
+        operational_section = extract_zoom_operational_tasks_section(report_text)
+        operational_tasks = normalize_zoom_operational_tasks(section=operational_section, analysis=analysis)
     except Exception as exc:  # noqa: BLE001
         if ai_request_id:
             with pg_connect() as conn:
@@ -4787,6 +5011,7 @@ def generate_zoom_call_report_if_needed(call_id: str) -> None:
                     "source": "app_generate_zoom_call_report",
                     "summary": str(analysis.get("summary") or "").strip(),
                     "report_text": report_text,
+                    "operational_tasks": operational_tasks,
                     "analysis": analysis,
                     "raw_input": {
                         "call_id": call_id,
@@ -20454,13 +20679,26 @@ def api_zoom_call_report_delete(call_id: str):
 @app.post("/api/zoom-calls/<call_id>/dispatch-operational-tasks")
 def api_zoom_call_dispatch_operational_tasks(call_id: str):
     try:
-        result = dispatch_zoom_operational_tasks(call_id)
+        request_payload = request.get_json(silent=True) or {}
+        preview_payload = request_payload.get("preview") if isinstance(request_payload.get("preview"), dict) else None
+        result = dispatch_prepared_zoom_operational_tasks(preview_payload) if preview_payload else dispatch_zoom_operational_tasks(call_id)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"Не удалось отправить задачи исполнителям: {exc}"}), 500
     call = load_zoom_call_detail(call_id)
     return jsonify({"ok": True, "call": call, "result": result, "message": f"Задачи отправлены: {result.get('sent', 0)}"})
+
+
+@app.get("/api/zoom-calls/<call_id>/dispatch-operational-tasks/preview")
+def api_zoom_call_dispatch_operational_tasks_preview(call_id: str):
+    try:
+        result = preview_zoom_operational_tasks(call_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Не удалось подготовить список задач: {exc}"}), 500
+    return jsonify({"ok": True, "result": result})
 
 
 @app.post("/api/sync/full")

@@ -778,6 +778,18 @@ type ZoomCallsTree = {
   updated_at_text?: string;
 };
 
+type ZoomOperationalTasksPreview = {
+  recipients: Array<{
+    name: string;
+    user_id: number;
+  }>;
+  title: string;
+  description: string;
+  deadline: string | null;
+  deadline_text: string;
+  operational_section: string;
+};
+
 type ChatOverallDailyReport = {
   report_id: string;
   report_date: string;
@@ -2249,6 +2261,8 @@ export default function App() {
   const [zoomCallsMessage, setZoomCallsMessage] = useState("");
   const [selectedZoomCall, setSelectedZoomCall] = useState<ZoomCall | null>(null);
   const [zoomCallDetailLoading, setZoomCallDetailLoading] = useState(false);
+  const [zoomDispatchPreview, setZoomDispatchPreview] = useState<ZoomOperationalTasksPreview | null>(null);
+  const [zoomDispatchCall, setZoomDispatchCall] = useState<ZoomCall | null>(null);
   const [zoomTranscriptVisible, setZoomTranscriptVisible] = useState(false);
   const [zoomFolder, setZoomFolder] = useState<{ year?: number; month?: number; date?: string }>({});
   const [accountingTab, setAccountingTab] = useState<
@@ -4066,13 +4080,146 @@ export default function App() {
     }
   };
 
-  const dispatchZoomOperationalTasks = async (call: ZoomCall) => {
-    const confirmed = window.confirm("Отправить задачи исполнителям из раздела «4. Операционные задачи»?");
-    if (!confirmed) return;
+  const extractZoomOperationalSection = (note: string) => {
+    const lines = String(note || "").trim().split(/\r?\n/);
+    const sectionLines: string[] = [];
+    let collecting = false;
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!collecting) {
+        if (/^\s*(?:4[.)]|IV[.)]?)\s*\**\s*Операционные задачи/i.test(line)) {
+          collecting = true;
+        }
+        continue;
+      }
+      if (/^\s*(?:[5-9][.)]|1[0-2][.)]|V[.)]?|VI[.)]?|VII[.)]?|VIII[.)]?|IX[.)]?)\s+(?!Ответственный:)\**/i.test(line)) break;
+      sectionLines.push(raw.trimEnd());
+    }
+    return sectionLines.join("\n").trim();
+  };
+
+  const cleanZoomOperationalSection = (section: string) => {
+    const sentenceCase = (value: string) => {
+      const text = value.trim().replace(/\.$/, "");
+      return text ? `${text.charAt(0).toUpperCase()}${text.slice(1)}` : text;
+    };
+    return String(section || "")
+      .split(/\r?\n/)
+      .map((raw) => {
+        const line = raw.trim();
+        if (!line) return "";
+        const match = line.match(
+          /^\s*(\d+)[.)]\s*(?:Ответственный:\s*.*?\.\s*)?Задача:\s*(.*?)\s*Срок:\s*(.*?)\.\s*Критерий результата:\s*(.*?)\.\s*(?:Статус:\s*.*?\.\s*)?(?:Источник:\s*.*)?$/i,
+        );
+        if (match) {
+          const [, number, taskText, deadlineText, resultText] = match;
+          return `${number}. ${sentenceCase(taskText)}. Критерий результата: ${resultText.trim().replace(/\.$/, "")}. Дедлайн - ${deadlineText.trim().replace(/\.$/, "")}.`;
+        }
+        return line
+          .replace(/^\s*(\d+)[.)]\s*/, "$1. ")
+          .replace(/Ответственный:\s*.*?\.\s*/i, "")
+          .replace(/Задача:\s*/i, "")
+          .replace(/\s*Срок:\s*/i, " Дедлайн - ")
+          .replace(/\s*Статус:\s*.*?(?:\.|$)/i, "")
+          .replace(/\s*Источник:\s*.*$/i, "")
+          .trim();
+      })
+      .filter(Boolean)
+      .join("\n");
+  };
+
+  const zoomCallDispatchDeadline = (call: ZoomCall) => {
+    const dateIso = call.date || call.start_time_msk.slice(0, 10) || isoFromDate(moscowNow());
+    const [year, month, day] = dateIso.split("-").map(Number);
+    const label = `${String(day).padStart(2, "0")}.${String(month).padStart(2, "0")}.${year} 19:00 МСК`;
+    return { deadline: `${dateIso}T19:00:00+03:00`, deadline_text: label };
+  };
+
+  const personNamesMatch = (left?: string | null, right?: string | null) => {
+    const leftText = String(left || "").trim().toLowerCase();
+    const rightText = String(right || "").trim().toLowerCase();
+    if (!leftText || !rightText) return false;
+    if (leftText === rightText) return true;
+    const leftTokens = leftText.split(/[\s,]+/).filter((token) => token.length > 1);
+    const rightTokens = rightText.split(/[\s,]+/).filter((token) => token.length > 1);
+    const smaller = leftTokens.length <= rightTokens.length ? leftTokens : rightTokens;
+    const larger = new Set(leftTokens.length <= rightTokens.length ? rightTokens : leftTokens);
+    return smaller.length > 0 && smaller.every((token) => larger.has(token));
+  };
+
+  const buildLocalZoomOperationalPreview = async (call: ZoomCall): Promise<ZoomOperationalTasksPreview> => {
+    const operationalSection = extractZoomOperationalSection(call.analytical_note);
+    if (!operationalSection) throw new Error("В отчете нет раздела «4. Операционные задачи».");
+    const cleanedSection = cleanZoomOperationalSection(operationalSection);
+    if (!cleanedSection) throw new Error("В разделе «4. Операционные задачи» нет задач для отправки.");
+    let members = teamRows;
+    if (!members.length) members = await loadTeam();
+    const participantNames = call.participants.map((participant) => participant.name).filter(Boolean);
+    const recipients = members
+      .filter((member) => member.user_id && member.name && participantNames.some((participantName) => personNamesMatch(member.name, participantName)))
+      .map((member) => ({ name: member.name || `Пользователь ${member.user_id}`, user_id: member.user_id }));
+    if (!recipients.length) throw new Error("Не удалось сопоставить участников созвона с оргструктурой (team).");
+    const periodText = call.time_text.includes("-")
+      ? call.time_text.split(" ")[0]
+      : call.start_time_msk && call.end_time_msk
+        ? `${call.start_time_msk}-${call.end_time_msk}`
+        : call.start_time_msk || "созвон";
+    const deadline = zoomCallDispatchDeadline(call);
+    return {
+      recipients,
+      title: `Итоги созвона ${periodText}`.trim(),
+      description: [
+        "Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс.",
+        "",
+        "Выделенные задачи с дедлайнами:",
+        cleanedSection,
+      ].join("\n"),
+      deadline: deadline.deadline,
+      deadline_text: deadline.deadline_text,
+      operational_section: cleanedSection,
+    };
+  };
+
+  const previewZoomOperationalTasks = async (call: ZoomCall) => {
     setZoomCallDetailLoading(true);
     setZoomCallsMessage("");
     try {
-      const payload = await fetchJsonSafe(`/api/zoom-calls/${encodeURIComponent(call.id)}/dispatch-operational-tasks`, { method: "POST" }, 180000);
+      let payload: any = null;
+      try {
+        payload = await fetchJsonSafe(
+          `/api/zoom-calls/${encodeURIComponent(call.id)}/dispatch-operational-tasks/preview`,
+          undefined,
+          60000,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        if (!message.includes("(404)")) throw error;
+      }
+      const preview = payload?.result || await buildLocalZoomOperationalPreview(call);
+      setZoomDispatchCall(call);
+      setZoomDispatchPreview(preview);
+    } catch (error) {
+      setZoomCallsMessage(error instanceof Error ? error.message : "Не удалось подготовить список отправки.");
+    } finally {
+      setZoomCallDetailLoading(false);
+    }
+  };
+
+  const dispatchZoomOperationalTasks = async () => {
+    if (!zoomDispatchCall) return;
+    const call = zoomDispatchCall;
+    setZoomCallDetailLoading(true);
+    setZoomCallsMessage("");
+    try {
+      const payload = await fetchJsonSafe(
+        `/api/zoom-calls/${encodeURIComponent(call.id)}/dispatch-operational-tasks`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ preview: zoomDispatchPreview }),
+        },
+        180000,
+      );
       const updatedCall = payload.call || call;
       setSelectedZoomCall(updatedCall);
       setZoomCallsTree((current) => ({
@@ -4089,6 +4236,8 @@ export default function App() {
         })),
       }));
       setZoomCallsMessage(payload.message || "Задачи отправлены исполнителям.");
+      setZoomDispatchPreview(null);
+      setZoomDispatchCall(null);
     } catch (error) {
       setZoomCallsMessage(error instanceof Error ? error.message : "Не удалось отправить задачи исполнителям.");
     } finally {
@@ -7911,12 +8060,13 @@ export default function App() {
                   {zoomTranscriptVisible ? "Посмотреть отчет" : "Посмотреть транскрибацию"}
                 </button>
                 <button
-                  onClick={() => void dispatchZoomOperationalTasks(selectedZoomCall)}
+                  onClick={() => void previewZoomOperationalTasks(selectedZoomCall)}
                   disabled={zoomCallDetailLoading || !selectedZoomCall.analytical_note}
-                  className="h-10 px-4 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 text-[13px] font-bold flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  className="w-10 h-10 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 flex items-center justify-center disabled:cursor-not-allowed disabled:opacity-50"
+                  title="Отправить задачи исполнителям"
+                  aria-label="Отправить задачи исполнителям"
                 >
-                  <Send className="w-4 h-4" />
-                  Отправить задачи исполнителям
+                  <ArrowRight className="w-4 h-4" />
                 </button>
                 <button
                   onClick={() => void deleteZoomCallReport(selectedZoomCall)}
@@ -7992,6 +8142,82 @@ export default function App() {
                   </div>
                 </>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {zoomDispatchPreview && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-150">
+          <div className="absolute inset-0 bg-slate-950/45 backdrop-blur-sm" onClick={() => setZoomDispatchPreview(null)}></div>
+          <div
+            className="relative w-full max-w-2xl max-h-[86vh] overflow-hidden rounded-2xl bg-white shadow-2xl ring-1 ring-slate-200 flex flex-col"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="px-5 py-4 border-b border-slate-100 flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <h3 className="text-lg font-black text-slate-950">Отправка задач</h3>
+                <p className="mt-1 text-xs font-bold text-slate-400">Проверьте получателей и текст перед отправкой</p>
+              </div>
+              <button
+                onClick={() => setZoomDispatchPreview(null)}
+                className="w-9 h-9 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-500 flex items-center justify-center"
+                aria-label="Закрыть"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-5 space-y-5">
+              <section>
+                <p className="text-xs font-black uppercase tracking-wider text-slate-400 mb-2">Кому</p>
+                <div className="flex flex-wrap gap-2">
+                  {zoomDispatchPreview.recipients.map((recipient) => (
+                    <span key={recipient.user_id} className="inline-flex items-center gap-1.5 rounded-lg bg-blue-50 px-3 py-1.5 text-xs font-black text-blue-700">
+                      <Users className="h-3.5 w-3.5" />
+                      {recipient.name}
+                    </span>
+                  ))}
+                </div>
+              </section>
+
+              <section className="grid gap-3 sm:grid-cols-[120px_1fr] text-sm">
+                <div className="font-black text-slate-400">Заголовок</div>
+                <div className="font-bold text-slate-900">{zoomDispatchPreview.title}</div>
+                <div className="font-black text-slate-400">Дедлайн</div>
+                <div className="font-bold text-slate-900">{zoomDispatchPreview.deadline_text}</div>
+              </section>
+
+              <section>
+                <p className="text-xs font-black uppercase tracking-wider text-slate-400 mb-2">Описание</p>
+                <pre className="max-h-72 overflow-y-auto whitespace-pre-wrap rounded-xl border border-slate-100 bg-slate-50 p-4 text-[13px] leading-relaxed text-slate-800 font-sans">
+                  {zoomDispatchPreview.description}
+                </pre>
+              </section>
+            </div>
+
+            <div className="px-5 py-4 border-t border-slate-100 bg-slate-50 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              {zoomCallsMessage ? (
+                <div className="text-[13px] font-bold text-red-600">{zoomCallsMessage}</div>
+              ) : (
+                <div></div>
+              )}
+              <div className="flex items-center justify-end gap-2">
+              <button
+                onClick={() => setZoomDispatchPreview(null)}
+                className="h-10 px-4 rounded-xl bg-white hover:bg-slate-100 text-slate-600 text-[13px] font-black border border-slate-200"
+              >
+                Отмена
+              </button>
+              <button
+                onClick={() => void dispatchZoomOperationalTasks()}
+                disabled={zoomCallDetailLoading}
+                className="h-10 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-[13px] font-black flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <ArrowRight className="w-4 h-4" />
+                Отправить
+              </button>
+              </div>
             </div>
           </div>
         </div>
