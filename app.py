@@ -4556,6 +4556,88 @@ def load_zoom_call_detail(call_id: str) -> dict[str, Any] | None:
     return payload
 
 
+def extract_zoom_operational_tasks_section(note: str) -> str:
+    text = str(note or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    collecting = False
+    section_lines: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not collecting:
+            if re.match(r"^\s*(?:4[.)]|IV[.)]?)\s*\**\s*Операционные задачи", line, re.IGNORECASE):
+                collecting = True
+            continue
+        if re.match(r"^\s*(?:[5-9][.)]|V[.)]?|VI[.)]?|VII[.)]?|VIII[.)]?|IX[.)]?)\s+\**", line, re.IGNORECASE):
+            break
+        section_lines.append(raw.rstrip())
+    return "\n".join(section_lines).strip()
+
+
+def dispatch_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
+    call = load_zoom_call_detail(call_id)
+    if not call:
+        raise ValueError("Zoom-созвон не найден.")
+    operational_section = extract_zoom_operational_tasks_section(call.get("analytical_note") or "")
+    if not operational_section:
+        raise ValueError("В отчете нет раздела «4. Операционные задачи».")
+    webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+    if not webhook_base:
+        raise ValueError("Укажите BITRIX_WEBHOOK_BASE в файле .env.")
+
+    participants = call.get("participants") or []
+    participant_names = {str(item.get("name") or "").strip().lower() for item in participants if item.get("name")}
+    team = load_team_members()
+    recipients = []
+    for member in team:
+        full_name = str(member.get("name") or "").strip()
+        bitrix_id = to_int(member.get("user_id"))
+        if bitrix_id is None or not full_name:
+            continue
+        if full_name.lower() in participant_names:
+            recipients.append({"name": full_name, "user_id": bitrix_id})
+    if not recipients:
+        raise ValueError("Не удалось сопоставить участников созвона с оргструктурой (team).")
+
+    time_text = str(call.get("time_text") or "").strip()
+    if "-" in time_text:
+        period_text = time_text.split(" ")[0]
+    else:
+        start = str(call.get("start_time_msk") or "").strip()
+        end = str(call.get("end_time_msk") or "").strip()
+        period_text = f"{start}-{end}" if start and end else start or "созвон"
+    title = f"Итоги созвона {period_text}".strip()
+    description = (
+        "Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс.\n\n"
+        "Выделенные задачи с дедлайнами:\n"
+        f"{operational_section}"
+    )
+
+    client = bitrix_webhook_client()
+    results: list[dict[str, Any]] = []
+    for recipient in recipients:
+        payload = {
+            "fields": {
+                "TITLE": title,
+                "DESCRIPTION": description,
+                "RESPONSIBLE_ID": recipient["user_id"],
+            }
+        }
+        response = client.call_with_fallback("tasks.task.add", payload, prefer_api=True)
+        result_payload = response.get("result") if isinstance(response, dict) else None
+        task_id = result_payload.get("task", {}).get("id") if isinstance(result_payload, dict) else None
+        if task_id is None and isinstance(result_payload, dict):
+            task_id = result_payload.get("id")
+        results.append({
+            "name": recipient["name"],
+            "user_id": recipient["user_id"],
+            "task_id": to_int(task_id) or task_id,
+        })
+        time.sleep(client.request_delay)
+    return {"sent": len(results), "results": results, "title": title}
+
+
 def delete_zoom_call_report(call_id: str) -> dict[str, Any] | None:
     ensure_zoom_schema()
     with pg_connect() as conn:
@@ -20367,6 +20449,18 @@ def api_zoom_call_report_delete(call_id: str):
         return jsonify({"error": "Zoom-созвон не найден."}), 404
     call = load_zoom_call_detail(call_id)
     return jsonify({"deleted": True, "call": call, "message": "Отчет по созвону удален."})
+
+
+@app.post("/api/zoom-calls/<call_id>/dispatch-operational-tasks")
+def api_zoom_call_dispatch_operational_tasks(call_id: str):
+    try:
+        result = dispatch_zoom_operational_tasks(call_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Не удалось отправить задачи исполнителям: {exc}"}), 500
+    call = load_zoom_call_detail(call_id)
+    return jsonify({"ok": True, "call": call, "result": result, "message": f"Задачи отправлены: {result.get('sent', 0)}"})
 
 
 @app.post("/api/sync/full")

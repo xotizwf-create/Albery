@@ -4066,6 +4066,36 @@ export default function App() {
     }
   };
 
+  const dispatchZoomOperationalTasks = async (call: ZoomCall) => {
+    const confirmed = window.confirm("Отправить задачи исполнителям из раздела «4. Операционные задачи»?");
+    if (!confirmed) return;
+    setZoomCallDetailLoading(true);
+    setZoomCallsMessage("");
+    try {
+      const payload = await fetchJsonSafe(`/api/zoom-calls/${encodeURIComponent(call.id)}/dispatch-operational-tasks`, { method: "POST" }, 180000);
+      const updatedCall = payload.call || call;
+      setSelectedZoomCall(updatedCall);
+      setZoomCallsTree((current) => ({
+        ...current,
+        years: current.years.map((year) => ({
+          ...year,
+          months: year.months.map((month) => ({
+            ...month,
+            dates: month.dates.map((day) => ({
+              ...day,
+              calls: day.calls.map((item) => (item.id === call.id ? updatedCall : item)),
+            })),
+          })),
+        })),
+      }));
+      setZoomCallsMessage(payload.message || "Задачи отправлены исполнителям.");
+    } catch (error) {
+      setZoomCallsMessage(error instanceof Error ? error.message : "Не удалось отправить задачи исполнителям.");
+    } finally {
+      setZoomCallDetailLoading(false);
+    }
+  };
+
   useEffect(() => {
     if (activeTab === "Зум-разговоры") {
       void loadZoomCalls();
@@ -7879,6 +7909,14 @@ export default function App() {
                 >
                   <FileText className="w-4 h-4" />
                   {zoomTranscriptVisible ? "Посмотреть отчет" : "Посмотреть транскрибацию"}
+                </button>
+                <button
+                  onClick={() => void dispatchZoomOperationalTasks(selectedZoomCall)}
+                  disabled={zoomCallDetailLoading || !selectedZoomCall.analytical_note}
+                  className="h-10 px-4 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 text-[13px] font-bold flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Send className="w-4 h-4" />
+                  Отправить задачи исполнителям
                 </button>
                 <button
                   onClick={() => void deleteZoomCallReport(selectedZoomCall)}
