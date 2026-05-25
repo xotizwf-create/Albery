@@ -803,6 +803,9 @@ type ZoomOperationalTasksPreview = {
   operational_section: string;
 };
 
+const ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO =
+  "Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс. В комментариях к задаче укажите, что из предложенного сформировано ошибочно, а что вы взяли в работу";
+
 type ChatOverallDailyReport = {
   report_id: string;
   report_date: string;
@@ -1214,7 +1217,7 @@ const extractOwnerRecommendationsByUser = (
   const appendRecommendation = (userId: number, text: string) => {
     const cleaned = cleanRecommendationLine(text);
     if (!cleaned || isReportTableSeparatorLine(cleaned)) return;
-    if (/^(рекомендации|полный текст отчета|главный вывод|динамика|риски|темы дня)$/i.test(cleaned)) return;
+    if (/^(текст рекомендаций|рекомендации|полный текст отчета|главный вывод|динамика|риски|темы дня)$/i.test(cleaned)) return;
     result[userId] = [result[userId], cleaned].filter(Boolean).join("\n");
   };
 
@@ -1226,7 +1229,7 @@ const extractOwnerRecommendationsByUser = (
       currentUserIds = Array.from(new Set(owners.map((owner) => owner.userId)));
       return;
     }
-    if (currentUserIds.length && (/^[-•]\s+/.test(line) || /^\d{1,2}[.)]\s+/.test(line))) {
+    if (currentUserIds.length) {
       currentUserIds.forEach((userId) => appendRecommendation(userId, line));
     }
   });
@@ -4258,7 +4261,11 @@ export default function App() {
     });
     const taskCards = [...taskCardMap.values()].map((card) => ({
       ...card,
-      description: (card.tasks || []).map((task, index) => formatLocalZoomOperationalTask(task as any, index + 1)).join("\n"),
+      description: [
+        ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO,
+        "",
+        (card.tasks || []).map((task, index) => formatLocalZoomOperationalTask(task as any, index + 1)).join("\n"),
+      ].join("\n"),
     }));
     const unmatchedAssignees = taskCards.filter((card) => !card.recipient).map((card) => card.assignee_name);
     const recipients = taskCards
@@ -4271,7 +4278,7 @@ export default function App() {
       unmatched_assignees: unmatchedAssignees,
       title,
       description: [
-        "Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс.",
+        ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO,
         "",
         "Выделенные задачи с дедлайнами:",
         cleanedSection,

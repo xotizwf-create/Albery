@@ -4746,6 +4746,12 @@ def format_zoom_operational_tasks_for_bitrix(tasks: list[dict[str, Any]]) -> str
     return "\n".join(lines).strip()
 
 
+ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO = (
+    "Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс. "
+    "В комментариях к задаче укажите, что из предложенного сформировано ошибочно, а что вы взяли в работу"
+)
+
+
 def clean_zoom_operational_tasks_section(section: str) -> str:
     return format_zoom_operational_tasks_for_bitrix(normalize_zoom_operational_tasks(section=section))
 
@@ -4801,7 +4807,8 @@ def person_names_match(left: Any, right: Any) -> bool:
 
 
 def zoom_operational_task_card_description(tasks: list[dict[str, Any]]) -> str:
-    return format_zoom_operational_tasks_for_bitrix(tasks)
+    task_text = format_zoom_operational_tasks_for_bitrix(tasks)
+    return f"{ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO}\n\n{task_text}".strip()
 
 
 def build_zoom_operational_task_cards(
@@ -4882,7 +4889,7 @@ def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = 
         period_text = f"{start}-{end}" if start and end else start or "созвон"
     title = f"Итоги созвона {period_text}".strip()
     description = (
-        "Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс.\n\n"
+        f"{ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO}\n\n"
         "Выделенные задачи с дедлайнами:\n"
         f"{cleaned_section}"
     )
