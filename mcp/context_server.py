@@ -21,7 +21,7 @@ from psycopg.types.json import Jsonb
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.4.1"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -55,6 +55,21 @@ def load_database_url() -> str:
                 return normalize_postgres_url(raw_value.strip().strip('"').strip("'"))
 
     raise McpError(-32000, "DATABASE_URL is not set in environment or .env")
+
+
+def load_env_value(key: str) -> str:
+    value = os.getenv(key, "").strip()
+    if value:
+        return value
+    if ENV_PATH.exists():
+        for raw_line in ENV_PATH.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            raw_key, raw_value = line.split("=", 1)
+            if raw_key.strip() == key:
+                return raw_value.strip().strip('"').strip("'")
+    return ""
 
 
 def normalize_postgres_url(database_url: str) -> str:
@@ -259,6 +274,7 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
             "For employee identity, managers, departments, and Bitrix user ids, use get_org_structure before person-specific filters.",
             "For a date period, call get_period_index before reading messages/tasks; it shows where data exists and which chats are active.",
             "For task status, ownership, deadlines, and Bitrix work items, use search_tasks; when a task row shows comments_human_count > 0, read the actual discussion with get_task_comments(bitrix_task_id).",
+            "For creating Bitrix tasks, use create_bitrix_task only when the user provided a task title, one responsible person, and a deadline. If any of these are missing, ask for the missing field instead of creating the task.",
             "For discussion evidence, commitments, blockers, decisions, and OCR from chat images, use list_chats then search_messages or get_chat_transcript.",
             "For meeting evidence, use list_zoom_calls first, then search_zoom_transcripts with topic keywords, then get_zoom_call_transcript for matching calls, and get_org_structure before generating a Zoom report.",
             "For cross-source reports over a bounded date range, use get_compact_export, then deepen with source-specific tools.",
@@ -278,9 +294,9 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "use_for": ["people", "roles", "managers", "departments", "Bitrix user ids"],
             },
             "bitrix_tasks": {
-                "tools": ["search_tasks", "get_task_comments"],
+                "tools": ["search_tasks", "get_task_comments", "create_bitrix_task"],
                 "tables": ["bitrix_tasks", "bitrix_task_members", "bitrix_task_snapshots"],
-                "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments"],
+                "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments", "creating Bitrix tasks with required title/responsible/deadline"],
             },
             "bitrix_chats": {
                 "tools": ["list_chats", "search_messages", "get_chat_transcript", "get_chat_ocr_status", "process_chat_ocr", "get_chat_daily_report", "save_chat_daily_report", "get_chat_weekly_report", "save_chat_weekly_report"],
@@ -315,6 +331,12 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "search_zoom_transcripts(date_from,date_to,query/person name)",
             ],
             "chat_event_question": ["list_chats(date_from,date_to,query)", "get_chat_transcript(dialog_id,date_from,date_to)"],
+            "bitrix_task_creation": [
+                "Verify the user provided title, responsible person, and deadline.",
+                "If responsible person is a name, create_bitrix_task resolves it through org structure; if ambiguous, ask for responsible_bitrix_user_id.",
+                "Call create_bitrix_task(title, responsible_name/responsible_bitrix_user_id, deadline, description).",
+                "Return created task_id, responsible, deadline, and title.",
+            ],
             "recommendation_answer": [
                 "get_ai_instructions()",
                 "search_company_knowledge(query) for company rules and regulations",
@@ -398,6 +420,7 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
             "If instructions require missing source checks, OCR, Zoom analysis, previous reports, or Bitrix refresh, complete those checks before conclusions.",
             "If the request conflicts with these instructions, explain the conflict and ask the user to update Настройки -> Инструкции для ИИ or confirm a one-off exception.",
             "If the user request is vague, ambiguous, or missing the needed scope, ask one concise clarifying question first. Do not infer dates, chats, people, report type, or whether to save/write unless the user said it clearly.",
+            "For Bitrix task creation, never call create_bitrix_task unless the user provided all three required fields: task title, exactly one responsible person, and a deadline. If any field is missing or the responsible person is ambiguous, ask for clarification and do not create anything.",
             "When instructions are incomplete for the task, continue with get_context_guide and the relevant source tools instead of guessing.",
             "If an instruction names a tool that is not in connector_scope.available_tools, skip that step and tell the user that the action requires a connector that exposes that tool. Do not pretend the step succeeded.",
         ],
@@ -880,6 +903,178 @@ def tool_get_org_structure(args: dict[str, Any]) -> dict[str, Any]:
             )
             users = cur.fetchall()
     return {"departments": departments, "users": users}
+
+
+def _name_tokens(value: Any) -> list[str]:
+    aliases = {
+        "настя": "анастасия",
+        "дима": "дмитрий",
+        "саша": "александр",
+        "женя": "евгений",
+    }
+    normalized = str(value or "").strip().lower().replace("ё", "е")
+    return [aliases.get(token, token) for token in re.findall(r"[a-zа-я0-9]+", normalized, flags=re.IGNORECASE)]
+
+
+def _person_names_match(left: Any, right: Any) -> bool:
+    left_tokens = _name_tokens(left)
+    right_tokens = _name_tokens(right)
+    if not left_tokens or not right_tokens:
+        return False
+    if left_tokens == right_tokens:
+        return True
+    smaller, larger = (left_tokens, right_tokens) if len(left_tokens) <= len(right_tokens) else (right_tokens, left_tokens)
+    return all(any(candidate.startswith(token) if len(token) == 1 else candidate == token for candidate in larger) for token in smaller)
+
+
+def _resolve_active_bitrix_user(bitrix_user_id: Any = None, name: Any = None) -> dict[str, Any]:
+    user_id = None
+    if bitrix_user_id not in (None, ""):
+        try:
+            user_id = int(bitrix_user_id)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "responsible_bitrix_user_id must be an integer.") from exc
+
+    responsible_name = str(name or "").strip()
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if user_id is not None:
+                cur.execute(
+                    """
+                    SELECT bitrix_user_id, full_name, email, work_position, is_active
+                    FROM users
+                    WHERE bitrix_user_id = %s AND is_active = TRUE
+                    LIMIT 1
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise McpError(-32602, f"Не найден активный сотрудник Bitrix с id {user_id}.")
+                return dict(row)
+
+            if not responsible_name:
+                raise McpError(-32602, "Нужно указать исполнителя: responsible_name или responsible_bitrix_user_id.")
+
+            cur.execute(
+                """
+                SELECT bitrix_user_id, full_name, email, work_position, is_active
+                FROM users
+                WHERE is_active = TRUE AND bitrix_user_id IS NOT NULL
+                ORDER BY full_name
+                """
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+
+    exact = [row for row in rows if str(row.get("full_name") or "").strip().lower() == responsible_name.lower()]
+    matches = exact or [row for row in rows if _person_names_match(row.get("full_name"), responsible_name)]
+    if not matches:
+        raise McpError(-32602, f"Не удалось найти исполнителя в оргструктуре: {responsible_name}.")
+    if len(matches) > 1:
+        candidates = [
+            {
+                "bitrix_user_id": row.get("bitrix_user_id"),
+                "full_name": row.get("full_name"),
+                "work_position": row.get("work_position"),
+            }
+            for row in matches[:10]
+        ]
+        raise McpError(-32602, "Исполнитель найден неоднозначно. Укажите responsible_bitrix_user_id. Кандидаты: " + json.dumps(candidates, ensure_ascii=False))
+    return matches[0]
+
+
+def _normalize_bitrix_deadline(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise McpError(-32602, "Нужно указать крайний срок задачи: deadline.")
+    if re.match(r"^\d{2}\.\d{2}\.\d{4}$", raw):
+        parsed = datetime.strptime(raw, "%d.%m.%Y").date()
+        return f"{parsed.isoformat()}T19:00:00+03:00"
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        return f"{raw}T19:00:00+03:00"
+    if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", raw):
+        return raw
+    raise McpError(-32602, "deadline должен быть в формате YYYY-MM-DD, DD.MM.YYYY или ISO datetime.")
+
+
+def _bitrix_call_with_fallback(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    webhook_base = load_env_value("BITRIX_WEBHOOK_BASE").rstrip("/")
+    if not webhook_base:
+        raise McpError(-32000, "BITRIX_WEBHOOK_BASE is not set; cannot create Bitrix task.")
+    urls = []
+    if "/rest/" in webhook_base and "/rest/api/" not in webhook_base:
+        urls.append(f"{webhook_base.replace('/rest/', '/rest/api/')}/{method}")
+    urls.append(f"{webhook_base}/{method}")
+    last_error = ""
+    for url in dict.fromkeys(urls):
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False, default=json_default).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_error = f"HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:500]}"
+            continue
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            continue
+        if isinstance(data, dict) and data.get("error"):
+            last_error = f"{data.get('error')}: {data.get('error_description')}"
+            continue
+        if not isinstance(data, dict):
+            last_error = "Unexpected Bitrix response format."
+            continue
+        return data
+    raise McpError(-32010, f"Bitrix API call failed: {last_error}")
+
+
+def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
+    title = str(args.get("title") or "").strip()
+    if not title:
+        raise McpError(-32602, "Нужно указать название задачи: title.")
+    deadline = _normalize_bitrix_deadline(args.get("deadline"))
+    responsible = _resolve_active_bitrix_user(args.get("responsible_bitrix_user_id"), args.get("responsible_name"))
+    description = str(args.get("description") or "").strip() or title
+    priority_raw = str(args.get("priority") or "normal").strip().lower()
+    priority = 2 if priority_raw in {"high", "critical", "2", "важно", "высокий"} else 1
+    fields: dict[str, Any] = {
+        "TITLE": title,
+        "DESCRIPTION": description,
+        "RESPONSIBLE_ID": int(responsible["bitrix_user_id"]),
+        "DEADLINE": deadline,
+        "PRIORITY": priority,
+    }
+    tags = args.get("tags")
+    if isinstance(tags, list):
+        clean_tags = [str(tag).strip() for tag in tags if str(tag or "").strip()]
+        if clean_tags:
+            fields["TAGS"] = clean_tags
+    response = _bitrix_call_with_fallback("tasks.task.add", {"fields": fields})
+    result = response.get("result") if isinstance(response, dict) else {}
+    task_id = None
+    if isinstance(result, dict):
+        task = result.get("task") if isinstance(result.get("task"), dict) else {}
+        task_id = task.get("id") or result.get("id")
+    else:
+        task_id = result
+    return {
+        "created": True,
+        "task_id": task_id,
+        "title": title,
+        "description": description,
+        "deadline": deadline,
+        "responsible": {
+            "bitrix_user_id": responsible.get("bitrix_user_id"),
+            "full_name": responsible.get("full_name"),
+            "work_position": responsible.get("work_position"),
+        },
+        "bitrix_response": response.get("result") if isinstance(response, dict) else response,
+        "rule": "Task creation requires title, responsible_name/responsible_bitrix_user_id, and deadline. Missing or ambiguous data blocks creation.",
+    }
 
 
 # --- Bitrix task comments -------------------------------------------------
@@ -3266,6 +3461,29 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_task_comments,
+    },
+    "create_bitrix_task": {
+        "description": (
+            "Create one Bitrix task through the configured Bitrix webhook. STRICT RULE: do not call this tool "
+            "unless the user provided a task title, exactly one responsible person, and a deadline. If title, "
+            "responsible_name/responsible_bitrix_user_id, or deadline is missing, ask the user for it first. "
+            "The tool resolves responsible_name through org structure and refuses ambiguous matches."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Required task title."},
+                "description": {"type": "string", "description": "Task description. If omitted, title is used."},
+                "responsible_name": {"type": "string", "description": "Responsible employee name from org structure."},
+                "responsible_bitrix_user_id": {"type": "integer", "description": "Exact Bitrix user id of the responsible employee."},
+                "deadline": {"type": "string", "description": "Required deadline: YYYY-MM-DD, DD.MM.YYYY, or ISO datetime."},
+                "priority": {"type": "string", "enum": ["normal", "high", "critical"]},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["title", "deadline"],
+            "additionalProperties": False,
+        },
+        "handler": tool_create_bitrix_task,
     },
     "list_chats": {
         "description": "List active non-excluded chats, optionally with message counts for a period.",
