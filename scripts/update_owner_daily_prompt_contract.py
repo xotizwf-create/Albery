@@ -12,6 +12,7 @@ import app  # noqa: E402
 
 
 def upsert_active_owner_daily_prompt() -> int:
+    prompt_text = app.OWNER_DAILY_PROMPT.rstrip() + app.OWNER_DAILY_STRICT_FORMAT_CONTRACT
     with app.pg_connect() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -52,7 +53,7 @@ def upsert_active_owner_daily_prompt() -> int:
                     VALUES (%s, 'owner_daily', 'Ежедневный отчет для собственника', %s, %s, TRUE)
                     RETURNING version
                     """,
-                    (category_id, app.OWNER_DAILY_PROMPT, version),
+                    (category_id, prompt_text, version),
                 )
                 return int(cur.fetchone()["version"])
 

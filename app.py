@@ -13335,7 +13335,7 @@ def _ai_owner_report(prompt_category: str, fallback_prompt: str, input_payload: 
             prompt_id, configured_prompt = pg_active_prompt(cur, prompt_category, fallback_prompt)
             prompt_text = configured_prompt or fallback_prompt
     effective_prompt_text = prompt_text
-    if request_type == "owner_daily_report":
+    if request_type == "owner_daily_report" and prompt_id is None:
         effective_prompt_text = prompt_text.rstrip() + OWNER_DAILY_STRICT_FORMAT_CONTRACT
     full_prompt = (
         effective_prompt_text.strip()
