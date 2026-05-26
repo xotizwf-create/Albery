@@ -33,6 +33,7 @@ def test_core_tools_present(ctx):
     required = {
         "start_here_always_read_ai_instructions",
         "get_context_guide",
+        "get_answer_context",
         "get_ai_instructions",
         "get_report_contract",
         "get_report_readiness",
