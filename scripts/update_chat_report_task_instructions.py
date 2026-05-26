@@ -28,51 +28,65 @@ if str(ROOT / "mcp") not in sys.path:
 import context_server as cs  # noqa: E402
 
 
-# Each edit: (anchor_old, replacement_new, already_applied_marker)
-EDITS: dict[str, list[tuple[str, str, str]]] = {
+# Each edit:
+#   old      - exact anchor to replace
+#   new      - replacement text
+#   markers  - any of these substrings means the edit (or an equivalent rule) is
+#              already present, so skip without changing anything
+#   required - if True, a missing anchor with no marker is a hard error
+#              (additive routing rules we must land); if False, a missing anchor
+#              is just skipped because the rule may already exist in other words
+EDITS: dict[str, list[dict[str, object]]] = {
     "Описание доступных инструментов": [
-        (
-            "- `search_tasks` - поиск задач по периоду, тексту и ответственному.",
-            "- `search_tasks` - поиск задач по id, периоду, тексту и ответственному.\n\n"
+        {
+            "old": "- `search_tasks` - поиск задач по периоду, тексту и ответственному.",
+            "new": "- `search_tasks` - поиск задач по id, периоду, тексту и ответственному.\n\n"
             "Если в запросе есть номер задачи (например, `318241`), это самый быстрый и правильный путь: "
             "сразу `search_tasks(bitrix_task_id=318241)` — мгновенный поиск по индексу, возвращает одну задачу. "
             "Не передавать номер в `query` (он ищет только по тексту названия/описания) и не листать все задачи через `offset`. "
             "Полный текст одной задачи: `search_tasks(bitrix_task_id=318241, include_full_description=true)`. "
             "Описания задач по умолчанию приходят сокращёнными (превью 500 символов) для скорости.",
-            "поиск задач по id, периоду",
-        ),
+            "markers": ["поиск задач по id, периоду"],
+            "required": True,
+        },
     ],
     "Работа в системе / Классификатор запросов": [
-        (
-            "1. `search_tasks(query,date_from,date_to)` - основной источник статуса, срока, ответственного.",
-            "1. Если в запросе есть номер задачи (например, `318241`) — сразу `search_tasks(bitrix_task_id=318241)`: "
+        {
+            "old": "1. `search_tasks(query,date_from,date_to)` - основной источник статуса, срока, ответственного.",
+            "new": "1. Если в запросе есть номер задачи (например, `318241`) — сразу `search_tasks(bitrix_task_id=318241)`: "
             "мгновенный поиск одной задачи по индексу, без `query` и без перебора всех задач. "
             "Если номера нет — `search_tasks(query,date_from,date_to)` как основной источник статуса, срока, ответственного.",
-            "мгновенный поиск одной задачи по индексу",
-        ),
+            "markers": ["мгновенный поиск одной задачи по индексу"],
+            "required": True,
+        },
     ],
+    # The empty-day / no_data rule may already exist in different wording on some
+    # databases; these edits are best-effort and never fatal.
     "Описание доступных инструментов / Генерация отчетов по чатам": [
-        (
-            "Недельный отчет строится только по дневным отчетам. Если за какой-то день недели дневного отчета нет, "
+        {
+            "old": "Недельный отчет строится только по дневным отчетам. Если за какой-то день недели дневного отчета нет, "
             "MCP сначала формирует и сохраняет этот дневной отчет по дневной инструкции, затем возвращается к недельному отчету.",
-            "Недельный отчет строится только по дневным отчетам за дни, где есть сообщения. "
+            "new": "Недельный отчет строится только по дневным отчетам за дни, где есть сообщения. "
             "Если за день с сообщениями дневного отчета нет, MCP сначала формирует и сохраняет этот дневной отчет "
             "по дневной инструкции, затем возвращается к недельному отчету. "
             "Дни без сообщений пропускаются: для них дневной отчет не формируется и не сохраняется.",
-            "Дни без сообщений пропускаются: для них дневной отчет не формируется",
-        ),
-        (
-            "5. Если сообщений за день нет, сохранить дневной отчет `no_data`.",
-            "5. Если сообщений за день нет, пропустить этот день: дневной отчет не формировать "
+            "markers": ["Дни без сообщений пропускаются", "Дни без сообщений не требуют"],
+            "required": False,
+        },
+        {
+            "old": "5. Если сообщений за день нет, сохранить дневной отчет `no_data`.",
+            "new": "5. Если сообщений за день нет, пропустить этот день: дневной отчет не формировать "
             "и не сохранять (в том числе `no_data`).",
-            "пропустить этот день: дневной отчет не формировать",
-        ),
-        (
-            "Если за 11 мая нет сообщений, сохранить `no_data` отчет за 11 мая, чтобы 12 мая имел предыдущий контекст.",
-            "Если за 11 мая нет сообщений, день пропускается: отчет за 11 мая не создается (в том числе `no_data`). "
+            "markers": ["пропустить этот день: дневной отчет не формировать", "не сохранять `no_data`", "не требуют `no_data`"],
+            "required": False,
+        },
+        {
+            "old": "Если за 11 мая нет сообщений, сохранить `no_data` отчет за 11 мая, чтобы 12 мая имел предыдущий контекст.",
+            "new": "Если за 11 мая нет сообщений, день пропускается: отчет за 11 мая не создается (в том числе `no_data`). "
             "Для контекста 12 мая берется ближайший предыдущий день, где отчет есть.",
-            "день пропускается: отчет за 11 мая не создается",
-        ),
+            "markers": ["день пропускается: отчет за 11 мая не создается", "не сохранять `no_data`"],
+            "required": False,
+        },
     ],
 }
 
@@ -86,17 +100,23 @@ def apply() -> int:
             raise SystemExit(f"Instruction folder not found: {path!r}")
         content = row["content"] or ""
         changed = False
-        for old, new, marker in edits:
+        for edit in edits:
+            old = str(edit["old"])
+            new = str(edit["new"])
+            markers = list(edit["markers"])  # type: ignore[arg-type]
+            required = bool(edit["required"])
             if old in content:
                 content = content.replace(old, new, 1)
                 changed = True
-            elif marker in content:
-                print(f"  [already applied] {path}: {marker[:40]}...")
-            else:
+            elif any(marker in content for marker in markers):
+                print(f"  [already correct] {path}: {markers[0][:40]}...")
+            elif required:
                 raise SystemExit(
-                    f"Anchor not found and edit not present in {path!r}.\n"
+                    f"Required anchor not found and edit not present in {path!r}.\n"
                     f"Anchor: {old[:80]}..."
                 )
+            else:
+                print(f"  [skipped, rule differs] {path}: {old[:40]}...")
         if changed:
             with cs.connect() as conn:
                 with conn.transaction():
