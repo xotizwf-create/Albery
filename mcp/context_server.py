@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 from uuid import UUID
 
+import psycopg
 from psycopg.types.json import Jsonb
 
 from shared.db import connect as pg_connection, load_env_value as shared_load_env_value, normalize_postgres_url as shared_normalize_postgres_url
@@ -529,22 +530,14 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
 
 
 def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[str, Any]:
-    full = bool(args.get("full", False))
-    intent = resolve_intent(str(args.get("intent") or ""))
-    instructions = load_ai_instructions() if full else []
-    instructions_index = load_ai_instruction_index()
+    instructions = load_ai_instructions()
     available_tools = list(args.get("_connector_tools") or sorted(TOOLS.keys()))
     connector_id = args.get("_connector_id") or "full"
     is_faq = connector_id == "faq" or set(available_tools) == FAQ_TOOL_NAMES
     connector_label = "FAQ MCP (read-only)" if is_faq else "Full MCP"
-    response = {
+    return {
         "mandatory_status": "READ_FIRST_AND_OBEY_EXACTLY",
-        "mode": "compact" if not full else "full",
-        "purpose": (
-            "This is the mandatory entry tool for this MCP server. It returns a compact execution contract by default "
-            "so normal questions can be answered quickly. Use full=true only for configured report generation, "
-            "instruction editing, or when the compact contract says the needed instruction is missing."
-        ),
+        "purpose": "This is the mandatory entry tool for this MCP server. The assistant must read these live settings before any analysis, report, recommendation, database lookup plan, or final answer.",
         "source": "Настройки -> Инструкции для ИИ (table ai_instruction_folders)",
         "connector_scope": {
             "connector_id": connector_id,
@@ -561,12 +554,9 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
             ],
         },
         "live_ai_instructions": instructions,
-        "live_ai_instructions_index": instructions_index,
         "execution_contract": [
             "Treat every non-empty instruction as binding for the current user request.",
-            "For ordinary Q&A, do not fan out across many tools. Prefer get_answer_context(query, intent, date_from/date_to/person when known) as the first data tool; it returns a compact cross-source context and follow-up recommendations.",
-            "Use deep tools only when get_answer_context reports missing_context/recommended_followup_tools, or when the user explicitly asks for a full transcript/file/task discussion/report.",
-            "For configured report generation, call this tool again with full=true or call get_ai_instructions(path=...) for the exact report instruction, then follow source order, required checks, save/read workflow, and stopping conditions.",
+            "Do exactly what the relevant instruction says: source order, report format, required checks, save/read workflow, and stopping conditions.",
             "If a specific report contract is required by the instructions, call get_report_contract for that category before generating the report.",
             "If instructions require missing source checks, OCR, Zoom analysis, previous reports, or Bitrix refresh, complete those checks before conclusions.",
             "If the request conflicts with these instructions, explain the conflict and ask the user to update Настройки -> Инструкции для ИИ or confirm a one-off exception.",
@@ -576,26 +566,13 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
             "If an instruction names a tool that is not in connector_scope.available_tools, skip that step and tell the user that the action requires a connector that exposes that tool. Do not pretend the step succeeded.",
         ],
         "next_tool_guidance": [
-            "For normal questions: call get_answer_context once, then answer if confidence is high/medium and missing_context is empty.",
-            "For report generation: use get_context_guide(intent='owner_daily_report_creation'|'recommendation_answer'|...) and get_report_contract when needed.",
-            "Use list_available_sources only for debugging/source availability questions, not as a default first step.",
+            "The live_ai_instructions above are the full text for this request; do not re-fetch them with get_ai_instructions unless you need a folder by path after the conversation grew long.",
+            "Use get_context_guide(intent='owner_daily_report_creation'|'recommendation_answer'|...) to get only the workflow and sources for the current task instead of the whole guide.",
+            "Use get_report_contract when generating configured reports.",
+            "Use get_report_readiness(date_from,date_to) before building daily/weekly/owner reports to learn in one call what is missing.",
+            "Use list_available_sources when freshness, availability, or row counts matter.",
         ],
-        "fast_path": {
-            "preferred_tool": "get_answer_context" if "get_answer_context" in available_tools else None,
-            "intent": intent,
-            "rules": [
-                "One compact data call first; deepen only when evidence is missing.",
-                "Ask one clarifying question instead of probing many tools if date/person/source scope is missing.",
-                "Never call get_ai_instructions without a path for ordinary Q&A; use full=true only for report/instruction work.",
-            ],
-        },
     }
-    if not full:
-        response["live_ai_instructions_note"] = (
-            "Full instruction bodies were intentionally omitted for speed. "
-            "Use full=true or get_ai_instructions(path=...) only when the current task requires a specific instruction body."
-        )
-    return response
 
 def tool_get_ai_instructions(args: dict[str, Any] | None = None) -> dict[str, Any]:
     args = args or {}
@@ -3218,276 +3195,10 @@ def tool_get_compact_export(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _clip_text(value: Any, max_chars: int = 700) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 1].rstrip() + "…"
-
-
-def _compact_company_items(items: list[dict[str, Any]], max_items: int) -> list[dict[str, Any]]:
-    return [
-        {
-            "folder_id": item.get("id"),
-            "path": item.get("path"),
-            "name": item.get("name"),
-            "google_file_id": item.get("google_file_id"),
-            "snippet": _clip_text(item.get("content"), 900),
-            "updated_at": item.get("updated_at"),
-        }
-        for item in items[:max_items]
-    ]
-
-
-def _compact_task_items(items: list[dict[str, Any]], max_items: int) -> list[dict[str, Any]]:
-    return [
-        {
-            "bitrix_task_id": item.get("bitrix_task_id"),
-            "title": item.get("title"),
-            "status": item.get("status_name") or item.get("status"),
-            "responsible_name": item.get("responsible_name"),
-            "responsible_bitrix_user_id": item.get("responsible_bitrix_user_id"),
-            "deadline_at": item.get("deadline_at"),
-            "updated_at_bitrix": item.get("updated_at_bitrix"),
-            "comments_human_count": item.get("comments_human_count"),
-            "description_snippet": _clip_text(item.get("description"), 500),
-        }
-        for item in items[:max_items]
-    ]
-
-
-def _compact_message_items(items: list[dict[str, Any]], max_items: int) -> list[dict[str, Any]]:
-    compact = []
-    for item in items[:max_items]:
-        file_snippets = []
-        for file_item in item.get("files") or []:
-            if isinstance(file_item, dict) and file_item.get("ocr_text"):
-                file_snippets.append(
-                    {
-                        "file_name": file_item.get("file_name"),
-                        "ocr_status": file_item.get("ocr_status"),
-                        "ocr_snippet": _clip_text(file_item.get("ocr_text"), 350),
-                    }
-                )
-        compact.append(
-            {
-                "dialog_id": item.get("dialog_id"),
-                "chat_title": item.get("chat_title"),
-                "message_date": item.get("message_date"),
-                "author_name": item.get("author_name"),
-                "message_snippet": _clip_text(item.get("message_text"), 550),
-                "files": file_snippets[:2],
-            }
-        )
-    return compact
-
-
-def _compact_zoom_items(items: list[dict[str, Any]], max_items: int) -> list[dict[str, Any]]:
-    return [
-        {
-            "call_id": item.get("call_id"),
-            "zoom_uuid": item.get("zoom_uuid"),
-            "call_date": item.get("call_date"),
-            "topic": item.get("topic"),
-            "technical_topic": item.get("technical_topic"),
-            "speaker": item.get("speaker"),
-            "segment_index": item.get("segment_index"),
-            "text_snippet": _clip_text(item.get("text"), 650),
-        }
-        for item in items[:max_items]
-    ]
-
-
-def _compact_answer_owner_reports(items: list[dict[str, Any]], max_items: int) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": item.get("id"),
-            "report_date": item.get("report_date"),
-            "period_start": item.get("period_start"),
-            "period_end": item.get("period_end"),
-            "generated_at": item.get("generated_at"),
-            "summary": _clip_text(item.get("summary") or item.get("report_text"), 700),
-            "risks_summary": _clip_text(item.get("risks_summary"), 500),
-            "recommendations": _clip_text(item.get("recommendations"), 500),
-        }
-        for item in items[:max_items]
-    ]
-
-
-def _safe_tool_call(name: str, args: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    started = time.perf_counter()
-    try:
-        result = TOOLS[name]["handler"](args)
-        return result, {"tool": name, "ok": True, "duration_ms": round((time.perf_counter() - started) * 1000, 1)}
-    except Exception as exc:  # noqa: BLE001 - answer context should degrade instead of failing the whole request.
-        logger.warning("get_answer_context source failed: %s", name, exc_info=True)
-        return None, {
-            "tool": name,
-            "ok": False,
-            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
-            "error": str(exc),
-        }
-
-
-def tool_get_answer_context(args: dict[str, Any]) -> dict[str, Any]:
-    """Fast composite context for ordinary Q&A.
-
-    Returns small, source-labelled snippets and follow-up recommendations. Deep
-    tools remain available for exact quotes, full chronology, full documents, or
-    disputed/high-stakes facts.
-    """
-    query = str(args.get("query") or "").strip()
-    if not query:
-        raise McpError(-32602, "Missing required argument: query")
-    intent = resolve_intent(str(args.get("intent") or "")) or "general_question"
-    person = str(args.get("person") or "").strip()
-    date_from = parse_date_arg(args, "date_from", required=False)
-    date_to = parse_date_arg(args, "date_to", required=False)
-    if date_from and not date_to:
-        date_to = date_from
-    if date_to and not date_from:
-        date_from = date_to
-    per_source_limit = parse_limit({"limit": args.get("per_source_limit", 5)}, default=5, max_limit=20)
-    include_chats = bool(args.get("include_chats", bool(date_from and date_to)))
-    include_owner_context = bool(
-        args.get(
-            "include_owner_context",
-            intent in {"recommendation_answer", "employee_period_question", "owner_daily_report_creation", "owner_weekly_report_creation"},
-        )
-    )
-    search_text = " ".join(part for part in [query, person] if part).strip()
-
-    sections: dict[str, Any] = {}
-    diagnostics: list[dict[str, Any]] = []
-    missing_context: list[str] = []
-    followups: list[dict[str, Any]] = []
-
-    company, diag = _safe_tool_call("search_company_knowledge", {"query": query, "limit": min(per_source_limit, 5)})
-    diagnostics.append(diag)
-    company_items = company.get("items", []) if company else []
-    sections["company_knowledge"] = _compact_company_items(company_items, per_source_limit)
-
-    tasks, diag = _safe_tool_call("search_tasks", {"query": search_text, "limit": per_source_limit})
-    diagnostics.append(diag)
-    task_items = tasks.get("items", []) if tasks else []
-    sections["bitrix_tasks"] = _compact_task_items(task_items, per_source_limit)
-    if any((item.get("comments_human_count") or 0) > 0 for item in task_items):
-        followups.append(
-            {
-                "tool": "get_task_comments",
-                "reason": "One or more matching tasks have human comments; read comments only if the answer depends on discussion or decision history.",
-                "args_hint": {"bitrix_task_id": "<bitrix_task_id from bitrix_tasks>"},
-            }
-        )
-
-    if date_from and date_to:
-        period, diag = _safe_tool_call("get_period_index", {"date_from": date_from.isoformat(), "date_to": date_to.isoformat()})
-        diagnostics.append(diag)
-        sections["period_index"] = period
-    else:
-        missing_context.append("date_from/date_to not provided; chat and period-scoped evidence was skipped unless explicitly unnecessary.")
-        sections["period_index"] = None
-
-    if include_chats and date_from and date_to:
-        messages, diag = _safe_tool_call(
-            "search_messages",
-            {
-                "date_from": date_from.isoformat(),
-                "date_to": date_to.isoformat(),
-                "query": search_text,
-                "include_ocr": True,
-                "limit": per_source_limit,
-            },
-        )
-        diagnostics.append(diag)
-        message_items = messages.get("items", []) if messages else []
-        sections["chat_messages"] = _compact_message_items(message_items, per_source_limit)
-        if message_items:
-            followups.append(
-                {
-                    "tool": "get_chat_transcript",
-                    "reason": "Use only if exact surrounding chat chronology is needed.",
-                    "args_hint": {"dialog_id": "<dialog_id from chat_messages>", "date_from": date_from.isoformat(), "date_to": date_to.isoformat()},
-                }
-            )
-    else:
-        sections["chat_messages"] = []
-
-    zoom_args: dict[str, Any] = {"query": search_text, "limit": per_source_limit}
-    if date_from:
-        zoom_args["date_from"] = date_from.isoformat()
-    if date_to:
-        zoom_args["date_to"] = date_to.isoformat()
-    zoom, diag = _safe_tool_call("search_zoom_transcripts", zoom_args)
-    diagnostics.append(diag)
-    zoom_items = zoom.get("items", []) if zoom else []
-    sections["zoom_transcripts"] = _compact_zoom_items(zoom_items, per_source_limit)
-    if zoom_items:
-        followups.append(
-            {
-                "tool": "get_zoom_call_transcript",
-                "reason": "Use only if the exact full meeting transcript is needed.",
-                "args_hint": {"call_id": "<call_id from zoom_transcripts>"},
-            }
-        )
-
-    if include_owner_context:
-        daily, diag = _safe_tool_call("get_owner_reports", {"report_kind": "daily", "limit": min(per_source_limit, 3)})
-        diagnostics.append(diag)
-        weekly, diag = _safe_tool_call("get_owner_reports", {"report_kind": "weekly", "limit": min(per_source_limit, 2)})
-        diagnostics.append(diag)
-        sections["owner_reports"] = {
-            "daily": _compact_answer_owner_reports((daily or {}).get("reports", []), 3),
-            "weekly": _compact_answer_owner_reports((weekly or {}).get("reports", []), 2),
-        }
-    else:
-        sections["owner_reports"] = {"daily": [], "weekly": []}
-
-    hit_count = sum(
-        len(value)
-        for key, value in sections.items()
-        if isinstance(value, list) and key in {"company_knowledge", "bitrix_tasks", "chat_messages", "zoom_transcripts"}
-    )
-    blocking_missing = [item for item in missing_context if "not provided" not in item]
-    confidence = "high" if hit_count >= 3 and not blocking_missing else "medium" if hit_count else "low"
-    if confidence == "low":
-        missing_context.append("No compact source hits found. Ask one clarifying question or use a more specific query/date/person.")
-
-    return {
-        "query": query,
-        "intent": intent,
-        "person": person or None,
-        "date_from": date_from.isoformat() if date_from else None,
-        "date_to": date_to.isoformat() if date_to else None,
-        "confidence": confidence,
-        "answer_context": sections,
-        "missing_context": missing_context,
-        "recommended_followup_tools": followups,
-        "usage_rule": (
-            "Answer from this compact context when confidence is high/medium and missing_context does not block the question. "
-            "Use recommended_followup_tools only for exact quotes, full chronology, full files, or disputed/high-stakes facts."
-        ),
-        "source_diagnostics": diagnostics,
-    }
-
-
 TOOLS: dict[str, dict[str, Any]] = {
     "start_here_always_read_ai_instructions": {
-        "description": "MANDATORY FIRST TOOL. Compact by default for speed. Call full=true only for configured reports, instruction editing, or when a specific full instruction body is required.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "full": {
-                    "type": "boolean",
-                    "description": "Return full live instruction bodies. Default false for fast Q&A.",
-                },
-                "intent": {
-                    "type": "string",
-                    "description": "Optional task intent hint, e.g. company_rule_question, employee_period_question, recommendation_answer.",
-                },
-            },
-            "additionalProperties": False,
-        },
+        "description": "MANDATORY FIRST TOOL. Always call this before any company analysis, report, recommendation, or answer. It reads live rules from Настройки -> Инструкции для ИИ and tells the assistant exactly how to work.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "handler": tool_start_here_always_read_ai_instructions,
     },
     "health": {
@@ -3513,32 +3224,6 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_context_guide,
-    },
-    "get_answer_context": {
-        "description": (
-            "FAST PATH for ordinary company Q&A. In one call, returns compact snippets from company knowledge, "
-            "Bitrix tasks, optional chat messages, Zoom transcripts, and owner context, plus confidence and recommended "
-            "follow-up tools. Use this before fanning out to many separate search/list/transcript tools."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "User question or focused search phrase."},
-                "intent": {
-                    "type": "string",
-                    "description": "Optional hint: company_rule_question, employee_period_question, chat_event_question, recommendation_answer, etc.",
-                },
-                "person": {"type": "string", "description": "Optional person/employee name to add to source searches."},
-                "date_from": {"type": "string", "description": "YYYY-MM-DD. Enables period index and chat evidence."},
-                "date_to": {"type": "string", "description": "YYYY-MM-DD. Defaults to date_from when omitted."},
-                "per_source_limit": {"type": "integer", "minimum": 1, "maximum": 20},
-                "include_chats": {"type": "boolean", "description": "Search chat messages when date range is available. Default true when date_from/date_to are set."},
-                "include_owner_context": {"type": "boolean", "description": "Include recent owner reports. Default true for recommendation/employee/owner intents."},
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-        "handler": tool_get_answer_context,
     },
     "get_ai_instructions": {
         "description": "Read live editable AI behavior and answer-format instructions from Настройки -> Инструкции для ИИ. start_here_always_read_ai_instructions already returns the full text, so call this only to re-read one folder by path. Use get_context_guide for the index of available paths.",
@@ -4137,18 +3822,13 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None) 
                     "_connector_tools": sorted(available_tools.keys()),
                     "_connector_id": connector_id,
                 }
-            started = time.perf_counter()
-            result_payload = available_tools[name]["handler"](args)
-            duration_ms = round((time.perf_counter() - started) * 1000, 1)
-            result_size = len(json.dumps(json_safe(result_payload), ensure_ascii=False, default=json_default))
-            logger.info("mcp_tool_call name=%s duration_ms=%s result_bytes=%s", name, duration_ms, result_size)
-            result = text_response(result_payload)
+            result = text_response(available_tools[name]["handler"](args))
         else:
             raise McpError(-32601, f"Unknown method: {method}")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except McpError as exc:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": exc.code, "message": exc.message}}
-    except Exception:
+    except Exception as exc:
         logger.exception("Unhandled MCP request error: method=%s id=%s", method, request_id)
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Internal MCP error."}}
 
@@ -4166,7 +3846,7 @@ def main() -> None:
         try:
             request = json.loads(line)
             response = handle_request(request)
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to parse or handle MCP stdin request")
             response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Invalid MCP request."}}
         if response is not None:
