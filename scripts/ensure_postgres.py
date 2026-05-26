@@ -36,6 +36,8 @@ REQUIRED_FUNCTION_MIGRATIONS = {
 
 ALWAYS_APPLY_MIGRATIONS = [
     "022_chats_personal_dialog_types.sql",
+    "024_chat_report_hot_path_indexes.sql",
+    "025_mcp_search_indexes.sql",
 ]
 
 

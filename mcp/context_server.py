@@ -16,7 +16,6 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 from uuid import UUID
 
-import psycopg
 from psycopg.types.json import Jsonb
 
 from shared.db import connect as pg_connection, load_env_value as shared_load_env_value, normalize_postgres_url as shared_normalize_postgres_url
@@ -41,6 +40,7 @@ TOOL_USAGE_CONTRACT = (
     "ask one short clarifying question before guessing. "
 )
 REFERENCE_CACHE_TTL_SECONDS = int(os.getenv("MCP_REFERENCE_CACHE_TTL_SECONDS", "60") or "60")
+TOOL_LATENCY_LOG_MS = float(os.getenv("MCP_TOOL_LATENCY_LOG_MS", "250") or "250")
 _TTL_CACHE: dict[tuple[Any, ...], tuple[float, Any]] = {}
 
 
@@ -3822,13 +3822,19 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None) 
                     "_connector_tools": sorted(available_tools.keys()),
                     "_connector_id": connector_id,
                 }
-            result = text_response(available_tools[name]["handler"](args))
+            started = time.perf_counter()
+            result_payload = available_tools[name]["handler"](args)
+            duration_ms = round((time.perf_counter() - started) * 1000, 1)
+            if duration_ms >= TOOL_LATENCY_LOG_MS:
+                result_size = len(json.dumps(json_safe(result_payload), ensure_ascii=False, default=json_default))
+                logger.info("mcp_tool_call name=%s duration_ms=%s result_bytes=%s", name, duration_ms, result_size)
+            result = text_response(result_payload)
         else:
             raise McpError(-32601, f"Unknown method: {method}")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except McpError as exc:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": exc.code, "message": exc.message}}
-    except Exception as exc:
+    except Exception:
         logger.exception("Unhandled MCP request error: method=%s id=%s", method, request_id)
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Internal MCP error."}}
 
@@ -3846,7 +3852,7 @@ def main() -> None:
         try:
             request = json.loads(line)
             response = handle_request(request)
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to parse or handle MCP stdin request")
             response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Invalid MCP request."}}
         if response is not None:
