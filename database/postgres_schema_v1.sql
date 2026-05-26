@@ -436,6 +436,7 @@ CREATE TABLE chat_message_files (
 
 CREATE INDEX idx_cmf_message ON chat_message_files(message_id, message_day);
 CREATE INDEX idx_cmf_chat    ON chat_message_files(chat_id);
+CREATE INDEX idx_cmf_chat_day ON chat_message_files(chat_id, message_day);
 CREATE INDEX idx_cmf_type    ON chat_message_files(file_type) WHERE file_type IS NOT NULL;
 
 CREATE TABLE chat_file_ocr (
@@ -678,6 +679,7 @@ CREATE TABLE chat_daily_reports (
 CREATE UNIQUE INDEX idx_cdr_current
     ON chat_daily_reports(chat_id, report_date) WHERE is_current = TRUE;
 CREATE INDEX idx_cdr_date ON chat_daily_reports(report_date);
+CREATE INDEX idx_cdr_chat_date ON chat_daily_reports(chat_id, report_date DESC);
 
 CREATE TABLE chat_weekly_reports (
     id                         UUID PRIMARY KEY DEFAULT gen_random_uuid(),

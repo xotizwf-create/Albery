@@ -1,9 +1,12 @@
 ﻿from __future__ import annotations
 
 import json
+import importlib
+import logging
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
@@ -14,9 +17,17 @@ from urllib.parse import urlparse, urlunparse
 from uuid import UUID
 
 import psycopg
-from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from shared.db import connect as pg_connection, load_env_value as shared_load_env_value, normalize_postgres_url as shared_normalize_postgres_url
+
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
@@ -29,6 +40,8 @@ TOOL_USAGE_CONTRACT = (
     "Call start_here_always_read_ai_instructions first; if scope is unclear, "
     "ask one short clarifying question before guessing. "
 )
+REFERENCE_CACHE_TTL_SECONDS = int(os.getenv("MCP_REFERENCE_CACHE_TTL_SECONDS", "60") or "60")
+_TTL_CACHE: dict[tuple[Any, ...], tuple[float, Any]] = {}
 
 
 class McpError(Exception):
@@ -38,48 +51,48 @@ class McpError(Exception):
         self.message = message
 
 
+def ttl_cache_get(key: tuple[Any, ...]) -> Any | None:
+    cached = _TTL_CACHE.get(key)
+    if not cached:
+        return None
+    expires_at, value = cached
+    if expires_at < time.time():
+        _TTL_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def ttl_cache_set(key: tuple[Any, ...], value: Any, ttl_seconds: int = REFERENCE_CACHE_TTL_SECONDS) -> Any:
+    _TTL_CACHE[key] = (time.time() + ttl_seconds, value)
+    return value
+
+
+def ttl_cache_delete_prefix(prefix: tuple[Any, ...]) -> None:
+    for key in list(_TTL_CACHE):
+        if key[: len(prefix)] == prefix:
+            _TTL_CACHE.pop(key, None)
+
+
 def load_database_url() -> str:
-    value = os.getenv("DATABASE_URL", "").strip()
-    if value:
-        return normalize_postgres_url(value)
-
-    if ENV_PATH.exists():
-        for raw_line in ENV_PATH.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, raw_value = line.split("=", 1)
-            if key.strip() == "DATABASE_URL":
-                return normalize_postgres_url(raw_value.strip().strip('"').strip("'"))
-
-    raise McpError(-32000, "DATABASE_URL is not set in environment or .env")
+    value = shared_load_env_value("DATABASE_URL")
+    if not value:
+        raise McpError(-32000, "DATABASE_URL is not set in environment or .env")
+    return normalize_postgres_url(value)
 
 
 def load_env_value(key: str) -> str:
-    value = os.getenv(key, "").strip()
-    if value:
-        return value
-    if ENV_PATH.exists():
-        for raw_line in ENV_PATH.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            raw_key, raw_value = line.split("=", 1)
-            if raw_key.strip() == key:
-                return raw_value.strip().strip('"').strip("'")
-    return ""
+    return shared_load_env_value(key)
 
 
 def normalize_postgres_url(database_url: str) -> str:
-    normalized = database_url.strip()
-    for prefix in ("postgresql+psycopg2://", "postgresql+psycopg://"):
-        if normalized.startswith(prefix):
-            return "postgresql://" + normalized[len(prefix):]
-    return normalized
+    return shared_normalize_postgres_url(database_url)
 
 
-def connect() -> psycopg.Connection:
-    return psycopg.connect(load_database_url(), row_factory=dict_row)
+def connect() -> Any:
+    try:
+        return pg_connection()
+    except RuntimeError as exc:
+        raise McpError(-32000, str(exc)) from exc
 
 
 def json_default(value: Any) -> Any:
@@ -108,6 +121,17 @@ def text_response(payload: Any) -> dict[str, Any]:
 def local_app_base_url() -> str:
     value = os.getenv("MCP_LOCAL_APP_BASE_URL", "").strip() or os.getenv("APP_BASE_URL", "").strip()
     return value.rstrip("/") if value else "http://127.0.0.1:5002"
+
+
+def app_workflow_function(name: str) -> Any:
+    try:
+        app_module = importlib.import_module("app")
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32000, f"Cannot load local app workflow module: {exc}") from exc
+    workflow = getattr(app_module, name, None)
+    if not callable(workflow):
+        raise McpError(-32000, f"Local app workflow is not available: {name}")
+    return workflow
 
 
 def json_safe(value: Any) -> Any:
@@ -192,6 +216,31 @@ def tool_health(_: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_get_runtime_status(_: dict[str, Any]) -> dict[str, Any]:
+    url = load_database_url()
+    parsed = urlparse(url)
+    safe_url = urlunparse((parsed.scheme, parsed.netloc.split("@")[-1], parsed.path, "", "", ""))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_database() AS database, current_schema() AS schema, now() AS server_time")
+            row = cur.fetchone()
+    return {
+        "mode": "mcp_first_postgresql_only",
+        "database": row["database"],
+        "schema": row["schema"],
+        "database_url": safe_url,
+        "server_time": row["server_time"],
+        "legacy_http_api_enabled": os.getenv("ALLOW_LEGACY_HTTP_API", "").strip() == "1",
+        "path_token_auth_enabled": os.getenv("MCP_ALLOW_PATH_TOKEN", "").strip() == "1",
+        "reference_cache_ttl_seconds": REFERENCE_CACHE_TTL_SECONDS,
+        "rules": [
+            "Use MCP tools as the primary interface for AI agents.",
+            "Read and write company data through PostgreSQL-backed MCP tools.",
+            "Do not depend on /api/* HTTP routes for MCP workflows.",
+        ],
+    }
+
+
 def tool_list_available_sources(_: dict[str, Any]) -> dict[str, Any]:
     table_names = [
         "users",
@@ -202,8 +251,6 @@ def tool_list_available_sources(_: dict[str, Any]) -> dict[str, Any]:
         "chat_messages",
         "chat_message_files",
         "chat_file_ocr",
-        "chat_daily_reports",
-        "chat_weekly_reports",
         "owner_daily_reports",
         "owner_weekly_reports",
         "owner_manager_recommendations",
@@ -268,6 +315,10 @@ def load_ai_instruction_index() -> list[dict[str, Any]]:
 
 
 def _load_ai_instruction_rows() -> list[dict[str, Any]]:
+    cache_key = ("ai_instruction_rows",)
+    cached = ttl_cache_get(cache_key)
+    if cached is not None:
+        return cached
     with connect() as conn:
         with conn.cursor() as cur:
             if not safe_table_exists(cur, "ai_instruction_folders"):
@@ -289,7 +340,7 @@ def _load_ai_instruction_rows() -> list[dict[str, Any]]:
                 ORDER BY path
                 """
             )
-            return cur.fetchall()
+            return ttl_cache_set(cache_key, cur.fetchall())
 
 
 INTENT_SOURCE_MAP: dict[str, list[str]] = {
@@ -298,8 +349,6 @@ INTENT_SOURCE_MAP: dict[str, list[str]] = {
     "chat_event_question": ["bitrix_chats", "organization"],
     "bitrix_task_creation": ["bitrix_tasks", "organization"],
     "recommendation_answer": ["owner_reports", "company_knowledge", "bitrix_tasks", "bitrix_chats", "zoom_calls"],
-    "daily_chat_report_creation": ["bitrix_chats", "zoom_calls", "organization"],
-    "chat_weekly_report_creation": ["bitrix_chats", "organization"],
     "owner_daily_report_creation": ["owner_reports", "bitrix_chats", "zoom_calls", "company_knowledge", "bitrix_tasks", "organization"],
     "owner_weekly_report_creation": ["owner_reports", "bitrix_chats", "zoom_calls", "company_knowledge", "bitrix_tasks", "organization"],
 }
@@ -318,10 +367,6 @@ INTENT_ALIASES: dict[str, str] = {
     "bitrix_task": "bitrix_task_creation",
     "recommendation": "recommendation_answer",
     "advice": "recommendation_answer",
-    "daily_chat_report": "daily_chat_report_creation",
-    "chat_analysis": "daily_chat_report_creation",
-    "weekly_chat_report": "chat_weekly_report_creation",
-    "chat_weekly_report": "chat_weekly_report_creation",
     "owner_daily": "owner_daily_report_creation",
     "company_daily_report": "owner_daily_report_creation",
     "owner_daily_report": "owner_daily_report_creation",
@@ -355,7 +400,7 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
             "For unfamiliar questions, call get_context_guide after start_here_always_read_ai_instructions, then list_available_sources if source freshness or row counts matter.",
             "Act as an internal company AI agent: answers must be based on company context, regulations, reports, Bitrix tasks, chats, Zoom, and live AI instructions, not generic advice.",
             "For company rules, regulations, document mirrors, and persistent business knowledge, use search_company_knowledge first.",
-            "For recommendations, management advice, or owner-facing conclusions, read recent owner daily/weekly reports and relevant chat daily/weekly reports before concluding what is done, open, overdue, or repeated.",
+            "For recommendations, management advice, or owner-facing conclusions, read recent owner reports and raw chat transcripts/OCR before concluding what is done, open, overdue, or repeated.",
             "If the request is vague, ambiguous, underspecified, or can be interpreted in several ways, stop and ask a short clarifying question before using data tools or answering.",
             "Ask what exact date/period, chat, person, task, source, output format, target decision, or save/write action is needed. Do not guess missing scope.",
             "Always use concrete names and task titles. Do not write only 'task 318099' or 'Natalia task'; write 'task 318099: Сформировать реестр платежей' with responsible person, status, deadline, and source when available.",
@@ -366,6 +411,7 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
             "For discussion evidence, commitments, blockers, decisions, and OCR from chat images, use list_chats then search_messages or get_chat_transcript.",
             "For meeting evidence, use list_zoom_calls first, then search_zoom_transcripts with topic keywords, then get_zoom_call_transcript for matching calls, and get_org_structure before generating a Zoom report.",
             "For cross-source reports over a bounded date range, use get_compact_export, then deepen with source-specific tools.",
+            "This project is MCP-first and PostgreSQL-only: do not call or depend on legacy /api/* HTTP routes for AI workflows.",
             "Prefer narrow queries with date ranges, dialog_id, responsible_bitrix_user_id, or search text. Page with offset instead of requesting everything.",
             "Do not treat absence of one search result as proof until the relevant source index/count was checked.",
             "When evidence is incomplete, separate confirmed facts from assumptions and ask the user for the missing input needed to continue.",
@@ -387,9 +433,14 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments", "creating Bitrix tasks with required title/responsible/deadline"],
             },
             "bitrix_chats": {
-                "tools": ["get_report_readiness", "list_chats", "search_messages", "get_chat_transcript", "get_chat_ocr_status", "process_chat_ocr", "get_chat_daily_report", "save_chat_daily_report", "get_chat_weekly_report", "save_chat_weekly_report"],
-                "tables": ["chats", "chat_messages", "chat_message_files", "chat_file_ocr", "chat_daily_reports", "chat_weekly_reports", "chat_report_items"],
-                "use_for": ["conversation evidence", "commitments", "decisions", "questions", "OCR from screenshots", "daily and weekly chat report storage"],
+                "tools": ["get_report_readiness", "list_chats", "search_messages", "get_chat_transcript", "get_chat_ocr_status", "process_chat_ocr"],
+                "tables": ["chats", "chat_messages", "chat_message_files", "chat_file_ocr"],
+                "use_for": ["conversation evidence", "commitments", "decisions", "questions", "OCR from screenshots", "raw chat transcript retrieval"],
+                "rules": [
+                    "Daily chat reports are disabled. Do not create, request, or wait for chat_daily_reports.",
+                    "Use get_chat_transcript with include_ocr=true after OCR is ready.",
+                    "process_chat_ocr calls the local PostgreSQL workflow directly from MCP; it does not require a local HTTP API route.",
+                ],
             },
             "owner_reports": {
                 "tools": ["get_report_readiness", "get_previous_owner_daily_context", "get_owner_reports", "save_owner_daily_report", "save_owner_weekly_report", "list_recommendations", "get_recommendation_feedback_context", "save_recommendation_event"],
@@ -402,7 +453,7 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "use_for": ["meeting transcripts", "call participants from Zoom API", "mentioned people in transcript", "spoken decisions", "facts of task execution", "standalone Zoom report storage"],
                 "rules": [
                     "For standalone Zoom reports, always include factual participants, mentioned people, a strict task block with owner/deadline/success-criteria gaps, and behavioral factors.",
-                    "For daily chat reports, Zoom relevance is based on transcript content, participants, and topics from chat/OCR/tasks, not only call title.",
+                    "For chat context, Zoom relevance is based on transcript content, participants, and topics from chat/OCR/tasks, not only call title.",
                     "If the report date has exactly one Zoom call, read its transcript before saying there are no relevant Zoom facts.",
                     "Search transcript keywords extracted from OCR/tasks/risks, for example payment calendar, motivation, margins, project names, overdue work, Bitrix, and owner names.",
                 ],
@@ -435,43 +486,23 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "search_tasks/search_messages/search_zoom_transcripts for concrete evidence",
                 "answer with specific task titles, owners, statuses, deadlines, and sources; ask clarifying questions when evidence is missing",
             ],
-            "daily_chat_report_creation": [
-                "get_report_contract(category_key='chat_analysis') and use the active report contract exactly",
-                "instructions for this task already arrived from start_here_always_read_ai_instructions; re-read only the specific folder if needed via get_ai_instructions(path='Формирование отчетов / Ежедневный отчет по чату')",
-                "get_report_readiness(date_from=report_date,date_to=report_date) to see in one call which active chats have messages, which already have a current daily report, and which same-day Zoom calls already have an analytical_note",
-                "get_chat_transcript(dialog_id,report_date,report_date,include_ocr=false) first; if there are no messages, skip this chat and do not create save_chat_daily_report/no_data",
-                "only when messages exist: get_chat_ocr_status(dialog_id,report_date); if OCR is missing for images/PDF, call process_chat_ocr(dialog_id,date_from=report_date,date_to=report_date)",
-                "only when messages exist: get_chat_transcript(dialog_id,report_date,report_date,include_ocr=true)",
-                "get_recommendation_feedback_context(dialog_id,report_date) and compare recommendations against previous-day and current-day messages",
-                "read previous chat daily report only if needed for continuity; do not generate a missing previous-day report when that previous day had no messages",
-                "use Zoom tools only when chat messages mention a Zoom-related topic, participant, decision, blocker, or task that needs cross-checking",
-                "save_chat_daily_report(dialog_id, report_date, analysis) after the MCP agent has generated the report itself using the active chat_analysis report contract and source data",
-            ],
-            "chat_weekly_report_creation": [
-                "get_report_contract(category_key='chat_weekly_report') and use the active report contract exactly",
-                "instructions already arrived from start_here_always_read_ai_instructions; re-read only if needed via get_ai_instructions(path='Формирование отчетов / Еженедельный отчет по чату')",
-                "get_report_readiness(date_from=period_start,date_to=period_end) to see per-day which days have messages and already have a daily report, so you only generate the missing ones",
-                "get_chat_daily_report(dialog_id, each active message date) or generate missing daily reports only for days that have chat messages; days without messages are ignored and no no_data daily report is created",
-                "get_chat_weekly_report(dialog_id, period_start, period_end) to check for an existing current weekly report",
-                "save_chat_weekly_report(dialog_id, period_start, period_end, analysis) after the MCP agent has generated the weekly report itself using verified daily reports",
-            ],
             "owner_daily_report_creation": [
                 "instructions already arrived from start_here_always_read_ai_instructions; re-read only if needed via get_ai_instructions(path='Формирование отчетов / Ежедневный отчет по компании')",
                 "open the active AI prompt in Сводная аналитика / Настройка промтов / ежедневный общий отчет для собственника and follow it as the report contract",
-                "get_report_readiness(date_from=report_date,date_to=report_date) ONCE to get, in a single call: active chats with messages and which already have current daily reports, same-day Zoom calls and which already have an analytical_note, and whether the previous owner daily report exists — use this instead of probing each chat/Zoom one by one",
+                "get_report_readiness(date_from=report_date,date_to=report_date) ONCE to get, in a single call: active chats with messages/OCR readiness, same-day Zoom calls and which already have an analytical_note, and whether the previous owner daily report exists — use this instead of probing each chat/Zoom one by one",
                 "read company regulations with search_company_knowledge before writing recommendations; compare Bitrix/Zoom/chat facts against regulated owners, process roles, payment calendar ownership, approval rules, meeting rhythm, and SLA",
-                "for every chat in missing_daily_reports from get_report_readiness, run the daily_chat_report_creation workflow before continuing; chats without messages are already excluded by readiness",
+                "for every active chat with messages, read get_chat_transcript(..., include_ocr=true); daily chat reports are disabled and must not be generated",
                 "for every Zoom call in missing_zoom_reports from get_report_readiness, use zoom_call_report instructions and save_zoom_call_report before continuing",
                 "if previous_owner_daily_report_exists is false in readiness, stop or create the missing previous day first; otherwise get_previous_owner_daily_context(report_date) for continuity",
-                "read recommendation feedback from chat daily reports and recommendation event context; every addressable recommendation must start with a soft greeting that accounts for the recipient's previous reply, objection, delegation, unclear answer, or missing response",
+                "read recommendation feedback from raw chat transcripts and recommendation event context; every addressable recommendation must start with a soft greeting that accounts for the recipient's previous reply, objection, delegation, unclear answer, or missing response",
                 "for every addressable recommendation, explicitly use regulation comparison when relevant: if the actual owner/executor/deadline/process differs from company regulation, mention the regulated owner/process and propose delegation, confirmation, Bitrix fixation, or regulation update",
-                "only after every chat daily report, every Zoom analytical report, and previous owner_daily_report are ready, create owner_daily_report",
+                "only after every needed raw chat transcript/OCR, every Zoom analytical report, and previous owner_daily_report are ready, create owner_daily_report",
                 "if any required source is missing or failed, stop and return the missing chat/Zoom/OCR source list instead of writing owner_daily_report",
             ],
             "owner_weekly_report_creation": [
                 "get_report_readiness(date_from=week_start,date_to=week_end) ONCE to see per-day readiness across the whole week (chats/Zoom/owner daily) in a single call before deepening",
                 "for each day in the week, run owner_daily_report_creation until the daily chain is complete",
-                "generate missing chat weekly reports from verified daily chat reports",
+                "use raw chat transcripts/OCR for weekly chat context; daily chat reports are disabled",
                 "create or refresh chat_overall_weekly_report",
                 "only then create owner_weekly_report",
                 "if any daily source chain is incomplete, stop and return the incomplete days and missing sources",
@@ -536,7 +567,7 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
         ],
         "next_tool_guidance": [
             "The live_ai_instructions above are the full text for this request; do not re-fetch them with get_ai_instructions unless you need a folder by path after the conversation grew long.",
-            "Use get_context_guide(intent='daily_chat_report_creation'|'owner_daily_report_creation'|'recommendation_answer'|...) to get only the workflow and sources for the current task instead of the whole guide.",
+            "Use get_context_guide(intent='owner_daily_report_creation'|'recommendation_answer'|...) to get only the workflow and sources for the current task instead of the whole guide.",
             "Use get_report_contract when generating configured reports.",
             "Use get_report_readiness(date_from,date_to) before building daily/weekly/owner reports to learn in one call what is missing.",
             "Use list_available_sources when freshness, availability, or row counts matter.",
@@ -602,12 +633,16 @@ def tool_get_report_contract(args: dict[str, Any]) -> dict[str, Any]:
         "contract": row,
         "note": (
             "Use contract_text as the exact report-generation contract. "
-            "For daily chat reports request category_key='chat_analysis'."
+            "Daily/weekly chat reports are disabled; use raw chat transcript tools instead."
         ),
     }
 
 
 def tool_get_company_profile(_: dict[str, Any]) -> dict[str, Any]:
+    cache_key = ("company_profile",)
+    cached = ttl_cache_get(cache_key)
+    if cached is not None:
+        return cached
     with connect() as conn:
         with conn.cursor() as cur:
             folders: list[dict[str, Any]] = []
@@ -637,13 +672,13 @@ def tool_get_company_profile(_: dict[str, Any]) -> dict[str, Any]:
             )
             row = cur.fetchone()
     if not row:
-        return {"title": "О компании", "content": "", "folders": folders, "updated_at": None}
-    return {
+        return ttl_cache_set(cache_key, {"title": "О компании", "content": "", "folders": folders, "updated_at": None})
+    return ttl_cache_set(cache_key, {
         "title": row["title"] or "О компании",
         "content": row["content"] or "",
         "folders": folders,
         "updated_at": row["updated_at"],
-    }
+    })
 
 
 def tool_list_company_files(args: dict[str, Any]) -> dict[str, Any]:
@@ -877,18 +912,7 @@ def tool_list_periods(args: dict[str, Any]) -> dict[str, Any]:
                 (limit,),
             )
             chat_periods = cur.fetchall()
-            cur.execute(
-                """
-                SELECT report_date AS period, count(*) AS reports_count
-                FROM chat_daily_reports
-                WHERE is_current = TRUE
-                GROUP BY report_date
-                ORDER BY report_date DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            report_periods = cur.fetchall()
+            report_periods: list[dict[str, Any]] = []
             zoom_periods: list[dict[str, Any]] = []
             if safe_table_exists(cur, "zoom_calls"):
                 cur.execute(
@@ -905,6 +929,7 @@ def tool_list_periods(args: dict[str, Any]) -> dict[str, Any]:
     return {
         "chat_message_periods": chat_periods,
         "chat_report_periods": report_periods,
+        "chat_reports_enabled": False,
         "zoom_call_periods": zoom_periods,
     }
 
@@ -988,13 +1013,11 @@ def tool_get_period_index(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_get_report_readiness(args: dict[str, Any]) -> dict[str, Any]:
-    """One-call source-readiness check for daily/weekly/owner report building.
+    """One-call source-readiness check for report building.
 
-    For each date in the range it reports which active chats have messages and
-    whether each already has a current daily report, which Zoom calls have an
-    analytical_note, and whether the current and previous owner daily reports
-    exist. This collapses the many per-chat / per-Zoom probing calls the report
-    workflows otherwise need into a single response.
+    Daily chat reports are disabled. For each date in the range this reports
+    which active chats have raw messages, which Zoom calls have an analytical_note,
+    and whether the current and previous owner daily reports exist.
     """
     date_from = parse_date_arg(args, "date_from")
     date_to = parse_date_arg(args, "date_to", required=False) or date_from
@@ -1016,18 +1039,6 @@ def tool_get_report_readiness(args: dict[str, Any]) -> dict[str, Any]:
                 (date_from, date_to),
             )
             message_rows = cur.fetchall()
-
-            report_keys: set[tuple[Any, Any]] = set()
-            if safe_table_exists(cur, "chat_daily_reports"):
-                cur.execute(
-                    """
-                    SELECT chat_id, report_date
-                    FROM chat_daily_reports
-                    WHERE is_current = TRUE AND report_date BETWEEN %s AND %s
-                    """,
-                    (date_from, date_to),
-                )
-                report_keys = {(row["chat_id"], row["report_date"]) for row in cur.fetchall()}
 
             zoom_rows: list[dict[str, Any]] = []
             if safe_table_exists(cur, "zoom_calls"):
@@ -1056,20 +1067,18 @@ def tool_get_report_readiness(args: dict[str, Any]) -> dict[str, Any]:
                 owner_dates = {row["report_date"] for row in cur.fetchall()}
 
     days: list[dict[str, Any]] = []
-    total_chats_missing = 0
     total_zoom_missing = 0
     days_ready = 0
     current = date_from
     while current <= date_to:
         day_chats = [row for row in message_rows if row["day"] == current]
-        missing_daily = [
+        chat_transcripts = [
             {
                 "dialog_id": row["dialog_id"],
                 "chat_title": row["chat_title"],
                 "messages_count": row["messages_count"],
             }
             for row in day_chats
-            if (row["chat_id"], current) not in report_keys
         ]
         day_zoom = [row for row in zoom_rows if row["call_date"] == current]
         missing_zoom = [
@@ -1082,9 +1091,8 @@ def tool_get_report_readiness(args: dict[str, Any]) -> dict[str, Any]:
         ]
         owner_exists = current in owner_dates
         prev_owner_exists = (current - timedelta(days=1)) in owner_dates
-        ready_for_owner = not missing_daily and not missing_zoom and prev_owner_exists
+        ready_for_owner = not missing_zoom and prev_owner_exists
 
-        total_chats_missing += len(missing_daily)
         total_zoom_missing += len(missing_zoom)
         if ready_for_owner:
             days_ready += 1
@@ -1094,8 +1102,8 @@ def tool_get_report_readiness(args: dict[str, Any]) -> dict[str, Any]:
                 "date": current,
                 "chats": {
                     "with_messages": len(day_chats),
-                    "daily_reports_ready": len(day_chats) - len(missing_daily),
-                    "missing_daily_reports": missing_daily,
+                    "transcripts": chat_transcripts,
+                    "daily_reports_enabled": False,
                 },
                 "zoom": {
                     "calls": len(day_zoom),
@@ -1114,12 +1122,13 @@ def tool_get_report_readiness(args: dict[str, Any]) -> dict[str, Any]:
         "days": days,
         "summary": {
             "days": len(days),
-            "total_chats_missing_daily_reports": total_chats_missing,
+            "daily_chat_reports_enabled": False,
             "total_zoom_missing_reports": total_zoom_missing,
             "days_ready_for_owner_daily": days_ready,
         },
         "next_actions": [
-            "Generate a chat_daily_report only for the chats in missing_daily_reports (chats without messages are already excluded).",
+            "Do not generate chat_daily_reports; they are disabled.",
+            "Read raw chat context with get_chat_transcript(dialog_id,date_from,date_to,include_ocr=true).",
             "Generate a Zoom report only for the calls in missing_zoom_reports.",
             "Build owner_daily_report only for days where ready_for_owner_daily is true; otherwise close the missing sources first.",
         ],
@@ -1128,6 +1137,10 @@ def tool_get_report_readiness(args: dict[str, Any]) -> dict[str, Any]:
 
 def tool_get_org_structure(args: dict[str, Any]) -> dict[str, Any]:
     include_inactive = bool(args.get("include_inactive", False))
+    cache_key = ("org_structure", include_inactive)
+    cached = ttl_cache_get(cache_key)
+    if cached is not None:
+        return cached
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1164,7 +1177,7 @@ def tool_get_org_structure(args: dict[str, Any]) -> dict[str, Any]:
                 (include_inactive,),
             )
             users = cur.fetchall()
-    return {"departments": departments, "users": users}
+    return ttl_cache_set(cache_key, {"departments": departments, "users": users})
 
 
 def _name_tokens(value: Any) -> list[str]:
@@ -1898,36 +1911,9 @@ def tool_process_chat_ocr(args: dict[str, Any]) -> dict[str, Any]:
     dialog_id = str(args.get("dialog_id") or "").strip()
     force = bool(args.get("force", False))
 
-    payload: dict[str, Any] = {
-        "date_from": date_from.isoformat(),
-        "date_to": date_to.isoformat(),
-        "force": force,
-    }
-    if dialog_id:
-        payload["dialog_id"] = dialog_id
-
-    url = f"{local_app_base_url()}/api/chats/images/process"
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-MCP-Shared-Secret": os.getenv("MCP_SHARED_SECRET", "").strip(),
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=int(os.getenv("MCP_OCR_TIMEOUT", "900"))) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw else {"status": "success"}
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            payload = {"error": raw}
-        raise McpError(-32011, payload.get("error") or f"OCR processing failed with HTTP {exc.code}") from exc
+        process_chat_image_ocr_for_period = app_workflow_function("process_chat_image_ocr_for_period")
+        return process_chat_image_ocr_for_period(date_from, date_to, force=force, dialog_id=dialog_id or None)
     except Exception as exc:
         raise McpError(-32011, f"OCR processing failed: {exc}") from exc
 
@@ -2465,133 +2451,7 @@ def tail_key(item: dict[str, Any]) -> tuple[str, str]:
     return (person, normalize_tail_text(item_text(item)))
 
 
-def previous_tail_days_by_key(cur: Any, chat_id: Any, report_date: date) -> dict[tuple[str, str], int]:
-    previous_date = report_date - timedelta(days=1)
-    cur.execute(
-        """
-        SELECT raw_ai_json
-        FROM chat_daily_reports
-        WHERE chat_id = %s AND report_date = %s
-        ORDER BY is_current DESC, version DESC, generated_at DESC
-        LIMIT 1
-        """,
-        (chat_id, previous_date),
-    )
-    row = cur.fetchone()
-    if not row:
-        return {}
-    raw = row.get("raw_ai_json") or {}
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            raw = {}
-    analysis = raw.get("analysis") if isinstance(raw, dict) else {}
-    if not isinstance(analysis, dict):
-        return {}
-    result: dict[tuple[str, str], int] = {}
-    for item in analysis.get("previous_day_tasks") or []:
-        if not isinstance(item, dict):
-            continue
-        status = chat_tail_current_status(item)
-        if status in {"done", "cancelled", "answered"}:
-            continue
-        result[tail_key(item)] = max(to_int(item.get("days_open")) or 0, 0) + 1
-    return result
-
-
-def apply_silence_days_to_chat_report(
-    cur: Any,
-    chat_id: Any,
-    report_date: date,
-    analysis: dict[str, Any],
-    report_text: str,
-) -> str:
-    previous_days = previous_tail_days_by_key(cur, chat_id, report_date)
-    silence_days: list[int] = []
-    for item in analysis.get("previous_day_tasks") or []:
-        if not isinstance(item, dict):
-            continue
-        status = chat_tail_current_status(item)
-        if status != "no_info":
-            continue
-        key = tail_key(item)
-        days = to_int(item.get("days_open")) or previous_days.get(key) or 1
-        item["days_open"] = days
-        silence_days.append(days)
-
-    if not report_text or not silence_days:
-        return report_text
-
-    iterator = iter(silence_days)
-
-    def replace_silence(match: Any) -> str:
-        try:
-            days = next(iterator)
-        except StopIteration:
-            days = 1
-        return f"[тишина {silence_days_label(days)}]"
-
-    return re.sub(r"\[тишина\](?!\s*\d)", replace_silence, report_text)
-
-
-def user_id_by_name(cur: Any, name: str | None) -> Any:
-    if not name:
-        return None
-    cur.execute(
-        """
-        SELECT id
-        FROM users
-        WHERE lower(full_name) = lower(%s)
-        ORDER BY is_active DESC, updated_at DESC NULLS LAST
-        LIMIT 1
-        """,
-        (name,),
-    )
-    row = cur.fetchone()
-    return row["id"] if row else None
-
-
-def tool_get_chat_daily_report(args: dict[str, Any]) -> dict[str, Any]:
-    dialog_id = str(args.get("dialog_id") or "").strip()
-    if not dialog_id:
-        raise McpError(-32602, "Missing required argument: dialog_id")
-    report_date = parse_date_arg(args, "report_date")
-    include_items = bool(args.get("include_items", True))
-
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT r.*, c.dialog_id, c.chat_title
-                FROM chat_daily_reports r
-                JOIN chats c ON c.id = r.chat_id
-                WHERE c.dialog_id = %s AND r.report_date = %s
-                ORDER BY r.is_current DESC, r.version DESC, r.generated_at DESC
-                LIMIT 1
-                """,
-                (dialog_id, report_date),
-            )
-            report = cur.fetchone()
-            if not report:
-                return {"report": None, "items": [], "message": "Chat daily report not found."}
-            items: list[dict[str, Any]] = []
-            if include_items:
-                cur.execute(
-                    """
-                    SELECT i.item_type, i.item_text, u.full_name AS person_name,
-                           i.confidence, i.evidence_message_ids, i.raw_json, i.created_at
-                    FROM chat_report_items i
-                    LEFT JOIN users u ON u.id = i.user_id
-                    WHERE i.chat_daily_report_id = %s
-                    ORDER BY i.created_at, i.item_type
-                    """,
-                    (report["id"],),
-                )
-                items = cur.fetchall()
-    return {"report": report, "items": items}
-
-
+# --- restored from HEAD (audit cleanup collateral): owner reports + recommendations ---
 def tool_get_owner_reports(args: dict[str, Any]) -> dict[str, Any]:
     report_kind = str(args.get("report_kind") or "daily").strip().lower()
     limit = parse_limit(args, 20)
@@ -3178,271 +3038,6 @@ def tool_save_owner_weekly_report(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def tool_save_chat_daily_report(args: dict[str, Any]) -> dict[str, Any]:
-    dialog_id = str(args.get("dialog_id") or "").strip()
-    if not dialog_id:
-        raise McpError(-32602, "Missing required argument: dialog_id")
-    report_date = parse_date_arg(args, "report_date")
-    report_text = str(args.get("report_text") or "").strip()
-    original_report_text = report_text
-    summary = str(args.get("summary") or report_text or "").strip()
-    analysis = args.get("analysis") if isinstance(args.get("analysis"), dict) else {}
-    if not summary and isinstance(analysis, dict):
-        summary = str(analysis.get("summary") or "").strip()
-    if not summary:
-        raise McpError(-32602, "Missing required argument: summary or analysis.summary")
-    status = str(args.get("status") or "done").strip()
-    if status == "done" and not analysis:
-        raise McpError(
-            -32602,
-            "analysis is required for done daily reports. Call get_report_contract(category_key='chat_analysis') "
-            "and save the full structured JSON, including previous_day_tasks, commitments, next_steps, risks, etc.",
-        )
-    model = str(args.get("model") or "mcp-manual").strip()
-    raw_ai_json = {
-        "source": "mcp_save_chat_daily_report",
-        "model": model,
-        "analysis": analysis,
-        "raw_input": args.get("raw_input") if isinstance(args.get("raw_input"), dict) else {},
-    }
-    if report_text:
-        raw_ai_json["report_text"] = report_text
-    risks_summary = str(args.get("risks_summary") or "").strip() or None
-    decisions_summary = str(args.get("decisions_summary") or "").strip() or None
-    if status not in {"done", "no_data", "error"}:
-        raise McpError(-32602, "status must be one of: done, no_data, error")
-
-    with connect() as conn:
-        with conn.transaction():
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM chats WHERE dialog_id = %s", (dialog_id,))
-                chat = cur.fetchone()
-                if not chat:
-                    raise McpError(-32602, f"Unknown dialog_id: {dialog_id}")
-                chat_id = chat["id"]
-                report_text = apply_silence_days_to_chat_report(cur, chat_id, report_date, analysis, report_text)
-                if report_text:
-                    raw_ai_json["report_text"] = report_text
-                if summary == original_report_text:
-                    summary = report_text
-                cur.execute(
-                    "SELECT COALESCE(MAX(version), 0) + 1 AS version FROM chat_daily_reports WHERE chat_id = %s AND report_date = %s",
-                    (chat_id, report_date),
-                )
-                version = cur.fetchone()["version"]
-                cur.execute(
-                    """
-                    UPDATE chat_daily_reports
-                    SET is_current = FALSE, updated_at = now()
-                    WHERE chat_id = %s AND report_date = %s AND is_current = TRUE
-                    """,
-                    (chat_id, report_date),
-                )
-                cur.execute(
-                    """
-                    INSERT INTO chat_daily_reports (
-                        chat_id, report_date, version, is_current, generated_at,
-                        messages_count, files_count, ocr_files_count,
-                        extracted_tasks_count, extracted_goals_count, extracted_facts_count,
-                        summary, risks_summary, decisions_summary, raw_ai_json, status
-                    )
-                    SELECT %s, %s, %s, TRUE, now(),
-                           COUNT(DISTINCT m.id),
-                           COUNT(DISTINCT f.id),
-                           COUNT(DISTINCT o.id),
-                           %s, %s, %s,
-                           %s, %s, %s, %s, %s
-                    FROM chats c
-                    LEFT JOIN chat_messages m ON m.chat_id = c.id AND m.message_day = %s
-                    LEFT JOIN chat_message_files f ON f.chat_id = c.id AND f.message_day = %s
-                    LEFT JOIN chat_file_ocr o ON o.file_id = f.id AND o.ocr_status = 'success'
-                    WHERE c.id = %s
-                    GROUP BY c.id
-                    RETURNING id
-                    """,
-                    (
-                        chat_id,
-                        report_date,
-                        version,
-                        count_analysis_items(analysis, ("commitments", "next_steps", "previous_day_tasks")),
-                        count_analysis_items(analysis, ("goals",)),
-                        count_analysis_items(analysis, ("results", "decisions")),
-                        summary,
-                        risks_summary,
-                        decisions_summary,
-                        jsonb_arg(raw_ai_json),
-                        status,
-                        report_date,
-                        report_date,
-                        chat_id,
-                    ),
-                )
-                report_id = cur.fetchone()["id"]
-                saved_items = 0
-                for report_item_type, item in analysis_items(analysis):
-                    text = item_text(item)
-                    if not text:
-                        continue
-                    cur.execute(
-                        """
-                        INSERT INTO chat_report_items (
-                            chat_daily_report_id, chat_id, report_date, item_type,
-                            item_text, user_id, confidence, evidence_message_ids, raw_json
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            report_id,
-                            chat_id,
-                            report_date,
-                            report_item_type,
-                            text,
-                            user_id_by_name(cur, str(item.get("person_name") or "").strip() or None),
-                            item.get("confidence") if isinstance(item.get("confidence"), (int, float)) else None,
-                            evidence_message_ids(item),
-                            jsonb_arg(item),
-                        ),
-                    )
-                    saved_items += 1
-    return {"report_id": report_id, "version": version, "items_saved": saved_items, "status": status}
-
-
-def tool_get_chat_weekly_report(args: dict[str, Any]) -> dict[str, Any]:
-    dialog_id = str(args.get("dialog_id") or "").strip()
-    if not dialog_id:
-        raise McpError(-32602, "Missing required argument: dialog_id")
-    period_start = parse_date_arg(args, "period_start")
-    period_end = parse_date_arg(args, "period_end")
-
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT r.*, c.dialog_id, c.chat_title
-                FROM chat_weekly_reports r
-                JOIN chats c ON c.id = r.chat_id
-                WHERE c.dialog_id = %s
-                  AND r.period_start = %s
-                  AND r.period_end = %s
-                  AND r.is_current = TRUE
-                ORDER BY r.version DESC, r.generated_at DESC
-                LIMIT 1
-                """,
-                (dialog_id, period_start, period_end),
-            )
-            report = cur.fetchone()
-    return {"report": report, "message": None if report else "Chat weekly report not found."}
-
-
-def tool_save_chat_weekly_report(args: dict[str, Any]) -> dict[str, Any]:
-    dialog_id = str(args.get("dialog_id") or "").strip()
-    if not dialog_id:
-        raise McpError(-32602, "Missing required argument: dialog_id")
-    period_start = parse_date_arg(args, "period_start")
-    period_end = parse_date_arg(args, "period_end")
-    if period_end < period_start:
-        raise McpError(-32602, "period_end must be greater than or equal to period_start")
-
-    analysis = args.get("analysis") if isinstance(args.get("analysis"), dict) else {}
-    report_text = str(args.get("report_text") or analysis.get("report_text") or "").strip()
-    summary = str(args.get("summary") or analysis.get("summary") or report_text or "").strip()
-    if not summary:
-        raise McpError(-32602, "Missing required argument: summary or analysis.summary")
-    model = str(args.get("model") or "mcp-manual").strip()
-    raw_json = {
-        "source": "mcp_save_chat_weekly_report",
-        "model": model,
-        "analysis": analysis,
-        "raw_input": args.get("raw_input") if isinstance(args.get("raw_input"), dict) else {},
-    }
-    if report_text:
-        raw_json["report_text"] = report_text
-
-    with connect() as conn:
-        with conn.transaction():
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM chats WHERE dialog_id = %s", (dialog_id,))
-                chat = cur.fetchone()
-                if not chat:
-                    raise McpError(-32602, f"Unknown dialog_id: {dialog_id}")
-                chat_id = chat["id"]
-                cur.execute(
-                    """
-                    SELECT
-                        COUNT(*) AS daily_reports_count,
-                        COALESCE(SUM(messages_count), 0) AS messages_count,
-                        COALESCE(SUM(extracted_goals_count), 0) AS goals_created_count,
-                        COALESCE(SUM(extracted_tasks_count), 0) AS extracted_tasks_count
-                    FROM chat_daily_reports
-                    WHERE chat_id = %s
-                      AND report_date BETWEEN %s AND %s
-                      AND is_current = TRUE
-                    """,
-                    (chat_id, period_start, period_end),
-                )
-                stats = cur.fetchone() or {}
-                cur.execute(
-                    "SELECT COALESCE(MAX(version), 0) + 1 AS version FROM chat_weekly_reports WHERE chat_id = %s AND period_start = %s AND period_end = %s",
-                    (chat_id, period_start, period_end),
-                )
-                version = cur.fetchone()["version"]
-                cur.execute(
-                    """
-                    UPDATE chat_weekly_reports
-                    SET is_current = FALSE
-                    WHERE chat_id = %s AND period_start = %s AND period_end = %s AND is_current = TRUE
-                    """,
-                    (chat_id, period_start, period_end),
-                )
-                cur.execute(
-                    """
-                    INSERT INTO chat_weekly_reports (
-                        chat_id, period_start, period_end, version, is_current, ai_request_id, prompt_id,
-                        generated_at, days_count, daily_reports_count, messages_count,
-                        goals_created_count, goal_updates_count, commitments_count, results_count,
-                        next_steps_count, risks_count, blockers_count, unresolved_questions_count,
-                        done_goal_updates_count, high_risk_goal_updates_count, summary,
-                        dynamics_summary, positives_summary, problems_summary, recommendations, raw_json
-                    ) VALUES (
-                        %s, %s, %s, %s, TRUE, NULL, NULL, now(),
-                        %s, %s, %s, %s,
-                        %s, %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s, %s, %s
-                    )
-                    RETURNING id
-                    """,
-                    (
-                        chat_id,
-                        period_start,
-                        period_end,
-                        version,
-                        (period_end - period_start).days + 1,
-                        int(stats.get("daily_reports_count") or 0),
-                        int(stats.get("messages_count") or 0),
-                        int(stats.get("goals_created_count") or 0),
-                        count_analysis_items(analysis, ("goal_updates", "key_goal_dynamics")),
-                        count_analysis_items(analysis, ("commitments", "hanging_tasks_by_owner", "not_done")),
-                        count_analysis_items(analysis, ("results", "closed_small_goals")),
-                        count_analysis_items(analysis, ("next_steps", "recommendations")),
-                        count_analysis_items(analysis, ("risks",)),
-                        count_analysis_items(analysis, ("blockers",)),
-                        count_analysis_items(analysis, ("unanswered_questions", "no_response_to_feedback")),
-                        count_analysis_items(analysis, ("closed_small_goals",)),
-                        count_analysis_items(analysis, ("hanging_goals", "weak_performers")),
-                        summary,
-                        str(analysis.get("dynamics_summary") or "").strip() or None,
-                        str(analysis.get("positives_summary") or "").strip() or None,
-                        str(analysis.get("problems_summary") or "").strip() or None,
-                        str(analysis.get("recommendations") or "").strip() or None,
-                        jsonb_arg(raw_json),
-                    ),
-                )
-                report_id = cur.fetchone()["id"]
-    return {"report_id": report_id, "version": version, "status": "done"}
-
-
 def tool_upsert_ai_instruction(args: dict[str, Any]) -> dict[str, Any]:
     raw_path = str(args.get("path") or "").strip()
     content = str(args.get("content") or "")
@@ -3458,20 +3053,7 @@ def tool_upsert_ai_instruction(args: dict[str, Any]) -> dict[str, Any]:
         with conn.transaction():
             with conn.cursor() as cur:
                 if not safe_table_exists(cur, "ai_instruction_folders"):
-                    cur.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS ai_instruction_folders (
-                            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-                            parent_id uuid REFERENCES ai_instruction_folders(id) ON DELETE CASCADE,
-                            name text NOT NULL,
-                            content text NOT NULL DEFAULT '',
-                            sort_order int NOT NULL DEFAULT 0,
-                            created_at timestamptz NOT NULL DEFAULT now(),
-                            updated_at timestamptz NOT NULL DEFAULT now(),
-                            CHECK (btrim(name) <> '')
-                        )
-                        """
-                    )
+                    raise McpError(-32000, "ai_instruction_folders table is missing. Apply database migrations before writing AI instructions.")
                 parent_id = None
                 current = None
                 for index, name in enumerate(path_parts):
@@ -3517,6 +3099,7 @@ def tool_upsert_ai_instruction(args: dict[str, Any]) -> dict[str, Any]:
                             (content, current["id"]),
                         )
                         current = cur.fetchone()
+    ttl_cache_delete_prefix(("ai_instruction_rows",))
     return {"folder": current, "path": " / ".join(path_parts)}
 
 
@@ -3612,39 +3195,6 @@ def tool_get_compact_export(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def tool_refresh_bitrix_context(args: dict[str, Any]) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    if args.get("date_from"):
-        payload["date_from"] = str(args["date_from"])
-    if args.get("date_to"):
-        payload["date_to"] = str(args["date_to"])
-
-    url = f"{local_app_base_url()}/api/sync/full"
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-MCP-Shared-Secret": os.getenv("MCP_SHARED_SECRET", "").strip(),
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=int(os.getenv("MCP_REFRESH_TIMEOUT", "600"))) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw else {"status": "success"}
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            payload = {"error": raw}
-        raise McpError(-32010, payload.get("error") or f"Refresh failed with HTTP {exc.code}") from exc
-    except Exception as exc:
-        raise McpError(-32010, f"Refresh failed: {exc}") from exc
-
-
 TOOLS: dict[str, dict[str, Any]] = {
     "start_here_always_read_ai_instructions": {
         "description": "MANDATORY FIRST TOOL. Always call this before any company analysis, report, recommendation, or answer. It reads live rules from Настройки -> Инструкции для ИИ and tells the assistant exactly how to work.",
@@ -3656,6 +3206,11 @@ TOOLS: dict[str, dict[str, Any]] = {
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "handler": tool_health,
     },
+    "get_runtime_status": {
+        "description": "Inspect MCP-first/PostgreSQL-only runtime mode, database target, cache TTL, and whether legacy HTTP API compatibility is enabled.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "handler": tool_get_runtime_status,
+    },
     "get_context_guide": {
         "description": "Read navigation rules after start_here_always_read_ai_instructions: where to search first, which tools map to which business sources, and how to avoid chaotic database exploration. Pass intent to get only the workflow and sources for the current task instead of the whole guide.",
         "inputSchema": {
@@ -3663,7 +3218,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "intent": {
                     "type": "string",
-                    "description": "Optional task route. One of: company_rule_question, employee_period_question, chat_event_question, bitrix_task_creation, recommendation_answer, daily_chat_report_creation, chat_weekly_report_creation, owner_daily_report_creation, owner_weekly_report_creation. Returns only that workflow and its sources. Omit for the full guide.",
+                    "description": "Optional task route. One of: company_rule_question, employee_period_question, chat_event_question, bitrix_task_creation, recommendation_answer, owner_daily_report_creation, owner_weekly_report_creation. Returns only that workflow and its sources. Omit for the full guide.",
                 },
             },
             "additionalProperties": False,
@@ -3745,7 +3300,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_search_company_knowledge,
     },
     "list_periods": {
-        "description": "List recent dates available in chat messages and chat reports.",
+        "description": "List recent dates available in chat messages and Zoom/owner sources.",
         "inputSchema": {
             "type": "object",
             "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT}},
@@ -3980,7 +3535,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_get_zoom_call_transcript,
     },
     "search_zoom_transcripts": {
-        "description": "Search Zoom transcript segments by text and optional date range. For daily chat reports, search keywords derived from chat OCR, tasks, risks, project names, and owner names.",
+        "description": "Search Zoom transcript segments by text and optional date range. For chat context, search keywords derived from chat OCR, tasks, risks, project names, and owner names.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4025,20 +3580,6 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_delete_zoom_call_report,
     },
-    "get_chat_daily_report": {
-        "description": "Read the current daily AI report for one chat/date, including structured report items when requested.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "dialog_id": {"type": "string"},
-                "report_date": {"type": "string", "description": "YYYY-MM-DD"},
-                "include_items": {"type": "boolean"},
-            },
-            "required": ["dialog_id", "report_date"],
-            "additionalProperties": False,
-        },
-        "handler": tool_get_chat_daily_report,
-    },
     "get_owner_reports": {
         "description": "Read recent current owner daily or weekly reports. Use before recommendations and management answers to understand prior context, done/open items, and repeated issues.",
         "inputSchema": {
@@ -4071,7 +3612,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_list_recommendations,
     },
     "get_recommendation_feedback_context": {
-        "description": "Read active recommendations and event history relevant to one chat/date. For daily chat reports, use before analyzing previous-day and current-day replies.",
+        "description": "Read active recommendations and event history relevant to one chat/date. Use with raw chat transcripts to analyze previous-day and current-day replies.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4118,27 +3659,6 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_previous_owner_daily_context,
-    },
-    "save_chat_daily_report": {
-        "description": "Save a generated daily report for one chat/date directly to PostgreSQL. Use after the MCP agent has analyzed chat OCR text, same-day Zoom reports, and previous-day report using the active chat_analysis report contract.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "dialog_id": {"type": "string"},
-                "report_date": {"type": "string", "description": "YYYY-MM-DD"},
-                "summary": {"type": "string"},
-                "report_text": {"type": "string"},
-                "analysis": {"type": "object", "description": "Structured report JSON with previous_day_tasks, commitments, results, risks, etc."},
-                "model": {"type": "string"},
-                "status": {"type": "string", "enum": ["done", "no_data", "error"]},
-                "risks_summary": {"type": "string"},
-                "decisions_summary": {"type": "string"},
-                "raw_input": {"type": "object"},
-            },
-            "required": ["dialog_id", "report_date"],
-            "additionalProperties": False,
-        },
-        "handler": tool_save_chat_daily_report,
     },
     "save_owner_daily_report": {
         "description": "Save a generated daily owner report directly to owner_daily_reports. Use for the general daily owner report, not for per-chat reports.",
@@ -4199,45 +3719,12 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_save_owner_weekly_report,
     },
-    "get_chat_weekly_report": {
-        "description": "Read the current weekly AI report for one chat and period.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "dialog_id": {"type": "string"},
-                "period_start": {"type": "string", "description": "YYYY-MM-DD"},
-                "period_end": {"type": "string", "description": "YYYY-MM-DD"},
-            },
-            "required": ["dialog_id", "period_start", "period_end"],
-            "additionalProperties": False,
-        },
-        "handler": tool_get_chat_weekly_report,
-    },
-    "save_chat_weekly_report": {
-        "description": "Save a generated weekly report for one chat directly to PostgreSQL. Use after the MCP agent has verified/generates missing daily reports, then analyzed the week using the chat_weekly_report report contract.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "dialog_id": {"type": "string"},
-                "period_start": {"type": "string", "description": "YYYY-MM-DD"},
-                "period_end": {"type": "string", "description": "YYYY-MM-DD"},
-                "summary": {"type": "string"},
-                "report_text": {"type": "string"},
-                "analysis": {"type": "object", "description": "Structured weekly report JSON from the chat_weekly_report report contract."},
-                "model": {"type": "string"},
-                "raw_input": {"type": "object"},
-            },
-            "required": ["dialog_id", "period_start", "period_end"],
-            "additionalProperties": False,
-        },
-        "handler": tool_save_chat_weekly_report,
-    },
     "upsert_ai_instruction": {
         "description": "Create or update one editable AI instruction folder by path in Настройки -> Инструкции для ИИ.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Folder path separated by /, for example: Формирование отчетов/Ежедневный отчет по чату"},
+                "path": {"type": "string", "description": "Folder path separated by /, for example: Формирование отчетов/Ежедневный отчет по компании"},
                 "content": {"type": "string"},
             },
             "required": ["path", "content"],
@@ -4263,24 +3750,13 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_get_compact_export,
     },
-    "refresh_bitrix_context": {
-        "description": "Refresh Bitrix-backed context now: team, tasks created in the period, unfinished task statuses, and chats for the period. Use before high-accuracy employee analytics when fresh Bitrix data is needed.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "date_from": {"type": "string", "description": "YYYY-MM-DD; defaults to today minus 7 days"},
-                "date_to": {"type": "string", "description": "YYYY-MM-DD; defaults to today"},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_refresh_bitrix_context,
-    },
 }
 
 
 FAQ_TOOL_NAMES: set[str] = {
     "start_here_always_read_ai_instructions",
     "health",
+    "get_runtime_status",
     "get_context_guide",
     "get_ai_instructions",
     "list_available_sources",
@@ -4353,7 +3829,8 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None) 
     except McpError as exc:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": exc.code, "message": exc.message}}
     except Exception as exc:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}}
+        logger.exception("Unhandled MCP request error: method=%s id=%s", method, request_id)
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Internal MCP error."}}
 
 
 def main() -> None:
@@ -4370,7 +3847,8 @@ def main() -> None:
             request = json.loads(line)
             response = handle_request(request)
         except Exception as exc:
-            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
+            logger.exception("Failed to parse or handle MCP stdin request")
+            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Invalid MCP request."}}
         if response is not None:
             sys.stdout.write(json.dumps(response, ensure_ascii=False, default=json_default) + "\n")
             sys.stdout.flush()
@@ -4378,4 +3856,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

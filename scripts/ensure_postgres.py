@@ -60,9 +60,10 @@ def maintenance_url(database_url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, "/postgres", parsed.query, parsed.fragment))
 
 
-def create_database_if_missing(database_url: str) -> None:
+def create_database_if_missing(database_url: str, admin_url: str | None = None) -> None:
     db_name = database_name_from_url(database_url)
-    with psycopg.connect(maintenance_url(database_url), autocommit=True) as conn:
+    connect_url = admin_url or maintenance_url(database_url)
+    with psycopg.connect(connect_url, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
             if cur.fetchone():
@@ -135,17 +136,16 @@ def main() -> int:
         return 1
 
     database_url = normalize_postgres_url(database_url)
-    admin_url = os.getenv("DATABASE_ADMIN_URL", "").strip()
-    migration_url = normalize_postgres_url(admin_url) if admin_url else database_url
+    admin_url = normalize_postgres_url(os.getenv("DATABASE_ADMIN_URL", "").strip()) or None
 
-    create_database_if_missing(migration_url)
+    create_database_if_missing(database_url, admin_url=admin_url)
     if schema_is_initialized(database_url):
         print("PostgreSQL schema already initialized.")
-        apply_required_migrations(migration_url)
+        apply_required_migrations(database_url)
         return 0
 
-    apply_schema(migration_url)
-    apply_required_migrations(migration_url)
+    apply_schema(database_url)
+    apply_required_migrations(database_url)
     return 0
 
 

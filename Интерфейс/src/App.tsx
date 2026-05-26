@@ -1,5 +1,14 @@
 ﻿import React, { useState, useRef, useEffect } from "react";
 import {
+  BANKS_DATA,
+  WB_REVENUE_WEEKS,
+  WB_DRR_DAILY,
+  WB_RETURNS_DAILY,
+  INITIAL_REGISTRY,
+  type PaymentItem,
+} from "./fixtures/demoData";
+import { fetchJsonSafe } from "./api/client";
+import {
   Bell,
   X,
   Wallet,
@@ -351,74 +360,6 @@ const SHORT_MONTHS = [
 ];
 
 // Data for Banks widget
-const BANKS_DATA = [
-  {
-    id: 1,
-    name: "Т-Банк",
-    type: "Основной",
-    amount: "4 550 000,00",
-    color: "bg-[#FFDD2D]",
-    textColor: "text-slate-900",
-    logo: "Т",
-  },
-  {
-    id: 2,
-    name: "Сбербанк",
-    type: "Резерв",
-    amount: "1 150 000,00",
-    color: "bg-[#21A038]",
-    textColor: "text-white",
-    logo: "С",
-  },
-  {
-    id: 3,
-    name: "Точка",
-    type: "Р/С",
-    amount: "850 000,00",
-    color: "bg-[#8934EB]",
-    textColor: "text-white",
-    logo: "Т",
-  },
-];
-
-const WB_REVENUE_WEEKS = [
-  { week: "Н13", revenue: 2.1 },
-  { week: "Н14", revenue: 2.5 },
-  { week: "Н15", revenue: 2.3 },
-  { week: "Н16", revenue: 2.8 },
-  { week: "Н17", revenue: 3.2 },
-];
-
-const WB_DRR_DAILY = [
-  { day: "21.04", drr: 4.2 },
-  { day: "22.04", drr: 4.8 },
-  { day: "23.04", drr: 5.4 },
-  { day: "24.04", drr: 6.1 },
-  { day: "25.04", drr: 4.9 },
-  { day: "26.04", drr: 4.5 },
-  { day: "27.04", drr: 3.8 },
-];
-
-const WB_RETURNS_DAILY = [
-  { day: "21.04", returns: 12 },
-  { day: "22.04", returns: 15 },
-  { day: "23.04", returns: 18 },
-  { day: "24.04", returns: 16 },
-  { day: "25.04", returns: 14 },
-  { day: "26.04", returns: 20 },
-  { day: "27.04", returns: 11 },
-];
-
-type PaymentItem = {
-  id: string;
-  date: string;
-  type: "incoming" | "outgoing";
-  amount: number;
-  source: "wb_api" | "manual";
-  description: string;
-  isProjected: boolean;
-};
-
 type TaskRegistryRow = {
   task_id: number;
   title: string | null;
@@ -1688,72 +1629,6 @@ function CustomDateRangeInput({
     </div>
   );
 }
-
-const INITIAL_REGISTRY: PaymentItem[] = [
-  {
-    id: "1",
-    date: "2026-04-06",
-    type: "incoming",
-    amount: 1200000,
-    source: "wb_api",
-    description: "Выплата WB (API)",
-    isProjected: false,
-  },
-  {
-    id: "2",
-    date: "2026-04-13",
-    type: "incoming",
-    amount: 1250000,
-    source: "wb_api",
-    description: "Выплата WB (API)",
-    isProjected: false,
-  },
-  {
-    id: "3",
-    date: "2026-04-20",
-    type: "incoming",
-    amount: 1180000,
-    source: "wb_api",
-    description: "Выплата WB (API)",
-    isProjected: false,
-  },
-  {
-    id: "4",
-    date: "2026-04-25",
-    type: "outgoing",
-    amount: 185450,
-    source: "manual",
-    description: 'Транспорт ООО "ЛайнЛогистик"',
-    isProjected: false,
-  },
-  {
-    id: "5",
-    date: "2026-04-27",
-    type: "incoming",
-    amount: 1450000,
-    source: "wb_api",
-    description: "Прогноз WB (API)",
-    isProjected: true,
-  },
-  {
-    id: "6",
-    date: "2026-04-28",
-    type: "outgoing",
-    amount: 750000,
-    source: "manual",
-    description: "Налоги",
-    isProjected: true,
-  },
-  {
-    id: "7",
-    date: "2026-05-05",
-    type: "outgoing",
-    amount: 8500000,
-    source: "manual",
-    description: "Закупка товара (Китай)",
-    isProjected: true,
-  },
-];
 
 const PROMPT_TEMPLATES = {
   daily: {
@@ -3952,25 +3827,6 @@ export default function App() {
 
   const isoFromDate = (value: Date) =>
     `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
-
-  const fetchJsonSafe = async (url: string, options?: RequestInit, timeoutMs = 180000) => {
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const response = await fetch(url, { ...(options || {}), signal: controller.signal });
-      const rawText = await response.text();
-      let payload: any = {};
-      try {
-        payload = rawText ? JSON.parse(rawText) : {};
-      } catch {
-        throw new Error(`Сервер вернул не-JSON ответ (${response.status}). Проверьте backend-логи.`);
-      }
-      if (!response.ok) throw new Error(payload?.error || `Ошибка запроса (${response.status})`);
-      return payload;
-    } finally {
-      window.clearTimeout(timer);
-    }
-  };
 
   const loadZoomCalls = async () => {
     setZoomCallsLoading(true);
