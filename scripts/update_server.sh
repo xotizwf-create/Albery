@@ -26,6 +26,7 @@ fi
 log "Applying PostgreSQL schema and migrations"
 "$VENV_DIR/bin/python" "$APP_DIR/scripts/ensure_postgres.py"
 "$VENV_DIR/bin/python" "$APP_DIR/scripts/update_recommendation_prompt_contracts.py"
+"$VENV_DIR/bin/python" "$APP_DIR/scripts/update_owner_daily_prompt_contract.py"
 
 log "Building frontend"
 if [ -z "$FRONTEND_DIR" ]; then
