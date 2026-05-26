@@ -26,10 +26,8 @@ PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
 TOOL_USAGE_CONTRACT = (
-    "MANDATORY: before using this tool for company work, call "
-    "start_here_always_read_ai_instructions. If the user request is vague, "
-    "ambiguous, or missing date/period/chat/person/report type/source/output "
-    "scope, ask one concise clarifying question first instead of guessing. "
+    "Call start_here_always_read_ai_instructions first; if scope is unclear, "
+    "ask one short clarifying question before guessing. "
 )
 
 
@@ -232,7 +230,44 @@ def tool_list_available_sources(_: dict[str, Any]) -> dict[str, Any]:
     return {"sources": sources}
 
 
-def load_ai_instructions() -> list[dict[str, Any]]:
+def load_ai_instructions(path_prefix: str | None = None) -> list[dict[str, Any]]:
+    """Live instruction folders from ai_instruction_folders.
+
+    When ``path_prefix`` is given (case-insensitive), only folders whose full
+    path starts with that prefix are returned, so the assistant can fetch a
+    single instruction instead of the whole tree.
+    """
+    rows = _load_ai_instruction_rows()
+    if not path_prefix:
+        return rows
+    needle = path_prefix.strip().lower()
+    if not needle:
+        return rows
+    return [row for row in rows if str(row.get("path") or "").lower().startswith(needle)]
+
+
+def load_ai_instruction_index() -> list[dict[str, Any]]:
+    """Compact map of instruction folders without the heavy ``content`` body.
+
+    Lets the assistant see which instructions exist and fetch only the relevant
+    one via get_ai_instructions(path=...) instead of re-reading the full tree.
+    """
+    index: list[dict[str, Any]] = []
+    for row in _load_ai_instruction_rows():
+        content = row.get("content")
+        index.append(
+            {
+                "id": row.get("id"),
+                "path": row.get("path"),
+                "name": row.get("name"),
+                "content_chars": len(content) if isinstance(content, str) else 0,
+                "updated_at": row.get("updated_at"),
+            }
+        )
+    return index
+
+
+def _load_ai_instruction_rows() -> list[dict[str, Any]]:
     with connect() as conn:
         with conn.cursor() as cur:
             if not safe_table_exists(cur, "ai_instruction_folders"):
@@ -257,11 +292,64 @@ def load_ai_instructions() -> list[dict[str, Any]]:
             return cur.fetchall()
 
 
-def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
-    ai_instructions = load_ai_instructions()
-    return {
+INTENT_SOURCE_MAP: dict[str, list[str]] = {
+    "company_rule_question": ["company_knowledge", "organization"],
+    "employee_period_question": ["organization", "bitrix_tasks", "bitrix_chats", "zoom_calls", "owner_reports"],
+    "chat_event_question": ["bitrix_chats", "organization"],
+    "bitrix_task_creation": ["bitrix_tasks", "organization"],
+    "recommendation_answer": ["owner_reports", "company_knowledge", "bitrix_tasks", "bitrix_chats", "zoom_calls"],
+    "daily_chat_report_creation": ["bitrix_chats", "zoom_calls", "organization"],
+    "chat_weekly_report_creation": ["bitrix_chats", "organization"],
+    "owner_daily_report_creation": ["owner_reports", "bitrix_chats", "zoom_calls", "company_knowledge", "bitrix_tasks", "organization"],
+    "owner_weekly_report_creation": ["owner_reports", "bitrix_chats", "zoom_calls", "company_knowledge", "bitrix_tasks", "organization"],
+}
+
+# Aliases so a loose intent string still routes to the right workflow.
+INTENT_ALIASES: dict[str, str] = {
+    "company_rule": "company_rule_question",
+    "rules": "company_rule_question",
+    "regulation": "company_rule_question",
+    "employee": "employee_period_question",
+    "period": "employee_period_question",
+    "analytics": "employee_period_question",
+    "chat": "chat_event_question",
+    "chat_event": "chat_event_question",
+    "create_task": "bitrix_task_creation",
+    "bitrix_task": "bitrix_task_creation",
+    "recommendation": "recommendation_answer",
+    "advice": "recommendation_answer",
+    "daily_chat_report": "daily_chat_report_creation",
+    "chat_analysis": "daily_chat_report_creation",
+    "weekly_chat_report": "chat_weekly_report_creation",
+    "chat_weekly_report": "chat_weekly_report_creation",
+    "owner_daily": "owner_daily_report_creation",
+    "company_daily_report": "owner_daily_report_creation",
+    "owner_daily_report": "owner_daily_report_creation",
+    "owner_weekly": "owner_weekly_report_creation",
+    "owner_weekly_report": "owner_weekly_report_creation",
+}
+
+
+def resolve_intent(raw: str) -> str | None:
+    key = (raw or "").strip().lower()
+    if not key:
+        return None
+    if key in INTENT_SOURCE_MAP:
+        return key
+    return INTENT_ALIASES.get(key)
+
+
+def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]:
+    args = args or {}
+    instructions_index = load_ai_instruction_index()
+    full_guide = {
         "purpose": "Navigation guide for using this MCP server systematically instead of guessing where data lives.",
-        "live_ai_instructions": ai_instructions,
+        "ai_instructions_index": instructions_index,
+        "ai_instructions_note": (
+            "Full live instruction text was already returned by start_here_always_read_ai_instructions. "
+            "To re-read one folder by path, call get_ai_instructions(path='Folder / Subfolder'). "
+            "Pass intent to get_context_guide to receive only the workflow and sources for the current task."
+        ),
         "operating_rules": [
             "Before any substantive answer or data work, call start_here_always_read_ai_instructions and follow its live instructions exactly.",
             "For unfamiliar questions, call get_context_guide after start_here_always_read_ai_instructions, then list_available_sources if source freshness or row counts matter.",
@@ -299,12 +387,12 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments", "creating Bitrix tasks with required title/responsible/deadline"],
             },
             "bitrix_chats": {
-                "tools": ["list_chats", "search_messages", "get_chat_transcript", "get_chat_ocr_status", "process_chat_ocr", "get_chat_daily_report", "save_chat_daily_report", "get_chat_weekly_report", "save_chat_weekly_report"],
+                "tools": ["get_report_readiness", "list_chats", "search_messages", "get_chat_transcript", "get_chat_ocr_status", "process_chat_ocr", "get_chat_daily_report", "save_chat_daily_report", "get_chat_weekly_report", "save_chat_weekly_report"],
                 "tables": ["chats", "chat_messages", "chat_message_files", "chat_file_ocr", "chat_daily_reports", "chat_weekly_reports", "chat_report_items"],
                 "use_for": ["conversation evidence", "commitments", "decisions", "questions", "OCR from screenshots", "daily and weekly chat report storage"],
             },
             "owner_reports": {
-                "tools": ["get_previous_owner_daily_context", "get_owner_reports", "save_owner_daily_report", "save_owner_weekly_report", "list_recommendations", "get_recommendation_feedback_context", "save_recommendation_event"],
+                "tools": ["get_report_readiness", "get_previous_owner_daily_context", "get_owner_reports", "save_owner_daily_report", "save_owner_weekly_report", "list_recommendations", "get_recommendation_feedback_context", "save_recommendation_event"],
                 "tables": ["owner_daily_reports", "owner_weekly_reports", "owner_manager_recommendations", "owner_recommendation_dispatches", "owner_recommendation_events"],
                 "use_for": ["recent owner context", "general daily reports for owner", "general weekly reports for owner", "owner-level report storage", "recommendation lifecycle", "recommendation feedback and statuses"],
             },
@@ -338,7 +426,7 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
                 "Return created task_id, responsible, deadline, and title.",
             ],
             "recommendation_answer": [
-                "get_ai_instructions()",
+                "instructions already arrived from start_here_always_read_ai_instructions; re-read a specific folder only if needed via get_ai_instructions(path=...)",
                 "search_company_knowledge(query) for company rules and regulations",
                 "get_owner_reports(report_kind='daily', limit=7)",
                 "get_owner_reports(report_kind='weekly', limit=4)",
@@ -349,8 +437,8 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
             ],
             "daily_chat_report_creation": [
                 "get_report_contract(category_key='chat_analysis') and use the active report contract exactly",
-                "get_ai_instructions() and read report-creation instructions",
-                "list_chats(date_from=report_date,date_to=report_date)",
+                "instructions for this task already arrived from start_here_always_read_ai_instructions; re-read only the specific folder if needed via get_ai_instructions(path='Формирование отчетов / Ежедневный отчет по чату')",
+                "get_report_readiness(date_from=report_date,date_to=report_date) to see in one call which active chats have messages, which already have a current daily report, and which same-day Zoom calls already have an analytical_note",
                 "get_chat_transcript(dialog_id,report_date,report_date,include_ocr=false) first; if there are no messages, skip this chat and do not create save_chat_daily_report/no_data",
                 "only when messages exist: get_chat_ocr_status(dialog_id,report_date); if OCR is missing for images/PDF, call process_chat_ocr(dialog_id,date_from=report_date,date_to=report_date)",
                 "only when messages exist: get_chat_transcript(dialog_id,report_date,report_date,include_ocr=true)",
@@ -361,27 +449,27 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
             ],
             "chat_weekly_report_creation": [
                 "get_report_contract(category_key='chat_weekly_report') and use the active report contract exactly",
-                "get_ai_instructions() and read weekly chat report instructions",
+                "instructions already arrived from start_here_always_read_ai_instructions; re-read only if needed via get_ai_instructions(path='Формирование отчетов / Еженедельный отчет по чату')",
+                "get_report_readiness(date_from=period_start,date_to=period_end) to see per-day which days have messages and already have a daily report, so you only generate the missing ones",
                 "get_chat_daily_report(dialog_id, each active message date) or generate missing daily reports only for days that have chat messages; days without messages are ignored and no no_data daily report is created",
                 "get_chat_weekly_report(dialog_id, period_start, period_end) to check for an existing current weekly report",
                 "save_chat_weekly_report(dialog_id, period_start, period_end, analysis) after the MCP agent has generated the weekly report itself using verified daily reports",
             ],
             "owner_daily_report_creation": [
-                "get_ai_instructions() and read Формирование отчетов / Ежедневный отчет по компании first",
+                "instructions already arrived from start_here_always_read_ai_instructions; re-read only if needed via get_ai_instructions(path='Формирование отчетов / Ежедневный отчет по компании')",
                 "open the active AI prompt in Сводная аналитика / Настройка промтов / ежедневный общий отчет для собственника and follow it as the report contract",
+                "get_report_readiness(date_from=report_date,date_to=report_date) ONCE to get, in a single call: active chats with messages and which already have current daily reports, same-day Zoom calls and which already have an analytical_note, and whether the previous owner daily report exists — use this instead of probing each chat/Zoom one by one",
                 "read company regulations with search_company_knowledge before writing recommendations; compare Bitrix/Zoom/chat facts against regulated owners, process roles, payment calendar ownership, approval rules, meeting rhythm, and SLA",
-                "check only active chats that have messages on report_date for current chat_daily_reports",
-                "if a chat has no messages on report_date, ignore it; do not create no_data reports and do not block owner_daily_report",
-                "if any active chat with messages is missing a daily report, run the daily_chat_report_creation workflow for that chat before continuing",
-                "list_zoom_calls(date_from=report_date,date_to=report_date)",
-                "for every same-day Zoom call, check analytical_note only; if missing, use zoom_call_report instructions and save_zoom_call_report before continuing",
-                "get_previous_owner_daily_context(report_date) to read the previous calendar day's current owner daily report; if missing, stop or create the missing previous day first",
+                "for every chat in missing_daily_reports from get_report_readiness, run the daily_chat_report_creation workflow before continuing; chats without messages are already excluded by readiness",
+                "for every Zoom call in missing_zoom_reports from get_report_readiness, use zoom_call_report instructions and save_zoom_call_report before continuing",
+                "if previous_owner_daily_report_exists is false in readiness, stop or create the missing previous day first; otherwise get_previous_owner_daily_context(report_date) for continuity",
                 "read recommendation feedback from chat daily reports and recommendation event context; every addressable recommendation must start with a soft greeting that accounts for the recipient's previous reply, objection, delegation, unclear answer, or missing response",
                 "for every addressable recommendation, explicitly use regulation comparison when relevant: if the actual owner/executor/deadline/process differs from company regulation, mention the regulated owner/process and propose delegation, confirmation, Bitrix fixation, or regulation update",
                 "only after every chat daily report, every Zoom analytical report, and previous owner_daily_report are ready, create owner_daily_report",
                 "if any required source is missing or failed, stop and return the missing chat/Zoom/OCR source list instead of writing owner_daily_report",
             ],
             "owner_weekly_report_creation": [
+                "get_report_readiness(date_from=week_start,date_to=week_end) ONCE to see per-day readiness across the whole week (chats/Zoom/owner daily) in a single call before deepening",
                 "for each day in the week, run owner_daily_report_creation until the daily chain is complete",
                 "generate missing chat weekly reports from verified daily chat reports",
                 "create or refresh chat_overall_weekly_report",
@@ -390,6 +478,25 @@ def tool_get_context_guide(_: dict[str, Any]) -> dict[str, Any]:
             ],
         },
     }
+
+    intent = resolve_intent(str(args.get("intent") or ""))
+    if intent is None:
+        return full_guide
+
+    # Task-scoped view: only the workflow and sources relevant to this intent,
+    # so the assistant reads one route instead of the whole guide.
+    source_keys = INTENT_SOURCE_MAP.get(intent, [])
+    return {
+        "purpose": full_guide["purpose"],
+        "intent": intent,
+        "operating_rules": full_guide["operating_rules"],
+        "source_map": {key: full_guide["source_map"][key] for key in source_keys if key in full_guide["source_map"]},
+        "workflow": full_guide["recommended_workflows"].get(intent, []),
+        "ai_instructions_index": full_guide["ai_instructions_index"],
+        "ai_instructions_note": full_guide["ai_instructions_note"],
+        "note": "Scoped to the requested intent. Call get_context_guide without intent to see all workflows and sources.",
+    }
+
 
 def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[str, Any]:
     instructions = load_ai_instructions()
@@ -428,16 +535,28 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
             "If an instruction names a tool that is not in connector_scope.available_tools, skip that step and tell the user that the action requires a connector that exposes that tool. Do not pretend the step succeeded.",
         ],
         "next_tool_guidance": [
-            "Use get_context_guide for route selection and source rules.",
+            "The live_ai_instructions above are the full text for this request; do not re-fetch them with get_ai_instructions unless you need a folder by path after the conversation grew long.",
+            "Use get_context_guide(intent='daily_chat_report_creation'|'owner_daily_report_creation'|'recommendation_answer'|...) to get only the workflow and sources for the current task instead of the whole guide.",
             "Use get_report_contract when generating configured reports.",
+            "Use get_report_readiness(date_from,date_to) before building daily/weekly/owner reports to learn in one call what is missing.",
             "Use list_available_sources when freshness, availability, or row counts matter.",
         ],
     }
 
-def tool_get_ai_instructions(_: dict[str, Any]) -> dict[str, Any]:
+def tool_get_ai_instructions(args: dict[str, Any] | None = None) -> dict[str, Any]:
+    args = args or {}
+    path = str(args.get("path") or "").strip()
+    instructions = load_ai_instructions(path or None)
+    note = "These instructions are loaded live from ai_instruction_folders. Edit them in the UI: Settings -> AI instructions."
+    if path:
+        note = (
+            f"Filtered to folders whose path starts with '{path}'. "
+            "Omit path to read the full tree, or use get_context_guide for the index of available paths."
+        )
     return {
-        "instructions": load_ai_instructions(),
-        "note": "These instructions are loaded live from ai_instruction_folders. Edit them in the UI: Settings -> AI instructions.",
+        "instructions": instructions,
+        "path": path or None,
+        "note": note,
     }
 
 
@@ -863,6 +982,146 @@ def tool_get_period_index(args: dict[str, Any]) -> dict[str, Any]:
             "search_zoom_transcripts",
             "get_company_profile",
             "get_compact_export",
+            "get_report_readiness",
+        ],
+    }
+
+
+def tool_get_report_readiness(args: dict[str, Any]) -> dict[str, Any]:
+    """One-call source-readiness check for daily/weekly/owner report building.
+
+    For each date in the range it reports which active chats have messages and
+    whether each already has a current daily report, which Zoom calls have an
+    analytical_note, and whether the current and previous owner daily reports
+    exist. This collapses the many per-chat / per-Zoom probing calls the report
+    workflows otherwise need into a single response.
+    """
+    date_from = parse_date_arg(args, "date_from")
+    date_to = parse_date_arg(args, "date_to", required=False) or date_from
+    if date_to < date_from:
+        raise McpError(-32602, "date_to must be greater than or equal to date_from")
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT m.message_day::date AS day, c.id AS chat_id,
+                       c.dialog_id, c.chat_title, count(m.id) AS messages_count
+                FROM chat_messages m
+                JOIN chats c ON c.id = m.chat_id
+                WHERE c.is_excluded = FALSE AND m.message_day BETWEEN %s AND %s
+                GROUP BY m.message_day::date, c.id, c.dialog_id, c.chat_title
+                ORDER BY day, messages_count DESC, c.chat_title NULLS LAST
+                """,
+                (date_from, date_to),
+            )
+            message_rows = cur.fetchall()
+
+            report_keys: set[tuple[Any, Any]] = set()
+            if safe_table_exists(cur, "chat_daily_reports"):
+                cur.execute(
+                    """
+                    SELECT chat_id, report_date
+                    FROM chat_daily_reports
+                    WHERE is_current = TRUE AND report_date BETWEEN %s AND %s
+                    """,
+                    (date_from, date_to),
+                )
+                report_keys = {(row["chat_id"], row["report_date"]) for row in cur.fetchall()}
+
+            zoom_rows: list[dict[str, Any]] = []
+            if safe_table_exists(cur, "zoom_calls"):
+                cur.execute(
+                    """
+                    SELECT id AS call_id, call_date, topic, technical_topic,
+                           (analytical_note IS NOT NULL AND length(btrim(analytical_note)) > 0) AS has_report
+                    FROM zoom_calls
+                    WHERE call_date BETWEEN %s AND %s
+                    ORDER BY call_date, start_time_msk NULLS LAST
+                    """,
+                    (date_from, date_to),
+                )
+                zoom_rows = cur.fetchall()
+
+            owner_dates: set[Any] = set()
+            if safe_table_exists(cur, "owner_daily_reports"):
+                cur.execute(
+                    """
+                    SELECT report_date
+                    FROM owner_daily_reports
+                    WHERE is_current = TRUE AND report_date BETWEEN %s AND %s
+                    """,
+                    (date_from - timedelta(days=1), date_to),
+                )
+                owner_dates = {row["report_date"] for row in cur.fetchall()}
+
+    days: list[dict[str, Any]] = []
+    total_chats_missing = 0
+    total_zoom_missing = 0
+    days_ready = 0
+    current = date_from
+    while current <= date_to:
+        day_chats = [row for row in message_rows if row["day"] == current]
+        missing_daily = [
+            {
+                "dialog_id": row["dialog_id"],
+                "chat_title": row["chat_title"],
+                "messages_count": row["messages_count"],
+            }
+            for row in day_chats
+            if (row["chat_id"], current) not in report_keys
+        ]
+        day_zoom = [row for row in zoom_rows if row["call_date"] == current]
+        missing_zoom = [
+            {
+                "call_id": str(row["call_id"]),
+                "topic": row.get("topic") or row.get("technical_topic"),
+            }
+            for row in day_zoom
+            if not row["has_report"]
+        ]
+        owner_exists = current in owner_dates
+        prev_owner_exists = (current - timedelta(days=1)) in owner_dates
+        ready_for_owner = not missing_daily and not missing_zoom and prev_owner_exists
+
+        total_chats_missing += len(missing_daily)
+        total_zoom_missing += len(missing_zoom)
+        if ready_for_owner:
+            days_ready += 1
+
+        days.append(
+            {
+                "date": current,
+                "chats": {
+                    "with_messages": len(day_chats),
+                    "daily_reports_ready": len(day_chats) - len(missing_daily),
+                    "missing_daily_reports": missing_daily,
+                },
+                "zoom": {
+                    "calls": len(day_zoom),
+                    "reports_ready": len(day_zoom) - len(missing_zoom),
+                    "missing_zoom_reports": missing_zoom,
+                },
+                "owner_daily_report_exists": owner_exists,
+                "previous_owner_daily_report_exists": prev_owner_exists,
+                "ready_for_owner_daily": ready_for_owner,
+            }
+        )
+        current += timedelta(days=1)
+
+    return {
+        "period": {"date_from": date_from, "date_to": date_to},
+        "days": days,
+        "summary": {
+            "days": len(days),
+            "total_chats_missing_daily_reports": total_chats_missing,
+            "total_zoom_missing_reports": total_zoom_missing,
+            "days_ready_for_owner_daily": days_ready,
+        },
+        "next_actions": [
+            "Generate a chat_daily_report only for the chats in missing_daily_reports (chats without messages are already excluded).",
+            "Generate a Zoom report only for the calls in missing_zoom_reports.",
+            "Build owner_daily_report only for days where ready_for_owner_daily is true; otherwise close the missing sources first.",
         ],
     }
 
@@ -1156,29 +1415,52 @@ def normalize_task_comment(item: dict[str, Any], names_by_id: dict[int, str]) ->
     }
 
 
+TASK_DESCRIPTION_PREVIEW_CHARS = 500
+
+
 def tool_search_tasks(args: dict[str, Any]) -> dict[str, Any]:
     date_from = parse_date_arg(args, "date_from", required=False)
     date_to = parse_date_arg(args, "date_to", required=False)
     query = str(args.get("query") or "").strip()
     responsible_bitrix_user_id = args.get("responsible_bitrix_user_id")
+    bitrix_task_id = args.get("bitrix_task_id")
+    include_full_description = bool(args.get("include_full_description", False))
     limit = parse_limit(args)
     offset = parse_offset(args)
 
     filters = []
     params: list[Any] = []
-    if date_from:
-        filters.append("COALESCE(t.updated_at_bitrix, t.created_at_bitrix, t.deadline_at, t.created_at)::date >= %s")
-        params.append(date_from)
-    if date_to:
-        filters.append("COALESCE(t.updated_at_bitrix, t.created_at_bitrix, t.deadline_at, t.created_at)::date <= %s")
-        params.append(date_to)
-    if query:
-        filters.append("(t.title ILIKE %s OR COALESCE(t.description, '') ILIKE %s)")
-        like = f"%{query}%"
-        params.extend([like, like])
-    if responsible_bitrix_user_id not in (None, ""):
-        filters.append("t.responsible_bitrix_user_id = %s")
-        params.append(int(responsible_bitrix_user_id))
+    # Direct id lookup uses the UNIQUE index on bitrix_task_id and is instant.
+    # When an id is given, ignore other filters so a known task is always found.
+    if bitrix_task_id not in (None, ""):
+        try:
+            filters.append("t.bitrix_task_id = %s")
+            params.append(int(bitrix_task_id))
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "bitrix_task_id must be an integer") from exc
+    else:
+        if date_from:
+            filters.append("COALESCE(t.updated_at_bitrix, t.created_at_bitrix, t.deadline_at, t.created_at)::date >= %s")
+            params.append(date_from)
+        if date_to:
+            filters.append("COALESCE(t.updated_at_bitrix, t.created_at_bitrix, t.deadline_at, t.created_at)::date <= %s")
+            params.append(date_to)
+        if query:
+            filters.append("(t.title ILIKE %s OR COALESCE(t.description, '') ILIKE %s)")
+            like = f"%{query}%"
+            params.extend([like, like])
+        if responsible_bitrix_user_id not in (None, ""):
+            filters.append("t.responsible_bitrix_user_id = %s")
+            params.append(int(responsible_bitrix_user_id))
+
+    if include_full_description:
+        description_cols = "t.description, length(t.description) AS description_full_length, FALSE AS description_truncated"
+    else:
+        description_cols = (
+            f"left(t.description, {TASK_DESCRIPTION_PREVIEW_CHARS}) AS description, "
+            "length(t.description) AS description_full_length, "
+            f"COALESCE(length(t.description) > {TASK_DESCRIPTION_PREVIEW_CHARS}, FALSE) AS description_truncated"
+        )
 
     where_sql = "WHERE " + " AND ".join(filters) if filters else ""
     params.extend([limit, offset])
@@ -1187,7 +1469,7 @@ def tool_search_tasks(args: dict[str, Any]) -> dict[str, Any]:
             cur.execute(
                 f"""
                 SELECT
-                    t.bitrix_task_id, t.title, t.description, t.status, t.status_name,
+                    t.bitrix_task_id, t.title, {description_cols}, t.status, t.status_name,
                     t.priority, t.created_at_bitrix, t.updated_at_bitrix, t.deadline_at,
                     t.closed_at_bitrix,
                     cu.bitrix_user_id AS creator_bitrix_user_id,
@@ -1214,7 +1496,14 @@ def tool_search_tasks(args: dict[str, Any]) -> dict[str, Any]:
                 params,
             )
             rows = cur.fetchall()
-    return {"items": rows, "limit": limit, "offset": offset}
+    note = None
+    if not include_full_description and any(row.get("description_truncated") for row in rows):
+        note = (
+            f"description is truncated to {TASK_DESCRIPTION_PREVIEW_CHARS} chars to keep the result small; "
+            "see description_full_length. To read one task in full use "
+            "search_tasks(bitrix_task_id=..., include_full_description=true)."
+        )
+    return {"items": rows, "limit": limit, "offset": offset, "note": note}
 
 
 def tool_get_task_comments(args: dict[str, Any]) -> dict[str, Any]:
@@ -3231,20 +3520,68 @@ def tool_upsert_ai_instruction(args: dict[str, Any]) -> dict[str, Any]:
     return {"folder": current, "path": " / ".join(path_parts)}
 
 
+def _compact_owner_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the lightweight summary fields; drop heavy report_text/raw_json.
+
+    The full text stays available through get_owner_reports and
+    get_previous_owner_daily_context when the assistant actually needs it.
+    """
+    return {
+        "id": report.get("id"),
+        "report_date": report.get("report_date"),
+        "period_start": report.get("period_start"),
+        "period_end": report.get("period_end"),
+        "version": report.get("version"),
+        "generated_at": report.get("generated_at"),
+        "summary": report.get("summary"),
+        "dynamics_summary": report.get("dynamics_summary"),
+        "risks_summary": report.get("risks_summary"),
+        "recommendations": report.get("recommendations"),
+    }
+
+
+def _compact_company_profile() -> dict[str, Any]:
+    """Profile header plus a folder index without the heavy document bodies.
+
+    Full document text stays available through search_company_knowledge and
+    get_company_file; bundling every mirrored doc here costs tens of thousands
+    of tokens on every export.
+    """
+    profile = tool_get_company_profile({})
+    folders = profile.get("folders") or []
+    index = [
+        {
+            "id": folder.get("id"),
+            "parent_id": folder.get("parent_id"),
+            "name": folder.get("name"),
+            "content_chars": len(folder.get("content") or ""),
+            "updated_at": folder.get("updated_at"),
+        }
+        for folder in folders
+    ]
+    return {
+        "title": profile.get("title"),
+        "content": profile.get("content"),
+        "updated_at": profile.get("updated_at"),
+        "folders_index": index,
+        "note": "Folder bodies omitted. Read a document with get_company_file(folder_id) or search with search_company_knowledge.",
+    }
+
+
 def tool_get_compact_export(args: dict[str, Any]) -> dict[str, Any]:
     date_from = parse_date_arg(args, "date_from")
     date_to = parse_date_arg(args, "date_to")
     include_messages = bool(args.get("include_messages", True))
     include_zoom_calls = bool(args.get("include_zoom_calls", True))
-    message_limit = parse_limit({"limit": args.get("message_limit", 200)})
-    zoom_limit = parse_limit({"limit": args.get("zoom_limit", 100)})
+    message_limit = parse_limit({"limit": args.get("message_limit", 100)})
+    zoom_limit = parse_limit({"limit": args.get("zoom_limit", 50)})
 
     return {
         "manifest": tool_get_period_index({"date_from": date_from.isoformat(), "date_to": date_to.isoformat()}),
-        "company_profile": tool_get_company_profile({}),
+        "company_profile": _compact_company_profile(),
         "org": tool_get_org_structure({"include_inactive": False}),
         "tasks": tool_search_tasks(
-            {"date_from": date_from.isoformat(), "date_to": date_to.isoformat(), "limit": args.get("task_limit", 200)}
+            {"date_from": date_from.isoformat(), "date_to": date_to.isoformat(), "limit": args.get("task_limit", 100)}
         )["items"],
         "messages": tool_search_messages(
             {"date_from": date_from.isoformat(), "date_to": date_to.isoformat(), "limit": message_limit}
@@ -3260,12 +3597,16 @@ def tool_get_compact_export(args: dict[str, Any]) -> dict[str, Any]:
         )["items"]
         if include_zoom_calls
         else [],
-        "recent_owner_daily_reports": tool_get_owner_reports({"report_kind": "daily", "limit": 7})["reports"],
-        "recent_owner_weekly_reports": tool_get_owner_reports({"report_kind": "weekly", "limit": 4})["reports"],
+        "recent_owner_daily_reports": [
+            _compact_owner_report(r) for r in tool_get_owner_reports({"report_kind": "daily", "limit": 5})["reports"]
+        ],
+        "recent_owner_weekly_reports": [
+            _compact_owner_report(r) for r in tool_get_owner_reports({"report_kind": "weekly", "limit": 2})["reports"]
+        ],
         "notes": [
             "This compact export is read-only and generated on demand from PostgreSQL.",
-            "Company profile is available through get_company_profile and included in this export.",
-            "Recent owner reports are included so recommendations can account for what was already done, repeated, or still open.",
+            "Task descriptions are previews; read one task in full via search_tasks(bitrix_task_id=..., include_full_description=true).",
+            "Owner reports here are summaries only; read full report_text via get_owner_reports or get_previous_owner_daily_context when needed.",
             "Zoom calls are available via list_zoom_calls, get_zoom_call_transcript, and search_zoom_transcripts.",
         ],
     }
@@ -3316,13 +3657,31 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_health,
     },
     "get_context_guide": {
-        "description": "Read navigation rules after start_here_always_read_ai_instructions: where to search first, which tools map to which business sources, and how to avoid chaotic database exploration.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "Read navigation rules after start_here_always_read_ai_instructions: where to search first, which tools map to which business sources, and how to avoid chaotic database exploration. Pass intent to get only the workflow and sources for the current task instead of the whole guide.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "description": "Optional task route. One of: company_rule_question, employee_period_question, chat_event_question, bitrix_task_creation, recommendation_answer, daily_chat_report_creation, chat_weekly_report_creation, owner_daily_report_creation, owner_weekly_report_creation. Returns only that workflow and its sources. Omit for the full guide.",
+                },
+            },
+            "additionalProperties": False,
+        },
         "handler": tool_get_context_guide,
     },
     "get_ai_instructions": {
-        "description": "Read live editable AI behavior and answer-format instructions from Настройки -> Инструкции для ИИ. Prefer start_here_always_read_ai_instructions as the mandatory first call.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "Read live editable AI behavior and answer-format instructions from Настройки -> Инструкции для ИИ. start_here_always_read_ai_instructions already returns the full text, so call this only to re-read one folder by path. Use get_context_guide for the index of available paths.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Optional folder path prefix, e.g. 'Формирование отчетов / Ежедневный отчет по компании'. Returns only matching folders. Omit to read the full tree.",
+                },
+            },
+            "additionalProperties": False,
+        },
         "handler": tool_get_ai_instructions,
     },
     "get_report_contract": {
@@ -3407,6 +3766,25 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_get_period_index,
     },
+    "get_report_readiness": {
+        "description": (
+            "Report-building readiness for a date range in one call: per day, which active chats have "
+            "messages and which already have a current daily report (missing_daily_reports), which Zoom "
+            "calls already have an analytical_note (missing_zoom_reports), and whether the current and "
+            "previous owner daily reports exist. Call this before daily/weekly/owner reports instead of "
+            "probing each chat and Zoom call separately."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD; defaults to date_from for a single day"},
+            },
+            "required": ["date_from"],
+            "additionalProperties": False,
+        },
+        "handler": tool_get_report_readiness,
+    },
     "get_org_structure": {
         "description": "Return departments and users with managers and department memberships.",
         "inputSchema": {
@@ -3418,17 +3796,22 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "search_tasks": {
         "description": (
-            "Search Bitrix tasks by period, text, and responsible user. Each row includes "
-            "comments_total_count and comments_human_count; when a task has human comments, "
-            "read them with get_task_comments(bitrix_task_id) for what people actually wrote."
+            "Search Bitrix tasks by id, period, text, or responsible user. When the request mentions a task "
+            "number (e.g. 318241), pass it as bitrix_task_id for an instant single-task lookup — do NOT put the "
+            "number in query (query matches title/description text only). Each row includes comments_total_count "
+            "and comments_human_count; when a task has human comments, read them with get_task_comments(bitrix_task_id). "
+            "Descriptions are truncated by default to keep results small; set include_full_description=true (best with "
+            "bitrix_task_id) to read one task's full description."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Exact Bitrix task number. Fastest path; ignores other filters."},
                 "date_from": {"type": "string"},
                 "date_to": {"type": "string"},
-                "query": {"type": "string"},
+                "query": {"type": "string", "description": "Text match on title/description. Not for task numbers — use bitrix_task_id instead."},
                 "responsible_bitrix_user_id": {"type": "integer"},
+                "include_full_description": {"type": "boolean", "description": "Return full descriptions instead of a 500-char preview. Use only with bitrix_task_id or a small result set."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
                 "offset": {"type": "integer", "minimum": 0},
             },

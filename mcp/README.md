@@ -6,7 +6,8 @@ Read-only MCP server for Claude Code / Claude Desktop. It exposes the local Post
 
 - `start_here_always_read_ai_instructions` - mandatory first tool for any company analysis/report/recommendation/answer; reads live rules from "Настройки -> Инструкции для ИИ" and returns the execution contract.
 - `health` - PostgreSQL connectivity check.
-- `get_context_guide` - navigation rules for using the database systematically after `start_here_always_read_ai_instructions`.
+- `get_context_guide` - navigation rules for using the database systematically after `start_here_always_read_ai_instructions`. Pass `intent` (e.g. `owner_daily_report_creation`) to get only the workflow and sources for the current task; without it you get the full guide plus a compact index of instruction folders.
+- `get_ai_instructions` - re-read live instructions; `start_here_always_read_ai_instructions` already returns the full text, so pass `path` to fetch only one folder (e.g. `path="Формирование отчетов / Ежедневный отчет по компании"`).
 - `get_report_contract` - read the active report-generation contract; for daily chat reports use `category_key=chat_analysis`.
 - `list_available_sources` - table availability and row counts.
 - `list_periods` - recent dates with chat messages/reports.
@@ -15,6 +16,7 @@ Read-only MCP server for Claude Code / Claude Desktop. It exposes the local Post
 - `get_company_file` - read the full text and source metadata for one company knowledge file.
 - `search_company_knowledge` - search "О компании", including Google Drive mirrored documents.
 - `get_period_index` - compact period manifest with counts and top chats.
+- `get_report_readiness` - one-call readiness for daily/weekly/owner reports: per day, which active chats have messages and still need a daily report, which Zoom calls still need an `analytical_note`, and whether the current/previous owner daily reports exist. Use it before report building instead of probing each chat/Zoom separately.
 - `get_org_structure` - departments, users, managers, memberships.
 - `search_tasks` - Bitrix task search; rows include `comments_total_count` and `comments_human_count`.
 - `get_task_comments` - read the comment thread of one task by `bitrix_task_id`, with author names and BB-code-cleaned text (system notifications excluded unless `include_service=true`).
@@ -41,17 +43,17 @@ Read-only MCP server for Claude Code / Claude Desktop. It exposes the local Post
 
 For any company analysis, report, recommendation, or answer, start with `start_here_always_read_ai_instructions`. It reads the live editable rules from "Настройки -> Инструкции для ИИ" and returns the mandatory execution contract.
 
-For new analysis requests, call `get_context_guide` after `start_here_always_read_ai_instructions`. It tells the model which source to inspect first:
+For new analysis requests, call `get_context_guide` after `start_here_always_read_ai_instructions`. Pass `intent` to get only the route for the current task (for example `get_context_guide(intent="owner_daily_report_creation")`); without `intent` it returns the full guide. The routes it covers:
 
 - company rules, regulations, and documents: `search_company_knowledge`, `list_company_files`, `get_company_file`, then `get_company_profile` if the full tree is needed;
 - employees, managers, and departments: `get_org_structure`;
 - date-based analysis: `get_period_index`, then `search_tasks`, `search_messages`, and Zoom tools;
 - chat evidence: `list_chats`, then `get_chat_transcript`;
 - meeting evidence: `list_zoom_calls`, then `get_zoom_call_transcript` or `search_zoom_transcripts`.
-- owner daily report creation: read the previous day through `get_previous_owner_daily_context(report_date=YYYY-MM-DD)`, then use relevant chat reports, Zoom reports, company knowledge, and concrete Bitrix tasks before saving.
-- recommendations and management answers: read prior owner context, relevant chat reports, company knowledge, and concrete Bitrix tasks before answering.
-- daily chat report creation: `get_ai_instructions`, active `get_report_contract(category_key=chat_analysis)`, then a fast `get_chat_transcript` without OCR. If there are no messages, skip the chat and do not create a `no_data` report. If messages exist, check OCR only when attachments require it, use Zoom tools only for relevant message topics, then save with `save_chat_daily_report`.
-- weekly chat report creation: `get_report_contract(category_key=chat_weekly_report)`, verify/generate required daily reports only for days that have messages, ignore days without messages, check existing report with `get_chat_weekly_report`, then save to `chat_weekly_reports` with `save_chat_weekly_report`.
+- owner daily report creation: call `get_report_readiness(date_from=report_date, date_to=report_date)` once to learn which chat/Zoom sources are missing and whether the previous owner daily exists; then close the missing sources, read the previous day through `get_previous_owner_daily_context(report_date=YYYY-MM-DD)`, and use relevant chat reports, Zoom reports, company knowledge, and concrete Bitrix tasks before saving.
+- recommendations and management answers: the instructions already arrived from `start_here_always_read_ai_instructions`; read prior owner context, relevant chat reports, company knowledge, and concrete Bitrix tasks before answering.
+- daily chat report creation: active `get_report_contract(category_key=chat_analysis)`, then `get_report_readiness` for the date (to know which chats still need a report), then a fast `get_chat_transcript` without OCR. If there are no messages, skip the chat and do not create a `no_data` report. If messages exist, check OCR only when attachments require it, use Zoom tools only for relevant message topics, then save with `save_chat_daily_report`.
+- weekly chat report creation: `get_report_contract(category_key=chat_weekly_report)`, `get_report_readiness(date_from=period_start, date_to=period_end)` to see per-day which days need daily reports, verify/generate required daily reports only for days that have messages, ignore days without messages, check existing report with `get_chat_weekly_report`, then save to `chat_weekly_reports` with `save_chat_weekly_report`.
 
 Zoom relevance for daily chat reports must be determined from transcript content, participants, and keywords from the chat/OCR context. Do not declare Zoom irrelevant after searching only the chat title, company name, or call topic.
 
