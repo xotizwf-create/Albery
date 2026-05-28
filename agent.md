@@ -1686,6 +1686,33 @@ python scripts/update_hermes_owner_daily_prompt.py
 
 Откат — переименовать `jobs.json.bak` обратно в `jobs.json` и рестартануть gateway.
 
+### Правило: после любых изменений в Hermes / MCP — рестартить gateway и писать дальнейшие шаги владельцу
+
+**Обязательное правило для будущих изменений.** `update_server.sh` перезапускает только `albery.service` (там живёт MCP HTTP-сервер). Но **`hermes-gateway.service` отдельный процесс**, который кэширует список MCP-инструментов на старте + Telegram-сессии дополнительно кэшируют toolset на старте сессии. Поэтому если ничего больше не делать — Hermes продолжит видеть старый список, и активный Telegram-чат тоже.
+
+Триггеры, после которых **обязателен** рестарт `hermes-gateway`:
+- добавлен/удалён/переименован MCP-инструмент в [mcp/context_server.py](mcp/context_server.py);
+- изменена `inputSchema` или `description` существующего MCP-инструмента (Hermes их кэширует);
+- изменён `/root/.hermes/config.yaml` (`display`, `cron`, `session_reset`, `compression`, `telegram_context_guard`, toolsets платформы);
+- изменён `/root/.hermes/cron/jobs.json` (промпт, расписание, deliver) — `update_hermes_*_prompt.py` это уже делают сами;
+- изменён код Hermes в `/usr/local/lib/hermes-agent/` (патчи gateway/telegram.py и т.п.).
+
+Команда (рестарт пары):
+
+```bash
+ssh root@186.246.7.32 'systemctl restart albery hermes-gateway && systemctl is-active albery hermes-gateway'
+```
+
+Проверка, что Hermes увидел новый toolset:
+
+```bash
+ssh root@186.246.7.32 'hermes mcp test albery 2>&1 | grep -E "Tools discovered|<new_tool_name>"'
+```
+
+**После рестарта — обязательно сообщить владельцу дальнейшие шаги в чате.** Минимум: «в Telegram-чате с Hermes напиши `/reset` (или `/new`), чтобы сессия подтянула новый список инструментов». Без `/reset` активная Telegram-сессия может продолжать видеть старый toolset до тех пор, пока её не сбросит idle-таймер (60 мин) или 04:00-ресет ([agent.md:1555-1568](agent.md#L1555-L1568)). Если изменение требует ещё чего-то от владельца (например, повторить cron-команду в чате, или одобрить рассылку — указать конкретное действие).
+
+Признак, что toolset устарел: Hermes отказывает с описанием **другого** инструмента (видел 2026-05-28 после деплоя `send_bitrix_message` — Hermes сослался на `send_owner_recommendations_to_bitrix`, потому что в кэше сессии нового инструмента ещё не было).
+
 ### Известная гран. ситуация: time-зоны в title «Итоги созвона ЧЧ:ММ»
 
 В Postgres колонка `zoom_calls.start_time_msk` фактически хранится как UTC
