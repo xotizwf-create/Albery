@@ -408,6 +408,7 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
             "For a date period, call get_period_index before reading messages/tasks; it shows where data exists and which chats are active.",
             "For task status, ownership, deadlines, and Bitrix work items, use search_tasks; when a task row shows comments_human_count > 0, read the actual discussion with get_task_comments(bitrix_task_id).",
             "For creating Bitrix tasks, use create_bitrix_task only when the user provided a task title, one responsible person, and a deadline. If any of these are missing, ask for the missing field instead of creating the task.",
+            "For deleting Bitrix tasks, first identify exactly one bitrix_task_id, show the user the task title/status/responsible/deadline, and ask for explicit confirmation. Only after the user confirms deletion, call delete_bitrix_task with confirm=true.",
             "For discussion evidence, commitments, blockers, decisions, and OCR from chat images, use list_chats then search_messages or get_chat_transcript.",
             "For meeting evidence, use list_zoom_calls first, then search_zoom_transcripts with topic keywords, then get_zoom_call_transcript for matching calls, and get_org_structure before generating a Zoom report.",
             "For cross-source reports over a bounded date range, use get_compact_export, then deepen with source-specific tools.",
@@ -428,9 +429,9 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "use_for": ["people", "roles", "managers", "departments", "Bitrix user ids"],
             },
             "bitrix_tasks": {
-                "tools": ["search_tasks", "get_task_comments", "create_bitrix_task"],
+                "tools": ["search_tasks", "get_task_comments", "create_bitrix_task", "delete_bitrix_task"],
                 "tables": ["bitrix_tasks", "bitrix_task_members", "bitrix_task_snapshots"],
-                "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments", "creating Bitrix tasks with required title/responsible/deadline"],
+                "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments", "creating Bitrix tasks with required title/responsible/deadline", "deleting Bitrix tasks only after exact id lookup and explicit confirmation"],
             },
             "bitrix_chats": {
                 "tools": ["get_report_readiness", "list_chats", "search_messages", "get_chat_transcript", "get_chat_ocr_status", "process_chat_ocr"],
@@ -475,6 +476,7 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "If responsible person is a name, create_bitrix_task resolves it through org structure; if ambiguous, ask for responsible_bitrix_user_id.",
                 "Call create_bitrix_task(title, responsible_name/responsible_bitrix_user_id, deadline, description).",
                 "Return created task_id, responsible, deadline, and title.",
+                "For deletion: search_tasks(bitrix_task_id=...) first, show the exact task title/status/responsible/deadline, ask the user to confirm deletion, then call delete_bitrix_task(bitrix_task_id=..., confirm=true). Never delete by name, search text, or ambiguous reference.",
             ],
             "recommendation_answer": [
                 "instructions already arrived from start_here_always_read_ai_instructions; re-read a specific folder only if needed via get_ai_instructions(path=...)",
@@ -562,6 +564,7 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
             "If the request conflicts with these instructions, explain the conflict and ask the user to update Настройки -> Инструкции для ИИ or confirm a one-off exception.",
             "If the user request is vague, ambiguous, or missing the needed scope, ask one concise clarifying question first. Do not infer dates, chats, people, report type, or whether to save/write unless the user said it clearly.",
             "For Bitrix task creation, never call create_bitrix_task unless the user provided all three required fields: task title, exactly one responsible person, and a deadline. If any field is missing or the responsible person is ambiguous, ask for clarification and do not create anything.",
+            "For Bitrix task deletion, never call delete_bitrix_task unless the user has already confirmed deletion of one exact bitrix_task_id after seeing its title/status/responsible/deadline.",
             "When instructions are incomplete for the task, continue with get_context_guide and the relevant source tools instead of guessing.",
             "If an instruction names a tool that is not in connector_scope.available_tools, skip that step and tell the user that the action requires a connector that exposes that tool. Do not pretend the step succeeded.",
         ],
@@ -1349,6 +1352,78 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
         },
         "bitrix_response": response.get("result") if isinstance(response, dict) else response,
         "rule": "Task creation requires title, responsible_name/responsible_bitrix_user_id, and deadline. Missing or ambiguous data blocks creation.",
+    }
+
+
+def tool_delete_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
+    raw_task_id = args.get("bitrix_task_id")
+    if raw_task_id in (None, ""):
+        raise McpError(-32602, "Нужно указать точный номер задачи: bitrix_task_id.")
+    try:
+        task_id = int(raw_task_id)
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "bitrix_task_id must be an integer.") from exc
+    if task_id <= 0:
+        raise McpError(-32602, "bitrix_task_id must be a positive integer.")
+
+    confirmed = args.get("confirm") is True
+    if not confirmed:
+        raise McpError(
+            -32602,
+            "Удаление задачи требует явного подтверждения. Сначала покажите пользователю точную задачу "
+            "(номер, название, статус, ответственный, дедлайн) и спросите подтверждение. После подтверждения "
+            "повторите вызов с confirm=true.",
+        )
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    t.bitrix_task_id,
+                    t.title,
+                    t.status,
+                    t.status_name,
+                    t.deadline_at,
+                    ru.bitrix_user_id AS responsible_bitrix_user_id,
+                    ru.full_name AS responsible_name
+                FROM bitrix_tasks t
+                LEFT JOIN users ru ON ru.id = t.responsible_user_id
+                WHERE t.bitrix_task_id = %s
+                LIMIT 1
+                """,
+                (task_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        raise McpError(
+            -32602,
+            f"Задача Bitrix {task_id} не найдена в локальном индексе. Сначала проверьте номер через search_tasks.",
+        )
+    task = dict(row)
+
+    expected_title = str(args.get("expected_title") or "").strip()
+    actual_title = str(task.get("title") or "").strip()
+    if expected_title and expected_title.lower() != actual_title.lower():
+        raise McpError(
+            -32602,
+            "expected_title не совпадает с найденной задачей. Удаление остановлено, чтобы не удалить не ту задачу.",
+        )
+
+    response = _bitrix_call_with_fallback("tasks.task.delete", {"taskId": task_id})
+    return {
+        "deleted": True,
+        "task": {
+            "bitrix_task_id": task.get("bitrix_task_id"),
+            "title": task.get("title"),
+            "status": task.get("status"),
+            "status_name": task.get("status_name"),
+            "deadline_at": task.get("deadline_at").isoformat() if hasattr(task.get("deadline_at"), "isoformat") else task.get("deadline_at"),
+            "responsible_bitrix_user_id": task.get("responsible_bitrix_user_id"),
+            "responsible_name": task.get("responsible_name"),
+        },
+        "bitrix_response": response.get("result") if isinstance(response, dict) else response,
+        "rule": "Deletion requires exact bitrix_task_id and confirm=true after the user has seen the exact task and explicitly confirmed deletion.",
     }
 
 
@@ -2959,6 +3034,14 @@ def tool_save_owner_daily_report(args: dict[str, Any]) -> dict[str, Any]:
                     ),
                 )
                 report_id = cur.fetchone()["id"]
+                analysis_for_messages = {
+                    "manager_messages": args.get("manager_messages"),
+                    "manager_recommendations": args.get("manager_recommendations"),
+                }
+                if analysis_for_messages["manager_messages"] or analysis_for_messages["manager_recommendations"]:
+                    app_workflow_function("save_owner_daily_manager_messages")(
+                        cur, report_id, report_date, analysis_for_messages
+                    )
     return {
         "report_id": str(report_id),
         "report_date": report_date.isoformat(),
@@ -3035,6 +3118,147 @@ def tool_save_owner_weekly_report(args: dict[str, Any]) -> dict[str, Any]:
         "version": version,
         "status": status,
         "is_current": True,
+    }
+
+
+def _resolve_current_owner_daily_report(cur: Any, report_date: date) -> dict[str, Any]:
+    cur.execute(
+        """
+        SELECT id, version, summary, dynamics_summary, risks_summary, recommendations, report_text
+        FROM owner_daily_reports
+        WHERE report_date = %s AND is_current = TRUE
+        LIMIT 1
+        """,
+        (report_date,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise McpError(-32602, f"Нет текущего ежедневного owner-отчёта за {report_date.isoformat()}.")
+    return dict(row)
+
+
+def tool_list_pending_owner_recommendations(args: dict[str, Any]) -> dict[str, Any]:
+    report_date = parse_date_arg(args, "report_date")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            report = _resolve_current_owner_daily_report(cur, report_date)
+            cur.execute(
+                """
+                SELECT r.id, r.manager_user_id, r.manager_bitrix_user_id,
+                       u.full_name AS manager_full_name,
+                       r.recommendation_text, r.subject, r.priority, r.due_date,
+                       r.recommendation_type, r.status, r.created_at
+                FROM owner_manager_recommendations r
+                LEFT JOIN users u ON u.id = r.manager_user_id
+                WHERE r.owner_daily_report_id = %s
+                  AND r.manager_bitrix_user_id IS NOT NULL
+                  AND r.status NOT IN ('sent','cancelled','done','rejected')
+                ORDER BY
+                  CASE r.priority
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    ELSE 4
+                  END,
+                  r.created_at
+                """,
+                (report["id"],),
+            )
+            rows = [json_safe(dict(row)) for row in cur.fetchall()]
+    return {
+        "report_id": str(report["id"]),
+        "report_date": report_date.isoformat(),
+        "report_summary": report.get("summary"),
+        "report_dynamics_summary": report.get("dynamics_summary"),
+        "report_risks_summary": report.get("risks_summary"),
+        "report_text": report.get("report_text"),
+        "recommendations": rows,
+        "recommendations_count": len(rows),
+    }
+
+
+def tool_send_owner_recommendations_to_bitrix(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Sending requires confirm=true. First show the owner the exact drafts (per recipient) and get explicit "
+            "approval. Only then call send_owner_recommendations_to_bitrix with confirm=true.",
+        )
+    report_date = parse_date_arg(args, "report_date")
+    recipient_recommendations = args.get("recipient_recommendations")
+    if not isinstance(recipient_recommendations, dict) or not recipient_recommendations:
+        raise McpError(
+            -32602,
+            "recipient_recommendations must be a non-empty object {bitrix_user_id: message_text}.",
+        )
+    normalized: dict[str, str] = {}
+    for key, value in recipient_recommendations.items():
+        user_id = to_int(key)
+        text = str(value or "").strip()
+        if user_id is None or not text:
+            continue
+        normalized[str(user_id)] = text
+    if not normalized:
+        raise McpError(-32602, "recipient_recommendations contains no valid (bitrix_user_id, text) entries.")
+    recipient_ids = [int(k) for k in normalized.keys()]
+    with connect() as conn:
+        with conn.cursor() as cur:
+            report = _resolve_current_owner_daily_report(cur, report_date)
+    workflow = app_workflow_function("send_owner_report_recommendations_to_bitrix")
+    result = workflow(str(report["id"]), "daily", recipient_ids, normalized)
+    return {
+        "report_id": str(report["id"]),
+        "report_date": report_date.isoformat(),
+        "sent": result.get("sent", 0),
+        "failed": result.get("failed", 0),
+        "results": json_safe(result.get("results") or []),
+        "errors": json_safe(result.get("errors") or []),
+    }
+
+
+def tool_cancel_owner_recommendation(args: dict[str, Any]) -> dict[str, Any]:
+    rec_id_raw = str(args.get("recommendation_id") or "").strip()
+    if not rec_id_raw:
+        raise McpError(-32602, "Missing required argument: recommendation_id")
+    try:
+        rec_uuid = UUID(rec_id_raw)
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "recommendation_id must be a UUID.") from exc
+    reason = str(args.get("reason") or "").strip()
+    with connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, status FROM owner_manager_recommendations WHERE id = %s",
+                    (rec_uuid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise McpError(-32602, f"Recommendation {rec_id_raw} not found.")
+                old_status = str(row.get("status") or "new")
+                cur.execute(
+                    """
+                    UPDATE owner_manager_recommendations
+                    SET status = 'cancelled', closed_at = COALESCE(closed_at, now()), updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (rec_uuid,),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO owner_recommendation_events (
+                        recommendation_id, event_type, author_type,
+                        old_status, new_status, event_text, source_payload
+                    )
+                    VALUES (%s, 'cancelled', 'system', %s, 'cancelled', %s, %s)
+                    """,
+                    (rec_uuid, old_status, reason or "Cancelled by owner.", jsonb_arg({"reason": reason})),
+                )
+    return {
+        "recommendation_id": rec_id_raw,
+        "old_status": old_status,
+        "new_status": "cancelled",
+        "reason": reason or None,
     }
 
 
@@ -3426,6 +3650,32 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_create_bitrix_task,
     },
+    "delete_bitrix_task": {
+        "description": (
+            "Delete one Bitrix task through the configured Bitrix webhook. STRICT CONFIRMATION RULE: do not call "
+            "this tool until the user has confirmed deletion of one exact bitrix_task_id after seeing the task "
+            "title, status, responsible person, and deadline. Never delete by title/search text/name or ambiguous "
+            "reference. First use search_tasks(bitrix_task_id=...) to show the exact task, then ask for confirmation. "
+            "Only after the user confirms, call delete_bitrix_task(bitrix_task_id=..., confirm=true)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Exact Bitrix task number to delete."},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true. Means the user explicitly confirmed deleting this exact task after seeing its details.",
+                },
+                "expected_title": {
+                    "type": "string",
+                    "description": "Optional safety check: if provided, must exactly match the locally indexed task title.",
+                },
+            },
+            "required": ["bitrix_task_id", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_delete_bitrix_task,
+    },
     "list_chats": {
         "description": "List active non-excluded chats, optionally with message counts for a period.",
         "inputSchema": {
@@ -3718,6 +3968,71 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_save_owner_weekly_report,
+    },
+    "list_pending_owner_recommendations": {
+        "description": (
+            "List addressed manager recommendations from the current owner_daily_report for a given date. "
+            "Returns rows with id, manager_full_name, manager_bitrix_user_id, recommendation_text, subject, priority, due_date, status. "
+            "Also returns the report summary, dynamics_summary, risks_summary, and report_text so the agent can build "
+            "personal message drafts (e.g. add the day conclusion to Evgeniy's draft). "
+            "Excludes recommendations already sent, cancelled, done, or rejected. "
+            "Use this after save_owner_daily_report and before send_owner_recommendations_to_bitrix."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "report_date": {"type": "string", "description": "YYYY-MM-DD"},
+            },
+            "required": ["report_date"],
+            "additionalProperties": False,
+        },
+        "handler": tool_list_pending_owner_recommendations,
+    },
+    "send_owner_recommendations_to_bitrix": {
+        "description": (
+            "Send owner_daily_report recommendations to Bitrix recipients as personal messages from the configured "
+            "BITRIX_WEBHOOK_BASE account (owner). STRICT RULE: do not call this tool unless the owner has just "
+            "approved the exact final texts you are about to send. Confirm=true is mandatory. "
+            "Each entry in recipient_recommendations is treated as a complete final message for that Bitrix user id — "
+            "send it as-is, do not edit or wrap. Uses im.message.add with fallback to im.notify.personal.add if the "
+            "private chat is blocked. Logs the outcome to owner_recommendation_dispatches and updates "
+            "owner_manager_recommendations.status to 'sent' for matching rows."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "report_date": {"type": "string", "description": "YYYY-MM-DD — the owner_daily_report date."},
+                "recipient_recommendations": {
+                    "type": "object",
+                    "description": "Map of bitrix_user_id -> final personal message text. Each value is sent as-is.",
+                    "additionalProperties": {"type": "string"},
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true. Means the owner has explicitly approved sending these exact texts.",
+                },
+            },
+            "required": ["report_date", "recipient_recommendations", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_send_owner_recommendations_to_bitrix,
+    },
+    "cancel_owner_recommendation": {
+        "description": (
+            "Mark one owner_manager_recommendations row as cancelled (e.g. the owner decided not to send it). "
+            "Writes an owner_recommendation_events 'cancelled' entry with the reason. Use when the owner explicitly "
+            "rejects a draft for a specific person."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recommendation_id": {"type": "string", "description": "UUID of the recommendation row."},
+                "reason": {"type": "string", "description": "Short owner-provided reason (optional)."},
+            },
+            "required": ["recommendation_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_cancel_owner_recommendation,
     },
     "upsert_ai_instruction": {
         "description": "Create or update one editable AI instruction folder by path in Настройки -> Инструкции для ИИ.",

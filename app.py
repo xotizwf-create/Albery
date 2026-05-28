@@ -11882,7 +11882,7 @@ def save_owner_daily_report(report_date: date) -> dict[str, Any]:
                     ),
                 )
                 row = cur.fetchone()
-                _save_owner_daily_manager_messages(cur, row["id"], report_date, analysis)
+                save_owner_daily_manager_messages(cur, row["id"], report_date, analysis)
     return {
         "report_id": str(row["id"]),
         "report_date": report_date.isoformat(),
@@ -12240,7 +12240,7 @@ def _save_owner_weekly_manager_messages(
         )
 
 
-def _save_owner_daily_manager_messages(
+def save_owner_daily_manager_messages(
     cur: Any,
     owner_daily_report_id: Any,
     report_date: date,
