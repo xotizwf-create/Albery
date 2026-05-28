@@ -867,3 +867,763 @@ tail -n 120 /var/log/nginx/error.log
 systemctl restart albery
 nginx -t && systemctl reload nginx
 ```
+
+## VPN-шлюз: весь исходящий трафик прод-сервера через Эстонию (AmneziaWG)
+
+Настроено 2026-05-27.
+
+### Зачем
+
+Прод-сервер `186.246.7.32` — российский. Некоторые иностранные сервисы режут
+российские IP (например, OpenAI/Codex отдают `HTTP 403`). Чтобы такие сервисы
+открывались, **весь исходящий трафик сервера заворачивается через эстонский
+AmneziaWG-VPN** и выходит в интернет с эстонского IP `95.85.243.43`.
+При этом **сайт `m4s.ru`/`mcp.m4s.ru` и SSH остаются на прямом российском IP** —
+входящие посетители не страдают.
+
+Проверка эффекта: с сервера `curl https://api.openai.com/v1/models` отдаёт `403`
+напрямую и `401` (т.е. дошли, нужен только ключ) через VPN. Gemini/googleapis
+доступен из РФ и без VPN.
+
+### Серверы и ключи (.env)
+
+```env
+# Эстонский VPN-сервер (там стоит Amnezia/AmneziaWG)
+VPN_SERVER_HOST=IP: 95.85.243.43
+VPN_SERVER_USER=root
+VPN_SERVER_PASSWORD=...
+# Российский прод-сервер
+root_password=...
+```
+
+- Эстонский сервер `95.85.243.43`: Amnezia в Docker. Профиль **1234** (UDP 1234,
+  контейнер `amnezia-awg-1234`, клиент `10.8.2.2`) закреплён за прод-сервером.
+  Там же есть старый профиль на UDP 47138 с личными устройствами владельца —
+  **его не трогать**. Клиентский конфиг профиля 1234:
+  `C:\Users\hotiz\Desktop\amnezia-estonia-1234.conf` — НЕ импортировать на ПК
+  (адрес `10.8.2.2` уже занят прод-сервером, будет конфликт).
+- Российский прод-сервер `186.246.7.32`: на нём стоит **клиент AmneziaWG** (`awg0`).
+
+### Как подключаться к серверам (без SSH-ключей, пароль из .env)
+
+Вход по паролю root через Python/Paramiko (как и для всего остального в этом проекте):
+
+```python
+import re, paramiko
+env = {...}  # прочитать .env
+host = re.search(r"\d+\.\d+\.\d+\.\d+", env["VPN_SERVER_HOST"]).group(0)  # 95.85.243.43
+c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+c.connect(host, username="root", password=env["VPN_SERVER_PASSWORD"],
+          look_for_keys=False, allow_agent=False)
+# для прод-сервера: host="186.246.7.32", password=env["root_password"]
+```
+
+Пароли и приватные ключи в чат/логи не выводить.
+
+### Как это работает (архитектура)
+
+- На прод-сервере поднят интерфейс `awg0` (AmneziaWG) с `Table = off` — туннель
+  сам по себе НЕ меняет маршруты. Маршрутизацией управляет отдельный скрипт.
+- **Policy-routing** (`/root/vpn_apply.sh`, запускается как `PostUp` туннеля):
+  - таблица `200`: маршрут по умолчанию через `awg0` (→ Эстония);
+  - `ip rule` для `sport 22/443/80 → main` и пометка connmark входящих на `eth0`
+    соединений (`fwmark 0x1 → main`) — ответы сервера как сайта/SSH уходят прямо
+    через `eth0` на российский IP;
+  - всё остальное (исходящее, инициированное сервером) → таблица `200` → туннель;
+  - endpoint VPN, локальная подсеть и DNS-апстримы (85.193.93.193/194) прибиты
+    прямым маршрутом через `eth0`, чтобы не зацикливать туннель и не ломать DNS;
+  - туннель только IPv4, поэтому исходящий IPv6 в интернет **заблокирован**
+    (`ip6tables` REJECT для NEW на `2000::/3`, входящий на сайт по IPv6 сохранён),
+    плюс `/etc/gai.conf` предпочитает IPv4. Без этого приложения (например Codex)
+    уходят по российскому IPv6 в обход VPN и получают блок.
+- `PreDown` (`/root/vpn_rollback.sh`) снимает всю эту маршрутизацию при остановке
+  туннеля, возвращая сервер на прямой маршрут (сайт при этом продолжает работать).
+
+### Файлы на прод-сервере
+
+```text
+/etc/amnezia/amneziawg/awg0.conf                 конфиг туннеля (Table=off, PostUp/PreDown, MTU=1280)
+/root/vpn_apply.sh                               включает policy-routing (endpoint определяется сам)
+/root/vpn_rollback.sh                            снимает policy-routing
+/root/vpn_apply.log                              лог apply/rollback
+/usr/local/sbin/vpn-healthcheck.sh               тест состояния VPN (exit 0 = OK)
+/usr/local/sbin/vpn-watchdog.sh                  авто-перезапуск туннеля, если он реально упал
+/usr/local/sbin/amneziawg-ensure-module.sh       пересборка модуля ядра при апгрейде ядра
+/etc/systemd/system/awg-quick@awg0.service.d/override.conf   ExecStartPre=ensure-module
+/etc/systemd/system/vpn-watchdog.{service,timer}
+/etc/modules-load.d/amneziawg.conf
+/usr/src/amneziawg-linux-kernel-module, /usr/src/amneziawg-tools   исходники
+```
+
+### Установка с нуля (что было сделано на прод-сервере)
+
+PPA `ppa:amnezia/amneziawg` больше нет — ставится из исходников с GitHub
+(GitHub с сервера доступен):
+
+```bash
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y build-essential dkms git "linux-headers-$(uname -r)"
+# модуль ядра
+cd /usr/src && git clone --depth=1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module
+cd amneziawg-linux-kernel-module/src && make -j"$(nproc)" && make install && depmod -a && modprobe amneziawg
+# утилиты awg / awg-quick
+cd /usr/src && git clone --depth=1 https://github.com/amnezia-vpn/amneziawg-tools
+cd amneziawg-tools/src && make -j"$(nproc)" && make install
+```
+
+Конфиг `/etc/amnezia/amneziawg/awg0.conf` = клиентский конфиг профиля 1234, но:
+добавлено `Table = off`, `MTU = 1280`, `PostUp = /root/vpn_apply.sh`,
+`PreDown = /root/vpn_rollback.sh`; строка `DNS = ...` удалена (чтобы awg-quick
+не трогал системный DNS). Включение:
+
+```bash
+systemctl enable --now awg-quick@awg0
+```
+
+### Автозапуск после перезагрузки сервера
+
+«Всегда включён» обеспечивают:
+
+- `systemctl enable awg-quick@awg0` — туннель + policy-routing (через PostUp)
+  поднимаются при загрузке (после `network-online.target`);
+- `ExecStartPre=/usr/local/sbin/amneziawg-ensure-module.sh` — если ядро
+  обновилось и модуля для него нет, он пересобирается перед стартом туннеля;
+- `/etc/modules-load.d/amneziawg.conf` — модуль грузится на раннем этапе;
+- `PersistentKeepalive=25` в конфиге — туннель сам переустанавливает handshake;
+- **watchdog** `vpn-watchdog.timer` (каждые ~3 мин): если handshake устарел И
+  через туннель нет интернета — перезапускает `awg-quick@awg0`.
+
+### Тест / проверка состояния
+
+Быстрый health-тест (печатает статус, код возврата 0 = всё ок):
+
+```bash
+ssh root@186.246.7.32 /usr/local/sbin/vpn-healthcheck.sh
+```
+
+Проверяет: сервис enabled+active, свежесть handshake, выходной IP = `95.85.243.43`,
+доступность OpenAI (не 403), что сайт `:5002` жив.
+
+Проверка пути загрузки БЕЗ полной перезагрузки (удалить интерфейс и поднять заново
+через systemd — имитация ребута):
+
+```bash
+ssh root@186.246.7.32 'awg-quick down awg0; systemctl restart awg-quick@awg0; sleep 5; /usr/local/sbin/vpn-healthcheck.sh'
+```
+
+Полный тест ребутом (сайт на ~1 мин недоступен во время перезагрузки; VPN должен
+подняться сам):
+
+```bash
+ssh root@186.246.7.32 reboot
+# подождать ~1-2 минуты, затем:
+ssh root@186.246.7.32 /usr/local/sbin/vpn-healthcheck.sh   # ожидаем RESULT: OK
+```
+
+### Как поставить ДРУГОЙ VPN (заменить профиль/сервер)
+
+Если появится новый VPN (другой эстонский/другой сервер) с AmneziaWG-конфигом:
+
+1. Положить новый клиентский конфиг в `/etc/amnezia/amneziawg/awg0.conf`.
+2. Дописать/сохранить в секции `[Interface]`:
+   `Table = off`, `MTU = 1280`,
+   `PostUp = /root/vpn_apply.sh`, `PreDown = /root/vpn_rollback.sh`;
+   удалить строку `DNS = ...`.
+3. Перезапустить и проверить:
+
+```bash
+systemctl restart awg-quick@awg0
+/usr/local/sbin/vpn-healthcheck.sh
+```
+
+Менять `vpn_apply.sh` НЕ нужно — IP нового VPN-сервера (endpoint) он определяет
+сам из туннеля. Если новый VPN — обычный WireGuard (без обфускации), используется
+стандартный `wg`/`wg-quick` и `/etc/wireguard/awg0.conf`, остальная логика та же.
+
+### Откат / временно отключить VPN (сервер вернётся на прямой IP, сайт продолжит работать)
+
+```bash
+ssh root@186.246.7.32 'bash /root/vpn_rollback.sh && awg-quick down awg0'
+# отключить и автозапуск:
+ssh root@186.246.7.32 'systemctl disable --now awg-quick@awg0 vpn-watchdog.timer'
+```
+
+### Диагностика
+
+```bash
+awg show awg0                       # handshake, трафик, endpoint
+ip rule show                        # должны быть правила 900/901/902/1000/1001
+ip route show table 200             # default dev awg0 + прямые маршруты endpoint/DNS
+tail -n 40 /root/vpn_apply.log
+journalctl -t vpn-watchdog -n 20    # срабатывания сторожа
+curl -s https://ifconfig.me/ip      # должно быть 95.85.243.43
+```
+
+Кросс-проверка с эстонской стороны (endpoint пира `10.8.2.2` должен показывать
+`186.246.7.32` — это и есть прод-сервер):
+
+```bash
+ssh root@95.85.243.43 "docker exec amnezia-awg-1234 wg show wg0"
+```
+
+## Codex (OpenAI) на прод-сервере
+
+Установлен `@openai/codex` (codex-cli) глобально через npm (Node 20+ уже есть):
+
+```bash
+npm install -g @openai/codex
+codex --version
+```
+
+**Вход в ChatGPT-аккаунт НА сервере напрямую сделать нельзя:** OpenAI (Cloudflare)
+блокирует страницы входа и `codex login --device-auth` с серверных/дата-центровых
+IP (403). При этом сам рантайм Codex с уже готовым токеном через VPN работает.
+Поэтому вход переносится с ПК:
+
+1. На ПК, где Codex залогинен в ChatGPT (`codex login` через браузер), взять файл
+   `%USERPROFILE%\.codex\auth.json` (Windows) или `~/.codex/auth.json` (Linux/mac).
+2. Положить его на сервер в `/root/.codex/auth.json` (chmod 600).
+3. Проверить: `codex login status` → должно быть `Logged in using ChatGPT`.
+
+**Критично:** без блокировки исходящего IPv6 (см. VPN-раздел, она в `vpn_apply.sh`)
+Codex идёт в `wss://chatgpt.com/backend-api/codex/responses` по российскому IPv6 в
+обход VPN и получает `403`. С блокировкой IPv6 трафик идёт через IPv4-VPN (Эстония),
+и бэкенд отвечает.
+
+Тест запроса с сервера:
+
+```bash
+cd /tmp && printf "Respond with exactly: PING-OK" | codex exec --skip-git-repo-check
+```
+
+- Реальная работа Codex зависит от тарифа ChatGPT-аккаунта: на бесплатном будет
+  `You've hit your usage limit` — нужен ChatGPT Plus/Pro с квотой Codex.
+- Если вход на сервере «протух» (токен истёк и не обновляется автоматически) —
+  просто заново скопировать свежий `~/.codex/auth.json` с ПК.
+- Логин/пароль ChatGPT в `.env` (`GPT Логин`/`GPT_Password`) для входа Codex
+  бесполезны (вход только браузером) — их лучше убрать из `.env`.
+
+## Hermes Agent (автономный ИИ-агент, мозг = ChatGPT Plus)
+
+Настроено 2026-05-27. Поставлен локально на ПК в WSL2 для теста; следующий шаг —
+перенос на прод-сервер.
+
+### Что это и зачем
+
+`Hermes Agent` (Nous Research, open-source) — автономный агент с **постоянной
+памятью, навыками, cron-планировщиком и MCP-клиентом**. Он **model-agnostic**:
+своего «мозга» у него нет, модель подключается по OAuth/API. Это **обвязка-агент**
+(как Codex/Cline), а НЕ модель.
+
+Наша задача: «цифровой сотрудник» по отчётам/действиям (а не правка кода). Albery
+уже отдаёт инструменты для этого через MCP — Hermes выступает автономным
+исполнителем поверх них. «Мозг» сейчас — **ChatGPT Plus (модель `gpt-5.5`)**.
+
+### Ключевые пути и факты
+
+```text
+версия:        v0.14.0
+бинарь:        ~/.local/bin/hermes
+установка:     ~/.hermes/hermes-agent
+конфиг:        ~/.hermes/config.yaml
+токены аккаунтов: ~/.hermes/auth.json   ← для смены аккаунта и переноса на сервер
+провайдер:     openai-codex   (= аккаунт ChatGPT через OAuth)
+модель:        gpt-5.5        (доступна и gpt-5.4)
+дашборд:       http://127.0.0.1:9119   (hermes dashboard --tui)
+```
+
+### Важные понятия (чтобы не путать)
+
+- Провайдер **`openai-codex`** — это НЕ отдельный урезанный продукт, а технический
+  **OAuth-канал к твоему аккаунту ChatGPT**. Модель `gpt-5.5` — обычная ChatGPT.
+- Подписку ChatGPT в Hermes можно подключить **только** через `openai-codex`.
+  Провайдер `openai` использует **API-ключ**, а не подписку.
+- **Лимиты**: на подписке Plus они есть всегда, как ни подключайся. «Без потолка» —
+  только **API-ключ** (платишь по токенам). Для автономного агента 24/7 на сервере
+  правильнее API-ключ; подписка Plus периодически будет упираться в `usage limit`.
+
+### Предусловие на Windows-ПК: сеть WSL2 через VPN
+
+`AmneziaVPN` на Windows ломает сеть внутри WSL2 (исходящий TCP виснет). Лечится
+**mirrored-режимом** — WSL начинает ходить через сетевой стек хоста (вместе с VPN,
+выход через Эстонию `95.85.243.43`), и API OpenAI/Anthropic становятся доступны.
+
+Создать `C:\Users\<user>\.wslconfig`:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+dnsTunneling=true
+autoProxy=true
+```
+
+Затем `wsl --shutdown` (перезапуск WSL). Проверка из WSL:
+`curl -s https://api.ipify.org` → должно быть `95.85.243.43`.
+
+### Установка Hermes (Linux / WSL2 / сервер)
+
+Требуется **Node.js 20+** (для сборки веб-дашборда на Vite) и Python 3.11
+(ставит установщик сам). На прод-сервере Node 20 уже есть; в WSL ставился nvm-ом.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+source ~/.bashrc        # или новый терминал
+hermes --version
+```
+
+- Установщик ставит uv, Python 3.11, клонирует репо, создаёт venv.
+- Опциональные `ripgrep`/`ffmpeg` требуют sudo — можно пропустить (агент работает
+  без них; поиск идёт через grep).
+- **ВАЖНО при неинтерактивном запуске** (фон, `curl | bash` без терминала):
+  установщик читает `/dev/tty` и **виснет на sudo-вопросе про ripgrep/ffmpeg**.
+  Запускать в сеансе без управляющего терминала (`setsid`) и с флагами
+  `--skip-setup --skip-browser`, либо просто ставить в живом SSH-терминале.
+
+Если в системе старый Node — поставить 20 через nvm (без sudo):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"
+nvm install 20 && nvm alias default 20
+# затем пересобрать веб-морду дашборда:
+cd ~/.hermes/hermes-agent/web && rm -rf node_modules package-lock.json && npm install && npm run build
+```
+
+### Подключение аккаунта ChatGPT (openai-codex, OAuth device-code)
+
+```bash
+hermes auth add openai-codex --type oauth
+```
+
+- Покажет URL `https://auth.openai.com/codex/device` и короткий код.
+- В браузере сначала **войти в аккаунт ChatGPT** (страница перекинет на `/log-in`),
+  потом **снова открыть** `/codex/device`, ввести код, подтвердить (Authorize).
+- Аккаунт должен быть **Plus/Pro** — на бесплатном будет `usage limit`.
+- Токен сохраняется в `~/.hermes/auth.json`. Проверка: `hermes auth list`.
+- **IP-нюанс**: вход с датацентрового IP Cloudflare может блокировать (`403`).
+  На ПК (через VPN-Эстонию) сработало. На сервере вход может не пройти — см. перенос.
+
+### Провайдер и модель по умолчанию
+
+```bash
+hermes config set model.provider openai-codex
+hermes config set model.default gpt-5.5      # или gpt-5.4; интерактивно: hermes model
+# проверка:
+printf '' | hermes -z "Respond with exactly: PING-OK"
+```
+
+### Смена аккаунта / провайдера
+
+```bash
+hermes auth list                       # что подключено
+hermes auth logout openai-codex        # выйти из аккаунта
+hermes auth remove <index|id|label>    # удалить конкретный кредл
+hermes auth add openai-codex --type oauth   # войти заново (другим аккаунтом)
+```
+
+Переключиться на **API-ключ** (без потолка лимитов, платно по токенам):
+
+```bash
+hermes auth add openai --type api-key --api-key sk-...     # или anthropic / gemini
+hermes config set model.provider openai                    # anthropic | gemini
+hermes config set model.default <model-id>
+```
+
+Весь токен-стор — один файл `~/.hermes/auth.json` (его можно бэкапить/копировать).
+
+### Запуск
+
+```bash
+hermes                       # чат в терминале
+hermes dashboard --tui       # веб-дашборд: чат + настройки + сессии + cron, порт 9119
+#   полезные флаги: --no-open  --port N  --skip-build (отдать готовый dist без сборки)
+#                   --status   --stop
+hermes gateway run           # фоновый шлюз/cron (для «сотрудника»); install — как сервис
+```
+
+Дашборд слушает `127.0.0.1:9119`; при mirrored-WSL открывается в браузере Windows
+по `http://localhost:9119`.
+
+### Перенос на прод-сервер (`186.246.7.32`, Ubuntu 22.04)
+
+1. Установить (Node 20 там уже есть):
+   `curl -fsSL .../install.sh | bash` (в живом SSH-терминале — TTY-хак не нужен).
+2. **Логин аккаунта** — упрётся в датацентровый IP (как было с Codex). Два пути:
+   - **(а) device-login:** на сервере `hermes auth add openai-codex --type oauth`,
+     а URL+код открыть/ввести в браузере на ПК (жилой IP). Если опрос токена с
+     сервера получит `403` — использовать путь (б).
+   - **(б) скопировать готовый `~/.hermes/auth.json` с ПК на сервер** (как делали с
+     `~/.codex/auth.json` для Codex): `scp ... root@186.246.7.32:/root/.hermes/auth.json`,
+     `chmod 600`. Тогда отдельный вход на сервере не нужен.
+3. Прописать провайдера/модель (`hermes config set ...`, см. выше).
+4. Держать запущенным: `hermes gateway install` (systemd-сервис, автозапуск) или
+   дашборд как сервис.
+5. VPN на сервере уже заворачивает исходящий трафик через Эстонию (см. раздел про
+   VPN-шлюз) — он нужен, иначе OpenAI отдаёт `403` российскому IP.
+
+### Что нужно для работы (чек-лист)
+
+- **Node 20+** (дашборд) и Python 3.11 (ставит установщик).
+- **Рабочий мозг**: `openai-codex` (ChatGPT Plus) или API-ключ.
+- **Нероссийский исходящий IP** (VPN) — OpenAI режет РФ.
+- Для роли «сотрудник по отчётам» (следующий этап): подключить **MCP Albery**
+  (секция `mcp_servers` в `~/.hermes/config.yaml`, HTTP-транспорт на
+  `https://mcp.m4s.ru/mcp/<MCP_SHARED_SECRET>`) и настроить **cron-задачи**
+  (`hermes cron`) — тогда агент сам по расписанию читает инструкции, собирает
+  данные и формирует отчёты через инструменты Albery.
+
+### Служебное (на ПК)
+
+- `C:\Users\<user>\.wslconfig` — mirrored-сеть WSL (не удалять, иначе WSL снова
+  потеряет интернет под VPN).
+- Разовые вспомогательные скрипты установки лежали в `C:\Users\<user>\*.sh` —
+  их можно удалить, на работу агента не влияют.
+
+### Прод-развёртывание Hermes (выполнено 2026-05-27)
+
+Hermes перенесён с ПК на прод-сервер `186.246.7.32` и работает **24/7** как
+systemd-служба. Мозг — ChatGPT Plus (`gpt-5.5`) через `openai-codex` OAuth.
+Чтобы не сжигать 5-часовой лимит Codex, reasoning на проде снижен до `medium`:
+`model.reasoning_effort=medium` и `agent.reasoning_effort=medium`.
+
+Расположение на сервере:
+
+```text
+бинарь:   /usr/local/bin/hermes
+код:      /usr/local/lib/hermes-agent
+дом:      /root/.hermes/   (config.yaml, .env, cron/, sessions/, logs/, state.db)
+служба:   /etc/systemd/system/hermes-gateway.service  (enabled+active, автозапуск)
+```
+
+Что сделано:
+
+- **Вход в ChatGPT:** `/root/.hermes/auth.json` скопирован с ПК (chmod 600) — вход
+  на серверном IP блокирует Cloudflare, а готовый токен работает через VPN-Эстонию.
+- **Swap:** добавлен `/swapfile` 2 ГБ (`vm.swappiness=10`, в `/etc/fstab`) — страховка
+  от OOM на 2 ГБ RAM. Сам агент лёгкий (~185–270 МБ), модель считается удалённо.
+- **MCP:** в `/root/.hermes/config.yaml` секция `mcp_servers.albery` =
+  `https://mcp.m4s.ru/mcp/<MCP_SHARED_SECRET>` (секрет из `/var/www/albery/.env`,
+  auth none). 38 инструментов. TZ сервера = Europe/Moscow, поэтому cron-время — МСК.
+- **Gateway-служба:** `hermes gateway install --system --run-as-user root`
+  (под root, т.к. весь стек тут под root). Планировщик cron работает автоматически.
+- **Telegram:** подключён к gateway через `/root/.hermes/.env`:
+  `TELEGRAM_BOT_TOKEN=<из .env TG_BOT_TOKEN>` и
+  `TELEGRAM_ALLOWED_USERS=<из .env TG_ID>`. Установлена зависимость
+  `python-telegram-bot[webhooks]` в `/usr/local/lib/hermes-agent/venv`.
+  Пользователь нажал `/start`, после этого проверочный пуш через
+  `hermes send --to telegram:<TG_ID> ...` вернулся `sent`.
+- **Тихий Telegram-режим:** в `/root/.hermes/config.yaml` включено
+  `display.platforms.telegram.tool_progress: off` — Telegram не показывает
+  технические tool-calls вида `mcp_albery_*`; и `cron.wrap_response: false` —
+  cron присылает только чистый ответ агента без обёртки `Cronjob Response`,
+  `job_id` и подсказки `stop reminder`.
+
+Две автоматизации (`hermes cron list`):
+
+- `zoom-to-tasks` — `*/30 * * * *`: находит Zoom-созвоны без отчёта
+  **без расхода Codex на пустых проверках**. Реализовано как `no-agent` cron
+  со скриптом `/root/.hermes/scripts/zoom_watchdog.sh`: скрипт напрямую и быстро
+  проверяет PostgreSQL (`zoom_calls` за последние 2 дня, `analytical_note=''`,
+  транскрипт есть). Если новых Zoom нет — stdout пустой, Telegram молчит, LLM не
+  вызывается. Если есть новый Zoom — только тогда скрипт запускает `hermes -z` с
+  промптом из `/root/.hermes/scripts/hermes_zoom_to_tasks_prompt.txt`
+  (источник правды в git: [scripts/hermes_zoom_to_tasks_prompt.txt](scripts/hermes_zoom_to_tasks_prompt.txt)).
+  Промпт подставляет `$DATE_FROM`, `$DATE_TO`, `$MISSING` через awk-substitution
+  (без проблем со sed-escaping для многострочных значений).
+  В скрипте есть `flock` и cooldown 7200 сек на тот же набор missing-call id,
+  чтобы при ошибке не жечь лимит каждые 30 минут.
+
+  **Что делает агент.** По промпту строго:
+  1. `start_here_always_read_ai_instructions` → `get_context_guide`;
+  2. для каждого созвона: `get_report_contract(zoom_processing)` (контракт — 13 KB, 12 разделов в `report_text` + JSON-схема с обязательным `operational_tasks`), `get_zoom_call_transcript(include_full_text=true)`, `get_org_structure`;
+  3. формирует отчёт **строго по контракту** (12 разделов + полный JSON) и сохраняет через `save_zoom_call_report` — это кладёт `analytical_note` и `raw_json.ai_report.analysis.operational_tasks`;
+  4. в Битрикс задачи НЕ создаёт (verification mode).
+
+  **Что приходит в Telegram (формат принципиально короткий).** Никакого пересказа отчёта, никаких разделов «Краткая суть» / «Риски» / «Выводы»:
+  ```
+  Созвон: <ДД.ММ.ГГГГ> — <тема>
+
+  Предлагаю поставить задачи в Битрикс:
+  1. <ФИО> — <task_text>. Срок: <deadline_text>. Критерий: <result_criteria>.
+  2. …
+
+  Создаём задачи в Битрикс? Ответь: ставь / не ставь / правки по №<n>: <текст>.
+  ```
+  Если задач 0 — строка «Задач не выделено.» и финальный вопрос не задаётся. Если обработано несколько созвонов — каждый отдельным блоком через разделитель «———».
+
+  Полный отчёт по контракту (краткая суть, риски, поведенческие факторы, диагностика и т.д.) живёт **только в БД** (`analytical_note` + `raw_json.ai_report.analysis`) и доступен через UI Albery / MCP `get_zoom_call_transcript`. В Telegram он не дублируется.
+
+  **На ответ «ставь»** — Hermes в Telegram-сессии должен прочитать `operational_tasks` сохранённого отчёта и для каждой задачи вызвать `create_bitrix_task`, предварительно собрав все обязательные поля (responsible, deadline, проверяемый результат). На «правки по №N: …» — пересобрать конкретную задачу. На «не ставь» — ничего не создавать.
+
+  **Деплой обновлённого промпта/watchdog'а**:
+  ```powershell
+  python scripts/update_hermes_zoom_to_tasks.py
+  # Опции:
+  #   --reset-and-run <zoom_call_uuid>
+  #     дополнительно: удалит сохранённый отчёт за этот созвон через MCP
+  #     delete_zoom_call_report, сбросит cooldown, и запустит watchdog один раз
+  #     через bash (для разработки; в проде используйте `hermes cron run f217482a8618`
+  #     если нужна реальная cron-delivery в Telegram).
+  ```
+  Источники правды в git:
+  - [scripts/hermes_zoom_to_tasks_prompt.txt](scripts/hermes_zoom_to_tasks_prompt.txt) — текст промпта (на проде: `/root/.hermes/scripts/hermes_zoom_to_tasks_prompt.txt`);
+  - [scripts/hermes_zoom_watchdog.sh](scripts/hermes_zoom_watchdog.sh) — wrapper (на проде: `/root/.hermes/scripts/zoom_watchdog.sh`, права 0700);
+  - [scripts/update_hermes_zoom_to_tasks.py](scripts/update_hermes_zoom_to_tasks.py) — патчер.
+  Бэкап предыдущего watchdog'a: `/root/.hermes/scripts/zoom_watchdog.sh.bak`.
+- `owner-daily` — `0 18 * * *`: формирует и сохраняет ежедневный отчёт собственнику
+  по контракту `get_report_contract(owner_daily)`. **На уровне prompt самого Hermes**
+  (не MCP-инструкций — контракт `owner_daily` НЕ трогали) включён двухфазный
+  режим согласования рекомендаций → отправка в Битрикс.
+
+  **Фаза 1 — формирование (cron в 18:00 МСК).** Hermes:
+  1. читает живые AI-инструкции, контракт `owner_daily`, источники за день (чаты с OCR, Zoom-отчёты, Bitrix-задачи, оргструктуру, регламенты, предыдущий owner-отчёт);
+  2. вызывает `save_owner_daily_report` и **дополнительно передаёт** аргумент `manager_messages` — массив адресных сообщений ТОЛЬКО для пятёрки (Сергей Виноградов, Наталья Горюнова, Артур Степанян, Евгений Палей, Александр Никитенко). В каждом `message_text` уже лежит ПОЛНЫЙ финальный текст в формате «<Имя>, приветствую! Рекомендации: 1) … 2) …», который пойдёт в Битрикс одной репликой;
+  3. для Евгения Палея (собственник) в начало `message_text` добавляется блок «Главный вывод дня — <2-3 строки executive summary>»;
+  4. на стороне MCP `tool_save_owner_daily_report` после INSERT в `owner_daily_reports` вызывает `save_owner_daily_manager_messages` (в `app.py`), который парсит `manager_messages` и пишет каждое сообщение строкой в `owner_manager_recommendations` со `status='new'`;
+  5. для **НЕ-разрешённых** сотрудников рекомендации в `manager_messages` НЕ передаются вообще — наблюдения по ним остаются только в `report_text/recommendations` отчёта;
+  6. **если для пятёрки за день нет фактов-оснований** (нет созвонов/чатов/ответов/просрочек) — `manager_messages` пустой, в БД ничего не записывается, и Hermes возвращает **пустой stdout** → Telegram молчит вообще (правило тишины, как у `zoom-to-tasks` при отсутствии новых созвонов);
+  7. если хоть один блок есть — Hermes собирает единое сообщение и присылает мне в Telegram:
+     ```
+     Согласуйте что мы отправляем:
+
+     Евгений, приветствую!
+     Главный вывод дня — …
+     Рекомендации: 1) … 2) …
+
+     ———
+
+     Сергей, приветствую!
+     Рекомендации: 1) …
+
+     Отправляю в Битрикс? Ответь: отправляй / не отправляй / правки по <имя>: <текст>.
+     ```
+
+  **Фаза 2 — отправка в Битрикс (ответ владельца в Telegram).** На «отправляй»
+  Hermes в новой Telegram-сессии:
+  1. `list_pending_owner_recommendations(report_date=today)` — читает сохранённые черновики из `owner_manager_recommendations` (статус `new`);
+  2. собирает `recipient_recommendations = {manager_bitrix_user_id: recommendation_text}` строго как есть (тексты уже финальные и одобренные);
+  3. `send_owner_recommendations_to_bitrix(report_date, recipient_recommendations, confirm=true)` → backend (`send_owner_report_recommendations_to_bitrix` в `app.py`) шлёт каждому через **`im.message.add` от моего имени** (через существующий `BITRIX_WEBHOOK_BASE`, отдельного бота пока не делаем) с fallback на `im.notify.personal.add` при `ERROR_NO_ACCESS`;
+  4. факт отправки пишется в `owner_recommendation_dispatches` (channel `bitrix_im` или `bitrix_notification`), статус соответствующих `owner_manager_recommendations` обновляется на `sent`, в `owner_recommendation_events` фиксируется событие `sent`;
+  5. на «правки по <имя>: …» — Hermes пересобирает текст для этого человека и снова показывает на согласование (старый черновик можно пометить `cancel_owner_recommendation(recommendation_id, reason)`);
+  6. на «не отправляй» — отметка статусов `cancelled`, ничего в Битрикс не уходит.
+
+  Сценарий полностью автоматизированный — отдельного «Альбери Бота» в Bitrix пока нет, сообщения идут от моего пользователя через тот же webhook, что и `create_bitrix_task`. Когда добавим отдельного бота (Phase 2), достаточно будет переключить `send_owner_report_recommendations_to_bitrix` на новый webhook.
+
+### Bitrix-инструменты в MCP
+
+В MCP Albery доступны инструменты:
+
+- `create_bitrix_task` — создаёт одну задачу в Bitrix. Агент обязан собрать и
+  показать человеку перед созданием: ответственный, дедлайн, проверяемый результат,
+  финальный человеческий текст задачи. Если чего-то нет — уточнять до конца, не
+  создавать.
+- `delete_bitrix_task` — удаляет одну задачу в Bitrix. Жёсткое правило:
+  сначала `search_tasks(bitrix_task_id=...)`, затем показать пользователю точную
+  задачу (номер, название, статус, ответственный, дедлайн) и спросить подтверждение.
+  Только после явного подтверждения можно вызвать
+  `delete_bitrix_task(bitrix_task_id=..., confirm=true)`. Нельзя удалять по названию,
+  поисковому тексту или неоднозначной ссылке. В инструменте есть дополнительная
+  защита: без `confirm=true` он откажет, а `expected_title` можно использовать как
+  safety-check от удаления не той задачи.
+- `list_pending_owner_recommendations(report_date)` — возвращает сохранённые
+  черновики рекомендаций из `owner_manager_recommendations` за указанный день
+  (только текущая версия отчёта, только статусы `new/queued`, только записи с
+  `manager_bitrix_user_id IS NOT NULL`). Вместе с черновиками отдаёт поля отчёта:
+  `report_summary`, `report_dynamics_summary`, `report_risks_summary`,
+  `report_text`. Используется Hermes-агентом в Telegram-сессии после ответа
+  владельца «отправляй», чтобы собрать `recipient_recommendations` под отправку.
+- `send_owner_recommendations_to_bitrix(report_date, recipient_recommendations, confirm=true)`
+  — шлёт каждому получателю один личный текст в Битрикс через `im.message.add`
+  с fallback на `im.notify.personal.add`. `confirm=true` обязателен — без него
+  инструмент отказывает. Параметр `recipient_recommendations` — это словарь
+  `{bitrix_user_id: text}`; текст отправляется как есть, без редактирования. Под
+  капотом — `send_owner_report_recommendations_to_bitrix` из `app.py`, который
+  пишет каждую отправку в `owner_recommendation_dispatches` (channel `bitrix_im`
+  / `bitrix_notification`), переводит соответствующие `owner_manager_recommendations`
+  в `status='sent'` и пишет `sent`-событие в `owner_recommendation_events`.
+- `cancel_owner_recommendation(recommendation_id, reason?)` — помечает одну
+  запись `owner_manager_recommendations` как `cancelled`, фиксирует событие
+  `cancelled` в `owner_recommendation_events`. Используется на «не отправляй»
+  или «правки по <имя>: …» (старый черновик отменяется, новый формируется).
+- `save_owner_daily_report` — **расширен 28.05.2026**: теперь принимает поле
+  `manager_messages` (массив объектов со структурой
+  `{manager_name, manager_bitrix_user_id, priority, message_type, subject, message_text, due, topics}`),
+  и после INSERT в `owner_daily_reports` сразу вызывает
+  `save_owner_daily_manager_messages` (в `app.py`) — он наполняет
+  `owner_manager_recommendations` строкой на каждый объект из `manager_messages`.
+  Без `manager_messages` инструмент работает как раньше (только сам отчёт).
+
+Обе cron-задачи доставляют результаты в Telegram:
+
+```text
+zoom-to-tasks -> Deliver: telegram:<TG_ID>
+owner-daily   -> Deliver: telegram:<TG_ID>
+```
+
+Управление и наблюдение (по SSH на сервере):
+
+```bash
+hermes cron list                       # список автоматизаций
+hermes cron pause/resume/edit <id>     # пауза/правка
+hermes chat                            # живой чат с агентом (есть руки Albery MCP)
+hermes sessions list                   # история запусков
+hermes logs gateway -f                 # лог шлюза
+journalctl -u hermes-gateway -f        # системный лог службы
+systemctl status hermes-gateway        # статус службы
+hermes send --to telegram:<TG_ID> "..." # тестовый пуш в Telegram
+```
+
+Telegram-бот принимает команды только от `TG_ID`. Снаружи бот работает через
+polling, поэтому отдельный webhook/Nginx не нужен. Для проверки логов:
+`tail -f /root/.hermes/logs/gateway.log` и `journalctl -u hermes-gateway -f`.
+Если в Telegram снова появятся строки `⚙️ mcp_albery_...`, вернуть тихий режим:
+
+```bash
+python3 - <<'PY'
+import yaml, pathlib
+p = pathlib.Path('/root/.hermes/config.yaml')
+cfg = yaml.safe_load(p.read_text()) or {}
+cfg.setdefault('display', {}).setdefault('platforms', {}).setdefault('telegram', {})['tool_progress'] = 'off'
+cfg.setdefault('cron', {})['wrap_response'] = False
+p.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
+PY
+systemctl restart hermes-gateway
+```
+
+Чтобы Telegram-агент не сжигал лимит Codex на нерелевантных инструментах, для
+платформы `telegram` отключены встроенные toolsets:
+`web`, `browser`, `terminal`, `file`, `code_execution`, `vision`, `image_gen`,
+`tts`, `skills`, `todo`, `session_search`, `delegation`, `cronjob`,
+`computer_use`, `messaging`. Оставлены `memory`, `clarify` и MCP `albery`.
+Это важно: бизнес-команды из Telegram должны идти через Albery MCP, а не через
+поиск по файлам/терминал. Проверка:
+
+```bash
+hermes tools list --platform telegram
+```
+
+28.05.2026 была удалена раздутая Telegram-сессия
+`20260527_232811_0b70890e`: на команде `Ещё раз попробуй` агент сделал 25 API
+вызовов, разогнал контекст до 100k+ токенов и полез в `search_files/read_file`.
+Если такое повторится: `systemctl restart hermes-gateway`, затем
+`hermes sessions list` и `hermes sessions delete --yes <session_id>`.
+
+Чтобы Telegram больше не тянул бесконечную историю и не сжигал 5-часовой лимит
+Codex, но при этом не забывал активный рабочий диалог, на сервере включён режим
+«час простоя = новый чат, активный диалог = сжатие»:
+
+```yaml
+session_reset:
+  mode: both
+  idle_minutes: 60
+  at_hour: 4
+  notify: false
+agent:
+  gateway_auto_continue_freshness: 300
+compression:
+  enabled: true
+  threshold: 0.20
+  target_ratio: 0.12
+  protect_first_n: 2
+  protect_last_n: 12
+  hygiene_hard_message_limit: 50
+sessions:
+  auto_prune: true
+  retention_days: 3
+  vacuum_after_prune: true
+telegram_context_guard:
+  enabled: true
+  token_threshold: 100000
+  message_limit: 50
+```
+
+Смысл настройки:
+
+- если в Telegram нет активности 60 минут, следующий запрос стартует как новый
+  чат — это защита от случайного подтягивания огромной истории;
+- пользователь может вручную начать новый чат командой `/new` или `/reset`;
+- каждый день в 04:00 gateway дополнительно сбрасывает активные сессии, чтобы
+  они не жили неделями;
+- если контекст растёт в рамках активного диалога, Hermes рано сжимает старую часть в summary
+  и оставляет свежий хвост из последних 12 сообщений;
+- дополнительно на проде установлен Telegram context guard в
+  `/usr/local/lib/hermes-agent/gateway/run.py` и
+  `/usr/local/lib/hermes-agent/gateway/platforms/telegram.py`: если перед
+  запуском модели в Telegram-сессии примерно `100000+` токенов или `50+`
+  сообщений, gateway **не запускает модель**, а присылает предупреждение с
+  кнопками `Да, сжать и продолжить` / `Нет, продолжить так`. При выборе
+  `Да` сначала выполняется `/compress`, затем повторяется исходное сообщение.
+  При выборе `Нет` исходное сообщение запускается без сжатия, но это уже
+  осознанное решение владельца;
+- старые transcript-сессии чистятся через 3 дня;
+- прошлые сессии физически остаются в SQLite, но **не подтягиваются
+  автоматически** в Telegram: авто-поиск по старым диалогам отключён, потому что
+  он может найти нерелевантное и снова сжечь лимит. Если после reset нужна
+  связь с прошлой темой, лучше коротко напомнить контекст или заранее сохранить
+  важное через `запомни: ...`;
+- постоянные предпочтения нужно хранить не в длинной переписке, а в `memory`
+  или в явных инструкциях cron/Albery. Пользователь может писать боту:
+  `запомни: ...`, но важные правила для отчётов лучше фиксировать в
+  `Настройки → Инструкции для ИИ` или в этом `agent.md`.
+
+Веб-дашборд слушает `127.0.0.1:9119` (наружу не открыт). Смотреть через SSH-туннель:
+
+```bash
+ssh -L 9119:127.0.0.1:9119 root@186.246.7.32
+# затем на ПК открыть http://localhost:9119  (нужен запущенный `hermes dashboard`)
+```
+
+«Обучение»: поведение отчётов/задач правится в Albery (`Настройки → Инструкции
+для ИИ` и `Сводная аналитика → Настройка промтов`: контракты `zoom_processing`,
+`owner_daily`) — это читают и Hermes, и внешние ассистенты. Уровень Hermes —
+`hermes memory` и тексты cron (`hermes cron edit <id> --prompt "..."`).
+
+Важно: на ПК (локальный WSL) остался свой Hermes с теми же cron-задачами, но без
+запущенного gateway — он не сработает. Не запускать оба планировщика против одного
+Albery (иначе версионная чехарда в отчётах). На тарифе Plus возможны upstream
+`usage limit` на тяжёлых прогонах — при необходимости перейти на API-ключ.
+
+### Cron script timeout (увеличен 28.05.2026 до 900s)
+
+По умолчанию Hermes убивает `--script` cron-задачу через **120 секунд**. Для
+`zoom-to-tasks` этого мало: когда `zoom_watchdog.sh` находит новый созвон и
+запускает `hermes -z` с тяжёлым промптом (полный транскрипт + AI-генерация),
+сессия идёт 3-7 минут — раньше cron падал с
+`Script timed out after 120s: /root/.hermes/scripts/zoom_watchdog.sh`.
+
+Лимит вынесен в `/root/.hermes/config.yaml`:
+
+```yaml
+cron:
+  wrap_response: false
+  max_parallel_jobs: null
+  script_timeout_seconds: 900
+```
+
+Резолвится в порядке: env `HERMES_CRON_SCRIPT_TIMEOUT` → `cron.script_timeout_seconds`
+в config.yaml → `120` (default). После изменения — `systemctl restart hermes-gateway`.
+Бэкап старого конфига перед правкой: `/root/.hermes/config.yaml.bak.<unix_ts>`.
+
+### Деплой Hermes-промптов
+
+Промпт cron-задачи `owner-daily` живёт в **двух местах**:
+
+1. **Источник правды (в git):** [scripts/hermes_owner_daily_prompt.txt](scripts/hermes_owner_daily_prompt.txt)
+2. **Применённый на проде:** поле `prompt` у джобы `owner-daily` в
+   `/root/.hermes/cron/jobs.json`.
+
+Применение/обновление промпта на проде:
+
+```powershell
+python scripts/update_hermes_owner_daily_prompt.py
+```
+
+Скрипт:
+- читает `scripts/hermes_owner_daily_prompt.txt`;
+- через paramiko заходит на прод (пароль из локального `.env`, не светится в логе);
+- сохраняет бэкап `/root/.hermes/cron/jobs.json.bak`;
+- патчит `prompt` у джобы `owner-daily` и кладёт обратно (chmod 600);
+- делает `systemctl restart hermes-gateway`.
+
+Откат — переименовать `jobs.json.bak` обратно в `jobs.json` и рестартануть gateway.
