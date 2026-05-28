@@ -1348,13 +1348,27 @@ systemd-служба. Мозг — ChatGPT Plus (`gpt-5.5`) через `openai-c
   1. <ФИО> — <task_text>. Срок: <deadline_text>. Критерий: <result_criteria>.
   2. …
 
-  Создаём задачи в Битрикс? Ответь: ставь / не ставь / правки по №<n>: <текст>.
+  Создаём задачи в Битрикс? Ответь «ставь» — я по каждому ответственному создам одну агрегированную задачу «Итоги созвона <ЧЧ:ММ>» с дедлайном <дата созвона> 19:00 МСК и описанием со списком всех его задач из созвона (формат как в Albery UI). «Не ставь» — пропускаю. «Правки по №<n>: <текст>» — пересоберу конкретную.
   ```
   Если задач 0 — строка «Задач не выделено.» и финальный вопрос не задаётся. Если обработано несколько созвонов — каждый отдельным блоком через разделитель «———».
 
   Полный отчёт по контракту (краткая суть, риски, поведенческие факторы, диагностика и т.д.) живёт **только в БД** (`analytical_note` + `raw_json.ai_report.analysis`) и доступен через UI Albery / MCP `get_zoom_call_transcript`. В Telegram он не дублируется.
 
-  **На ответ «ставь»** — Hermes в Telegram-сессии должен прочитать `operational_tasks` сохранённого отчёта и для каждой задачи вызвать `create_bitrix_task`, предварительно собрав все обязательные поля (responsible, deadline, проверяемый результат). На «правки по №N: …» — пересобрать конкретную задачу. На «не ставь» — ничего не создавать.
+  **На ответ «ставь» (Phase 2 — отправка в Битрикс).** Hermes в Telegram-сессии **НЕ создаёт по одной мелкой задаче через `create_bitrix_task`** — он использует existing UI dispatcher (тот же код, что и кнопка «Отправка задач» в Albery UI):
+  1. `list_pending_zoom_operational_dispatches()` без аргументов — возвращает массив `pending` ТОЛЬКО за сегодня (Europe/Moscow). Это именно те созвоны, которые владелец видел в недавней сводке.
+  2. Для каждого `pending` → `dispatch_zoom_operational_tasks(call_id, confirm=true)`. Этот инструмент сам сгруппирует `operational_tasks` по ответственному, создаст **одну агрегированную Bitrix-задачу** «Итоги созвона ЧЧ:ММ» на каждого человека с описанием через стандартный intro `Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс…` + нумерованный список этого человека.
+  3. После успешной отправки бэкенд помечает `zoom_calls.raw_json.ai_report.bitrix_dispatch` (timestamp + task_ids) → следующий `list_pending` для того же дня уже не вернёт этот созвон.
+  4. Hermes отвечает владельцу короткой человеческой сводкой («Создано M задач в Битрикс по созвону <тема>: — ФИО (N задач)»), без техн id, MCP, прочей кухни.
+
+  Правило поведения на «ставь» зафиксировано отдельной AI-инструкцией в Albery («Cron автоматизации/Zoom задачи — ответ ставь», источник в git: [scripts/ai_instruction_zoom_approval.md](scripts/ai_instruction_zoom_approval.md)). Hermes читает её через `start_here_always_read_ai_instructions` в начале Telegram-сессии. Деплой инструкции — `python scripts/upsert_albery_ai_instruction.py "<path>" scripts/ai_instruction_zoom_approval.md`.
+
+  Жёсткие правила в этой AI-инструкции (важны чтобы Hermes не сжигал токены и не делал лишнего):
+  - НЕ переспрашивай «3 обязательных поля» — у `dispatch_zoom_operational_tasks` все поля собираются из БД автоматически.
+  - НЕ вызывай `create_bitrix_task` для отдельных задач — это создаёт много мелких задач вместо одной агрегированной.
+  - НЕ ищи `call_id` вручную через `list_zoom_calls`/`get_zoom_call_transcript` — `list_pending_zoom_operational_dispatches` уже отфильтровал нужное.
+  - НЕ читай `get_org_structure`, `get_zoom_call_transcript`, `get_report_contract` — dispatch сам всё подтянет из БД.
+  - На «не ставь» — ничего не создавай, отвечай «Понял, задачи не ставлю.».
+  - На «правки по №N: …» — `dispatch_zoom_operational_tasks` не вызывай; режим редактирования отдельной задачи пока не автоматизирован, обсуди с владельцем устно.
 
   **Деплой обновлённого промпта/watchdog'а**:
   ```powershell
@@ -1370,6 +1384,8 @@ systemd-служба. Мозг — ChatGPT Plus (`gpt-5.5`) через `openai-c
   - [scripts/hermes_zoom_to_tasks_prompt.txt](scripts/hermes_zoom_to_tasks_prompt.txt) — текст промпта (на проде: `/root/.hermes/scripts/hermes_zoom_to_tasks_prompt.txt`);
   - [scripts/hermes_zoom_watchdog.sh](scripts/hermes_zoom_watchdog.sh) — wrapper (на проде: `/root/.hermes/scripts/zoom_watchdog.sh`, права 0700);
   - [scripts/update_hermes_zoom_to_tasks.py](scripts/update_hermes_zoom_to_tasks.py) — патчер.
+  - [scripts/ai_instruction_zoom_approval.md](scripts/ai_instruction_zoom_approval.md) — AI-инструкция Albery для Telegram-сессии.
+  - [scripts/upsert_albery_ai_instruction.py](scripts/upsert_albery_ai_instruction.py) — общий патчер AI-инструкций через MCP `upsert_ai_instruction`.
   Бэкап предыдущего watchdog'a: `/root/.hermes/scripts/zoom_watchdog.sh.bak`.
 - `owner-daily` — `0 18 * * *`: формирует и сохраняет ежедневный отчёт собственнику
   по контракту `get_report_contract(owner_daily)`. **На уровне prompt самого Hermes**
@@ -1453,6 +1469,29 @@ systemd-служба. Мозг — ChatGPT Plus (`gpt-5.5`) через `openai-c
   `save_owner_daily_manager_messages` (в `app.py`) — он наполняет
   `owner_manager_recommendations` строкой на каждый объект из `manager_messages`.
   Без `manager_messages` инструмент работает как раньше (только сам отчёт).
+- `list_pending_zoom_operational_dispatches(date_from?, date_to?)` — **добавлен 28.05.2026**:
+  возвращает Zoom-созвоны с сохранённым `analytical_note`, по которым ещё не
+  созданы агрегированные «Итоги созвона» задачи в Битрикс. **Default период —
+  только сегодня (Europe/Moscow)** — это страховка от случайной отправки старых
+  непереданных созвонов на ответ «ставь»; за прошлые дни нужно передать
+  `date_from` явно. Hermes использует это как первый шаг Phase 2 zoom-to-tasks.
+- `preview_zoom_operational_tasks(call_id)` — **добавлен 28.05.2026**: показывает
+  что будет создано в Битрикс БЕЗ отправки. Возвращает `title` («Итоги созвона
+  ЧЧ:ММ»), per-recipient `task_cards` (одна карточка = одна агрегированная
+  задача), `deadline` (дата созвона 19:00 МСК), стандартное `description`.
+  Полезен для отладки; в обычном flow Hermes этот инструмент не дёргает —
+  идёт сразу к `dispatch_zoom_operational_tasks`.
+- `dispatch_zoom_operational_tasks(call_id, confirm=true)` — **добавлен
+  28.05.2026**: создаёт агрегированные Bitrix-задачи «Итоги созвона ЧЧ:ММ» —
+  одна задача на каждого ответственного из `operational_tasks` сохранённого
+  отчёта. Дедлайн = call_date 19:00 МСК. Описание = `ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO` +
+  список задач этого человека. Внутри использует тот же
+  `build_zoom_operational_task_cards` + `dispatch_prepared_zoom_operational_tasks`,
+  что и Flask endpoint UI-кнопки «Отправка задач», поэтому формат идентичен.
+  После успеха записывает `zoom_calls.raw_json.ai_report.bitrix_dispatch` (timestamp
+  + созданные task_ids) — `list_pending_zoom_operational_dispatches` больше его
+  не вернёт. Требует `confirm=true`. **НЕЛЬЗЯ заменять на серию
+  `create_bitrix_task`** — это создаст много мелких задач вместо одной агрегированной.
 
 Обе cron-задачи доставляют результаты в Telegram:
 
@@ -1627,3 +1666,19 @@ python scripts/update_hermes_owner_daily_prompt.py
 - делает `systemctl restart hermes-gateway`.
 
 Откат — переименовать `jobs.json.bak` обратно в `jobs.json` и рестартануть gateway.
+
+### Известная гран. ситуация: time-зоны в title «Итоги созвона ЧЧ:ММ»
+
+В Postgres колонка `zoom_calls.start_time_msk` фактически хранится как UTC
+(`timestamptz`), несмотря на название с `_msk`. Конверсия в МСК делается на
+runtime через `astimezone(MSK_TZ)`. Это работает корректно в happy-path
+(`zoom_call_row_payload` precomputed-ит `time_text` как `"09:28 - 10:26"` уже
+в МСК). Но **fallback-пути** (когда `time_text` пустой) когда-то брали `str(start_time_msk)` напрямую — выдавали
+ISO с `+00:00` и в title вылезало UTC время (например `"Итоги созвона 06:28"`
+вместо МСК `09:28`).
+
+Зафиксировано 28.05.2026:
+- backend `build_zoom_operational_tasks_dispatch` ([app.py:3601-3611](app.py#L3601-L3611)) теперь конвертит fallback через `parse_datetime(...).astimezone(MSK_TZ).strftime('%H:%M')`;
+- frontend `buildLocalZoomOperationalPreview` ([Интерфейс/src/App.tsx:4110-4124](Интерфейс/src/App.tsx#L4110-L4124)) использует `Date.toLocaleTimeString({timeZone: 'Europe/Moscow'})`.
+
+Если в будущем появится новый код, формирующий «Итоги созвона …» из ISO-строки — обязательно конвертировать в МСК. Прямой использовать `str(call.start_time_msk)` нельзя.
