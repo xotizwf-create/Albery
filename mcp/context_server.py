@@ -4007,7 +4007,9 @@ TOOLS: dict[str, dict[str, Any]] = {
             "'Итоги созвона' tasks to Bitrix. Each pending entry has call_id, call_date, topic, time, and duration. "
             "Use this AS THE FIRST STEP when the owner answers 'ставь' / 'создавай' / 'да' after a zoom-to-tasks "
             "Telegram summary: it tells you exactly which call_ids still need dispatching. "
-            "Default period: today and previous 2 days, Europe/Moscow."
+            "DEFAULT PERIOD: today only (Europe/Moscow) — covers exactly the calls the owner just approved. "
+            "Pass date_from explicitly if you really need to dispatch older calls (rare; usually the owner only "
+            "wants the call they just saw in the summary)."
         ),
         "inputSchema": {
             "type": "object",

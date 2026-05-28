@@ -3705,10 +3705,11 @@ def list_pending_zoom_operational_dispatches(
     if not postgres_enabled():
         return []
     ensure_zoom_schema()
+    today = msk_today()
     if date_from is None:
-        date_from = msk_today() - timedelta(days=2)
+        date_from = today
     if date_to is None:
-        date_to = msk_today()
+        date_to = today
     with pg_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
