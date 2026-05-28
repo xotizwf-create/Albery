@@ -1733,6 +1733,37 @@ ssh root@186.246.7.32 'hermes mcp test albery 2>&1 | grep -E "Tools discovered|<
 
 Признак, что toolset устарел: Hermes отказывает с описанием **другого** инструмента (видел 2026-05-28 после деплоя `send_bitrix_message` — Hermes сослался на `send_owner_recommendations_to_bitrix`, потому что в кэше сессии нового инструмента ещё не было).
 
+### Известный баг: 120s таймаут `create_bitrix_task` / `delete_bitrix_task` (исправлено 28.05.2026)
+
+**Симптом.** Hermes в Telegram отвечал: «Не удалось создать задачу» или «MCP call timed out after 120.0s». В журнале `journalctl -u hermes-gateway`:
+
+```
+ERROR tools.mcp_tool: MCP tool albery/create_bitrix_task call failed:
+MCP call timed out after 120.0s (configured timeout: 120.0s)
+```
+
+**Корневая причина.** В Albery жили **две разные реализации Bitrix-клиента**:
+- `BitrixClient` в [app.py:14246](app.py#L14246) — на `requests.Session`, кэш, retry. **Быстрый**, < 2s. Используют `send_bitrix_message`, `dispatch_zoom_operational_tasks`, `send_owner_recommendations_to_bitrix`.
+- `_bitrix_call_with_fallback` в [mcp/context_server.py](mcp/context_server.py) — на голом `urllib.request.urlopen(timeout=60)`. **Зависал ровно 120с** (60 × 2 fallback URL). Использовали `create_bitrix_task`, `delete_bitrix_task`.
+
+Hermes-side MCP-клиент имеет свой ceiling 120s → urllib доходил до 120s раньше, чем что-либо ответил → Hermes ловил `MCP call timed out`, а никакая задача в Bitrix не создавалась.
+
+Дополнительно у `delete_bitrix_task` был **SQL-баг**: JOIN на несуществующую колонку `bitrix_tasks.responsible_user_id` (на самом деле колонка зовётся `responsible_id`) → каждый вызов падал с `psycopg.errors.UndefinedColumn` ещё до обращения в Bitrix.
+
+**Фикс.**
+1. В [app.py](app.py) добавлен workflow `bitrix_method_call(method, payload, prefer_api=True)` — тонкая обёртка над `BitrixClient.call_with_fallback`. Доступен через `app_workflow_function("bitrix_method_call")`.
+2. `_bitrix_call_with_fallback` в [mcp/context_server.py](mcp/context_server.py) свёрнут до 8 строк — делегирует в `bitrix_method_call`. Голый urllib выпилен.
+3. SQL в `tool_delete_bitrix_task` поправлен: `responsible_user_id` → `responsible_id`.
+
+После фикса замеры на проде (с реальным Bitrix через VPN-Эстонию):
+- Разовая задача: **1.02s**
+- Задача с наблюдателями (1 человек): **0.67s**
+- Периодическая weekly с `IS_REGULAR=Y`: **0.72s** (Bitrix-портал принимает `REGULAR_PARAMETERS` ровно в нашем формате)
+
+Версия MCP поднята до `0.6.1`. Коммиты: `db0c4e0` (urllib → BitrixClient), `90109e1` (SQL fix).
+
+**Правило на будущее.** Любой новый MCP-инструмент, дёргающий Bitrix API, обязан идти через `app_workflow_function("bitrix_method_call")` (или прямо `BitrixClient` в самом app.py). Не делать собственные urllib-обёртки — это уже один раз привело к 120с таймауту в проде.
+
 ### Известная гран. ситуация: time-зоны в title «Итоги созвона ЧЧ:ММ»
 
 В Postgres колонка `zoom_calls.start_time_msk` фактически хранится как UTC
