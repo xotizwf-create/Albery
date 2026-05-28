@@ -1559,7 +1559,7 @@ def tool_delete_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
                     ru.bitrix_user_id AS responsible_bitrix_user_id,
                     ru.full_name AS responsible_name
                 FROM bitrix_tasks t
-                LEFT JOIN users ru ON ru.id = t.responsible_user_id
+                LEFT JOIN users ru ON ru.id = t.responsible_id
                 WHERE t.bitrix_task_id = %s
                 LIMIT 1
                 """,
