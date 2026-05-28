@@ -3121,6 +3121,38 @@ def tool_save_owner_weekly_report(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_list_pending_zoom_operational_dispatches(args: dict[str, Any]) -> dict[str, Any]:
+    date_from = parse_date_arg(args, "date_from", required=False)
+    date_to = parse_date_arg(args, "date_to", required=False)
+    workflow = app_workflow_function("list_pending_zoom_operational_dispatches")
+    rows = workflow(date_from, date_to)
+    return {"pending": json_safe(rows), "pending_count": len(rows)}
+
+
+def tool_preview_zoom_operational_tasks(args: dict[str, Any]) -> dict[str, Any]:
+    call_id = str(args.get("call_id") or "").strip()
+    if not call_id:
+        raise McpError(-32602, "Missing required argument: call_id")
+    workflow = app_workflow_function("preview_zoom_operational_tasks")
+    return json_safe(workflow(call_id))
+
+
+def tool_dispatch_zoom_operational_tasks(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Sending requires confirm=true. The owner must have explicitly approved creating aggregated 'Итоги созвона' "
+            "Bitrix tasks for this zoom call (one task per responsible person, exactly like the Albery UI 'Отправка задач'). "
+            "Only then call dispatch_zoom_operational_tasks with confirm=true.",
+        )
+    call_id = str(args.get("call_id") or "").strip()
+    if not call_id:
+        raise McpError(-32602, "Missing required argument: call_id")
+    workflow = app_workflow_function("dispatch_zoom_operational_tasks")
+    result = workflow(call_id)
+    return json_safe(result)
+
+
 def _resolve_current_owner_daily_report(cur: Any, report_date: date) -> dict[str, Any]:
     cur.execute(
         """
@@ -3968,6 +4000,69 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_save_owner_weekly_report,
+    },
+    "list_pending_zoom_operational_dispatches": {
+        "description": (
+            "List Zoom calls that have a saved analytical report but were NOT yet dispatched as aggregated "
+            "'Итоги созвона' tasks to Bitrix. Each pending entry has call_id, call_date, topic, time, and duration. "
+            "Use this AS THE FIRST STEP when the owner answers 'ставь' / 'создавай' / 'да' after a zoom-to-tasks "
+            "Telegram summary: it tells you exactly which call_ids still need dispatching. "
+            "Default period: today and previous 2 days, Europe/Moscow."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "YYYY-MM-DD (default: today minus 2 days)"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD (default: today)"},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_pending_zoom_operational_dispatches,
+    },
+    "preview_zoom_operational_tasks": {
+        "description": (
+            "Preview the aggregated 'Итоги созвона' Bitrix tasks that would be created for one Zoom call WITHOUT sending. "
+            "Returns title (e.g. 'Итоги созвона 09:28'), per-recipient cards (one card = one aggregated task per "
+            "responsible person, grouping all of their operational_tasks from the call), deadline (call_date 19:00 МСК), "
+            "and the standard description '"
+            "Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс...'. "
+            "Do not call this if you only need to send — just call dispatch_zoom_operational_tasks directly."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "call_id": {"type": "string", "description": "Zoom call UUID (from list_pending_zoom_operational_dispatches or list_zoom_calls)."},
+            },
+            "required": ["call_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_preview_zoom_operational_tasks,
+    },
+    "dispatch_zoom_operational_tasks": {
+        "description": (
+            "Create aggregated 'Итоги созвона <ЧЧ:ММ>' Bitrix tasks for ONE Zoom call: one task per responsible person, "
+            "deadline = call_date 19:00 МСК, description = standard 'Ознакомьтесь со списком...' header plus the list of "
+            "this person's operational_tasks from the call. Behaves EXACTLY like Albery UI button 'Отправка задач'. "
+            "STRICT CONFIRMATION RULE: do not call unless the owner has just explicitly approved sending (replied "
+            "'ставь' / 'создавай' / 'да' to the zoom-to-tasks Telegram summary). confirm=true is mandatory. "
+            "DO NOT use create_bitrix_task to recreate individual tasks here — this is the right tool for zoom "
+            "operational tasks; it groups them and produces the exact card format the owner expects. "
+            "After success the call is marked with raw_json.ai_report.bitrix_dispatch.dispatched_at so "
+            "list_pending_zoom_operational_dispatches will not return it again."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "call_id": {"type": "string", "description": "Zoom call UUID."},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true. Means the owner explicitly approved creating aggregated 'Итоги созвона' tasks for this call.",
+                },
+            },
+            "required": ["call_id", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_dispatch_zoom_operational_tasks,
     },
     "list_pending_owner_recommendations": {
         "description": (

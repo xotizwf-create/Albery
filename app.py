@@ -3657,7 +3657,87 @@ def preview_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
 
 def dispatch_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
     payload = build_zoom_operational_tasks_dispatch(call_id, require_webhook=True)
-    return dispatch_prepared_zoom_operational_tasks(payload)
+    result = dispatch_prepared_zoom_operational_tasks(payload)
+    mark_zoom_operational_tasks_dispatched(call_id, result.get("results") or [])
+    result["call_id"] = call_id
+    return result
+
+
+def mark_zoom_operational_tasks_dispatched(call_id: str, results: list[dict[str, Any]]) -> None:
+    if not postgres_enabled():
+        return
+    task_ids = [to_int(item.get("task_id")) for item in results if isinstance(item, dict)]
+    task_ids = [tid for tid in task_ids if tid is not None]
+    payload = {
+        "dispatched_at": datetime.now(MSK_TZ).isoformat(),
+        "task_ids": task_ids,
+        "recipient_count": len(results),
+    }
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE zoom_calls
+                    SET raw_json = jsonb_set(
+                            jsonb_set(
+                                COALESCE(raw_json, '{}'::jsonb),
+                                '{ai_report}',
+                                COALESCE(raw_json->'ai_report', '{}'::jsonb),
+                                true
+                            ),
+                            '{ai_report,bitrix_dispatch}',
+                            %s::jsonb,
+                            true
+                        ),
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (pg_json(payload), call_id),
+                )
+
+
+def list_pending_zoom_operational_dispatches(
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[dict[str, Any]]:
+    """Zoom calls with a saved analytical_note that haven't been dispatched to Bitrix yet."""
+    if not postgres_enabled():
+        return []
+    ensure_zoom_schema()
+    if date_from is None:
+        date_from = msk_today() - timedelta(days=2)
+    if date_to is None:
+        date_to = msk_today()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, zoom_uuid, call_date, topic, technical_topic,
+                       start_time_msk, end_time_msk, duration_min,
+                       length(coalesce(analytical_note,'')) AS note_len
+                FROM zoom_calls
+                WHERE call_date BETWEEN %s AND %s
+                  AND coalesce(analytical_note,'') <> ''
+                  AND (raw_json->'ai_report'->'bitrix_dispatch') IS NULL
+                ORDER BY call_date, start_time_msk NULLS LAST
+                """,
+                (date_from, date_to),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "call_id": str(row["id"]),
+            "zoom_uuid": row.get("zoom_uuid"),
+            "call_date": row["call_date"].isoformat() if hasattr(row["call_date"], "isoformat") else str(row["call_date"]),
+            "topic": row.get("topic") or row.get("technical_topic"),
+            "start_time_msk": str(row.get("start_time_msk") or ""),
+            "end_time_msk": str(row.get("end_time_msk") or ""),
+            "duration_min": row.get("duration_min"),
+            "note_len": row.get("note_len"),
+        }
+        for row in rows
+    ]
 
 
 def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[str, Any]:
