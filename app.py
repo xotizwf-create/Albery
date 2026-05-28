@@ -3602,9 +3602,11 @@ def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = 
     if "-" in time_text:
         period_text = time_text.split(" ")[0]
     else:
-        start = str(call.get("start_time_msk") or "").strip()
-        end = str(call.get("end_time_msk") or "").strip()
-        period_text = f"{start}-{end}" if start and end else start or "созвон"
+        start_dt = parse_datetime(call.get("start_time_msk"))
+        end_dt = parse_datetime(call.get("end_time_msk"))
+        start_hhmm = start_dt.astimezone(MSK_TZ).strftime("%H:%M") if start_dt else ""
+        end_hhmm = end_dt.astimezone(MSK_TZ).strftime("%H:%M") if end_dt else ""
+        period_text = f"{start_hhmm}-{end_hhmm}" if start_hhmm and end_hhmm else start_hhmm or "созвон"
     title = f"Итоги созвона {period_text}".strip()
     description = (
         f"{ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO}\n\n"

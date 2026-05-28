@@ -4107,11 +4107,20 @@ export default function App() {
     if (!cleanedSection) throw new Error("В разделе «4. Операционные задачи» нет задач для отправки.");
     let members = teamRows;
     if (!members.length) members = await loadTeam();
-    const periodText = call.time_text.includes("-")
+    const toMoscowHHMM = (iso: string | undefined | null): string => {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return "";
+      return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Moscow" });
+    };
+    const periodText = call.time_text && call.time_text.includes("-")
       ? call.time_text.split(" ")[0]
-      : call.start_time_msk && call.end_time_msk
-        ? `${call.start_time_msk}-${call.end_time_msk}`
-        : call.start_time_msk || "созвон";
+      : (() => {
+          const startHhmm = toMoscowHHMM(call.start_time_msk);
+          const endHhmm = toMoscowHHMM(call.end_time_msk);
+          if (startHhmm && endHhmm) return `${startHhmm}-${endHhmm}`;
+          return startHhmm || "созвон";
+        })();
     const deadline = zoomCallDispatchDeadline(call);
     const title = `Итоги созвона ${periodText}`.trim();
     const taskCardMap = new Map<string, NonNullable<ZoomOperationalTasksPreview["task_cards"]>[number]>();
