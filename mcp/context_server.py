@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.6.1"
+SERVER_VERSION = "0.7.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3726,6 +3726,130 @@ def tool_get_compact_export(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_GOOGLE_SHEETS_RE = re.compile(r"https?://docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_\-]+)")
+_GOOGLE_DOCS_RE = re.compile(r"https?://docs\.google\.com/document/d/([a-zA-Z0-9_\-]+)")
+_GOOGLE_GID_RE = re.compile(r"[?&#]gid=(\d+)")
+
+
+def _rewrite_url_for_export(url: str) -> tuple[str, str]:
+    m = _GOOGLE_SHEETS_RE.search(url)
+    if m:
+        sheet_id = m.group(1)
+        gid_match = _GOOGLE_GID_RE.search(url)
+        gid_part = f"&gid={gid_match.group(1)}" if gid_match else ""
+        return (
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_part}",
+            "google_sheet_csv",
+        )
+    m = _GOOGLE_DOCS_RE.search(url)
+    if m:
+        doc_id = m.group(1)
+        return (
+            f"https://docs.google.com/document/d/{doc_id}/export?format=txt",
+            "google_doc_text",
+        )
+    return (url, "raw")
+
+
+def _strip_html_to_text(html: str) -> str:
+    text = re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", " ", html, flags=re.IGNORECASE)
+    text = re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
+    url = str(args.get("url") or "").strip()
+    if not url:
+        raise McpError(-32602, "url is required.")
+    if not re.match(r"^https?://", url):
+        raise McpError(-32602, "url must start with http:// or https://.")
+    max_chars_raw = args.get("max_chars")
+    if max_chars_raw in (None, ""):
+        max_chars = 50_000
+    else:
+        try:
+            max_chars = int(max_chars_raw)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "max_chars must be a positive integer.") from exc
+        if max_chars < 100 or max_chars > 200_000:
+            raise McpError(-32602, "max_chars must be between 100 and 200000.")
+    strip_html_flag = bool(args.get("strip_html", True))
+
+    fetched_url, kind = _rewrite_url_for_export(url)
+    request = urllib.request.Request(
+        fetched_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; AlberyMCP/0.7 fetch_url)",
+            "Accept": "text/csv,text/plain,text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            status = response.status
+            content_type = response.headers.get("Content-Type", "") or ""
+            raw_bytes = response.read(max_chars * 6 + 4096)
+            final_url = response.geturl() or fetched_url
+    except urllib.error.HTTPError as exc:
+        try:
+            body_preview = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:  # noqa: BLE001
+            body_preview = ""
+        hint = ""
+        if kind in {"google_sheet_csv", "google_doc_text"} and exc.code in (401, 403, 302, 401):
+            hint = (
+                "Похоже, документ Google закрыт. Откройте доступ «Любой, у кого есть ссылка — Просмотр» "
+                "(Поделиться → изменить доступ → Любой, у кого есть ссылка), либо положите файл в Drive-папку, "
+                "которую читает Albery через Apps Script, и используйте search_company_knowledge / list_company_files."
+            )
+        return {
+            "ok": False,
+            "original_url": url,
+            "fetched_url": fetched_url,
+            "kind": kind,
+            "status": exc.code,
+            "error": f"HTTP {exc.code}",
+            "body_preview": body_preview,
+            "hint": hint,
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Fetch failed: {exc}") from exc
+
+    charset_match = re.search(r"charset=([a-zA-Z0-9_\-]+)", content_type)
+    charset = charset_match.group(1) if charset_match else "utf-8"
+    try:
+        text = raw_bytes.decode(charset, errors="replace")
+    except LookupError:
+        text = raw_bytes.decode("utf-8", errors="replace")
+
+    looks_html = ("html" in content_type.lower()) or text.lstrip().lower().startswith(("<!doctype", "<html"))
+    if strip_html_flag and looks_html and kind == "raw":
+        text = _strip_html_to_text(text)
+
+    truncated = len(text) > max_chars
+    if truncated:
+        text = text[:max_chars]
+
+    return {
+        "ok": True,
+        "original_url": url,
+        "fetched_url": fetched_url,
+        "final_url": final_url,
+        "kind": kind,
+        "status": status,
+        "content_type": content_type,
+        "char_count": len(text),
+        "truncated": truncated,
+        "text": text,
+    }
+
+
 TOOLS: dict[str, dict[str, Any]] = {
     "start_here_always_read_ai_instructions": {
         "description": "MANDATORY FIRST TOOL. Always call this before any company analysis, report, recommendation, or answer. It reads live rules from Настройки -> Инструкции для ИИ and tells the assistant exactly how to work.",
@@ -4475,6 +4599,40 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_cancel_owner_recommendation,
+    },
+    "fetch_url": {
+        "description": (
+            "Fetch the contents of a web URL the user sent in chat (article, public Google Sheet, public Google Doc, "
+            "raw text file, etc.) and return it as plain text. Use this when the user shares a link and asks you to "
+            "read, summarize, or extract data from it. Special handling: Google Sheets URLs are auto-rewritten to "
+            "CSV export, Google Docs URLs to TXT export. HTML pages are stripped to text by default. Size is hard-"
+            "capped (default 50000 chars, max 200000) to protect the context window. On 401/403 from Google docs, "
+            "the response includes a hint about opening link sharing or using the synced Drive folder. Do NOT use "
+            "this for company knowledge that already lives in Albery — prefer search_company_knowledge, "
+            "list_company_files, get_company_file, search_messages, get_zoom_call_transcript for that."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Full http(s) URL to fetch. Google Sheets/Docs links are auto-rewritten to export endpoints.",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 200000,
+                    "description": "Hard cap on returned text length. Default 50000. Bump only if a larger document is genuinely needed.",
+                },
+                "strip_html": {
+                    "type": "boolean",
+                    "description": "Strip HTML tags to plain text when the response looks like HTML. Default true.",
+                },
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        "handler": tool_fetch_url,
     },
     "upsert_ai_instruction": {
         "description": "Create or update one editable AI instruction folder by path in Настройки -> Инструкции для ИИ.",
