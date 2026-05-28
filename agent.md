@@ -1492,6 +1492,25 @@ systemd-служба. Мозг — ChatGPT Plus (`gpt-5.5`) через `openai-c
   + созданные task_ids) — `list_pending_zoom_operational_dispatches` больше его
   не вернёт. Требует `confirm=true`. **НЕЛЬЗЯ заменять на серию
   `create_bitrix_task`** — это создаст много мелких задач вместо одной агрегированной.
+- `send_bitrix_message(recipient_bitrix_user_id?, recipient_name?, message_text, confirm)` —
+  **добавлен 28.05.2026**: отправляет одно личное сообщение в Bitrix любому
+  активному сотруднику от моего пользователя (через `BITRIX_WEBHOOK_BASE`,
+  отдельного бота пока нет). Под капотом — `send_bitrix_personal_message` в
+  [app.py](app.py): `im.message.add` с fallback на `im.notify.personal.add` при
+  `ERROR_NO_ACCESS`. Получатель резолвится через `_resolve_message_recipient` в
+  [mcp/context_server.py](mcp/context_server.py) — приоритет у
+  `recipient_bitrix_user_id` (точный integer); если передано только
+  `recipient_name`, делается fuzzy-match по активным `users` (через
+  `_person_names_match`), и при неоднозначности инструмент отказывает и возвращает
+  кандидатов. `confirm=true` обязателен — Hermes должен сначала показать владельцу
+  итоговый `message_text` + `full_name`/`work_position`/`bitrix_user_id` получателя
+  и получить явное «отправляй». `message_text` уходит как есть, без редактирования
+  и без подписей. Это **общий** инструмент для сценариев «напиши <имя> в Битрикс:
+  …» из Telegram-чата с Hermes или любой ИИ через коннектор — НЕ путать с
+  `send_owner_recommendations_to_bitrix` (тот строго привязан к
+  `owner_daily_reports.manager_messages` и работает только в Phase 2 owner-daily).
+  MCP server version поднят до `0.5.0` (`hermes mcp test albery` должен показывать
+  45 инструментов).
 
 Обе cron-задачи доставляют результаты в Telegram:
 
@@ -1682,3 +1701,49 @@ ISO с `+00:00` и в title вылезало UTC время (например `"
 - frontend `buildLocalZoomOperationalPreview` ([Интерфейс/src/App.tsx:4110-4124](Интерфейс/src/App.tsx#L4110-L4124)) использует `Date.toLocaleTimeString({timeZone: 'Europe/Moscow'})`.
 
 Если в будущем появится новый код, формирующий «Итоги созвона …» из ISO-строки — обязательно конвертировать в МСК. Прямой использовать `str(call.start_time_msk)` нельзя.
+
+### Дорожная карта: внедрение Hermes в компанию + RBAC по ролям (план, не выполнено)
+
+Обсуждено 28.05.2026. Сейчас Hermes на проде — **один инстанс, один Telegram-бот, один MCP-секрет**, `TELEGRAM_ALLOWED_USERS=<TG_ID владельца>`. Это работает для владельца, но **не масштабируется** на менеджеров/сотрудников.
+
+**Ограничение Hermes:** `hermes tools list --platform telegram` задаёт toolset на **всю платформу**, не на отдельного TG-пользователя. Внутри одного бота сделать «владельцу всё, менеджеру половину, сотруднику только read» **нельзя нативно** — только soft-RBAC в AI-инструкции, который модель может «забыть» после `/compress`. Для Bitrix-write это недопустимо.
+
+**Целевая архитектура (3 тира, расширение существующего FAQ MCP):**
+
+```
+Albery backend (один)
+├── /mcp/<MCP_SHARED_SECRET>         → 45 tools (full)          → hermes-owner   (твой TG)
+├── /mcp-manager/<MCP_MANAGER_SECRET> → ~20 tools (read + своя
+│                                       зона, без im.message,
+│                                       без dispatch, без delete) → hermes-manager (5 TG)
+└── /mcp-faq/<MCP_FAQ_SHARED_SECRET> → 12 tools (read-only,
+                                       уже работает)             → hermes-staff   (все TG)
+```
+
+Каждый Hermes — отдельный systemd-юнит в `/root/.hermes-<role>/` со своим `auth.json`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, своей `state.db`/памятью. Cron-джобы (`zoom-to-tasks`, `owner-daily`) остаются **только у owner-инстанса**.
+
+**Цена:** RAM ~250 МБ × 3 = 750 МБ (на 2 ГБ + swap 2 ГБ — тянет). Codex-лимит делится поинстансно → лучше отдельные ChatGPT Plus подписки на инстанс с реальной нагрузкой. Иначе все три инстанса будут конкурировать за один 5-часовой лимит.
+
+**Шаги внедрения (в этом порядке):**
+
+1. **Расширить MCP до manager-эндпоинта.** В [mcp/context_server.py](mcp/context_server.py) добавить третью точку входа `/mcp-manager/<secret>` рядом с `/mcp/` и `/mcp-faq/` (по аналогии с тем, как сделан FAQ — см. [agent.md:608-626](agent.md#L608-L626)). Toolset для менеджера: `search_tasks`, `get_task_comments`, `search_zoom_transcripts`, `get_zoom_call_transcript`, `search_company_knowledge`, `get_company_file`, `list_chats`, `search_messages`, `get_chat_transcript`, `get_org_structure`, `get_context_guide`, `start_here_always_read_ai_instructions`, `health`, `list_available_sources`. **Не давать** менеджеру: `create_bitrix_task`, `delete_bitrix_task`, `dispatch_zoom_operational_tasks`, `send_bitrix_message`, `send_owner_recommendations_to_bitrix`, `save_*_report`, `delete_zoom_call_report`, `upsert_ai_instruction`, `process_chat_ocr`, `cancel_owner_recommendation`.
+2. **Поднять `hermes-manager` инстанс.** Отдельный `/root/.hermes-manager/`, отдельный бот в BotFather, `TELEGRAM_ALLOWED_USERS` = TG-id 1-2 менеджеров для пилота. Без cron. Прицепить только `/mcp-manager/`. Свой `auth.json`, желательно отдельный ChatGPT-аккаунт.
+3. **Обкатать 1-2 недели** на пилотной паре менеджеров. AI-инструкция для manager-MCP — отдельный документ в Albery «Hermes для менеджера: что можно делать», читается через `start_here_always_read_ai_instructions` каждой сессией.
+4. **Если зайдёт — открыть `hermes-staff`** через уже существующий `/mcp-faq/` (12 tools, регламенты + Zoom-расшифровки + оргструктура). Третий бот, ширим на всех сотрудников.
+
+**Чего НЕ делать:** не давать сотрудникам MCP-секрет напрямую (только через серверного Hermes-бота); не публиковать секреты в клиентском коде; не запускать второй планировщик cron-джоб против того же Albery (версионная чехарда отчётов — см. [agent.md:1621-1624](agent.md#L1621-L1624)).
+
+**Альтернатива «попроще» (1 инстанс + soft-RBAC):** оставить один Hermes, в AI-инструкции вшить «если `sender_tg_id ∈ {X, Y}` — нельзя `dispatch_*`, `send_bitrix_message`, `delete_bitrix_task`, `send_owner_recommendations_to_bitrix`». Дёшево, но **это не безопасность** — модель может проигнорировать после сжатия контекста. Годится для UX-разделения «не показывай менеджеру owner-команды», не для защиты от злого умысла.
+
+### Обучение Hermes (где править поведение, по убыванию силы)
+
+| Уровень | Источник правды | Кто читает | Деплой |
+|---|---|---|---|
+| Контракт отчёта (структура секций + JSON-схема) | Albery UI → `Сводная аналитика → Настройка промтов` (`zoom_processing`, `owner_daily`) | Все — Hermes, внешние ассистенты | Сохранение в UI = live |
+| AI-инструкции (правила поведения) | Albery UI → `Настройки → Инструкции для ИИ` + git: [scripts/ai_instruction_zoom_approval.md](scripts/ai_instruction_zoom_approval.md) | Hermes через `start_here_always_read_ai_instructions` в начале сессии | `python scripts/upsert_albery_ai_instruction.py <path> <file>` |
+| Cron-промпт (что делает одна джоба) | git: [scripts/hermes_zoom_to_tasks_prompt.txt](scripts/hermes_zoom_to_tasks_prompt.txt), [scripts/hermes_owner_daily_prompt.txt](scripts/hermes_owner_daily_prompt.txt) | Только эта cron-джоба | `python scripts/update_hermes_*_prompt.py` → restart gateway |
+| Память Hermes (личные предпочтения) | `/root/.hermes/state.db` через `hermes memory` или «запомни: …» в Telegram | Hermes везде, в рамках инстанса | Live |
+
+**Правило большого пальца:** что должно быть у всех (формат отчёта, состав пятёрки, что считать срочным) → **контракт/AI-инструкции в Albery**. Что специфично для одной cron-джобы (cooldown, формат Telegram-сводки) → **cron-промпт в git**. Личные предпочтения владельца → **`hermes memory`**.
+
+**Болевая точка** из ретро [agent.md:1545-1549](agent.md#L1545-L1549): обучать **жёсткими запретами** в AI-инструкции, а не уговорами. Пример из [scripts/ai_instruction_zoom_approval.md](scripts/ai_instruction_zoom_approval.md): «НЕ вызывай `create_bitrix_task` / НЕ читай `get_org_structure`» — это спасло Codex-лимит. Без таких запретов Hermes идёт в `search_files` и сжигает 100k токенов.

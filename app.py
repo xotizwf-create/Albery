@@ -13556,6 +13556,47 @@ def send_owner_daily_report_to_bitrix(
     return send_owner_report_recommendations_to_bitrix(report_id, "daily", recipient_ids, recipient_recommendations)
 
 
+def send_bitrix_personal_message(
+    bitrix_user_id: Any,
+    message_text: str,
+) -> dict[str, Any]:
+    try:
+        user_id = int(bitrix_user_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("bitrix_user_id must be an integer.") from exc
+    if user_id <= 0:
+        raise ValueError("bitrix_user_id must be a positive integer.")
+    text = str(message_text or "").strip()
+    if not text:
+        raise ValueError("message_text must be a non-empty string.")
+    client = bitrix_webhook_client()
+    try:
+        response = client.call_with_fallback(
+            "im.message.add",
+            {"DIALOG_ID": str(user_id), "MESSAGE": text},
+            prefer_api=True,
+        )
+        return {
+            "user_id": user_id,
+            "channel": "bitrix_im",
+            "response": response.get("result") if isinstance(response, dict) else response,
+        }
+    except Exception as exc:  # noqa: BLE001
+        if not is_bitrix_no_access_error(exc):
+            raise
+        response = client.call_with_fallback(
+            "im.notify.personal.add",
+            {"USER_ID": user_id, "MESSAGE": text},
+            prefer_api=True,
+        )
+        return {
+            "user_id": user_id,
+            "channel": "bitrix_notification",
+            "response": response.get("result") if isinstance(response, dict) else response,
+            "im_message_error": str(exc),
+        }
+
+
 def reportlab_font_paths() -> tuple[str, str]:
     regular_candidates = [
         Path("C:/Windows/Fonts/arial.ttf"),

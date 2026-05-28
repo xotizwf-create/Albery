@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.4.1"
+SERVER_VERSION = "0.5.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3248,6 +3248,110 @@ def tool_send_owner_recommendations_to_bitrix(args: dict[str, Any]) -> dict[str,
     }
 
 
+def _resolve_message_recipient(
+    recipient_bitrix_user_id: Any = None,
+    recipient_name: Any = None,
+) -> dict[str, Any]:
+    user_id = None
+    if recipient_bitrix_user_id not in (None, ""):
+        try:
+            user_id = int(recipient_bitrix_user_id)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "recipient_bitrix_user_id must be an integer.") from exc
+
+    name_clean = str(recipient_name or "").strip()
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if user_id is not None:
+                cur.execute(
+                    """
+                    SELECT bitrix_user_id, full_name, email, work_position, is_active
+                    FROM users
+                    WHERE bitrix_user_id = %s AND is_active = TRUE
+                    LIMIT 1
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise McpError(-32602, f"Не найден активный сотрудник Bitrix с id {user_id}.")
+                return dict(row)
+
+            if not name_clean:
+                raise McpError(
+                    -32602,
+                    "Нужно указать получателя: recipient_name или recipient_bitrix_user_id.",
+                )
+
+            cur.execute(
+                """
+                SELECT bitrix_user_id, full_name, email, work_position, is_active
+                FROM users
+                WHERE is_active = TRUE AND bitrix_user_id IS NOT NULL
+                ORDER BY full_name
+                """
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+
+    exact = [row for row in rows if str(row.get("full_name") or "").strip().lower() == name_clean.lower()]
+    matches = exact or [row for row in rows if _person_names_match(row.get("full_name"), name_clean)]
+    if not matches:
+        raise McpError(-32602, f"Не удалось найти получателя в оргструктуре: {name_clean}.")
+    if len(matches) > 1:
+        candidates = [
+            {
+                "bitrix_user_id": row.get("bitrix_user_id"),
+                "full_name": row.get("full_name"),
+                "work_position": row.get("work_position"),
+            }
+            for row in matches[:10]
+        ]
+        raise McpError(
+            -32602,
+            "Получатель найден неоднозначно. Уточните recipient_bitrix_user_id. Кандидаты: "
+            + json.dumps(candidates, ensure_ascii=False),
+        )
+    return matches[0]
+
+
+def tool_send_bitrix_message(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Sending a Bitrix message requires confirm=true. First show the user the exact final message_text "
+            "and the resolved recipient (full_name + work_position + bitrix_user_id) and get explicit approval. "
+            "Only then call send_bitrix_message with confirm=true.",
+        )
+    message_text = str(args.get("message_text") or "").strip()
+    if not message_text:
+        raise McpError(-32602, "message_text must be a non-empty string.")
+    if len(message_text) > 20000:
+        raise McpError(-32602, "message_text is too long (max 20000 characters).")
+    recipient = _resolve_message_recipient(
+        args.get("recipient_bitrix_user_id"),
+        args.get("recipient_name"),
+    )
+    workflow = app_workflow_function("send_bitrix_personal_message")
+    try:
+        result = workflow(int(recipient["bitrix_user_id"]), message_text)
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Bitrix send failed: {exc}") from exc
+    return {
+        "sent": True,
+        "recipient": {
+            "bitrix_user_id": recipient.get("bitrix_user_id"),
+            "full_name": recipient.get("full_name"),
+            "work_position": recipient.get("work_position"),
+        },
+        "channel": result.get("channel"),
+        "message_text": message_text,
+        "bitrix_response": json_safe(result.get("response")),
+        "im_message_error": result.get("im_message_error"),
+    }
+
+
 def tool_cancel_owner_recommendation(args: dict[str, Any]) -> dict[str, Any]:
     rec_id_raw = str(args.get("recommendation_id") or "").strip()
     if not rec_id_raw:
@@ -4113,6 +4217,44 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_send_owner_recommendations_to_bitrix,
+    },
+    "send_bitrix_message": {
+        "description": (
+            "Send one personal Bitrix message to a single employee via the configured BITRIX_WEBHOOK_BASE account "
+            "(your own user — there is no separate bot user). Uses im.message.add with fallback to "
+            "im.notify.personal.add when the private chat is blocked. STRICT RULES: "
+            "(1) confirm=true is mandatory — first resolve the recipient and show the user the exact final "
+            "message_text together with the recipient's full_name + work_position + bitrix_user_id, then ask "
+            "for explicit approval; only then call this tool with confirm=true. "
+            "(2) Pass either recipient_bitrix_user_id (preferred — exact integer) or recipient_name (fuzzy lookup "
+            "against active users). If recipient_name is ambiguous, the tool returns the candidates and refuses "
+            "to send — re-ask the user and call again with recipient_bitrix_user_id. "
+            "(3) message_text is sent verbatim — do not wrap, edit, or prepend signatures."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recipient_bitrix_user_id": {
+                    "type": "integer",
+                    "description": "Exact Bitrix user id of the recipient. Preferred over recipient_name.",
+                },
+                "recipient_name": {
+                    "type": "string",
+                    "description": "Full name (or distinctive part) of the recipient. Used only when recipient_bitrix_user_id is not provided. Fuzzy-matched against active users; ambiguity is refused.",
+                },
+                "message_text": {
+                    "type": "string",
+                    "description": "Final message to send, verbatim. Up to 20000 characters.",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true. Means the user has explicitly approved sending this exact text to this exact recipient.",
+                },
+            },
+            "required": ["message_text", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_send_bitrix_message,
     },
     "cancel_owner_recommendation": {
         "description": (
