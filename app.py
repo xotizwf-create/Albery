@@ -13556,6 +13556,15 @@ def send_owner_daily_report_to_bitrix(
     return send_owner_report_recommendations_to_bitrix(report_id, "daily", recipient_ids, recipient_recommendations)
 
 
+def bitrix_method_call(
+    method: str,
+    payload: dict[str, Any] | None = None,
+    prefer_api: bool = True,
+) -> dict[str, Any]:
+    client = bitrix_webhook_client()
+    return client.call_with_fallback(method, payload or {}, prefer_api=prefer_api)
+
+
 def send_bitrix_personal_message(
     bitrix_user_id: Any,
     message_text: str,

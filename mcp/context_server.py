@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.6.1"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -1440,38 +1440,13 @@ def _normalize_bitrix_deadline(value: Any) -> str:
 
 
 def _bitrix_call_with_fallback(method: str, payload: dict[str, Any]) -> dict[str, Any]:
-    webhook_base = load_env_value("BITRIX_WEBHOOK_BASE").rstrip("/")
-    if not webhook_base:
-        raise McpError(-32000, "BITRIX_WEBHOOK_BASE is not set; cannot create Bitrix task.")
-    urls = []
-    if "/rest/" in webhook_base and "/rest/api/" not in webhook_base:
-        urls.append(f"{webhook_base.replace('/rest/', '/rest/api/')}/{method}")
-    urls.append(f"{webhook_base}/{method}")
-    last_error = ""
-    for url in dict.fromkeys(urls):
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload, ensure_ascii=False, default=json_default).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            last_error = f"HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:500]}"
-            continue
-        except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
-            continue
-        if isinstance(data, dict) and data.get("error"):
-            last_error = f"{data.get('error')}: {data.get('error_description')}"
-            continue
-        if not isinstance(data, dict):
-            last_error = "Unexpected Bitrix response format."
-            continue
-        return data
-    raise McpError(-32010, f"Bitrix API call failed: {last_error}")
+    workflow = app_workflow_function("bitrix_method_call")
+    try:
+        return workflow(method, payload, True)
+    except ValueError as exc:
+        raise McpError(-32000, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Bitrix API call failed: {exc}") from exc
 
 
 def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
