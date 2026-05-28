@@ -1430,10 +1430,30 @@ systemd-служба. Мозг — ChatGPT Plus (`gpt-5.5`) через `openai-c
 
 В MCP Albery доступны инструменты:
 
-- `create_bitrix_task` — создаёт одну задачу в Bitrix. Агент обязан собрать и
-  показать человеку перед созданием: ответственный, дедлайн, проверяемый результат,
-  финальный человеческий текст задачи. Если чего-то нет — уточнять до конца, не
-  создавать.
+- `create_bitrix_task` — создаёт одну задачу в Bitrix (разовую или периодическую,
+  с наблюдателями опционально). Агент обязан собрать и показать человеку перед
+  созданием: ответственный, дедлайн, проверяемый результат, финальный человеческий
+  текст задачи, полный список наблюдателей (если есть), и расписание (если
+  периодическая). Если чего-то нет — уточнять до конца, не создавать. **Расширен
+  28.05.2026** — три новых параметра:
+  - `auditor_names: list[str]` / `auditor_bitrix_user_ids: list[int]` — наблюдатели
+    из активной оргструктуры (`users.is_active=TRUE`). Резолвинг через новый хелпер
+    `_resolve_active_bitrix_users` ([mcp/context_server.py](mcp/context_server.py)):
+    fuzzy-match по `_person_names_match`, неоднозначность → отказ + список кандидатов
+    с `bitrix_user_id`/`full_name`/`work_position`. Списки объединяются и
+    дедуплицируются. На Bitrix уходит как `fields.AUDITORS = [int]`.
+  - `periodic: {type, interval?, weekdays?, day_of_month?, daily_mode?, until?}` —
+    расписание. Если присутствует, задача создаётся как `IS_REGULAR=Y` +
+    `REGULAR_PARAMETERS` (через `_build_bitrix_regular_parameters`). Поддержка:
+    - `type="daily"` + `daily_mode="all"|"workdays"` (default `all`) → `REPEAT_TYPE=daily`, `DAILY_MODE`;
+    - `type="weekly"` + `weekdays=["MO","WE","FR"]` + `interval` → `REPEAT_TYPE=weekly`, `REPEAT_WEEKDAYS`, `REPEAT_EVERY`;
+    - `type="monthly"` + `day_of_month=1-31` + `interval` → `REPEAT_TYPE=monthlydays`, `REPEAT_MONTHDAY`, `REPEAT_EVERY`;
+    - опциональный `until="YYYY-MM-DD"` → `REPEAT_TILL`.
+    Невалидные комбинации (нет `type`, weekly без `weekdays`, monthly без
+    `day_of_month`, кривой weekday-код, `interval<1`, кривой `until`) → инструмент
+    отказывает с понятным сообщением.
+  Schema-валидация в `inputSchema` дополнительно ограничивает enum'ы. MCP server
+  version поднят до `0.6.0`.
 - `delete_bitrix_task` — удаляет одну задачу в Bitrix. Жёсткое правило:
   сначала `search_tasks(bitrix_task_id=...)`, затем показать пользователю точную
   задачу (номер, название, статус, ответственный, дедлайн) и спросить подтверждение.

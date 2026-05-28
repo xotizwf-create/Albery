@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -1261,6 +1261,170 @@ def _resolve_active_bitrix_user(bitrix_user_id: Any = None, name: Any = None) ->
     return matches[0]
 
 
+def _resolve_active_bitrix_users(
+    bitrix_user_ids: Any,
+    names: Any,
+    *,
+    role_label: str,
+    id_field: str,
+    name_field: str,
+) -> list[dict[str, Any]]:
+    ids_input = bitrix_user_ids if isinstance(bitrix_user_ids, list) else []
+    names_input = names if isinstance(names, list) else []
+    if not ids_input and not names_input:
+        return []
+
+    parsed_ids: list[int] = []
+    for raw in ids_input:
+        if raw in (None, ""):
+            continue
+        try:
+            parsed_ids.append(int(raw))
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, f"{id_field}: каждый элемент должен быть integer.") from exc
+
+    clean_names = [str(n).strip() for n in names_input if str(n or "").strip()]
+
+    resolved: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            for uid in parsed_ids:
+                if uid in seen:
+                    continue
+                cur.execute(
+                    """
+                    SELECT bitrix_user_id, full_name, email, work_position, is_active
+                    FROM users
+                    WHERE bitrix_user_id = %s AND is_active = TRUE
+                    LIMIT 1
+                    """,
+                    (uid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise McpError(
+                        -32602,
+                        f"{role_label} не найден: активный сотрудник Bitrix с id {uid} отсутствует.",
+                    )
+                seen.add(uid)
+                resolved.append(dict(row))
+
+            if clean_names:
+                cur.execute(
+                    """
+                    SELECT bitrix_user_id, full_name, email, work_position, is_active
+                    FROM users
+                    WHERE is_active = TRUE AND bitrix_user_id IS NOT NULL
+                    ORDER BY full_name
+                    """
+                )
+                all_active = [dict(r) for r in cur.fetchall()]
+                for name in clean_names:
+                    exact = [
+                        r for r in all_active
+                        if str(r.get("full_name") or "").strip().lower() == name.lower()
+                    ]
+                    matches = exact or [
+                        r for r in all_active if _person_names_match(r.get("full_name"), name)
+                    ]
+                    if not matches:
+                        raise McpError(
+                            -32602,
+                            f"{role_label} не найден в оргструктуре: {name}.",
+                        )
+                    if len(matches) > 1:
+                        candidates = [
+                            {
+                                "bitrix_user_id": r.get("bitrix_user_id"),
+                                "full_name": r.get("full_name"),
+                                "work_position": r.get("work_position"),
+                            }
+                            for r in matches[:10]
+                        ]
+                        raise McpError(
+                            -32602,
+                            f"{role_label} '{name}' найден неоднозначно. Уточните через {id_field}. Кандидаты: "
+                            + json.dumps(candidates, ensure_ascii=False),
+                        )
+                    uid = int(matches[0]["bitrix_user_id"])
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
+                    resolved.append(matches[0])
+
+    return resolved
+
+
+_BITRIX_WEEKDAY_CODES = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
+
+
+def _build_bitrix_regular_parameters(periodic: dict[str, Any]) -> dict[str, Any]:
+    type_raw = str(periodic.get("type") or "").strip().lower()
+    if type_raw not in {"daily", "weekly", "monthly"}:
+        raise McpError(-32602, "periodic.type must be one of: daily, weekly, monthly.")
+
+    interval_raw = periodic.get("interval")
+    if interval_raw in (None, ""):
+        interval = 1
+    else:
+        try:
+            interval = int(interval_raw)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "periodic.interval must be a positive integer.") from exc
+        if interval < 1:
+            raise McpError(-32602, "periodic.interval must be >= 1.")
+
+    params: dict[str, Any] = {"REPEAT_EVERY": interval}
+
+    if type_raw == "daily":
+        daily_mode = str(periodic.get("daily_mode") or "all").strip().lower()
+        if daily_mode not in {"all", "workdays"}:
+            raise McpError(-32602, "periodic.daily_mode must be 'all' or 'workdays'.")
+        params["REPEAT_TYPE"] = "daily"
+        params["DAILY_MODE"] = daily_mode
+    elif type_raw == "weekly":
+        weekdays_raw = periodic.get("weekdays")
+        if not isinstance(weekdays_raw, list) or not weekdays_raw:
+            raise McpError(
+                -32602,
+                "periodic.weekdays must be a non-empty list when type=weekly (e.g. ['MO','WE','FR']).",
+            )
+        normalized_weekdays: list[str] = []
+        for code in weekdays_raw:
+            code_str = str(code or "").strip().upper()
+            if code_str not in _BITRIX_WEEKDAY_CODES:
+                raise McpError(
+                    -32602,
+                    f"periodic.weekdays: '{code}' is not a valid weekday code. Use MO/TU/WE/TH/FR/SA/SU.",
+                )
+            if code_str not in normalized_weekdays:
+                normalized_weekdays.append(code_str)
+        params["REPEAT_TYPE"] = "weekly"
+        params["REPEAT_WEEKDAYS"] = normalized_weekdays
+    else:  # monthly
+        dom_raw = periodic.get("day_of_month")
+        if dom_raw in (None, ""):
+            raise McpError(-32602, "periodic.day_of_month is required when type=monthly (1-31).")
+        try:
+            dom = int(dom_raw)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "periodic.day_of_month must be an integer 1-31.") from exc
+        if not 1 <= dom <= 31:
+            raise McpError(-32602, "periodic.day_of_month must be between 1 and 31.")
+        params["REPEAT_TYPE"] = "monthlydays"
+        params["REPEAT_MONTHDAY"] = dom
+
+    until_raw = str(periodic.get("until") or "").strip()
+    if until_raw:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", until_raw):
+            raise McpError(-32602, "periodic.until must be YYYY-MM-DD.")
+        params["REPEAT_TILL"] = until_raw
+
+    return params
+
+
 def _normalize_bitrix_deadline(value: Any) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -1319,6 +1483,15 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     description = str(args.get("description") or "").strip() or title
     priority_raw = str(args.get("priority") or "normal").strip().lower()
     priority = 2 if priority_raw in {"high", "critical", "2", "важно", "высокий"} else 1
+
+    auditors = _resolve_active_bitrix_users(
+        args.get("auditor_bitrix_user_ids"),
+        args.get("auditor_names"),
+        role_label="Наблюдатель",
+        id_field="auditor_bitrix_user_ids",
+        name_field="auditor_names",
+    )
+
     fields: dict[str, Any] = {
         "TITLE": title,
         "DESCRIPTION": description,
@@ -1326,11 +1499,24 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
         "DEADLINE": deadline,
         "PRIORITY": priority,
     }
+    if auditors:
+        fields["AUDITORS"] = [int(u["bitrix_user_id"]) for u in auditors]
+
     tags = args.get("tags")
     if isinstance(tags, list):
         clean_tags = [str(tag).strip() for tag in tags if str(tag or "").strip()]
         if clean_tags:
             fields["TAGS"] = clean_tags
+
+    periodic_arg = args.get("periodic")
+    is_periodic = False
+    regular_parameters: dict[str, Any] | None = None
+    if isinstance(periodic_arg, dict) and periodic_arg:
+        regular_parameters = _build_bitrix_regular_parameters(periodic_arg)
+        fields["IS_REGULAR"] = "Y"
+        fields["REGULAR_PARAMETERS"] = regular_parameters
+        is_periodic = True
+
     response = _bitrix_call_with_fallback("tasks.task.add", {"fields": fields})
     result = response.get("result") if isinstance(response, dict) else {}
     task_id = None
@@ -1350,6 +1536,16 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
             "full_name": responsible.get("full_name"),
             "work_position": responsible.get("work_position"),
         },
+        "auditors": [
+            {
+                "bitrix_user_id": u.get("bitrix_user_id"),
+                "full_name": u.get("full_name"),
+                "work_position": u.get("work_position"),
+            }
+            for u in auditors
+        ],
+        "is_periodic": is_periodic,
+        "regular_parameters": regular_parameters,
         "bitrix_response": response.get("result") if isinstance(response, dict) else response,
         "rule": "Task creation requires title, responsible_name/responsible_bitrix_user_id, and deadline. Missing or ambiguous data blocks creation.",
     }
@@ -3765,21 +3961,53 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "create_bitrix_task": {
         "description": (
-            "Create one Bitrix task through the configured Bitrix webhook. STRICT RULE: do not call this tool "
-            "unless the user provided a task title, exactly one responsible person, and a deadline. If title, "
-            "responsible_name/responsible_bitrix_user_id, or deadline is missing, ask the user for it first. "
-            "The tool resolves responsible_name through org structure and refuses ambiguous matches."
+            "Create one Bitrix task through the configured Bitrix webhook. Supports one-off and recurring tasks, "
+            "and optional observers (наблюдатели) resolved against the org structure. STRICT RULE: do not call "
+            "this tool unless the user provided a task title, exactly one responsible person, and a deadline. "
+            "If title, responsible_name/responsible_bitrix_user_id, or deadline is missing, ask the user for it "
+            "first. The tool resolves responsible_name and auditor_names through the active org structure and "
+            "refuses ambiguous matches. To make the task recurring, pass periodic={type, ...}; otherwise the "
+            "task is one-off. Before creating, confirm with the user: title, responsible, deadline, full list "
+            "of observers (if any), and periodic schedule (if any)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "Required task title."},
                 "description": {"type": "string", "description": "Task description. If omitted, title is used."},
-                "responsible_name": {"type": "string", "description": "Responsible employee name from org structure."},
-                "responsible_bitrix_user_id": {"type": "integer", "description": "Exact Bitrix user id of the responsible employee."},
-                "deadline": {"type": "string", "description": "Required deadline: YYYY-MM-DD, DD.MM.YYYY, or ISO datetime."},
+                "responsible_name": {"type": "string", "description": "Responsible employee name from org structure (fuzzy-matched against active users)."},
+                "responsible_bitrix_user_id": {"type": "integer", "description": "Exact Bitrix user id of the responsible employee. Preferred over responsible_name when known."},
+                "deadline": {"type": "string", "description": "Required deadline: YYYY-MM-DD, DD.MM.YYYY, or ISO datetime. For recurring tasks this is the first instance deadline."},
                 "priority": {"type": "string", "enum": ["normal", "high", "critical"]},
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "auditor_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of observer (наблюдатель) full names from the active org structure. Each is fuzzy-matched against users; ambiguity is refused.",
+                },
+                "auditor_bitrix_user_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Optional list of observer Bitrix user ids. Preferred over auditor_names when known. Merged with names; duplicates are dropped.",
+                },
+                "periodic": {
+                    "type": "object",
+                    "description": "Optional recurrence schedule. Omit for a one-off task. When present, the task is created as IS_REGULAR=Y with the corresponding REGULAR_PARAMETERS in Bitrix.",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["daily", "weekly", "monthly"], "description": "Recurrence type."},
+                        "interval": {"type": "integer", "minimum": 1, "description": "Every N units (default 1). E.g. interval=2 with type=weekly = every other week."},
+                        "weekdays": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]},
+                            "description": "Required for type=weekly. Two-letter day codes (MO/TU/WE/TH/FR/SA/SU).",
+                        },
+                        "day_of_month": {"type": "integer", "minimum": 1, "maximum": 31, "description": "Required for type=monthly. Day of the month (1-31)."},
+                        "daily_mode": {"type": "string", "enum": ["all", "workdays"], "description": "Optional for type=daily (default 'all'). 'workdays' = skip weekends."},
+                        "until": {"type": "string", "description": "Optional end date YYYY-MM-DD. After this date, no new instances are created."},
+                    },
+                    "required": ["type"],
+                    "additionalProperties": False,
+                },
             },
             "required": ["title", "deadline"],
             "additionalProperties": False,
