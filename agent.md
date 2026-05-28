@@ -1733,6 +1733,25 @@ ssh root@186.246.7.32 'hermes mcp test albery 2>&1 | grep -E "Tools discovered|<
 
 Признак, что toolset устарел: Hermes отказывает с описанием **другого** инструмента (видел 2026-05-28 после деплоя `send_bitrix_message` — Hermes сослался на `send_owner_recommendations_to_bitrix`, потому что в кэше сессии нового инструмента ещё не было).
 
+### MCP-инструмент `fetch_url` (добавлено 28.05.2026)
+
+**Зачем.** В Hermes для Telegram-платформы отключены встроенные `web`/`browser` toolset'ы ([agent.md:1538-1543](agent.md#L1538-L1543)) — после инцидента 28.05 с раздутой сессией на 100k токенов. Поэтому Hermes не мог открывать ссылки из чата (Google Sheets/Docs, статьи, регламенты). Включать `web` обратно опасно — одна большая страница съест полконтекста Codex.
+
+**Решение.** Отдельный MCP-инструмент `fetch_url(url, max_chars?, strip_html?)`:
+- **Google Sheets** URL (`docs.google.com/spreadsheets/d/<id>/edit?gid=<n>`) автоматически переписывается в `/export?format=csv&gid=<n>` → возвращается чистый CSV.
+- **Google Docs** URL (`docs.google.com/document/d/<id>/...`) → `/export?format=txt`.
+- Прочие URL: HTTP GET + `User-Agent: AlberyMCP/0.7`, по умолчанию HTML-теги срезаются до текста, скрипты/стили выкидываются.
+- **Size cap:** default `max_chars=50000`, max 200000. Это ~12k токенов на ответ — не съедает контекст.
+- На HTTP 401/403 для Google-документов в ответ добавляется `hint`: «Откройте доступ "Любой, у кого есть ссылка — Просмотр" либо положите файл в Drive-папку, которую читает Albery через Apps Script (`list_company_files` / `search_company_knowledge` / `get_company_file`)».
+
+Когда **НЕ** использовать `fetch_url`: для знаний, которые уже синхронизированы в Albery (регламенты, инструкции, Zoom-расшифровки, чаты) — там быстрее и точнее работают `search_company_knowledge`, `list_company_files`, `get_company_file`, `search_messages`, `get_zoom_call_transcript`.
+
+**Проверено на реальном Google Sheet** (28.05.2026, `17NZP5U5YBQPKKQrBUGq05bpTjq2V-KBX98uM1Wa2W_4`): 0.82с, HTTP 200, 6103 символа CSV, не truncated. Распарсилось как 40 строк × 7 колонок.
+
+**Версия MCP** поднята до `0.7.0`, инструментов 46. Коммит `92c7391`.
+
+**Flow в Telegram после /reset:** «Прочитай таблицу <ссылка> и создай задачи в Битриксе» → Hermes сам зовёт `fetch_url(...)` → парсит CSV → резолвит ФИО исполнителей/наблюдателей через `_resolve_active_bitrix_user(s)` → показывает план → ждёт «создавай» → циклом `create_bitrix_task` на каждую строку (с `auditor_names`, `periodic` если есть).
+
 ### Известный баг: 120s таймаут `create_bitrix_task` / `delete_bitrix_task` (исправлено 28.05.2026)
 
 **Симптом.** Hermes в Telegram отвечал: «Не удалось создать задачу» или «MCP call timed out after 120.0s». В журнале `journalctl -u hermes-gateway`:
