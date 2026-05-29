@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.8.1"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3443,13 +3443,17 @@ def tool_send_owner_weekly_report_pdf(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32602, "recipient_bitrix_user_ids contains no valid integer id.")
     loader = app_workflow_function("load_owner_weekly_report")
     report = loader(period_start, period_end)
-    if not report or not report.get("id"):
+    # load_owner_weekly_report returns the dict from owner_weekly_report_to_dict,
+    # which exposes the primary key as "report_id" (not "id"). Accept both so the
+    # lookup never falsely reports "not found" and re-triggers a save/retry loop.
+    report_pk = (report.get("report_id") or report.get("id")) if report else None
+    if not report_pk:
         raise McpError(
             -32004,
             f"Текущий недельный отчёт за {period_start.isoformat()}–{period_end.isoformat()} не найден. "
             "Сначала сохрани его через save_owner_weekly_report.",
         )
-    report_id = str(report["id"])
+    report_id = str(report_pk)
     workflow = app_workflow_function("send_owner_report_pdf_to_bitrix")
     result = workflow(report_id, "weekly", normalized_ids)
     return {
