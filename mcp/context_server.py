@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.8.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3419,6 +3419,53 @@ def tool_send_owner_recommendations_to_bitrix(args: dict[str, Any]) -> dict[str,
     }
 
 
+def tool_send_owner_weekly_report_pdf(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Sending requires confirm=true. First save the weekly report via save_owner_weekly_report, show the owner "
+            "the report period and that the PDF goes to Evgeniy, get explicit approval. Only then call "
+            "send_owner_weekly_report_pdf with confirm=true.",
+        )
+    period_start = parse_date_arg(args, "period_start")
+    period_end = parse_date_arg(args, "period_end")
+    recipient_ids = args.get("recipient_bitrix_user_ids")
+    if recipient_ids in (None, "", []):
+        recipient_ids = [1]  # Evgeniy Palei by default
+    if not isinstance(recipient_ids, list):
+        recipient_ids = [recipient_ids]
+    normalized_ids: list[int] = []
+    for value in recipient_ids:
+        user_id = to_int(value)
+        if user_id is not None:
+            normalized_ids.append(user_id)
+    if not normalized_ids:
+        raise McpError(-32602, "recipient_bitrix_user_ids contains no valid integer id.")
+    loader = app_workflow_function("load_owner_weekly_report")
+    report = loader(period_start, period_end)
+    if not report or not report.get("id"):
+        raise McpError(
+            -32004,
+            f"Текущий недельный отчёт за {period_start.isoformat()}–{period_end.isoformat()} не найден. "
+            "Сначала сохрани его через save_owner_weekly_report.",
+        )
+    report_id = str(report["id"])
+    workflow = app_workflow_function("send_owner_report_pdf_to_bitrix")
+    result = workflow(report_id, "weekly", normalized_ids)
+    return {
+        "report_id": report_id,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "recipient_bitrix_user_ids": normalized_ids,
+        "filename": result.get("filename"),
+        "pdf_size": result.get("pdf_size"),
+        "sent": result.get("sent", 0),
+        "failed": result.get("failed", 0),
+        "results": json_safe(result.get("results") or []),
+        "errors": json_safe(result.get("errors") or []),
+    }
+
+
 def _resolve_message_recipient(
     recipient_bitrix_user_id: Any = None,
     recipient_name: Any = None,
@@ -4431,6 +4478,35 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_save_owner_weekly_report,
+    },
+    "send_owner_weekly_report_pdf": {
+        "description": (
+            "Send the current weekly owner report as a PDF into Bitrix personal messages (default recipient: "
+            "Evgeniy Palei, bitrix_user_id 1). Builds the PDF from the saved owner_weekly_report for the given period "
+            "and attaches it via im.disk.file.commit. STRICT RULE: confirm=true is mandatory — first build and save "
+            "the weekly report via save_owner_weekly_report, show the owner the report period and that the PDF goes to "
+            "Evgeniy, get explicit approval, and only then call this tool with confirm=true. The weekly report for that "
+            "period must already be saved (is_current)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "period_start": {"type": "string", "description": "YYYY-MM-DD (Monday of the reported week)."},
+                "period_end": {"type": "string", "description": "YYYY-MM-DD (Friday/Sunday of the reported week)."},
+                "recipient_bitrix_user_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Bitrix user ids to send the PDF to. Default [1] (Evgeniy Palei).",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true. Means the owner explicitly approved sending the weekly PDF to Evgeniy.",
+                },
+            },
+            "required": ["period_start", "period_end", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_send_owner_weekly_report_pdf,
     },
     "list_pending_zoom_operational_dispatches": {
         "description": (
