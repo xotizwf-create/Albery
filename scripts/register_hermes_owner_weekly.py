@@ -82,10 +82,13 @@ def main() -> None:
         print(f"ERROR: '{DAILY_NAME}' job not found", file=sys.stderr)
         sys.exit(3)
 
-    # 1) owner-daily: skip Friday + refresh prompt
+    # 1) owner-daily: skip Friday + refresh prompt. Reset next_run_at so the
+    # scheduler recomputes from the new expr (otherwise the cached Friday run
+    # would still fire).
     daily["schedule"] = {"kind": "cron", "expr": DAILY_EXPR, "display": DAILY_EXPR}
     daily["schedule_display"] = DAILY_EXPR
     daily["prompt"] = daily_prompt
+    daily["next_run_at"] = None
 
     # 2) owner-weekly: create or update in place
     weekly = next((j for j in jobs if isinstance(j, dict) and j.get("name") == WEEKLY_NAME), None)
