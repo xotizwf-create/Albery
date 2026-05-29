@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.8.1"
+SERVER_VERSION = "0.8.2"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -2199,7 +2199,12 @@ def tool_list_zoom_calls(args: dict[str, Any]) -> dict[str, Any]:
                     zc.analytical_note,
                     count(DISTINCT zcp.id) AS participants_count,
                     count(DISTINCT zcts.id) AS transcript_segments_count,
-                    array_remove(array_agg(DISTINCT COALESCE(zcp.participant_name, zcp.participant_email)), NULL) AS participants
+                    array_remove(array_agg(DISTINCT COALESCE(zcp.participant_name, zcp.participant_email)), NULL) AS participants_raw,
+                    (
+                        SELECT array_remove(array_agg(DISTINCT s.speaker), NULL)
+                        FROM zoom_call_transcript_segments s
+                        WHERE s.call_id = zc.id
+                    ) AS speakers
                 FROM zoom_calls zc
                 LEFT JOIN zoom_call_participants zcp ON zcp.call_id = zc.id
                 LEFT JOIN zoom_call_transcript_segments zcts ON zcts.call_id = zc.id
@@ -2211,6 +2216,14 @@ def tool_list_zoom_calls(args: dict[str, Any]) -> dict[str, Any]:
                 params,
             )
             rows = cur.fetchall()
+    # Prefer real transcript speaker names over shared technical Zoom account names.
+    resolver = app_workflow_function("resolve_zoom_participants")
+    for row in rows:
+        resolved = resolver(
+            [{"name": name} for name in (row.get("participants_raw") or [])],
+            row.get("speakers") or [],
+        )
+        row["participants"] = [p["name"] for p in resolved if p.get("name")]
     return {"items": rows, "limit": limit, "offset": offset}
 
 
@@ -2260,6 +2273,23 @@ def tool_get_zoom_call_transcript(args: dict[str, Any]) -> dict[str, Any]:
                 (call["id"],),
             )
             total_segments = cur.fetchone()["total_segments"]
+            # All distinct transcript speakers (not just the current page) so shared
+            # Zoom accounts ("Координатор") resolve to the real renamed names.
+            cur.execute(
+                "SELECT DISTINCT speaker FROM zoom_call_transcript_segments "
+                "WHERE call_id = %s AND speaker IS NOT NULL",
+                (call["id"],),
+            )
+            all_speakers = [row["speaker"] for row in cur.fetchall()]
+
+    resolver = app_workflow_function("resolve_zoom_participants")
+    resolved_participants = resolver(
+        [
+            {"name": p.get("participant_name"), "email": p.get("participant_email")}
+            for p in participants
+        ],
+        all_speakers,
+    )
 
     call_payload = dict(call)
     call_payload.pop("raw_json", None)
@@ -2267,7 +2297,8 @@ def tool_get_zoom_call_transcript(args: dict[str, Any]) -> dict[str, Any]:
         call_payload.pop("transcript_text", None)
     return {
         "call": call_payload,
-        "participants": participants,
+        "participants": resolved_participants,
+        "participants_raw": participants,
         "segments": segments,
         "total_segments": total_segments,
         "limit": limit,

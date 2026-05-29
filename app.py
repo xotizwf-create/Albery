@@ -3125,6 +3125,94 @@ def dedupe_zoom_participants(participants: list[dict[str, Any]] | None) -> list[
     return result
 
 
+# Shared / technical Zoom account display names that are NOT a real person. These
+# are accounts several people log into and rename themselves on the call (e.g. the
+# "Координатор" account used by both Наталья and Артур). In that case the real
+# names live in the transcript speaker labels, not in the Zoom participant list.
+ZOOM_TECHNICAL_PARTICIPANT_NAMES = {
+    name.strip().lower()
+    for name in os.getenv(
+        "ZOOM_TECHNICAL_PARTICIPANT_NAMES",
+        "координатор,coordinator,zoom,zoom room,zoom rooms,рекордер,recorder,user,гость,guest",
+    ).split(",")
+    if name.strip()
+}
+
+ZOOM_SPEAKER_NOISE_NAMES = {"unknown", "speaker", "webvtt", "transcript", "участник", "спикер"}
+
+
+def is_technical_participant_name(name: Any) -> bool:
+    return str(name or "").strip().lower() in ZOOM_TECHNICAL_PARTICIPANT_NAMES
+
+
+def clean_zoom_speaker_names(speakers: Any) -> list[str]:
+    """Distinct, order-preserving real speaker names from transcript speaker labels."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in speakers or []:
+        name = str(raw or "").strip()
+        key = name.lower()
+        if not name or key in ZOOM_SPEAKER_NOISE_NAMES or key in seen:
+            continue
+        seen.add(key)
+        result.append(name)
+    return result
+
+
+def resolve_zoom_participants(
+    api_participants: list[dict[str, Any]] | None,
+    segment_speakers: Any = None,
+) -> list[dict[str, Any]]:
+    """Return display participants preferring real transcript speaker names over
+    shared/technical Zoom account names.
+
+    When people share one Zoom account ("Координатор") and rename themselves on the
+    call, the transcript carries their real names while the Zoom participant list
+    only has the account name. We surface the transcript names and drop the shared
+    technical account when at least one real speaker is present; real (non-technical)
+    Zoom participants who never spoke are still kept. Falls back to the raw
+    participant list when no usable transcript speakers exist.
+    """
+    speakers = clean_zoom_speaker_names(segment_speakers)
+    real_speakers = [s for s in speakers if not is_technical_participant_name(s)]
+    real_speaker_keys = {s.lower() for s in real_speakers}
+    have_real = bool(real_speakers)
+
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(name: Any, email: Any) -> None:
+        name = str(name or "").strip()
+        email = str(email or "").strip()
+        if not name and not email:
+            return
+        key = (name.lower(), email.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        result.append({"name": name or None, "email": email or None})
+
+    # 1) Authoritative identities: real transcript speakers.
+    for speaker in real_speakers:
+        add(speaker, None)
+
+    # 2) Zoom participants: drop the shared technical account when real speakers
+    #    cover the call; skip names already represented by a speaker.
+    for participant in api_participants or []:
+        name = str(participant.get("name") or "").strip()
+        if have_real and is_technical_participant_name(name):
+            continue
+        if name and name.lower() in real_speaker_keys:
+            continue
+        add(name, participant.get("email"))
+
+    # 3) Fallback: nothing resolved (no transcript, no usable participants).
+    if not result:
+        for participant in api_participants or []:
+            add(participant.get("name"), participant.get("email"))
+    return result
+
+
 def zoom_call_row_payload(
     row: dict[str, Any],
     participants: list[dict[str, Any]] | None = None,
@@ -3170,7 +3258,12 @@ def load_zoom_calls_tree() -> dict[str, Any]:
                         ORDER BY zcp.participant_name NULLS LAST, zcp.participant_email NULLS LAST
                     ) FILTER (WHERE zcp.id IS NOT NULL),
                     '[]'::jsonb
-                ) AS participants_json
+                ) AS participants_json,
+                (
+                    SELECT COALESCE(jsonb_agg(DISTINCT s.speaker) FILTER (WHERE s.speaker IS NOT NULL), '[]'::jsonb)
+                    FROM zoom_call_transcript_segments s
+                    WHERE s.call_id = zc.id
+                ) AS speakers_json
                 FROM zoom_calls zc
                 LEFT JOIN zoom_call_participants zcp ON zcp.call_id = zc.id
                 GROUP BY zc.id
@@ -3187,11 +3280,10 @@ def load_zoom_calls_tree() -> dict[str, Any]:
         call_date = row["call_date"]
         year = call_date.year
         month = call_date.month
-        participants = [
-            item
-            for item in (row.get("participants_json") or [])
-            if item.get("name") or item.get("email")
-        ]
+        participants = resolve_zoom_participants(
+            row.get("participants_json") or [],
+            row.get("speakers_json") or [],
+        )
         call_payload = zoom_call_row_payload(row, participants)
         year_payload = years_map.setdefault(year, {"year": year, "months": {}})
         month_payload = year_payload["months"].setdefault(
@@ -3260,7 +3352,11 @@ def load_zoom_call_detail(call_id: str) -> dict[str, Any] | None:
                 (call_id,),
             )
             segments = cur.fetchall()
-    payload = zoom_call_row_payload(row, participants, include_transcript=False)
+    resolved_participants = resolve_zoom_participants(
+        [dict(participant) for participant in participants],
+        [segment.get("speaker") for segment in segments],
+    )
+    payload = zoom_call_row_payload(row, resolved_participants, include_transcript=False)
     payload["segments"] = [dict(segment) for segment in segments]
     if not segments:
         payload["transcript_text"] = row.get("transcript_text") or ""
@@ -12089,7 +12185,12 @@ def _compact_zoom_calls_for_owner_prompt(period_start: date, period_end: date) -
                            jsonb_agg(DISTINCT zcp.participant_name)
                            FILTER (WHERE zcp.participant_name IS NOT NULL),
                            '[]'::jsonb
-                       ) AS participants_json
+                       ) AS participants_json,
+                       (
+                           SELECT COALESCE(jsonb_agg(DISTINCT s.speaker) FILTER (WHERE s.speaker IS NOT NULL), '[]'::jsonb)
+                           FROM zoom_call_transcript_segments s
+                           WHERE s.call_id = zc.id
+                       ) AS speakers_json
                 FROM zoom_calls zc
                 LEFT JOIN zoom_call_participants zcp ON zcp.call_id = zc.id
                 LEFT JOIN zoom_call_transcript_segments zcts ON zcts.call_id = zc.id
@@ -12114,7 +12215,14 @@ def _compact_zoom_calls_for_owner_prompt(period_start: date, period_end: date) -
             "start_time_msk": row["start_time_msk"].isoformat() if hasattr(row["start_time_msk"], "isoformat") else str(row["start_time_msk"] or ""),
             "end_time_msk": row["end_time_msk"].isoformat() if hasattr(row["end_time_msk"], "isoformat") else str(row["end_time_msk"] or ""),
             "duration_min": row["duration_min"],
-            "participants": row["participants_json"] if isinstance(row["participants_json"], list) else [],
+            "participants": [
+                p["name"]
+                for p in resolve_zoom_participants(
+                    [{"name": n} for n in (row["participants_json"] or [])],
+                    row.get("speakers_json") or [],
+                )
+                if p.get("name")
+            ],
             "transcript_segments_count": row["transcript_segments_count"],
             "has_zoom_report": bool(note),
             "analytical_note": note[:30000],
@@ -16476,7 +16584,12 @@ def load_zoom_calls_for_chat_prompt(target_date: date, max_calls: int = 20) -> l
                         ORDER BY zcp.participant_name NULLS LAST, zcp.participant_email NULLS LAST
                     ) FILTER (WHERE zcp.id IS NOT NULL),
                     '[]'::jsonb
-                ) AS participants_json
+                ) AS participants_json,
+                (
+                    SELECT COALESCE(jsonb_agg(DISTINCT s.speaker) FILTER (WHERE s.speaker IS NOT NULL), '[]'::jsonb)
+                    FROM zoom_call_transcript_segments s
+                    WHERE s.call_id = zc.id
+                ) AS speakers_json
                 FROM zoom_calls zc
                 LEFT JOIN zoom_call_participants zcp ON zcp.call_id = zc.id
                 WHERE zc.call_date = %s
@@ -16500,7 +16613,9 @@ def load_zoom_calls_for_chat_prompt(target_date: date, max_calls: int = 20) -> l
                 "end_time_msk": iso_or_none(row.get("end_time_msk")),
                 "topic": row.get("topic") or "",
                 "technical_topic": row.get("technical_topic") or "",
-                "participants": dedupe_zoom_participants(row.get("participants_json") or []),
+                "participants": resolve_zoom_participants(
+                    row.get("participants_json") or [], row.get("speakers_json") or []
+                ),
                 "analytical_note": analytical_note,
                 "has_zoom_report": bool(analytical_note),
                 "zoom_report_generated_before_chat": str(row["id"]) in ensured_call_ids,
