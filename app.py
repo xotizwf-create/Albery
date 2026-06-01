@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, abort, jsonify, redirect, request, send_file, send_from_directory, session, stream_with_context, url_for
+from flask import Flask, Response, abort, has_request_context, jsonify, redirect, request, send_file, send_from_directory, session, stream_with_context, url_for
 import psycopg
 from psycopg.types.json import Jsonb
 from werkzeug.exceptions import HTTPException
@@ -3561,8 +3561,15 @@ def _zoom_export_token(filename: str) -> str:
 
 
 def _zoom_export_public_url(filename: str) -> str:
-    host = (os.getenv("MCP_HOST") or os.getenv("CANONICAL_WEB_HOST") or "").strip()
     path = f"/zoom-export/{_zoom_export_token(filename)}/{quote(os.path.basename(filename))}"
+    host = (os.getenv("MCP_HOST") or os.getenv("CANONICAL_WEB_HOST") or "").strip()
+    if not host:
+        # Fall back to the host of the current request (the MCP call comes in on mcp.m4s.ru).
+        try:
+            if has_request_context():
+                host = request.host
+        except Exception:
+            host = ""
     return f"https://{host}{path}" if host else path
 
 
