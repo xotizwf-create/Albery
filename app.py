@@ -3620,6 +3620,65 @@ def person_names_match(left: Any, right: Any) -> bool:
     return all(token_matches(token) for token in smaller)
 
 
+# Editable AI instruction (folder name) that maps how a person is named in Zoom
+# transcripts to their name in the Bitrix org structure. Hermes reads it as part of
+# its instructions, and the zoom-dispatch matching below also reads it so the
+# server-side name matching honours the same aliases.
+EMPLOYEE_NAME_ALIAS_INSTRUCTION_NAME = "Сопоставление имён сотрудников (алиасы оргструктуры)"
+_employee_name_alias_cache: dict[str, Any] = {"ts": 0.0, "map": {}}
+
+
+def normalize_person_name(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower().replace("ё", "е"))
+
+
+def load_employee_name_aliases() -> dict[str, str]:
+    """Load {zoom_name -> org_structure_name} from the editable AI instruction.
+
+    Lines are written as ``- Имя в созвоне = Имя в оргструктуре`` (``=>`` also
+    accepted); comment (``#``) and other lines are ignored. Cached for 60s; on any
+    error the last good map (or empty) is returned so dispatch never breaks on this.
+    """
+    now = time.time()
+    cache = _employee_name_alias_cache
+    if cache["map"] and (now - float(cache["ts"])) < 60:
+        return cache["map"]
+    if not postgres_enabled():
+        return cache["map"]
+    content = ""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass('public.ai_instruction_folders') IS NOT NULL AS ok")
+                row = cur.fetchone()
+                if row and row.get("ok"):
+                    cur.execute(
+                        "SELECT content FROM ai_instruction_folders WHERE lower(name) = lower(%s) "
+                        "ORDER BY updated_at DESC NULLS LAST LIMIT 1",
+                        (EMPLOYEE_NAME_ALIAS_INSTRUCTION_NAME,),
+                    )
+                    found = cur.fetchone()
+                    content = (found.get("content") if found else "") or ""
+    except Exception:
+        return cache["map"]
+    aliases: dict[str, str] = {}
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line.startswith("- "):
+            continue
+        body = line[2:].replace("=>", "=")
+        if "=" not in body:
+            continue
+        left, right = body.split("=", 1)
+        zoom_name = normalize_person_name(left)
+        org_name = right.strip()
+        if zoom_name and org_name:
+            aliases[zoom_name] = org_name
+    cache["ts"] = now
+    cache["map"] = aliases
+    return aliases
+
+
 def zoom_operational_task_card_description(tasks: list[dict[str, Any]]) -> str:
     task_text = format_zoom_operational_tasks_for_bitrix(tasks)
     return f"{ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO}\n\n{task_text}".strip()
@@ -3634,8 +3693,12 @@ def build_zoom_operational_task_cards(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     cards_by_key: dict[str, dict[str, Any]] = {}
     unmatched: list[str] = []
+    name_aliases = load_employee_name_aliases()
     for task in tasks:
         assignee_name = str(task.get("assignee_name") or "").strip()
+        # Resolve a Zoom-transcript name to the org-structure name via the editable
+        # alias instruction (e.g. "Анастасия Докучаева" -> "Анастасия Андрусяк").
+        match_name = name_aliases.get(normalize_person_name(assignee_name), assignee_name)
         bitrix_user_id = to_int(task.get("bitrix_user_id"))
         matched_member: dict[str, Any] | None = None
         if bitrix_user_id is not None:
@@ -3643,11 +3706,11 @@ def build_zoom_operational_task_cards(
                 if to_int(member.get("user_id")) == bitrix_user_id:
                     matched_member = member
                     break
-        if matched_member is None and assignee_name and assignee_name != "Требует назначения":
+        if matched_member is None and match_name and match_name != "Требует назначения":
             for member in team:
                 full_name = str(member.get("name") or "").strip()
                 member_id = to_int(member.get("user_id"))
-                if member_id is not None and full_name and person_names_match(full_name, assignee_name):
+                if member_id is not None and full_name and person_names_match(full_name, match_name):
                     matched_member = member
                     break
 
