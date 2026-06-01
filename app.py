@@ -3549,6 +3549,74 @@ def export_zoom_calls_markdown(
     return {"calls": total, "filename": filename, "markdown": markdown, "chars": len(markdown)}
 
 
+ZOOM_EXPORT_DIR = EXPORT_DIR / "zoom"
+
+
+def _zoom_export_token(filename: str) -> str:
+    """Unguessable, stateless token for a given export filename (HMAC over a server
+    secret). The public download route recomputes and compares it, so links work
+    without login but cannot be guessed."""
+    secret = (os.getenv("FLASK_SECRET_KEY") or os.getenv("MCP_SHARED_SECRET") or "albery-zoom-export").encode("utf-8")
+    return hmac.new(secret, os.path.basename(filename).encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
+def _zoom_export_public_url(filename: str) -> str:
+    host = (os.getenv("MCP_HOST") or os.getenv("CANONICAL_WEB_HOST") or "").strip()
+    path = f"/zoom-export/{_zoom_export_token(filename)}/{quote(os.path.basename(filename))}"
+    return f"https://{host}{path}" if host else path
+
+
+def save_zoom_markdown_export(markdown: str, filename: str) -> dict[str, Any]:
+    """Persist a Markdown export to disk and return a public, token-protected download URL.
+    Used by the MCP export tools so the connector returns a short link instead of the full
+    document (which large clients truncate)."""
+    ZOOM_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = os.path.basename(str(filename or "").strip()) or "zoom_export.md"
+    (ZOOM_EXPORT_DIR / safe_name).write_text(markdown, encoding="utf-8")
+    return {
+        "filename": safe_name,
+        "download_url": _zoom_export_public_url(safe_name),
+        "bytes": len(markdown.encode("utf-8")),
+    }
+
+
+def _zoom_export_link_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """Compact link-mode payload (no full markdown, so MCP clients don't truncate it)."""
+    markdown = result.get("markdown") or ""
+    saved = save_zoom_markdown_export(markdown, result.get("filename") or "zoom_export.md")
+    preview = "\n".join(markdown.splitlines()[:40])
+    payload = {
+        "filename": saved["filename"],
+        "download_url": saved["download_url"],
+        "chars": result.get("chars", len(markdown)),
+        "bytes": saved["bytes"],
+        "preview": preview,
+    }
+    for key in ("call_id", "topic", "date", "calls"):
+        if key in result:
+            payload[key] = result[key]
+    return payload
+
+
+def export_zoom_call_markdown_link(call_id: str) -> dict[str, Any]:
+    """export_zoom_call_markdown + save to disk; returns a download URL instead of inline text."""
+    return _zoom_export_link_payload(export_zoom_call_markdown(call_id))
+
+
+def export_zoom_calls_markdown_link(
+    call_ids: list[str] | None = None,
+    date_from: Any = None,
+    date_to: Any = None,
+    include_google_drive: bool = False,
+) -> dict[str, Any]:
+    """export_zoom_calls_markdown + save to disk; returns a download URL instead of inline text."""
+    return _zoom_export_link_payload(
+        export_zoom_calls_markdown(
+            call_ids=call_ids, date_from=date_from, date_to=date_to, include_google_drive=include_google_drive
+        )
+    )
+
+
 def extract_zoom_operational_tasks_section(note: str) -> str:
     text = str(note or "").strip()
     if not text:
@@ -18690,6 +18758,7 @@ AUTH_EXEMPT_PREFIXES = (
     "/bitrix/events/",
     "/zoom/events/",
     "/google-drive/events/",
+    "/zoom-export/",
 )
 
 
@@ -19336,6 +19405,25 @@ def api_zoom_calls_export_markdown():
     if not result.get("calls"):
         return jsonify({"error": "Нет созвонов под заданные условия."}), 404
     return _markdown_download_response(result["markdown"], result["filename"])
+
+
+@app.get("/zoom-export/<token>/<path:filename>")
+def zoom_export_download(token: str, filename: str):
+    """Public, token-protected download of a saved Zoom Markdown export. No login: the
+    token is an unguessable HMAC of the filename, so the link works in chat/connectors
+    but cannot be enumerated. Created by the MCP export tools (save_zoom_markdown_export)."""
+    safe_name = os.path.basename(filename or "")
+    if not safe_name or not hmac.compare_digest(str(token), _zoom_export_token(safe_name)):
+        abort(404)
+    file_path = (ZOOM_EXPORT_DIR / safe_name).resolve()
+    if file_path.parent != ZOOM_EXPORT_DIR.resolve() or not file_path.exists():
+        abort(404)
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name=safe_name,
+        mimetype="text/markdown; charset=utf-8",
+    )
 
 
 @app.post("/api/sync/full")

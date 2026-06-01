@@ -2310,7 +2310,7 @@ def tool_export_zoom_call_markdown(args: dict[str, Any]) -> dict[str, Any]:
     call_id = str(args.get("call_id") or "").strip()
     if not call_id:
         raise McpError(-32602, "Missing required argument: call_id")
-    workflow = app_workflow_function("export_zoom_call_markdown")
+    workflow = app_workflow_function("export_zoom_call_markdown_link")
     try:
         return json_safe(workflow(call_id))
     except ValueError as exc:
@@ -2327,7 +2327,7 @@ def tool_export_zoom_transcripts_markdown(args: dict[str, Any]) -> dict[str, Any
     include_gd = bool(args.get("include_google_drive", False))
     if not call_ids and not date_from and not date_to:
         raise McpError(-32602, "Provide call_ids, or date_from/date_to.")
-    workflow = app_workflow_function("export_zoom_calls_markdown")
+    workflow = app_workflow_function("export_zoom_calls_markdown_link")
     try:
         result = workflow(
             call_ids=call_ids,
@@ -4365,11 +4365,12 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "export_zoom_call_markdown": {
         "description": (
-            "Export ONE Zoom call as a ready-to-send Markdown document: header with topic, date, "
-            "time (МСК), duration and participants, then the FULL transcript line by line (speaker + "
-            "timecode). Returns {markdown, filename, call_id, chars}. Use this when the owner asks to "
-            "get/send a call's transcript 'в md'/'markdown'/'файлом' — deliver the `markdown` value to "
-            "the chat (preferably as a .md file attachment using the suggested `filename`)."
+            "Export ONE Zoom call as a Markdown document: header with topic, date, time (МСК), duration "
+            "and participants, then the FULL transcript line by line (speaker + timecode). The file is "
+            "saved server-side and the tool returns {download_url, filename, call_id, chars, bytes, preview} "
+            "— the FULL transcript is NOT inlined (clients truncate it). Use when the owner asks to get/send "
+            "a call's transcript 'в md'/'markdown'/'файлом': give them the `download_url` (public, login-free, "
+            "unguessable link); `preview` is only the first lines for context."
         ),
         "inputSchema": {
             "type": "object",
@@ -4387,8 +4388,10 @@ TOOLS: dict[str, dict[str, Any]] = {
             "boundaries between meetings; each meeting has metadata (topic, date, МСК time, duration, "
             "participants) plus its FULL transcript. Select either by explicit call_ids OR by a "
             "date_from/date_to range (YYYY-MM-DD). Google Drive transcript imports (noisy duplicates) are "
-            "excluded unless include_google_drive=true. Returns {markdown, filename, calls, chars}. The "
-            "document can be large — deliver `markdown` to the chat as a .md file attachment, not as plain text."
+            "excluded unless include_google_drive=true. The file is saved server-side and the tool returns "
+            "{download_url, filename, calls, chars, bytes, preview} — the FULL document is NOT inlined (it "
+            "would be truncated by the client). Give the owner the `download_url` (a public, login-free, "
+            "unguessable link); `preview` is just the first lines for context."
         ),
         "inputSchema": {
             "type": "object",
