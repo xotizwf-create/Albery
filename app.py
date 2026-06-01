@@ -3369,6 +3369,38 @@ def _zoom_md_clean_offset(value: Any) -> str:
     return text.split(".")[0].split(",")[0] if text else ""
 
 
+# Parsing artifacts that show up as fake participants in some imported transcripts.
+_ZOOM_PARTICIPANT_ARTIFACTS = {"", "none", "дата созвона", "время созвона", "дата", "время"}
+
+
+def load_zoom_call_participant_names(call_id: str) -> list[str]:
+    """Actual Zoom attendees for a call (deduped, parsing artifacts filtered out),
+    ordered by time in the meeting. Used for the Markdown export so the document lists
+    everyone who attended, not the report-oriented resolved speaker set."""
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT participant_name, participant_email
+                FROM zoom_call_participants
+                WHERE call_id = %s
+                ORDER BY duration_seconds DESC NULLS LAST, participant_name NULLS LAST
+                """,
+                (call_id,),
+            )
+            rows = cur.fetchall()
+    seen: set[str] = set()
+    names: list[str] = []
+    for row in rows:
+        name = str(row.get("participant_name") or row.get("participant_email") or "").strip()
+        key = name.lower()
+        if key in _ZOOM_PARTICIPANT_ARTIFACTS or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
 def render_zoom_call_markdown(detail: dict[str, Any], index: int | None = None, total: int | None = None) -> str:
     """Render ONE Zoom call (from load_zoom_call_detail) as markdown:
     metadata (topic, date, MSK time, duration, participants) + the FULL transcript
@@ -3433,6 +3465,7 @@ def export_zoom_call_markdown(call_id: str) -> dict[str, Any]:
     detail = load_zoom_call_detail(call_id)
     if not detail:
         raise ValueError("Zoom-созвон не найден.")
+    detail["participants"] = [{"name": name} for name in load_zoom_call_participant_names(str(detail.get("id") or call_id))]
     markdown = render_zoom_call_markdown(detail)
     return {
         "call_id": str(detail.get("id") or call_id),
@@ -3484,6 +3517,7 @@ def export_zoom_calls_markdown(
     for call_id in ids:
         detail = load_zoom_call_detail(call_id)
         if detail:
+            detail["participants"] = [{"name": name} for name in load_zoom_call_participant_names(str(detail.get("id") or call_id))]
             details.append(detail)
     total = len(details)
 
