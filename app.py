@@ -3824,19 +3824,37 @@ def list_pending_zoom_operational_dispatches(
                 (date_from, date_to),
             )
             rows = cur.fetchall()
-    return [
-        {
-            "call_id": str(row["id"]),
-            "zoom_uuid": row.get("zoom_uuid"),
-            "call_date": row["call_date"].isoformat() if hasattr(row["call_date"], "isoformat") else str(row["call_date"]),
-            "topic": row.get("topic") or row.get("technical_topic"),
-            "start_time_msk": str(row.get("start_time_msk") or ""),
-            "end_time_msk": str(row.get("end_time_msk") or ""),
-            "duration_min": row.get("duration_min"),
-            "note_len": row.get("note_len"),
-        }
-        for row in rows
-    ]
+
+    def _to_msk(value: Any) -> Any:
+        # zoom_calls.start_time_msk/end_time_msk are stored as UTC instants
+        # despite the column name, so always convert to Europe/Moscow here.
+        if value is not None and hasattr(value, "astimezone"):
+            try:
+                return value.astimezone(MSK_TZ)
+            except (ValueError, OverflowError):
+                return value
+        return None
+
+    result = []
+    for row in rows:
+        start_msk = _to_msk(row.get("start_time_msk"))
+        end_msk = _to_msk(row.get("end_time_msk"))
+        start_hhmm = start_msk.strftime("%H:%M") if start_msk else ""
+        end_hhmm = end_msk.strftime("%H:%M") if end_msk else ""
+        result.append(
+            {
+                "call_id": str(row["id"]),
+                "zoom_uuid": row.get("zoom_uuid"),
+                "call_date": row["call_date"].isoformat() if hasattr(row["call_date"], "isoformat") else str(row["call_date"]),
+                "topic": row.get("topic") or row.get("technical_topic"),
+                "start_time_msk": start_msk.isoformat() if start_msk else "",
+                "end_time_msk": end_msk.isoformat() if end_msk else "",
+                "time_text": f"{start_hhmm}-{end_hhmm}" if start_hhmm and end_hhmm else (start_hhmm or ""),
+                "duration_min": row.get("duration_min"),
+                "note_len": row.get("note_len"),
+            }
+        )
+    return result
 
 
 def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[str, Any]:

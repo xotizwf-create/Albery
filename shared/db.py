@@ -53,6 +53,26 @@ def _pool_enabled() -> bool:
     return os.getenv("POSTGRES_POOL_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 
 
+def _session_options() -> str:
+    """libpq `options` string applied to every connection.
+
+    Without these, a statement that hits a row/table lock waits forever; a single
+    stuck call then holds its pool connection until the MCP client times out (120s)
+    and repeated retries exhaust the pool, taking the whole MCP server down. These
+    timeouts make any blocked/abandoned query fail fast instead of poisoning the pool.
+    All values are in milliseconds; 0 disables a given timeout and is overridable via env.
+    """
+    statement_ms = os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", "120000").strip() or "0"
+    lock_ms = os.getenv("POSTGRES_LOCK_TIMEOUT_MS", "15000").strip() or "0"
+    idle_tx_ms = os.getenv("POSTGRES_IDLE_IN_TX_TIMEOUT_MS", "120000").strip() or "0"
+    parts = [
+        f"-c statement_timeout={statement_ms}",
+        f"-c lock_timeout={lock_ms}",
+        f"-c idle_in_transaction_session_timeout={idle_tx_ms}",
+    ]
+    return " ".join(parts)
+
+
 def get_pool() -> Any | None:
     global _pool
     if ConnectionPool is None or not _pool_enabled():
@@ -62,7 +82,7 @@ def get_pool() -> Any | None:
             conninfo=database_url(),
             min_size=int(os.getenv("POSTGRES_POOL_MIN_SIZE", "1") or "1"),
             max_size=int(os.getenv("POSTGRES_POOL_MAX_SIZE", "10") or "10"),
-            kwargs={"row_factory": dict_row},
+            kwargs={"row_factory": dict_row, "options": _session_options()},
             open=False,
         )
         _pool.open()
@@ -76,7 +96,7 @@ def connect() -> Iterator[psycopg.Connection]:
         with pool.connection() as conn:
             yield conn
         return
-    with psycopg.connect(database_url(), row_factory=dict_row) as conn:
+    with psycopg.connect(database_url(), row_factory=dict_row, options=_session_options()) as conn:
         yield conn
 
 
