@@ -3865,6 +3865,7 @@ def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[st
     title = str(payload.get("title") or "").strip()
     description = str(payload.get("description") or "").strip()
     deadline = str(payload.get("deadline") or "").strip() or None
+    skipped_assignees: list[str] = []
     if task_cards:
         recipients = []
         for card in task_cards:
@@ -3873,15 +3874,18 @@ def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[st
             recipient = card.get("recipient") if isinstance(card.get("recipient"), dict) else None
             if recipient:
                 recipients.append(recipient)
-        missing = [
-            str(card.get("assignee_name") or "Требует назначения")
-            for card in task_cards
-            if isinstance(card, dict) and not isinstance(card.get("recipient"), dict)
-        ]
-        if missing:
-            raise ValueError("Не найдены Bitrix-пользователи для ответственных: " + ", ".join(missing))
+            else:
+                # No Bitrix user matched for this assignee — skip their card instead of
+                # failing the whole dispatch, so every matched recipient still gets tasks.
+                # The skipped names are returned so the caller (Hermes) can report them.
+                name = str(card.get("assignee_name") or "Требует назначения").strip()
+                if name and name not in skipped_assignees:
+                    skipped_assignees.append(name)
     if not recipients:
-        raise ValueError("Нет получателей для отправки задачи.")
+        raise ValueError(
+            "Не удалось сопоставить ни одного ответственного с Bitrix-пользователем"
+            + (": " + ", ".join(skipped_assignees) if skipped_assignees else ".")
+        )
     if not title and not task_cards:
         raise ValueError("Не задан заголовок задачи.")
     if not description and not task_cards:
@@ -3930,6 +3934,7 @@ def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[st
     return {
         "sent": len(results),
         "results": results,
+        "skipped_assignees": skipped_assignees,
         "title": title,
         "description": description,
         "deadline": deadline,

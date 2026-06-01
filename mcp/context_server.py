@@ -4592,7 +4592,11 @@ TOOLS: dict[str, dict[str, Any]] = {
             "DO NOT use create_bitrix_task to recreate individual tasks here — this is the right tool for zoom "
             "operational tasks; it groups them and produces the exact card format the owner expects. "
             "After success the call is marked with raw_json.ai_report.bitrix_dispatch.dispatched_at so "
-            "list_pending_zoom_operational_dispatches will not return it again."
+            "list_pending_zoom_operational_dispatches will not return it again. "
+            "PARTIAL SUCCESS: the result returns 'sent' (number of tasks created) and 'skipped_assignees' "
+            "(responsible people with no matching Bitrix user, e.g. not in the team sync). This is a SUCCESS, "
+            "not an error — do NOT retry. Report it to the owner like 'Поставил N задач; не нашёл в Битриксе: "
+            "<names> — добавьте их в Битрикс или поставьте задачу вручную.'"
         ),
         "inputSchema": {
             "type": "object",
