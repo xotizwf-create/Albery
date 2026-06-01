@@ -3363,6 +3363,158 @@ def load_zoom_call_detail(call_id: str) -> dict[str, Any] | None:
     return payload
 
 
+def _zoom_md_clean_offset(value: Any) -> str:
+    """HH:MM:SS timecode without milliseconds."""
+    text = str(value or "").strip()
+    return text.split(".")[0].split(",")[0] if text else ""
+
+
+def render_zoom_call_markdown(detail: dict[str, Any], index: int | None = None, total: int | None = None) -> str:
+    """Render ONE Zoom call (from load_zoom_call_detail) as markdown:
+    metadata (topic, date, MSK time, duration, participants) + the FULL transcript
+    by cue (speaker + timecode). Falls back to raw transcript_text when there are
+    no parsed segments."""
+    topic = (detail.get("topic") or detail.get("technical_topic") or "Без темы").strip()
+    date_text = (detail.get("date_text") or detail.get("date") or "").strip()
+    time_text = (detail.get("time_text") or "").strip()
+    time_label = f"{time_text} МСК" if time_text else "время не зафиксировано"
+    duration = detail.get("duration_min")
+    duration_text = f"{duration} мин" if duration is not None else "—"
+    names: list[str] = []
+    for participant in detail.get("participants") or []:
+        name = str(participant.get("name") or participant.get("email") or "").strip()
+        if name:
+            names.append(name)
+
+    lines: list[str] = []
+    if index is not None and total is not None:
+        lines.append(f"# Встреча {index} из {total} — {date_text}, {time_label}")
+    else:
+        lines.append(f"# {topic} — {date_text}")
+    lines.append("")
+    lines.append(f"- **Тема:** {topic}")
+    lines.append(f"- **Дата:** {date_text}")
+    lines.append(f"- **Время:** {time_label}")
+    lines.append(f"- **Длительность:** {duration_text}")
+    lines.append(f"- **Участников:** {len(names)}")
+    if names:
+        lines.append("- **Участники:** " + ", ".join(names))
+    lines.append("")
+    lines.append("## Полный транскрипт")
+    lines.append("")
+    segments = detail.get("segments") or []
+    if segments:
+        for segment in segments:
+            text = str(segment.get("text") or "").strip()
+            if not text:
+                continue
+            offset = _zoom_md_clean_offset(segment.get("start_offset"))
+            speaker = str(segment.get("speaker") or "").strip()
+            prefix = f"[{offset}] " if offset else ""
+            lines.append(f"{prefix}**{speaker}:** {text}" if speaker else f"{prefix}{text}")
+    elif str(detail.get("transcript_text") or "").strip():
+        lines.append("```")
+        lines.append(detail["transcript_text"].strip())
+        lines.append("```")
+    else:
+        lines.append("_Транскрипт отсутствует._")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _zoom_export_filename(detail: dict[str, Any]) -> str:
+    call_date = str(detail.get("date") or "call").strip()
+    short_id = str(detail.get("id") or "")[:8]
+    return f"zoom_transcript_{call_date}_{short_id}.md".strip("_")
+
+
+def export_zoom_call_markdown(call_id: str) -> dict[str, Any]:
+    """Markdown export for ONE Zoom call. Returns {markdown, filename, call_id, ...}."""
+    detail = load_zoom_call_detail(call_id)
+    if not detail:
+        raise ValueError("Zoom-созвон не найден.")
+    markdown = render_zoom_call_markdown(detail)
+    return {
+        "call_id": str(detail.get("id") or call_id),
+        "topic": detail.get("topic"),
+        "date": detail.get("date"),
+        "filename": _zoom_export_filename(detail),
+        "markdown": markdown,
+        "chars": len(markdown),
+    }
+
+
+def export_zoom_calls_markdown(
+    call_ids: list[str] | None = None,
+    date_from: Any = None,
+    date_to: Any = None,
+    include_google_drive: bool = False,
+) -> dict[str, Any]:
+    """Markdown export for MANY Zoom calls into one document with a table of contents
+    and clear ``---`` boundaries. Select either by explicit ``call_ids`` or by a
+    ``date_from``/``date_to`` range. Google Drive transcript imports (noisy metadata,
+    usually duplicates of the Zoom API recording) are excluded unless requested."""
+    ensure_zoom_schema()
+    ids: list[str] = []
+    if call_ids:
+        ids = [str(value).strip() for value in call_ids if str(value).strip()]
+    else:
+        date_from_value = safe_parse_date(date_from) if date_from else None
+        date_to_value = safe_parse_date(date_to) if date_to else None
+        clauses: list[str] = []
+        params: list[Any] = []
+        if date_from_value is not None:
+            clauses.append("call_date >= %s")
+            params.append(date_from_value)
+        if date_to_value is not None:
+            clauses.append("call_date <= %s")
+            params.append(date_to_value)
+        if not include_google_drive:
+            clauses.append("COALESCE(zoom_account_key, '') <> 'GOOGLE_DRIVE_TRANSCRIPTS'")
+        where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT id FROM zoom_calls{where_sql} ORDER BY call_date, start_time_msk NULLS LAST",
+                    params,
+                )
+                ids = [str(row["id"]) for row in cur.fetchall()]
+
+    details: list[dict[str, Any]] = []
+    for call_id in ids:
+        detail = load_zoom_call_detail(call_id)
+        if detail:
+            details.append(detail)
+    total = len(details)
+
+    header: list[str] = ["# Транскрипты созвонов Zoom", ""]
+    header.append("Выгрузка из БД Albery. Время — московское (МСК); транскрипт — по репликам (спикер + таймкод).")
+    header.append(f"Встреч в выгрузке: {total}.")
+    header.append("")
+    if total:
+        header.append("## Содержание")
+        for position, detail in enumerate(details, 1):
+            topic = (detail.get("topic") or "Без темы").strip()
+            date_text = (detail.get("date_text") or "").strip()
+            time_text = (detail.get("time_text") or "").strip()
+            header.append(f"{position}. {date_text} {time_text} — {topic}".rstrip())
+        header.append("")
+
+    body_parts = [render_zoom_call_markdown(detail, index=i, total=total) for i, detail in enumerate(details, 1)]
+    markdown = "\n".join(header)
+    for part in body_parts:
+        markdown += "\n---\n\n" + part
+    markdown = markdown.rstrip() + "\n"
+
+    filename = "zoom_transcripts.md"
+    if not call_ids:
+        df = (safe_parse_date(date_from).isoformat() if date_from and safe_parse_date(date_from) else "")
+        dt = (safe_parse_date(date_to).isoformat() if date_to and safe_parse_date(date_to) else "")
+        if df or dt:
+            filename = f"zoom_transcripts_{df or 'start'}_{dt or 'end'}.md"
+    return {"calls": total, "filename": filename, "markdown": markdown, "chars": len(markdown)}
+
+
 def extract_zoom_operational_tasks_section(note: str) -> str:
     text = str(note or "").strip()
     if not text:
@@ -19105,6 +19257,51 @@ def api_zoom_call_dispatch_operational_tasks_preview(call_id: str):
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"Не удалось подготовить список задач: {exc}"}), 500
     return jsonify({"ok": True, "result": result})
+
+
+def _markdown_download_response(markdown: str, filename: str) -> Response:
+    return Response(
+        markdown,
+        mimetype="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/zoom-calls/<call_id>/export.md")
+def api_zoom_call_export_markdown(call_id: str):
+    """Download ONE Zoom call as a markdown file (metadata + full transcript)."""
+    try:
+        result = export_zoom_call_markdown(call_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Не удалось сформировать экспорт: {exc}"}), 500
+    return _markdown_download_response(result["markdown"], result["filename"])
+
+
+@app.get("/api/zoom-export.md")
+def api_zoom_calls_export_markdown():
+    """Download MANY Zoom calls in one markdown file. Query params: date_from, date_to
+    (YYYY-MM-DD), ids (comma-separated call ids; overrides the date range),
+    include_google_drive=1 to keep Google Drive transcript imports."""
+    ids_param = (request.args.get("ids") or "").strip()
+    call_ids = [part.strip() for part in ids_param.split(",") if part.strip()] or None
+    date_from = (request.args.get("date_from") or "").strip() or None
+    date_to = (request.args.get("date_to") or "").strip() or None
+    include_gd = request.args.get("include_google_drive", "").strip() in {"1", "true", "yes"}
+    if not call_ids and not date_from and not date_to:
+        return jsonify({"error": "Укажите date_from/date_to или ids."}), 400
+    try:
+        result = export_zoom_calls_markdown(
+            call_ids=call_ids, date_from=date_from, date_to=date_to, include_google_drive=include_gd
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Не удалось сформировать экспорт: {exc}"}), 500
+    if not result.get("calls"):
+        return jsonify({"error": "Нет созвонов под заданные условия."}), 404
+    return _markdown_download_response(result["markdown"], result["filename"])
 
 
 @app.post("/api/sync/full")

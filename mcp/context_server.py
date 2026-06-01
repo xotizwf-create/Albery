@@ -2306,6 +2306,40 @@ def tool_get_zoom_call_transcript(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_export_zoom_call_markdown(args: dict[str, Any]) -> dict[str, Any]:
+    call_id = str(args.get("call_id") or "").strip()
+    if not call_id:
+        raise McpError(-32602, "Missing required argument: call_id")
+    workflow = app_workflow_function("export_zoom_call_markdown")
+    try:
+        return json_safe(workflow(call_id))
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+
+
+def tool_export_zoom_transcripts_markdown(args: dict[str, Any]) -> dict[str, Any]:
+    raw_ids = args.get("call_ids")
+    if raw_ids is not None and not isinstance(raw_ids, list):
+        raise McpError(-32602, "call_ids must be an array of Zoom call ids.")
+    call_ids = [str(value).strip() for value in (raw_ids or []) if str(value).strip()] or None
+    date_from = parse_date_arg(args, "date_from", required=False)
+    date_to = parse_date_arg(args, "date_to", required=False)
+    include_gd = bool(args.get("include_google_drive", False))
+    if not call_ids and not date_from and not date_to:
+        raise McpError(-32602, "Provide call_ids, or date_from/date_to.")
+    workflow = app_workflow_function("export_zoom_calls_markdown")
+    try:
+        result = workflow(
+            call_ids=call_ids,
+            date_from=date_from.isoformat() if date_from else None,
+            date_to=date_to.isoformat() if date_to else None,
+            include_google_drive=include_gd,
+        )
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    return json_safe(result)
+
+
 def _first_text_value(*values: Any) -> str:
     for value in values:
         text = str(value or "").strip()
@@ -4328,6 +4362,45 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_zoom_call_transcript,
+    },
+    "export_zoom_call_markdown": {
+        "description": (
+            "Export ONE Zoom call as a ready-to-send Markdown document: header with topic, date, "
+            "time (МСК), duration and participants, then the FULL transcript line by line (speaker + "
+            "timecode). Returns {markdown, filename, call_id, chars}. Use this when the owner asks to "
+            "get/send a call's transcript 'в md'/'markdown'/'файлом' — deliver the `markdown` value to "
+            "the chat (preferably as a .md file attachment using the suggested `filename`)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "call_id": {"type": "string", "description": "Zoom call id from list_zoom_calls/get_zoom_call_transcript."},
+            },
+            "required": ["call_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_export_zoom_call_markdown,
+    },
+    "export_zoom_transcripts_markdown": {
+        "description": (
+            "Export MANY Zoom calls into ONE Markdown document with a table of contents and clear '---' "
+            "boundaries between meetings; each meeting has metadata (topic, date, МСК time, duration, "
+            "participants) plus its FULL transcript. Select either by explicit call_ids OR by a "
+            "date_from/date_to range (YYYY-MM-DD). Google Drive transcript imports (noisy duplicates) are "
+            "excluded unless include_google_drive=true. Returns {markdown, filename, calls, chars}. The "
+            "document can be large — deliver `markdown` to the chat as a .md file attachment, not as plain text."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "call_ids": {"type": "array", "items": {"type": "string"}, "description": "Explicit Zoom call ids; overrides the date range."},
+                "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD"},
+                "include_google_drive": {"type": "boolean", "description": "Keep Google Drive transcript imports (default false)."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_export_zoom_transcripts_markdown,
     },
     "search_zoom_transcripts": {
         "description": "Search Zoom transcript segments by text and optional date range. For chat context, search keywords derived from chat OCR, tasks, risks, project names, and owner names.",
