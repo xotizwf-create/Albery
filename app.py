@@ -3567,16 +3567,27 @@ def export_zoom_calls_markdown(
 ZOOM_EXPORT_DIR = EXPORT_DIR / "zoom"
 
 
-def _zoom_export_token(filename: str) -> str:
-    """Unguessable, stateless token for a given export filename (HMAC over a server
-    secret). The public download route recomputes and compares it, so links work
-    without login but cannot be guessed."""
+def zoom_export_ttl_seconds() -> int:
+    """How long a download link (and its file) lives. Default 30 min, env-overridable."""
+    try:
+        return max(60, int(os.getenv("ZOOM_EXPORT_TTL_SECONDS", "1800")))
+    except ValueError:
+        return 1800
+
+
+def _zoom_export_token(filename: str, expires_at: int) -> str:
+    """Unguessable, stateless, time-bound token: HMAC over (expiry + filename). The
+    public download route recomputes it and also checks the expiry, so a link works
+    without login but cannot be guessed and stops working after expires_at."""
     secret = (os.getenv("FLASK_SECRET_KEY") or os.getenv("MCP_SHARED_SECRET") or "albery-zoom-export").encode("utf-8")
-    return hmac.new(secret, os.path.basename(filename).encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    message = f"{expires_at}:{os.path.basename(filename)}".encode("utf-8")
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()[:32]
 
 
 def _zoom_export_public_url(filename: str) -> str:
-    path = f"/zoom-export/{_zoom_export_token(filename)}/{quote(os.path.basename(filename))}"
+    expires_at = int(time.time()) + zoom_export_ttl_seconds()
+    token = _zoom_export_token(filename, expires_at)
+    path = f"/zoom-export/{expires_at}/{token}/{quote(os.path.basename(filename))}"
     host = (os.getenv("MCP_HOST") or os.getenv("CANONICAL_WEB_HOST") or "").strip()
     if not host:
         # Fall back to the host of the current request (the MCP call comes in on mcp.m4s.ru).
@@ -3588,16 +3599,36 @@ def _zoom_export_public_url(filename: str) -> str:
     return f"https://{host}{path}" if host else path
 
 
+def cleanup_zoom_exports() -> int:
+    """Delete export files older than the TTL so they don't accumulate on disk.
+    Called opportunistically on each new export; safe to call anytime."""
+    if not ZOOM_EXPORT_DIR.exists():
+        return 0
+    cutoff = time.time() - zoom_export_ttl_seconds()
+    removed = 0
+    for path in ZOOM_EXPORT_DIR.iterdir():
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def save_zoom_markdown_export(markdown: str, filename: str) -> dict[str, Any]:
-    """Persist a Markdown export to disk and return a public, token-protected download URL.
-    Used by the MCP export tools so the connector returns a short link instead of the full
-    document (which large clients truncate)."""
+    """Persist a Markdown export to disk and return a public, token-protected download URL
+    that expires after the TTL (default 30 min). Used by the MCP export tools so the
+    connector returns a short link instead of the full document (which large clients
+    truncate). Old exports are swept on each call so they don't fill the disk."""
     ZOOM_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_zoom_exports()
     safe_name = os.path.basename(str(filename or "").strip()) or "zoom_export.md"
     (ZOOM_EXPORT_DIR / safe_name).write_text(markdown, encoding="utf-8")
     return {
         "filename": safe_name,
         "download_url": _zoom_export_public_url(safe_name),
+        "expires_in_seconds": zoom_export_ttl_seconds(),
         "bytes": len(markdown.encode("utf-8")),
     }
 
@@ -3610,6 +3641,7 @@ def _zoom_export_link_payload(result: dict[str, Any]) -> dict[str, Any]:
     payload = {
         "filename": saved["filename"],
         "download_url": saved["download_url"],
+        "expires_in_seconds": saved.get("expires_in_seconds"),
         "chars": result.get("chars", len(markdown)),
         "bytes": saved["bytes"],
         "preview": preview,
@@ -19477,16 +19509,25 @@ def api_zoom_calls_export_markdown():
     return _markdown_download_response(result["markdown"], result["filename"])
 
 
-@app.get("/zoom-export/<token>/<path:filename>")
-def zoom_export_download(token: str, filename: str):
-    """Public, token-protected download of a saved Zoom Markdown export. No login: the
-    token is an unguessable HMAC of the filename, so the link works in chat/connectors
-    but cannot be enumerated. Created by the MCP export tools (save_zoom_markdown_export)."""
+@app.get("/zoom-export/<int:expires_at>/<token>/<path:filename>")
+def zoom_export_download(expires_at: int, token: str, filename: str):
+    """Public, token-protected, time-limited download of a saved Zoom Markdown export.
+    No login: the token is an unguessable HMAC of (expiry + filename), so the link works
+    in chat/connectors but cannot be enumerated and stops working after expires_at
+    (default 30 min). Expired files are deleted on access; fresh ones are swept by
+    cleanup_zoom_exports. Created by the MCP export tools (save_zoom_markdown_export)."""
     safe_name = os.path.basename(filename or "")
-    if not safe_name or not hmac.compare_digest(str(token), _zoom_export_token(safe_name)):
+    if not safe_name or not hmac.compare_digest(str(token), _zoom_export_token(safe_name, expires_at)):
         abort(404)
     file_path = (ZOOM_EXPORT_DIR / safe_name).resolve()
     if file_path.parent != ZOOM_EXPORT_DIR.resolve() or not file_path.exists():
+        abort(404)
+    if time.time() > expires_at:
+        # Link expired — remove the file so it doesn't linger, then 404.
+        try:
+            file_path.unlink()
+        except OSError:
+            pass
         abort(404)
     return send_file(
         file_path,

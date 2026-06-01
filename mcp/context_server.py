@@ -4375,7 +4375,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "saved server-side and the tool returns {download_url, filename, call_id, chars, bytes, preview} "
             "— the FULL transcript is NOT inlined (clients truncate it). Use when the owner asks to get/send "
             "a call's transcript 'в md'/'markdown'/'файлом': give them the `download_url` (public, login-free, "
-            "unguessable link); `preview` is only the first lines for context. "
+            "unguessable link that EXPIRES in ~30 min — send it promptly); `preview` is only the first lines for context. "
             "SCOPE: this is for exactly ONE call the owner pointed at. If the owner asks for a DATE/DAY or "
             "'все встречи/созвоны за <дата>', do NOT call this per-call and do NOT export just one — a day "
             "usually has several meetings; use export_zoom_transcripts_markdown with date_from=date_to=<day> "
@@ -4407,7 +4407,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "are excluded unless include_google_drive=true. The file is saved server-side and the tool "
             "returns {download_url, filename, calls, chars, bytes, preview} — the FULL document is NOT "
             "inlined (it would be truncated by the client). Give the owner the `download_url` (a public, "
-            "login-free, unguessable link); `preview` is just the first lines for context."
+            "login-free, unguessable link that EXPIRES in ~30 min — send it promptly); `preview` is just the first lines for context."
         ),
         "inputSchema": {
             "type": "object",
