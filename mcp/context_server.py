@@ -4370,7 +4370,11 @@ TOOLS: dict[str, dict[str, Any]] = {
             "saved server-side and the tool returns {download_url, filename, call_id, chars, bytes, preview} "
             "— the FULL transcript is NOT inlined (clients truncate it). Use when the owner asks to get/send "
             "a call's transcript 'в md'/'markdown'/'файлом': give them the `download_url` (public, login-free, "
-            "unguessable link); `preview` is only the first lines for context."
+            "unguessable link); `preview` is only the first lines for context. "
+            "SCOPE: this is for exactly ONE call the owner pointed at. If the owner asks for a DATE/DAY or "
+            "'все встречи/созвоны за <дата>', do NOT call this per-call and do NOT export just one — a day "
+            "usually has several meetings; use export_zoom_transcripts_markdown with date_from=date_to=<day> "
+            "to get ALL of them in one file."
         ),
         "inputSchema": {
             "type": "object",
@@ -4386,7 +4390,10 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Export MANY Zoom calls into ONE Markdown document with a table of contents and clear '---' "
             "boundaries between meetings; each meeting has metadata (topic, date, МСК time, duration, "
-            "participants) plus its FULL transcript. Select either by explicit call_ids OR by a "
+            "participants) plus its FULL transcript. THIS IS THE DEFAULT TOOL for any 'выгрузи "
+            "созвоны/встречи/транскрипты за <дата или период>' request. For a SINGLE day, pass the SAME date "
+            "in date_from AND date_to — it returns EVERY meeting of that day (days often have 2–3 meetings), "
+            "never just one. Select either by explicit call_ids OR by a "
             "date_from/date_to range (YYYY-MM-DD). Google Drive transcript imports (noisy duplicates) are "
             "excluded unless include_google_drive=true. The file is saved server-side and the tool returns "
             "{download_url, filename, calls, chars, bytes, preview} — the FULL document is NOT inlined (it "
