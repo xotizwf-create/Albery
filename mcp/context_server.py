@@ -496,7 +496,7 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "for every active chat with messages, read get_chat_transcript(..., include_ocr=true); daily chat reports are disabled and must not be generated",
                 "for every Zoom call in missing_zoom_reports from get_report_readiness, use zoom_call_report instructions and save_zoom_call_report before continuing",
                 "if previous_owner_daily_report_exists is false in readiness, stop or create the missing previous day first; otherwise get_previous_owner_daily_context(report_date) for continuity",
-                "read recommendation feedback from raw chat transcripts and recommendation event context; every addressable recommendation must start with a soft greeting that accounts for the recipient's previous reply, objection, delegation, unclear answer, or missing response",
+                "read recommendation feedback from raw chat transcripts and recommendation event context; every addressable recommendation must account for the recipient's previous reply, objection, delegation, unclear answer, or missing response — but recommendations are now delivered as one Bitrix task per recipient (title 'Рекомендации DD.MM', deadline 10:00 next day, non-movable), so write each person's recommendations as a clean numbered list WITHOUT any greeting or salutation",
                 "for every addressable recommendation, explicitly use regulation comparison when relevant: if the actual owner/executor/deadline/process differs from company regulation, mention the regulated owner/process and propose delegation, confirmation, Bitrix fixation, or regulation update",
                 "only after every needed raw chat transcript/OCR, every Zoom analytical report, and previous owner_daily_report are ready, create owner_daily_report",
                 "if any required source is missing or failed, stop and return the missing chat/Zoom/OCR source list instead of writing owner_daily_report",
@@ -2322,15 +2322,20 @@ def tool_export_zoom_transcripts_markdown(args: dict[str, Any]) -> dict[str, Any
     if raw_ids is not None and not isinstance(raw_ids, list):
         raise McpError(-32602, "call_ids must be an array of Zoom call ids.")
     call_ids = [str(value).strip() for value in (raw_ids or []) if str(value).strip()] or None
+    raw_dates = args.get("dates")
+    if raw_dates is not None and not isinstance(raw_dates, list):
+        raise McpError(-32602, "dates must be an array of YYYY-MM-DD strings.")
+    dates = [str(value).strip() for value in (raw_dates or []) if str(value).strip()] or None
     date_from = parse_date_arg(args, "date_from", required=False)
     date_to = parse_date_arg(args, "date_to", required=False)
     include_gd = bool(args.get("include_google_drive", False))
-    if not call_ids and not date_from and not date_to:
-        raise McpError(-32602, "Provide call_ids, or date_from/date_to.")
+    if not call_ids and not dates and not date_from and not date_to:
+        raise McpError(-32602, "Provide dates, call_ids, or date_from/date_to.")
     workflow = app_workflow_function("export_zoom_calls_markdown_link")
     try:
         result = workflow(
             call_ids=call_ids,
+            dates=dates,
             date_from=date_from.isoformat() if date_from else None,
             date_to=date_to.isoformat() if date_to else None,
             include_google_drive=include_gd,
@@ -3449,8 +3454,8 @@ def tool_send_owner_recommendations_to_bitrix(args: dict[str, Any]) -> dict[str,
     if args.get("confirm") is not True:
         raise McpError(
             -32602,
-            "Sending requires confirm=true. First show the owner the exact drafts (per recipient) and get explicit "
-            "approval. Only then call send_owner_recommendations_to_bitrix with confirm=true.",
+            "Creating recommendation tasks requires confirm=true. First show the owner the exact recommendation list "
+            "per recipient and get explicit approval. Only then call send_owner_recommendations_to_bitrix with confirm=true.",
         )
     report_date = parse_date_arg(args, "report_date")
     recipient_recommendations = args.get("recipient_recommendations")
@@ -4391,21 +4396,26 @@ TOOLS: dict[str, dict[str, Any]] = {
             "Export MANY Zoom calls into ONE Markdown document with a table of contents and clear '---' "
             "boundaries between meetings; each meeting has metadata (topic, date, МСК time, duration, "
             "participants) plus its FULL transcript. THIS IS THE DEFAULT TOOL for any 'выгрузи "
-            "созвоны/встречи/транскрипты за <дата или период>' request. For a SINGLE day, pass the SAME date "
-            "in date_from AND date_to — it returns EVERY meeting of that day (days often have 2–3 meetings), "
-            "never just one. Select either by explicit call_ids OR by a "
-            "date_from/date_to range (YYYY-MM-DD). Google Drive transcript imports (noisy duplicates) are "
-            "excluded unless include_google_drive=true. The file is saved server-side and the tool returns "
-            "{download_url, filename, calls, chars, bytes, preview} — the FULL document is NOT inlined (it "
-            "would be truncated by the client). Give the owner the `download_url` (a public, login-free, "
-            "unguessable link); `preview` is just the first lines for context."
+            "созвоны/встречи/транскрипты за <даты/период>' request, and it ALWAYS returns EVERY meeting on "
+            "the chosen days (a day often has 2–3 meetings). Choose ONE selector: "
+            "(1) `dates` — an array of specific YYYY-MM-DD days (USE THIS for a list of non-contiguous days, "
+            "e.g. 7,8,14,15 мая → dates=['2026-05-07','2026-05-08','2026-05-14','2026-05-15']); "
+            "(2) `date_from`+`date_to` — a continuous range (for one day pass the same date twice); "
+            "(3) `call_ids` — only if you already have exact ids. "
+            "DO NOT call list_zoom_calls and paginate it to collect ids — just pass `dates`; this tool "
+            "resolves all meetings itself in ONE call. Google Drive transcript imports (noisy duplicates) "
+            "are excluded unless include_google_drive=true. The file is saved server-side and the tool "
+            "returns {download_url, filename, calls, chars, bytes, preview} — the FULL document is NOT "
+            "inlined (it would be truncated by the client). Give the owner the `download_url` (a public, "
+            "login-free, unguessable link); `preview` is just the first lines for context."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "call_ids": {"type": "array", "items": {"type": "string"}, "description": "Explicit Zoom call ids; overrides the date range."},
-                "date_from": {"type": "string", "description": "YYYY-MM-DD"},
-                "date_to": {"type": "string", "description": "YYYY-MM-DD"},
+                "dates": {"type": "array", "items": {"type": "string"}, "description": "Specific days as YYYY-MM-DD. Best for a list of non-contiguous days; returns ALL meetings on each."},
+                "call_ids": {"type": "array", "items": {"type": "string"}, "description": "Explicit Zoom call ids; overrides dates and the range."},
+                "date_from": {"type": "string", "description": "YYYY-MM-DD (continuous range start)"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD (continuous range end)"},
                 "include_google_drive": {"type": "boolean", "description": "Keep Google Drive transcript imports (default false)."},
             },
             "additionalProperties": False,
@@ -4700,7 +4710,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "List addressed manager recommendations from the current owner_daily_report for a given date. "
             "Returns rows with id, manager_full_name, manager_bitrix_user_id, recommendation_text, subject, priority, due_date, status. "
             "Also returns the report summary, dynamics_summary, risks_summary, and report_text so the agent can build "
-            "personal message drafts (e.g. add the day conclusion to Evgeniy's draft). "
+            "the per-recipient recommendation list that will become each person's Bitrix task. "
             "Excludes recommendations already sent, cancelled, done, or rejected. "
             "Use this after save_owner_daily_report and before send_owner_recommendations_to_bitrix."
         ),
@@ -4716,13 +4726,16 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "send_owner_recommendations_to_bitrix": {
         "description": (
-            "Send owner_daily_report recommendations to Bitrix recipients as personal messages from the configured "
-            "BITRIX_WEBHOOK_BASE account (owner). STRICT RULE: do not call this tool unless the owner has just "
-            "approved the exact final texts you are about to send. Confirm=true is mandatory. "
-            "Each entry in recipient_recommendations is treated as a complete final message for that Bitrix user id — "
-            "send it as-is, do not edit or wrap. Uses im.message.add with fallback to im.notify.personal.add if the "
-            "private chat is blocked. Logs the outcome to owner_recommendation_dispatches and updates "
-            "owner_manager_recommendations.status to 'sent' for matching rows."
+            "Create owner_daily_report recommendation TASKS in Bitrix from the configured BITRIX_WEBHOOK_BASE account "
+            "(owner) — one task per recipient, NOT personal messages. Each task is titled 'Рекомендации DD.MM', the "
+            "recipient is the responsible person, the description asks them to react (неактуально / взял в работу / "
+            "уже в работе / уже есть результат / уже есть рабочий файл — «ссылка») and then lists their recommendations. "
+            "The deadline is fixed at 10:00 the next day (Europe/Moscow) and the assignee cannot move it "
+            "(ALLOW_CHANGE_DEADLINE=N). STRICT RULE: do not call this tool unless the owner has just approved the exact "
+            "recommendation texts. Confirm=true is mandatory. Each entry in recipient_recommendations is the final "
+            "recommendation body for that Bitrix user id (a clean numbered list, no greeting) and becomes the task "
+            "description body verbatim. Uses tasks.task.add. Logs the outcome to owner_recommendation_dispatches and "
+            "updates owner_manager_recommendations.status to 'sent' for matching rows."
         ),
         "inputSchema": {
             "type": "object",
@@ -4730,12 +4743,12 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "report_date": {"type": "string", "description": "YYYY-MM-DD — the owner_daily_report date."},
                 "recipient_recommendations": {
                     "type": "object",
-                    "description": "Map of bitrix_user_id -> final personal message text. Each value is sent as-is.",
+                    "description": "Map of bitrix_user_id -> final recommendation body (clean numbered list, no greeting). Becomes the task description body verbatim.",
                     "additionalProperties": {"type": "string"},
                 },
                 "confirm": {
                     "type": "boolean",
-                    "description": "Must be true. Means the owner has explicitly approved sending these exact texts.",
+                    "description": "Must be true. Means the owner has explicitly approved creating these recommendation tasks.",
                 },
             },
             "required": ["report_date", "recipient_recommendations", "confirm"],

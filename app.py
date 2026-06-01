@@ -3479,29 +3479,36 @@ def export_zoom_call_markdown(call_id: str) -> dict[str, Any]:
 
 def export_zoom_calls_markdown(
     call_ids: list[str] | None = None,
+    dates: list[Any] | None = None,
     date_from: Any = None,
     date_to: Any = None,
     include_google_drive: bool = False,
 ) -> dict[str, Any]:
     """Markdown export for MANY Zoom calls into one document with a table of contents
-    and clear ``---`` boundaries. Select either by explicit ``call_ids`` or by a
-    ``date_from``/``date_to`` range. Google Drive transcript imports (noisy metadata,
-    usually duplicates of the Zoom API recording) are excluded unless requested."""
+    and clear ``---`` boundaries. Selection priority: explicit ``call_ids`` >
+    ``dates`` (an explicit list of YYYY-MM-DD days — best for several non-contiguous
+    days, returns EVERY meeting on each) > ``date_from``/``date_to`` range. Google
+    Drive transcript imports (noisy duplicates) are excluded unless requested."""
     ensure_zoom_schema()
     ids: list[str] = []
     if call_ids:
         ids = [str(value).strip() for value in call_ids if str(value).strip()]
     else:
-        date_from_value = safe_parse_date(date_from) if date_from else None
-        date_to_value = safe_parse_date(date_to) if date_to else None
         clauses: list[str] = []
         params: list[Any] = []
-        if date_from_value is not None:
-            clauses.append("call_date >= %s")
-            params.append(date_from_value)
-        if date_to_value is not None:
-            clauses.append("call_date <= %s")
-            params.append(date_to_value)
+        date_values = [parsed for value in (dates or []) if (parsed := safe_parse_date(value)) is not None]
+        if date_values:
+            clauses.append("call_date = ANY(%s)")
+            params.append(date_values)
+        else:
+            date_from_value = safe_parse_date(date_from) if date_from else None
+            date_to_value = safe_parse_date(date_to) if date_to else None
+            if date_from_value is not None:
+                clauses.append("call_date >= %s")
+                params.append(date_from_value)
+            if date_to_value is not None:
+                clauses.append("call_date <= %s")
+                params.append(date_to_value)
         if not include_google_drive:
             clauses.append("COALESCE(zoom_account_key, '') <> 'GOOGLE_DRIVE_TRANSCRIPTS'")
         where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
@@ -3542,10 +3549,18 @@ def export_zoom_calls_markdown(
 
     filename = "zoom_transcripts.md"
     if not call_ids:
-        df = (safe_parse_date(date_from).isoformat() if date_from and safe_parse_date(date_from) else "")
-        dt = (safe_parse_date(date_to).isoformat() if date_to and safe_parse_date(date_to) else "")
-        if df or dt:
-            filename = f"zoom_transcripts_{df or 'start'}_{dt or 'end'}.md"
+        date_values = sorted(parsed for value in (dates or []) if (parsed := safe_parse_date(value)) is not None)
+        if date_values:
+            filename = (
+                f"zoom_transcripts_{date_values[0].isoformat()}.md"
+                if len(date_values) == 1
+                else f"zoom_transcripts_{date_values[0].isoformat()}_{date_values[-1].isoformat()}.md"
+            )
+        else:
+            df = (safe_parse_date(date_from).isoformat() if date_from and safe_parse_date(date_from) else "")
+            dt = (safe_parse_date(date_to).isoformat() if date_to and safe_parse_date(date_to) else "")
+            if df or dt:
+                filename = f"zoom_transcripts_{df or 'start'}_{dt or 'end'}.md"
     return {"calls": total, "filename": filename, "markdown": markdown, "chars": len(markdown)}
 
 
@@ -3612,6 +3627,7 @@ def export_zoom_call_markdown_link(call_id: str) -> dict[str, Any]:
 
 def export_zoom_calls_markdown_link(
     call_ids: list[str] | None = None,
+    dates: list[Any] | None = None,
     date_from: Any = None,
     date_to: Any = None,
     include_google_drive: bool = False,
@@ -3619,7 +3635,7 @@ def export_zoom_calls_markdown_link(
     """export_zoom_calls_markdown + save to disk; returns a download URL instead of inline text."""
     return _zoom_export_link_payload(
         export_zoom_calls_markdown(
-            call_ids=call_ids, date_from=date_from, date_to=date_to, include_google_drive=include_google_drive
+            call_ids=call_ids, dates=dates, date_from=date_from, date_to=date_to, include_google_drive=include_google_drive
         )
     )
 
@@ -13902,6 +13918,41 @@ def bitrix_webhook_client() -> BitrixClient:
     return BitrixClient(webhook_base)
 
 
+# Owner recommendations are delivered as a single Bitrix task per recipient (titled
+# "Рекомендации DD.MM"), not as personal IM messages. The task is created in the
+# evening (~18:00) and its deadline is 10:00 the next day (MSK) and must not be movable.
+RECOMMENDATION_TASK_REACTION_HEADER = (
+    "Ознакомьтесь со списком рекомендаций и дайте на них реакцию:\n"
+    "- неактуально\n"
+    "- взял в работу\n"
+    "- уже в работе\n"
+    "- уже есть результат\n"
+    "- уже есть рабочий файл — «ссылка»"
+)
+
+
+def owner_recommendations_report_anchor_date(report: dict[str, Any], report_kind: str) -> date:
+    raw = report.get("report_date") if report_kind == "daily" else (report.get("period_end") or report.get("report_date"))
+    return safe_parse_date(raw) or msk_today()
+
+
+def owner_recommendations_task_title(report: dict[str, Any], report_kind: str) -> str:
+    anchor = owner_recommendations_report_anchor_date(report, report_kind)
+    return f"Рекомендации {anchor.strftime('%d.%m')}"
+
+
+def owner_recommendations_task_deadline(report: dict[str, Any], report_kind: str) -> tuple[str, str]:
+    anchor = owner_recommendations_report_anchor_date(report, report_kind)
+    due_date = anchor + timedelta(days=1)
+    deadline_at = datetime.combine(due_date, dt_time(10, 0), tzinfo=MSK_TZ)
+    return deadline_at.isoformat(), f"{due_date.strftime('%d.%m.%Y')} 10:00 МСК"
+
+
+def build_owner_recommendation_task_description(body_text: str) -> str:
+    body = str(body_text or "").strip()
+    return f"{RECOMMENDATION_TASK_REACTION_HEADER}\n\nТекст рекомендаций:\n{body}"
+
+
 def send_owner_report_recommendations_to_bitrix(
     report_id: str,
     report_kind: str,
@@ -13934,6 +13985,9 @@ def send_owner_report_recommendations_to_bitrix(
             text = normalize_recommendation_message_text(value)
             if user_id is not None and text:
                 recommendation_texts[user_id] = text
+    task_title = owner_recommendations_task_title(report, report_kind)
+    deadline, deadline_text = owner_recommendations_task_deadline(report, report_kind)
+
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     for user_id in normalized_ids:
@@ -13942,57 +13996,61 @@ def send_owner_report_recommendations_to_bitrix(
             str(user_id) in recipient_recommendations or user_id in recipient_recommendations
         )
         if rows_for_user and not has_custom_text:
-            message = "\n\n".join(
-                f"ID рекомендации: {row['id']}\n{str(row.get('recommendation_text') or '').strip()}"
+            body = "\n\n".join(
+                normalize_recommendation_message_text(row.get("recommendation_text"))
                 for row in rows_for_user
                 if str(row.get("recommendation_text") or "").strip()
             ).strip()
         else:
-            message = normalize_recommendation_message_text(recommendation_texts.get(user_id))
-        if not message:
+            body = normalize_recommendation_message_text(recommendation_texts.get(user_id))
+        if not body:
             errors.append({"user_id": user_id, "error": "Для получателя нет адресной рекомендации."})
             continue
+        description = build_owner_recommendation_task_description(body)
+        # One Bitrix task per recipient. Deadline is fixed (10:00 next day) and the
+        # assignee cannot move it (ALLOW_CHANGE_DEADLINE = N).
+        task_payload = {
+            "fields": {
+                "TITLE": task_title,
+                "DESCRIPTION": description,
+                "RESPONSIBLE_ID": user_id,
+                "DEADLINE": deadline,
+                "ALLOW_CHANGE_DEADLINE": "N",
+            }
+        }
         try:
-            response = client.call_with_fallback(
-                "im.message.add",
-                {"DIALOG_ID": str(user_id), "MESSAGE": message},
-                prefer_api=True,
-            )
+            response = client.call_with_fallback("tasks.task.add", task_payload, prefer_api=True)
+            result_payload = response.get("result") if isinstance(response, dict) else None
+            task_id = None
+            if isinstance(result_payload, dict):
+                task_obj = result_payload.get("task")
+                if isinstance(task_obj, dict):
+                    task_id = task_obj.get("id")
+                if task_id is None:
+                    task_id = result_payload.get("id")
+            task_id = to_int(task_id) or task_id
             if rows_for_user:
-                record_recommendation_dispatch_result(rows_for_user, "bitrix_im", user_id, message, response.get("result"), "sent")
-            results.append({"user_id": user_id, "channel": "bitrix_im", "response": response.get("result")})
-        except Exception as exc:  # noqa: BLE001
-            if not is_bitrix_no_access_error(exc):
-                if rows_for_user:
-                    record_recommendation_dispatch_result(rows_for_user, "bitrix_im", user_id, message, {"error": str(exc)}, "error")
-                errors.append({"user_id": user_id, "error": str(exc)})
-                continue
-            try:
-                response = client.call_with_fallback(
-                    "im.notify.personal.add",
-                    {"USER_ID": user_id, "MESSAGE": message},
-                    prefer_api=True,
+                record_recommendation_dispatch_result(
+                    rows_for_user,
+                    "bitrix_task",
+                    user_id,
+                    description,
+                    {"id": task_id, "task_id": task_id, "result": result_payload},
+                    "sent",
                 )
-                if rows_for_user:
-                    record_recommendation_dispatch_result(rows_for_user, "bitrix_notification", user_id, message, response.get("result"), "sent")
-                results.append({"user_id": user_id, "channel": "bitrix_notification", "response": response.get("result")})
-            except Exception as notify_exc:  # noqa: BLE001
-                if rows_for_user:
-                    record_recommendation_dispatch_result(
-                        rows_for_user,
-                        "bitrix_notification",
-                        user_id,
-                        message,
-                        {"im_message_error": str(exc), "notification_error": str(notify_exc)},
-                        "error",
-                    )
-                errors.append({
-                    "user_id": user_id,
-                    "error": (
-                        "Нет доступа к личному диалогу Bitrix, и персональное уведомление тоже не отправлено. "
-                        f"im.message.add: {exc}; im.notify.personal.add: {notify_exc}"
-                    ),
-                })
+            results.append({
+                "user_id": user_id,
+                "channel": "bitrix_task",
+                "task_id": task_id,
+                "title": task_title,
+                "deadline_text": deadline_text,
+            })
+        except Exception as exc:  # noqa: BLE001
+            if rows_for_user:
+                record_recommendation_dispatch_result(
+                    rows_for_user, "bitrix_task", user_id, description, {"error": str(exc)}, "error"
+                )
+            errors.append({"user_id": user_id, "error": str(exc)})
     return {
         "report": report,
         "report_kind": report_kind,
@@ -14000,6 +14058,8 @@ def send_owner_report_recommendations_to_bitrix(
         "failed": len(errors),
         "results": results,
         "errors": errors,
+        "task_title": task_title,
+        "deadline_text": deadline_text,
     }
 
 
@@ -19391,19 +19451,22 @@ def api_zoom_call_export_markdown(call_id: str):
 
 @app.get("/api/zoom-export.md")
 def api_zoom_calls_export_markdown():
-    """Download MANY Zoom calls in one markdown file. Query params: date_from, date_to
-    (YYYY-MM-DD), ids (comma-separated call ids; overrides the date range),
-    include_google_drive=1 to keep Google Drive transcript imports."""
+    """Download MANY Zoom calls in one markdown file. Query params: dates (comma-separated
+    YYYY-MM-DD list for specific/non-contiguous days), date_from, date_to (YYYY-MM-DD range),
+    ids (comma-separated call ids; overrides everything), include_google_drive=1 to keep
+    Google Drive transcript imports."""
     ids_param = (request.args.get("ids") or "").strip()
     call_ids = [part.strip() for part in ids_param.split(",") if part.strip()] or None
+    dates_param = (request.args.get("dates") or "").strip()
+    dates = [part.strip() for part in dates_param.split(",") if part.strip()] or None
     date_from = (request.args.get("date_from") or "").strip() or None
     date_to = (request.args.get("date_to") or "").strip() or None
     include_gd = request.args.get("include_google_drive", "").strip() in {"1", "true", "yes"}
-    if not call_ids and not date_from and not date_to:
-        return jsonify({"error": "Укажите date_from/date_to или ids."}), 400
+    if not call_ids and not dates and not date_from and not date_to:
+        return jsonify({"error": "Укажите dates, date_from/date_to или ids."}), 400
     try:
         result = export_zoom_calls_markdown(
-            call_ids=call_ids, date_from=date_from, date_to=date_to, include_google_drive=include_gd
+            call_ids=call_ids, dates=dates, date_from=date_from, date_to=date_to, include_google_drive=include_gd
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -20913,12 +20976,12 @@ def api_owner_daily_report_send(report_id: str):
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"Ошибка отправки отчета в Bitrix: {exc}"}), 500
     if result["sent"]:
-        message = f"Отчет отправлен: {result['sent']} получател."
+        message = f"Поставлено задач с рекомендациями: {result['sent']}."
         if result["failed"]:
             message += f" Ошибок: {result['failed']}."
     else:
-        first_error = (result.get("errors") or [{}])[0].get("error") or "нет доступа к выбранным получателям"
-        message = f"Отчет не отправлен. Ошибок: {result['failed']}. {first_error}"
+        first_error = (result.get("errors") or [{}])[0].get("error") or "нет адресных рекомендаций для выбранных получателей"
+        message = f"Задачи не поставлены. Ошибок: {result['failed']}. {first_error}"
     return jsonify({**result, "message": message})
 
 
