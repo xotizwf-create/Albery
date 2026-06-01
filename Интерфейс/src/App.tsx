@@ -54,6 +54,7 @@ import {
   Folder,
   FolderOpen,
   Sparkles,
+  Download,
 } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -8048,6 +8049,16 @@ export default function App() {
                 >
                   <FileText className="w-4 h-4" />
                   {zoomTranscriptVisible ? "Посмотреть отчет" : "Посмотреть транскрибацию"}
+                </button>
+                <button
+                  onClick={() => {
+                    window.location.href = `/api/zoom-calls/${encodeURIComponent(selectedZoomCall.id)}/export.md`;
+                  }}
+                  className="h-10 px-4 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-[13px] font-bold flex items-center justify-center gap-2"
+                  title="Скачать транскрипт встречи в Markdown"
+                >
+                  <Download className="w-4 h-4" />
+                  Скачать .md
                 </button>
                 <button
                   onClick={() => void previewZoomOperationalTasks(selectedZoomCall)}
