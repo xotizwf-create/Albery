@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.8.2"
+SERVER_VERSION = "0.9.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3394,6 +3394,29 @@ def tool_dispatch_zoom_operational_tasks(args: dict[str, Any]) -> dict[str, Any]
     return json_safe(result)
 
 
+def tool_list_leader_evaluations(args: dict[str, Any]) -> dict[str, Any]:
+    date_from = parse_date_arg(args, "date_from", required=False)
+    date_to = parse_date_arg(args, "date_to", required=False)
+    workflow = app_workflow_function("list_leader_evaluations")
+    return json_safe(workflow(date_from, date_to))
+
+
+def tool_dispatch_leader_evaluations_digest(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Sending requires confirm=true. The owner must have explicitly approved the leader-evaluation digest "
+            "in Telegram before it is created as a Bitrix task for Евгений Палей.",
+        )
+    digest_text = str(args.get("digest_text") or "").strip()
+    if not digest_text:
+        raise McpError(-32602, "Missing required argument: digest_text")
+    date_from = parse_date_arg(args, "date_from", required=False)
+    date_to = parse_date_arg(args, "date_to", required=False)
+    workflow = app_workflow_function("dispatch_leader_evaluations_digest")
+    return json_safe(workflow(digest_text, date_from, date_to))
+
+
 def _resolve_current_owner_daily_report(cur: Any, report_date: date) -> dict[str, Any]:
     cur.execute(
         """
@@ -4704,6 +4727,46 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_dispatch_zoom_operational_tasks,
+    },
+    "list_leader_evaluations": {
+        "description": (
+            "Read aggregated leader evaluations (how Артур, Наталья, Евгений, Сергей run their calls) across saved "
+            "zoom reports in a date range. Returns by_leader: per leader a list of call evaluations "
+            "{call_date, topic, role (host/co_leader), verdict (good/minor_issue/issue), result_for_owner} plus "
+            "verdict counts, and calls_count. DEFAULT PERIOD: previous Friday .. today (the Wednesday digest window — "
+            "Fri + Mon + Tue + Wed). Use this on the Wednesday owner-digest cron to compose a per-leader summary with "
+            "dynamics, show it to the owner in Telegram for approval, then send via dispatch_leader_evaluations_digest."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "YYYY-MM-DD (default: today minus 5 days = previous Friday)"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD (default: today)"},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_leader_evaluations,
+    },
+    "dispatch_leader_evaluations_digest": {
+        "description": (
+            "Create the weekly leader-evaluation digest as ONE Bitrix task for the owner Евгений Палей: title "
+            "'Ознакомиться с оценкой руководителей за период <даты>', description = the approved digest_text, deadline = "
+            "next calendar day 10:00 МСК (sent Wednesday evening, reviewed by Thursday 10:00). STRICT CONFIRMATION RULE: "
+            "call only after the owner explicitly approved the digest in Telegram ('отправляй'); confirm=true is mandatory. "
+            "digest_text must be the final approved per-leader summary text."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "digest_text": {"type": "string", "description": "Final approved per-leader digest text for the task description."},
+                "date_from": {"type": "string", "description": "YYYY-MM-DD (default: previous Friday)"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD (default: today)"},
+                "confirm": {"type": "boolean", "description": "Must be true. Owner explicitly approved sending the digest."},
+            },
+            "required": ["digest_text", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_dispatch_leader_evaluations_digest,
     },
     "list_pending_owner_recommendations": {
         "description": (
