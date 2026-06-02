@@ -3996,6 +3996,28 @@ def _zoom_ai_analysis(call: dict[str, Any]) -> dict[str, Any]:
     return analysis if isinstance(analysis, dict) else {}
 
 
+def _render_dispatch_summary(value: Any) -> str:
+    """Render dispatch_summary as a clean 'Обсуждали / Решили' block.
+
+    The prompt asks for a two-line string, but the model sometimes returns an
+    object {discussed, decided, ...}. Handle both so the task body is never a raw
+    dict repr.
+    """
+    if isinstance(value, dict):
+        discussed = str(value.get("discussed") or value.get("Обсуждали") or value.get("discussion") or "").strip()
+        decided = str(value.get("decided") or value.get("Решили") or value.get("decisions") or "").strip()
+        parts: list[str] = []
+        if discussed:
+            parts.append(f"Обсуждали: {discussed}")
+        if decided:
+            parts.append(f"Решили: {decided}")
+        if parts:
+            return "\n".join(parts).strip()
+        # Unknown object shape — fall back to any non-empty scalar values.
+        return " ".join(str(v).strip() for v in value.values() if isinstance(v, str) and v.strip()).strip()
+    return str(value or "").strip()
+
+
 def format_zoom_dispatch_summary(call: dict[str, Any]) -> str:
     """Short outward-facing summary (Обсуждали / Решили) from the v9 prompt.
 
@@ -4003,12 +4025,12 @@ def format_zoom_dispatch_summary(call: dict[str, Any]) -> str:
     report predates dispatch_summary (then participants without tasks get nothing).
     """
     analysis = _zoom_ai_analysis(call)
-    text = str(analysis.get("dispatch_summary") or "").strip()
+    text = _render_dispatch_summary(analysis.get("dispatch_summary"))
     if text:
         return text
     raw_json = call.get("raw_json") if isinstance(call.get("raw_json"), dict) else {}
     ai_report = raw_json.get("ai_report") if isinstance(raw_json.get("ai_report"), dict) else {}
-    return str(ai_report.get("dispatch_summary") or "").strip() if isinstance(ai_report, dict) else ""
+    return _render_dispatch_summary(ai_report.get("dispatch_summary")) if isinstance(ai_report, dict) else ""
 
 
 def zoom_call_participants(call: dict[str, Any]) -> list[dict[str, Any]]:
@@ -4077,7 +4099,8 @@ def find_zoom_leader_evaluation(
             return ev
     target = name_aliases.get(normalize_person_name(recipient_name), recipient_name)
     for ev in leader_evals:
-        ev_name_raw = str(ev.get("person_name") or "").strip()
+        # The model sometimes uses leader_name instead of person_name.
+        ev_name_raw = str(ev.get("person_name") or ev.get("leader_name") or "").strip()
         ev_name = name_aliases.get(normalize_person_name(ev_name_raw), ev_name_raw)
         if ev_name and target and person_names_match(ev_name, target):
             return ev
@@ -4175,7 +4198,9 @@ def build_zoom_operational_task_cards(
         if ev is not None:
             card["is_leader"] = True
             card["leader_verdict"] = str(ev.get("verdict") or "").strip().lower() or None
-            card["leader_message"] = str(ev.get("message_for_leader") or "").strip()
+            # message_for_leader is the personal note; fall back to result_for_owner
+            # if the model only produced the owner-facing line.
+            card["leader_message"] = str(ev.get("message_for_leader") or ev.get("result_for_owner") or "").strip()
 
     # 4) Render descriptions.
     cards = [cards_by_key[key] for key in order]
@@ -4341,7 +4366,7 @@ def collect_leader_evaluations_for_period(date_from: date, date_to: date) -> dic
         for ev in evals:
             if not isinstance(ev, dict):
                 continue
-            name = str(ev.get("person_name") or "").strip()
+            name = str(ev.get("person_name") or ev.get("leader_name") or "").strip()
             if not name:
                 continue
             bitrix_user_id = to_int(ev.get("bitrix_user_id"))
