@@ -58,7 +58,31 @@ def test_format_for_bitrix_numbers_and_deadline(app_module):
     assert len(lines) == 2
     assert lines[0].startswith("1.")
     assert lines[1].startswith("2.")
-    assert "Дедлайн - завтра" in lines[0]
-    assert "Критерий результата: готов" in lines[0]
+    assert "Срок: завтра" in lines[0]
+    assert "Критерий: готов" in lines[0]
     # No result criteria -> no criterion clause.
-    assert "Критерий результата" not in lines[1]
+    assert "Критерий:" not in lines[1]
+
+
+def test_zoom_dispatch_title_includes_date_and_time_range(app_module):
+    call = {"date": "2026-06-02", "time_text": "14:00 - 14:42"}
+
+    assert app_module.zoom_dispatch_title(call) == "Итоги созвона 02.06, 14:00 - 14:42"
+
+
+def test_build_zoom_card_description_for_leader_is_personal(app_module):
+    description = app_module.build_zoom_card_description(
+        "Обсуждали: поставки.\nРешили: сверить таблицу.",
+        "Вы хорошо удержали повестку и мягко вернули обсуждение к срокам.",
+        [
+            {
+                "task_text": "проверить таблицу фабрик",
+                "deadline_text": "03.06.2026",
+                "result_criteria": "таблица обновлена и отправлена Артуру",
+            }
+        ],
+    )
+
+    assert "Оценка Вас как руководителя: Вы хорошо удержали повестку" in description
+    assert app_module.ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO in description
+    assert "1. Проверить таблицу фабрик. Срок: 03.06.2026. Критерий: таблица обновлена и отправлена Артуру." in description

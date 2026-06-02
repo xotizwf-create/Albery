@@ -8,6 +8,7 @@ import html
 import logging
 import mimetypes
 import os
+import subprocess
 from queue import Empty, Queue
 import re
 import time
@@ -2691,6 +2692,7 @@ def upsert_zoom_recording_meeting(
         return {
             "status": "skipped_unchanged",
             "uuid": meeting_uuid,
+            "call_id": str(existing.get("id") or ""),
             "transcript_files": len(transcript_files),
         }
 
@@ -2845,6 +2847,7 @@ def upsert_zoom_recording_meeting(
     return {
         "status": "synced",
         "uuid": meeting_uuid,
+        "call_id": str(call_id),
         "transcript_files_synced": synced_transcript_files,
         "segments_synced": len(all_cues),
         "participant_error": participant_error,
@@ -2990,6 +2993,39 @@ def enqueue_zoom_recording_event(event_name: str, zoom_uuid: str, payload: dict[
                 return str(cur.fetchone()["id"])
 
 
+def trigger_hermes_zoom_watchdog_from_event() -> dict[str, Any]:
+    """Kick the existing Hermes zoom-to-tasks watchdog after a Zoom transcript event.
+
+    The watchdog remains the source of truth for report generation and Telegram
+    preview. This helper only starts it immediately instead of waiting for cron.
+    """
+    enabled = str(os.getenv("ZOOM_EVENT_TRIGGER_HERMES", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        return {"triggered": False, "reason": "disabled"}
+
+    script_path = Path(os.getenv("HERMES_ZOOM_WATCHDOG_PATH", "/root/.hermes/scripts/zoom_watchdog.sh"))
+    if not script_path.exists():
+        return {"triggered": False, "reason": "watchdog_not_found", "path": str(script_path)}
+
+    state_path = Path(os.getenv("HERMES_ZOOM_WATCHDOG_STATE_PATH", "/root/.hermes/state/zoom_watchdog.last"))
+    try:
+        state_path.unlink(missing_ok=True)
+    except OSError as exc:
+        app.logger.warning("Could not clear Hermes zoom watchdog cooldown: %s", exc)
+
+    try:
+        process = subprocess.Popen(
+            ["bash", str(script_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Could not start Hermes zoom watchdog")
+        return {"triggered": False, "reason": "start_failed", "error": str(exc), "path": str(script_path)}
+    return {"triggered": True, "pid": process.pid, "path": str(script_path)}
+
+
 def process_zoom_recording_event_queue(limit: int = 20) -> dict[str, Any]:
     ensure_zoom_event_queue_schema()
     limit = max(1, min(int(limit or 20), 100))
@@ -3028,6 +3064,8 @@ def process_zoom_recording_event_queue(limit: int = 20) -> dict[str, Any]:
                         continue
         try:
             result = sync_zoom_recording_by_uuid(zoom_uuid, force=False)
+            if event_name == "recording.transcript_completed" and result.get("status") in {"synced", "skipped_unchanged"}:
+                result["hermes_zoom_watchdog"] = trigger_hermes_zoom_watchdog_from_event()
             with pg_connect() as conn:
                 with conn.transaction():
                     with conn.cursor() as cur:
@@ -3862,16 +3900,16 @@ def format_zoom_operational_tasks_for_bitrix(tasks: list[dict[str, Any]]) -> str
         result_criteria = str(task.get("result_criteria") or "").strip().rstrip(".")
         deadline_text = str(task.get("deadline_text") or "срок не указан").strip().rstrip(".")
         line = f"{index}. {task_text}."
+        line += f" Срок: {deadline_text}."
         if result_criteria:
-            line += f" Критерий результата: {result_criteria}."
-        line += f" Дедлайн - {deadline_text}."
+            line += f" Критерий: {result_criteria}."
         lines.append(line)
     return "\n".join(lines).strip()
 
 
 ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO = (
-    "Также прошу ознакомиться со списком выделенных из созвона задач и поставить себе самые важные в Битрикс, "
-    "а в комментариях к задаче указать, что из предложенного сформировано ошибочно, а что вы взяли в работу"
+    "Также во время созвона были выделены следующие задачи, добавьте себе задачи, которые считаете нужными, "
+    "в комментарии напишите, что добавили, а что нет, подтвердите артефактом"
 )
 
 
@@ -4118,12 +4156,39 @@ def build_zoom_card_description(
     if dispatch_summary.strip():
         parts.append(dispatch_summary.strip())
     if leader_message.strip():
-        parts.append(f"Оценка: {leader_message.strip()}")
+        parts.append(f"Оценка Вас как руководителя: {leader_message.strip()}")
     if tasks:
         task_text = format_zoom_operational_tasks_for_bitrix(tasks)
         if task_text:
             parts.append(f"{ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO}\n\n{task_text}")
     return "\n\n".join(parts).strip()
+
+
+def zoom_dispatch_title(call: dict[str, Any]) -> str:
+    call_date = safe_parse_date(call.get("date"))
+    if call_date is None:
+        start_for_date = parse_datetime(call.get("start_time_msk"))
+        call_date = start_for_date.astimezone(MSK_TZ).date() if start_for_date else None
+    date_prefix = call_date.strftime("%d.%m") if call_date else ""
+
+    time_text = str(call.get("time_text") or "").strip()
+    start_text = ""
+    end_text = ""
+    if "-" in time_text:
+        left, right = time_text.split("-", 1)
+        start_text = left.strip()
+        end_text = right.strip()
+    else:
+        start_dt = parse_datetime(call.get("start_time_msk"))
+        end_dt = parse_datetime(call.get("end_time_msk"))
+        start_text = start_dt.astimezone(MSK_TZ).strftime("%H:%M") if start_dt else time_text
+        end_text = end_dt.astimezone(MSK_TZ).strftime("%H:%M") if end_dt else ""
+
+    suffix_parts = [part for part in [date_prefix, start_text] if part]
+    suffix = ", ".join(suffix_parts)
+    if end_text:
+        suffix = f"{suffix} - {end_text}" if suffix else end_text
+    return f"Итоги созвона {suffix or 'созвон'}".strip()
 
 
 def build_zoom_operational_task_cards(
@@ -4224,16 +4289,7 @@ def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = 
     cleaned_section = format_zoom_operational_tasks_for_bitrix(operational_tasks)
 
     team = load_team_members()
-    time_text = str(call.get("time_text") or "").strip()
-    if "-" in time_text:
-        period_text = time_text.split(" ")[0]
-    else:
-        start_dt = parse_datetime(call.get("start_time_msk"))
-        end_dt = parse_datetime(call.get("end_time_msk"))
-        start_hhmm = start_dt.astimezone(MSK_TZ).strftime("%H:%M") if start_dt else ""
-        end_hhmm = end_dt.astimezone(MSK_TZ).strftime("%H:%M") if end_dt else ""
-        period_text = f"{start_hhmm}-{end_hhmm}" if start_hhmm and end_hhmm else start_hhmm or "созвон"
-    title = f"Итоги созвона {period_text}".strip()
+    title = zoom_dispatch_title(call)
     deadline, deadline_text = zoom_dispatch_deadline(call)
 
     task_cards, unmatched_assignees, unmatched_participants = build_zoom_operational_task_cards(

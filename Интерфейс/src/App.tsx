@@ -2455,7 +2455,7 @@ export default function App() {
       );
       const failed = Number(payload.failed || 0);
       setOwnerReportSendStatus(failed > 0 ? "error" : "success");
-      setOwnerReportSendMessage(payload.message || (ownerReportSendMode === "full" ? "PDF-отчет успешно отправлен в Bitrix." : "Рекомендации успешно отправлены в Bitrix."));
+      setOwnerReportSendMessage(payload.message || (ownerReportSendMode === "full" ? "PDF-отчет успешно отправлен в Bitrix." : "Рекомендации поставлены задачами в Bitrix."));
     } catch (error) {
       setOwnerReportSendStatus("error");
       setOwnerReportSendMessage(error instanceof Error ? error.message : "Не удалось отправить отчет.");
@@ -9272,7 +9272,7 @@ export default function App() {
                   <div className="text-[12px] font-medium text-slate-400 mt-1">
                     {ownerReportSendMode === "full"
                       ? "Будет сформирован красивый PDF со всем текстом отчета и таблицами, затем отправлен выбранным людям."
-                      : "Отправляется только текст рекомендаций конкретного человека."}
+                      : "Каждому выбранному человеку ставится задача «Рекомендации ДД.ММ» с его рекомендациями. Дедлайн — до 10:00 следующего дня, переносить нельзя."}
                   </div>
                 </div>
                 <div className="text-[12px] font-bold text-slate-400">Выбрано: {ownerReportRecipientIds.length}</div>
@@ -9337,7 +9337,7 @@ export default function App() {
                   {ownerReportSendStatus === "success"
                     ? ownerReportSendMode === "full"
                       ? "Отчет успешно отправлен. "
-                      : "Рекомендации успешно отправлены. "
+                      : "Рекомендации поставлены задачами. "
                     : ownerReportSendStatus === "error"
                       ? "Ошибка отправки. "
                       : ""}
