@@ -86,8 +86,8 @@ def main() -> int:
                     print("No active zoom_processing prompt found; nothing changed.")
                     return 1
                 current_text = str(active["prompt_text"] or "")
-                if all(m in current_text for m in MARKERS):
-                    print("Active zoom_processing prompt already at v9 (markers present); nothing changed.")
+                if current_text.strip() == new_text.strip():
+                    print("Active zoom_processing prompt already matches local v9 prompt; nothing changed.")
                     return 0
                 new_version = int(active["version"] or 1) + 1
                 if dry_run:
