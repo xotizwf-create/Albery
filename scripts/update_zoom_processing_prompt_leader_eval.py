@@ -95,7 +95,8 @@ def main() -> int:
                         f"[dry-run] would deactivate version {active['version']} (id {active['id']}) and "
                         f"insert version {new_version} (len {len(current_text)} -> {len(new_text)})."
                     )
-                    conn.rollback()
+                    # No writes were issued; returning lets the empty transaction
+                    # commit harmlessly (psycopg forbids explicit rollback here).
                     return 0
                 cur.execute("UPDATE ai_prompts SET is_active = FALSE WHERE id = %s", (active["id"],))
                 cur.execute(
