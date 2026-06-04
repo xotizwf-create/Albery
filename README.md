@@ -25,6 +25,10 @@ Set `DATABASE_URL` in `.env`, then run:
 The Flask runtime is PostgreSQL-only. `DATABASE_URL` is required; local SQLite databases are not used.
 
 ## 1) Bitrix webhook
+
+Important Bitrix requirement:
+- Active Bitrix Marketplace subscription is mandatory. Without it, message delivery and pulling information from Bitrix may stop working.
+
 Create incoming webhook in Bitrix24 and grant scopes:
 - `task`
 - `user`
