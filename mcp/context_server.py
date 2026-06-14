@@ -198,6 +198,19 @@ def safe_table_exists(cur: Any, table_name: str) -> bool:
     return bool(cur.fetchone()["exists"])
 
 
+def column_exists(cur: Any, table_name: str, column_name: str) -> bool:
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s AND column_name = %s
+        ) AS exists
+        """,
+        (table_name, column_name),
+    )
+    return bool(cur.fetchone()["exists"])
+
+
 def tool_health(_: dict[str, Any]) -> dict[str, Any]:
     url = load_database_url()
     parsed = urlparse(url)
@@ -833,18 +846,25 @@ def tool_search_company_knowledge(args: dict[str, Any]) -> dict[str, Any]:
     limit = parse_limit(args, 50)
     offset = parse_offset(args)
 
-    filters = []
-    params: list[Any] = []
-    if query:
-        like = f"%{query}%"
-        filters.append("(f.name ILIKE %s OR COALESCE(f.content, '') ILIKE %s)")
-        params.extend([like, like])
-    where_sql = "WHERE " + " AND ".join(filters) if filters else ""
+    # Trigram similarity threshold for fuzzy name matches (typos / partial words).
+    name_sim_threshold = 0.3
+    like = f"%{query}%"
+    params: dict[str, Any] = {
+        "query": query,
+        "like": like,
+        "sim": name_sim_threshold,
+        "limit": limit,
+        "offset": offset,
+    }
 
     with connect() as conn:
         with conn.cursor() as cur:
             if not safe_table_exists(cur, "company_folders"):
                 return {"items": [], "limit": limit, "offset": offset, "message": "company_folders table does not exist yet."}
+
+            # Russian full-text vector is available after migration 026; fall back to the
+            # plain ILIKE search if the column is not present yet (e.g. mid-deploy).
+            has_tsv = column_exists(cur, "company_folders", "content_tsv")
 
             drive_join = ""
             drive_select = """
@@ -862,6 +882,42 @@ def tool_search_company_knowledge(args: dict[str, Any]) -> dict[str, Any]:
                     ds.mime_type,
                     ds.google_updated_at,
                     ds.raw_json AS drive_raw_json
+                """
+
+            if not query:
+                where_sql = ""
+                order_sql = """
+                    ORDER BY f.updated_at DESC NULLS LAST, lower(f.name)
+                """
+            elif has_tsv:
+                # Hybrid: Russian FTS (word stems) OR fuzzy name (pg_trgm) OR ILIKE substring.
+                # Ranked by FTS relevance + fuzzy name similarity + a small exact-name bonus.
+                where_sql = """
+                    WHERE
+                        f.content_tsv @@ websearch_to_tsquery('russian', %(query)s)
+                        OR f.name ILIKE %(like)s
+                        OR COALESCE(f.content, '') ILIKE %(like)s
+                        OR similarity(f.name, %(query)s) >= %(sim)s
+                """
+                order_sql = """
+                    ORDER BY
+                        (
+                            ts_rank_cd(f.content_tsv, websearch_to_tsquery('russian', %(query)s))
+                            + 0.5 * similarity(f.name, %(query)s)
+                            + CASE WHEN f.name ILIKE %(like)s THEN 0.3 ELSE 0 END
+                        ) DESC,
+                        f.updated_at DESC NULLS LAST,
+                        lower(f.name)
+                """
+            else:
+                where_sql = """
+                    WHERE f.name ILIKE %(like)s OR COALESCE(f.content, '') ILIKE %(like)s
+                """
+                order_sql = """
+                    ORDER BY
+                        CASE WHEN f.name ILIKE %(like)s THEN 0 ELSE 1 END,
+                        f.updated_at DESC NULLS LAST,
+                        lower(f.name)
                 """
 
             cur.execute(
@@ -887,13 +943,10 @@ def tool_search_company_knowledge(args: dict[str, Any]) -> dict[str, Any]:
                 JOIN folder_tree ft ON ft.id = f.id
                 {drive_join}
                 {where_sql}
-                ORDER BY
-                    CASE WHEN %s = '' THEN 0 WHEN f.name ILIKE %s THEN 0 ELSE 1 END,
-                    f.updated_at DESC NULLS LAST,
-                    lower(f.name)
-                LIMIT %s OFFSET %s
+                {order_sql}
+                LIMIT %(limit)s OFFSET %(offset)s
                 """,
-                [*params, query, f"%{query}%", limit, offset],
+                params,
             )
             rows = cur.fetchall()
 
