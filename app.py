@@ -14460,7 +14460,7 @@ def send_owner_report_recommendations_to_bitrix(
             if rows_for_user:
                 record_recommendation_dispatch_result(
                     rows_for_user,
-                    "bitrix_task",
+                    "bitrix_task_create",
                     user_id,
                     description,
                     {"id": task_id, "task_id": task_id, "result": result_payload},
@@ -14468,7 +14468,7 @@ def send_owner_report_recommendations_to_bitrix(
                 )
             results.append({
                 "user_id": user_id,
-                "channel": "bitrix_task",
+                "channel": "bitrix_task_create",
                 "task_id": task_id,
                 "title": task_title,
                 "deadline_text": deadline_text,
@@ -14476,7 +14476,7 @@ def send_owner_report_recommendations_to_bitrix(
         except Exception as exc:  # noqa: BLE001
             if rows_for_user:
                 record_recommendation_dispatch_result(
-                    rows_for_user, "bitrix_task", user_id, description, {"error": str(exc)}, "error"
+                    rows_for_user, "bitrix_task_create", user_id, description, {"error": str(exc)}, "error"
                 )
             errors.append({"user_id": user_id, "error": str(exc)})
     return {
