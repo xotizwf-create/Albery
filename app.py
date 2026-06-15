@@ -20401,6 +20401,28 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
         logging.exception("b24 testbot: app reply failed")
 
 
+def _b24_app_typing(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str) -> None:
+    """Show the bot as 'typing…' — the read/processing signal (no eye reaction on this portal)."""
+    if not (client_endpoint and access_token and bot_id and dialog_id):
+        return
+    try:
+        _b24_app_call(client_endpoint, access_token, "imbot.chat.sendTyping",
+                      {"BOT_ID": bot_id, "DIALOG_ID": dialog_id})
+    except Exception:  # noqa: BLE001
+        logging.debug("b24 testbot: typing failed", exc_info=True)
+
+
+def _b24_app_like(client_endpoint: str, access_token: str, bot_id: Any, message_id: Any) -> None:
+    """👍 on the user's message — the 'request done' signal."""
+    if not (client_endpoint and access_token and bot_id and message_id):
+        return
+    try:
+        _b24_app_call(client_endpoint, access_token, "imbot.message.like",
+                      {"BOT_ID": bot_id, "MESSAGE_ID": message_id})
+    except Exception:  # noqa: BLE001
+        logging.debug("b24 testbot: like failed", exc_info=True)
+
+
 def hermes_brain_answer(user_text: str, dialog_id: str) -> str:
     """Run one turn through the local Hermes brain, restricted to a read-only MCP
     toolset (no terminal/web/code). Per-dialog session keeps short-term context."""
@@ -20426,13 +20448,14 @@ def hermes_brain_answer(user_text: str, dialog_id: str) -> str:
     return answer
 
 
-def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str, user_text: str) -> None:
+def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str, user_text: str, message_id: Any = "") -> None:
     try:
         answer = hermes_brain_answer(user_text, dialog_id)
     except Exception as exc:  # noqa: BLE001
         logging.exception("b24 testbot: hermes brain failed")
         answer = f"Ошибка: {str(exc)[:200]}"
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer)
+    _b24_app_like(client_endpoint, access_token, bot_id, message_id)
 
 
 def _bitrix_imbot_app_event():
@@ -20476,11 +20499,14 @@ def _bitrix_imbot_app_event():
 
     if event_name == "ONIMBOTMESSAGEADD":
         message_text = str(_imbot_event_param(payload, "MESSAGE") or "").strip()
+        message_id = _imbot_event_param(payload, "MESSAGE_ID") or ""
         if not dialog_id or not message_text:
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
+        # Read/processing signal first, then run the agent in the background.
+        _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
         threading.Thread(
             target=_b24_app_process,
-            args=(endpoint, access_token, bot_id, dialog_id, message_text),
+            args=(endpoint, access_token, bot_id, dialog_id, message_text, message_id),
             daemon=True,
         ).start()
         return jsonify({"ok": True, "event": event_name, "accepted": True})
