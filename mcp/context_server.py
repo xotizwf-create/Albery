@@ -3720,6 +3720,38 @@ def tool_send_bitrix_message(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_write_company_sheet(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Запись в Google-таблицу требует confirm=true. Сначала покажи пользователю, что именно впишешь "
+            "(таблица, лист, строки или диапазон), получи явное согласие, и только потом вызови с confirm=true.",
+        )
+    spreadsheet_id = str(args.get("spreadsheet_id") or "").strip()
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", spreadsheet_id)
+    if match:
+        spreadsheet_id = match.group(1)
+    if not spreadsheet_id:
+        raise McpError(-32602, "spreadsheet_id (или ссылка на таблицу) обязателен.")
+    mode = str(args.get("mode") or "append").strip().lower()
+    workflow = app_workflow_function("write_company_google_sheet")
+    try:
+        if mode == "update":
+            result = workflow(spreadsheet_id, args.get("sheet"), "update", None, args.get("range"), args.get("values"))
+        else:
+            rows = args.get("rows") or []
+            if not rows:
+                raise McpError(-32602, "Для mode=append нужен непустой rows (список строк, каждая — список ячеек).")
+            result = workflow(spreadsheet_id, args.get("sheet"), "append", rows, None, None)
+    except McpError:
+        raise
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Sheet write failed: {exc}") from exc
+    return result
+
+
 def tool_cancel_owner_recommendation(args: dict[str, Any]) -> dict[str, Any]:
     rec_id_raw = str(args.get("recommendation_id") or "").strip()
     if not rec_id_raw:
@@ -4909,6 +4941,31 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_send_bitrix_message,
+    },
+    "write_company_sheet": {
+        "description": (
+            "Записать данные в Google-таблицу компании (выполняется от имени владельца через Apps Script, "
+            "поэтому может редактировать таблицы владельца). mode='append' добавляет строки в конец листа "
+            "(rows — список списков ячеек); mode='update' пишет values в A1-диапазон range (напр. 'A2:D11'). "
+            "Принимает spreadsheet_id ИЛИ полную ссылку на таблицу. Перед записью ОБЯЗАТЕЛЬНО покажи пользователю, "
+            "что и куда впишешь, получи согласие, затем вызови с confirm=true. Инструмент только для полного "
+            "доступа (в FAQ-коннекторе недоступен)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": {"type": "string", "description": "ID таблицы или полная ссылка на Google Sheet"},
+                "sheet": {"type": "string", "description": "Имя листа (опц.; по умолчанию первый лист)"},
+                "mode": {"type": "string", "enum": ["append", "update"], "description": "append — строки в конец; update — диапазон"},
+                "rows": {"type": "array", "items": {"type": "array"}, "description": "Для append: список строк (каждая — список ячеек)"},
+                "range": {"type": "string", "description": "Для update: A1-диапазон, напр. 'A2:D11'"},
+                "values": {"type": "array", "items": {"type": "array"}, "description": "Для update: значения для диапазона (список списков)"},
+                "confirm": {"type": "boolean", "description": "Должно быть true после явного согласия пользователя"},
+            },
+            "required": ["spreadsheet_id", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_write_company_sheet,
     },
     "cancel_owner_recommendation": {
         "description": (

@@ -298,6 +298,37 @@ def google_drive_company_sync_config() -> tuple[str, str]:
     return sync_url, token
 
 
+def write_company_google_sheet(
+    spreadsheet_id: str,
+    sheet: str | None = None,
+    mode: str = "append",
+    rows: list | None = None,
+    cell_range: str | None = None,
+    values: list | None = None,
+) -> dict[str, Any]:
+    """Write into a company Google Sheet via the Apps Script web app (runs as the
+    owner, so it can edit the owner's spreadsheets). mode 'append' adds rows to the
+    end; 'update' writes values into an A1 range."""
+    sync_url, token = google_drive_company_sync_config()
+    action = "sheet_update" if mode == "update" else "sheet_append"
+    body: dict[str, Any] = {"token": token, "action": action, "spreadsheet_id": str(spreadsheet_id)}
+    if sheet:
+        body["sheet"] = str(sheet)
+    if action == "sheet_append":
+        body["rows"] = rows or []
+    else:
+        body["range"] = str(cell_range or "")
+        body["values"] = values or []
+    timeout = int(os.getenv("GOOGLE_DRIVE_SYNC_TIMEOUT_SECONDS", "120") or "120")
+    response = requests.post(sync_url, json=body, timeout=timeout)
+    if not response.ok:
+        raise RuntimeError(f"Apps Script HTTP {response.status_code}: {response.text[:300]}")
+    data = response.json()
+    if not isinstance(data, dict) or not data.get("ok"):
+        raise RuntimeError(f"Apps Script sheet write failed: {data}")
+    return data
+
+
 def fetch_google_drive_company_payload(
     known_files: dict[str, dict[str, Any]] | None = None,
     known_folders: dict[str, dict[str, Any]] | None = None,

@@ -70,7 +70,59 @@ function doPost(e) {
     return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
   }
 
+  const action = String(payload.action || '');
+  if (action === 'sheet_append' || action === 'sheet_update') {
+    return handleSheetWrite(action, payload);
+  }
+
   return buildCompanySyncResponse(payload);
+}
+
+// Authenticated write into a Google Sheet (runs as the deploying owner, so it can
+// edit any spreadsheet the owner can edit). action: 'sheet_append' appends rows to
+// the end of a sheet; 'sheet_update' writes values into an A1 range.
+function handleSheetWrite(action, payload) {
+  try {
+    const ssId = String(payload.spreadsheet_id || '');
+    if (!ssId) {
+      return jsonResponse({ ok: false, error: 'spreadsheet_id required' }, 400);
+    }
+    const ss = SpreadsheetApp.openById(ssId);
+    const sheetName = payload.sheet ? String(payload.sheet) : '';
+    let sheet = sheetName ? ss.getSheetByName(sheetName) : ss.getSheets()[0];
+    if (!sheet) {
+      if (payload.create_sheet && sheetName) {
+        sheet = ss.insertSheet(sheetName);
+      } else {
+        return jsonResponse({ ok: false, error: 'sheet not found: ' + sheetName }, 404);
+      }
+    }
+    if (action === 'sheet_append') {
+      const rows = payload.rows || [];
+      if (!rows.length || !Array.isArray(rows[0])) {
+        return jsonResponse({ ok: false, error: 'rows must be a non-empty list of lists' }, 400);
+      }
+      const width = Math.max.apply(null, rows.map(function (r) { return r.length; }));
+      const norm = rows.map(function (r) {
+        const row = r.slice();
+        while (row.length < width) { row.push(''); }
+        return row;
+      });
+      const startRow = sheet.getLastRow() + 1;
+      sheet.getRange(startRow, 1, norm.length, width).setValues(norm);
+      return jsonResponse({ ok: true, spreadsheet_id: ssId, sheet: sheet.getName(), appended_rows: norm.length, start_row: startRow });
+    }
+    // sheet_update
+    const range = String(payload.range || '');
+    const values = payload.values || [];
+    if (!range || !values.length || !Array.isArray(values[0])) {
+      return jsonResponse({ ok: false, error: 'range and values (list of lists) required' }, 400);
+    }
+    sheet.getRange(range).setValues(values);
+    return jsonResponse({ ok: true, spreadsheet_id: ssId, sheet: sheet.getName(), updated_range: range, updated_rows: values.length });
+  } catch (error) {
+    return jsonResponse({ ok: false, error: String(error && error.message ? error.message : error) }, 500);
+  }
 }
 
 function buildCompanySyncResponse(payload) {
