@@ -20547,6 +20547,25 @@ def _b24_session_touch(dialog_id: str) -> None:
         logging.exception("b24 testbot: session touch failed")
 
 
+def _b24_recent_history(dialog_id: str, limit: int = 6) -> list[tuple[str, str]]:
+    """Last successful Q/A pairs for this dialog — we inject them into the prompt
+    because `hermes -z` one-shot calls do NOT persist/resume `--continue` sessions,
+    so the agent has no memory of its own. This is how the bot remembers context."""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT question, answer FROM bitrix_bot_interactions "
+                    "WHERE dialog_id=%s AND status='ok' AND question <> '' "
+                    "ORDER BY id DESC LIMIT %s",
+                    (str(dialog_id), int(limit)),
+                )
+                return [(r["question"], r["answer"]) for r in reversed(cur.fetchall())]
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: history fetch failed")
+        return []
+
+
 def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> str:
     """Run one turn through the local Hermes brain. Toolset is chosen by access tier
     (full owners → full MCP `albery`; everyone else → read-only `albery-faq`). Session
@@ -20562,8 +20581,12 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> st
                 "знания компании через инструменты. Изменять данные нельзя — только справка.]")
     parts = [head]
     if seed:
-        parts.append("Контекст предыдущего разговора: " + seed)
-    parts.append(user_text)
+        parts.append("Сводка более ранней части разговора: " + seed)
+    history = _b24_recent_history(dialog_id, int(os.getenv("B24_TESTBOT_HISTORY_TURNS", "6")))
+    if history:
+        convo = "\n".join(f"Пользователь: {q}\nАссистент: {a}" for q, a in history)
+        parts.append("История этого диалога (предыдущие реплики, помни их):\n" + convo)
+    parts.append("Текущее сообщение пользователя:\n" + user_text)
     prompt = "\n\n".join(parts)
     cmd = ["hermes", "-z", prompt, "--continue", session, "-t", toolset, "--yolo"]
     try:
