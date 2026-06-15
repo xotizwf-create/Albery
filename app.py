@@ -20326,8 +20326,147 @@ def _b24_testbot_process(dialog_id: str, user_text: str) -> None:
     _b24_testbot_reply(dialog_id, answer)
 
 
+# --- Local-application (app-context) flow ---------------------------------
+# Bitrix forbids registering a chat-bot from an inbound webhook ("Client ID not
+# specified"); a local application is required. The app delivers events with an
+# `auth` block (access_token + application_token + client_endpoint); we register
+# the bot on ONAPPINSTALL and reply with the per-event access token. Persistent
+# state (application_token + bot_id + endpoint) lives in a small JSON file so the
+# handler needs no restart after install.
+
+B24_APP_HANDLER_URL = "https://mcp.m4s.ru/bitrix/imbot/app"
+
+
+def _b24_state_path() -> str:
+    return os.getenv("B24_TESTBOT_STATE", "").strip() or "/var/www/albery/.b24_testbot_state.json"
+
+
+def _b24_load_state() -> dict[str, Any]:
+    try:
+        with open(_b24_state_path(), encoding="utf-8") as fh:
+            return json.load(fh) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _b24_save_state(state: dict[str, Any]) -> None:
+    try:
+        with open(_b24_state_path(), "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+    except OSError:
+        logging.exception("b24 testbot: failed to persist state")
+
+
+def _imbot_auth(payload: dict[str, Any], name: str) -> str:
+    for key in (f"auth[{name}]", f"AUTH[{name}]"):
+        if key in payload:
+            value = payload[key]
+            return str((value[0] if isinstance(value, list) and value else value) or "")
+    return ""
+
+
+def _b24_app_call(client_endpoint: str, access_token: str, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = (client_endpoint or "").strip().rstrip("/")
+    if not base or not access_token:
+        raise ValueError("client_endpoint/access_token пусты")
+    resp = requests.post(f"{base}/{method}.json?auth={access_token}", json=payload or {}, timeout=60)
+    if not resp.ok:
+        raise RuntimeError(f"{method}: HTTP {resp.status_code} {resp.text[:300]}")
+    data = resp.json()
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(f"{method}: {data.get('error')} ({data.get('error_description')})")
+    return data if isinstance(data, dict) else {"result": data}
+
+
+def _b24_app_register_bot(client_endpoint: str, access_token: str) -> Any:
+    payload = {
+        "CODE": "hermes_agent",
+        "TYPE": "B",
+        "OPENLINE": "N",
+        "EVENT_MESSAGE_ADD": B24_APP_HANDLER_URL,
+        "EVENT_WELCOME_MESSAGE": B24_APP_HANDLER_URL,
+        "EVENT_BOT_DELETE": B24_APP_HANDLER_URL,
+        "PROPERTIES": {"NAME": "Гермес-ассистент (тест)", "COLOR": "AQUA", "WORK_POSITION": "ИИ-ассистент"},
+    }
+    return _b24_app_call(client_endpoint, access_token, "imbot.register", payload).get("result")
+
+
+def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str, text: str) -> None:
+    if not (client_endpoint and access_token and bot_id and dialog_id):
+        return
+    try:
+        _b24_app_call(client_endpoint, access_token, "imbot.message.add",
+                      {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text})
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: app reply failed")
+
+
+def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str, user_text: str) -> None:
+    try:
+        answer = b24_testbot_run_agent(user_text)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("b24 testbot: agent failed")
+        answer = f"Ошибка: {str(exc)[:200]}"
+    _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer)
+
+
+def _bitrix_imbot_app_event():
+    if request.method == "GET":
+        return jsonify({"ok": True, "message": "Bitrix imbot app endpoint is ready."})
+
+    payload = flatten_request_payload()
+    event_name = str(first_non_empty(payload.get("event"), payload.get("EVENT")) or "").upper()
+    app_token = _imbot_auth(payload, "application_token")
+    access_token = _imbot_auth(payload, "access_token")
+    client_endpoint = _imbot_auth(payload, "client_endpoint")
+    state = _b24_load_state()
+
+    if event_name in ("ONAPPINSTALL", "ONAPPUPDATE"):
+        try:
+            bot_id = state.get("bot_id") or _b24_app_register_bot(client_endpoint, access_token)
+            state.update({"application_token": app_token, "client_endpoint": client_endpoint, "bot_id": bot_id})
+            _b24_save_state(state)
+            return jsonify({"ok": True, "event": event_name, "bot_id": bot_id})
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("b24 app install failed")
+            return jsonify({"ok": False, "event": event_name, "error": str(exc)[:300]}), 200
+
+    stored = state.get("application_token", "")
+    if not stored or not app_token or not hmac.compare_digest(app_token, stored):
+        return jsonify({"error": "forbidden"}), 403
+
+    if event_name in ("ONAPPUNINSTALL", "ONIMBOTDELETE"):
+        _b24_save_state({})
+        return jsonify({"ok": True, "event": event_name})
+
+    bot_id = state.get("bot_id")
+    endpoint = client_endpoint or state.get("client_endpoint", "")
+    dialog_id = str(_imbot_event_param(payload, "DIALOG_ID") or "")
+
+    if event_name == "ONIMBOTJOINCHAT":
+        if dialog_id:
+            _b24_app_reply(endpoint, access_token, bot_id, dialog_id,
+                           "Привет! Я Гермес-ассистент. Спрашивай — помогу по задачам и сотрудникам.")
+        return jsonify({"ok": True, "event": event_name})
+
+    if event_name == "ONIMBOTMESSAGEADD":
+        message_text = str(_imbot_event_param(payload, "MESSAGE") or "").strip()
+        if not dialog_id or not message_text:
+            return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
+        threading.Thread(
+            target=_b24_app_process,
+            args=(endpoint, access_token, bot_id, dialog_id, message_text),
+            daemon=True,
+        ).start()
+        return jsonify({"ok": True, "event": event_name, "accepted": True})
+
+    return jsonify({"ok": True, "event": event_name, "ignored": True}), 200
+
+
 @app.route("/bitrix/imbot/<secret>", methods=["GET", "POST"])
 def bitrix_imbot_webhook(secret: str):
+    if secret == "app":
+        return _bitrix_imbot_app_event()
     if not b24_testbot_secret_valid(secret):
         return jsonify({"error": "forbidden"}), 403
     if request.method == "GET":
