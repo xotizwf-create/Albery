@@ -20448,14 +20448,42 @@ def hermes_brain_answer(user_text: str, dialog_id: str) -> str:
     return answer
 
 
-def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str, user_text: str, message_id: Any = "") -> None:
+def _b24_log_interaction(dialog_id: str, from_user_id: Any, question: str, answer: str,
+                         latency_ms: int, status: str, error: str | None) -> None:
+    """Best-effort analytics row (never breaks the reply path)."""
+    try:
+        session = "bitrix-" + re.sub(r"[^A-Za-z0-9_-]", "", str(dialog_id))[:40]
+        tier = "full" if os.getenv("B24_TESTBOT_TOOLSET", "albery-faq").strip() == "albery" else "faq"
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO bitrix_bot_interactions
+                          (dialog_id, bitrix_user_id, tier, session_name, question, answer, latency_ms, status, error)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (str(dialog_id), to_int(from_user_id), tier, session,
+                         question, answer, latency_ms, status, error),
+                    )
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: interaction log failed")
+
+
+def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
+                     user_text: str, message_id: Any = "", from_user_id: Any = "") -> None:
+    started = time.monotonic()
+    status, error = "ok", None
     try:
         answer = hermes_brain_answer(user_text, dialog_id)
     except Exception as exc:  # noqa: BLE001
         logging.exception("b24 testbot: hermes brain failed")
+        status, error = "error", str(exc)[:500]
         answer = f"Ошибка: {str(exc)[:200]}"
+    latency_ms = int((time.monotonic() - started) * 1000)
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer)
     _b24_app_like(client_endpoint, access_token, bot_id, message_id)
+    _b24_log_interaction(dialog_id, from_user_id, user_text, answer, latency_ms, status, error)
 
 
 def _bitrix_imbot_app_event():
@@ -20500,13 +20528,14 @@ def _bitrix_imbot_app_event():
     if event_name == "ONIMBOTMESSAGEADD":
         message_text = str(_imbot_event_param(payload, "MESSAGE") or "").strip()
         message_id = _imbot_event_param(payload, "MESSAGE_ID") or ""
+        from_user_id = _imbot_event_param(payload, "FROM_USER_ID") or ""
         if not dialog_id or not message_text:
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
         # Read/processing signal first, then run the agent in the background.
         _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
         threading.Thread(
             target=_b24_app_process,
-            args=(endpoint, access_token, bot_id, dialog_id, message_text, message_id),
+            args=(endpoint, access_token, bot_id, dialog_id, message_text, message_id, from_user_id),
             daemon=True,
         ).start()
         return jsonify({"ok": True, "event": event_name, "accepted": True})
