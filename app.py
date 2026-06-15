@@ -20412,27 +20412,128 @@ def _b24_app_typing(client_endpoint: str, access_token: str, bot_id: Any, dialog
         logging.debug("b24 testbot: typing failed", exc_info=True)
 
 
-def _b24_app_like(client_endpoint: str, access_token: str, bot_id: Any, message_id: Any) -> None:
-    """👍 on the user's message — the 'request done' signal."""
-    if not (client_endpoint and access_token and bot_id and message_id):
+def _b24_app_react(client_endpoint: str, access_token: str, message_id: Any, reaction: str, add: bool = True) -> None:
+    """Add/remove a chat reaction (👀 eyes on read, 👍 like on done) via the IM v2 API."""
+    if not (client_endpoint and access_token and message_id):
         return
+    method = "im.v2.Chat.Message.Reaction.add" if add else "im.v2.Chat.Message.Reaction.delete"
     try:
-        _b24_app_call(client_endpoint, access_token, "imbot.message.like",
-                      {"BOT_ID": bot_id, "MESSAGE_ID": message_id})
+        _b24_app_call(client_endpoint, access_token, method, {"messageId": message_id, "reaction": reaction})
     except Exception:  # noqa: BLE001
-        logging.debug("b24 testbot: like failed", exc_info=True)
+        logging.debug("b24 testbot: reaction %s/%s failed", reaction, add, exc_info=True)
 
 
-def hermes_brain_answer(user_text: str, dialog_id: str) -> str:
-    """Run one turn through the local Hermes brain, restricted to a read-only MCP
-    toolset (no terminal/web/code). Per-dialog session keeps short-term context."""
-    session = "bitrix-" + re.sub(r"[^A-Za-z0-9_-]", "", str(dialog_id))[:40]
-    toolset = os.getenv("B24_TESTBOT_TOOLSET", "albery-faq").strip() or "albery-faq"
+def _b24_full_user_ids() -> set[int]:
+    return {int(x) for x in re.findall(r"\d+", os.getenv("B24_TESTBOT_FULL_USER_IDS", "14,16"))}
+
+
+def _b24_tier_for(from_user_id: Any) -> str:
+    """Privileged Bitrix users (owners) get the full MCP; everyone else read-only FAQ."""
+    return "full" if to_int(from_user_id) in _b24_full_user_ids() else "faq"
+
+
+# --- Session lifecycle: 8h idle reset + turn-cap rotation with carried summary ----
+# Hermes auto-compression is disabled on this box (it failed on codex), so we bound the
+# context ourselves: each Bitrix dialog maps to an epoch'd session. Idle >8h starts a
+# fresh epoch; after a turn cap we rotate to a new epoch seeded with a short summary of
+# the previous one (conversation-summary-buffer) so long threads never blow the window.
+B24_IDLE_RESET_SECONDS = int(os.getenv("B24_TESTBOT_IDLE_RESET_SECONDS", "28800"))
+B24_TURN_CAP = int(os.getenv("B24_TESTBOT_TURN_CAP", "16"))
+
+
+def _b24_summarize_segment(dialog_id: str) -> str | None:
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT question, answer FROM bitrix_bot_interactions WHERE dialog_id=%s ORDER BY id DESC LIMIT 20",
+                    (str(dialog_id),),
+                )
+                rows = cur.fetchall()
+        if not rows:
+            return None
+        convo = "\n".join(f"- {r['question']} → {r['answer']}" for r in reversed(rows))[:6000]
+        proc = subprocess.run(
+            ["hermes", "-z", "Сожми диалог в 3-4 предложениях как контекст для продолжения, по-русски:\n\n" + convo,
+             "-t", "albery-faq", "--yolo"],
+            capture_output=True, text=True, timeout=90, cwd="/root", env={**os.environ, "HOME": "/root"},
+        )
+        return (proc.stdout or "").strip() or None
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: summarize failed")
+        return None
+
+
+def _b24_session_prepare(dialog_id: str) -> tuple[str, str | None]:
+    """Return (session_name, seed_summary_for_this_turn) applying idle reset / cap rotation."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(dialog_id))[:40]
+    now = datetime.now(timezone.utc)
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT epoch, turns, summary, last_at FROM bitrix_bot_sessions WHERE dialog_id=%s FOR UPDATE",
+                        (str(dialog_id),),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        cur.execute(
+                            "INSERT INTO bitrix_bot_sessions (dialog_id, epoch, turns, last_at) VALUES (%s, 1, 0, %s)",
+                            (str(dialog_id), now),
+                        )
+                        return f"bitrix-{safe}-e1", None
+                    epoch, turns, summary, last_at = row["epoch"], row["turns"], row["summary"], row["last_at"]
+                    idle = (now - last_at).total_seconds() if last_at else 1e12
+                    seed: str | None = None
+                    if idle > B24_IDLE_RESET_SECONDS:
+                        epoch, turns, summary = epoch + 1, 0, None
+                    elif turns >= B24_TURN_CAP:
+                        seed = _b24_summarize_segment(dialog_id) or summary
+                        epoch, turns, summary = epoch + 1, 0, seed
+                    elif turns == 0:
+                        seed = summary
+                    cur.execute(
+                        "UPDATE bitrix_bot_sessions SET epoch=%s, turns=%s, summary=%s, last_at=%s WHERE dialog_id=%s",
+                        (epoch, turns, summary, now, str(dialog_id)),
+                    )
+                    return f"bitrix-{safe}-e{epoch}", seed
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: session prepare failed")
+        return f"bitrix-{safe}-e1", None
+
+
+def _b24_session_touch(dialog_id: str) -> None:
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE bitrix_bot_sessions SET turns = turns + 1, last_at = now() WHERE dialog_id = %s",
+                        (str(dialog_id),),
+                    )
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: session touch failed")
+
+
+def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> str:
+    """Run one turn through the local Hermes brain. Toolset is chosen by access tier
+    (full owners → full MCP `albery`; everyone else → read-only `albery-faq`). Session
+    lifecycle (idle reset + cap rotation + carried summary) is handled by _b24_session_prepare."""
+    session, seed = _b24_session_prepare(dialog_id)
+    toolset = "albery" if tier == "full" else "albery-faq"
     timeout_s = int(os.getenv("B24_TESTBOT_HERMES_TIMEOUT", "170"))
-    prompt = (
-        "[Канал: Битрикс24, пишет сотрудник компании. Отвечай кратко, по-русски, "
-        "опираясь на знания компании через инструменты.]\n\n" + user_text
-    )
+    if tier == "full":
+        head = ("[Канал: Битрикс24, пишет руководитель (полный доступ). Отвечай кратко, по-русски. "
+                "Можешь использовать все инструменты, но любое изменение данных сначала подтверждай с человеком.]")
+    else:
+        head = ("[Канал: Битрикс24, пишет сотрудник компании. Отвечай кратко, по-русски, опираясь на "
+                "знания компании через инструменты. Изменять данные нельзя — только справка.]")
+    parts = [head]
+    if seed:
+        parts.append("Контекст предыдущего разговора: " + seed)
+    parts.append(user_text)
+    prompt = "\n\n".join(parts)
     cmd = ["hermes", "-z", prompt, "--continue", session, "-t", toolset, "--yolo"]
     try:
         proc = subprocess.run(
@@ -20448,12 +20549,11 @@ def hermes_brain_answer(user_text: str, dialog_id: str) -> str:
     return answer
 
 
-def _b24_log_interaction(dialog_id: str, from_user_id: Any, question: str, answer: str,
+def _b24_log_interaction(dialog_id: str, from_user_id: Any, tier: str, question: str, answer: str,
                          latency_ms: int, status: str, error: str | None) -> None:
     """Best-effort analytics row (never breaks the reply path)."""
     try:
         session = "bitrix-" + re.sub(r"[^A-Za-z0-9_-]", "", str(dialog_id))[:40]
-        tier = "full" if os.getenv("B24_TESTBOT_TOOLSET", "albery-faq").strip() == "albery" else "faq"
         with pg_connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
@@ -20473,17 +20573,21 @@ def _b24_log_interaction(dialog_id: str, from_user_id: Any, question: str, answe
 def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
                      user_text: str, message_id: Any = "", from_user_id: Any = "") -> None:
     started = time.monotonic()
+    tier = _b24_tier_for(from_user_id)
     status, error = "ok", None
     try:
-        answer = hermes_brain_answer(user_text, dialog_id)
+        answer = hermes_brain_answer(user_text, dialog_id, tier)
     except Exception as exc:  # noqa: BLE001
         logging.exception("b24 testbot: hermes brain failed")
         status, error = "error", str(exc)[:500]
         answer = f"Ошибка: {str(exc)[:200]}"
     latency_ms = int((time.monotonic() - started) * 1000)
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer)
-    _b24_app_like(client_endpoint, access_token, bot_id, message_id)
-    _b24_log_interaction(dialog_id, from_user_id, user_text, answer, latency_ms, status, error)
+    # done: swap 👀 (read) → 👍 (done) on the user's message.
+    _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
+    _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
+    _b24_session_touch(dialog_id)
+    _b24_log_interaction(dialog_id, from_user_id, tier, user_text, answer, latency_ms, status, error)
 
 
 def _bitrix_imbot_app_event():
@@ -20531,7 +20635,8 @@ def _bitrix_imbot_app_event():
         from_user_id = _imbot_event_param(payload, "FROM_USER_ID") or ""
         if not dialog_id or not message_text:
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
-        # Read/processing signal first, then run the agent in the background.
+        # Read signal: 👀 reaction + typing indicator, then run the agent in the background.
+        _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
         _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
         threading.Thread(
             target=_b24_app_process,

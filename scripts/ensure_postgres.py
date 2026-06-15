@@ -29,6 +29,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "company_drive_folders": "021_company_drive_folders.sql",
     "integration_sync_status": "023_integration_sync_status.sql",
     "bitrix_bot_interactions": "027_bitrix_bot_interactions.sql",
+    "bitrix_bot_sessions": "028_bitrix_bot_sessions.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {
