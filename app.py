@@ -20401,11 +20401,36 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
         logging.exception("b24 testbot: app reply failed")
 
 
+def hermes_brain_answer(user_text: str, dialog_id: str) -> str:
+    """Run one turn through the local Hermes brain, restricted to a read-only MCP
+    toolset (no terminal/web/code). Per-dialog session keeps short-term context."""
+    session = "bitrix-" + re.sub(r"[^A-Za-z0-9_-]", "", str(dialog_id))[:40]
+    toolset = os.getenv("B24_TESTBOT_TOOLSET", "albery-faq").strip() or "albery-faq"
+    timeout_s = int(os.getenv("B24_TESTBOT_HERMES_TIMEOUT", "170"))
+    prompt = (
+        "[Канал: Битрикс24, пишет сотрудник компании. Отвечай кратко, по-русски, "
+        "опираясь на знания компании через инструменты.]\n\n" + user_text
+    )
+    cmd = ["hermes", "-z", prompt, "--continue", session, "-t", toolset, "--yolo"]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s,
+            cwd="/root", env={**os.environ, "HOME": "/root"},
+        )
+    except subprocess.TimeoutExpired:
+        return "Долго думаю — попробуй короче или переформулируй вопрос."
+    answer = (proc.stdout or "").strip()
+    if not answer:
+        logging.error("hermes brain empty: rc=%s err=%s", proc.returncode, (proc.stderr or "")[:300])
+        return "Мозг временно недоступен, попробуй ещё раз чуть позже."
+    return answer
+
+
 def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str, user_text: str) -> None:
     try:
-        answer = b24_testbot_run_agent(user_text)
+        answer = hermes_brain_answer(user_text, dialog_id)
     except Exception as exc:  # noqa: BLE001
-        logging.exception("b24 testbot: agent failed")
+        logging.exception("b24 testbot: hermes brain failed")
         answer = f"Ошибка: {str(exc)[:200]}"
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer)
 
