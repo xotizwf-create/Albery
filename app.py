@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import os
 import subprocess
+import threading
 from queue import Empty, Queue
 import re
 import time
@@ -19250,6 +19251,7 @@ AUTH_EXEMPT_PREFIXES = (
     "/sse",
     "/sse-faq",
     "/bitrix/events/",
+    "/bitrix/imbot/",
     "/zoom/events/",
     "/google-drive/events/",
     "/zoom-export/",
@@ -19342,7 +19344,7 @@ def canonical_web_redirect():
     current_host = request.host.split(":", 1)[0].lower()
     if current_host in {canonical_host, mcp_host}:
         return None
-    if request.path.startswith(("/mcp", "/mcp-faq", "/sse", "/sse-faq", "/bitrix/events/", "/zoom/events/", "/google-drive/events/")) and mcp_host:
+    if request.path.startswith(("/mcp", "/mcp-faq", "/sse", "/sse-faq", "/bitrix/events/", "/bitrix/imbot/", "/zoom/events/", "/google-drive/events/")) and mcp_host:
         target_host = mcp_host
     else:
         target_host = canonical_host
@@ -20080,6 +20082,278 @@ def api_process_bitrix_task_events():
     payload = request.get_json(silent=True) or request.form
     limit = to_int(payload.get("limit")) or 20
     return jsonify(process_bitrix_task_event_queue(limit=limit))
+
+
+# ---------------------------------------------------------------------------
+# Bitrix24 chat-bot (sandbox): an agentic assistant living on a SEPARATE inbound
+# webhook (B24_TESTBOT_WEBHOOK_BASE) so it never touches the production
+# BITRIX_WEBHOOK_BASE integration. It reuses the existing OpenAI-compatible LLM
+# layer (llm_* helpers) for tool-calling, and the existing BitrixClient for REST.
+# ---------------------------------------------------------------------------
+
+B24_TESTBOT_SYSTEM_PROMPT = (
+    "Ты — ассистент внутри Битрикс24 (тестовый портал-песочница). Отвечай кратко, по-русски. "
+    "Ты умеешь работать с задачами и сотрудниками портала через инструменты. "
+    "Прежде чем создать или закрыть задачу, убедись, что знаешь ответственного: если назван человек по "
+    "имени — сначала вызови list_users и найди его ID; при неоднозначности переспроси. "
+    "Не выдумывай ID, задачи и имена — опирайся только на данные инструментов. "
+    "После действия коротко подтверди результат (номер задачи, кому, дедлайн)."
+)
+
+B24_TESTBOT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_users",
+            "description": "Список активных сотрудников портала (id, имя, должность). Используй для резолва имени в ID.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tasks",
+            "description": "Список задач портала. Можно отфильтровать по ответственному.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "responsible_id": {"type": "integer", "description": "ID ответственного (опц.)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_task",
+            "description": "Создать задачу в Битриксе.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "responsible_id": {"type": "integer"},
+                    "description": {"type": "string"},
+                    "deadline": {"type": "string", "description": "Дедлайн ISO8601, напр. 2026-06-20T18:00:00, опц."},
+                },
+                "required": ["title", "responsible_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_task",
+            "description": "Завершить задачу по её ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "integer"}},
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Отправить личное сообщение сотруднику портала по его ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["user_id", "text"],
+            },
+        },
+    },
+]
+
+
+def b24_testbot_secret_valid(secret: str) -> bool:
+    expected = os.getenv("B24_TESTBOT_SECRET", "").strip()
+    if not expected:
+        return False
+    return hmac.compare_digest(secret, expected)
+
+
+def b24_testbot_client() -> BitrixClient:
+    base = os.getenv("B24_TESTBOT_WEBHOOK_BASE", "").strip()
+    if not base:
+        raise ValueError("B24_TESTBOT_WEBHOOK_BASE не задан в .env")
+    return BitrixClient(base)
+
+
+def _imbot_event_param(payload: dict[str, Any], name: str) -> Any:
+    """Read a Bitrix imbot form field flattened as data[PARAMS][<name>]."""
+    for key in (f"data[PARAMS][{name}]", f"data[params][{name}]"):
+        if key in payload:
+            value = payload[key]
+            return value[0] if isinstance(value, list) and value else value
+    return None
+
+
+def _b24_testbot_call(client: BitrixClient, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    # Plain webhook path first (standard /rest/<id>/<token>/), API path as fallback.
+    return client.call_with_fallback(method, payload, prefer_api=False)
+
+
+def _b24_testbot_exec_tool(client: BitrixClient, name: str, args: dict[str, Any]) -> str:
+    try:
+        if name == "list_users":
+            data = _b24_testbot_call(client, "user.get", {"ACTIVE": True})
+            rows = data.get("result") or []
+            users = [
+                {
+                    "id": to_int(u.get("ID")),
+                    "name": " ".join(p for p in (u.get("NAME"), u.get("LAST_NAME")) if p).strip() or u.get("EMAIL"),
+                    "position": u.get("WORK_POSITION") or "",
+                }
+                for u in rows
+                if isinstance(u, dict)
+            ]
+            return json.dumps({"users": users}, ensure_ascii=False)
+
+        if name == "list_tasks":
+            filt: dict[str, Any] = {}
+            resp_id = to_int(args.get("responsible_id"))
+            if resp_id:
+                filt["RESPONSIBLE_ID"] = resp_id
+            data = _b24_testbot_call(
+                client,
+                "tasks.task.list",
+                {"filter": filt, "select": ["ID", "TITLE", "STATUS", "RESPONSIBLE_ID", "DEADLINE"]},
+            )
+            result = data.get("result") or {}
+            tasks = result.get("tasks", result) if isinstance(result, dict) else result
+            return json.dumps({"tasks": tasks}, ensure_ascii=False)[:6000]
+
+        if name == "create_task":
+            title = str(args.get("title") or "").strip()
+            resp_id = to_int(args.get("responsible_id"))
+            if not title or not resp_id:
+                return json.dumps({"error": "title и responsible_id обязательны"}, ensure_ascii=False)
+            fields: dict[str, Any] = {"TITLE": title, "RESPONSIBLE_ID": resp_id}
+            if args.get("description"):
+                fields["DESCRIPTION"] = str(args["description"])
+            if args.get("deadline"):
+                fields["DEADLINE"] = str(args["deadline"])
+            data = _b24_testbot_call(client, "tasks.task.add", {"fields": fields})
+            task = (data.get("result") or {}).get("task") or {}
+            return json.dumps({"created_task_id": to_int(task.get("id")), "title": task.get("title")}, ensure_ascii=False)
+
+        if name == "complete_task":
+            task_id = to_int(args.get("task_id"))
+            if not task_id:
+                return json.dumps({"error": "task_id обязателен"}, ensure_ascii=False)
+            _b24_testbot_call(client, "tasks.task.complete", {"taskId": task_id})
+            return json.dumps({"completed_task_id": task_id}, ensure_ascii=False)
+
+        if name == "send_message":
+            user_id = to_int(args.get("user_id"))
+            text = str(args.get("text") or "").strip()
+            if not user_id or not text:
+                return json.dumps({"error": "user_id и text обязательны"}, ensure_ascii=False)
+            _b24_testbot_call(client, "im.message.add", {"DIALOG_ID": str(user_id), "MESSAGE": text})
+            return json.dumps({"sent_to": user_id}, ensure_ascii=False)
+
+        return json.dumps({"error": f"неизвестный инструмент {name}"}, ensure_ascii=False)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": str(exc)[:300]}, ensure_ascii=False)
+
+
+def b24_testbot_run_agent(user_text: str) -> str:
+    api_key = llm_api_key()
+    if not api_key:
+        return "LLM не настроен (нет OPENAI_API_KEY/GOOGLE_API_KEY)."
+    model = os.getenv("B24_TESTBOT_MODEL", "").strip() or os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    client = b24_testbot_client()
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": B24_TESTBOT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_text},
+    ]
+    max_steps = max(1, int(os.getenv("B24_TESTBOT_MAX_STEPS", "6")))
+    for _ in range(max_steps):
+        response = llm_post_with_retry(
+            llm_api_url("/chat/completions"),
+            llm_auth_headers(api_key),
+            {
+                "model": model,
+                "messages": messages,
+                "tools": B24_TESTBOT_TOOLS,
+                "tool_choice": "auto",
+                "temperature": 0.2,
+            },
+            timeout=max(60, int(os.getenv("B24_TESTBOT_TIMEOUT_SECONDS", "90"))),
+        )
+        if not response.ok:
+            return f"Ошибка LLM: HTTP {response.status_code} {response.text[:200]}"
+        message = (response.json().get("choices") or [{}])[0].get("message") or {}
+        messages.append(message)
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return (message.get("content") or "").strip() or "(пустой ответ)"
+        for call in tool_calls:
+            fn = call.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result = _b24_testbot_exec_tool(client, fn.get("name") or "", args)
+            messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": result})
+    return "Не уложился в лимит шагов — переформулируй запрос."
+
+
+def _b24_testbot_reply(dialog_id: str, text: str) -> None:
+    bot_id = os.getenv("B24_TESTBOT_BOT_ID", "").strip()
+    if not bot_id or not dialog_id:
+        return
+    try:
+        b24_testbot_client().call_with_fallback(
+            "imbot.message.add",
+            {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text},
+            prefer_api=False,
+        )
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: failed to send reply")
+
+
+def _b24_testbot_process(dialog_id: str, user_text: str) -> None:
+    try:
+        answer = b24_testbot_run_agent(user_text)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("b24 testbot: agent failed")
+        answer = f"Ошибка: {str(exc)[:200]}"
+    _b24_testbot_reply(dialog_id, answer)
+
+
+@app.route("/bitrix/imbot/<secret>", methods=["GET", "POST"])
+def bitrix_imbot_webhook(secret: str):
+    if not b24_testbot_secret_valid(secret):
+        return jsonify({"error": "forbidden"}), 403
+    if request.method == "GET":
+        return jsonify({"ok": True, "message": "Bitrix imbot endpoint is ready."})
+
+    payload = flatten_request_payload()
+    event_name = str(first_non_empty(payload.get("event"), payload.get("EVENT")) or "").upper()
+    if event_name == "ONIMBOTJOINCHAT":
+        dialog_id = str(_imbot_event_param(payload, "DIALOG_ID") or "")
+        if dialog_id:
+            _b24_testbot_reply(dialog_id, "Привет! Я тестовый ассистент. Могу искать сотрудников, ставить и закрывать задачи, писать людям. Что сделать?")
+        return jsonify({"ok": True, "event": event_name})
+    if event_name != "ONIMBOTMESSAGEADD":
+        return jsonify({"ok": True, "event": event_name, "ignored": True}), 200
+
+    dialog_id = str(_imbot_event_param(payload, "DIALOG_ID") or "")
+    message_text = str(_imbot_event_param(payload, "MESSAGE") or "").strip()
+    # Ignore messages authored by a bot to avoid loops.
+    if str(_imbot_event_param(payload, "FROM_USER_ID") or "") and _imbot_event_param(payload, "MESSAGE") is None:
+        return jsonify({"ok": True, "ignored": True, "reason": "no_message"}), 200
+    if not dialog_id or not message_text:
+        return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
+
+    # Respond to Bitrix immediately; run the (slower) agent loop in the background.
+    threading.Thread(target=_b24_testbot_process, args=(dialog_id, message_text), daemon=True).start()
+    return jsonify({"ok": True, "event": event_name, "accepted": True})
 
 
 @app.route("/zoom/events/<secret>", methods=["GET", "POST"])
