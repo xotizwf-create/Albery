@@ -20452,30 +20452,37 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
 
 def _b24_ensure_command_registered(client_endpoint: str, access_token: str, bot_id: Any) -> None:
     """Best-effort: register the `/new` bot command once so it shows in the chat '/' menu
-    and clicks on the keyboard button resolve. Never breaks the reply path; typing /new
-    works regardless because the message handler also matches it as a keyword."""
+    and the keyboard button resolves. Runs in a background thread so it NEVER blocks the
+    event response; guarded by a state flag so it registers only once. Must use the app
+    access_token (the webhook lacks the client id → ACCESS_DENIED). Typing /new works
+    regardless, because the message handler also matches it as a keyword."""
     if not (client_endpoint and access_token and bot_id):
         return
-    state = _b24_load_state()
-    if state.get("cmd_new_registered"):
+    if _b24_load_state().get("cmd_new_registered"):
         return
-    try:
-        _b24_app_call(client_endpoint, access_token, "imbot.command.register", {
-            "BOT_ID": bot_id,
-            "COMMAND": "new",
-            "COMMON": "N",
-            "HIDDEN": "N",
-            "EXTRANET_SUPPORT": "N",
-            "LANG": [
-                {"LANGUAGE_ID": "ru", "TITLE": "Новая сессия", "PARAMS": ""},
-                {"LANGUAGE_ID": "en", "TITLE": "New session", "PARAMS": ""},
-            ],
-            "EVENT_COMMAND_ADD": B24_APP_HANDLER_URL,
-        })
-        state["cmd_new_registered"] = True
-        _b24_save_state(state)
-    except Exception:  # noqa: BLE001
-        logging.debug("b24 testbot: command register failed", exc_info=True)
+
+    def _do() -> None:
+        try:
+            _b24_app_call(client_endpoint, access_token, "imbot.command.register", {
+                "BOT_ID": bot_id,
+                "COMMAND": "new",
+                "COMMON": "N",
+                "HIDDEN": "N",
+                "EXTRANET_SUPPORT": "N",
+                "LANG": [
+                    {"LANGUAGE_ID": "ru", "TITLE": "Новая сессия", "PARAMS": ""},
+                    {"LANGUAGE_ID": "en", "TITLE": "New session", "PARAMS": ""},
+                ],
+                "EVENT_COMMAND_ADD": B24_APP_HANDLER_URL,
+            })
+            st = _b24_load_state()
+            st["cmd_new_registered"] = True
+            _b24_save_state(st)
+            logging.info("b24 testbot: /new command registered")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("b24 testbot: command register failed: %s", exc)
+
+    threading.Thread(target=_do, daemon=True).start()
 
 
 def _b24_app_typing(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str) -> None:
@@ -20750,6 +20757,7 @@ def _b24_do_reset(client_endpoint: str, access_token: str, bot_id: Any, dialog_i
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id,
                    "🆕 Начал новую сессию — предыдущий контекст очищен. Спрашивайте!",
                    keyboard=_b24_reset_keyboard())
+    _b24_ensure_command_registered(client_endpoint, access_token, bot_id)
 
 
 def _bitrix_imbot_app_event():
@@ -20784,6 +20792,10 @@ def _bitrix_imbot_app_event():
     bot_id = state.get("bot_id")
     endpoint = client_endpoint or state.get("client_endpoint", "")
     dialog_id = str(_imbot_event_param(payload, "DIALOG_ID") or "")
+
+    # Self-heal: ensure the /new command is registered (background, one-time, no-op after).
+    if access_token and bot_id and endpoint and event_name in ("ONIMBOTMESSAGEADD", "ONIMCOMMANDADD"):
+        _b24_ensure_command_registered(endpoint, access_token, bot_id)
 
     if event_name == "ONIMBOTJOINCHAT":
         if dialog_id:
