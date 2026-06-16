@@ -185,15 +185,31 @@ def ensure_fresh(conn: Any) -> dict[str, Any]:
         return {"status": "error", "error": str(exc)}
 
 
+def _broaden_fts(query: str, min_word_len: int = 3) -> str | None:
+    """Turn a multi-word query into an OR-of-words FTS string for a wider recall pass.
+
+    websearch_to_tsquery treats spaces as AND, so "график зум созвонов" needs ALL three
+    stems and misses a doc that only contains "Зум". Joining with OR lets the strongest
+    word still match. Returns None for single-word queries (nothing to broaden)."""
+    words = [w for w in re.findall(r"\w+", query, flags=re.UNICODE) if len(w) >= min_word_len]
+    if len(words) < 2:
+        return None
+    return " OR ".join(dict.fromkeys(words))  # de-dupe, keep order
+
+
 def search_chunks(conn: Any, query: str, limit: int = 6, offset: int = 0,
-                  per_doc: int = 2, name_sim_threshold: float = 0.3) -> list[dict[str, Any]]:
+                  per_doc: int = 2, name_sim_threshold: float = 0.3,
+                  fts_text: str | None = None) -> list[dict[str, Any]]:
     """Hybrid lexical retrieval over chunks: Russian FTS + pg_trgm + ILIKE.
 
     Returns at most ``per_doc`` chunks per document (diversity), ranked by a fused score.
+    ``fts_text`` overrides the full-text query expression (used for the OR-broadened pass);
+    ILIKE/similarity still use the raw ``query``.
     """
     like = f"%{query}%"
     params = {
         "q": query,
+        "ftsq": fts_text if fts_text is not None else query,
         "like": like,
         "sim": name_sim_threshold,
         "per_doc": per_doc,
@@ -209,14 +225,14 @@ def search_chunks(conn: Any, query: str, limit: int = 6, offset: int = 0,
                 c.path,
                 c.content,
                 (
-                    ts_rank_cd(c.content_tsv, websearch_to_tsquery('russian', %(q)s))
+                    ts_rank_cd(c.content_tsv, websearch_to_tsquery('russian', %(ftsq)s))
                     + 0.4 * similarity(c.content, %(q)s)
                     + 0.5 * similarity(c.name, %(q)s)
                     + CASE WHEN c.name ILIKE %(like)s THEN 0.3 ELSE 0 END
                 ) AS score
             FROM company_knowledge_chunks c
             WHERE
-                c.content_tsv @@ websearch_to_tsquery('russian', %(q)s)
+                c.content_tsv @@ websearch_to_tsquery('russian', %(ftsq)s)
                 OR c.name ILIKE %(like)s
                 OR c.content ILIKE %(like)s
                 OR similarity(c.name, %(q)s) >= %(sim)s
@@ -235,3 +251,23 @@ def search_chunks(conn: Any, query: str, limit: int = 6, offset: int = 0,
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchall()
+
+
+def search_expanded(conn: Any, query: str, limit: int = 6, offset: int = 0,
+                    per_doc: int = 2) -> tuple[list[dict[str, Any]], str]:
+    """Query-expansion wrapper: strict phrase search first, then an OR-of-words pass.
+
+    Returns (rows, mode) where mode is 'strict' | 'broad' | 'empty'. Lets the lexical
+    layer recover recall for phrasings like 'график зум созвонов' (0 strict hits) by
+    matching the single discriminating word ('зум'); true synonym gaps are still handed
+    back to the agent (mode='empty') to rephrase.
+    """
+    rows = search_chunks(conn, query, limit=limit, offset=offset, per_doc=per_doc)
+    if rows:
+        return rows, "strict"
+    broad = _broaden_fts(query)
+    if broad:
+        rows = search_chunks(conn, query, limit=limit, offset=offset, per_doc=per_doc, fts_text=broad)
+        if rows:
+            return rows, "broad"
+    return [], "empty"

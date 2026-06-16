@@ -894,12 +894,12 @@ def tool_search_company_knowledge(args: dict[str, Any]) -> dict[str, Any]:
                         "or read a full document with get_company_file(folder_id).",
             }
 
-        # Query → chunked passage retrieval (preferred).
+        # Query → chunked passage retrieval (preferred), with query-expansion fallback.
         if chunks_ready:
-            from shared.knowledge_chunks import ensure_fresh, search_chunks
+            from shared.knowledge_chunks import ensure_fresh, search_expanded
 
             ensure_fresh(conn)  # cheap signature check; re-chunks only changed docs
-            rows = search_chunks(conn, query, limit=limit, offset=offset)
+            rows, mode = search_expanded(conn, query, limit=limit, offset=offset)
             items = [
                 {
                     "folder_id": r["folder_id"],
@@ -912,12 +912,28 @@ def tool_search_company_knowledge(args: dict[str, Any]) -> dict[str, Any]:
                 }
                 for r in rows
             ]
+            if not items:
+                return {
+                    "items": [],
+                    "limit": limit,
+                    "offset": offset,
+                    "note": "Ничего не найдено по этому запросу. ПЕРЕФОРМУЛИРУЙТЕ синонимами и вызовите "
+                            "search_company_knowledge ещё раз перед выводом «не нашёл» (напр.: "
+                            "«созвоны»→«встречи/планёрки/Zoom/созвоны», «график»→«расписание/периодичность/ритм», "
+                            "«зарплата»→«оплата труда/штатное расписание/ФОТ»). Либо вызовите без query, "
+                            "чтобы увидеть список документов, и откройте нужный через get_company_file(folder_id).",
+                }
+            note = (
+                "Найдено по отдельным словам (широкий поиск) — проверьте релевантность; если не то, "
+                "переформулируйте синонимами и поищите ещё раз. "
+                if mode == "broad"
+                else "Focused passages (chunks), not full documents. "
+            )
             return {
                 "items": items,
                 "limit": limit,
                 "offset": offset,
-                "note": "Focused passages (chunks), not full documents. "
-                        "Read the whole document with get_company_file(folder_id).",
+                "note": note + "Read the whole document with get_company_file(folder_id).",
             }
 
         # Fallback: chunks table not built yet (brief mid-deploy window). Legacy whole-doc
@@ -4190,7 +4206,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_get_company_file,
     },
     "search_company_knowledge": {
-        "description": "Search the persistent 'О компании' knowledge base, including Google Drive mirrored docs/sheets. Use for rules, regulations, processes, and company facts before searching chats.",
+        "description": "Search the persistent 'О компании' knowledge base, including Google Drive mirrored docs/sheets. Use for rules, regulations, processes, and company facts before searching chats. Returns focused passages (chunks); read a full document with get_company_file(folder_id). If a search returns no results, RETRY with synonyms/rephrasings (e.g. 'созвоны'→'встречи/планёрки/Zoom', 'график'→'расписание/периодичность/ритм') before concluding nothing exists.",
         "inputSchema": {
             "type": "object",
             "properties": {
