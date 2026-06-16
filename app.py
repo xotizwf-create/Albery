@@ -20456,7 +20456,13 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
                    text: str, keyboard: list[dict[str, Any]] | None = None) -> None:
     if not (client_endpoint and access_token and bot_id and dialog_id):
         return
-    params: dict[str, Any] = {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text}
+    # Footnote under every bot message (configurable/disable via B24_DISCLAIMER="").
+    disclaimer = os.getenv(
+        "B24_DISCLAIMER",
+        "[i]Ответы Албери AI могут быть неточными. Проверяйте важную информацию.[/i]",
+    ).strip()
+    body = f"{text}\n\n{disclaimer}" if disclaimer else text
+    params: dict[str, Any] = {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": body}
     if keyboard:
         params["KEYBOARD"] = keyboard
     try:
