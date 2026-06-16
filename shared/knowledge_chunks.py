@@ -32,6 +32,33 @@ _SIGNATURE_KEY = "chunk_signature"
 
 _PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
 
+# Folders whose name starts with these are sync artifacts (an interrupted Drive sync
+# leaves "__sync_tmp__<doc>" orphans that duplicate the real document). They are excluded
+# from the chunk index so search never returns a document twice.
+_EXCLUDE_NAME_PREFIXES = ("__sync_tmp__",)
+
+_BR_TAG = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_EMPTY_CELLS = re.compile(r"(?:\|[ \t]*){2,}")  # runs of empty table cells: "|  |  |  |"
+
+
+def _is_excluded(name: str) -> bool:
+    return (name or "").startswith(_EXCLUDE_NAME_PREFIXES)
+
+
+def _normalize_for_index(text: str) -> str:
+    """Light denoising of Drive-mirrored sheet text before chunking.
+
+    Flattened Google Sheets carry empty-cell noise ("|  |  |  |"), <br> tags and a few
+    "∅" placeholders. Collapsing them keeps real content and trims wasted tokens without
+    touching the source document (this runs only on the search index)."""
+    if not text:
+        return text
+    text = _BR_TAG.sub("\n", text)
+    text = text.replace("∅", "")
+    text = _EMPTY_CELLS.sub("| ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
+
 
 def _hard_split(text: str, target: int, overlap: int) -> list[str]:
     out: list[str] = []
@@ -136,7 +163,7 @@ def rebuild(conn: Any, force: bool = False) -> dict[str, Any]:
         state = {row["folder_id"]: row["content_hash"] for row in cur.fetchall()}
         paths = _folder_paths(cur)
 
-        built = skipped = 0
+        built = skipped = excluded = 0
         for f in folders:
             fid = f["id"]
             content = f["content"] or ""
@@ -144,7 +171,14 @@ def rebuild(conn: Any, force: bool = False) -> dict[str, Any]:
             if not force and state.get(fid) == h:
                 skipped += 1
                 continue
-            pieces = chunk_text(content)
+            # Sync artifacts (__sync_tmp__*) duplicate a real doc — index nothing for them,
+            # but still record state so incremental runs skip them by hash next time.
+            if _is_excluded(f["name"]):
+                pieces: list[str] = []
+                excluded += 1
+            else:
+                pieces = chunk_text(_normalize_for_index(content))
+                built += 1
             cur.execute("DELETE FROM company_knowledge_chunks WHERE folder_id = %s", (fid,))
             for idx, piece in enumerate(pieces):
                 cur.execute(
@@ -174,7 +208,8 @@ def rebuild(conn: Any, force: bool = False) -> dict[str, Any]:
             """,
             (_SIGNATURE_KEY, signature),
         )
-        return {"status": "rebuilt", "built": built, "skipped": skipped, "folders": len(folders)}
+        return {"status": "rebuilt", "built": built, "skipped": skipped,
+                "excluded": excluded, "folders": len(folders)}
 
 
 def ensure_fresh(conn: Any) -> dict[str, Any]:
