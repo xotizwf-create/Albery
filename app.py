@@ -20464,23 +20464,26 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
         "B24_DISCLAIMER",
         "Ответы Албери AI могут быть неточными. Проверяйте важную информацию.",
     ).strip()
-    params: dict[str, Any] = {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text}
+    base: dict[str, Any] = {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text}
     if keyboard:
-        params["KEYBOARD"] = keyboard
+        base["KEYBOARD"] = keyboard
+
+    # Prefer a separated grey ATTACH "plashka" (closest to Bitrix CoPilot's footer). If the
+    # portal rejects the ATTACH format, fall back to an INLINE italic footnote so the
+    # disclaimer is ALWAYS visible — and log the exact rejection so the format can be fixed.
     if disclaimer:
-        params["ATTACH"] = [{
-            "COLOR": "#C8C8C8",
-            "BLOCKS": [{"MESSAGE": f"[SIZE=10]ℹ️ {disclaimer}[/SIZE]"}],
-        }]
-    try:
-        _b24_app_call(client_endpoint, access_token, "imbot.message.add", params)
-    except Exception:  # noqa: BLE001
-        # ATTACH may be unsupported/malformed on this portal — deliver the answer plainly.
-        params.pop("ATTACH", None)
+        attach_params = dict(base)
+        attach_params["ATTACH"] = [{"COLOR": "#C8C8C8", "BLOCKS": [{"MESSAGE": disclaimer}]}]
         try:
-            _b24_app_call(client_endpoint, access_token, "imbot.message.add", params)
-        except Exception:  # noqa: BLE001
-            logging.exception("b24 testbot: app reply failed")
+            _b24_app_call(client_endpoint, access_token, "imbot.message.add", attach_params)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("b24 testbot: ATTACH disclaimer rejected (%s) — using inline footnote", exc)
+        base["MESSAGE"] = f"{text}\n\n[i]{disclaimer}[/i]"
+    try:
+        _b24_app_call(client_endpoint, access_token, "imbot.message.add", base)
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: app reply failed")
 
 
 def _b24_ensure_command_registered(client_endpoint: str, access_token: str, bot_id: Any) -> None:
