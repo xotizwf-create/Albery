@@ -4114,6 +4114,109 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_list_bitrix_bot_sessions(args: dict[str, Any]) -> dict[str, Any]:
+    """Overview of conversations employees had with the AI assistant inside Bitrix24 chat —
+    one row per dialog/user from bitrix_bot_interactions (the bot's own log)."""
+    limit = parse_limit(args, 50)
+    date_from = parse_date_arg(args, "date_from", required=False)
+    date_to = parse_date_arg(args, "date_to", required=False)
+    where: list[str] = []
+    params: dict[str, Any] = {"limit": limit}
+    if date_from:
+        where.append("i.created_at >= %(df)s")
+        params["df"] = date_from
+    if date_to:
+        where.append("i.created_at < (%(dt)s::date + 1)")
+        params["dt"] = date_to
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if not safe_table_exists(cur, "bitrix_bot_interactions"):
+                return {"items": [], "limit": limit, "message": "bitrix_bot_interactions table does not exist yet."}
+            cur.execute(
+                f"""
+                SELECT
+                    i.dialog_id,
+                    i.bitrix_user_id,
+                    u.full_name,
+                    u.work_position,
+                    count(*) AS messages,
+                    count(*) FILTER (WHERE i.status <> 'ok') AS errors,
+                    min(i.created_at) AS first_at,
+                    max(i.created_at) AS last_at,
+                    array_remove(array_agg(DISTINCT i.tier), NULL) AS tiers,
+                    round(avg(i.latency_ms))::int AS avg_latency_ms,
+                    max(s.epoch) AS epoch,
+                    max(s.turns) AS turns
+                FROM bitrix_bot_interactions i
+                LEFT JOIN users u ON u.bitrix_user_id = i.bitrix_user_id
+                LEFT JOIN bitrix_bot_sessions s ON s.dialog_id = i.dialog_id
+                {where_sql}
+                GROUP BY i.dialog_id, i.bitrix_user_id, u.full_name, u.work_position
+                ORDER BY max(i.created_at) DESC
+                LIMIT %(limit)s
+                """,
+                params,
+            )
+            items = cur.fetchall()
+    return {"items": items, "limit": limit,
+            "note": "Conversations employees had with the AI assistant in Bitrix24. "
+                    "Use get_bitrix_bot_chat(dialog_id|bitrix_user_id) to read a full transcript."}
+
+
+def tool_get_bitrix_bot_chat(args: dict[str, Any]) -> dict[str, Any]:
+    """Full question→answer transcript of one person's conversation with the AI assistant in
+    Bitrix24 (by dialog_id or bitrix_user_id), for quality analysis."""
+    limit = parse_limit(args, 100)
+    dialog_id = str(args.get("dialog_id") or "").strip()
+    raw_user = args.get("bitrix_user_id")
+    query = str(args.get("query") or "").strip()
+    date_from = parse_date_arg(args, "date_from", required=False)
+    date_to = parse_date_arg(args, "date_to", required=False)
+    if not dialog_id and raw_user in (None, ""):
+        raise McpError(-32602, "Provide dialog_id or bitrix_user_id")
+    where: list[str] = []
+    params: dict[str, Any] = {"limit": limit}
+    if dialog_id:
+        where.append("i.dialog_id = %(d)s")
+        params["d"] = dialog_id
+    if raw_user not in (None, ""):
+        try:
+            params["u"] = int(raw_user)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "bitrix_user_id must be an integer") from exc
+        where.append("i.bitrix_user_id = %(u)s")
+    if query:
+        where.append("(i.question ILIKE %(q)s OR i.answer ILIKE %(q)s)")
+        params["q"] = f"%{query}%"
+    if date_from:
+        where.append("i.created_at >= %(df)s")
+        params["df"] = date_from
+    if date_to:
+        where.append("i.created_at < (%(dt)s::date + 1)")
+        params["dt"] = date_to
+    where_sql = "WHERE " + " AND ".join(where)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if not safe_table_exists(cur, "bitrix_bot_interactions"):
+                return {"items": [], "limit": limit, "message": "bitrix_bot_interactions table does not exist yet."}
+            cur.execute(
+                f"""
+                SELECT i.id, i.created_at, i.dialog_id, i.bitrix_user_id, u.full_name,
+                       i.tier, i.question, i.answer, i.latency_ms, i.status, i.error
+                FROM bitrix_bot_interactions i
+                LEFT JOIN users u ON u.bitrix_user_id = i.bitrix_user_id
+                {where_sql}
+                ORDER BY i.id DESC
+                LIMIT %(limit)s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    rows.reverse()  # chronological order for reading
+    return {"items": rows, "limit": limit}
+
+
 TOOLS: dict[str, dict[str, Any]] = {
     "start_here_always_read_ai_instructions": {
         "description": "MANDATORY FIRST TOOL. Always call this before any company analysis, report, recommendation, or answer. It reads live rules from Настройки -> Инструкции для ИИ and tells the assistant exactly how to work.",
@@ -4435,6 +4538,35 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_search_messages,
+    },
+    "list_bitrix_bot_sessions": {
+        "description": "List conversations/sessions employees had with the AI assistant (Гермес-ассистент) INSIDE Bitrix24 chat — one row per dialog/user with message count, first/last activity, access tier, error count, current session epoch. Use this when asked about chats/sessions/interactions people had with the AI agent/bot in Bitrix (this is the bot's OWN log; human-to-human chats are list_chats/search_messages). Then read a full transcript with get_bitrix_bot_chat.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "YYYY-MM-DD inclusive (optional)."},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD inclusive (optional)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_bitrix_bot_sessions,
+    },
+    "get_bitrix_bot_chat": {
+        "description": "Read the full question→answer transcript of one person's conversation with the AI assistant in Bitrix24 (by dialog_id or bitrix_user_id), to analyze and improve answer quality. Optional `query` filters by substring in the question/answer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dialog_id": {"type": "string", "description": "Bitrix dialog id (from list_bitrix_bot_sessions)."},
+                "bitrix_user_id": {"type": "integer", "description": "Bitrix user id (alternative to dialog_id)."},
+                "query": {"type": "string", "description": "Optional substring filter over question/answer."},
+                "date_from": {"type": "string", "description": "YYYY-MM-DD inclusive (optional)."},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD inclusive (optional)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_get_bitrix_bot_chat,
     },
     "get_chat_transcript": {
         "description": "Get raw chat transcript messages by dialog_id and period, including OCR transcripts for attached images and PDFs.",
