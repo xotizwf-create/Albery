@@ -153,13 +153,34 @@ def write_config_users(user_ids: list[str]) -> None:
 
 
 def restart_gateway() -> str:
+    """Restart the gateway a few seconds LATER, detached.
+
+    This script may be invoked by the agent itself (owner asks in Telegram). The
+    agent runs inside hermes-gateway, so an immediate restart would kill it before
+    it can reply. A short delayed/detached restart lets the agent deliver its
+    confirmation first; the allowlist change is already written to disk by now and
+    takes effect on the restart. Works the same when run directly over SSH.
+    """
+    delay = os.environ.get("TG_ACCESS_RESTART_DELAY", "4")
+    # Prefer a transient systemd timer (survives this process exiting); fall back to nohup.
     try:
-        subprocess.run(["systemctl", "restart", "hermes-gateway"], check=True, timeout=120)
-        out = subprocess.run(["systemctl", "is-active", "hermes-gateway"],
-                             capture_output=True, text=True, timeout=30)
-        return out.stdout.strip() or out.stderr.strip()
-    except Exception as exc:  # pragma: no cover
-        return f"restart-error: {exc}"
+        subprocess.Popen(
+            ["systemd-run", f"--on-active={delay}s",
+             "--unit", f"tg-access-restart-{int(time.time())}",
+             "systemctl", "restart", "hermes-gateway"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return f"перезапуск запланирован через {delay}s"
+    except FileNotFoundError:
+        try:
+            subprocess.Popen(
+                ["bash", "-c", f"sleep {delay}; systemctl restart hermes-gateway"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return f"перезапуск запланирован через {delay}s"
+        except Exception as exc:  # pragma: no cover
+            return f"restart-error: {exc}"
 
 
 # ---- commands --------------------------------------------------------------
