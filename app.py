@@ -20223,6 +20223,21 @@ def _imbot_event_param(payload: dict[str, Any], name: str) -> Any:
     return None
 
 
+def _imbot_scan(payload: dict[str, Any], field: str) -> str:
+    """Robustly pull a field whose flattened key ENDS with `field`, regardless of layout
+    (command events put COMMAND/DIALOG_ID at data[..] or data[PARAMS][..], unlike messages).
+    `field` is matched on the alpha/underscore-normalized key tail, so 'COMMAND' won't grab
+    'COMMAND_ID'/'COMMAND_PARAMS'."""
+    suf = field.upper()
+    for key, value in payload.items():
+        norm = re.sub(r"[^A-Z_]", "", str(key).upper())
+        if norm.endswith(suf):
+            val = value[0] if isinstance(value, list) and value else value
+            if val not in (None, ""):
+                return str(val)
+    return ""
+
+
 def _b24_testbot_call(client: BitrixClient, method: str, payload: dict[str, Any]) -> dict[str, Any]:
     # Plain webhook path first (standard /rest/<id>/<token>/), API path as fallback.
     return client.call_with_fallback(method, payload, prefer_api=False)
@@ -20806,12 +20821,27 @@ def _bitrix_imbot_app_event():
             _b24_ensure_command_registered(endpoint, access_token, bot_id)
         return jsonify({"ok": True, "event": event_name})
 
-    # A '🆕 Новая сессия' button / `/new` command click arrives as ONIMCOMMANDADD.
+    # A '🆕 Новая сессия' button / `/new` command click arrives as ONIMCOMMANDADD. The
+    # command-event field layout differs from messages, so read fields robustly.
     if event_name == "ONIMCOMMANDADD":
-        command = str(_imbot_event_param(payload, "COMMAND") or "").strip().lstrip("/").lower()
-        message_id = _imbot_event_param(payload, "MESSAGE_ID") or ""
-        if dialog_id and command in ("new", "reset", "новая", "сброс"):
-            _b24_do_reset(endpoint, access_token, bot_id, dialog_id, message_id)
+        try:
+            logging.info("b24 testbot: ONIMCOMMANDADD keys=%s", [k for k in payload.keys()][:40])
+        except Exception:  # noqa: BLE001
+            pass
+        command = (_imbot_scan(payload, "COMMAND") or "").strip().lstrip("/").lower()
+        cmd_dialog = dialog_id or _imbot_scan(payload, "DIALOG_ID")
+        message_id = _imbot_scan(payload, "MESSAGE_ID")
+        command_id = _imbot_scan(payload, "COMMAND_ID")
+        # We only registered `/new`, so any command event on a dialog means "reset".
+        if cmd_dialog and (not command or command in ("new", "reset", "новая", "сброс")):
+            _b24_do_reset(endpoint, access_token, bot_id, cmd_dialog, message_id)
+        # Acknowledge the command so Bitrix stops retrying / showing 'typing…' (best-effort).
+        if command_id:
+            try:
+                _b24_app_call(endpoint, access_token, "imbot.command.answer",
+                              {"COMMAND_ID": command_id, "MESSAGE": ""})
+            except Exception:  # noqa: BLE001
+                logging.debug("b24 testbot: command.answer failed", exc_info=True)
         return jsonify({"ok": True, "event": event_name, "command": command})
 
     if event_name == "ONIMBOTMESSAGEADD":
