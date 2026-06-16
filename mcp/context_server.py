@@ -4114,6 +4114,49 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _b24_bot_user_names(user_ids: Any) -> dict[Any, str]:
+    """Resolve bot-portal user ids -> 'First Last' via the bot's own Bitrix webhook (cached).
+    The synced ``users`` table holds the main portal; the chat-bot may run on a different
+    portal where ids differ, so names there won't match — fall back to user.get."""
+    out: dict[Any, str] = {}
+    base = (shared_load_env_value("B24_TESTBOT_WEBHOOK_BASE") or "").strip().rstrip("/")
+    if not base:
+        return out
+    import urllib.parse
+    for uid in {u for u in user_ids if u not in (None, "")}:
+        ck = ("b24_user_name", str(uid))
+        cached = ttl_cache_get(ck)
+        if cached is not None:
+            out[uid] = cached
+            continue
+        name = ""
+        try:
+            data = urllib.parse.urlencode({"ID": uid}).encode()
+            with urllib.request.urlopen(base + "/user.get.json", data=data, timeout=15) as resp:
+                res = json.loads(resp.read().decode()).get("result") or []
+            if res:
+                u0 = res[0]
+                name = " ".join(x for x in (u0.get("NAME"), u0.get("LAST_NAME")) if x).strip() or (u0.get("EMAIL") or "")
+        except Exception:  # noqa: BLE001
+            name = ""
+        ttl_cache_set(ck, name, 3600)
+        out[uid] = name
+    return out
+
+
+def _enrich_bot_user_names(items: list[dict[str, Any]]) -> None:
+    missing = [it.get("bitrix_user_id") for it in items
+               if not it.get("full_name") and it.get("bitrix_user_id") not in (None, "")]
+    if not missing:
+        return
+    names = _b24_bot_user_names(missing)
+    for it in items:
+        if not it.get("full_name"):
+            nm = names.get(it.get("bitrix_user_id"))
+            if nm:
+                it["full_name"] = nm
+
+
 def tool_list_bitrix_bot_sessions(args: dict[str, Any]) -> dict[str, Any]:
     """Overview of conversations employees had with the AI assistant inside Bitrix24 chat —
     one row per dialog/user from bitrix_bot_interactions (the bot's own log)."""
@@ -4159,6 +4202,7 @@ def tool_list_bitrix_bot_sessions(args: dict[str, Any]) -> dict[str, Any]:
                 params,
             )
             items = cur.fetchall()
+    _enrich_bot_user_names(items)
     return {"items": items, "limit": limit,
             "note": "Conversations employees had with the AI assistant in Bitrix24. "
                     "Use get_bitrix_bot_chat(dialog_id|bitrix_user_id) to read a full transcript."}
@@ -4214,6 +4258,7 @@ def tool_get_bitrix_bot_chat(args: dict[str, Any]) -> dict[str, Any]:
             )
             rows = cur.fetchall()
     rows.reverse()  # chronological order for reading
+    _enrich_bot_user_names(rows)
     return {"items": rows, "limit": limit}
 
 
