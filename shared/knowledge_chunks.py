@@ -55,6 +55,9 @@ def _normalize_for_index(text: str) -> str:
         return text
     text = _BR_TAG.sub("\n", text)
     text = text.replace("∅", "")
+    # Drop auto-generated empty column headers ("Колонка 5:") — real columns are named
+    # ("Встречи:", "Участники:"), never "Колонка N". Then collapse the empty cells left behind.
+    text = re.sub(r"Колонка \d+:\s*", "", text)
     text = _EMPTY_CELLS.sub("| ", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text
