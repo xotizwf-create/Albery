@@ -842,115 +842,134 @@ def tool_get_company_file(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_search_company_knowledge(args: dict[str, Any]) -> dict[str, Any]:
-    query = str(args.get("query") or "").strip()
-    limit = parse_limit(args, 50)
-    offset = parse_offset(args)
+    """RAG-style retrieval over company knowledge.
 
-    # Trigram similarity threshold for fuzzy name matches (typos / partial words).
-    name_sim_threshold = 0.3
-    like = f"%{query}%"
-    params: dict[str, Any] = {
-        "query": query,
-        "like": like,
-        "sim": name_sim_threshold,
-        "limit": limit,
-        "offset": offset,
-    }
+    With a ``query`` this returns the few most relevant PASSAGES (chunks ~400 tokens),
+    not whole documents — whole files averaged ~24 KB and burned the model's context.
+    The chunk index self-refreshes (``ensure_fresh``) so edits and Drive syncs are
+    reflected automatically. Read a full document with ``get_company_file(folder_id)``.
+    Without a query it returns a lightweight document list (names/paths + short preview).
+    """
+    query = str(args.get("query") or "").strip()
+    limit = parse_limit(args, 6, max_limit=30)
+    offset = parse_offset(args)
 
     with connect() as conn:
         with conn.cursor() as cur:
             if not safe_table_exists(cur, "company_folders"):
                 return {"items": [], "limit": limit, "offset": offset, "message": "company_folders table does not exist yet."}
+            chunks_ready = safe_table_exists(cur, "company_knowledge_chunks")
 
-            # Russian full-text vector is available after migration 026; fall back to the
-            # plain ILIKE search if the column is not present yet (e.g. mid-deploy).
-            has_tsv = column_exists(cur, "company_folders", "content_tsv")
-
-            drive_join = ""
-            drive_select = """
-                NULL::text AS google_file_id,
-                NULL::text AS source_url,
-                NULL::text AS mime_type,
-                NULL::timestamptz AS google_updated_at,
-                '{}'::jsonb AS drive_raw_json
-            """
-            if safe_table_exists(cur, "company_drive_sources"):
-                drive_join = "LEFT JOIN company_drive_sources ds ON ds.folder_id = f.id"
-                drive_select = """
-                    ds.google_file_id,
-                    ds.source_url,
-                    ds.mime_type,
-                    ds.google_updated_at,
-                    ds.raw_json AS drive_raw_json
-                """
-
-            if not query:
-                where_sql = ""
-                order_sql = """
+        # No query → lightweight listing (names, paths, previews) — never full bodies.
+        if not query:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH RECURSIVE folder_tree AS (
+                        SELECT id, parent_id, name, ARRAY[name]::text[] AS path
+                        FROM company_folders WHERE parent_id IS NULL
+                        UNION ALL
+                        SELECT child.id, child.parent_id, child.name, folder_tree.path || child.name
+                        FROM company_folders child JOIN folder_tree ON folder_tree.id = child.parent_id
+                    )
+                    SELECT
+                        f.id AS folder_id, f.parent_id, f.name,
+                        array_to_string(ft.path, ' / ') AS path,
+                        left(COALESCE(f.content, ''), 200) AS preview,
+                        length(COALESCE(f.content, '')) AS content_length,
+                        f.updated_at
+                    FROM company_folders f
+                    JOIN folder_tree ft ON ft.id = f.id
                     ORDER BY f.updated_at DESC NULLS LAST, lower(f.name)
-                """
-            elif has_tsv:
-                # Hybrid: Russian FTS (word stems) OR fuzzy name (pg_trgm) OR ILIKE substring.
-                # Ranked by FTS relevance + fuzzy name similarity + a small exact-name bonus.
-                where_sql = """
-                    WHERE
-                        f.content_tsv @@ websearch_to_tsquery('russian', %(query)s)
-                        OR f.name ILIKE %(like)s
-                        OR COALESCE(f.content, '') ILIKE %(like)s
-                        OR similarity(f.name, %(query)s) >= %(sim)s
-                """
-                order_sql = """
-                    ORDER BY
-                        (
-                            ts_rank_cd(f.content_tsv, websearch_to_tsquery('russian', %(query)s))
-                            + 0.5 * similarity(f.name, %(query)s)
-                            + CASE WHEN f.name ILIKE %(like)s THEN 0.3 ELSE 0 END
-                        ) DESC,
-                        f.updated_at DESC NULLS LAST,
-                        lower(f.name)
-                """
-            else:
-                where_sql = """
-                    WHERE f.name ILIKE %(like)s OR COALESCE(f.content, '') ILIKE %(like)s
-                """
-                order_sql = """
-                    ORDER BY
-                        CASE WHEN f.name ILIKE %(like)s THEN 0 ELSE 1 END,
-                        f.updated_at DESC NULLS LAST,
-                        lower(f.name)
-                """
-
-            cur.execute(
-                f"""
-                WITH RECURSIVE folder_tree AS (
-                    SELECT id, parent_id, name, ARRAY[name]::text[] AS path
-                    FROM company_folders
-                    WHERE parent_id IS NULL
-                    UNION ALL
-                    SELECT child.id, child.parent_id, child.name, folder_tree.path || child.name
-                    FROM company_folders child
-                    JOIN folder_tree ON folder_tree.id = child.parent_id
+                    LIMIT %(limit)s OFFSET %(offset)s
+                    """,
+                    {"limit": limit, "offset": offset},
                 )
-                SELECT
-                    f.id,
-                    f.parent_id,
-                    f.name,
-                    array_to_string(ft.path, ' / ') AS path,
-                    f.content,
-                    f.updated_at,
-                    {drive_select}
-                FROM company_folders f
-                JOIN folder_tree ft ON ft.id = f.id
-                {drive_join}
-                {where_sql}
-                {order_sql}
-                LIMIT %(limit)s OFFSET %(offset)s
-                """,
-                params,
-            )
-            rows = cur.fetchall()
+                items = cur.fetchall()
+            return {
+                "items": items,
+                "limit": limit,
+                "offset": offset,
+                "note": "Document list (names, paths, previews). Pass a `query` for focused passages, "
+                        "or read a full document with get_company_file(folder_id).",
+            }
 
-    return {"items": rows, "limit": limit, "offset": offset}
+        # Query → chunked passage retrieval (preferred).
+        if chunks_ready:
+            from shared.knowledge_chunks import ensure_fresh, search_chunks
+
+            ensure_fresh(conn)  # cheap signature check; re-chunks only changed docs
+            rows = search_chunks(conn, query, limit=limit, offset=offset)
+            items = [
+                {
+                    "folder_id": r["folder_id"],
+                    "name": r["name"],
+                    "path": r["path"],
+                    "chunk_index": r["chunk_index"],
+                    "content": r["content"],  # the focused passage
+                    "snippet": r["content"],
+                    "score": round(float(r["score"]), 4),
+                }
+                for r in rows
+            ]
+            return {
+                "items": items,
+                "limit": limit,
+                "offset": offset,
+                "note": "Focused passages (chunks), not full documents. "
+                        "Read the whole document with get_company_file(folder_id).",
+            }
+
+        # Fallback: chunks table not built yet (brief mid-deploy window). Legacy whole-doc
+        # hybrid search, but content is truncated so it can't blow up the context.
+        return _legacy_search_company_knowledge(conn, query, limit, offset)
+
+
+def _legacy_search_company_knowledge(conn: Any, query: str, limit: int, offset: int) -> dict[str, Any]:
+    like = f"%{query}%"
+    with conn.cursor() as cur:
+        has_tsv = column_exists(cur, "company_folders", "content_tsv")
+        if has_tsv:
+            where_sql = (
+                "WHERE f.content_tsv @@ websearch_to_tsquery('russian', %(query)s) "
+                "OR f.name ILIKE %(like)s OR COALESCE(f.content, '') ILIKE %(like)s "
+                "OR similarity(f.name, %(query)s) >= 0.3"
+            )
+            order_sql = (
+                "ORDER BY (ts_rank_cd(f.content_tsv, websearch_to_tsquery('russian', %(query)s)) "
+                "+ 0.5 * similarity(f.name, %(query)s)) DESC, f.updated_at DESC NULLS LAST, lower(f.name)"
+            )
+        else:
+            where_sql = "WHERE f.name ILIKE %(like)s OR COALESCE(f.content, '') ILIKE %(like)s"
+            order_sql = "ORDER BY f.updated_at DESC NULLS LAST, lower(f.name)"
+        cur.execute(
+            f"""
+            WITH RECURSIVE folder_tree AS (
+                SELECT id, parent_id, name, ARRAY[name]::text[] AS path
+                FROM company_folders WHERE parent_id IS NULL
+                UNION ALL
+                SELECT child.id, child.parent_id, child.name, folder_tree.path || child.name
+                FROM company_folders child JOIN folder_tree ON folder_tree.id = child.parent_id
+            )
+            SELECT f.id AS folder_id, f.parent_id, f.name,
+                   array_to_string(ft.path, ' / ') AS path,
+                   left(COALESCE(f.content, ''), 1500) AS content,
+                   f.updated_at
+            FROM company_folders f JOIN folder_tree ft ON ft.id = f.id
+            {where_sql}
+            {order_sql}
+            LIMIT %(limit)s OFFSET %(offset)s
+            """,
+            {"query": query, "like": like, "limit": limit, "offset": offset},
+        )
+        items = cur.fetchall()
+    return {
+        "items": items,
+        "limit": limit,
+        "offset": offset,
+        "note": "Fallback search (chunk index not built yet); content truncated to 1500 chars. "
+                "Read a full document with get_company_file(folder_id).",
+    }
 
 
 def tool_list_periods(args: dict[str, Any]) -> dict[str, Any]:
