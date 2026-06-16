@@ -5340,6 +5340,14 @@ TOOLS: dict[str, dict[str, Any]] = {
 }
 
 
+# Google Sheets writing runs through the Apps Script web-app deployed under xotizwf@gmail.com,
+# so every edit is attributed to that account. Owner asked (2026-06-16) to stop that account
+# appearing anywhere until a replacement account is connected. Disable the write tool by default;
+# re-enable with ALBERY_ALLOW_SHEET_WRITE=1 once a new Apps Script account is in place.
+if os.getenv("ALBERY_ALLOW_SHEET_WRITE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    TOOLS.pop("write_company_sheet", None)
+
+
 FAQ_TOOL_NAMES: set[str] = {
     "start_here_always_read_ai_instructions",
     "health",
