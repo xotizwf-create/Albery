@@ -1,5 +1,5 @@
 const FOLDER_ID = '11R9uAL6vkbWDiGvjOnS8k22NQxxmrAlK';
-const CALLS_FOLDER_ID = '11cy4HOs1IPOgrIsI9cVDZMnZ5i4UYgCG';
+// Calls-folder (Zoom transcripts) sync removed 2026-06-16 — unused.
 const SYNC_TOKEN = 'C-NJb3jZB_PYpOAQZboPjcuL7zauBlOul1IYB6dt0dWslO2Rd70B6am-9teKP4aP';
 const TRANSCRIPT_FILE_NAME = 'transcript.txt';
 
@@ -165,14 +165,11 @@ function buildCompanySyncResponse(payload) {
       reason: 'unsupported_mime_type',
     }));
 
-  const callsFolder = DriveApp.getFolderById(CALLS_FOLDER_ID);
-  const transcripts = [];
-  collectTranscriptFiles(callsFolder, [], transcripts);
+  const transcripts = [];  // calls-folder sync removed 2026-06-16 (unused)
 
   return jsonResponse({
     ok: true,
     folder_id: FOLDER_ID,
-    calls_folder_id: CALLS_FOLDER_ID,
     synced_at: new Date().toISOString(),
     folders,
     documents,
