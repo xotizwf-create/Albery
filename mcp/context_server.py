@@ -587,6 +587,7 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
             "Use get_report_contract when generating configured reports.",
             "Use get_report_readiness(date_from,date_to) before building daily/weekly/owner reports to learn in one call what is missing.",
             "Use list_available_sources when freshness, availability, or row counts matter.",
+            "When the user asks what you can do / your capabilities ('что ты умеешь', 'твои возможности'), call get_ai_capabilities — it returns the tier-specific list; answer only within it, and (full access) keep it current with update_ai_capabilities.",
         ],
     }
 
@@ -4262,6 +4263,62 @@ def tool_get_bitrix_bot_chat(args: dict[str, Any]) -> dict[str, Any]:
     return {"items": rows, "limit": limit}
 
 
+def tool_get_ai_capabilities(args: dict[str, Any]) -> dict[str, Any]:
+    """Return what the assistant can do for the CALLER's access tier (full/faq). The tier is
+    taken from the connector (_connector_id injected by handle_request), so the read-only FAQ
+    assistant never sees owner-only powers."""
+    connector_id = args.get("_connector_id") or "full"
+    tier = "faq" if connector_id == "faq" else "full"
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if not safe_table_exists(cur, "ai_agent_capabilities"):
+                return {"tier": tier, "capabilities": "", "message": "ai_agent_capabilities table does not exist yet."}
+            cur.execute("SELECT content, updated_at, updated_by FROM ai_agent_capabilities WHERE tier = %s", (tier,))
+            row = cur.fetchone()
+    can_edit = tier == "full"
+    return {
+        "tier": tier,
+        "capabilities": row["content"] if row else "",
+        "updated_at": row["updated_at"] if row else None,
+        "note": (
+            f"Это твои возможности для текущего уровня доступа ({tier}). Отвечай пользователю "
+            "СТРОГО в рамках этого списка — не обещай того, чего тут нет. "
+            + ("Если узнал/получил новую возможность — дополни список через update_ai_capabilities."
+               if can_edit else "Обновлять список на этом уровне доступа нельзя.")
+        ),
+    }
+
+
+def tool_update_ai_capabilities(args: dict[str, Any]) -> dict[str, Any]:
+    """Self-update the capabilities note (FULL access only — not exposed to the FAQ connector).
+    mode 'append' (default) adds a line; 'replace' overwrites. tier 'full' (default) or 'faq'."""
+    content = str(args.get("content") or "").strip()
+    if not content:
+        raise McpError(-32602, "content is required")
+    tier = str(args.get("tier") or "full").strip().lower()
+    if tier not in ("full", "faq"):
+        raise McpError(-32602, "tier must be 'full' or 'faq'")
+    mode = str(args.get("mode") or "append").strip().lower()
+    if mode not in ("append", "replace"):
+        raise McpError(-32602, "mode must be 'append' or 'replace'")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT content FROM ai_agent_capabilities WHERE tier = %s", (tier,))
+            row = cur.fetchone()
+            existing = (row["content"] if row else "") or ""
+            new_content = content if mode == "replace" else ((existing + "\n" + content).strip() if existing else content)
+            cur.execute(
+                """
+                INSERT INTO ai_agent_capabilities (tier, content, updated_at, updated_by)
+                VALUES (%s, %s, now(), 'agent')
+                ON CONFLICT (tier) DO UPDATE
+                  SET content = EXCLUDED.content, updated_at = now(), updated_by = 'agent'
+                """,
+                (tier, new_content),
+            )
+    return {"tier": tier, "mode": mode, "ok": True, "content": new_content}
+
+
 TOOLS: dict[str, dict[str, Any]] = {
     "start_here_always_read_ai_instructions": {
         "description": "MANDATORY FIRST TOOL. Always call this before any company analysis, report, recommendation, or answer. It reads live rules from Настройки -> Инструкции для ИИ and tells the assistant exactly how to work.",
@@ -4612,6 +4669,25 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_bitrix_bot_chat,
+    },
+    "get_ai_capabilities": {
+        "description": "Return what YOU (this AI assistant) can do, scoped to the caller's access level. Call this whenever the user asks 'что ты умеешь', 'твои возможности', 'what can you do', or before promising an action — and answer strictly within the returned list (it differs for owners vs employees). Your exact tool set is in start_here.available_tools; this is the human-readable, owner-maintained description.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "handler": tool_get_ai_capabilities,
+    },
+    "update_ai_capabilities": {
+        "description": "Record/update the assistant's capabilities note (FULL access only). Use when you gain or are told about a new capability so future sessions know it. mode 'append' (default) adds, 'replace' overwrites; tier 'full' (default) or 'faq'. Keep it concise and truthful.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Text to append or the full replacement."},
+                "mode": {"type": "string", "enum": ["append", "replace"], "description": "Default 'append'."},
+                "tier": {"type": "string", "enum": ["full", "faq"], "description": "Which audience's list. Default 'full'."},
+            },
+            "required": ["content"],
+            "additionalProperties": False,
+        },
+        "handler": tool_update_ai_capabilities,
     },
     "get_chat_transcript": {
         "description": "Get raw chat transcript messages by dialog_id and period, including OCR transcripts for attached images and PDFs.",
@@ -5279,6 +5355,7 @@ FAQ_TOOL_NAMES: set[str] = {
     "list_zoom_calls",
     "get_zoom_call_transcript",
     "search_zoom_transcripts",
+    "get_ai_capabilities",
 }
 
 
@@ -5326,7 +5403,7 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None) 
             args = params.get("arguments") or {}
             if name not in available_tools:
                 raise McpError(-32601, f"Unknown or unavailable tool: {name}")
-            if name == "start_here_always_read_ai_instructions":
+            if name in ("start_here_always_read_ai_instructions", "get_ai_capabilities"):
                 connector_id = "faq" if tool_names == FAQ_TOOL_NAMES else "full"
                 args = {
                     **args,

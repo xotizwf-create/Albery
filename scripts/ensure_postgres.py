@@ -31,6 +31,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "bitrix_bot_interactions": "027_bitrix_bot_interactions.sql",
     "bitrix_bot_sessions": "028_bitrix_bot_sessions.sql",
     "company_knowledge_chunks": "029_company_knowledge_chunks.sql",
+    "ai_agent_capabilities": "031_ai_agent_capabilities.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {
