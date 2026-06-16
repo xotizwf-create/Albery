@@ -20473,7 +20473,12 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
     # disclaimer is ALWAYS visible — and log the exact rejection so the format can be fixed.
     if disclaimer:
         attach_params = dict(base)
-        attach_params["ATTACH"] = [{"COLOR": "#C8C8C8", "BLOCKS": [{"MESSAGE": disclaimer}]}]
+        # Bitrix REST attach = flat array of block objects (NOT the JS-UI COLOR/BLOCKS shape).
+        # A thin grey delimiter + the text reads as a separated footnote under the message.
+        attach_params["ATTACH"] = [
+            {"DELIMITER": {"SIZE": 200, "COLOR": "#C8C8C8"}},
+            {"MESSAGE": disclaimer},
+        ]
         try:
             _b24_app_call(client_endpoint, access_token, "imbot.message.add", attach_params)
             return
