@@ -20437,91 +20437,202 @@ def _b24_app_register_bot(client_endpoint: str, access_token: str) -> Any:
     return _b24_app_call(client_endpoint, access_token, "imbot.register", payload).get("result")
 
 
-def _b24_reset_keyboard() -> list[dict[str, Any]]:
-    """A '🆕 Новая сессия' button under bot replies. It invokes the registered bot
-    command `new`; if the portal delivers it as text instead, the keyword detector
-    (_b24_is_reset_command) still catches '/new'."""
-    return [{
-        "TEXT": "🆕 Новая сессия",
-        "COMMAND": "new",
-        "COMMAND_PARAMS": "/new",
-        "DISPLAY": "LINE",
-        "BG_COLOR": "#29619b",
-        "TEXT_COLOR": "#FFFFFF",
-        "BLOCK": "N",
-    }]
-
-
-def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
-                   text: str, keyboard: list[dict[str, Any]] | None = None) -> None:
-    if not (client_endpoint and access_token and bot_id and dialog_id):
-        return
-    # Disclaimer footnote under every bot message, rendered as a separated grey ATTACH block
-    # (closest a third-party imbot can get to Bitrix CoPilot's native footer). Configurable /
-    # disable via B24_DISCLAIMER="". If the portal rejects the ATTACH format, we retry without
-    # it so the answer is always delivered.
-    disclaimer = os.getenv(
+def _b24_disclaimer() -> str:
+    """The grey footnote shown under every bot message (configurable / disable via B24_DISCLAIMER="")."""
+    return os.getenv(
         "B24_DISCLAIMER",
         "Ответы Албери AI могут быть неточными. Проверяйте важную информацию.",
     ).strip()
+
+
+def _b24_keyboard() -> list[dict[str, Any]]:
+    """Buttons under the bot's latest reply: '🆕 Новая сессия' (resets the dialog via the `new`
+    command) and '⚠️ Сообщить об ошибке' (starts the error-report flow via `report_error`). Only
+    the most recent bot message carries these — _b24_app_reply strips the keyboard off the
+    previous one (see _b24_strip_keyboard) so the chat is not littered with duplicate buttons.
+    Typed '/new' / 'новая сессия' still resets via the _b24_is_reset_command keyword detector."""
+    return [
+        {
+            "TEXT": "🆕 Новая сессия",
+            "COMMAND": "new",
+            "COMMAND_PARAMS": "/new",
+            "DISPLAY": "LINE",
+            "BG_COLOR": "#29619b",
+            "TEXT_COLOR": "#FFFFFF",
+            "BLOCK": "N",
+        },
+        {
+            "TEXT": "⚠️ Сообщить об ошибке",
+            "COMMAND": "report_error",
+            "COMMAND_PARAMS": "/report_error",
+            "DISPLAY": "LINE",
+            "BG_COLOR": "#9b3029",
+            "TEXT_COLOR": "#FFFFFF",
+            "BLOCK": "N",
+        },
+    ]
+
+
+# --- "keyboard only under the last message" bookkeeping ----------------------
+# Bitrix attaches a keyboard per-message, so replying with one each turn stacks a fresh pair of
+# buttons under every bot message (visual spam). We remember the id+text of the message that
+# currently holds the keyboard (per dialog, in the small JSON state) and, when sending a new
+# keyboard'd reply, edit the previous one to drop its keyboard — leaving exactly one live set.
+
+def _b24_get_last_kb(dialog_id: str) -> dict[str, Any] | None:
+    return (_b24_load_state().get("last_kb") or {}).get(str(dialog_id))
+
+
+def _b24_set_last_kb(dialog_id: str, message_id: Any, text: str) -> None:
+    st = _b24_load_state()
+    last_kb = st.get("last_kb") or {}
+    last_kb[str(dialog_id)] = {"id": message_id, "text": text}
+    if len(last_kb) > 300:  # keep the map bounded on a long-lived box
+        last_kb = dict(list(last_kb.items())[-300:])
+    st["last_kb"] = last_kb
+    _b24_save_state(st)
+
+
+def _b24_set_awaiting_error(dialog_id: str) -> None:
+    st = _b24_load_state()
+    awaiting = st.get("awaiting_error") or {}
+    awaiting[str(dialog_id)] = int(time.time())
+    st["awaiting_error"] = awaiting
+    _b24_save_state(st)
+
+
+def _b24_pop_awaiting_error(dialog_id: str, ttl_seconds: int = 3600) -> bool:
+    """True (and clears the flag) if this dialog is awaiting an error description set within ttl."""
+    st = _b24_load_state()
+    awaiting = st.get("awaiting_error") or {}
+    ts = awaiting.pop(str(dialog_id), None)
+    if ts is None:
+        return False
+    st["awaiting_error"] = awaiting
+    _b24_save_state(st)
+    return (int(time.time()) - int(ts)) < ttl_seconds
+
+
+def _b24_strip_keyboard(client_endpoint: str, access_token: str, bot_id: Any,
+                        message_id: Any, text: str) -> None:
+    """Best-effort: edit a previous bot message to drop its keyboard (KEYBOARD='N' clears it).
+    imbot.message.update needs the message body, so we re-send the stored text (and re-attach
+    the same grey disclaimer plashka). Never raises — a lingering button is only cosmetic."""
+    if not (client_endpoint and access_token and bot_id and message_id):
+        return
+    params: dict[str, Any] = {
+        "BOT_ID": bot_id, "MESSAGE_ID": message_id,
+        "MESSAGE": text or " ", "KEYBOARD": "N",
+    }
+    disclaimer = _b24_disclaimer()
+    if disclaimer:
+        with_attach = dict(params)
+        with_attach["ATTACH"] = [
+            {"DELIMITER": {"SIZE": 200, "COLOR": "#C8C8C8"}},
+            {"MESSAGE": disclaimer},
+        ]
+        try:
+            _b24_app_call(client_endpoint, access_token, "imbot.message.update", with_attach)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("b24 testbot: strip-keyboard ATTACH update failed (%s) — retry plain", exc)
+    try:
+        _b24_app_call(client_endpoint, access_token, "imbot.message.update", params)
+    except Exception:  # noqa: BLE001
+        logging.debug("b24 testbot: strip-keyboard update failed", exc_info=True)
+
+
+def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
+                   text: str, keyboard: list[dict[str, Any]] | None = None) -> Any:
+    """Send a bot message; returns the new message id (or None). When a keyboard is attached, the
+    buttons are moved off the previous bot message so only the latest reply shows them.
+
+    The disclaimer footnote under every bot message is a separated grey ATTACH block (closest a
+    third-party imbot gets to Bitrix CoPilot's native footer). If the portal rejects the ATTACH
+    format, we retry with an INLINE italic footnote so the answer is always delivered."""
+    if not (client_endpoint and access_token and bot_id and dialog_id):
+        return None
+    disclaimer = _b24_disclaimer()
     base: dict[str, Any] = {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text}
     if keyboard:
         base["KEYBOARD"] = keyboard
 
-    # Prefer a separated grey ATTACH "plashka" (closest to Bitrix CoPilot's footer). If the
-    # portal rejects the ATTACH format, fall back to an INLINE italic footnote so the
-    # disclaimer is ALWAYS visible — and log the exact rejection so the format can be fixed.
+    new_message_id: Any = None
+    sent_text = text
     if disclaimer:
         attach_params = dict(base)
         # Bitrix REST attach = flat array of block objects (NOT the JS-UI COLOR/BLOCKS shape).
-        # A thin grey delimiter + the text reads as a separated footnote under the message.
         attach_params["ATTACH"] = [
             {"DELIMITER": {"SIZE": 200, "COLOR": "#C8C8C8"}},
             {"MESSAGE": disclaimer},
         ]
         try:
-            _b24_app_call(client_endpoint, access_token, "imbot.message.add", attach_params)
-            return
+            res = _b24_app_call(client_endpoint, access_token, "imbot.message.add", attach_params)
+            new_message_id = res.get("result")
         except Exception as exc:  # noqa: BLE001
             logging.warning("b24 testbot: ATTACH disclaimer rejected (%s) — using inline footnote", exc)
-        base["MESSAGE"] = f"{text}\n\n[i]{disclaimer}[/i]"
-    try:
-        _b24_app_call(client_endpoint, access_token, "imbot.message.add", base)
-    except Exception:  # noqa: BLE001
-        logging.exception("b24 testbot: app reply failed")
+            sent_text = f"{text}\n\n[i]{disclaimer}[/i]"
+            base["MESSAGE"] = sent_text
+    if new_message_id is None:
+        try:
+            res = _b24_app_call(client_endpoint, access_token, "imbot.message.add", base)
+            new_message_id = res.get("result")
+        except Exception:  # noqa: BLE001
+            logging.exception("b24 testbot: app reply failed")
+            return None
+
+    # Keep the buttons only under the latest message: drop the previous keyboard, remember this one.
+    if keyboard and new_message_id:
+        prev = _b24_get_last_kb(dialog_id)
+        if prev and str(prev.get("id")) != str(new_message_id):
+            _b24_strip_keyboard(client_endpoint, access_token, bot_id, prev.get("id"), prev.get("text") or "")
+        _b24_set_last_kb(dialog_id, new_message_id, sent_text)
+    return new_message_id
+
+
+_B24_COMMANDS = [
+    {"COMMAND": "new", "ru": "Новая сессия", "en": "New session"},
+    {"COMMAND": "report_error", "ru": "Сообщить об ошибке", "en": "Report an error"},
+]
 
 
 def _b24_ensure_command_registered(client_endpoint: str, access_token: str, bot_id: Any) -> None:
-    """Best-effort: register the `/new` bot command once so it shows in the chat '/' menu
-    and the keyboard button resolves. Runs in a background thread so it NEVER blocks the
-    event response; guarded by a state flag so it registers only once. Must use the app
-    access_token (the webhook lacks the client id → ACCESS_DENIED). Typing /new works
-    regardless, because the message handler also matches it as a keyword."""
+    """Best-effort: register the bot commands (`/new`, `/report_error`) once so their keyboard
+    buttons resolve and they show in the chat '/' menu. Runs in a background thread so it NEVER
+    blocks the event response; guarded by a state flag so it registers only once per command set.
+    Must use the app access_token (the webhook lacks the client id → ACCESS_DENIED). Already-
+    registered commands return an API error (not a transport one) — treated as success."""
     if not (client_endpoint and access_token and bot_id):
         return
-    if _b24_load_state().get("cmd_new_registered"):
+    if _b24_load_state().get("cmds_registered_v2"):
         return
 
     def _do() -> None:
-        try:
-            _b24_app_call(client_endpoint, access_token, "imbot.command.register", {
-                "BOT_ID": bot_id,
-                "COMMAND": "new",
-                "COMMON": "N",
-                "HIDDEN": "N",
-                "EXTRANET_SUPPORT": "N",
-                "LANG": [
-                    {"LANGUAGE_ID": "ru", "TITLE": "Новая сессия", "PARAMS": ""},
-                    {"LANGUAGE_ID": "en", "TITLE": "New session", "PARAMS": ""},
-                ],
-                "EVENT_COMMAND_ADD": B24_APP_HANDLER_URL,
-            })
+        transport_failed = False
+        for spec in _B24_COMMANDS:
+            try:
+                _b24_app_call(client_endpoint, access_token, "imbot.command.register", {
+                    "BOT_ID": bot_id,
+                    "COMMAND": spec["COMMAND"],
+                    "COMMON": "N",
+                    "HIDDEN": "N",
+                    "EXTRANET_SUPPORT": "N",
+                    "LANG": [
+                        {"LANGUAGE_ID": "ru", "TITLE": spec["ru"], "PARAMS": ""},
+                        {"LANGUAGE_ID": "en", "TITLE": spec["en"], "PARAMS": ""},
+                    ],
+                    "EVENT_COMMAND_ADD": B24_APP_HANDLER_URL,
+                })
+                logging.info("b24 testbot: /%s command registered", spec["COMMAND"])
+            except requests.RequestException as exc:
+                transport_failed = True
+                logging.warning("b24 testbot: command register transport error for %s: %s", spec["COMMAND"], exc)
+            except Exception as exc:  # noqa: BLE001 — API error (e.g. already registered) is fine
+                logging.debug("b24 testbot: command register note for %s: %s", spec["COMMAND"], exc)
+        if not transport_failed:  # only retry on a real connectivity failure
             st = _b24_load_state()
-            st["cmd_new_registered"] = True
+            st["cmds_registered_v2"] = True
             _b24_save_state(st)
-            logging.info("b24 testbot: /new command registered")
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("b24 testbot: command register failed: %s", exc)
 
     threading.Thread(target=_do, daemon=True).start()
 
@@ -20789,7 +20900,7 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
         answer = f"Ошибка: {str(exc)[:200]}"
     latency_ms = int((time.monotonic() - started) * 1000)
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer,
-                   keyboard=_b24_reset_keyboard())
+                   keyboard=_b24_keyboard())
     # done: swap 👀 (read) → 👍 (done) on the user's message.
     _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
     _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
@@ -20807,8 +20918,121 @@ def _b24_do_reset(client_endpoint: str, access_token: str, bot_id: Any, dialog_i
         _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id,
                    "🆕 Начал новую сессию — предыдущий контекст очищен. Спрашивайте!",
-                   keyboard=_b24_reset_keyboard())
+                   keyboard=_b24_keyboard())
     _b24_ensure_command_registered(client_endpoint, access_token, bot_id)
+
+
+# --- "Сообщить об ошибке": ask → capture next message → forward to Telegram + log -----------
+# The notifications group is a Telegram group ("Albery_Уведомления"); generic Bitrix REST is the
+# wrong channel anyway. We deliver via the Telegram Bot API using @albery_ai_bot's token and log
+# every report to bitrix_error_reports (delivered flag + any delivery error) for an audit trail.
+
+def _albery_tg_bot_token() -> str:
+    """Telegram bot token for Albery notifications. Prefer an explicit ALBERY_TG_BOT_TOKEN;
+    otherwise reuse the Hermes gateway bot (@albery_ai_bot) token from /root/.hermes/.env — the
+    albery service runs as root on the same box, so no secret needs to be duplicated."""
+    token = os.getenv("ALBERY_TG_BOT_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        for line in Path("/root/.hermes/.env").read_text(encoding="utf-8").splitlines():
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def _albery_tg_notify(text: str) -> tuple[bool, str | None]:
+    """Send a plain-text message to the Albery notifications Telegram group. Returns (ok, error)."""
+    token = _albery_tg_bot_token()
+    chat_id = os.getenv("ALBERY_ERROR_REPORT_TG_CHAT", "-5283789593").strip()
+    if not token or not chat_id:
+        return False, "telegram token/chat not configured"
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=20,
+        )
+        data = resp.json() if resp.content else {}
+        if not (isinstance(data, dict) and data.get("ok")):
+            detail = data.get("description") if isinstance(data, dict) else resp.text
+            return False, str(detail)[:300]
+        return True, None
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)[:300]
+
+
+def _b24_user_name(client_endpoint: str, access_token: str, user_id: Any) -> str:
+    """Best-effort '<First Last>' for a Bitrix user id (empty string if unavailable)."""
+    uid = to_int(user_id)
+    if not uid:
+        return ""
+    try:
+        data = _b24_app_call(client_endpoint, access_token, "user.get", {"ID": uid})
+        rows = data.get("result") or []
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            u = rows[0]
+            return " ".join(p for p in (u.get("NAME"), u.get("LAST_NAME")) if p).strip()
+    except Exception:  # noqa: BLE001
+        logging.debug("b24 testbot: user.get name lookup failed", exc_info=True)
+    return ""
+
+
+def _b24_log_error_report(dialog_id: str, from_user_id: Any, reporter_name: str,
+                          report_text: str, delivered: bool, delivery_error: str | None) -> None:
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO bitrix_error_reports
+                          (dialog_id, bitrix_user_id, reporter_name, report_text, delivered, delivery_error)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (str(dialog_id), to_int(from_user_id), reporter_name or None,
+                         report_text, bool(delivered), delivery_error),
+                    )
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: error-report log failed")
+
+
+def _b24_start_error_report(client_endpoint: str, access_token: str, bot_id: Any,
+                            dialog_id: str, message_id: Any = "") -> None:
+    """User pressed '⚠️ Сообщить об ошибке' — ask for the description and arm capture of their
+    next message (handled in ONIMBOTMESSAGEADD via _b24_pop_awaiting_error)."""
+    _b24_set_awaiting_error(dialog_id)
+    if message_id:
+        _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
+        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
+    _b24_app_reply(
+        client_endpoint, access_token, bot_id, dialog_id,
+        "Объясните, пожалуйста, в чём заключается ошибка? Опишите одним сообщением — "
+        "я сразу передам Александру.",
+        keyboard=_b24_keyboard(),
+    )
+    _b24_ensure_command_registered(client_endpoint, access_token, bot_id)
+
+
+def _b24_handle_error_report(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
+                             report_text: str, from_user_id: Any, reporter_name: str,
+                             message_id: Any = "") -> None:
+    """Forward a user's error description to the Albery notifications Telegram group and log it."""
+    name = (reporter_name or "").strip() or "Сотрудник"
+    tg_text = f"⚠️ {name} отправил отчёт об ошибке, текст: {report_text}. Я уже иду разбираться дальше."
+    ok, err = _albery_tg_notify(tg_text)
+    _b24_log_error_report(dialog_id, from_user_id, name, report_text, ok, err)
+    if message_id:
+        _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
+        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
+    if ok:
+        confirm = "Спасибо! Передал ваше сообщение Александру — уже разбираемся."
+    else:
+        logging.error("b24 testbot: error report TG delivery failed: %s", err)
+        confirm = "Спасибо! Записал вашу ошибку и передам Александру."
+    _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, confirm, keyboard=_b24_keyboard())
 
 
 def _bitrix_imbot_app_event():
@@ -20853,12 +21077,13 @@ def _bitrix_imbot_app_event():
             _b24_app_reply(endpoint, access_token, bot_id, dialog_id,
                            "Привет! Я Гермес-ассистент. Спрашивайте — помогу по задачам и сотрудникам.\n"
                            "Чтобы начать разговор заново, нажмите «🆕 Новая сессия» или напишите /new.",
-                           keyboard=_b24_reset_keyboard())
+                           keyboard=_b24_keyboard())
             _b24_ensure_command_registered(endpoint, access_token, bot_id)
         return jsonify({"ok": True, "event": event_name})
 
-    # A '🆕 Новая сессия' button / `/new` command click arrives as ONIMCOMMANDADD. The
-    # command-event field layout differs from messages, so read fields robustly.
+    # A keyboard button / slash command click arrives as ONIMCOMMANDADD. The command-event field
+    # layout differs from messages, so read fields robustly: `report_error` starts the error-report
+    # flow; `new` (or an empty/unknown command) resets the session.
     if event_name == "ONIMCOMMANDADD":
         try:
             logging.info("b24 testbot: ONIMCOMMANDADD keys=%s", [k for k in payload.keys()][:40])
@@ -20868,8 +21093,9 @@ def _bitrix_imbot_app_event():
         cmd_dialog = dialog_id or _imbot_scan(payload, "DIALOG_ID")
         message_id = _imbot_scan(payload, "MESSAGE_ID")
         command_id = _imbot_scan(payload, "COMMAND_ID")
-        # We only registered `/new`, so any command event on a dialog means "reset".
-        if cmd_dialog and (not command or command in ("new", "reset", "новая", "сброс")):
+        if cmd_dialog and command in ("report_error", "error", "ошибка"):
+            _b24_start_error_report(endpoint, access_token, bot_id, cmd_dialog, message_id)
+        elif cmd_dialog and (not command or command in ("new", "reset", "новая", "сброс")):
             _b24_do_reset(endpoint, access_token, bot_id, cmd_dialog, message_id)
         # Acknowledge the command so Bitrix stops retrying / showing 'typing…' (best-effort).
         if command_id:
@@ -20886,6 +21112,17 @@ def _bitrix_imbot_app_event():
         from_user_id = _imbot_event_param(payload, "FROM_USER_ID") or ""
         if not dialog_id or not message_text:
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
+        # Pending error report: this message is the user's error description — capture, forward to
+        # the Albery notifications Telegram group + log it, WITHOUT calling the model.
+        if _b24_pop_awaiting_error(dialog_id):
+            reporter = _b24_user_name(endpoint, access_token, from_user_id)
+            _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
+            threading.Thread(
+                target=_b24_handle_error_report,
+                args=(endpoint, access_token, bot_id, dialog_id, message_text, from_user_id, reporter, message_id),
+                daemon=True,
+            ).start()
+            return jsonify({"ok": True, "event": event_name, "error_report": True})
         # 'New session' request (typed /new or 'новая сессия'): reset WITHOUT calling the model.
         if _b24_is_reset_command(message_text):
             _b24_do_reset(endpoint, access_token, bot_id, dialog_id, message_id)
