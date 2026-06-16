@@ -42,6 +42,7 @@ ALWAYS_APPLY_MIGRATIONS = [
     "024_chat_report_hot_path_indexes.sql",
     "025_mcp_search_indexes.sql",
     "026_company_folders_fts.sql",
+    "030_bitrix_bot_session_reset.sql",
 ]
 
 

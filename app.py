@@ -20422,14 +20422,60 @@ def _b24_app_register_bot(client_endpoint: str, access_token: str) -> Any:
     return _b24_app_call(client_endpoint, access_token, "imbot.register", payload).get("result")
 
 
-def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str, text: str) -> None:
+def _b24_reset_keyboard() -> list[dict[str, Any]]:
+    """A '🆕 Новая сессия' button under bot replies. It invokes the registered bot
+    command `new`; if the portal delivers it as text instead, the keyword detector
+    (_b24_is_reset_command) still catches '/new'."""
+    return [{
+        "TEXT": "🆕 Новая сессия",
+        "COMMAND": "new",
+        "COMMAND_PARAMS": "/new",
+        "DISPLAY": "LINE",
+        "BG_COLOR": "#29619b",
+        "TEXT_COLOR": "#FFFFFF",
+        "BLOCK": "N",
+    }]
+
+
+def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
+                   text: str, keyboard: list[dict[str, Any]] | None = None) -> None:
     if not (client_endpoint and access_token and bot_id and dialog_id):
         return
+    params: dict[str, Any] = {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text}
+    if keyboard:
+        params["KEYBOARD"] = keyboard
     try:
-        _b24_app_call(client_endpoint, access_token, "imbot.message.add",
-                      {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text})
+        _b24_app_call(client_endpoint, access_token, "imbot.message.add", params)
     except Exception:  # noqa: BLE001
         logging.exception("b24 testbot: app reply failed")
+
+
+def _b24_ensure_command_registered(client_endpoint: str, access_token: str, bot_id: Any) -> None:
+    """Best-effort: register the `/new` bot command once so it shows in the chat '/' menu
+    and clicks on the keyboard button resolve. Never breaks the reply path; typing /new
+    works regardless because the message handler also matches it as a keyword."""
+    if not (client_endpoint and access_token and bot_id):
+        return
+    state = _b24_load_state()
+    if state.get("cmd_new_registered"):
+        return
+    try:
+        _b24_app_call(client_endpoint, access_token, "imbot.command.register", {
+            "BOT_ID": bot_id,
+            "COMMAND": "new",
+            "COMMON": "N",
+            "HIDDEN": "N",
+            "EXTRANET_SUPPORT": "N",
+            "LANG": [
+                {"LANGUAGE_ID": "ru", "TITLE": "Новая сессия", "PARAMS": ""},
+                {"LANGUAGE_ID": "en", "TITLE": "New session", "PARAMS": ""},
+            ],
+            "EVENT_COMMAND_ADD": B24_APP_HANDLER_URL,
+        })
+        state["cmd_new_registered"] = True
+        _b24_save_state(state)
+    except Exception:  # noqa: BLE001
+        logging.debug("b24 testbot: command register failed", exc_info=True)
 
 
 def _b24_app_typing(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str) -> None:
@@ -20547,6 +20593,53 @@ def _b24_session_touch(dialog_id: str) -> None:
         logging.exception("b24 testbot: session touch failed")
 
 
+# Reset keywords/commands accepted from chat (typed text or a bot command). Matched against
+# the whole trimmed message (case/space-insensitive), so they never fire mid-sentence.
+B24_RESET_TRIGGERS = {
+    "/new", "/reset", "/clear", "/restart", "/start",
+    "/новая", "/сброс", "/сбросить", "/заново",
+    "новая сессия", "новый диалог", "новый чат", "начать заново", "начать сначала",
+    "сбросить сессию", "сброс сессии", "сбросить контекст", "очистить контекст",
+    "сбрось сессию", "сбросить диалог", "сброс",
+}
+
+
+def _b24_is_reset_command(text: str) -> bool:
+    """True if the message is purely a 'new session' request (typed or via a bot command)."""
+    norm = " ".join(str(text or "").strip().lower().split())
+    norm = norm.rstrip("!.,")
+    return norm in B24_RESET_TRIGGERS
+
+
+def _b24_session_reset(dialog_id: str) -> None:
+    """Manual 'new session': bump the epoch AND raise the history floor so previously
+    injected Q/A from bitrix_bot_interactions is no longer carried into the prompt — i.e.
+    a genuinely clean conversation, not just a relabeled session key."""
+    now = datetime.now(timezone.utc)
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COALESCE(MAX(id), 0) AS floor FROM bitrix_bot_interactions WHERE dialog_id=%s",
+                        (str(dialog_id),),
+                    )
+                    floor = cur.fetchone()["floor"]
+                    cur.execute(
+                        """
+                        INSERT INTO bitrix_bot_sessions (dialog_id, epoch, turns, summary, last_at, history_floor_id)
+                        VALUES (%s, 2, 0, NULL, %s, %s)
+                        ON CONFLICT (dialog_id) DO UPDATE
+                          SET epoch = bitrix_bot_sessions.epoch + 1,
+                              turns = 0, summary = NULL, last_at = %s,
+                              history_floor_id = %s
+                        """,
+                        (str(dialog_id), now, floor, now, floor),
+                    )
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: session reset failed")
+
+
 def _b24_recent_history(dialog_id: str, limit: int = 6) -> list[tuple[str, str]]:
     """Last successful Q/A pairs for this dialog — we inject them into the prompt
     because `hermes -z` one-shot calls do NOT persist/resume `--continue` sessions,
@@ -20557,8 +20650,9 @@ def _b24_recent_history(dialog_id: str, limit: int = 6) -> list[tuple[str, str]]
                 cur.execute(
                     "SELECT question, answer FROM bitrix_bot_interactions "
                     "WHERE dialog_id=%s AND status='ok' AND question <> '' "
+                    "AND id > COALESCE((SELECT history_floor_id FROM bitrix_bot_sessions WHERE dialog_id=%s), 0) "
                     "ORDER BY id DESC LIMIT %s",
-                    (str(dialog_id), int(limit)),
+                    (str(dialog_id), str(dialog_id), int(limit)),
                 )
                 return [(r["question"], r["answer"]) for r in reversed(cur.fetchall())]
     except Exception:  # noqa: BLE001
@@ -20636,12 +20730,26 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
         status, error = "error", str(exc)[:500]
         answer = f"Ошибка: {str(exc)[:200]}"
     latency_ms = int((time.monotonic() - started) * 1000)
-    _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer)
+    _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer,
+                   keyboard=_b24_reset_keyboard())
     # done: swap 👀 (read) → 👍 (done) on the user's message.
     _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
     _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
     _b24_session_touch(dialog_id)
+    _b24_ensure_command_registered(client_endpoint, access_token, bot_id)
     _b24_log_interaction(dialog_id, from_user_id, tier, user_text, answer, latency_ms, status, error)
+
+
+def _b24_do_reset(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
+                  message_id: Any = "") -> None:
+    """Reset the dialog's session and confirm — runs WITHOUT calling the model."""
+    _b24_session_reset(dialog_id)
+    if message_id:
+        _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
+        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
+    _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id,
+                   "🆕 Начал новую сессию — предыдущий контекст очищен. Спрашивайте!",
+                   keyboard=_b24_reset_keyboard())
 
 
 def _bitrix_imbot_app_event():
@@ -20680,8 +20788,19 @@ def _bitrix_imbot_app_event():
     if event_name == "ONIMBOTJOINCHAT":
         if dialog_id:
             _b24_app_reply(endpoint, access_token, bot_id, dialog_id,
-                           "Привет! Я Гермес-ассистент. Спрашивай — помогу по задачам и сотрудникам.")
+                           "Привет! Я Гермес-ассистент. Спрашивайте — помогу по задачам и сотрудникам.\n"
+                           "Чтобы начать разговор заново, нажмите «🆕 Новая сессия» или напишите /new.",
+                           keyboard=_b24_reset_keyboard())
+            _b24_ensure_command_registered(endpoint, access_token, bot_id)
         return jsonify({"ok": True, "event": event_name})
+
+    # A '🆕 Новая сессия' button / `/new` command click arrives as ONIMCOMMANDADD.
+    if event_name == "ONIMCOMMANDADD":
+        command = str(_imbot_event_param(payload, "COMMAND") or "").strip().lstrip("/").lower()
+        message_id = _imbot_event_param(payload, "MESSAGE_ID") or ""
+        if dialog_id and command in ("new", "reset", "новая", "сброс"):
+            _b24_do_reset(endpoint, access_token, bot_id, dialog_id, message_id)
+        return jsonify({"ok": True, "event": event_name, "command": command})
 
     if event_name == "ONIMBOTMESSAGEADD":
         message_text = str(_imbot_event_param(payload, "MESSAGE") or "").strip()
@@ -20689,6 +20808,10 @@ def _bitrix_imbot_app_event():
         from_user_id = _imbot_event_param(payload, "FROM_USER_ID") or ""
         if not dialog_id or not message_text:
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
+        # 'New session' request (typed /new or 'новая сессия'): reset WITHOUT calling the model.
+        if _b24_is_reset_command(message_text):
+            _b24_do_reset(endpoint, access_token, bot_id, dialog_id, message_id)
+            return jsonify({"ok": True, "event": event_name, "reset": True})
         # Read signal: 👀 reaction + typing indicator, then run the agent in the background.
         _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
         _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
