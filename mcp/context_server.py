@@ -3788,6 +3788,30 @@ def tool_write_company_sheet(args: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def tool_create_google_sheet(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Создание Google-таблицы требует confirm=true. Сначала покажи пользователю, что создашь "
+            "(название, какие данные впишешь, и что доступ будет «по ссылке — редактор»), получи согласие, "
+            "и только потом вызови с confirm=true.",
+        )
+    title = str(args.get("title") or "").strip()
+    if not title:
+        raise McpError(-32602, "title (название таблицы) обязателен.")
+    rows = args.get("rows")
+    if rows is not None and not isinstance(rows, list):
+        raise McpError(-32602, "rows должен быть списком строк (каждая — список ячеек).")
+    share = args.get("share_anyone_writer", True)
+    workflow = app_workflow_function("create_google_sheet")
+    try:
+        return workflow(title, rows, bool(share))
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Create sheet failed: {exc}") from exc
+
+
 def tool_cancel_owner_recommendation(args: dict[str, Any]) -> dict[str, Any]:
     rec_id_raw = str(args.get("recommendation_id") or "").strip()
     if not rec_id_raw:
@@ -5254,6 +5278,27 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_write_company_sheet,
+    },
+    "create_google_sheet": {
+        "description": (
+            "Создать НОВУЮ Google-таблицу (от имени Google-аккаунта агента). По умолчанию выдаёт доступ "
+            "«по ссылке — редактор» (anyone with link = editor) и возвращает ссылку. Можно сразу вписать "
+            "данные через rows (список строк, каждая — список ячеек, с A1). Перед созданием ОБЯЗАТЕЛЬНО "
+            "покажи пользователю название и что впишешь, получи согласие, затем вызови с confirm=true. "
+            "Инструмент только для полного/операционного доступа (в FAQ-коннекторе недоступен)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Название новой таблицы"},
+                "rows": {"type": "array", "items": {"type": "array"}, "description": "Опц.: начальные данные с A1 (список строк)"},
+                "share_anyone_writer": {"type": "boolean", "description": "Доступ «по ссылке — редактор» (по умолчанию true)"},
+                "confirm": {"type": "boolean", "description": "Должно быть true после явного согласия пользователя"},
+            },
+            "required": ["title", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_create_google_sheet,
     },
     "cancel_owner_recommendation": {
         "description": (

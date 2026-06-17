@@ -329,6 +329,56 @@ def write_company_google_sheet(
     return data
 
 
+def _google_user_credentials() -> Any:
+    """Load the albery agent's Google OAuth user credentials from the secure token paths and
+    refresh if needed. Requires the google-auth libraries in the venv."""
+    from google.oauth2.credentials import Credentials
+    import google.auth.transport.requests as _gtr
+
+    last_err: Exception | None = None
+    for path in ("/root/.hermes/secure/google_oauth_token.json", "/root/.hermes/google_token.json"):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except OSError as exc:
+            last_err = exc
+            continue
+        creds = Credentials.from_authorized_user_info(data, data.get("scopes"))
+        if not creds.valid:
+            creds.refresh(_gtr.Request())
+        return creds
+    raise RuntimeError(f"Google OAuth token не найден в secure store ({last_err})")
+
+
+def create_google_sheet(title: str, rows: list | None = None, share_anyone_writer: bool = True) -> dict[str, Any]:
+    """Create a brand-new Google Sheet via the Sheets/Drive API (as the albery agent's Google
+    account), optionally write initial rows, optionally share it as anyone-with-link = editor, and
+    return its id + url."""
+    from googleapiclient.discovery import build
+
+    creds = _google_user_credentials()
+    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    clean_title = (str(title or "").strip() or "Новая таблица")[:200]
+    spreadsheet = sheets.spreadsheets().create(body={"properties": {"title": clean_title}}).execute()
+    sid = spreadsheet["spreadsheetId"]
+    url = spreadsheet.get("spreadsheetUrl") or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
+    if rows:
+        width = max((len(r) for r in rows if isinstance(r, list)), default=1)
+        norm = [[(r[i] if isinstance(r, list) and i < len(r) else "") for i in range(width)] for r in rows]
+        sheets.spreadsheets().values().update(
+            spreadsheetId=sid, range="A1", valueInputOption="USER_ENTERED", body={"values": norm},
+        ).execute()
+    if share_anyone_writer:
+        drive.permissions().create(fileId=sid, body={"type": "anyone", "role": "writer"}).execute()
+    return {
+        "spreadsheet_id": sid,
+        "url": url,
+        "title": clean_title,
+        "access": "anyone_with_link_editor" if share_anyone_writer else "private",
+    }
+
+
 def fetch_google_drive_company_payload(
     known_files: dict[str, dict[str, Any]] | None = None,
     known_folders: dict[str, dict[str, Any]] | None = None,
