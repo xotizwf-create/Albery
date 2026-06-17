@@ -3340,7 +3340,8 @@ export default function App() {
   const setAgentTier = async (uid: number, tier: string, name?: string) => {
     setAgentAccessMessage("");
     try {
-      if (tier === "none") {
+      if (tier === "faq") {
+        // faq is the default level — drop the row so the user falls back to it
         await fetchJsonSafe(`/api/agent-access/${uid}`, { method: "DELETE" }, 30000);
       } else {
         await fetchJsonSafe(
@@ -3472,7 +3473,7 @@ export default function App() {
                     ) : (
                       visibleUsers.map((u) => {
                         const locked = agentBootstrapIds.includes(u.id);
-                        const current = locked ? "admin" : tierByUser[u.id] || "none";
+                        const current = tierByUser[u.id] || "faq";
                         return (
                           <tr key={u.id} className="border-t border-[#Eef0f4]">
                             <td className="px-4 py-3">

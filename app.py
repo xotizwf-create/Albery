@@ -19552,7 +19552,7 @@ def agent_access_list():
     except Exception:  # noqa: BLE001
         logging.exception("agent_access list failed")
         return jsonify({"error": "Не удалось загрузить доступы."}), 500
-    return jsonify({"rows": rows, "bootstrap_admin_ids": sorted(_b24_owner_user_ids())})
+    return jsonify({"rows": rows, "bootstrap_admin_ids": []})
 
 
 _AGENT_BOT_EMAILS = {"a9ent.ai@gmail.com"}  # the agent's own Bitrix account — not a grantee
@@ -19608,8 +19608,8 @@ def agent_access_upsert():
     name = (str(body.get("display_name")).strip() or None) if body.get("display_name") else None
     if not uid or uid < 1:
         return jsonify({"error": "Укажите корректный Bitrix user ID."}), 400
-    if tier not in ("admin", "ops", "faq"):
-        return jsonify({"error": "Уровень должен быть admin, ops или faq."}), 400
+    if tier not in ("none", "admin", "ops", "faq"):
+        return jsonify({"error": "Уровень должен быть none, faq, ops или admin."}), 400
     try:
         _agent_access_set(uid, tier, name)
     except Exception:  # noqa: BLE001
@@ -19620,8 +19620,6 @@ def agent_access_upsert():
 
 @app.delete("/api/agent-access/<int:uid>")
 def agent_access_delete(uid: int):
-    if uid in _b24_owner_user_ids():
-        return jsonify({"error": "Владельца нельзя убрать (закреплён как admin)."}), 400
     try:
         _agent_access_remove(uid)
     except Exception:  # noqa: BLE001
@@ -20940,15 +20938,12 @@ def _agent_access_remove(bitrix_user_id: int) -> None:
 def _b24_tier_for(from_user_id: Any) -> str:
     """Access tier from the Bitrix-trusted sender id (cannot be spoofed in chat):
     'admin' = full incl. instruction/settings edits + deletes; 'ops' = full operational access
-    minus the admin tools; 'faq' = read-only knowledge base; 'none' = no access (the bot does
-    not respond at all). Resolution: the env owner ids are an un-removable bootstrap admin (so the
-    UI can never lock the owner out); otherwise the agent_access table (managed from the "Настройки
-    Агента" tab) decides; users with no grant default to 'none'."""
-    uid = to_int(from_user_id)
-    if uid in _b24_owner_user_ids():
-        return "admin"
-    tier = _agent_access_map().get(uid)
-    return tier if tier in ("admin", "ops", "faq") else "none"
+    minus the admin tools; 'faq' = knowledge base; 'none' = no access (the bot does not respond).
+    The agent_access table (managed from the "Настройки Агента" tab) decides; a user with no row
+    defaults to 'faq' (knowledge base). 'none' is an explicit stored deny. No id is hard-pinned —
+    every level, including the owner's, is editable from the UI."""
+    tier = _agent_access_map().get(to_int(from_user_id))
+    return tier if tier in ("admin", "ops", "faq", "none") else "faq"
 
 
 # --- Session lifecycle: 30-min idle reset + turn-cap rotation with carried summary ----

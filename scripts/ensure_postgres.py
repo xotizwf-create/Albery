@@ -47,6 +47,7 @@ ALWAYS_APPLY_MIGRATIONS = [
     "026_company_folders_fts.sql",
     "030_bitrix_bot_session_reset.sql",
     "033_error_report_context_views.sql",
+    "035_agent_access_none_tier.sql",
 ]
 
 
