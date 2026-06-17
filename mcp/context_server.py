@@ -5367,6 +5367,21 @@ FAQ_TOOL_NAMES: set[str] = {
 }
 
 
+# Tools that change the agent's own configuration or destroy data. Reserved for the admin
+# connector only (the full /mcp endpoint, tool_names=None). The ops connector (/mcp-ops) gets
+# everything else; FAQ gets the read-only subset. This is capability-based access control:
+# non-admin connectors never receive these tools, so they cannot be called regardless of prompt.
+OWNER_ONLY_TOOL_NAMES: set[str] = {
+    "upsert_ai_instruction",
+    "update_ai_capabilities",
+    "delete_bitrix_task",
+    "delete_zoom_call_report",
+}
+
+# Operational-full connector: every registered tool EXCEPT the admin-only ones above.
+OPS_TOOL_NAMES: set[str] = set(TOOLS) - OWNER_ONLY_TOOL_NAMES
+
+
 def _allowed_tools(tool_names: set[str] | None = None) -> dict[str, dict[str, Any]]:
     if tool_names is None:
         return TOOLS
@@ -5410,6 +5425,11 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None) 
             name = params.get("name")
             args = params.get("arguments") or {}
             if name not in available_tools:
+                raise McpError(-32601, f"Unknown or unavailable tool: {name}")
+            # Defense-in-depth: admin-only tools are reachable ONLY via the full/admin connector
+            # (tool_names is None). Even if a future config mistakenly added them to a scoped
+            # connector's tool set, refuse here.
+            if name in OWNER_ONLY_TOOL_NAMES and tool_names is not None:
                 raise McpError(-32601, f"Unknown or unavailable tool: {name}")
             if name in ("start_here_always_read_ai_instructions", "get_ai_capabilities"):
                 connector_id = "faq" if tool_names == FAQ_TOOL_NAMES else "full"

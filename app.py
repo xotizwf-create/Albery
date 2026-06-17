@@ -19546,6 +19546,18 @@ def faq_mcp_auth_ok(path_token: str | None = None) -> bool:
     return hmac.compare_digest(auth_header, f"Bearer {expected}")
 
 
+def ops_mcp_auth_ok(path_token: str | None = None) -> bool:
+    """Auth for the operational-full MCP connector (/mcp-ops): all tools EXCEPT the admin-only
+    ones (instruction/capability edits, destructive deletes — see OWNER_ONLY_TOOL_NAMES)."""
+    expected = os.getenv("MCP_OPS_SHARED_SECRET", "").strip()
+    if not expected:
+        return False
+    if path_token and os.getenv("MCP_ALLOW_PATH_TOKEN", "").strip() == "1" and hmac.compare_digest(path_token, expected):
+        return True
+    auth_header = request.headers.get("Authorization", "").strip()
+    return hmac.compare_digest(auth_header, f"Bearer {expected}")
+
+
 def mcp_auth_error():
     return jsonify({
         "jsonrpc": "2.0",
@@ -19636,6 +19648,45 @@ def mcp_faq_http(path_token: str | None = None):
         }), 400
 
     response = handle_request(payload, tool_names=FAQ_TOOL_NAMES)
+    if response is None:
+        return ("", 202)
+    return jsonify(response), mcp_status_code(response)
+
+
+@app.get("/mcp-ops")
+@app.get("/mcp-ops/<path:path_token>")
+def mcp_ops_info(path_token: str | None = None):
+    if not ops_mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    from mcp.context_server import OPS_TOOL_NAMES
+
+    return jsonify({
+        "name": "employee-analytics-context-ops",
+        "transport": "http-json-rpc",
+        "endpoint": "/mcp-ops",
+        "auth": "shared-secret",
+        "scope": "full operational access EXCEPT admin tools (AI instruction/capability edits, destructive deletes)",
+        "methods": ["initialize", "tools/list", "tools/call"],
+        "tools": sorted(OPS_TOOL_NAMES),
+    })
+
+
+@app.post("/mcp-ops")
+@app.post("/mcp-ops/<path:path_token>")
+def mcp_ops_http(path_token: str | None = None):
+    if not ops_mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    from mcp.context_server import OPS_TOOL_NAMES, handle_request
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Request body must be JSON."},
+        }), 400
+
+    response = handle_request(payload, tool_names=OPS_TOOL_NAMES)
     if response is None:
         return ("", 202)
     return jsonify(response), mcp_status_code(response)
@@ -19766,6 +19817,68 @@ def mcp_faq_sse_messages(session_id: str, path_token: str | None = None):
         }), 400
 
     response = handle_request(payload, tool_names=FAQ_TOOL_NAMES)
+    if response is not None:
+        queue.put(mcp_sse_event("message", json.dumps(response, ensure_ascii=False)))
+    return ("", 202)
+
+
+@app.get("/sse-ops")
+@app.get("/sse-ops/<path:path_token>")
+def mcp_ops_sse(path_token: str | None = None):
+    if not ops_mcp_auth_ok(path_token):
+        return mcp_auth_error()
+
+    session_id = uuid4().hex
+    queue: Queue[str] = Queue()
+    MCP_SSE_SESSIONS[session_id] = queue
+    if path_token:
+        endpoint = url_for("mcp_ops_sse_messages", session_id=session_id, path_token=path_token)
+    else:
+        endpoint = url_for("mcp_ops_sse_messages", session_id=session_id)
+
+    @stream_with_context
+    def stream():
+        yield mcp_sse_event("endpoint", endpoint)
+        try:
+            while True:
+                try:
+                    yield queue.get(timeout=15)
+                except Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            MCP_SSE_SESSIONS.pop(session_id, None)
+
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/mcp-ops/messages/<session_id>")
+@app.post("/mcp-ops/messages/<session_id>/<path:path_token>")
+def mcp_ops_sse_messages(session_id: str, path_token: str | None = None):
+    if not ops_mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    queue = MCP_SSE_SESSIONS.get(session_id)
+    if queue is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32004, "message": "Unknown MCP SSE session."},
+        }), 404
+
+    from mcp.context_server import OPS_TOOL_NAMES, handle_request
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Request body must be JSON."},
+        }), 400
+
+    response = handle_request(payload, tool_names=OPS_TOOL_NAMES)
     if response is not None:
         queue.put(mcp_sse_event("message", json.dumps(response, ensure_ascii=False)))
     return ("", 202)
@@ -20663,9 +20776,24 @@ def _b24_full_user_ids() -> set[int]:
     return {int(x) for x in re.findall(r"\d+", os.getenv("B24_TESTBOT_FULL_USER_IDS", "14,16"))}
 
 
+def _b24_owner_user_ids() -> set[int]:
+    """Bitrix user ids that get the ADMIN connector — can edit AI instructions/capabilities and
+    run destructive deletes (OWNER_ONLY_TOOL_NAMES). Default: 16 = Александр on the b24-0xrp3s
+    portal. Everyone else (including other 'full' users) is capped at the operational connector."""
+    return {int(x) for x in re.findall(r"\d+", os.getenv("B24_TESTBOT_OWNER_USER_IDS", "16"))}
+
+
 def _b24_tier_for(from_user_id: Any) -> str:
-    """Privileged Bitrix users (owners) get the full MCP; everyone else read-only FAQ."""
-    return "full" if to_int(from_user_id) in _b24_full_user_ids() else "faq"
+    """Access tier from the Bitrix-trusted sender id (cannot be spoofed in chat):
+    'admin' = full incl. instruction/settings edits + deletes (owner ids only);
+    'ops'   = full operational access minus the admin tools (other privileged users);
+    'faq'   = read-only (everyone else)."""
+    uid = to_int(from_user_id)
+    if uid in _b24_owner_user_ids():
+        return "admin"
+    if uid in _b24_full_user_ids():
+        return "ops"
+    return "faq"
 
 
 # --- Session lifecycle: 30-min idle reset + turn-cap rotation with carried summary ----
@@ -20836,11 +20964,12 @@ def _b24_recent_history(dialog_id: str, limit: int = 6) -> list[tuple[str, str]]
 
 
 def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> str:
-    """Run one turn through the local Hermes brain. Toolset is chosen by access tier
-    (full owners → full MCP `albery`; everyone else → read-only `albery-faq`). Session
-    lifecycle (idle reset + cap rotation + carried summary) is handled by _b24_session_prepare."""
+    """Run one turn through the local Hermes brain. Toolset is chosen by access tier:
+    admin → full MCP `albery` (incl. instruction/settings edits + deletes); ops → `albery-ops`
+    (operational, no admin tools); everyone else → read-only `albery-faq`. Session lifecycle
+    (idle reset + cap rotation + carried summary) is handled by _b24_session_prepare."""
     session, seed = _b24_session_prepare(dialog_id)
-    toolset = "albery" if tier == "full" else "albery-faq"
+    toolset = {"admin": "albery", "ops": "albery-ops"}.get(tier, "albery-faq")
     timeout_s = int(os.getenv("B24_TESTBOT_HERMES_TIMEOUT", "170"))
     fmt = (
         " ФОРМАТ ОТВЕТА (важно): пиши структурно и читаемо. Если ответ короткий — 1–2 предложения "
@@ -20850,7 +20979,7 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> st
         "пустая строка. Не используй Markdown (никаких #, **, ` или таблиц) — Битрикс их НЕ "
         "отображает; для жирного используй ТОЛЬКО [b]...[/b]. Без воды, по делу."
     )
-    if tier == "full":
+    if tier in ("admin", "ops"):
         head = ("[Канал: Битрикс24, пишет руководитель (полный доступ). Отвечай по-русски. "
                 "Можешь использовать все инструменты, но любое изменение данных сначала подтверждай с человеком."
                 + fmt + "]")
