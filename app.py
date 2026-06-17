@@ -20656,11 +20656,11 @@ def _b24_disclaimer() -> str:
 
 
 def _b24_keyboard() -> list[dict[str, Any]]:
-    """Buttons under the bot's latest reply: '🆕 Новая сессия' (resets the dialog via the `new`
-    command) and '⚠️ Сообщить об ошибке' (starts the error-report flow via `report_error`). Only
-    the most recent bot message carries these — _b24_app_reply strips the keyboard off the
-    previous one (see _b24_strip_keyboard) so the chat is not littered with duplicate buttons.
-    Typed '/new' / 'новая сессия' still resets via the _b24_is_reset_command keyword detector."""
+    """Buttons under the bot's latest reply: '🆕 Новая сессия' (resets via `new`), '⚠️ Сообщить об
+    ошибке' (error-report flow via `report_error`) and '❓ Как пользоваться' (re-shows the onboarding
+    guide via `help`). Only the most recent bot message carries these — _b24_app_reply strips the
+    keyboard off the previous one (see _b24_strip_keyboard). Typed '/new' / 'новая сессия' still
+    resets via the _b24_is_reset_command keyword detector."""
     return [
         {
             "TEXT": "🆕 Новая сессия",
@@ -20680,7 +20680,108 @@ def _b24_keyboard() -> list[dict[str, Any]]:
             "TEXT_COLOR": "#FFFFFF",
             "BLOCK": "N",
         },
+        {
+            "TEXT": "❓ Как пользоваться",
+            "COMMAND": "help",
+            "COMMAND_PARAMS": "/help",
+            "DISPLAY": "LINE",
+            "BG_COLOR": "#3a7a3a",
+            "TEXT_COLOR": "#FFFFFF",
+            "BLOCK": "N",
+        },
     ]
+
+
+def _b24_onb_next_keyboard() -> list[dict[str, Any]]:
+    """A single 'Далее ▶️' button to advance the onboarding (command `onb_next`)."""
+    return [{
+        "TEXT": "Далее ▶️",
+        "COMMAND": "onb_next",
+        "COMMAND_PARAMS": "/onb_next",
+        "DISPLAY": "LINE",
+        "BG_COLOR": "#29619b",
+        "TEXT_COLOR": "#FFFFFF",
+        "BLOCK": "N",
+    }]
+
+
+def _b24_welcome_keyboard() -> list[dict[str, Any]]:
+    """First-open greeting: a prominent '🚀 Пройти обучение' (command `help`) — the user can also
+    just start asking."""
+    return [{
+        "TEXT": "🚀 Пройти обучение",
+        "COMMAND": "help",
+        "COMMAND_PARAMS": "/help",
+        "DISPLAY": "LINE",
+        "BG_COLOR": "#5440F6",
+        "TEXT_COLOR": "#FFFFFF",
+        "BLOCK": "N",
+    }]
+
+
+# --- Onboarding: a short 3-step "how to use me" walkthrough driven by buttons -------------
+_B24_ONB_LAST_STEP = 3
+
+
+def _b24_onboarding_text(step: int, tier: str) -> str:
+    """Content for an onboarding step, lightly adapted to the user's access tier."""
+    can_act = tier in ("ops", "admin")
+    if step == 1:
+        abilities = [
+            "[b]Шаг 1 из 3 — что я умею[/b]",
+            "- Отвечаю на вопросы по компании: регламенты, процессы, оргструктура, база знаний.",
+            "- Разбираю Zoom-созвоны: краткие итоги, задачи, участники.",
+        ]
+        if can_act:
+            abilities += [
+                "- Ищу, ставлю и закрываю задачи в Bitrix24.",
+                "- Готовлю отчёты и пишу сотрудникам (любое изменение — только после вашего подтверждения).",
+            ]
+        return "\n".join(abilities)
+    if step == 2:
+        return "\n".join([
+            "[b]Шаг 2 из 3 — как формулировать запрос[/b]",
+            "- Одна задача — одно сообщение.",
+            "- Указывайте конкретику: кто / что / период / документ.",
+            "- Можно задать формат ответа (списком, кратко, по пунктам).",
+            "",
+            "Пример: вместо «что по задачам» → «какие задачи у Натальи на этой неделе».",
+        ])
+    return "\n".join([
+        "[b]Шаг 3 из 3 — попробуйте сами[/b]",
+        "Примеры запросов:",
+        "- «Что в регламенте про пятничную планёрку?»",
+        "- «Покажи открытые задачи Артура»",
+        "- «Сделай краткую сводку по Zoom-созвону за вчера»",
+        "",
+        "Напишите свой первый запрос — я помогу! 🚀",
+    ])
+
+
+def _b24_send_onboarding(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
+                         step: int, tier: str, message_id: Any = "") -> None:
+    """Send one onboarding step. Steps 1-2 carry a 'Далее ▶️' button; the final step restores the
+    normal keyboard. The current step is remembered per dialog so 'Далее' knows what comes next."""
+    step = max(1, min(step, _B24_ONB_LAST_STEP))
+    if message_id:
+        _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
+        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
+    keyboard = _b24_onb_next_keyboard() if step < _B24_ONB_LAST_STEP else _b24_keyboard()
+    _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id,
+                   _b24_onboarding_text(step, tier), keyboard=keyboard)
+    st = _b24_load_state()
+    onb = st.get("onboarding") or {}
+    if step < _B24_ONB_LAST_STEP:
+        onb[str(dialog_id)] = step
+    else:
+        onb.pop(str(dialog_id), None)
+    st["onboarding"] = onb
+    _b24_save_state(st)
+    _b24_ensure_command_registered(client_endpoint, access_token, bot_id)
+
+
+def _b24_onboarding_step(dialog_id: str) -> int:
+    return int((_b24_load_state().get("onboarding") or {}).get(str(dialog_id), 0))
 
 
 # --- "keyboard only under the last message" bookkeeping ----------------------
@@ -20803,6 +20904,8 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
 _B24_COMMANDS = [
     {"COMMAND": "new", "ru": "Новая сессия", "en": "New session"},
     {"COMMAND": "report_error", "ru": "Сообщить об ошибке", "en": "Report an error"},
+    {"COMMAND": "help", "ru": "Как пользоваться", "en": "How to use"},
+    {"COMMAND": "onb_next", "ru": "Далее", "en": "Next"},
 ]
 
 
@@ -20814,7 +20917,7 @@ def _b24_ensure_command_registered(client_endpoint: str, access_token: str, bot_
     registered commands return an API error (not a transport one) — treated as success."""
     if not (client_endpoint and access_token and bot_id):
         return
-    if _b24_load_state().get("cmds_registered_v2"):
+    if _b24_load_state().get("cmds_registered_v3"):
         return
 
     def _do() -> None:
@@ -20841,7 +20944,7 @@ def _b24_ensure_command_registered(client_endpoint: str, access_token: str, bot_
                 logging.debug("b24 testbot: command register note for %s: %s", spec["COMMAND"], exc)
         if not transport_failed:  # only retry on a real connectivity failure
             st = _b24_load_state()
-            st["cmds_registered_v2"] = True
+            st["cmds_registered_v3"] = True
             _b24_save_state(st)
 
     threading.Thread(target=_do, daemon=True).start()
@@ -21364,10 +21467,14 @@ def _bitrix_imbot_app_event():
 
     if event_name == "ONIMBOTJOINCHAT":
         if dialog_id:
-            _b24_app_reply(endpoint, access_token, bot_id, dialog_id,
-                           "Привет! Я Гермес-ассистент. Спрашивайте — помогу по задачам и сотрудникам.\n"
-                           "Чтобы начать разговор заново, нажмите «🆕 Новая сессия» или напишите /new.",
-                           keyboard=_b24_keyboard())
+            _b24_app_reply(
+                endpoint, access_token, bot_id, dialog_id,
+                "👋 Я — ИИ-агент Албери, и я могу сильно упростить вашу работу: подскажу по компании "
+                "и регламентам, разберу Zoom-созвоны, помогу с задачами и отчётами.\n\n"
+                "Чтобы пользоваться мной эффективно, пройдите короткое обучение (1 минута) — или "
+                "сразу задайте свой вопрос. Поехали! 🚀",
+                keyboard=_b24_welcome_keyboard(),
+            )
             _b24_ensure_command_registered(endpoint, access_token, bot_id)
         return jsonify({"ok": True, "event": event_name})
 
@@ -21383,8 +21490,24 @@ def _bitrix_imbot_app_event():
         cmd_dialog = dialog_id or _imbot_scan(payload, "DIALOG_ID")
         message_id = _imbot_scan(payload, "MESSAGE_ID")
         command_id = _imbot_scan(payload, "COMMAND_ID")
-        if cmd_dialog and command in ("report_error", "error", "ошибка"):
+        cmd_user = _imbot_scan(payload, "USER_ID")
+        if cmd_dialog and cmd_user and _b24_tier_for(cmd_user) == "none":
+            try:
+                _b24_app_call(endpoint, access_token, "imbot.message.add", {
+                    "BOT_ID": bot_id, "DIALOG_ID": cmd_dialog,
+                    "MESSAGE": "😔 К сожалению, у вас нет доступа к агенту.\n\n"
+                               "Пожалуйста, обратитесь к вашему руководителю или к Александру Никитенко 🙌",
+                })
+            except Exception:  # noqa: BLE001
+                logging.exception("b24 testbot: no-access notice (command) failed")
+        elif cmd_dialog and command in ("report_error", "error", "ошибка"):
             _b24_start_error_report(endpoint, access_token, bot_id, cmd_dialog, message_id)
+        elif cmd_dialog and command in ("help", "обучение", "onboarding", "помощь"):
+            _b24_send_onboarding(endpoint, access_token, bot_id, cmd_dialog, 1,
+                                 _b24_tier_for(cmd_user), message_id)
+        elif cmd_dialog and command == "onb_next":
+            _b24_send_onboarding(endpoint, access_token, bot_id, cmd_dialog,
+                                 _b24_onboarding_step(cmd_dialog) + 1, _b24_tier_for(cmd_user), message_id)
         elif cmd_dialog and (not command or command in ("new", "reset", "новая", "сброс")):
             _b24_do_reset(endpoint, access_token, bot_id, cmd_dialog, message_id)
         # Acknowledge the command so Bitrix stops retrying / showing 'typing…' (best-effort).
@@ -21408,8 +21531,8 @@ def _bitrix_imbot_app_event():
             try:
                 _b24_app_call(endpoint, access_token, "imbot.message.add", {
                     "BOT_ID": bot_id, "DIALOG_ID": dialog_id,
-                    "MESSAGE": "К сожалению, у вас нет доступа к агенту. "
-                               "Обратитесь к вашему руководителю или к Александру Никитенко.",
+                    "MESSAGE": "😔 К сожалению, у вас нет доступа к агенту.\n\n"
+                               "Пожалуйста, обратитесь к вашему руководителю или к Александру Никитенко 🙌",
                 })
             except Exception:  # noqa: BLE001
                 logging.exception("b24 testbot: no-access notice failed")
