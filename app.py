@@ -21279,9 +21279,12 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> st
                 "Отвечай по-русски." + access_rule + fmt + "]")
     elif tier == "ops":
         head = ("[Канал: Битрикс24. Уровень доступа пользователя: ВСЕ ФУНКЦИИ — можешь искать/ставить/"
-                "закрывать задачи, готовить отчёты, работать с документами и таблицами, писать "
-                "сотрудникам (любое изменение сначала подтверждай). Недоступно только изменение "
-                "собственных настроек/инструкций. Отвечай по-русски." + access_rule + fmt + "]")
+                "закрывать задачи, готовить отчёты, писать сотрудникам, а также СОЗДАВАТЬ и "
+                "РЕДАКТИРОВАТЬ Google-таблицы и Google-документы (вносить данные, формулы, оформление, "
+                "автоматизацию — используй инструменты и навык работы с Google Sheets через Google "
+                "Sheets/Apps Script API). Любое изменение данных сначала подтверждай. Недоступно "
+                "только изменение собственных настроек/инструкций. Отвечай по-русски."
+                + access_rule + fmt + "]")
     else:  # faq
         head = ("[Канал: Битрикс24. Уровень доступа пользователя: СПРАВКА (только знания и чтение). "
                 "Тебе доступно: отвечать на вопросы по компании, регламентам, оргструктуре, базе знаний, "
@@ -21381,12 +21384,23 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
     started = time.monotonic()
     tier = _b24_tier_for(from_user_id)
     status, error = "ok", None
+    # Keep the 'typing…' indicator alive while the brain works (turns can take 6–60s; the Bitrix
+    # indicator otherwise fades after ~30s and the bot looks frozen).
+    stop_typing = threading.Event()
+
+    def _typing_keepalive() -> None:
+        while not stop_typing.wait(20):
+            _b24_app_typing(client_endpoint, access_token, bot_id, dialog_id)
+
+    threading.Thread(target=_typing_keepalive, daemon=True).start()
     try:
         answer = hermes_brain_answer(user_text, dialog_id, tier)
     except Exception as exc:  # noqa: BLE001
         logging.exception("b24 testbot: hermes brain failed")
         status, error = "error", str(exc)[:500]
         answer = f"Ошибка: {str(exc)[:200]}"
+    finally:
+        stop_typing.set()
     latency_ms = int((time.monotonic() - started) * 1000)
     answer, escalation_request = _b24_extract_escalation(answer)
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer,
