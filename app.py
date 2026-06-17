@@ -19555,9 +19555,6 @@ def agent_access_list():
     return jsonify({"rows": rows, "bootstrap_admin_ids": []})
 
 
-_AGENT_BOT_EMAILS = {"a9ent.ai@gmail.com"}  # the agent's own Bitrix account — not a grantee
-
-
 @app.get("/api/agent-access/bitrix-users")
 def agent_access_bitrix_users():
     """Active Bitrix users from the live bot portal (B24_TESTBOT_WEBHOOK_BASE) — the ids here are
@@ -19589,8 +19586,6 @@ def agent_access_bitrix_users():
         if not uid:
             continue
         email = (u.get("EMAIL") or "").strip()
-        if email.lower() in _AGENT_BOT_EMAILS:
-            continue
         portal_name = " ".join(p for p in (u.get("NAME"), u.get("LAST_NAME")) if p).strip()
         dir_name, dir_pos = email_dir.get(email.lower(), (None, None))
         name = portal_name or (dir_name or "").strip() or email or f"#{uid}"
