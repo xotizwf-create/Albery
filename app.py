@@ -20668,12 +20668,13 @@ def _b24_tier_for(from_user_id: Any) -> str:
     return "full" if to_int(from_user_id) in _b24_full_user_ids() else "faq"
 
 
-# --- Session lifecycle: 8h idle reset + turn-cap rotation with carried summary ----
+# --- Session lifecycle: 30-min idle reset + turn-cap rotation with carried summary ----
 # Hermes auto-compression is disabled on this box (it failed on codex), so we bound the
-# context ourselves: each Bitrix dialog maps to an epoch'd session. Idle >8h starts a
-# fresh epoch; after a turn cap we rotate to a new epoch seeded with a short summary of
+# context ourselves: each Bitrix dialog maps to an epoch'd session. Idle >30 min starts a
+# genuinely fresh epoch (history floor raised + no carried summary, like the manual «Новая
+# сессия» button); after a turn cap we rotate to a new epoch seeded with a short summary of
 # the previous one (conversation-summary-buffer) so long threads never blow the window.
-B24_IDLE_RESET_SECONDS = int(os.getenv("B24_TESTBOT_IDLE_RESET_SECONDS", "28800"))
+B24_IDLE_RESET_SECONDS = int(os.getenv("B24_TESTBOT_IDLE_RESET_SECONDS", "1800"))
 B24_TURN_CAP = int(os.getenv("B24_TESTBOT_TURN_CAP", "16"))
 
 
@@ -20722,17 +20723,32 @@ def _b24_session_prepare(dialog_id: str) -> tuple[str, str | None]:
                     epoch, turns, summary, last_at = row["epoch"], row["turns"], row["summary"], row["last_at"]
                     idle = (now - last_at).total_seconds() if last_at else 1e12
                     seed: str | None = None
+                    idle_reset = False
                     if idle > B24_IDLE_RESET_SECONDS:
-                        epoch, turns, summary = epoch + 1, 0, None
+                        # Idle gap → genuinely fresh session: drop carried summary AND raise the
+                        # history floor so prior Q/A is no longer injected into the prompt.
+                        epoch, turns, summary, idle_reset = epoch + 1, 0, None, True
                     elif turns >= B24_TURN_CAP:
                         seed = _b24_summarize_segment(dialog_id) or summary
                         epoch, turns, summary = epoch + 1, 0, seed
                     elif turns == 0:
                         seed = summary
-                    cur.execute(
-                        "UPDATE bitrix_bot_sessions SET epoch=%s, turns=%s, summary=%s, last_at=%s WHERE dialog_id=%s",
-                        (epoch, turns, summary, now, str(dialog_id)),
-                    )
+                    if idle_reset:
+                        cur.execute(
+                            "SELECT COALESCE(MAX(id), 0) AS floor FROM bitrix_bot_interactions WHERE dialog_id=%s",
+                            (str(dialog_id),),
+                        )
+                        floor = cur.fetchone()["floor"]
+                        cur.execute(
+                            "UPDATE bitrix_bot_sessions SET epoch=%s, turns=%s, summary=%s, last_at=%s, "
+                            "history_floor_id=%s WHERE dialog_id=%s",
+                            (epoch, turns, summary, now, floor, str(dialog_id)),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE bitrix_bot_sessions SET epoch=%s, turns=%s, summary=%s, last_at=%s WHERE dialog_id=%s",
+                            (epoch, turns, summary, now, str(dialog_id)),
+                        )
                     return f"bitrix-{safe}-e{epoch}", seed
     except Exception:  # noqa: BLE001
         logging.exception("b24 testbot: session prepare failed")
