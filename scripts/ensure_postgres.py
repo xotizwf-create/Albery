@@ -34,6 +34,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "ai_agent_capabilities": "031_ai_agent_capabilities.sql",
     "bitrix_error_reports": "032_bitrix_error_reports.sql",
     "agent_access": "034_agent_access.sql",
+    "access_requests": "036_access_requests.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {

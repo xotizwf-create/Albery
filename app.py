@@ -19555,42 +19555,59 @@ def agent_access_list():
     return jsonify({"rows": rows, "bootstrap_admin_ids": []})
 
 
-@app.get("/api/agent-access/bitrix-users")
-def agent_access_bitrix_users():
-    """Active Bitrix users from the live bot portal (B24_TESTBOT_WEBHOOK_BASE) — the ids here are
-    exactly the ones the bot receives, so the list maps 1:1 to access rows. Most portal accounts
-    have empty NAME/LAST_NAME, so we resolve a human name by email from the synced org directory
-    (users table), falling back to the email itself."""
+_PORTAL_USERS_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
+
+
+def _b24_portal_user_directory(force: bool = False) -> dict[int, dict[str, str]]:
+    """Cached {bitrix_user_id: {name, email, position}} for active accounts on the live bot portal.
+    Most portal accounts have empty NAME, so a human name is resolved by email from the synced org
+    directory (users table). Cached ~10 min — used by the access UI and by requester-name lookups."""
+    now = time.monotonic()
+    if not force and _PORTAL_USERS_CACHE["map"] and (now - _PORTAL_USERS_CACHE["at"]) < 600:
+        return _PORTAL_USERS_CACHE["map"]
+    out: dict[int, dict[str, str]] = {}
     try:
         client = b24_testbot_client()
         data = _b24_testbot_call(client, "user.get", {"ACTIVE": True})
-    except Exception as exc:  # noqa: BLE001
-        logging.exception("agent_access bitrix users failed")
-        return jsonify({"error": "Не удалось получить пользователей Bitrix.", "detail": str(exc)[:200]}), 502
-
-    email_dir: dict[str, tuple[str | None, str | None]] = {}
-    try:
+        email_dir: dict[str, tuple[str | None, str | None]] = {}
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT lower(email) AS email, full_name, work_position FROM users WHERE email <> ''")
                 email_dir = {r["email"]: (r["full_name"], r["work_position"]) for r in cur.fetchall()}
+        for u in data.get("result") or []:
+            if not isinstance(u, dict):
+                continue
+            uid = to_int(u.get("ID"))
+            if not uid:
+                continue
+            email = (u.get("EMAIL") or "").strip()
+            portal_name = " ".join(p for p in (u.get("NAME"), u.get("LAST_NAME")) if p).strip()
+            dir_name, dir_pos = email_dir.get(email.lower(), (None, None))
+            out[uid] = {
+                "name": portal_name or (dir_name or "").strip() or email or f"#{uid}",
+                "email": email,
+                "position": (u.get("WORK_POSITION") or dir_pos or "").strip(),
+            }
     except Exception:  # noqa: BLE001
-        logging.exception("agent_access org directory load failed")
+        logging.exception("portal user directory load failed")
+        return _PORTAL_USERS_CACHE["map"]
+    _PORTAL_USERS_CACHE.update(at=now, map=out)
+    return out
 
-    result = data.get("result") or []
-    users = []
-    for u in result if isinstance(result, list) else []:
-        if not isinstance(u, dict):
-            continue
-        uid = to_int(u.get("ID"))
-        if not uid:
-            continue
-        email = (u.get("EMAIL") or "").strip()
-        portal_name = " ".join(p for p in (u.get("NAME"), u.get("LAST_NAME")) if p).strip()
-        dir_name, dir_pos = email_dir.get(email.lower(), (None, None))
-        name = portal_name or (dir_name or "").strip() or email or f"#{uid}"
-        position = (u.get("WORK_POSITION") or dir_pos or "").strip()
-        users.append({"id": uid, "name": name, "email": email, "position": position})
+
+def _b24_requester_name(from_user_id: Any) -> str:
+    info = _b24_portal_user_directory().get(to_int(from_user_id))
+    return (info or {}).get("name") or "Сотрудник"
+
+
+@app.get("/api/agent-access/bitrix-users")
+def agent_access_bitrix_users():
+    """Active Bitrix users from the live bot portal — ids map 1:1 to access rows; names resolved
+    by email from the synced org directory (see _b24_portal_user_directory)."""
+    directory = _b24_portal_user_directory(force=True)
+    if not directory:
+        return jsonify({"error": "Не удалось получить пользователей Bitrix."}), 502
+    users = [{"id": uid, **info} for uid, info in directory.items()]
     users.sort(key=lambda x: x["name"].lower())
     return jsonify({"users": users})
 
@@ -21296,6 +21313,49 @@ def _b24_log_interaction(dialog_id: str, from_user_id: Any, tier: str, question:
         logging.exception("b24 testbot: interaction log failed")
 
 
+# --- Access-upgrade escalation: when the model marks a reply with [[ESCALATE: <суть>]] (after the
+# user agrees to forward an access request), we strip the marker and notify the owner in Telegram.
+_B24_ESCALATE_RE = re.compile(r"\[\[\s*ESCALATE\s*:?\s*(.*?)\]\]", re.IGNORECASE | re.DOTALL)
+
+
+def _b24_extract_escalation(answer: str) -> tuple[str, str | None]:
+    """Strip a [[ESCALATE: ...]] marker from the reply; return (clean_text, request_summary|None)."""
+    match = _B24_ESCALATE_RE.search(answer or "")
+    if not match:
+        return answer, None
+    summary = (match.group(1) or "").strip()
+    clean = _B24_ESCALATE_RE.sub("", answer).strip()
+    return clean, summary
+
+
+def _b24_log_access_request(dialog_id: str, from_user_id: Any, requester_name: str,
+                            request_text: str, delivered: bool, delivery_error: str | None) -> None:
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO access_requests (dialog_id, bitrix_user_id, requester_name, "
+                        "request_text, delivered, delivery_error) VALUES (%s, %s, %s, %s, %s, %s)",
+                        (str(dialog_id), to_int(from_user_id), requester_name or None,
+                         request_text, bool(delivered), delivery_error),
+                    )
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: access-request log failed")
+
+
+def _b24_forward_access_request(dialog_id: str, from_user_id: Any, request_text: str) -> None:
+    """Notify the owner (Telegram) that a user requests more access, and log it for the record."""
+    name = _b24_requester_name(from_user_id)
+    text = (f"🔐 {name} просит расширить доступ к ИИ-агенту.\n\n"
+            f"Запрос: {request_text}\n\n"
+            f"Сейчас прав не хватает — уровень доступа можно изменить в «Настройки Агента».")
+    ok, err = _albery_tg_notify(text, os.getenv("ALBERY_ACCESS_REQUEST_TG_CHAT", "").strip() or None)
+    _b24_log_access_request(dialog_id, from_user_id, name, request_text, ok, err)
+    if not ok:
+        logging.error("b24 testbot: access-request TG delivery failed: %s", err)
+
+
 def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
                      user_text: str, message_id: Any = "", from_user_id: Any = "") -> None:
     started = time.monotonic()
@@ -21308,8 +21368,15 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
         status, error = "error", str(exc)[:500]
         answer = f"Ошибка: {str(exc)[:200]}"
     latency_ms = int((time.monotonic() - started) * 1000)
+    answer, escalation_request = _b24_extract_escalation(answer)
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer,
                    keyboard=_b24_keyboard())
+    if escalation_request is not None:
+        threading.Thread(
+            target=_b24_forward_access_request,
+            args=(dialog_id, from_user_id, escalation_request or user_text),
+            daemon=True,
+        ).start()
     # done: swap 👀 (read) → 👍 (done) on the user's message.
     _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
     _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
@@ -21352,10 +21419,11 @@ def _albery_tg_bot_token() -> str:
     return ""
 
 
-def _albery_tg_notify(text: str) -> tuple[bool, str | None]:
-    """Send a plain-text message to the Albery notifications Telegram group. Returns (ok, error)."""
+def _albery_tg_notify(text: str, chat_id: str | None = None) -> tuple[bool, str | None]:
+    """Send a plain-text message to a Telegram chat (default: the Albery notifications group).
+    Returns (ok, error)."""
     token = _albery_tg_bot_token()
-    chat_id = os.getenv("ALBERY_ERROR_REPORT_TG_CHAT", "-5283789593").strip()
+    chat_id = (chat_id or os.getenv("ALBERY_ERROR_REPORT_TG_CHAT", "-5283789593")).strip()
     if not token or not chat_id:
         return False, "telegram token/chat not configured"
     try:
