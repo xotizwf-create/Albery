@@ -21402,9 +21402,18 @@ def _bitrix_imbot_app_event():
         from_user_id = _imbot_event_param(payload, "FROM_USER_ID") or ""
         if not dialog_id or not message_text:
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
-        # Access gate: users without a grant ('none' tier) get no response at all.
+        # Access gate: users explicitly set to 'none' get a plain system notice (no model,
+        # no disclaimer, no buttons) instead of silence, so they know to request access.
         if _b24_tier_for(from_user_id) == "none":
-            return jsonify({"ok": True, "ignored": True, "reason": "no_access"}), 200
+            try:
+                _b24_app_call(endpoint, access_token, "imbot.message.add", {
+                    "BOT_ID": bot_id, "DIALOG_ID": dialog_id,
+                    "MESSAGE": "К сожалению, у вас нет доступа к агенту. "
+                               "Обратитесь к вашему руководителю или к Александру Никитенко.",
+                })
+            except Exception:  # noqa: BLE001
+                logging.exception("b24 testbot: no-access notice failed")
+            return jsonify({"ok": True, "event": event_name, "no_access": True}), 200
         # Pending error report: this message is the user's error description — capture, forward to
         # the Albery notifications Telegram group + log it, WITHOUT calling the model.
         if _b24_pop_awaiting_error(dialog_id):
