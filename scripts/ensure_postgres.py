@@ -45,6 +45,7 @@ ALWAYS_APPLY_MIGRATIONS = [
     "025_mcp_search_indexes.sql",
     "026_company_folders_fts.sql",
     "030_bitrix_bot_session_reset.sql",
+    "033_error_report_context_views.sql",
 ]
 
 
