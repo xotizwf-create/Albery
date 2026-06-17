@@ -1,4 +1,4 @@
-﻿import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import {
   BANKS_DATA,
   WB_REVENUE_WEEKS,
@@ -2090,11 +2090,10 @@ export default function App() {
     { bitrix_user_id: number; tier: string; display_name: string | null; updated_at: string }[]
   >([]);
   const [agentBootstrapIds, setAgentBootstrapIds] = useState<number[]>([]);
-  const [agentBitrixUsers, setAgentBitrixUsers] = useState<{ id: number; name: string; position: string }[]>([]);
+  const [agentBitrixUsers, setAgentBitrixUsers] = useState<{ id: number; name: string; email: string; position: string }[]>([]);
   const [agentAccessLoading, setAgentAccessLoading] = useState(false);
   const [agentAccessMessage, setAgentAccessMessage] = useState("");
-  const [agentAddUserId, setAgentAddUserId] = useState("");
-  const [agentAddTier, setAgentAddTier] = useState("ops");
+  const [agentSearch, setAgentSearch] = useState("");
   const [agentSection, setAgentSection] = useState<"bitrix" | "telegram">("bitrix");
   const [aiInstructionDraft, setAiInstructionDraft] = useState("");
   const [aiInstructionLoading, setAiInstructionLoading] = useState(false);
@@ -3341,7 +3340,7 @@ export default function App() {
   const setAgentTier = async (uid: number, tier: string, name?: string) => {
     setAgentAccessMessage("");
     try {
-      if (tier === "faq") {
+      if (tier === "none") {
         await fetchJsonSafe(`/api/agent-access/${uid}`, { method: "DELETE" }, 30000);
       } else {
         await fetchJsonSafe(
@@ -3354,7 +3353,6 @@ export default function App() {
           30000,
         );
       }
-      setAgentAddUserId("");
       await loadAgentAccess();
     } catch (error) {
       setAgentAccessMessage(error instanceof Error ? error.message : "Не удалось сохранить.");
@@ -3390,25 +3388,20 @@ export default function App() {
   );
 
   const renderAgentAccessSettings = () => {
-    const tierClass: Record<string, string> = {
-      admin: "bg-[#EDE9FE] text-[#5440F6]",
-      ops: "bg-emerald-50 text-emerald-600",
-      faq: "bg-slate-100 text-slate-500",
-    };
-    const userById = (uid: number) => agentBitrixUsers.find((u) => u.id === uid);
-    const nameFor = (uid: number, fallback?: string | null) => userById(uid)?.name || fallback || `#${uid}`;
-    const addOptions = agentBitrixUsers
-      .filter((u) => !agentBootstrapIds.includes(u.id))
-      .map((u) => ({ value: String(u.id), label: u.position ? `${u.name} — ${u.position}` : u.name }));
-    const tierAddOptions = [
-      { value: "ops", label: "Оператор (полный доступ без правки настроек)" },
-      { value: "admin", label: "Админ (полный, включая инструкции/настройки)" },
+    const STATUS_OPTIONS = [
+      { value: "none", label: "Отсутствие доступа" },
+      { value: "faq", label: "Доступ к базе знаний" },
+      { value: "ops", label: "Доступ ко всем функциям" },
+      { value: "admin", label: "Полный доступ" },
     ];
-    const tierRowOptions = [
-      { value: "faq", label: "Чтение" },
-      { value: "ops", label: "Оператор" },
-      { value: "admin", label: "Админ" },
-    ];
+    const tierByUser: Record<number, string> = {};
+    agentAccessRows.forEach((r) => {
+      tierByUser[r.bitrix_user_id] = r.tier;
+    });
+    const query = agentSearch.trim().toLowerCase();
+    const visibleUsers = agentBitrixUsers.filter(
+      (u) => !query || u.name.toLowerCase().includes(query) || u.email.toLowerCase().includes(query) || String(u.id).includes(query),
+    );
 
     return (
       <div className="flex flex-col gap-6 animate-in fade-in duration-300 h-full">
@@ -3424,35 +3417,15 @@ export default function App() {
                 <p className="text-sm text-slate-500 font-medium mt-1">Кто и с каким уровнем может пользоваться ИИ-агентом</p>
               </div>
             </div>
-            <button
-              onClick={() => void loadAgentAccess()}
-              disabled={agentAccessLoading}
-              className="flex items-center gap-2 border border-[#Eef0f4] bg-white hover:border-[#CBD5E1] text-slate-700 px-4 py-2.5 rounded-xl font-bold text-sm transition-all disabled:opacity-60"
-            >
+            <button onClick={() => void loadAgentAccess()} disabled={agentAccessLoading} className="flex items-center gap-2 border border-[#Eef0f4] bg-white hover:border-[#CBD5E1] text-slate-700 px-4 py-2.5 rounded-xl font-bold text-sm transition-all disabled:opacity-60">
               <RefreshCw className={cn("w-4 h-4", agentAccessLoading && "animate-spin")} strokeWidth={2.5} />
               Обновить
             </button>
           </div>
 
           <div className="flex items-center gap-2 mb-6">
-            <button
-              onClick={() => setAgentSection("bitrix")}
-              className={cn(
-                "px-4 py-2 rounded-lg text-[13px] font-bold border transition-all",
-                agentSection === "bitrix" ? "bg-blue-50 text-blue-700 border-blue-200" : "bg-white text-slate-500 border-slate-200 hover:bg-slate-50",
-              )}
-            >
-              Bitrix
-            </button>
-            <button
-              onClick={() => setAgentSection("telegram")}
-              className={cn(
-                "px-4 py-2 rounded-lg text-[13px] font-bold border transition-all",
-                agentSection === "telegram" ? "bg-blue-50 text-blue-700 border-blue-200" : "bg-white text-slate-500 border-slate-200 hover:bg-slate-50",
-              )}
-            >
-              Telegram
-            </button>
+            <button onClick={() => setAgentSection("bitrix")} className={cn("px-4 py-2 rounded-lg text-[13px] font-bold border transition-all", agentSection === "bitrix" ? "bg-blue-50 text-blue-700 border-blue-200" : "bg-white text-slate-500 border-slate-200 hover:bg-slate-50")}>Bitrix</button>
+            <button onClick={() => setAgentSection("telegram")} className={cn("px-4 py-2 rounded-lg text-[13px] font-bold border transition-all", agentSection === "telegram" ? "bg-blue-50 text-blue-700 border-blue-200" : "bg-white text-slate-500 border-slate-200 hover:bg-slate-50")}>Telegram</button>
           </div>
 
           {agentAccessMessage && (
@@ -3464,89 +3437,61 @@ export default function App() {
               Управление Telegram-доступом скоро появится здесь.
             </div>
           ) : (
-            <div className="space-y-6">
-              <div className="rounded-xl border border-[#Eef0f4] bg-[#F8FAFC] px-4 py-3 text-[13px] font-medium text-slate-600 leading-relaxed">
-                <b className="text-[#5440F6]">Админ</b> — всё, включая правку инструкций/настроек и удаление.{" "}
-                <b className="text-emerald-600">Оператор</b> — полный рабочий доступ без этого.{" "}
-                <b className="text-slate-500">Чтение</b> — только справка по компании. Изменения применяются сразу.
+            <div className="space-y-5">
+              <div className="rounded-xl border border-[#Eef0f4] bg-[#F8FAFC] px-4 py-3 text-[12.5px] font-medium text-slate-600 leading-relaxed space-y-1">
+                <div><b className="text-slate-500">Отсутствие доступа</b> — агент не отвечает этому человеку.</div>
+                <div><b className="text-blue-600">Доступ к базе знаний</b> — отвечает по компании, Zoom-созвонам и базе знаний.</div>
+                <div><b className="text-emerald-600">Доступ ко всем функциям</b> — может всё, кроме редактирования собственной системы.</div>
+                <div><b className="text-[#5440F6]">Полный доступ</b> — доступно всё (по умолчанию у Александра Никитенко).</div>
+                <div className="text-slate-400 pt-1">Изменения применяются сразу.</div>
               </div>
 
-              <div className="rounded-2xl border border-[#Eef0f4] p-5">
-                <div className="text-[13px] font-bold text-slate-700 mb-3">Выдать доступ сотруднику</div>
-                <div className="flex flex-wrap items-center gap-3">
-                  <CustomSelect value={agentAddUserId} onChange={setAgentAddUserId} options={addOptions} placeholder="Выберите сотрудника из Bitrix" className="min-w-[280px] flex-1" />
-                  <CustomSelect value={agentAddTier} onChange={setAgentAddTier} options={tierAddOptions} className="min-w-[280px]" />
-                  <button
-                    onClick={() => {
-                      const uid = Number(agentAddUserId);
-                      if (uid) void setAgentTier(uid, agentAddTier, userById(uid)?.name);
-                    }}
-                    disabled={!agentAddUserId}
-                    className="h-11 px-5 rounded-xl bg-[#5440F6] text-white font-bold text-[13px] disabled:opacity-50"
-                  >
-                    Выдать
-                  </button>
-                </div>
-                {agentBitrixUsers.length === 0 && !agentAccessLoading && (
-                  <div className="text-[12px] text-slate-400 mt-2">Список сотрудников Bitrix недоступен — проверьте подключение портала.</div>
-                )}
+              <div className="flex items-center justify-between gap-3">
+                <input
+                  value={agentSearch}
+                  onChange={(e) => setAgentSearch(e.target.value)}
+                  placeholder="Поиск по имени или почте"
+                  className="h-11 w-full max-w-sm rounded-xl border border-[#Eef0f4] bg-white px-4 text-[13px] font-medium text-slate-700 outline-none focus:border-[#5440F6]/40 focus:ring-2 focus:ring-[#5440F6]/10"
+                />
+                <div className="text-[12px] font-bold text-slate-400 whitespace-nowrap">Всего: {agentBitrixUsers.length}</div>
               </div>
 
-              <div>
-                <div className="text-[13px] font-bold text-slate-700 mb-3">Назначенные ({agentAccessRows.length})</div>
-                <div className="rounded-2xl border border-[#Eef0f4] overflow-hidden">
-                  <table className="w-full text-[13px]">
-                    <thead className="bg-[#F8FAFC]">
-                      <tr className="text-slate-400 text-[11px] uppercase tracking-wide">
-                        <th className="text-left font-bold px-4 py-3">Сотрудник</th>
-                        <th className="text-left font-bold px-4 py-3">ID</th>
-                        <th className="text-left font-bold px-4 py-3">Уровень</th>
-                        <th className="text-left font-bold px-4 py-3">Обновлено</th>
-                        <th className="px-4 py-3"></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {agentAccessRows.length === 0 ? (
-                        <tr>
-                          <td colSpan={5} className="px-4 py-6 text-center text-slate-400 font-bold">Пока никому не выдан расширенный доступ.</td>
-                        </tr>
-                      ) : (
-                        agentAccessRows.map((row) => {
-                          const locked = agentBootstrapIds.includes(row.bitrix_user_id);
-                          return (
-                            <tr key={row.bitrix_user_id} className="border-t border-[#Eef0f4]">
-                              <td className="px-4 py-3 font-bold text-slate-800">{nameFor(row.bitrix_user_id, row.display_name)}</td>
-                              <td className="px-4 py-3 text-slate-400">{row.bitrix_user_id}</td>
-                              <td className="px-4 py-3">
-                                {locked ? (
-                                  <span className={cn("inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold", tierClass.admin)}>Админ · владелец</span>
-                                ) : (
-                                  <CustomSelect
-                                    value={row.tier}
-                                    onChange={(t) => void setAgentTier(row.bitrix_user_id, t, nameFor(row.bitrix_user_id, row.display_name))}
-                                    options={tierRowOptions}
-                                    className="w-[160px]"
-                                  />
-                                )}
-                              </td>
-                              <td className="px-4 py-3 text-slate-400">{row.updated_at}</td>
-                              <td className="px-4 py-3 text-right">
-                                {!locked && (
-                                  <button
-                                    onClick={() => void setAgentTier(row.bitrix_user_id, "faq")}
-                                    className="inline-flex items-center gap-1.5 text-slate-400 hover:text-red-600 font-bold text-[12px]"
-                                  >
-                                    <Trash2 className="w-4 h-4" /> Убрать
-                                  </button>
-                                )}
-                              </td>
-                            </tr>
-                          );
-                        })
-                      )}
-                    </tbody>
-                  </table>
-                </div>
+              <div className="rounded-2xl border border-[#Eef0f4]">
+                <table className="w-full text-[13px]">
+                  <thead className="bg-[#F8FAFC]">
+                    <tr className="text-slate-400 text-[11px] uppercase tracking-wide">
+                      <th className="text-left font-bold px-4 py-3">Сотрудник</th>
+                      <th className="text-left font-bold px-4 py-3 w-[300px]">Уровень доступа</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {agentAccessLoading && agentBitrixUsers.length === 0 ? (
+                      <tr><td colSpan={2} className="px-4 py-6 text-center text-slate-400 font-bold">Загрузка…</td></tr>
+                    ) : visibleUsers.length === 0 ? (
+                      <tr><td colSpan={2} className="px-4 py-6 text-center text-slate-400 font-bold">{agentBitrixUsers.length === 0 ? "Список сотрудников Bitrix недоступен — проверьте подключение портала." : "Никого не найдено."}</td></tr>
+                    ) : (
+                      visibleUsers.map((u) => {
+                        const locked = agentBootstrapIds.includes(u.id);
+                        const current = locked ? "admin" : tierByUser[u.id] || "none";
+                        return (
+                          <tr key={u.id} className="border-t border-[#Eef0f4]">
+                            <td className="px-4 py-3">
+                              <div className="font-bold text-slate-800">{u.name}</div>
+                              <div className="text-[11px] text-slate-400">{u.email || `ID ${u.id}`}{locked ? " · владелец" : ""}</div>
+                            </td>
+                            <td className="px-4 py-3">
+                              {locked ? (
+                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-[#EDE9FE] text-[#5440F6]">Полный доступ</span>
+                              ) : (
+                                <CustomSelect value={current} onChange={(t) => void setAgentTier(u.id, t, u.name)} options={STATUS_OPTIONS} className="w-[280px]" />
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
           )}

@@ -19555,16 +19555,31 @@ def agent_access_list():
     return jsonify({"rows": rows, "bootstrap_admin_ids": sorted(_b24_owner_user_ids())})
 
 
+_AGENT_BOT_EMAILS = {"a9ent.ai@gmail.com"}  # the agent's own Bitrix account — not a grantee
+
+
 @app.get("/api/agent-access/bitrix-users")
 def agent_access_bitrix_users():
     """Active Bitrix users from the live bot portal (B24_TESTBOT_WEBHOOK_BASE) — the ids here are
-    exactly the ones the bot receives, so the dropdown maps 1:1 to access rows."""
+    exactly the ones the bot receives, so the list maps 1:1 to access rows. Most portal accounts
+    have empty NAME/LAST_NAME, so we resolve a human name by email from the synced org directory
+    (users table), falling back to the email itself."""
     try:
         client = b24_testbot_client()
         data = _b24_testbot_call(client, "user.get", {"ACTIVE": True})
     except Exception as exc:  # noqa: BLE001
         logging.exception("agent_access bitrix users failed")
         return jsonify({"error": "Не удалось получить пользователей Bitrix.", "detail": str(exc)[:200]}), 502
+
+    email_dir: dict[str, tuple[str | None, str | None]] = {}
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT lower(email) AS email, full_name, work_position FROM users WHERE email <> ''")
+                email_dir = {r["email"]: (r["full_name"], r["work_position"]) for r in cur.fetchall()}
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_access org directory load failed")
+
     result = data.get("result") or []
     users = []
     for u in result if isinstance(result, list) else []:
@@ -19573,8 +19588,14 @@ def agent_access_bitrix_users():
         uid = to_int(u.get("ID"))
         if not uid:
             continue
-        name = " ".join(p for p in (u.get("NAME"), u.get("LAST_NAME")) if p).strip()
-        users.append({"id": uid, "name": name or f"#{uid}", "position": u.get("WORK_POSITION") or ""})
+        email = (u.get("EMAIL") or "").strip()
+        if email.lower() in _AGENT_BOT_EMAILS:
+            continue
+        portal_name = " ".join(p for p in (u.get("NAME"), u.get("LAST_NAME")) if p).strip()
+        dir_name, dir_pos = email_dir.get(email.lower(), (None, None))
+        name = portal_name or (dir_name or "").strip() or email or f"#{uid}"
+        position = (u.get("WORK_POSITION") or dir_pos or "").strip()
+        users.append({"id": uid, "name": name, "email": email, "position": position})
     users.sort(key=lambda x: x["name"].lower())
     return jsonify({"users": users})
 
@@ -20919,14 +20940,15 @@ def _agent_access_remove(bitrix_user_id: int) -> None:
 def _b24_tier_for(from_user_id: Any) -> str:
     """Access tier from the Bitrix-trusted sender id (cannot be spoofed in chat):
     'admin' = full incl. instruction/settings edits + deletes; 'ops' = full operational access
-    minus the admin tools; 'faq' = read-only. Resolution: the env owner ids are an un-removable
-    bootstrap admin (so the UI can never lock the owner out); otherwise the agent_access table
-    (managed from the "Настройки Агента" tab) decides; unknown users default to read-only faq."""
+    minus the admin tools; 'faq' = read-only knowledge base; 'none' = no access (the bot does
+    not respond at all). Resolution: the env owner ids are an un-removable bootstrap admin (so the
+    UI can never lock the owner out); otherwise the agent_access table (managed from the "Настройки
+    Агента" tab) decides; users with no grant default to 'none'."""
     uid = to_int(from_user_id)
     if uid in _b24_owner_user_ids():
         return "admin"
     tier = _agent_access_map().get(uid)
-    return tier if tier in ("admin", "ops", "faq") else "faq"
+    return tier if tier in ("admin", "ops", "faq") else "none"
 
 
 # --- Session lifecycle: 30-min idle reset + turn-cap rotation with carried summary ----
@@ -21390,6 +21412,9 @@ def _bitrix_imbot_app_event():
         from_user_id = _imbot_event_param(payload, "FROM_USER_ID") or ""
         if not dialog_id or not message_text:
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
+        # Access gate: users without a grant ('none' tier) get no response at all.
+        if _b24_tier_for(from_user_id) == "none":
+            return jsonify({"ok": True, "ignored": True, "reason": "no_access"}), 200
         # Pending error report: this message is the user's error description — capture, forward to
         # the Albery notifications Telegram group + log it, WITHOUT calling the model.
         if _b24_pop_awaiting_error(dialog_id):
