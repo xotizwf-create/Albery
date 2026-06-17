@@ -2085,7 +2085,17 @@ export default function App() {
   const [renamingCompanyFolderId, setRenamingCompanyFolderId] = useState<string | null>(null);
   const [renamingCompanyFolderName, setRenamingCompanyFolderName] = useState("");
   const [companyFolderDeleteCandidate, setCompanyFolderDeleteCandidate] = useState<CompanyFolder | null>(null);
-  const [settingsSubTab, setSettingsSubTab] = useState<"ai_instructions">("ai_instructions");
+  const [settingsSubTab, setSettingsSubTab] = useState<"ai_instructions" | "agent_settings">("ai_instructions");
+  const [agentAccessRows, setAgentAccessRows] = useState<
+    { bitrix_user_id: number; tier: string; display_name: string | null; updated_at: string }[]
+  >([]);
+  const [agentBootstrapIds, setAgentBootstrapIds] = useState<number[]>([]);
+  const [agentBitrixUsers, setAgentBitrixUsers] = useState<{ id: number; name: string; position: string }[]>([]);
+  const [agentAccessLoading, setAgentAccessLoading] = useState(false);
+  const [agentAccessMessage, setAgentAccessMessage] = useState("");
+  const [agentAddUserId, setAgentAddUserId] = useState("");
+  const [agentAddTier, setAgentAddTier] = useState("ops");
+  const [agentSection, setAgentSection] = useState<"bitrix" | "telegram">("bitrix");
   const [aiInstructionDraft, setAiInstructionDraft] = useState("");
   const [aiInstructionLoading, setAiInstructionLoading] = useState(false);
   const [aiInstructionSaving, setAiInstructionSaving] = useState(false);
@@ -3310,6 +3320,241 @@ export default function App() {
     );
   };
 
+  const loadAgentAccess = async () => {
+    setAgentAccessLoading(true);
+    setAgentAccessMessage("");
+    try {
+      const [acc, usr] = await Promise.all([
+        fetchJsonSafe("/api/agent-access", undefined, 30000),
+        fetchJsonSafe("/api/agent-access/bitrix-users", undefined, 30000).catch(() => ({ users: [] })),
+      ]);
+      setAgentAccessRows(acc.rows || []);
+      setAgentBootstrapIds(acc.bootstrap_admin_ids || []);
+      setAgentBitrixUsers(usr.users || []);
+    } catch (error) {
+      setAgentAccessMessage(error instanceof Error ? error.message : "Не удалось загрузить доступы.");
+    } finally {
+      setAgentAccessLoading(false);
+    }
+  };
+
+  const setAgentTier = async (uid: number, tier: string, name?: string) => {
+    setAgentAccessMessage("");
+    try {
+      if (tier === "faq") {
+        await fetchJsonSafe(`/api/agent-access/${uid}`, { method: "DELETE" }, 30000);
+      } else {
+        await fetchJsonSafe(
+          "/api/agent-access",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ bitrix_user_id: uid, tier, display_name: name || null }),
+          },
+          30000,
+        );
+      }
+      setAgentAddUserId("");
+      await loadAgentAccess();
+    } catch (error) {
+      setAgentAccessMessage(error instanceof Error ? error.message : "Не удалось сохранить.");
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === "Настройки" && settingsSubTab === "agent_settings") void loadAgentAccess();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, settingsSubTab]);
+
+  const renderSettingsTabs = () => (
+    <div className="flex items-center gap-2 bg-white p-1.5 rounded-xl border border-[#Eef0f4] w-max shadow-sm">
+      <button
+        onClick={() => setSettingsSubTab("ai_instructions")}
+        className={cn(
+          "px-5 py-2 rounded-lg text-[13px] font-bold transition-all",
+          settingsSubTab === "ai_instructions" ? "bg-[#5440F6] text-white shadow-md shadow-[#5440F6]/20" : "text-slate-500 hover:text-slate-900",
+        )}
+      >
+        Инструкции для ИИ
+      </button>
+      <button
+        onClick={() => setSettingsSubTab("agent_settings")}
+        className={cn(
+          "px-5 py-2 rounded-lg text-[13px] font-bold transition-all",
+          settingsSubTab === "agent_settings" ? "bg-[#5440F6] text-white shadow-md shadow-[#5440F6]/20" : "text-slate-500 hover:text-slate-900",
+        )}
+      >
+        Настройки Агента
+      </button>
+    </div>
+  );
+
+  const renderAgentAccessSettings = () => {
+    const tierClass: Record<string, string> = {
+      admin: "bg-[#EDE9FE] text-[#5440F6]",
+      ops: "bg-emerald-50 text-emerald-600",
+      faq: "bg-slate-100 text-slate-500",
+    };
+    const userById = (uid: number) => agentBitrixUsers.find((u) => u.id === uid);
+    const nameFor = (uid: number, fallback?: string | null) => userById(uid)?.name || fallback || `#${uid}`;
+    const addOptions = agentBitrixUsers
+      .filter((u) => !agentBootstrapIds.includes(u.id))
+      .map((u) => ({ value: String(u.id), label: u.position ? `${u.name} — ${u.position}` : u.name }));
+    const tierAddOptions = [
+      { value: "ops", label: "Оператор (полный доступ без правки настроек)" },
+      { value: "admin", label: "Админ (полный, включая инструкции/настройки)" },
+    ];
+    const tierRowOptions = [
+      { value: "faq", label: "Чтение" },
+      { value: "ops", label: "Оператор" },
+      { value: "admin", label: "Админ" },
+    ];
+
+    return (
+      <div className="flex flex-col gap-6 animate-in fade-in duration-300 h-full">
+        {renderSettingsTabs()}
+        <div className="bg-white rounded-3xl p-8 border border-[#Eef0f4] shadow-[0_4px_20px_-8px_rgba(0,0,0,0.03)] h-full overflow-y-auto">
+          <div className="flex flex-wrap items-center justify-between gap-4 mb-8">
+            <div className="flex items-center gap-4">
+              <div className="w-12 h-12 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center shrink-0 border border-blue-100">
+                <Users className="w-6 h-6" strokeWidth={2.5} />
+              </div>
+              <div>
+                <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Настройки Агента</h2>
+                <p className="text-sm text-slate-500 font-medium mt-1">Кто и с каким уровнем может пользоваться ИИ-агентом</p>
+              </div>
+            </div>
+            <button
+              onClick={() => void loadAgentAccess()}
+              disabled={agentAccessLoading}
+              className="flex items-center gap-2 border border-[#Eef0f4] bg-white hover:border-[#CBD5E1] text-slate-700 px-4 py-2.5 rounded-xl font-bold text-sm transition-all disabled:opacity-60"
+            >
+              <RefreshCw className={cn("w-4 h-4", agentAccessLoading && "animate-spin")} strokeWidth={2.5} />
+              Обновить
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2 mb-6">
+            <button
+              onClick={() => setAgentSection("bitrix")}
+              className={cn(
+                "px-4 py-2 rounded-lg text-[13px] font-bold border transition-all",
+                agentSection === "bitrix" ? "bg-blue-50 text-blue-700 border-blue-200" : "bg-white text-slate-500 border-slate-200 hover:bg-slate-50",
+              )}
+            >
+              Bitrix
+            </button>
+            <button
+              onClick={() => setAgentSection("telegram")}
+              className={cn(
+                "px-4 py-2 rounded-lg text-[13px] font-bold border transition-all",
+                agentSection === "telegram" ? "bg-blue-50 text-blue-700 border-blue-200" : "bg-white text-slate-500 border-slate-200 hover:bg-slate-50",
+              )}
+            >
+              Telegram
+            </button>
+          </div>
+
+          {agentAccessMessage && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[13px] font-bold text-amber-700 mb-5">{agentAccessMessage}</div>
+          )}
+
+          {agentSection === "telegram" ? (
+            <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-8 text-center text-sm font-bold text-slate-400">
+              Управление Telegram-доступом скоро появится здесь.
+            </div>
+          ) : (
+            <div className="space-y-6">
+              <div className="rounded-xl border border-[#Eef0f4] bg-[#F8FAFC] px-4 py-3 text-[13px] font-medium text-slate-600 leading-relaxed">
+                <b className="text-[#5440F6]">Админ</b> — всё, включая правку инструкций/настроек и удаление.{" "}
+                <b className="text-emerald-600">Оператор</b> — полный рабочий доступ без этого.{" "}
+                <b className="text-slate-500">Чтение</b> — только справка по компании. Изменения применяются сразу.
+              </div>
+
+              <div className="rounded-2xl border border-[#Eef0f4] p-5">
+                <div className="text-[13px] font-bold text-slate-700 mb-3">Выдать доступ сотруднику</div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <CustomSelect value={agentAddUserId} onChange={setAgentAddUserId} options={addOptions} placeholder="Выберите сотрудника из Bitrix" className="min-w-[280px] flex-1" />
+                  <CustomSelect value={agentAddTier} onChange={setAgentAddTier} options={tierAddOptions} className="min-w-[280px]" />
+                  <button
+                    onClick={() => {
+                      const uid = Number(agentAddUserId);
+                      if (uid) void setAgentTier(uid, agentAddTier, userById(uid)?.name);
+                    }}
+                    disabled={!agentAddUserId}
+                    className="h-11 px-5 rounded-xl bg-[#5440F6] text-white font-bold text-[13px] disabled:opacity-50"
+                  >
+                    Выдать
+                  </button>
+                </div>
+                {agentBitrixUsers.length === 0 && !agentAccessLoading && (
+                  <div className="text-[12px] text-slate-400 mt-2">Список сотрудников Bitrix недоступен — проверьте подключение портала.</div>
+                )}
+              </div>
+
+              <div>
+                <div className="text-[13px] font-bold text-slate-700 mb-3">Назначенные ({agentAccessRows.length})</div>
+                <div className="rounded-2xl border border-[#Eef0f4] overflow-hidden">
+                  <table className="w-full text-[13px]">
+                    <thead className="bg-[#F8FAFC]">
+                      <tr className="text-slate-400 text-[11px] uppercase tracking-wide">
+                        <th className="text-left font-bold px-4 py-3">Сотрудник</th>
+                        <th className="text-left font-bold px-4 py-3">ID</th>
+                        <th className="text-left font-bold px-4 py-3">Уровень</th>
+                        <th className="text-left font-bold px-4 py-3">Обновлено</th>
+                        <th className="px-4 py-3"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {agentAccessRows.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="px-4 py-6 text-center text-slate-400 font-bold">Пока никому не выдан расширенный доступ.</td>
+                        </tr>
+                      ) : (
+                        agentAccessRows.map((row) => {
+                          const locked = agentBootstrapIds.includes(row.bitrix_user_id);
+                          return (
+                            <tr key={row.bitrix_user_id} className="border-t border-[#Eef0f4]">
+                              <td className="px-4 py-3 font-bold text-slate-800">{nameFor(row.bitrix_user_id, row.display_name)}</td>
+                              <td className="px-4 py-3 text-slate-400">{row.bitrix_user_id}</td>
+                              <td className="px-4 py-3">
+                                {locked ? (
+                                  <span className={cn("inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold", tierClass.admin)}>Админ · владелец</span>
+                                ) : (
+                                  <CustomSelect
+                                    value={row.tier}
+                                    onChange={(t) => void setAgentTier(row.bitrix_user_id, t, nameFor(row.bitrix_user_id, row.display_name))}
+                                    options={tierRowOptions}
+                                    className="w-[160px]"
+                                  />
+                                )}
+                              </td>
+                              <td className="px-4 py-3 text-slate-400">{row.updated_at}</td>
+                              <td className="px-4 py-3 text-right">
+                                {!locked && (
+                                  <button
+                                    onClick={() => void setAgentTier(row.bitrix_user_id, "faq")}
+                                    className="inline-flex items-center gap-1.5 text-slate-400 hover:text-red-600 font-bold text-[12px]"
+                                  >
+                                    <Trash2 className="w-4 h-4" /> Убрать
+                                  </button>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   const renderAiInstructionsSettings = () => {
     const atRoot = !aiInstructionCurrentFolder;
     const hasChanges = aiInstructionCurrentFolder ? aiInstructionDraft !== (aiInstructionCurrentFolder.content || "") : false;
@@ -3318,17 +3563,7 @@ export default function App() {
 
     return (
       <div className="flex flex-col gap-6 animate-in fade-in duration-300 h-full">
-        <div className="flex items-center gap-2 bg-white p-1.5 rounded-xl border border-[#Eef0f4] w-max shadow-sm">
-          <button
-            onClick={() => setSettingsSubTab("ai_instructions")}
-            className={cn(
-              "px-5 py-2 rounded-lg text-[13px] font-bold transition-all",
-              settingsSubTab === "ai_instructions" ? "bg-[#5440F6] text-white shadow-md shadow-[#5440F6]/20" : "text-slate-500 hover:text-slate-900",
-            )}
-          >
-            Инструкции для ИИ
-          </button>
-        </div>
+        {renderSettingsTabs()}
 
         <div className="bg-white rounded-3xl p-8 border border-[#Eef0f4] shadow-[0_4px_20px_-8px_rgba(0,0,0,0.03)] h-full overflow-y-auto">
           <div className="flex flex-wrap items-center justify-between gap-4 mb-8">
@@ -6141,7 +6376,7 @@ export default function App() {
     }
 
     if (activeTab === "Настройки") {
-      return renderAiInstructionsSettings();
+      return settingsSubTab === "agent_settings" ? renderAgentAccessSettings() : renderAiInstructionsSettings();
     }
 
     if (activeTab !== "Сводная аналитика") {

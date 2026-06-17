@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import hashlib
@@ -19526,101 +19526,20 @@ def logout():
     return redirect(url_for("login"), code=302)
 
 
-# --- Agent access management UI (/admin/access) -------------------------------------------
-# Lets an admin grant/revoke the chat-bot tier (admin/ops/faq) per Bitrix user, live (the bot
-# reads agent_access on each turn via a short cache). Behind the site's admin session login
-# (require_admin_auth). Served as a server-rendered page because the SPA source isn't in the repo.
-
-_AGENT_ACCESS_PAGE_HTML = """<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Доступ агента</title>
-<style>
- :root{color-scheme:dark}
- body{font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#0f1620;color:#e6edf3;margin:0;padding:24px}
- h1{font-size:20px;margin:0 0 4px} .sub{color:#8b98a5;font-size:13px;margin-bottom:20px}
- table{width:100%;border-collapse:collapse;margin-bottom:28px;background:#152030;border-radius:10px;overflow:hidden}
- th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #22303f;font-size:14px}
- th{color:#8b98a5;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
- tr:last-child td{border-bottom:none}
- select,input{background:#0f1620;color:#e6edf3;border:1px solid #2a3a4d;border-radius:6px;padding:6px 8px;font-size:14px}
- button{background:#29619b;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:13px;cursor:pointer}
- button.danger{background:#7a2e2e} button.ghost{background:#22303f}
- .tag{font-size:11px;padding:2px 7px;border-radius:99px;font-weight:600}
- .tag.admin{background:#3a2b58;color:#d6b8ff}.tag.ops{background:#1e4620;color:#a6e3a1}.tag.faq{background:#2a3a4d;color:#9fb3c8}
- .lock{color:#8b98a5;font-size:12px}
- .card{background:#152030;border-radius:10px;padding:16px;max-width:560px;margin-bottom:20px}
- .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin-top:8px}
- .row label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:#8b98a5}
- .msg{font-size:13px;margin-left:10px}.ok{color:#a6e3a1}.err{color:#ff7b72}
- a.back{color:#8b98a5;font-size:13px;text-decoration:none}
-</style></head><body>
- <a class="back" href="/main">&larr; назад</a>
- <h1>Управление доступом ИИ-агента</h1>
- <div class="sub">Уровень в чат-боте Bitrix по пользователю. <b>admin</b> — всё, включая правку инструкций/настроек и удаление. <b>ops</b> — полный операционный доступ без этого. <b>faq</b> — только чтение. Изменения применяются сразу.</div>
-
- <h3 style="font-size:14px;color:#8b98a5">Назначенные</h3>
- <table id="rows"><thead><tr><th>Bitrix ID</th><th>Имя</th><th>Уровень</th><th>Обновлено</th><th></th></tr></thead><tbody></tbody></table>
-
- <div class="card">
-  <b style="font-size:14px">Добавить / изменить</b>
-  <div class="row">
-   <label>Bitrix user ID<input id="addId" type="number" min="1" placeholder="напр. 17"></label>
-   <label>Имя (необяз.)<input id="addName" type="text" placeholder="Имя Фамилия"></label>
-   <label>Уровень<select id="addTier"><option value="faq">faq</option><option value="ops">ops</option><option value="admin">admin</option></select></label>
-   <button onclick="setAccess(+document.getElementById('addId').value, document.getElementById('addTier').value, document.getElementById('addName').value)">Сохранить</button>
-   <span id="addMsg" class="msg"></span>
-  </div>
- </div>
-
- <h3 style="font-size:14px;color:#8b98a5">Недавние пользователи бота (кандидаты)</h3>
- <table id="cands"><thead><tr><th>Bitrix ID</th><th>Имя</th><th>Последний раз</th><th>Выдать</th></tr></thead><tbody></tbody></table>
-
-<script>
-const TIERS=['faq','ops','admin'];
-let BOOT=[];
-function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-async function api(url,body){
- const o={headers:{'Accept':'application/json'},credentials:'same-origin'};
- if(body){o.method='POST';o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
- const r=await fetch(url,o); const d=await r.json().catch(()=>({})); if(!r.ok) throw new Error(d.error||r.status); return d;
-}
-function tierSel(uid,cur,locked){
- if(locked) return '<span class="tag '+cur+'">'+cur+'</span> <span class="lock">(владелец, закреплён)</span>';
- return '<select onchange="setAccess('+uid+',this.value)">'+TIERS.map(t=>'<option value="'+t+'"'+(t===cur?' selected':'')+'>'+t+'</option>').join('')+'</select>';
-}
-async function load(){
- const d=await api('/admin/access/data'); BOOT=d.bootstrap_admin_ids||[];
- const tb=document.querySelector('#rows tbody'); tb.innerHTML='';
- (d.rows||[]).forEach(r=>{const locked=BOOT.includes(r.bitrix_user_id);
-  tb.innerHTML+='<tr><td>'+r.bitrix_user_id+'</td><td>'+esc(r.display_name)+'</td><td>'+tierSel(r.bitrix_user_id,r.tier,locked)+'</td><td style="color:#8b98a5">'+esc(r.updated_at||'')+'</td><td>'+(locked?'':'<button class="danger" onclick="removeAccess('+r.bitrix_user_id+')">Убрать</button>')+'</td></tr>';});
- const cb=document.querySelector('#cands tbody'); cb.innerHTML='';
- (d.candidates||[]).forEach(c=>{cb.innerHTML+='<tr><td>'+c.bitrix_user_id+'</td><td>'+esc(c.name)+'</td><td style="color:#8b98a5">'+esc(c.last_seen||'')+'</td><td><button class="ghost" onclick="setAccess('+c.bitrix_user_id+',\\'ops\\',\\''+esc(c.name)+'\\')">→ ops</button> <button class="ghost" onclick="setAccess('+c.bitrix_user_id+',\\'faq\\',\\''+esc(c.name)+'\\')">→ faq</button></td></tr>';});
- if(!(d.candidates||[]).length) cb.innerHTML='<tr><td colspan="4" style="color:#8b98a5">нет новых пользователей</td></tr>';
-}
-async function setAccess(uid,tier,name){
- const m=document.getElementById('addMsg'); m.textContent='';
- if(!uid||uid<1){m.textContent='Укажите ID';m.className='msg err';return;}
- try{await api('/admin/access/set',{bitrix_user_id:uid,tier:tier,display_name:name||null}); m.textContent='Сохранено';m.className='msg ok'; await load();}
- catch(e){m.textContent='Ошибка: '+e.message;m.className='msg err';}
-}
-async function removeAccess(uid){ try{await api('/admin/access/remove',{bitrix_user_id:uid}); await load();}catch(e){alert('Ошибка: '+e.message);} }
-load();
-</script></body></html>"""
+# --- Agent access management API (/api/agent-access) --------------------------------------
+# Backs the "Настройки Агента" tab in the SPA. Lets an admin grant/revoke the chat-bot tier
+# (admin/ops/faq) per Bitrix user, live (the bot reads agent_access each turn via a short
+# cache). Behind the site's admin session login + /api origin check (require_admin_auth).
 
 
-@app.get("/admin/access")
-def agent_access_page():
-    return Response(_AGENT_ACCESS_PAGE_HTML, mimetype="text/html")
-
-
-@app.get("/admin/access/data")
-def agent_access_data():
-    rows, candidates = [], []
+@app.get("/api/agent-access")
+def agent_access_list():
+    rows = []
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT bitrix_user_id, tier, display_name, note, updated_at FROM agent_access "
+                    "SELECT bitrix_user_id, tier, display_name, updated_at FROM agent_access "
                     "ORDER BY CASE tier WHEN 'admin' THEN 0 WHEN 'ops' THEN 1 ELSE 2 END, bitrix_user_id"
                 )
                 for r in cur.fetchall():
@@ -19630,39 +19549,38 @@ def agent_access_data():
                         "display_name": r["display_name"],
                         "updated_at": r["updated_at"].astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M") if r["updated_at"] else "",
                     })
-                cur.execute(
-                    """
-                    SELECT i.bitrix_user_id, MAX(i.created_at) AS last_seen,
-                      (SELECT r.reporter_name FROM bitrix_error_reports r
-                         WHERE r.bitrix_user_id = i.bitrix_user_id AND r.reporter_name IS NOT NULL
-                         ORDER BY r.id DESC LIMIT 1) AS name
-                    FROM bitrix_bot_interactions i
-                    WHERE i.bitrix_user_id IS NOT NULL
-                      AND i.bitrix_user_id NOT IN (SELECT bitrix_user_id FROM agent_access)
-                    GROUP BY i.bitrix_user_id
-                    ORDER BY last_seen DESC LIMIT 50
-                    """
-                )
-                for r in cur.fetchall():
-                    candidates.append({
-                        "bitrix_user_id": int(r["bitrix_user_id"]),
-                        "name": r["name"],
-                        "last_seen": r["last_seen"].astimezone(MSK_TZ).strftime("%d.%m %H:%M") if r["last_seen"] else "",
-                    })
     except Exception:  # noqa: BLE001
-        logging.exception("agent_access data load failed")
-        return jsonify({"error": "Не удалось загрузить данные доступа."}), 500
-    return jsonify({
-        "rows": rows,
-        "candidates": candidates,
-        "bootstrap_admin_ids": sorted(_b24_owner_user_ids()),
-    })
+        logging.exception("agent_access list failed")
+        return jsonify({"error": "Не удалось загрузить доступы."}), 500
+    return jsonify({"rows": rows, "bootstrap_admin_ids": sorted(_b24_owner_user_ids())})
 
 
-@app.post("/admin/access/set")
-def agent_access_set():
-    if not browser_origin_ok():
-        return jsonify({"error": "Invalid request origin."}), 403
+@app.get("/api/agent-access/bitrix-users")
+def agent_access_bitrix_users():
+    """Active Bitrix users from the live bot portal (B24_TESTBOT_WEBHOOK_BASE) — the ids here are
+    exactly the ones the bot receives, so the dropdown maps 1:1 to access rows."""
+    try:
+        client = b24_testbot_client()
+        data = _b24_testbot_call(client, "user.get", {"ACTIVE": True})
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("agent_access bitrix users failed")
+        return jsonify({"error": "Не удалось получить пользователей Bitrix.", "detail": str(exc)[:200]}), 502
+    result = data.get("result") or []
+    users = []
+    for u in result if isinstance(result, list) else []:
+        if not isinstance(u, dict):
+            continue
+        uid = to_int(u.get("ID"))
+        if not uid:
+            continue
+        name = " ".join(p for p in (u.get("NAME"), u.get("LAST_NAME")) if p).strip()
+        users.append({"id": uid, "name": name or f"#{uid}", "position": u.get("WORK_POSITION") or ""})
+    users.sort(key=lambda x: x["name"].lower())
+    return jsonify({"users": users})
+
+
+@app.post("/api/agent-access")
+def agent_access_upsert():
     body = request.get_json(silent=True) or {}
     uid = to_int(body.get("bitrix_user_id"))
     tier = str(body.get("tier") or "").strip().lower()
@@ -19674,25 +19592,19 @@ def agent_access_set():
     try:
         _agent_access_set(uid, tier, name)
     except Exception:  # noqa: BLE001
-        logging.exception("agent_access set failed")
+        logging.exception("agent_access upsert failed")
         return jsonify({"error": "Не удалось сохранить."}), 500
     return jsonify({"ok": True})
 
 
-@app.post("/admin/access/remove")
-def agent_access_remove_route():
-    if not browser_origin_ok():
-        return jsonify({"error": "Invalid request origin."}), 403
-    body = request.get_json(silent=True) or {}
-    uid = to_int(body.get("bitrix_user_id"))
-    if not uid:
-        return jsonify({"error": "Укажите Bitrix user ID."}), 400
+@app.delete("/api/agent-access/<int:uid>")
+def agent_access_delete(uid: int):
     if uid in _b24_owner_user_ids():
         return jsonify({"error": "Владельца нельзя убрать (закреплён как admin)."}), 400
     try:
         _agent_access_remove(uid)
     except Exception:  # noqa: BLE001
-        logging.exception("agent_access remove failed")
+        logging.exception("agent_access delete failed")
         return jsonify({"error": "Не удалось убрать."}), 500
     return jsonify({"ok": True})
 
@@ -20954,8 +20866,8 @@ def _b24_owner_user_ids() -> set[int]:
     return {int(x) for x in re.findall(r"\d+", os.getenv("B24_TESTBOT_OWNER_USER_IDS", "16"))}
 
 
-# Access tiers are stored in the agent_access table and managed live from /admin/access. We
-# cache the map briefly so tier resolution doesn't hit the DB on every bot message.
+# Access tiers are stored in the agent_access table and managed live from the "Настройки Агента"
+# tab (/api/agent-access). We cache the map briefly so tier resolution skips the DB per message.
 _AGENT_ACCESS_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
 _AGENT_ACCESS_TTL = 20.0
 
@@ -21009,7 +20921,7 @@ def _b24_tier_for(from_user_id: Any) -> str:
     'admin' = full incl. instruction/settings edits + deletes; 'ops' = full operational access
     minus the admin tools; 'faq' = read-only. Resolution: the env owner ids are an un-removable
     bootstrap admin (so the UI can never lock the owner out); otherwise the agent_access table
-    (managed from /admin/access) decides; unknown users default to read-only faq."""
+    (managed from the "Настройки Агента" tab) decides; unknown users default to read-only faq."""
     uid = to_int(from_user_id)
     if uid in _b24_owner_user_ids():
         return "admin"
