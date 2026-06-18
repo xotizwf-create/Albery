@@ -3793,8 +3793,8 @@ def tool_create_google_sheet(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(
             -32602,
             "Создание Google-таблицы требует confirm=true. Сначала покажи пользователю, что создашь "
-            "(название, какие данные впишешь, и что доступ будет «по ссылке — редактор»), получи согласие, "
-            "и только потом вызови с confirm=true.",
+            "(название, какие данные впишешь, как будет оформлена таблица, и что доступ будет «по ссылке — редактор»), "
+            "получи согласие, и только потом вызови с confirm=true.",
         )
     title = str(args.get("title") or "").strip()
     if not title:
@@ -5416,12 +5416,16 @@ TOOLS: dict[str, dict[str, Any]] = {
     "format_google_sheet": {
         "description": (
             "Style a sheet and build dashboards: apply a list of Sheets API batchUpdate request objects. "
+            "A Google Sheet or task/list table is NOT finished if it is a raw grid. Every delivered table must be "
+            "beautiful and readable: clear title/header, frozen header row, readable column widths, wrapping, "
+            "contrast colors, borders, number/currency/date formats, and conditional formatting/charts when useful. "
+            "create_google_sheet auto-applies a default readable style when rows are provided; use this tool for any "
+            "extra formatting, dashboards, charts, task/status colors, merged title blocks or polished layout. "
             "Before saying a dashboard is ready, write/check formulas with write_google_sheet_values so formula "
             "errors are caught; for ru_RU sheets use semicolons in formulas. "
-            "cell formatting, number/currency formats, conditional formatting, frozen rows/cols, column "
-            "widths, merged cells, and CHARTS (addChart) for dashboards. Get each tab's sheetId from "
-            "get_google_sheet_meta. requests = standard Sheets API request objects (repeatCell, mergeCells, "
-            "updateSheetProperties, addChart, addConditionalFormatRule, updateDimensionProperties, ...)."
+            "Get each tab's sheetId from get_google_sheet_meta. requests = standard Sheets API request objects "
+            "(repeatCell, mergeCells, updateSheetProperties, addChart, addConditionalFormatRule, "
+            "updateDimensionProperties, ...)."
         ),
         "inputSchema": {
             "type": "object",

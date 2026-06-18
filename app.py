@@ -438,6 +438,137 @@ def _scan_formula_errors(sheets: Any, spreadsheet_id: str, cell_range: str, limi
     return errors
 
 
+def _first_sheet_id(sheets: Any, spreadsheet_id: str) -> int:
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=str(spreadsheet_id),
+        fields="sheets(properties(sheetId,index))",
+    ).execute()
+    sheet_props = sorted(
+        ((item.get("properties") or {}) for item in (meta.get("sheets") or [])),
+        key=lambda item: item.get("index", 0),
+    )
+    if not sheet_props:
+        raise RuntimeError("Google Sheet has no visible sheets to format")
+    return int(sheet_props[0].get("sheetId", 0))
+
+
+def _apply_default_google_sheet_style(
+    sheets: Any, spreadsheet_id: str, width: int, row_count: int, sheet_id: int | None = None
+) -> bool:
+    """Apply the Albery default readable style to a newly generated table.
+
+    The Bitrix agent must not hand off bare grids: every generated table/list should have
+    a frozen contrast header, readable wrapping, borders, alternating rows and useful widths.
+    """
+    width = max(1, min(int(width or 1), 26))
+    row_count = max(1, int(row_count or 1))
+    sid = int(sheet_id if sheet_id is not None else _first_sheet_id(sheets, spreadsheet_id))
+    full_range = {
+        "sheetId": sid,
+        "startRowIndex": 0,
+        "endRowIndex": row_count,
+        "startColumnIndex": 0,
+        "endColumnIndex": width,
+    }
+    header_range = {
+        "sheetId": sid,
+        "startRowIndex": 0,
+        "endRowIndex": 1,
+        "startColumnIndex": 0,
+        "endColumnIndex": width,
+    }
+    border = {
+        "style": "SOLID",
+        "width": 1,
+        "color": {"red": 0.82, "green": 0.85, "blue": 0.90},
+    }
+    requests = [
+        {
+            "updateSheetProperties": {
+                "properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": 1}},
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": full_range,
+                "cell": {
+                    "userEnteredFormat": {
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": "userEnteredFormat(verticalAlignment,wrapStrategy)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": header_range,
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.10, "green": 0.16, "blue": 0.27},
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                        "textFormat": {
+                            "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                            "bold": True,
+                            "fontSize": 11,
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,wrapStrategy,textFormat)",
+            }
+        },
+        {
+            "updateBorders": {
+                "range": full_range,
+                "top": border,
+                "bottom": border,
+                "left": border,
+                "right": border,
+                "innerHorizontal": border,
+                "innerVertical": border,
+            }
+        },
+        {
+            "addBanding": {
+                "bandedRange": {
+                    "range": full_range,
+                    "rowProperties": {
+                        "headerColor": {"red": 0.10, "green": 0.16, "blue": 0.27},
+                        "firstBandColor": {"red": 1, "green": 1, "blue": 1},
+                        "secondBandColor": {"red": 0.96, "green": 0.98, "blue": 1.0},
+                    },
+                }
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+                "properties": {"pixelSize": 42},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": width},
+                "properties": {"pixelSize": 160},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "autoResizeDimensions": {
+                "dimensions": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": width}
+            }
+        },
+    ]
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=str(spreadsheet_id), body={"requests": requests}
+    ).execute()
+    return True
+
+
 def create_google_sheet(title: str, rows: list | None = None, share_anyone_writer: bool = True) -> dict[str, Any]:
     """Create a brand-new Google Sheet via the Sheets/Drive API (as the albery agent's Google
     account), optionally write initial rows, optionally share it as anyone-with-link = editor, and
@@ -453,6 +584,7 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
     url = spreadsheet.get("spreadsheetUrl") or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
     locale = _sheet_locale(sheets, sid)
     formula_separator = _formula_argument_separator_for_locale(locale)
+    style_applied = False
     if rows:
         width = max((len(r) for r in rows if isinstance(r, list)), default=1)
         norm = [[(r[i] if isinstance(r, list) and i < len(r) else "") for i in range(width)] for r in rows]
@@ -463,6 +595,7 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
         formula_errors = _scan_formula_errors(sheets, sid, f"A1:{_a1_column_name(width)}{len(norm)}")
         if formula_errors:
             raise RuntimeError(f"Google Sheet formula validation failed after create: {formula_errors[:5]}")
+        style_applied = _apply_default_google_sheet_style(sheets, sid, width, len(norm))
     if share_anyone_writer:
         drive.permissions().create(fileId=sid, body={"type": "anyone", "role": "writer"}).execute()
     return {
@@ -471,6 +604,7 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
         "title": clean_title,
         "locale": locale,
         "formula_separator": formula_separator,
+        "style_applied": style_applied,
         "access": "anyone_with_link_editor" if share_anyone_writer else "private",
     }
 
