@@ -643,6 +643,40 @@ def _apply_default_google_sheet_style(
     return True
 
 
+def _share_drive_anyone(drive, file_id, role: str = "writer") -> str:
+    """Share a Drive item for anyone-with-the-link. Tries `role` then 'reader'. Returns granted role or ''."""
+    if not file_id:
+        return ""
+    for r in (role if role in ("writer", "reader") else "writer", "reader"):
+        try:
+            drive.permissions().create(fileId=str(file_id), body={"type": "anyone", "role": r}).execute()
+            return r
+        except Exception:
+            continue
+    return ""
+
+
+def share_drive_item_for_everyone(item: str, role: str = "writer") -> dict[str, Any]:
+    """Open ANY Drive item (sheet/doc/folder/file/Apps Script) for anyone-with-the-link. Accepts id or URL."""
+    from googleapiclient.discovery import build
+    fid = _extract_drive_folder_id(item)
+    if not fid:
+        raise ValueError("item (Drive id or URL) is required")
+    drive = build("drive", "v3", credentials=_google_user_credentials(), cache_discovery=False)
+    granted = _share_drive_anyone(drive, fid, role)
+    try:
+        meta = drive.files().get(fileId=fid, fields="id,name,mimeType,webViewLink").execute()
+    except Exception:
+        meta = {"id": fid}
+    return {
+        "id": fid,
+        "name": meta.get("name"),
+        "web_view_link": meta.get("webViewLink"),
+        "shared_role": granted or "none",
+        "access": ("anyone_with_link_" + ("editor" if granted == "writer" else "viewer")) if granted else "share_failed",
+    }
+
+
 def create_google_sheet(title: str, rows: list | None = None, share_anyone_writer: bool = True) -> dict[str, Any]:
     """Create a brand-new Google Sheet via the Sheets/Drive API (as the albery agent's Google
     account), optionally write initial rows, optionally share it as anyone-with-link = editor, and
@@ -821,9 +855,11 @@ def create_drive_folder(name: str, parent_folder: str, reuse_existing: bool = Tr
         found = drive.files().list(q=q, fields="files(id,name,mimeType,parents,webViewLink)", pageSize=10, supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", []) or []
         if found:
             meta = found[0]
-            return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": False, "reused": True}
+            _share_drive_anyone(drive, meta.get("id"))
+            return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": False, "reused": True, "access": "anyone_with_link_editor"}
     meta = drive.files().create(body={"name": clean_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}, fields="id,name,mimeType,parents,webViewLink", supportsAllDrives=True).execute()
-    return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": True, "reused": False}
+    _share_drive_anyone(drive, meta.get("id"))
+    return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": True, "reused": False, "access": "anyone_with_link_editor"}
 
 
 _DRIVE_DEFAULT_CATEGORIES = ["Регламенты", "Мотивация сотрудников", "ИИ / Автоматизация", "Финансы", "Обучение", "Отчёты", "Маркетинг / Продажи", "Операционка", "Архив / Разобрать вручную"]
@@ -22481,7 +22517,15 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> st
         "[[ESCALATE: краткая суть запроса]] (пользователь его не увидит, система сама уберёт и отправит "
         "выжимку Александру). Если в обучении показаны умения, которых нет в твоём доступе — поясни, что "
         "обучение показывает возможности в целом, а доступно именно этому пользователю — по его уровню "
-        "доступа."
+        "доступа. "
+        "ДОСТУП К GOOGLE-ОБЪЕКТАМ (КРИТИЧНО): любую Google-таблицу, документ, папку, Apps Script или "
+        "веб-приложение, которые ты СОЗДАЁШЬ или ссылку на которые ДАЁШЬ человеку, ОБЯЗАТЕЛЬНО открывай "
+        "«для всех по ссылке» (редактор). НИКОГДА не присылай ссылку на объект, к которому нет доступа по "
+        "ссылке — иначе человек видит «Нет доступа». Таблицы создавай через create_google_sheet (он сразу "
+        "открывает доступ); для ЛЮБОГО другого объекта — включая таблицу, которую создало само "
+        "приложение/скрипт, — вызови share_drive_item_for_everyone(item=<id или url>) ПЕРЕД тем как дать "
+        "ссылку. Если пишешь Apps Script, создающий файл/таблицу — добавь в код открытие доступа: "
+        "DriveApp.getFileById(id).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.EDIT)."
     )
     if tier == "admin":
         head = ("[Канал: Битрикс24. Уровень доступа пользователя: ПОЛНЫЙ — доступны все инструменты, "

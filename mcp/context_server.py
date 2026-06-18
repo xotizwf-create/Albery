@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.11.0"
+SERVER_VERSION = "0.12.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3869,6 +3869,19 @@ def tool_move_drive_file_to_folder(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"move_drive_file_to_folder failed: {exc}") from exc
 
 
+def tool_share_drive_item_for_everyone(args: dict[str, Any]) -> dict[str, Any]:
+    item = str(args.get("item") or args.get("file_id") or args.get("url") or "").strip()
+    if not item:
+        raise McpError(-32602, "item (Drive id or URL) is required.")
+    role = str(args.get("role") or "writer").strip().lower()
+    try:
+        return app_workflow_function("share_drive_item_for_everyone")(item, role)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"share_drive_item_for_everyone failed: {exc}") from exc
+
+
 def tool_remove_drive_item_from_folder(args: dict[str, Any]) -> dict[str, Any]:
     if args.get("confirm") is not True:
         raise McpError(
@@ -5535,6 +5548,25 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_move_drive_file_to_folder,
+    },
+    "share_drive_item_for_everyone": {
+        "description": (
+            "Open ANY Google Drive item — spreadsheet, document, folder, file, or an Apps Script project — for "
+            "ANYONE WITH THE LINK (editor by default). Accepts a Drive/Docs/Sheets id or URL. ALWAYS call this "
+            "after creating a Google object, or before sending its link to a person, so the link is never "
+            "'Нет доступа'. For a sheet your Apps Script created at runtime, pass its id/url here too."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item": {"type": "string", "description": "Drive/Docs/Sheets id or URL"},
+                "file_id": {"type": "string", "description": "Alias for item"},
+                "role": {"type": "string", "description": "writer (default = editor) or reader (viewer)"},
+            },
+            "required": ["item"],
+            "additionalProperties": False,
+        },
+        "handler": tool_share_drive_item_for_everyone,
     },
     "remove_drive_item_from_folder": {
         "description": (
