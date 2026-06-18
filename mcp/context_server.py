@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.12.0"
+SERVER_VERSION = "0.13.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3869,6 +3869,19 @@ def tool_move_drive_file_to_folder(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"move_drive_file_to_folder failed: {exc}") from exc
 
 
+def tool_make_sheet_applet(args: dict[str, Any]) -> dict[str, Any]:
+    sid = str(args.get("spreadsheet_id") or args.get("spreadsheet") or args.get("url") or "").strip()
+    if not sid:
+        raise McpError(-32602, "spreadsheet_id (id or URL) is required.")
+    sheet = str(args.get("sheet") or "").strip() or None
+    try:
+        return app_workflow_function("make_sheet_applet")(sid, sheet)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"make_sheet_applet failed: {exc}") from exc
+
+
 def tool_share_drive_item_for_everyone(args: dict[str, Any]) -> dict[str, Any]:
     item = str(args.get("item") or args.get("file_id") or args.get("url") or "").strip()
     if not item:
@@ -5548,6 +5561,27 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_move_drive_file_to_folder,
+    },
+    "make_sheet_applet": {
+        "description": (
+            "Make a Google Sheet usable by an ANONYMOUS Apps Script web app WITHOUT any Google login or "
+            "authorization. Returns a public token-protected applet_url (served by Albery with a9ent.ai's "
+            "token): GET it -> {values:[[...]]} (reads rows), POST {values:[...]} -> appends a row, plus a "
+            "ready html_snippet (appletRows()/appletAdd()). HOW TO BUILD A DATA WEB APP: the Apps Script "
+            "doGet must return ONLY HTML/JS (NEVER call SpreadsheetApp/DriveApp in the code — that makes "
+            "Google demand login and return 403 to anonymous users); read/write the sheet from the page's "
+            "JS via this applet. Pass the spreadsheet id or URL."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": {"type": "string", "description": "Spreadsheet id or URL"},
+                "sheet": {"type": "string", "description": "Optional sheet/tab name (default: first sheet)"},
+            },
+            "required": ["spreadsheet_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_make_sheet_applet,
     },
     "share_drive_item_for_everyone": {
         "description": (

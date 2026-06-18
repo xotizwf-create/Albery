@@ -677,6 +677,57 @@ def share_drive_item_for_everyone(item: str, role: str = "writer") -> dict[str, 
     }
 
 
+def _applet_secret() -> bytes:
+    return (os.getenv("FLASK_SECRET_KEY") or os.getenv("MCP_SHARED_SECRET") or "albery-applet").encode("utf-8")
+
+
+def _applet_token(spreadsheet_id: str, sheet: str = "") -> str:
+    raw = (str(spreadsheet_id) + "|" + str(sheet or "")).encode("utf-8")
+    b = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    sig = hmac.new(_applet_secret(), b.encode("ascii"), hashlib.sha256).hexdigest()[:24]
+    return b + "." + sig
+
+
+def _applet_decode(token: str):
+    try:
+        b, sig = str(token).split(".", 1)
+    except ValueError:
+        return None, None
+    if not hmac.compare_digest(sig, hmac.new(_applet_secret(), b.encode("ascii"), hashlib.sha256).hexdigest()[:24]):
+        return None, None
+    try:
+        raw = base64.urlsafe_b64decode(b + "=" * (-len(b) % 4)).decode("utf-8")
+    except Exception:
+        return None, None
+    sid, _, sheet = raw.partition("|")
+    return sid, sheet
+
+
+def make_sheet_applet(spreadsheet_id: str, sheet: str | None = None) -> dict[str, Any]:
+    """Make a Google-Sheet usable by an ANONYMOUS web app: returns public, token-protected read/write
+    endpoints (served by Albery using a9ent.ai's authorized token) so the Apps Script web app never
+    needs Google authorization. The web app's doGet serves only HTML/JS; its JS fetches these URLs."""
+    sid = _extract_drive_folder_id(spreadsheet_id) or str(spreadsheet_id or "").strip()
+    if not sid:
+        raise ValueError("spreadsheet_id (id or URL) is required")
+    tok = _applet_token(sid, sheet or "")
+    base = "https://mcp.m4s.ru/applet/" + tok
+    snippet = (
+        "<script>\n"
+        "const APPLET=\"" + base + "\";\n"
+        "async function appletRows(){const r=await fetch(APPLET);const d=await r.json();return d.values||[];}\n"
+        "async function appletAdd(row){const r=await fetch(APPLET,{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({values:row})});return r.json();}\n"
+        "</script>"
+    )
+    return {"spreadsheet_id": sid, "sheet": sheet or "(первый лист)", "applet_url": base,
+            "read": "GET " + base + " -> {values:[[...]]}",
+            "write": "POST " + base + " {values:[col1,col2,...]} -> добавляет строку",
+            "html_snippet": snippet,
+            "note": "doGet веб-приложения должен возвращать ТОЛЬКО HTML/JS (без SpreadsheetApp). "
+                    "Данные читай appletRows()/пиши appletAdd([...]). Работает анонимно, без входа Google."}
+
+
 def create_google_sheet(title: str, rows: list | None = None, share_anyone_writer: bool = True) -> dict[str, Any]:
     """Create a brand-new Google Sheet via the Sheets/Drive API (as the albery agent's Google
     account), optionally write initial rows, optionally share it as anyone-with-link = editor, and
@@ -1109,7 +1160,8 @@ def _apps_script_build_manifest(existing, *, web_app, access, execute_as, advanc
     if web_app:
         m["webapp"] = {
             "executeAs": (str(execute_as or "").strip() or "USER_DEPLOYING"),
-            "access": (str(access or "").strip() or "ANYONE_ANONYMOUS"),
+            "access": ("ANYONE_ANONYMOUS" if str(access or "").strip().upper() in ("", "ANYONE", "ANYONE_ANONYMOUS")
+                   else str(access).strip().upper()),
         }
     if advanced_services:
         entries, seen = [], set()
@@ -1153,7 +1205,7 @@ def manage_apps_script(
     creds = _google_user_credentials()
     svc = build("script", "v1", credentials=creds, cache_discovery=False)
     act = str(action or "").strip().lower()
-    acc = access or "ANYONE_ANONYMOUS"
+    acc = "ANYONE_ANONYMOUS" if str(access or "").strip().upper() in ("", "ANYONE", "ANYONE_ANONYMOUS") else str(access).strip().upper()
     exe = execute_as or "USER_DEPLOYING"
 
     def _editor_url(sid):
@@ -20234,6 +20286,7 @@ AUTH_EXEMPT_PREFIXES = (
     "/zoom/events/",
     "/google-drive/events/",
     "/zoom-export/",
+    "/applet/",
 )
 
 
@@ -22525,7 +22578,13 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> st
         "открывает доступ); для ЛЮБОГО другого объекта — включая таблицу, которую создало само "
         "приложение/скрипт, — вызови share_drive_item_for_everyone(item=<id или url>) ПЕРЕД тем как дать "
         "ссылку. Если пишешь Apps Script, создающий файл/таблицу — добавь в код открытие доступа: "
-        "DriveApp.getFileById(id).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.EDIT)."
+        "DriveApp.getFileById(id).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.EDIT). "
+        "ВЕБ-ПРИЛОЖЕНИЯ НА ТАБЛИЦАХ (чтобы открывались У ВСЕХ без входа Google): НЕЛЬЗЯ обращаться к "
+        "SpreadsheetApp/DriveApp в коде Apps Script — тогда Google требует вход и отдаёт 403 анонимам. "
+        "Делай так: doGet возвращает ТОЛЬКО HTML/JS; для данных вызови инструмент "
+        "make_sheet_applet(spreadsheet_id=<id таблицы>) и встрой его html_snippet/applet_url в страницу "
+        "(JS читает строки appletRows() и добавляет appletAdd([...]) через Albery — это работает "
+        "анонимно, без авторизации Google). Публикуй ТОЛЬКО ANYONE_ANONYMOUS, никогда не ANYONE."
     )
     if tier == "admin":
         head = ("[Канал: Битрикс24. Уровень доступа пользователя: ПОЛНЫЙ — доступны все инструменты, "
@@ -24859,6 +24918,48 @@ def api_registry_export():
         "export_filename": export_filename,
         "download_url": url_for("download_export", filename=export_filename),
     })
+
+
+def _applet_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/applet/<token>", methods=["GET", "POST", "OPTIONS"])
+def applet_data(token: str):
+    """Public, token-protected read/append for ONE spreadsheet, so anonymous Apps Script web apps can
+    use Sheets without Google authorization. The token is an HMAC over the spreadsheet id (+ sheet)."""
+    if request.method == "OPTIONS":
+        return _applet_cors(app.make_response(("", 204)))
+    sid, sheet = _applet_decode(token)
+    if not sid:
+        return _applet_cors(jsonify({"ok": False, "error": "bad token"})), 403
+    from googleapiclient.discovery import build
+    try:
+        sheets = build("sheets", "v4", credentials=_google_user_credentials(), cache_discovery=False)
+        rng = (f"{_quote_sheet_name_for_a1(sheet)}!A1:Z10000" if sheet else "A1:Z10000")
+        if request.method == "GET":
+            vr = sheets.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute()
+            return _applet_cors(jsonify({"ok": True, "values": vr.get("values", [])}))
+        body = request.get_json(silent=True) or {}
+        row = body.get("values")
+        if not isinstance(row, list):
+            return _applet_cors(jsonify({"ok": False, "error": "values must be a list (one row)"})), 400
+        if row and isinstance(row[0], list):
+            rows = row
+        else:
+            rows = [row]
+        sheets.spreadsheets().values().append(
+            spreadsheetId=sid, range=rng, valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS", body={"values": rows},
+        ).execute()
+        return _applet_cors(jsonify({"ok": True, "appended": len(rows)}))
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("applet_data failed")
+        return _applet_cors(jsonify({"ok": False, "error": str(exc)[:200]})), 500
 
 
 @app.get("/download/<path:filename>")
