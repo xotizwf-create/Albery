@@ -1029,20 +1029,176 @@ def format_google_sheet(spreadsheet_id: str, requests: list) -> dict[str, Any]:
     }
 
 
+# Common Apps Script advanced services: alias -> (userSymbol, serviceId, version)
+_APPS_SCRIPT_ADVANCED_SERVICES = {
+    "drive": ("Drive", "drive", "v3"),
+    "sheets": ("Sheets", "sheets", "v4"),
+    "docs": ("Docs", "docs", "v1"),
+    "documents": ("Docs", "docs", "v1"),
+    "slides": ("Slides", "slides", "v1"),
+    "calendar": ("Calendar", "calendar", "v3"),
+    "gmail": ("Gmail", "gmail", "v1"),
+    "people": ("People", "people", "v1"),
+    "tasks": ("Tasks", "tasks", "v1"),
+    "youtube": ("YouTube", "youtube", "v3"),
+    "bigquery": ("BigQuery", "bigquery", "v2"),
+    "driveactivity": ("DriveActivity", "driveactivity", "v2"),
+    "admin": ("AdminDirectory", "admin", "directory_v1"),
+}
+
+
+def _apps_script_share_anyone(creds: Any, script_id: str, role: str = "writer") -> str:
+    """Share a standalone Apps Script project so anyone with the link can open it.
+    Returns the granted role ('writer'/'reader') on success, '' if sharing failed."""
+    from googleapiclient.discovery import build
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    for r in (role, "reader"):
+        try:
+            drive.permissions().create(fileId=str(script_id), body={"type": "anyone", "role": r}).execute()
+            return r
+        except Exception:
+            continue
+    return ""
+
+
+def _apps_script_build_manifest(existing, *, web_app, access, execute_as, advanced_services, oauth_scopes):
+    """Merge web-app + advanced-service settings into an Apps Script manifest dict."""
+    m = dict(existing or {})
+    m.setdefault("timeZone", "Europe/Moscow")
+    m.setdefault("exceptionLogging", "STACKDRIVER")
+    m.setdefault("runtimeVersion", "V8")
+    if web_app:
+        m["webapp"] = {
+            "executeAs": (str(execute_as or "").strip() or "USER_DEPLOYING"),
+            "access": (str(access or "").strip() or "ANYONE_ANONYMOUS"),
+        }
+    if advanced_services:
+        entries, seen = [], set()
+        for raw in advanced_services:
+            key = str(raw or "").strip().lower().replace(" ", "")
+            spec = _APPS_SCRIPT_ADVANCED_SERVICES.get(key)
+            if not spec or spec[1] in seen:
+                continue
+            seen.add(spec[1])
+            entries.append({"userSymbol": spec[0], "serviceId": spec[1], "version": spec[2]})
+        if entries:
+            deps = dict(m.get("dependencies") or {})
+            deps["enabledAdvancedServices"] = entries
+            m["dependencies"] = deps
+    if oauth_scopes:
+        merged = list(dict.fromkeys(
+            [s for s in (m.get("oauthScopes") or []) if s]
+            + [str(s).strip() for s in oauth_scopes if str(s).strip()]))
+        m["oauthScopes"] = merged
+    return m
+
+
 def manage_apps_script(
     action: str, script_id: str | None = None, title: str | None = None,
     files: list | None = None, function_name: str | None = None,
     parameters: list | None = None, description: str | None = None,
+    web_app: bool = True, access: str | None = None, execute_as: str | None = None,
+    advanced_services: list | None = None, oauth_scopes: list | None = None,
+    share: bool = True,
 ) -> dict[str, Any]:
-    """Create/get/update/deploy/run a Google Apps Script project via the Apps Script API
-    (scopes script.projects + script.deployments)."""
+    """Create/get/update/deploy/run an Apps Script project, or publish a working web app, via the
+    Apps Script API (scopes script.projects + script.deployments + drive for sharing).
+
+    action=publish_web_app makes a ready web app in one call: create (or reuse script_id) + write
+    files + a webapp manifest (access default ANYONE_ANONYMOUS = open by link to everyone, executeAs
+    USER_DEPLOYING) + deploy + share, returning the live web_app_url
+    (https://script.google.com/macros/s/.../exec). advanced_services (e.g. ['drive','sheets']) enable
+    Apps Script advanced services; oauth_scopes add runtime scopes."""
+    import json as _json
     from googleapiclient.discovery import build
-    svc = build("script", "v1", credentials=_google_user_credentials(), cache_discovery=False)
+    creds = _google_user_credentials()
+    svc = build("script", "v1", credentials=creds, cache_discovery=False)
     act = str(action or "").strip().lower()
+    acc = access or "ANYONE_ANONYMOUS"
+    exe = execute_as or "USER_DEPLOYING"
+
+    def _editor_url(sid):
+        return f"https://script.google.com/d/{sid}/edit"
+
+    def _read_files(sid):
+        return (svc.projects().getContent(scriptId=str(sid)).execute() or {}).get("files", [])
+
+    def _manifest_from(files_list):
+        for f in files_list or []:
+            if str(f.get("name")) == "appsscript":
+                try:
+                    return _json.loads(f.get("source") or "{}")
+                except Exception:
+                    return {}
+        return {}
+
+    def _norm_code_files(raw):
+        norm = []
+        for f in raw or []:
+            if isinstance(f, dict) and str(f.get("name")) != "appsscript":
+                norm.append({
+                    "name": str(f.get("name") or "Code"),
+                    "type": str(f.get("type") or "SERVER_JS").upper(),
+                    "source": str(f.get("source") or ""),
+                })
+        return norm
+
+    def _deploy(sid, want_web_app):
+        current = _read_files(sid)
+        manifest = _apps_script_build_manifest(
+            _manifest_from(current), web_app=want_web_app, access=acc, execute_as=exe,
+            advanced_services=advanced_services, oauth_scopes=oauth_scopes)
+        new_files = [{"name": "appsscript", "type": "JSON", "source": _json.dumps(manifest)}]
+        new_files += [{"name": f["name"], "type": f["type"], "source": f.get("source", "")}
+                      for f in current if str(f.get("name")) != "appsscript"]
+        svc.projects().updateContent(scriptId=str(sid), body={"files": new_files}).execute()
+        ver = svc.projects().versions().create(
+            scriptId=str(sid), body={"description": description or "albery deploy"}).execute()
+        dep = svc.projects().deployments().create(
+            scriptId=str(sid),
+            body={"versionNumber": ver.get("versionNumber"), "manifestFileName": "appsscript",
+                  "description": description or "albery deploy"}).execute()
+        web_url = ""
+        for ep in (dep.get("entryPoints") or []):
+            if ep.get("entryPointType") == "WEB_APP":
+                web_url = (ep.get("webApp") or {}).get("url") or ""
+        if not web_url and want_web_app and dep.get("deploymentId"):
+            web_url = f"https://script.google.com/macros/s/{dep['deploymentId']}/exec"
+        out = {"script_id": str(sid), "version": ver.get("versionNumber"),
+               "deployment_id": dep.get("deploymentId"), "editor_url": _editor_url(sid)}
+        if want_web_app:
+            out["web_app_url"] = web_url
+            out["access"] = acc
+            out["note"] = ("Web app is open by link (web_app_url). If the code uses Drive/Sheets/Gmail "
+                           "etc., the first run may need a one-time authorization by owner a9ent.ai in "
+                           "the editor (editor_url).")
+        return out
+
     if act == "create":
         proj = svc.projects().create(body={"title": title or "Albery Script"}).execute()
         sid = proj.get("scriptId")
-        return {"script_id": sid, "url": f"https://script.google.com/d/{sid}/edit", "title": proj.get("title")}
+        out = {"script_id": sid, "editor_url": _editor_url(sid), "title": proj.get("title")}
+        if share:
+            out["shared"] = _apps_script_share_anyone(creds, sid) or "no"
+        return out
+
+    if act == "publish_web_app":
+        sid = script_id
+        if not sid:
+            proj = svc.projects().create(body={"title": title or "Albery Web App"}).execute()
+            sid = proj.get("scriptId")
+        if isinstance(files, list) and files:
+            manifest = _apps_script_build_manifest(
+                None, web_app=True, access=acc, execute_as=exe,
+                advanced_services=advanced_services, oauth_scopes=oauth_scopes)
+            body_files = [{"name": "appsscript", "type": "JSON", "source": _json.dumps(manifest)}]
+            body_files += _norm_code_files(files)
+            svc.projects().updateContent(scriptId=str(sid), body={"files": body_files}).execute()
+        out = _deploy(sid, True)
+        if share:
+            out["shared"] = _apps_script_share_anyone(creds, sid) or "no"
+        return out
+
     if not script_id:
         raise ValueError("script_id is required for action " + act)
     if act == "get":
@@ -1050,27 +1206,24 @@ def manage_apps_script(
     if act == "update":
         if not isinstance(files, list) or not files:
             raise ValueError("files (list) is required for update")
-        norm = []
-        for f in files:
-            if isinstance(f, dict):
-                norm.append({
-                    "name": str(f.get("name") or "Code"),
-                    "type": str(f.get("type") or "SERVER_JS").upper(),
-                    "source": str(f.get("source") or ""),
-                })
-        svc.projects().updateContent(scriptId=str(script_id), body={"files": norm}).execute()
-        return {"script_id": str(script_id), "updated_files": [f["name"] for f in norm]}
+        code_files = _norm_code_files(files)
+        supplied_manifest = next(
+            (f for f in files if isinstance(f, dict) and str(f.get("name")) == "appsscript"), None)
+        body_files = list(code_files)
+        if supplied_manifest:
+            body_files.insert(0, {"name": "appsscript", "type": "JSON",
+                                  "source": str(supplied_manifest.get("source") or "{}")})
+        else:
+            mf = next((f for f in _read_files(script_id) if str(f.get("name")) == "appsscript"), None)
+            if mf:
+                body_files.insert(0, {"name": "appsscript", "type": "JSON", "source": mf.get("source", "{}")})
+        svc.projects().updateContent(scriptId=str(script_id), body={"files": body_files}).execute()
+        out = {"script_id": str(script_id), "updated_files": [f["name"] for f in code_files]}
+        if share:
+            out["shared"] = _apps_script_share_anyone(creds, script_id) or "no"
+        return out
     if act == "deploy":
-        ver = svc.projects().versions().create(
-            scriptId=str(script_id), body={"description": description or "albery deploy"},
-        ).execute()
-        dep = svc.projects().deployments().create(
-            scriptId=str(script_id),
-            body={"versionNumber": ver.get("versionNumber"), "manifestFileName": "appsscript",
-                  "description": description or "albery deploy"},
-        ).execute()
-        return {"script_id": str(script_id), "version": ver.get("versionNumber"),
-                "deployment_id": dep.get("deploymentId")}
+        return _deploy(script_id, bool(web_app))
     if act == "run":
         resp = svc.scripts().run(
             scriptId=str(script_id),

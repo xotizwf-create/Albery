@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.10.1"
+SERVER_VERSION = "0.11.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3938,17 +3938,23 @@ def tool_manage_apps_script(args: dict[str, Any]) -> dict[str, Any]:
     if args.get("confirm") is not True:
         raise McpError(-32602, "Set confirm=true to run an Apps Script action.")
     action = str(args.get("action") or "").strip().lower()
-    if action not in ("create", "get", "update", "deploy", "run"):
-        raise McpError(-32602, "action must be one of: create, get, update, deploy, run.")
+    if action not in ("create", "get", "update", "deploy", "run", "publish_web_app"):
+        raise McpError(-32602, "action must be one of: create, get, update, deploy, run, publish_web_app.")
     try:
         return app_workflow_function("manage_apps_script")(
             action,
-            str(args.get("script_id") or "") or None,
-            str(args.get("title") or "") or None,
-            args.get("files"),
-            str(args.get("function_name") or "") or None,
-            args.get("parameters"),
-            str(args.get("description") or "") or None,
+            script_id=str(args.get("script_id") or "") or None,
+            title=str(args.get("title") or "") or None,
+            files=args.get("files"),
+            function_name=str(args.get("function_name") or "") or None,
+            parameters=args.get("parameters"),
+            description=str(args.get("description") or "") or None,
+            web_app=bool(args.get("web_app", True)),
+            access=str(args.get("access") or "") or None,
+            execute_as=str(args.get("execute_as") or "") or None,
+            advanced_services=args.get("advanced_services"),
+            oauth_scopes=args.get("oauth_scopes"),
+            share=bool(args.get("share", True)),
         )
     except McpError:
         raise
@@ -5573,22 +5579,34 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "manage_apps_script": {
         "description": (
-            "Google Apps Script via the Apps Script API. action=create (new project, title) | get (project "
-            "files) | update (overwrite files=[{name,type:SERVER_JS|JSON|HTML,source}]) | deploy (version + "
-            "deployment) | run (run function_name; needs an API-executable deployment in the same GCP "
-            "project). Requires confirm=true. If the API is disabled, ask the owner to enable the Apps "
-            "Script API in Google Cloud for a9ent.ai."
+            "Google Apps Script via the Apps Script API. To MAKE A WORKING WEB APP in one call use "
+            "action=publish_web_app with files=[{name,type:HTML|SERVER_JS,source}] (the code needs a "
+            "doGet/doPost) -> returns a ready web_app_url (https://script.google.com/macros/s/.../exec) "
+            "open by link to everyone (access ANYONE_ANONYMOUS, executeAs USER_DEPLOYING). Other actions: "
+            "create (new project) | get (files) | update (overwrite files=[{name,type:SERVER_JS|JSON|HTML,"
+            "source}], manifest preserved) | deploy (version+deploy, web app by default -> web_app_url) | "
+            "run (run function_name). advanced_services=['drive','sheets','calendar','gmail','docs',...] "
+            "enables Apps Script advanced services in the manifest; oauth_scopes adds runtime scopes. "
+            "share=true (default) makes the project editable by link. ALWAYS give the owner the web_app_url, "
+            "not the editor_url. Requires confirm=true. If the API is disabled, ask the owner to enable the "
+            "Apps Script API in Google Cloud for a9ent.ai (and for an advanced service, its matching API)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["create", "get", "update", "deploy", "run"]},
+                "action": {"type": "string", "enum": ["create", "get", "update", "deploy", "run", "publish_web_app"]},
                 "script_id": {"type": "string"},
                 "title": {"type": "string"},
-                "files": {"type": "array", "items": {"type": "object"}},
+                "files": {"type": "array", "items": {"type": "object"}, "description": "[{name,type:SERVER_JS|HTML|JSON,source}]"},
                 "function_name": {"type": "string"},
                 "parameters": {"type": "array"},
                 "description": {"type": "string"},
+                "web_app": {"type": "boolean", "description": "deploy as a web app (default true)"},
+                "access": {"type": "string", "description": "ANYONE_ANONYMOUS (default, open to all) | ANYONE | DOMAIN | MYSELF"},
+                "execute_as": {"type": "string", "description": "USER_DEPLOYING (default) | USER_ACCESSING"},
+                "advanced_services": {"type": "array", "items": {"type": "string"}, "description": "e.g. ['drive','sheets','calendar']"},
+                "oauth_scopes": {"type": "array", "items": {"type": "string"}},
+                "share": {"type": "boolean", "description": "share project editable by link (default true)"},
                 "confirm": {"type": "boolean", "description": "must be true"},
             },
             "required": ["action", "confirm"],
