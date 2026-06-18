@@ -695,19 +695,74 @@ def _extract_drive_folder_id(value: Any) -> str:
 
 
 def move_drive_file_to_folder(file_id: str, folder: str) -> dict[str, Any]:
-    """Move a Drive file (e.g. a spreadsheet) into the given Drive folder (id or URL)."""
+    """Move a Drive item (file, spreadsheet, document or folder) into the given Drive folder.
+
+    Drive folders are files with a folder mimeType, so the same parents API works for both
+    ordinary files and nested folders. We keep the old function name for MCP compatibility.
+    """
     from googleapiclient.discovery import build
     creds = _google_user_credentials()
     drive = build("drive", "v3", credentials=creds, cache_discovery=False)
     fid = _extract_drive_folder_id(folder)
+    item_id = _extract_drive_folder_id(file_id)
+    if not item_id:
+        raise ValueError("file_id is required (Drive file/folder id or URL)")
     if not fid:
         raise ValueError("folder is required (Drive folder id or URL)")
-    meta = drive.files().get(fileId=str(file_id), fields="parents").execute()
-    prev = ",".join(meta.get("parents", []) or [])
-    drive.files().update(
-        fileId=str(file_id), addParents=fid, removeParents=prev, fields="id,parents",
+    meta = drive.files().get(fileId=str(item_id), fields="id,name,mimeType,parents").execute()
+    prev_parents = meta.get("parents", []) or []
+    prev = ",".join(prev_parents)
+    updated = drive.files().update(
+        fileId=str(item_id), addParents=fid, removeParents=prev, fields="id,name,mimeType,parents",
     ).execute()
-    return {"file_id": str(file_id), "folder_id": fid, "moved": True}
+    return {
+        "file_id": str(item_id),
+        "item_id": str(item_id),
+        "item_name": meta.get("name"),
+        "mime_type": meta.get("mimeType"),
+        "folder_id": fid,
+        "previous_parents": prev_parents,
+        "parents": updated.get("parents", []),
+        "moved": True,
+    }
+
+
+def remove_drive_item_from_folder(item_id: str, folder: str) -> dict[str, Any]:
+    """Remove a Drive item (file or folder) from one concrete parent folder without deleting it."""
+    from googleapiclient.discovery import build
+    creds = _google_user_credentials()
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    clean_item_id = _extract_drive_folder_id(item_id)
+    parent_id = _extract_drive_folder_id(folder)
+    if not clean_item_id:
+        raise ValueError("item_id is required (Drive file/folder id or URL)")
+    if not parent_id:
+        raise ValueError("folder is required (Drive folder id or URL)")
+    meta = drive.files().get(fileId=str(clean_item_id), fields="id,name,mimeType,parents").execute()
+    parents = meta.get("parents", []) or []
+    if parent_id not in parents:
+        return {
+            "item_id": str(clean_item_id),
+            "item_name": meta.get("name"),
+            "mime_type": meta.get("mimeType"),
+            "folder_id": parent_id,
+            "previous_parents": parents,
+            "parents": parents,
+            "removed": False,
+            "reason": "item is not in the specified folder",
+        }
+    updated = drive.files().update(
+        fileId=str(clean_item_id), removeParents=parent_id, fields="id,name,mimeType,parents",
+    ).execute()
+    return {
+        "item_id": str(clean_item_id),
+        "item_name": meta.get("name"),
+        "mime_type": meta.get("mimeType"),
+        "folder_id": parent_id,
+        "previous_parents": parents,
+        "parents": updated.get("parents", []),
+        "removed": True,
+    }
 
 
 def get_google_sheet_meta(spreadsheet_id: str) -> dict[str, Any]:

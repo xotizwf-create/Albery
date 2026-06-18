@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.10.0"
+SERVER_VERSION = "0.10.1"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3857,16 +3857,35 @@ def tool_format_google_sheet(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_move_drive_file_to_folder(args: dict[str, Any]) -> dict[str, Any]:
-    fid = str(args.get("file_id") or "").strip()
+    fid = str(args.get("file_id") or args.get("item_id") or "").strip()
     folder = str(args.get("folder") or "").strip()
     if not fid or not folder:
-        raise McpError(-32602, "file_id and folder (id or URL) are required.")
+        raise McpError(-32602, "file_id/item_id and folder (id or URL) are required.")
     try:
         return app_workflow_function("move_drive_file_to_folder")(fid, folder)
     except McpError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise McpError(-32010, f"move_drive_file_to_folder failed: {exc}") from exc
+
+
+def tool_remove_drive_item_from_folder(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Нужно confirm=true: сначала покажи пользователю, какой файл/папку убираешь и из какой папки Drive. "
+            "Операция убирает элемент только из указанной папки, не удаляя его из Google Drive полностью.",
+        )
+    item_id = str(args.get("item_id") or args.get("file_id") or "").strip()
+    folder = str(args.get("folder") or "").strip()
+    if not item_id or not folder:
+        raise McpError(-32602, "item_id/file_id and folder (id or URL) are required.")
+    try:
+        return app_workflow_function("remove_drive_item_from_folder")(item_id, folder)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"remove_drive_item_from_folder failed: {exc}") from exc
 
 
 def tool_manage_apps_script(args: dict[str, Any]) -> dict[str, Any]:
@@ -5447,21 +5466,45 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "move_drive_file_to_folder": {
         "description": (
-            "Move a Drive file (e.g. a spreadsheet the agent created) into a Google Drive folder (id or "
-            "folder URL). IMPORTANT: the target folder must be shared with the agent's account "
-            "(a9ent.ai@gmail.com) as Editor, otherwise it returns 404 - in that case ask the owner to give "
-            "a9ent.ai@gmail.com edit access to the folder first."
+            "Move a Google Drive item — file, spreadsheet, document OR folder — into another Drive folder "
+            "(folder id or URL). This replaces the item's previous parent folders with the target folder, so use "
+            "it for moving files inside folders and moving nested folders. IMPORTANT: the target folder must be "
+            "shared with the agent's account (a9ent.ai@gmail.com) as Editor, otherwise it returns 404 - in that "
+            "case ask the owner to give a9ent.ai@gmail.com edit access to the folder first."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file_id": {"type": "string", "description": "File/spreadsheet id"},
-                "folder": {"type": "string", "description": "Drive folder id or folder URL"},
+                "file_id": {"type": "string", "description": "Drive file/folder id or URL"},
+                "item_id": {"type": "string", "description": "Alias for file_id; Drive file/folder id or URL"},
+                "folder": {"type": "string", "description": "Target Drive folder id or folder URL"},
             },
-            "required": ["file_id", "folder"],
+            "required": ["folder"],
             "additionalProperties": False,
         },
         "handler": tool_move_drive_file_to_folder,
+    },
+    "remove_drive_item_from_folder": {
+        "description": (
+            "Remove a Google Drive item — file, spreadsheet, document OR folder — from one specified parent "
+            "folder without deleting the item from Drive completely. Use this when the owner says: 'удали эту "
+            "таблицу/файл/папку из этой папки', 'убери из папки'. Strict rule: ask for confirmation first and "
+            "call with confirm=true only after the user approved the exact item and folder. If the item has no "
+            "other parent, Google Drive may place it in the owner's My Drive/root or keep it accessible by link; "
+            "this is still not permanent deletion."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string", "description": "Drive file/folder id or URL"},
+                "file_id": {"type": "string", "description": "Alias for item_id; Drive file/folder id or URL"},
+                "folder": {"type": "string", "description": "Parent Drive folder id or folder URL to remove from"},
+                "confirm": {"type": "boolean"},
+            },
+            "required": ["folder", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_remove_drive_item_from_folder,
     },
     "manage_apps_script": {
         "description": (
