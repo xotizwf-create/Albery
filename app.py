@@ -462,7 +462,7 @@ def format_google_sheet(spreadsheet_id: str, requests: list) -> dict[str, Any]:
     return {
         "spreadsheet_id": str(spreadsheet_id),
         "applied": len(requests),
-        "replies": resp.get("replies", []),
+        "replies_count": len(resp.get("replies", []) or []),
         "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
     }
 
