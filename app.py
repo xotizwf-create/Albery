@@ -765,6 +765,136 @@ def remove_drive_item_from_folder(item_id: str, folder: str) -> dict[str, Any]:
     }
 
 
+def _drive_q(value: str) -> str:
+    return str(value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _drive_public_meta(item: dict[str, Any]) -> dict[str, Any]:
+    mime = item.get("mimeType") or ""
+    return {
+        "id": item.get("id"), "name": item.get("name"), "mime_type": mime,
+        "is_folder": mime == "application/vnd.google-apps.folder",
+        "parents": item.get("parents", []) or [], "web_view_link": item.get("webViewLink"),
+    }
+
+
+def list_drive_folder_items(folder: str, page_size: int = 200) -> dict[str, Any]:
+    from googleapiclient.discovery import build
+    creds = _google_user_credentials()
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    folder_id = _extract_drive_folder_id(folder)
+    if not folder_id:
+        raise ValueError("folder is required (Drive folder id or URL)")
+    parent = drive.files().get(fileId=str(folder_id), fields="id,name,mimeType,parents,webViewLink", supportsAllDrives=True).execute()
+    items: list[dict[str, Any]] = []
+    token = None
+    limit = max(1, min(int(page_size or 200), 1000))
+    while True:
+        resp = drive.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken,files(id,name,mimeType,parents,webViewLink,modifiedTime)",
+            pageSize=min(1000, limit - len(items)), orderBy="folder,name_natural", spaces="drive",
+            pageToken=token, supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute()
+        items.extend(resp.get("files", []) or [])
+        token = resp.get("nextPageToken")
+        if not token or len(items) >= limit:
+            break
+    return {"folder": _drive_public_meta(parent), "count": len(items), "items": [_drive_public_meta(x) for x in items]}
+
+
+def create_drive_folder(name: str, parent_folder: str, reuse_existing: bool = True) -> dict[str, Any]:
+    from googleapiclient.discovery import build
+    creds = _google_user_credentials()
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    parent_id = _extract_drive_folder_id(parent_folder)
+    clean_name = str(name or "").strip()
+    if not parent_id:
+        raise ValueError("parent_folder is required (Drive folder id or URL)")
+    if not clean_name:
+        raise ValueError("name is required")
+    if reuse_existing:
+        q = f"'{parent_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{_drive_q(clean_name)}'"
+        found = drive.files().list(q=q, fields="files(id,name,mimeType,parents,webViewLink)", pageSize=10, supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", []) or []
+        if found:
+            meta = found[0]
+            return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": False, "reused": True}
+    meta = drive.files().create(body={"name": clean_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}, fields="id,name,mimeType,parents,webViewLink", supportsAllDrives=True).execute()
+    return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": True, "reused": False}
+
+
+_DRIVE_DEFAULT_CATEGORIES = ["Регламенты", "Мотивация сотрудников", "ИИ / Автоматизация", "Финансы", "Обучение", "Отчёты", "Маркетинг / Продажи", "Операционка", "Архив / Разобрать вручную"]
+_DRIVE_CATEGORY_KEYWORDS = {
+    "Регламенты": ["регламент", "инструкц", "правил", "порядок", "политик", "стандарт", "соп", "sop"],
+    "Мотивация сотрудников": ["мотивац", "преми", "бонус", "kpi", "оклад", "зарплат", "вознаграж", "сотрудник"],
+    "ИИ / Автоматизация": ["ии", "ai", "gpt", "нейро", "автомат", "бот", "скрипт", "интеграц", "prompt", "промпт"],
+    "Финансы": ["финанс", "счет", "счёт", "оплат", "платеж", "платёж", "бюджет", "касс", "ддс", "налог", "прибыл", "расход", "доход"],
+    "Обучение": ["обуч", "курс", "тренинг", "адаптац", "онборд", "инструктаж", "гайд", "мануал"],
+    "Отчёты": ["отчет", "отчёт", "дашборд", "сводк", "аналитик", "результат", "метрик"],
+    "Маркетинг / Продажи": ["маркет", "продаж", "воронк", "лид", "клиент", "реклам", "акци", "crm", "коммерч", "кп"],
+    "Операционка": ["операцион", "процесс", "план", "задач", "проект", "созвон", "встреч", "логист", "склад", "закуп"],
+}
+
+
+def _drive_classify_item(name: str, mime_type: str, categories: list[str]) -> tuple[str, str]:
+    low = str(name or "").lower()
+    scores: dict[str, int] = {c: 0 for c in categories}
+    for cat, words in _DRIVE_CATEGORY_KEYWORDS.items():
+        if cat not in scores:
+            continue
+        for w in words:
+            if w in low:
+                scores[cat] += 2 if len(w) > 3 else 1
+    if mime_type == "application/vnd.google-apps.spreadsheet" or low.endswith((".xls", ".xlsx", ".csv")):
+        for cat in ("Финансы", "Отчёты"):
+            if cat in scores:
+                scores[cat] += 1
+    best = max(scores.items(), key=lambda kv: kv[1]) if scores else ("", 0)
+    fallback = "Архив / Разобрать вручную"
+    if best[1] <= 0:
+        return (fallback if fallback in categories else (categories[-1] if categories else fallback), "no confident keyword match")
+    return best[0], "keyword match"
+
+
+def organize_drive_folder(folder: str, categories: list[str] | None = None, dry_run: bool = True) -> dict[str, Any]:
+    folder_id = _extract_drive_folder_id(folder)
+    if not folder_id:
+        raise ValueError("folder is required (Drive folder id or URL)")
+    cats = [str(x).strip() for x in (categories or _DRIVE_DEFAULT_CATEGORIES) if str(x).strip()]
+    if not cats:
+        raise ValueError("categories must not be empty")
+    listing = list_drive_folder_items(folder_id, page_size=1000)
+    existing_by_name = {x["name"]: x for x in listing["items"] if x.get("is_folder")}
+    category_folders: dict[str, dict[str, Any]] = {}
+    created: list[dict[str, Any]] = []
+    for cat in cats:
+        if cat in existing_by_name:
+            category_folders[cat] = existing_by_name[cat]
+        elif dry_run:
+            category_folders[cat] = {"id": None, "name": cat, "is_folder": True, "would_create": True}
+            created.append({"name": cat, "would_create": True})
+        else:
+            meta = create_drive_folder(cat, folder_id, reuse_existing=True)
+            category_folders[cat] = meta
+            if meta.get("created"):
+                created.append(meta)
+    moves: list[dict[str, Any]] = []
+    moved: list[dict[str, Any]] = []
+    category_names = set(cats)
+    for item in listing["items"]:
+        name = item.get("name") or ""
+        if item.get("is_folder") and name in category_names:
+            continue
+        target, reason = _drive_classify_item(name, item.get("mime_type") or "", cats)
+        target_meta = category_folders.get(target)
+        plan = {"item_id": item.get("id"), "item_name": name, "item_is_folder": bool(item.get("is_folder")), "target_folder": target, "target_folder_id": target_meta.get("id") if target_meta else None, "reason": reason}
+        moves.append(plan)
+        if not dry_run and target_meta and target_meta.get("id"):
+            res = move_drive_file_to_folder(str(item.get("id")), str(target_meta.get("id")))
+            moved.append({**plan, "moved": bool(res.get("moved"))})
+    return {"folder_id": folder_id, "dry_run": bool(dry_run), "categories": cats, "source_items_count": listing["count"], "category_folders": category_folders, "created_folders": created, "planned_moves": moves, "moved": moved, "moved_count": len(moved)}
+
+
 def get_google_sheet_meta(spreadsheet_id: str) -> dict[str, Any]:
     """Return a spreadsheet's tabs with sheetId/title/grid size, so callers can target the
     correct sheetId in format_google_sheet batchUpdate requests."""
@@ -22224,7 +22354,8 @@ def _bitrix_imbot_app_event():
 
     # A keyboard button / slash command click arrives as ONIMCOMMANDADD. The command-event field
     # layout differs from messages, so read fields robustly: `report_error` starts the error-report
-    # flow; `new` (or an empty/unknown command) resets the session.
+    # flow; only an explicit `new/reset` command resets the session. Empty/unknown command
+    # events are ignored to avoid accidental context loss after Bitrix keyboard glitches.
     if event_name == "ONIMCOMMANDADD":
         try:
             logging.info("b24 testbot: ONIMCOMMANDADD keys=%s", [k for k in payload.keys()][:40])
@@ -22252,8 +22383,10 @@ def _bitrix_imbot_app_event():
         elif cmd_dialog and command == "onb_next":
             _b24_send_onboarding(endpoint, access_token, bot_id, cmd_dialog,
                                  _b24_onboarding_step(cmd_dialog) + 1, _b24_tier_for(cmd_user), message_id)
-        elif cmd_dialog and (not command or command in ("new", "reset", "новая", "сброс")):
+        elif cmd_dialog and command in ("new", "reset", "новая", "сброс"):
             _b24_do_reset(endpoint, access_token, bot_id, cmd_dialog, message_id)
+        elif cmd_dialog:
+            logging.info("b24 testbot: ignored unknown/empty command event: %r", command)
         # Acknowledge the command so Bitrix stops retrying / showing 'typing…' (best-effort).
         if command_id:
             try:

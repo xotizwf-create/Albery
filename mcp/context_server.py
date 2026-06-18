@@ -3888,6 +3888,52 @@ def tool_remove_drive_item_from_folder(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"remove_drive_item_from_folder failed: {exc}") from exc
 
 
+def tool_list_drive_folder_items(args: dict[str, Any]) -> dict[str, Any]:
+    folder = str(args.get("folder") or "").strip()
+    if not folder:
+        raise McpError(-32602, "folder (id or URL) is required.")
+    page_size = int(args.get("page_size") or 200)
+    try:
+        return app_workflow_function("list_drive_folder_items")(folder, page_size)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"list_drive_folder_items failed: {exc}") from exc
+
+
+def tool_create_drive_folder(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Нужно confirm=true: сначала покажи пользователю имя новой папки и где она будет создана.")
+    name = str(args.get("name") or "").strip()
+    parent = str(args.get("parent_folder") or args.get("folder") or "").strip()
+    if not name or not parent:
+        raise McpError(-32602, "name and parent_folder/folder (id or URL) are required.")
+    try:
+        return app_workflow_function("create_drive_folder")(name, parent, bool(args.get("reuse_existing", True)))
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"create_drive_folder failed: {exc}") from exc
+
+
+def tool_organize_drive_folder(args: dict[str, Any]) -> dict[str, Any]:
+    folder = str(args.get("folder") or "").strip()
+    if not folder:
+        raise McpError(-32602, "folder (id or URL) is required.")
+    dry_run = bool(args.get("dry_run", True))
+    if not dry_run and args.get("confirm") is not True:
+        raise McpError(-32602, "Нужно confirm=true: сначала покажи пользователю план сортировки папки Drive. Для безопасной проверки используй dry_run=true.")
+    categories = args.get("categories")
+    if categories is not None and not isinstance(categories, list):
+        raise McpError(-32602, "categories must be a list of folder names.")
+    try:
+        return app_workflow_function("organize_drive_folder")(folder, categories, dry_run)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"organize_drive_folder failed: {exc}") from exc
+
+
 def tool_manage_apps_script(args: dict[str, Any]) -> dict[str, Any]:
     if args.get("confirm") is not True:
         raise McpError(-32602, "Set confirm=true to run an Apps Script action.")
@@ -5479,7 +5525,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "item_id": {"type": "string", "description": "Alias for file_id; Drive file/folder id or URL"},
                 "folder": {"type": "string", "description": "Target Drive folder id or folder URL"},
             },
-            "required": ["folder"],
+            "required": ["file_id", "folder"],
             "additionalProperties": False,
         },
         "handler": tool_move_drive_file_to_folder,
@@ -5501,10 +5547,29 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "folder": {"type": "string", "description": "Parent Drive folder id or folder URL to remove from"},
                 "confirm": {"type": "boolean"},
             },
-            "required": ["folder", "confirm"],
+            "required": ["item_id", "folder", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_remove_drive_item_from_folder,
+    },
+
+    "list_drive_folder_items": {
+        "description": (
+            "List direct contents of a Google Drive folder: files AND subfolders, with ids, names, mime types and links. "
+            "Use this before creating/moving/removing Drive items, and before proposing a folder-sorting plan."
+        ),
+        "inputSchema": {"type": "object", "properties": {"folder": {"type": "string", "description": "Drive folder id or URL"}, "page_size": {"type": "integer", "default": 200}}, "required": ["folder"], "additionalProperties": False},
+        "handler": tool_list_drive_folder_items,
+    },
+    "create_drive_folder": {
+        "description": "Create a Google Drive subfolder inside a specified parent folder, or reuse an existing exact-name subfolder. Ask for confirmation first and call with confirm=true.",
+        "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "New subfolder name"}, "parent_folder": {"type": "string", "description": "Parent Drive folder id or URL"}, "folder": {"type": "string", "description": "Alias for parent_folder"}, "reuse_existing": {"type": "boolean", "default": True}, "confirm": {"type": "boolean"}}, "required": ["name", "confirm"], "additionalProperties": False},
+        "handler": tool_create_drive_folder,
+    },
+    "organize_drive_folder": {
+        "description": "Smartly organize a Google Drive folder: create/reuse category subfolders and move files AND folders into categories. Use dry_run=true first; after approval use dry_run=false and confirm=true.",
+        "inputSchema": {"type": "object", "properties": {"folder": {"type": "string", "description": "Drive folder id or URL to organize"}, "categories": {"type": "array", "items": {"type": "string"}}, "dry_run": {"type": "boolean", "default": True}, "confirm": {"type": "boolean"}}, "required": ["folder"], "additionalProperties": False},
+        "handler": tool_organize_drive_folder,
     },
     "manage_apps_script": {
         "description": (
