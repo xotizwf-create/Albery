@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import hashlib
 import base64
+import urllib.request
+import urllib.parse
+import urllib.error
 import hmac
 import html
 import logging
@@ -21665,6 +21668,14 @@ def _b24_onboarding_text(step: int, tier: str) -> str:  # noqa: ARG001 — tier 
             "- 📈 Отчёты по компании, задачам и чатам",
             "- 💬 Сообщения сотрудникам",
             "",
+            "━━━━━━━━━━━━━━",
+            "⭐ [b]И ГЛАВНОЕ — СОЗДАЮ ПРИЛОЖЕНИЯ[/b]",
+            "Для сложных автоматизаций обычной таблицы порой мало — нужно отдельное приложение. "
+            "Я соберу его сам на базе ваших Google-таблиц: от вас только идея и логика словами, "
+            "а я напишу, опубликую и пришлю готовую рабочую ссылку (доступ по ссылке для всех, "
+            "настраивать ничего не нужно). Примеры: калькуляторы, формы, дашборды, мини-сервисы. 🚀",
+            "━━━━━━━━━━━━━━",
+            "",
             "Важно: уровень моих возможностей зависит от вашего доступа. Чтобы узнать, что доступно "
             "именно вам — задайте вопрос «Что ты умеешь?».",
         ])
@@ -22129,6 +22140,152 @@ def _b24_session_reset(dialog_id: str) -> None:
         logging.exception("b24 testbot: session reset failed")
 
 
+# ── Bitrix bot: read screenshots (Groq vision OCR) + reply-to-earlier-message context ──────────
+def _b24_groq_api_key() -> str:
+    """GROQ key for vision OCR. Albery runs as root, so it can read the Hermes gateway env where
+    the key already lives (no secret duplicated into the Albery .env)."""
+    k = os.getenv("GROQ_API_KEY", "").strip()
+    if k:
+        return k
+    try:
+        for line in Path("/root/.hermes/secure/hermes-gateway.env").read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("GROQ_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def _b24_vision_ocr(image_bytes: bytes, name: str = "") -> str:
+    """OCR/describe an image with Groq vision. NOTE: api.groq.com blocks urllib's default
+    User-Agent with Cloudflare 1010 — a browser UA passes (same gotcha as the STT path)."""
+    key = _b24_groq_api_key()
+    if not key or not image_bytes:
+        return ""
+    ext = (name.rsplit(".", 1)[-1] if "." in name else "png").lower()
+    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif", "webp": "webp"}.get(ext, "png")
+    b64 = base64.b64encode(image_bytes).decode()
+    payload = {
+        "model": os.getenv("B24_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
+        "max_tokens": 800, "temperature": 0,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Это изображение/скриншот, который пользователь прислал ассистенту "
+             "в чате. Извлеки ВЕСЬ текст с него ДОСЛОВНО, а затем кратко (1-2 предложения) опиши, что на "
+             "нём и какая может быть проблема/смысл. Ответь по-русски, без лишних вступлений."},
+            {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}}]}],
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
+                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urllib.request.urlopen(req, timeout=70) as r:
+            d = json.loads(r.read().decode("utf-8", "ignore"))
+        return ((d.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "").strip()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("b24 vision OCR failed: %s", repr(exc)[:200])
+        return ""
+
+
+def _b24_fetch_bytes(url: str, access_token: str, max_bytes: int = 20 * 1024 * 1024) -> bytes:
+    """Download a Bitrix file. Tries the URL as-is, then with ?auth=<token> (REST file URLs need it)."""
+    if not url:
+        return b""
+    candidates = [url]
+    if "auth=" not in url and access_token:
+        candidates.append(url + ("&" if "?" in url else "?") + "auth=" + access_token)
+    for u in candidates:
+        try:
+            with requests.get(u, stream=True, timeout=60) as resp:
+                if resp.status_code != 200:
+                    continue
+                buf = b""
+                for chunk in resp.iter_content(65536):
+                    buf += chunk
+                    if len(buf) > max_bytes:
+                        break
+                if buf[:64].lstrip().lower().startswith((b"<!doctype html", b"<html")):
+                    continue  # got a login/HTML page, not the file
+                return buf
+        except Exception:  # noqa: BLE001
+            continue
+    return b""
+
+
+def _b24_message_extras(payload: dict):
+    """Parse attached images + reply-context straight from the flattened imbot event payload.
+    Bitrix delivers files inline as data[PARAMS][FILES][<id>][field] (with a pre-signed urlDownload
+    that needs no auth) and the replied-to message as data[PARAMS][REPLY_MESSAGE][MESSAGE]. We do NOT
+    call im.dialog.messages.get: for a bot, DIALOG_ID resolves to the wrong (own 'Мои заметки') chat."""
+    image_texts: list = []
+    reply_text = ""
+    if not isinstance(payload, dict):
+        return image_texts, reply_text
+    # --- replied-to message: the full text is already in the event ---
+    for key in ("data[PARAMS][REPLY_MESSAGE][MESSAGE]", "data[params][REPLY_MESSAGE][MESSAGE]"):
+        v = payload.get(key)
+        if isinstance(v, list):
+            v = v[0] if v else ""
+        if v and str(v).strip():
+            reply_text = str(v).strip()
+            break
+    # --- attached files: rebuild FILES[<id>] groups from the flattened keys ---
+    files: dict = {}
+    pat = re.compile(r"^data\[PARAMS\]\[FILES\]\[([^\]]+)\]\[([^\]]+)\]$", re.I)
+    for k, v in payload.items():
+        m = pat.match(str(k))
+        if not m:
+            continue
+        val = v[0] if isinstance(v, list) and v else v
+        files.setdefault(m.group(1), {})[m.group(2)] = val
+    wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
+    for fid, f in list(files.items())[:4]:
+        if str(f.get("type") or "").lower() != "image":
+            continue
+        # The inline urlDownload/_esd links are session-bound (redirect to OAuth login server-side),
+        # so resolve a REST-authed DOWNLOAD_URL via disk.file.get instead (needs 'disk' scope).
+        durl = ""
+        try:
+            durl = (_refresh_bitrix_download_url(wh, fid) or "") if wh else ""
+        except Exception:  # noqa: BLE001
+            logging.exception("b24 extras: disk.file.get failed for fid=%s", fid)
+        if not durl:
+            logging.warning("b24 extras: no server download URL for image fid=%s — the bot-portal "
+                            "webhook (B24_TESTBOT_WEBHOOK_BASE) likely needs the 'disk' scope", fid)
+            continue
+        data = _b24_fetch_bytes(durl, "")
+        if not data:
+            logging.warning("b24 extras: image download empty fid=%s", fid)
+            continue
+        txt = _b24_vision_ocr(data, str(f.get("name") or "image.png"))
+        if txt:
+            image_texts.append(txt)
+    if os.getenv("B24_DEBUG_PAYLOAD", "0") == "1":
+        logging.info("b24 extras: images=%d reply=%s", len(image_texts), bool(reply_text))
+    return image_texts, reply_text
+
+
+def _b24_compose_user_text(text: str, image_texts: list, reply_text: str) -> str:
+    """Fold reply-context and image OCR into the message text handed to the brain."""
+    text = (text or "").strip()
+    blocks: list[str] = []
+    if reply_text:
+        blocks.append("[Пользователь ОТВЕЧАЕТ на это более раннее сообщение (возможно, из прошлой "
+                      "сессии) — учитывай его как контекст]:\n«" + reply_text[:1500] + "»")
+    if text:
+        blocks.append(text)
+    multi = len(image_texts) > 1
+    for i, ocr in enumerate(image_texts, 1):
+        label = f"[Пользователь прислал изображение №{i}. Распознанное содержимое:]" if multi \
+            else "[Пользователь прислал изображение. Распознанное содержимое:]"
+        blocks.append(label + "\n" + ocr[:2500])
+    if not text and image_texts:
+        blocks.append("(Текста в сообщении не было — отвечай по содержимому изображения.)")
+    return "\n\n".join(blocks) if blocks else text
+
+
+
 def _b24_recent_history(dialog_id: str, limit: int = 6) -> list[tuple[str, str]]:
     """Last successful Q/A pairs for this dialog — we inject them into the prompt
     because `hermes -z` one-shot calls do NOT persist/resume `--continue` sessions,
@@ -22553,7 +22710,21 @@ def _bitrix_imbot_app_event():
         message_text = str(_imbot_event_param(payload, "MESSAGE") or "").strip()
         message_id = _imbot_event_param(payload, "MESSAGE_ID") or ""
         from_user_id = _imbot_event_param(payload, "FROM_USER_ID") or ""
-        if not dialog_id or not message_text:
+        if os.getenv("B24_DEBUG_PAYLOAD", "0") == "1":
+            try:
+                _red = {k: ("<redacted>" if re.search(r"TOKEN|AUTH|SECRET|REFRESH", k, re.I) else v)
+                        for k, v in payload.items()}
+                logging.info("b24 MSGADD keys=%s payload=%s",
+                             list(payload.keys()), json.dumps(_red, ensure_ascii=False)[:3500])
+            except Exception:  # noqa: BLE001
+                logging.exception("b24 MSGADD debug log failed")
+        # The bot must SEE screenshots and understand replies to earlier (possibly reset) messages.
+        image_texts, reply_text = [], ""
+        try:
+            image_texts, reply_text = _b24_message_extras(payload)
+        except Exception:  # noqa: BLE001
+            logging.exception("b24 testbot: image/reply extras failed")
+        if not dialog_id or (not message_text and not image_texts and not reply_text):
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
         # Access gate: users explicitly set to 'none' get a plain system notice (no model,
         # no disclaimer, no buttons) instead of silence, so they know to request access.
@@ -22587,7 +22758,8 @@ def _bitrix_imbot_app_event():
         _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
         threading.Thread(
             target=_b24_app_process,
-            args=(endpoint, access_token, bot_id, dialog_id, message_text, message_id, from_user_id),
+            args=(endpoint, access_token, bot_id, dialog_id,
+                  _b24_compose_user_text(message_text, image_texts, reply_text), message_id, from_user_id),
             daemon=True,
         ).start()
         return jsonify({"ok": True, "event": event_name, "accepted": True})
