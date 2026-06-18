@@ -21100,7 +21100,9 @@ def zoom_export_download(expires_at: int, token: str, filename: str):
         file_path,
         as_attachment=True,
         download_name=safe_name,
-        mimetype="text/markdown; charset=utf-8",
+        mimetype=(__import__("mimetypes").guess_type(safe_name)[0]
+                  or ("text/markdown; charset=utf-8" if safe_name.lower().endswith((".md", ".markdown"))
+                      else "application/octet-stream")),
     )
 
 
@@ -21661,7 +21663,7 @@ def _b24_onboarding_text(step: int, tier: str) -> str:  # noqa: ARG001 — tier 
             "Я многое умею, вот основное:",
             "- 🔎 Глубокий поиск информации в интернете — могу найти информацию из глубоких архивов",
             "- 📚 Поиск по базе знаний и базе данных компании (регламенты, процессы, оргструктура, документы)",
-            "- 📄 Работа с документами: Word, Excel, PDF — читаю, анализирую, делаю выжимки",
+            "- 📄 Работа с документами: Word, Excel, PDF, Markdown — пришлите файл прямо в чат, я прочитаю и разберу его; могу вернуть ответ файлом (например, PDF)",
             "- 📊 Работа с Google-таблицами — могу сам поставить нужные формулы, сделать красивое оформление или полноценную автоматизацию таблицы",
             "- 🎧 Разбор Zoom-созвонов: итоги, задачи, участники",
             "- ✅ Задачи в Bitrix24: поиск, постановка, закрытие",
@@ -22213,16 +22215,140 @@ def _b24_fetch_bytes(url: str, access_token: str, max_bytes: int = 20 * 1024 * 1
     return b""
 
 
+_B24_DOC_EXTS = ("pdf", "docx", "doc", "xlsx", "xlsm", "md", "markdown", "txt",
+                 "csv", "tsv", "json", "rtf", "htm", "html", "log", "yaml", "yml")
+_B24_IMG_EXTS = ("png", "jpg", "jpeg", "gif", "webp", "bmp", "heic")
+_B24_DELIVER_RE = re.compile(r"\[\[DELIVER_PDF:\s*([^\]]*)\]\]", re.I)
+
+
+def _b24_extract_document(data: bytes, name: str) -> str:
+    """Extract readable text from a user-sent document. Pure-python extractors (pypdf / python-docx /
+    openpyxl) + native text for md/txt/csv. Legacy binary .doc isn't supported (no libreoffice)."""
+    import io as _io
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    try:
+        if ext in ("md", "markdown", "txt", "csv", "tsv", "json", "log", "yaml", "yml", "htm", "html"):
+            return data.decode("utf-8", "ignore")
+        if ext == "pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(_io.BytesIO(data))
+            return "\n".join((pg.extract_text() or "") for pg in reader.pages).strip()
+        if ext == "docx":
+            from docx import Document
+            doc = Document(_io.BytesIO(data))
+            parts = [p.text for p in doc.paragraphs]
+            for tbl in doc.tables:
+                for row in tbl.rows:
+                    parts.append(" | ".join(cell.text for cell in row.cells))
+            return "\n".join(parts).strip()
+        if ext in ("xlsx", "xlsm"):
+            from openpyxl import load_workbook
+            wb = load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
+            out = []
+            for ws in wb.worksheets:
+                out.append("# Лист: " + str(ws.title))
+                for row in ws.iter_rows(values_only=True):
+                    cells = ["" if v is None else str(v) for v in row]
+                    if any(c.strip() for c in cells):
+                        out.append(" | ".join(cells))
+            return "\n".join(out).strip()
+        if ext == "doc":
+            return ""  # legacy binary .doc — unsupported without libreoffice/antiword
+        return data.decode("utf-8", "ignore")
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("b24 doc extract failed (%s): %s", name, repr(exc)[:160])
+        return ""
+
+
+def _b24_text_to_pdf(title: str, text: str) -> bytes:
+    """Render plain/markdown-ish text (supports [b]…[/b], **…**, '- ' bullets, '# ' headings) to a
+    Cyrillic-capable PDF via reportlab + the DejaVu fonts already used for owner reports."""
+    import io as _io, html as _html
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    fr, fb = "Helvetica", "Helvetica-Bold"
+    try:
+        reg, bold = reportlab_font_paths()
+        pdfmetrics.registerFont(TTFont("B24Reg", reg))
+        pdfmetrics.registerFont(TTFont("B24Bold", bold))
+        fr, fb = "B24Reg", "B24Bold"
+    except Exception:  # noqa: BLE001
+        pass
+    body = ParagraphStyle("b24body", fontName=fr, fontSize=11, leading=15)
+    head = ParagraphStyle("b24head", fontName=fb, fontSize=15, leading=19, spaceBefore=4, spaceAfter=8)
+    sub = ParagraphStyle("b24sub", fontName=fb, fontSize=12.5, leading=17, spaceBefore=6, spaceAfter=4)
+
+    def fmt(s: str) -> str:
+        s = _html.escape(s)
+        s = re.sub(r"\[b\](.+?)\[/b\]", r"<b>\1</b>", s, flags=re.S)
+        s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s, flags=re.S)
+        return s
+
+    flow = []
+    if title:
+        flow.append(Paragraph(fmt(str(title)), head))
+        flow.append(Spacer(1, 4))
+    for raw in (text or "").split("\n"):
+        line = raw.rstrip()
+        if not line.strip():
+            flow.append(Spacer(1, 6)); continue
+        st = line.lstrip()
+        if st.startswith("# "):
+            flow.append(Paragraph(fmt(st[2:]), head))
+        elif st.startswith("## "):
+            flow.append(Paragraph(fmt(st[3:]), sub))
+        elif st.startswith(("- ", "• ", "* ")):
+            flow.append(Paragraph("•&nbsp;" + fmt(st[2:]), body))
+        else:
+            flow.append(Paragraph(fmt(line), body))
+    buf = _io.BytesIO()
+    SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
+                      topMargin=16 * mm, bottomMargin=16 * mm,
+                      title=str(title or "Документ")).build(flow)
+    return buf.getvalue()
+
+
+def _b24_save_pdf_export(pdf_bytes: bytes, name: str) -> str:
+    """Save a PDF to the export dir and return a public, token-protected, time-limited download URL
+    (reuses the zoom-export token mechanism; the route serves any file in that dir)."""
+    base = re.sub(r"[^\w.\-() а-яёА-ЯЁ]+", "_", str(name or "Документ")).strip() or "Документ"
+    if not base.lower().endswith(".pdf"):
+        base += ".pdf"
+    fname = "%d_%s" % (int(time.time()), base)
+    ZOOM_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_zoom_exports()
+    (ZOOM_EXPORT_DIR / fname).write_bytes(pdf_bytes)
+    url = _zoom_export_public_url(fname)
+    if url.startswith("/"):
+        url = "https://mcp.m4s.ru" + url
+    return url
+
+
+def _b24_extract_deliver(answer: str):
+    """Strip a [[DELIVER_PDF: name]] marker; return (clean_text, pdf_filename|None)."""
+    m = _B24_DELIVER_RE.search(answer or "")
+    if not m:
+        return answer, None
+    name = (m.group(1) or "").strip() or "Документ"
+    clean = _B24_DELIVER_RE.sub("", answer).strip()
+    return clean, name
+
+
 def _b24_message_extras(payload: dict):
-    """Parse attached images + reply-context straight from the flattened imbot event payload.
-    Bitrix delivers files inline as data[PARAMS][FILES][<id>][field] (with a pre-signed urlDownload
-    that needs no auth) and the replied-to message as data[PARAMS][REPLY_MESSAGE][MESSAGE]. We do NOT
-    call im.dialog.messages.get: for a bot, DIALOG_ID resolves to the wrong (own 'Мои заметки') chat."""
+    """Parse images + documents + reply-context straight from the flattened imbot event payload.
+    Files come inline as data[PARAMS][FILES][<id>][field]; the inline _esd urls are session-bound, so
+    we resolve a REST DOWNLOAD_URL via disk.file.get (needs the webhook 'disk' scope). Images -> Groq
+    vision OCR; documents (pdf/docx/xlsx/md/txt/csv) -> text extraction. Reply text is inline in
+    data[PARAMS][REPLY_MESSAGE][MESSAGE]. Returns (image_texts, reply_text, doc_blocks)."""
     image_texts: list = []
     reply_text = ""
+    doc_blocks: list = []
     if not isinstance(payload, dict):
-        return image_texts, reply_text
-    # --- replied-to message: the full text is already in the event ---
+        return image_texts, reply_text, doc_blocks
     for key in ("data[PARAMS][REPLY_MESSAGE][MESSAGE]", "data[params][REPLY_MESSAGE][MESSAGE]"):
         v = payload.get(key)
         if isinstance(v, list):
@@ -22230,7 +22356,6 @@ def _b24_message_extras(payload: dict):
         if v and str(v).strip():
             reply_text = str(v).strip()
             break
-    # --- attached files: rebuild FILES[<id>] groups from the flattened keys ---
     files: dict = {}
     pat = re.compile(r"^data\[PARAMS\]\[FILES\]\[([^\]]+)\]\[([^\]]+)\]$", re.I)
     for k, v in payload.items():
@@ -22240,36 +22365,46 @@ def _b24_message_extras(payload: dict):
         val = v[0] if isinstance(v, list) and v else v
         files.setdefault(m.group(1), {})[m.group(2)] = val
     wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
-    for fid, f in list(files.items())[:4]:
-        if str(f.get("type") or "").lower() != "image":
+    for fid, f in list(files.items())[:5]:
+        name = str(f.get("name") or "")
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        is_image = str(f.get("type") or "").lower() == "image" or ext in _B24_IMG_EXTS
+        is_doc = ext in _B24_DOC_EXTS
+        if not (is_image or is_doc):
             continue
-        # The inline urlDownload/_esd links are session-bound (redirect to OAuth login server-side),
-        # so resolve a REST-authed DOWNLOAD_URL via disk.file.get instead (needs 'disk' scope).
         durl = ""
         try:
             durl = (_refresh_bitrix_download_url(wh, fid) or "") if wh else ""
         except Exception:  # noqa: BLE001
-            logging.exception("b24 extras: disk.file.get failed for fid=%s", fid)
+            logging.exception("b24 extras: disk.file.get failed fid=%s", fid)
         if not durl:
-            logging.warning("b24 extras: no server download URL for image fid=%s — the bot-portal "
-                            "webhook (B24_TESTBOT_WEBHOOK_BASE) likely needs the 'disk' scope", fid)
+            logging.warning("b24 extras: no server download URL fid=%s — bot webhook likely needs 'disk' scope", fid)
             continue
         data = _b24_fetch_bytes(durl, "")
         if not data:
-            logging.warning("b24 extras: image download empty fid=%s", fid)
+            logging.warning("b24 extras: empty download fid=%s", fid)
             continue
-        txt = _b24_vision_ocr(data, str(f.get("name") or "image.png"))
-        if txt:
-            image_texts.append(txt)
+        if is_image:
+            txt = _b24_vision_ocr(data, name or "image.png")
+            if txt:
+                image_texts.append(txt)
+        else:
+            txt = _b24_extract_document(data, name or "file")
+            if txt and txt.strip():
+                doc_blocks.append((name or "документ", txt.strip()))
+            else:
+                doc_blocks.append((name or "документ",
+                                   "(не удалось извлечь текст: возможно скан без текстового слоя, "
+                                   "пустой файл или устаревший формат .doc — попросите прислать PDF/DOCX)"))
     if os.getenv("B24_DEBUG_PAYLOAD", "0") == "1":
-        logging.info("b24 extras: images=%d reply=%s", len(image_texts), bool(reply_text))
-    return image_texts, reply_text
+        logging.info("b24 extras: images=%d docs=%d reply=%s", len(image_texts), len(doc_blocks), bool(reply_text))
+    return image_texts, reply_text, doc_blocks
 
 
-def _b24_compose_user_text(text: str, image_texts: list, reply_text: str) -> str:
-    """Fold reply-context and image OCR into the message text handed to the brain."""
+def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_blocks: list = None) -> str:
+    """Fold reply-context, image OCR and extracted document text into the message for the brain."""
     text = (text or "").strip()
-    blocks: list[str] = []
+    blocks: list = []
     if reply_text:
         blocks.append("[Пользователь ОТВЕЧАЕТ на это более раннее сообщение (возможно, из прошлой "
                       "сессии) — учитывай его как контекст]:\n«" + reply_text[:1500] + "»")
@@ -22277,13 +22412,17 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str) -> str
         blocks.append(text)
     multi = len(image_texts) > 1
     for i, ocr in enumerate(image_texts, 1):
-        label = f"[Пользователь прислал изображение №{i}. Распознанное содержимое:]" if multi \
-            else "[Пользователь прислал изображение. Распознанное содержимое:]"
+        label = (f"[Изображение №{i}. Распознанное содержимое:]" if multi
+                 else "[Пользователь прислал изображение. Распознанное содержимое:]")
         blocks.append(label + "\n" + ocr[:2500])
-    if not text and image_texts:
-        blocks.append("(Текста в сообщении не было — отвечай по содержимому изображения.)")
+    for name, content in (doc_blocks or []):
+        body = content[:12000]
+        if len(content) > 12000:
+            body += "\n…[документ обрезан, показано начало]"
+        blocks.append(f"[Пользователь прислал документ «{name}». Извлечённое содержимое:]\n" + body)
+    if not text and (image_texts or doc_blocks):
+        blocks.append("(Текста в сообщении не было — отвечай по содержимому вложения.)")
     return "\n\n".join(blocks) if blocks else text
-
 
 
 def _b24_recent_history(dialog_id: str, limit: int = 6) -> list[tuple[str, str]]:
@@ -22324,6 +22463,11 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> st
         "не добавляй финальных резюме «То есть коротко…». Не используй Markdown (#, **, ` или таблицы) "
         "— Битрикс их не отображает; жирный ТОЛЬКО через [b]...[/b]. Итог: коротко по содержанию, но с "
         "аккуратным оформлением, акцентами жирным и живыми эмодзи."
+        " ФАЙЛ-ОТВЕТ: если пользователь просит ответ ДОКУМЕНТОМ/ФАЙЛОМ (\"пришли PDF\", "
+        "\"оформи в PDF\", \"сделай файл\"), сформируй ПОЛНОЕ содержимое документа прямо в ответе "
+        "(заголовки [b]…[/b], списки \"- \", абзацы) и в САМОМ конце добавь служебный маркер РОВНО так: "
+        "[[DELIVER_PDF: Краткое-имя-файла]] — система сама соберёт из твоего ответа PDF и пришлёт ссылку, "
+        "сам маркер пользователь не увидит. Без явной просьбы о файле маркер НЕ добавляй."
     )
     access_rule = (
         " ПРАВИЛО ПРО ДОСТУП (обязательно): если пользователь просит ДЕЙСТВИЕ, которого нет в твоём "
@@ -22469,6 +22613,14 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
         stop_typing.set()
     latency_ms = int((time.monotonic() - started) * 1000)
     answer, escalation_request = _b24_extract_escalation(answer)
+    answer, _deliver_name = _b24_extract_deliver(answer)
+    if _deliver_name:
+        try:
+            _pdf = _b24_text_to_pdf(_deliver_name, answer or _deliver_name)
+            _link = _b24_save_pdf_export(_pdf, _deliver_name)
+            answer = "📎 Готово, оформил ответ в PDF:\n" + _link + "\n\n(ссылка действует ~30 минут)"
+        except Exception:  # noqa: BLE001
+            logging.exception("b24 testbot: PDF deliver failed — sending text instead")
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer,
                    keyboard=_b24_keyboard())
     if escalation_request is not None:
@@ -22719,12 +22871,12 @@ def _bitrix_imbot_app_event():
             except Exception:  # noqa: BLE001
                 logging.exception("b24 MSGADD debug log failed")
         # The bot must SEE screenshots and understand replies to earlier (possibly reset) messages.
-        image_texts, reply_text = [], ""
+        image_texts, reply_text, doc_blocks = [], "", []
         try:
-            image_texts, reply_text = _b24_message_extras(payload)
+            image_texts, reply_text, doc_blocks = _b24_message_extras(payload)
         except Exception:  # noqa: BLE001
-            logging.exception("b24 testbot: image/reply extras failed")
-        if not dialog_id or (not message_text and not image_texts and not reply_text):
+            logging.exception("b24 testbot: image/reply/doc extras failed")
+        if not dialog_id or (not message_text and not image_texts and not reply_text and not doc_blocks):
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
         # Access gate: users explicitly set to 'none' get a plain system notice (no model,
         # no disclaimer, no buttons) instead of silence, so they know to request access.
@@ -22759,7 +22911,7 @@ def _bitrix_imbot_app_event():
         threading.Thread(
             target=_b24_app_process,
             args=(endpoint, access_token, bot_id, dialog_id,
-                  _b24_compose_user_text(message_text, image_texts, reply_text), message_id, from_user_id),
+                  _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks), message_id, from_user_id),
             daemon=True,
         ).start()
         return jsonify({"ok": True, "event": event_name, "accepted": True})
