@@ -5362,8 +5362,10 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Создать НОВУЮ Google-таблицу (от имени Google-аккаунта агента). По умолчанию выдаёт доступ "
             "«по ссылке — редактор» (anyone with link = editor) и возвращает ссылку. Можно сразу вписать "
-            "данные через rows (список строк, каждая — список ячеек, с A1). Перед созданием ОБЯЗАТЕЛЬНО "
-            "покажи пользователю название и что впишешь, получи согласие, затем вызови с confirm=true. "
+            "данные через rows (список строк, каждая — список ячеек, с A1). Если rows переданы, сервер "
+            "автоматически применяет спокойное читабельное оформление: перенос текста, автоширины под русский "
+            "текст/числа/₽, аккуратные границы, лёгкая зебра и без лишней пёстрой заливки. Перед созданием "
+            "ОБЯЗАТЕЛЬНО покажи пользователю название и что впишешь, получи согласие, затем вызови с confirm=true. "
             "Инструмент только для полного/операционного доступа (в FAQ-коннекторе недоступен)."
         ),
         "inputSchema": {
@@ -5416,9 +5418,14 @@ TOOLS: dict[str, dict[str, Any]] = {
     "format_google_sheet": {
         "description": (
             "Style a sheet and build dashboards: apply a list of Sheets API batchUpdate request objects. "
-            "A Google Sheet or task/list table is NOT finished if it is a raw grid. Every delivered table must be "
-            "beautiful and readable: clear title/header, frozen header row, readable column widths, wrapping, "
-            "contrast colors, borders, number/currency/date formats, and conditional formatting/charts when useful. "
+            "A Google Sheet or task/list table is NOT finished if it is a raw grid or a cramped rainbow dashboard. "
+            "Every delivered table must be beautiful and readable: clear title/header, frozen header row, readable "
+            "column widths, wrapping, enough row height, light borders, number/currency/date formats, and charts only "
+            "when they clarify the data. Use a calm executive-dashboard palette: mostly white/light neutral background, "
+            "one main accent color, muted section headers, and status colors only for small status cells; do NOT flood "
+            "whole tables with red/green/yellow or multiple bright colors. Before giving a link to the user, make sure "
+            "texts and ₽/number cells are not clipped. The server automatically runs a readability polish after your "
+            "custom requests: wrap text, auto-fit rows/columns, then enforce sane widths from actual cell contents. "
             "create_google_sheet auto-applies a default readable style when rows are provided; use this tool for any "
             "extra formatting, dashboards, charts, task/status colors, merged title blocks or polished layout. "
             "Before saying a dashboard is ready, write/check formulas with write_google_sheet_values so formula "

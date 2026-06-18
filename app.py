@@ -452,13 +452,96 @@ def _first_sheet_id(sheets: Any, spreadsheet_id: str) -> int:
     return int(sheet_props[0].get("sheetId", 0))
 
 
+def _sheet_column_pixel_width(values: list[list[Any]], col_index: int) -> int:
+    """Choose a readable fixed width after Google auto-resize.
+
+    Google auto-resize can still leave generated dashboards cramped when there are merged
+    KPI blocks, currency values, Russian labels, or formulas. We use a conservative width
+    from the actual visible content so numbers and text do not get clipped.
+    """
+    longest = 0
+    has_money_or_number = False
+    for row in values or []:
+        if not isinstance(row, list) or col_index >= len(row):
+            continue
+        text = str(row[col_index] if row[col_index] is not None else "").strip()
+        if not text:
+            continue
+        for part in text.replace("\n", " ").split():
+            longest = max(longest, len(part))
+        longest = max(longest, min(len(text), 42))
+        if any(ch.isdigit() for ch in text) or "₽" in text or "%" in text:
+            has_money_or_number = True
+    if has_money_or_number:
+        return max(135, min(260, 9 * longest + 46))
+    return max(150, min(340, 8 * longest + 52))
+
+
+def _readability_dimension_requests(
+    sheet_id: int, values: list[list[Any]] | None, width: int, row_count: int
+) -> list[dict[str, Any]]:
+    """Dimension requests that keep Albery-generated sheets readable.
+
+    Order matters: let Sheets auto-fit first, then apply sane minimum-like fixed widths
+    based on the data. This prevents the clipped/squeezed dashboard look reported by the owner.
+    """
+    width = max(1, min(int(width or 1), 26))
+    row_count = max(1, min(int(row_count or 1), 200))
+    values = values or []
+    requests: list[dict[str, Any]] = [
+        {
+            "autoResizeDimensions": {
+                "dimensions": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": width}
+            }
+        },
+        {
+            "autoResizeDimensions": {
+                "dimensions": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": row_count}
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+                "properties": {"pixelSize": 46},
+                "fields": "pixelSize",
+            }
+        },
+    ]
+    for col in range(width):
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": col, "endIndex": col + 1},
+                    "properties": {"pixelSize": _sheet_column_pixel_width(values, col)},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+    if row_count > 1:
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 1, "endIndex": row_count},
+                    "properties": {"pixelSize": 32},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+    return requests
+
+
 def _apply_default_google_sheet_style(
-    sheets: Any, spreadsheet_id: str, width: int, row_count: int, sheet_id: int | None = None
+    sheets: Any,
+    spreadsheet_id: str,
+    width: int,
+    row_count: int,
+    sheet_id: int | None = None,
+    values: list[list[Any]] | None = None,
 ) -> bool:
     """Apply the Albery default readable style to a newly generated table.
 
-    The Bitrix agent must not hand off bare grids: every generated table/list should have
-    a frozen contrast header, readable wrapping, borders, alternating rows and useful widths.
+    The Bitrix agent must not hand off cramped or rainbow-colored grids. Generated tables
+    should be calm, readable and automatically fitted to Russian text, money and formulas.
     """
     width = max(1, min(int(width or 1), 26))
     row_count = max(1, int(row_count or 1))
@@ -480,7 +563,7 @@ def _apply_default_google_sheet_style(
     border = {
         "style": "SOLID",
         "width": 1,
-        "color": {"red": 0.82, "green": 0.85, "blue": 0.90},
+        "color": {"red": 0.88, "green": 0.90, "blue": 0.94},
     }
     requests = [
         {
@@ -494,11 +577,17 @@ def _apply_default_google_sheet_style(
                 "range": full_range,
                 "cell": {
                     "userEnteredFormat": {
+                        "backgroundColor": {"red": 1, "green": 1, "blue": 1},
+                        "horizontalAlignment": "LEFT",
                         "verticalAlignment": "MIDDLE",
                         "wrapStrategy": "WRAP",
+                        "textFormat": {
+                            "foregroundColor": {"red": 0.12, "green": 0.16, "blue": 0.22},
+                            "fontSize": 10,
+                        },
                     }
                 },
-                "fields": "userEnteredFormat(verticalAlignment,wrapStrategy)",
+                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,wrapStrategy,textFormat)",
             }
         },
         {
@@ -506,12 +595,12 @@ def _apply_default_google_sheet_style(
                 "range": header_range,
                 "cell": {
                     "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.10, "green": 0.16, "blue": 0.27},
+                        "backgroundColor": {"red": 0.93, "green": 0.96, "blue": 1.0},
                         "horizontalAlignment": "CENTER",
                         "verticalAlignment": "MIDDLE",
                         "wrapStrategy": "WRAP",
                         "textFormat": {
-                            "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                            "foregroundColor": {"red": 0.08, "green": 0.16, "blue": 0.28},
                             "bold": True,
                             "fontSize": 11,
                         },
@@ -536,33 +625,15 @@ def _apply_default_google_sheet_style(
                 "bandedRange": {
                     "range": full_range,
                     "rowProperties": {
-                        "headerColor": {"red": 0.10, "green": 0.16, "blue": 0.27},
+                        "headerColor": {"red": 0.93, "green": 0.96, "blue": 1.0},
                         "firstBandColor": {"red": 1, "green": 1, "blue": 1},
-                        "secondBandColor": {"red": 0.96, "green": 0.98, "blue": 1.0},
+                        "secondBandColor": {"red": 0.985, "green": 0.99, "blue": 1.0},
                     },
                 }
             }
         },
-        {
-            "updateDimensionProperties": {
-                "range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
-                "properties": {"pixelSize": 42},
-                "fields": "pixelSize",
-            }
-        },
-        {
-            "updateDimensionProperties": {
-                "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": width},
-                "properties": {"pixelSize": 160},
-                "fields": "pixelSize",
-            }
-        },
-        {
-            "autoResizeDimensions": {
-                "dimensions": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": width}
-            }
-        },
     ]
+    requests.extend(_readability_dimension_requests(sid, values or [], width, row_count))
     sheets.spreadsheets().batchUpdate(
         spreadsheetId=str(spreadsheet_id), body={"requests": requests}
     ).execute()
@@ -595,7 +666,7 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
         formula_errors = _scan_formula_errors(sheets, sid, f"A1:{_a1_column_name(width)}{len(norm)}")
         if formula_errors:
             raise RuntimeError(f"Google Sheet formula validation failed after create: {formula_errors[:5]}")
-        style_applied = _apply_default_google_sheet_style(sheets, sid, width, len(norm))
+        style_applied = _apply_default_google_sheet_style(sheets, sid, width, len(norm), values=norm)
     if share_anyone_writer:
         drive.permissions().create(fileId=sid, body={"type": "anyone", "role": "writer"}).execute()
     return {
@@ -688,6 +759,69 @@ def write_google_sheet_values(
         "formula_errors": 0,
     }
 
+def _quote_sheet_name_for_a1(title: str) -> str:
+    return "'" + str(title or "").replace("'", "''") + "'"
+
+
+def _apply_google_sheet_readability_polish(sheets: Any, spreadsheet_id: str) -> bool:
+    """Post-format safety pass for any sheet styled by the Bitrix agent.
+
+    It intentionally avoids repainting user colors/charts. It only fixes the recurring
+    usability failures: clipped text/numbers, cramped columns, row heights and wrapping.
+    """
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=str(spreadsheet_id),
+        fields="sheets(properties(sheetId,title,index,gridProperties(rowCount,columnCount)))",
+    ).execute()
+    sheet_props = sorted(
+        ((item.get("properties") or {}) for item in (meta.get("sheets") or [])),
+        key=lambda item: item.get("index", 0),
+    )
+    if not sheet_props:
+        return False
+    requests: list[dict[str, Any]] = []
+    for props in sheet_props[:5]:
+        sid = int(props.get("sheetId", 0))
+        title = props.get("title") or "Sheet1"
+        values_resp = sheets.spreadsheets().values().get(
+            spreadsheetId=str(spreadsheet_id),
+            range=f"{_quote_sheet_name_for_a1(title)}!A1:Z200",
+        ).execute()
+        values = values_resp.get("values", []) or []
+        if not values:
+            continue
+        width = max((len(row) for row in values if isinstance(row, list)), default=1)
+        row_count = len(values)
+        full_range = {
+            "sheetId": sid,
+            "startRowIndex": 0,
+            "endRowIndex": row_count,
+            "startColumnIndex": 0,
+            "endColumnIndex": width,
+        }
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": full_range,
+                    "cell": {
+                        "userEnteredFormat": {
+                            "verticalAlignment": "MIDDLE",
+                            "wrapStrategy": "WRAP",
+                        }
+                    },
+                    "fields": "userEnteredFormat(verticalAlignment,wrapStrategy)",
+                }
+            }
+        )
+        requests.extend(_readability_dimension_requests(sid, values, width, row_count))
+    if not requests:
+        return False
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=str(spreadsheet_id), body={"requests": requests}
+    ).execute()
+    return True
+
+
 def format_google_sheet(spreadsheet_id: str, requests: list) -> dict[str, Any]:
     """Apply Sheets API batchUpdate request objects: cell formatting, number/currency formats,
     conditional formatting, frozen rows/cols, column widths, merges, and charts (addChart)
@@ -700,9 +834,11 @@ def format_google_sheet(spreadsheet_id: str, requests: list) -> dict[str, Any]:
     resp = sheets.spreadsheets().batchUpdate(
         spreadsheetId=str(spreadsheet_id), body={"requests": requests},
     ).execute()
+    readability_polished = _apply_google_sheet_readability_polish(sheets, str(spreadsheet_id))
     return {
         "spreadsheet_id": str(spreadsheet_id),
         "applied": len(requests),
+        "readability_polished": readability_polished,
         "replies_count": len(resp.get("replies", []) or []),
         "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
     }
