@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.13.0"
+SERVER_VERSION = "0.14.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3869,6 +3869,16 @@ def tool_move_drive_file_to_folder(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"move_drive_file_to_folder failed: {exc}") from exc
 
 
+def tool_get_webapp_template(args: dict[str, Any]) -> dict[str, Any]:
+    title = str(args.get("title") or "").strip() or None
+    try:
+        return app_workflow_function("webapp_design_template")(title)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"get_webapp_template failed: {exc}") from exc
+
+
 def tool_make_sheet_applet(args: dict[str, Any]) -> dict[str, Any]:
     sid = str(args.get("spreadsheet_id") or args.get("spreadsheet") or args.get("url") or "").strip()
     if not sid:
@@ -5561,6 +5571,21 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_move_drive_file_to_folder,
+    },
+    "get_webapp_template": {
+        "description": (
+            "Get the Albery-branded HTML/CSS web-app template (matches the prod React site: light bg, "
+            "white rounded cards, primary purple #5440F6, Inter font, soft shadows, styled inputs/buttons/"
+            "tables/badges). Returns html_skeleton with {{TITLE}}/{{CONTENT}}/{{APPLET}} placeholders, css, "
+            "a working content_example and how_to. ALWAYS use this as the base for any web app so it looks "
+            "consistent and beautiful. Combine with make_sheet_applet for data."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"title": {"type": "string", "description": "App title to inline (optional)"}},
+            "additionalProperties": False,
+        },
+        "handler": tool_get_webapp_template,
     },
     "make_sheet_applet": {
         "description": (
