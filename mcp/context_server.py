@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "0.10.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -3812,6 +3812,85 @@ def tool_create_google_sheet(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"Create sheet failed: {exc}") from exc
 
 
+def tool_get_google_sheet_meta(args: dict[str, Any]) -> dict[str, Any]:
+    sid = str(args.get("spreadsheet_id") or "").strip()
+    if not sid:
+        raise McpError(-32602, "spreadsheet_id is required.")
+    try:
+        return app_workflow_function("get_google_sheet_meta")(sid)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"get_google_sheet_meta failed: {exc}") from exc
+
+
+def tool_write_google_sheet_values(args: dict[str, Any]) -> dict[str, Any]:
+    sid = str(args.get("spreadsheet_id") or "").strip()
+    rng = str(args.get("range") or "").strip()
+    values = args.get("values")
+    if not sid or not rng:
+        raise McpError(-32602, "spreadsheet_id and range are required.")
+    if not isinstance(values, list):
+        raise McpError(-32602, "values must be a list of rows (each row a list).")
+    vio = str(args.get("value_input_option") or "USER_ENTERED")
+    try:
+        return app_workflow_function("write_google_sheet_values")(sid, rng, values, vio)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"write_google_sheet_values failed: {exc}") from exc
+
+
+def tool_format_google_sheet(args: dict[str, Any]) -> dict[str, Any]:
+    sid = str(args.get("spreadsheet_id") or "").strip()
+    requests = args.get("requests")
+    if not sid:
+        raise McpError(-32602, "spreadsheet_id is required.")
+    if not isinstance(requests, list) or not requests:
+        raise McpError(-32602, "requests must be a non-empty list of Sheets API request objects.")
+    try:
+        return app_workflow_function("format_google_sheet")(sid, requests)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"format_google_sheet failed: {exc}") from exc
+
+
+def tool_move_drive_file_to_folder(args: dict[str, Any]) -> dict[str, Any]:
+    fid = str(args.get("file_id") or "").strip()
+    folder = str(args.get("folder") or "").strip()
+    if not fid or not folder:
+        raise McpError(-32602, "file_id and folder (id or URL) are required.")
+    try:
+        return app_workflow_function("move_drive_file_to_folder")(fid, folder)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"move_drive_file_to_folder failed: {exc}") from exc
+
+
+def tool_manage_apps_script(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Set confirm=true to run an Apps Script action.")
+    action = str(args.get("action") or "").strip().lower()
+    if action not in ("create", "get", "update", "deploy", "run"):
+        raise McpError(-32602, "action must be one of: create, get, update, deploy, run.")
+    try:
+        return app_workflow_function("manage_apps_script")(
+            action,
+            str(args.get("script_id") or "") or None,
+            str(args.get("title") or "") or None,
+            args.get("files"),
+            str(args.get("function_name") or "") or None,
+            args.get("parameters"),
+            str(args.get("description") or "") or None,
+        )
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"manage_apps_script failed: {exc}") from exc
+
+
 def tool_cancel_owner_recommendation(args: dict[str, Any]) -> dict[str, Any]:
     rec_id_raw = str(args.get("recommendation_id") or "").strip()
     if not rec_id_raw:
@@ -5299,6 +5378,99 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_create_google_sheet,
+    },
+    "get_google_sheet_meta": {
+        "description": (
+            "Read a Google Sheet's structure: its tabs (sheetId / title / grid size). Call this "
+            "before format_google_sheet so you know each tab's sheetId for batchUpdate requests. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"spreadsheet_id": {"type": "string", "description": "Google Sheet id"}},
+            "required": ["spreadsheet_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_get_google_sheet_meta,
+    },
+    "write_google_sheet_values": {
+        "description": (
+            "Write a 2D array of values/formulas into an A1 range of a Google Sheet (USER_ENTERED, "
+            "so formulas like =SUMIF(...) work). Use for sheets the agent created via create_google_sheet."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": {"type": "string"},
+                "range": {"type": "string", "description": "A1 range, e.g. 'G3' or 'Sheet1!A1'"},
+                "values": {"type": "array", "items": {"type": "array"}, "description": "2D array of rows"},
+                "value_input_option": {"type": "string", "enum": ["USER_ENTERED", "RAW"]},
+            },
+            "required": ["spreadsheet_id", "range", "values"],
+            "additionalProperties": False,
+        },
+        "handler": tool_write_google_sheet_values,
+    },
+    "format_google_sheet": {
+        "description": (
+            "Style a sheet and build dashboards: apply a list of Sheets API batchUpdate request objects - "
+            "cell formatting, number/currency formats, conditional formatting, frozen rows/cols, column "
+            "widths, merged cells, and CHARTS (addChart) for dashboards. Get each tab's sheetId from "
+            "get_google_sheet_meta. requests = standard Sheets API request objects (repeatCell, mergeCells, "
+            "updateSheetProperties, addChart, addConditionalFormatRule, updateDimensionProperties, ...)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": {"type": "string"},
+                "requests": {"type": "array", "items": {"type": "object"}, "description": "List of Sheets API batchUpdate request objects"},
+            },
+            "required": ["spreadsheet_id", "requests"],
+            "additionalProperties": False,
+        },
+        "handler": tool_format_google_sheet,
+    },
+    "move_drive_file_to_folder": {
+        "description": (
+            "Move a Drive file (e.g. a spreadsheet the agent created) into a Google Drive folder (id or "
+            "folder URL). IMPORTANT: the target folder must be shared with the agent's account "
+            "(a9ent.ai@gmail.com) as Editor, otherwise it returns 404 - in that case ask the owner to give "
+            "a9ent.ai@gmail.com edit access to the folder first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string", "description": "File/spreadsheet id"},
+                "folder": {"type": "string", "description": "Drive folder id or folder URL"},
+            },
+            "required": ["file_id", "folder"],
+            "additionalProperties": False,
+        },
+        "handler": tool_move_drive_file_to_folder,
+    },
+    "manage_apps_script": {
+        "description": (
+            "Google Apps Script via the Apps Script API. action=create (new project, title) | get (project "
+            "files) | update (overwrite files=[{name,type:SERVER_JS|JSON|HTML,source}]) | deploy (version + "
+            "deployment) | run (run function_name; needs an API-executable deployment in the same GCP "
+            "project). Requires confirm=true. If the API is disabled, ask the owner to enable the Apps "
+            "Script API in Google Cloud for a9ent.ai."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["create", "get", "update", "deploy", "run"]},
+                "script_id": {"type": "string"},
+                "title": {"type": "string"},
+                "files": {"type": "array", "items": {"type": "object"}},
+                "function_name": {"type": "string"},
+                "parameters": {"type": "array"},
+                "description": {"type": "string"},
+                "confirm": {"type": "boolean", "description": "must be true"},
+            },
+            "required": ["action", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_manage_apps_script,
     },
     "cancel_owner_recommendation": {
         "description": (

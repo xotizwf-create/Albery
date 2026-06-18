@@ -379,6 +379,150 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
     }
 
 
+# === ALBERY GSHEET+APPSSCRIPT TOOLS (2026-06-18) ===
+def _extract_drive_folder_id(value: Any) -> str:
+    """Accept a bare Drive folder id or a folder/file URL and return the id."""
+    import re as _re
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    for pat in (r"/folders/([A-Za-z0-9_-]+)", r"[?&]id=([A-Za-z0-9_-]+)", r"/d/([A-Za-z0-9_-]+)"):
+        m = _re.search(pat, s)
+        if m:
+            return m.group(1)
+    return s
+
+
+def move_drive_file_to_folder(file_id: str, folder: str) -> dict[str, Any]:
+    """Move a Drive file (e.g. a spreadsheet) into the given Drive folder (id or URL)."""
+    from googleapiclient.discovery import build
+    creds = _google_user_credentials()
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    fid = _extract_drive_folder_id(folder)
+    if not fid:
+        raise ValueError("folder is required (Drive folder id or URL)")
+    meta = drive.files().get(fileId=str(file_id), fields="parents").execute()
+    prev = ",".join(meta.get("parents", []) or [])
+    drive.files().update(
+        fileId=str(file_id), addParents=fid, removeParents=prev, fields="id,parents",
+    ).execute()
+    return {"file_id": str(file_id), "folder_id": fid, "moved": True}
+
+
+def get_google_sheet_meta(spreadsheet_id: str) -> dict[str, Any]:
+    """Return a spreadsheet's tabs with sheetId/title/grid size, so callers can target the
+    correct sheetId in format_google_sheet batchUpdate requests."""
+    from googleapiclient.discovery import build
+    creds = _google_user_credentials()
+    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    ss = sheets.spreadsheets().get(
+        spreadsheetId=str(spreadsheet_id),
+        fields="spreadsheetId,spreadsheetUrl,sheets(properties(sheetId,title,index,gridProperties))",
+    ).execute()
+    return {
+        "spreadsheet_id": ss.get("spreadsheetId"),
+        "url": ss.get("spreadsheetUrl"),
+        "sheets": [s.get("properties", {}) for s in ss.get("sheets", [])],
+    }
+
+
+def write_google_sheet_values(
+    spreadsheet_id: str, cell_range: str, values: list, value_input_option: str = "USER_ENTERED",
+) -> dict[str, Any]:
+    """Write a 2D array of values (formulas allowed with USER_ENTERED) into an A1 range."""
+    from googleapiclient.discovery import build
+    if not isinstance(values, list):
+        raise ValueError("values must be a list of rows (each row a list)")
+    creds = _google_user_credentials()
+    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    opt = value_input_option if value_input_option in ("USER_ENTERED", "RAW") else "USER_ENTERED"
+    resp = sheets.spreadsheets().values().update(
+        spreadsheetId=str(spreadsheet_id), range=str(cell_range),
+        valueInputOption=opt, body={"values": values},
+    ).execute()
+    return {
+        "spreadsheet_id": str(spreadsheet_id),
+        "updated_range": resp.get("updatedRange"),
+        "updated_cells": resp.get("updatedCells"),
+    }
+
+
+def format_google_sheet(spreadsheet_id: str, requests: list) -> dict[str, Any]:
+    """Apply Sheets API batchUpdate request objects: cell formatting, number/currency formats,
+    conditional formatting, frozen rows/cols, column widths, merges, and charts (addChart)
+    for dashboards. The caller builds standard Sheets API request objects."""
+    from googleapiclient.discovery import build
+    if not isinstance(requests, list) or not requests:
+        raise ValueError("requests must be a non-empty list of Sheets API request objects")
+    creds = _google_user_credentials()
+    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    resp = sheets.spreadsheets().batchUpdate(
+        spreadsheetId=str(spreadsheet_id), body={"requests": requests},
+    ).execute()
+    return {
+        "spreadsheet_id": str(spreadsheet_id),
+        "applied": len(requests),
+        "replies": resp.get("replies", []),
+        "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+    }
+
+
+def manage_apps_script(
+    action: str, script_id: str | None = None, title: str | None = None,
+    files: list | None = None, function_name: str | None = None,
+    parameters: list | None = None, description: str | None = None,
+) -> dict[str, Any]:
+    """Create/get/update/deploy/run a Google Apps Script project via the Apps Script API
+    (scopes script.projects + script.deployments)."""
+    from googleapiclient.discovery import build
+    svc = build("script", "v1", credentials=_google_user_credentials(), cache_discovery=False)
+    act = str(action or "").strip().lower()
+    if act == "create":
+        proj = svc.projects().create(body={"title": title or "Albery Script"}).execute()
+        sid = proj.get("scriptId")
+        return {"script_id": sid, "url": f"https://script.google.com/d/{sid}/edit", "title": proj.get("title")}
+    if not script_id:
+        raise ValueError("script_id is required for action " + act)
+    if act == "get":
+        return svc.projects().getContent(scriptId=str(script_id)).execute()
+    if act == "update":
+        if not isinstance(files, list) or not files:
+            raise ValueError("files (list) is required for update")
+        norm = []
+        for f in files:
+            if isinstance(f, dict):
+                norm.append({
+                    "name": str(f.get("name") or "Code"),
+                    "type": str(f.get("type") or "SERVER_JS").upper(),
+                    "source": str(f.get("source") or ""),
+                })
+        svc.projects().updateContent(scriptId=str(script_id), body={"files": norm}).execute()
+        return {"script_id": str(script_id), "updated_files": [f["name"] for f in norm]}
+    if act == "deploy":
+        ver = svc.projects().versions().create(
+            scriptId=str(script_id), body={"description": description or "albery deploy"},
+        ).execute()
+        dep = svc.projects().deployments().create(
+            scriptId=str(script_id),
+            body={"versionNumber": ver.get("versionNumber"), "manifestFileName": "appsscript",
+                  "description": description or "albery deploy"},
+        ).execute()
+        return {"script_id": str(script_id), "version": ver.get("versionNumber"),
+                "deployment_id": dep.get("deploymentId")}
+    if act == "run":
+        resp = svc.scripts().run(
+            scriptId=str(script_id),
+            body={"function": function_name, "parameters": parameters or [], "devMode": True},
+        ).execute()
+        if "error" in resp:
+            return {"error": resp["error"]}
+        return {"result": resp.get("response", {}).get("result")}
+    raise ValueError("unknown action: " + act)
+
+
+# === END ALBERY GSHEET+APPSSCRIPT TOOLS ===
+
+
 def fetch_google_drive_company_payload(
     known_files: dict[str, dict[str, Any]] | None = None,
     known_folders: dict[str, dict[str, Any]] | None = None,
