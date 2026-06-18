@@ -5395,7 +5395,10 @@ TOOLS: dict[str, dict[str, Any]] = {
     "write_google_sheet_values": {
         "description": (
             "Write a 2D array of values/formulas into an A1 range of a Google Sheet (USER_ENTERED, "
-            "so formulas like =SUMIF(...) work). Use for sheets the agent created via create_google_sheet."
+            "so formulas work). The server normalizes formula argument separators for the target Sheet locale "
+            "(ru_RU uses semicolons, not commas) and validates the updated range; if formulas still produce "
+            "#ERROR, the tool fails instead of letting the assistant claim success. Use for sheets the agent "
+            "created via create_google_sheet."
         ),
         "inputSchema": {
             "type": "object",
@@ -5412,7 +5415,9 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "format_google_sheet": {
         "description": (
-            "Style a sheet and build dashboards: apply a list of Sheets API batchUpdate request objects - "
+            "Style a sheet and build dashboards: apply a list of Sheets API batchUpdate request objects. "
+            "Before saying a dashboard is ready, write/check formulas with write_google_sheet_values so formula "
+            "errors are caught; for ru_RU sheets use semicolons in formulas. "
             "cell formatting, number/currency formats, conditional formatting, frozen rows/cols, column "
             "widths, merged cells, and CHARTS (addChart) for dashboards. Get each tab's sheetId from "
             "get_google_sheet_meta. requests = standard Sheets API request objects (repeatCell, mergeCells, "

@@ -350,6 +350,94 @@ def _google_user_credentials() -> Any:
     raise RuntimeError(f"Google OAuth token не найден в secure store ({last_err})")
 
 
+_FORMULA_ERROR_PREFIXES = ("#ERROR", "#VALUE", "#REF", "#DIV/0", "#NAME", "#N/A", "#NUM", "#NULL")
+
+
+def _formula_argument_separator_for_locale(locale: str | None) -> str:
+    """Google Sheets parses USER_ENTERED formulas with locale-specific argument separators.
+    Russian and many European locales require semicolons, while en_US accepts commas."""
+    loc = (locale or "").lower()
+    if loc.startswith(("ru", "uk", "be", "de", "fr", "es", "it", "pl", "pt", "nl", "cs", "da", "fi", "sv", "tr")):
+        return ";"
+    return ","
+
+
+def _normalize_formula_for_separator(value: Any, separator: str) -> Any:
+    """Convert comma-separated formula arguments to semicolons outside quoted strings.
+    This prevents #ERROR in ru_RU sheets when an LLM writes English-style formulas.
+    Cell values that are not formulas are returned unchanged."""
+    if separator != ";" or not isinstance(value, str) or not value.startswith("="):
+        return value
+    out: list[str] = []
+    in_double = False
+    in_single = False
+    escape_next = False
+    for ch in value:
+        if escape_next:
+            out.append(ch)
+            escape_next = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escape_next = True
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            continue
+        if ch == "," and not in_double and not in_single:
+            out.append(";")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _normalize_sheet_values_for_locale(values: list, separator: str) -> list:
+    return [
+        [_normalize_formula_for_separator(cell, separator) for cell in (row if isinstance(row, list) else [row])]
+        for row in (values or [])
+    ]
+
+
+def _sheet_locale(sheets: Any, spreadsheet_id: str) -> str:
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=str(spreadsheet_id), fields="properties(locale)"
+    ).execute()
+    return (meta.get("properties") or {}).get("locale") or ""
+
+
+def _a1_column_name(index: int) -> str:
+    index = max(1, int(index or 1))
+    name = ""
+    while index:
+        index, rem = divmod(index - 1, 26)
+        name = chr(65 + rem) + name
+    return name
+
+
+def _scan_formula_errors(sheets: Any, spreadsheet_id: str, cell_range: str, limit: int = 20) -> list[dict[str, Any]]:
+    try:
+        vr = sheets.spreadsheets().values().get(
+            spreadsheetId=str(spreadsheet_id),
+            range=str(cell_range),
+            valueRenderOption="FORMATTED_VALUE",
+        ).execute()
+    except Exception:
+        return []
+    errors: list[dict[str, Any]] = []
+    for r, row in enumerate(vr.get("values", []) or [], start=1):
+        for c, val in enumerate(row or [], start=1):
+            if isinstance(val, str) and val.upper().startswith(_FORMULA_ERROR_PREFIXES):
+                errors.append({"row": r, "column": c, "value": val})
+                if len(errors) >= limit:
+                    return errors
+    return errors
+
+
 def create_google_sheet(title: str, rows: list | None = None, share_anyone_writer: bool = True) -> dict[str, Any]:
     """Create a brand-new Google Sheet via the Sheets/Drive API (as the albery agent's Google
     account), optionally write initial rows, optionally share it as anyone-with-link = editor, and
@@ -363,18 +451,26 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
     spreadsheet = sheets.spreadsheets().create(body={"properties": {"title": clean_title}}).execute()
     sid = spreadsheet["spreadsheetId"]
     url = spreadsheet.get("spreadsheetUrl") or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
+    locale = _sheet_locale(sheets, sid)
+    formula_separator = _formula_argument_separator_for_locale(locale)
     if rows:
         width = max((len(r) for r in rows if isinstance(r, list)), default=1)
         norm = [[(r[i] if isinstance(r, list) and i < len(r) else "") for i in range(width)] for r in rows]
+        norm = _normalize_sheet_values_for_locale(norm, formula_separator)
         sheets.spreadsheets().values().update(
             spreadsheetId=sid, range="A1", valueInputOption="USER_ENTERED", body={"values": norm},
         ).execute()
+        formula_errors = _scan_formula_errors(sheets, sid, f"A1:{_a1_column_name(width)}{len(norm)}")
+        if formula_errors:
+            raise RuntimeError(f"Google Sheet formula validation failed after create: {formula_errors[:5]}")
     if share_anyone_writer:
         drive.permissions().create(fileId=sid, body={"type": "anyone", "role": "writer"}).execute()
     return {
         "spreadsheet_id": sid,
         "url": url,
         "title": clean_title,
+        "locale": locale,
+        "formula_separator": formula_separator,
         "access": "anyone_with_link_editor" if share_anyone_writer else "private",
     }
 
@@ -429,23 +525,34 @@ def get_google_sheet_meta(spreadsheet_id: str) -> dict[str, Any]:
 def write_google_sheet_values(
     spreadsheet_id: str, cell_range: str, values: list, value_input_option: str = "USER_ENTERED",
 ) -> dict[str, Any]:
-    """Write a 2D array of values (formulas allowed with USER_ENTERED) into an A1 range."""
+    """Write a 2D array of values (formulas allowed with USER_ENTERED) into an A1 range.
+    USER_ENTERED formulas are normalized for the target sheet locale and then validated."""
     from googleapiclient.discovery import build
     if not isinstance(values, list):
         raise ValueError("values must be a list of rows (each row a list)")
     creds = _google_user_credentials()
     sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
     opt = value_input_option if value_input_option in ("USER_ENTERED", "RAW") else "USER_ENTERED"
+    locale = _sheet_locale(sheets, str(spreadsheet_id))
+    formula_separator = _formula_argument_separator_for_locale(locale)
+    values_to_write = values
+    if opt == "USER_ENTERED":
+        values_to_write = _normalize_sheet_values_for_locale(values, formula_separator)
     resp = sheets.spreadsheets().values().update(
         spreadsheetId=str(spreadsheet_id), range=str(cell_range),
-        valueInputOption=opt, body={"values": values},
+        valueInputOption=opt, body={"values": values_to_write},
     ).execute()
+    formula_errors = _scan_formula_errors(sheets, str(spreadsheet_id), resp.get("updatedRange") or str(cell_range))
+    if formula_errors:
+        raise RuntimeError(f"Google Sheet formula validation failed after write: {formula_errors[:10]}")
     return {
         "spreadsheet_id": str(spreadsheet_id),
         "updated_range": resp.get("updatedRange"),
         "updated_cells": resp.get("updatedCells"),
+        "locale": locale,
+        "formula_separator": formula_separator,
+        "formula_errors": 0,
     }
-
 
 def format_google_sheet(spreadsheet_id: str, requests: list) -> dict[str, Any]:
     """Apply Sheets API batchUpdate request objects: cell formatting, number/currency formats,
