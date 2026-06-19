@@ -9,12 +9,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from psycopg.types.json import Jsonb
 
@@ -95,8 +96,22 @@ def connect() -> Any:
         raise McpError(-32000, str(exc)) from exc
 
 
+_MSK_TZ = ZoneInfo("Europe/Moscow")
+
+
+def _to_msk(value: datetime) -> datetime:
+    """Render datetimes in Moscow time (UTC+3) for all MCP output. The DB stores timestamptz and
+    the connection runs in UTC, so a bare .isoformat() would leak UTC to the model (e.g. Zoom call
+    times). Naive datetimes are assumed to already be UTC (the server runs in UTC)."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(_MSK_TZ)
+
+
 def json_default(value: Any) -> Any:
-    if isinstance(value, (datetime, date)):
+    if isinstance(value, datetime):
+        return _to_msk(value).isoformat()
+    if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, Decimal):
         return float(value)
@@ -139,7 +154,9 @@ def json_safe(value: Any) -> Any:
         return {str(key): json_safe(item) for key, item in value.items()}
     if isinstance(value, list):
         return [json_safe(item) for item in value]
-    if isinstance(value, (datetime, date)):
+    if isinstance(value, datetime):
+        return _to_msk(value).isoformat()
+    if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, Decimal):
         return float(value)
