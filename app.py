@@ -22329,7 +22329,8 @@ def _b24_fetch_bytes(url: str, access_token: str, max_bytes: int = 20 * 1024 * 1
 _B24_DOC_EXTS = ("pdf", "docx", "doc", "xlsx", "xlsm", "md", "markdown", "txt",
                  "csv", "tsv", "json", "rtf", "htm", "html", "log", "yaml", "yml")
 _B24_IMG_EXTS = ("png", "jpg", "jpeg", "gif", "webp", "bmp", "heic")
-_B24_DELIVER_RE = re.compile(r"\[\[DELIVER_PDF:\s*([^\]]*)\]\]", re.I)
+_B24_DELIVER_RE = re.compile(r"\[\[DELIVER_(PDF|XLSX|EXCEL|DOCX|WORD):\s*([^\]]*)\]\]", re.I)
+_B24_DELIVER_FMT = {"pdf": "pdf", "xlsx": "xlsx", "excel": "xlsx", "docx": "docx", "word": "docx"}
 
 
 def _b24_extract_document(data: bytes, name: str) -> str:
@@ -22380,7 +22381,8 @@ def _b24_text_to_pdf(title: str, text: str) -> bytes:
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib import colors
     fr, fb = "Helvetica", "Helvetica-Bold"
     try:
         reg, bold = reportlab_font_paths()
@@ -22393,7 +22395,10 @@ def _b24_text_to_pdf(title: str, text: str) -> bytes:
     head = ParagraphStyle("b24head", fontName=fb, fontSize=15, leading=19, spaceBefore=4, spaceAfter=8)
     sub = ParagraphStyle("b24sub", fontName=fb, fontSize=12.5, leading=17, spaceBefore=6, spaceAfter=4)
 
+    _emoji = re.compile("[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF\uFE0F\u200D]")
+
     def fmt(s: str) -> str:
+        s = _emoji.sub("", s)  # DejaVu lacks colour emoji -> would render as tofu boxes in the PDF
         s = _html.escape(s)
         s = re.sub(r"\[b\](.+?)\[/b\]", r"<b>\1</b>", s, flags=re.S)
         s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s, flags=re.S)
@@ -22403,8 +22408,27 @@ def _b24_text_to_pdf(title: str, text: str) -> bytes:
     if title:
         flow.append(Paragraph(fmt(str(title)), head))
         flow.append(Spacer(1, 4))
-    for raw in (text or "").split("\n"):
-        line = raw.rstrip()
+    PURPLE = colors.HexColor("#5440F6")
+    avail = (210 - 36) * mm  # A4 width minus left/right margins
+    for kind, val in _b24_split_doc_blocks(text):
+        if kind == "table":
+            ncols = max((len(r) for r in val), default=1) or 1
+            cst = ParagraphStyle("b24cell", fontName=fr, fontSize=9.5, leading=12)
+            chs = ParagraphStyle("b24cellh", fontName=fb, fontSize=9.5, leading=12, textColor=colors.white)
+            data = [[Paragraph(fmt(c), chs if ri == 0 else cst) for c in row] for ri, row in enumerate(val)]
+            tbl = Table(data, colWidths=[avail / ncols] * ncols, repeatRows=1)
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), PURPLE),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F4F2FF")]),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D9D5F5")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]))
+            flow.append(tbl)
+            flow.append(Spacer(1, 8))
+            continue
+        line = val.rstrip()
         if not line.strip():
             flow.append(Spacer(1, 6)); continue
         st = line.lstrip()
@@ -22439,17 +22463,191 @@ def _b24_save_pdf_export(pdf_bytes: bytes, name: str) -> str:
     return url
 
 
+def _b24_plain(s) -> str:
+    """Drop inline formatting markers ([b]…[/b], **…**) for raw cell/run text."""
+    s = re.sub(r"\[/?b\]", "", str(s or ""))
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s, flags=re.S)
+    return s
+
+
+def _b24_bold_segments(s):
+    """Split a line into (text, is_bold) runs honoring [b]…[/b] / **…**."""
+    s = re.sub(r"\*\*(.+?)\*\*", r"[b]\1[/b]", str(s or ""), flags=re.S)
+    out = []
+    for i, part in enumerate(re.split(r"\[b\](.+?)\[/b\]", s, flags=re.S)):
+        if part:
+            out.append((part, i % 2 == 1))
+    return out or [("", False)]
+
+
+def _b24_split_doc_blocks(text: str):
+    """Split answer text into ('table', rows) and ('line', str) blocks. A table is a run of
+    markdown pipe rows ('| a | b |'); the '| --- | --- |' separator row is dropped and ragged
+    rows are padded to the widest row."""
+    out = []
+    lines = (text or "").split("\n")
+
+    def is_row(s):
+        t = s.strip()
+        return t.startswith("|") and t.count("|") >= 2
+
+    def is_sep(s):
+        t = s.strip().strip("|").replace(" ", "")
+        return bool(t) and set(t) <= set("-:|")
+
+    i = 0
+    while i < len(lines):
+        if is_row(lines[i]):
+            rows = []
+            while i < len(lines) and is_row(lines[i]):
+                if not is_sep(lines[i]):
+                    rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                i += 1
+            if rows:
+                w = max(len(r) for r in rows)
+                out.append(("table", [r + [""] * (w - len(r)) for r in rows]))
+        else:
+            out.append(("line", lines[i]))
+            i += 1
+    return out
+
+
+def _b24_text_to_xlsx(title: str, text: str) -> bytes:
+    """Build a real .xlsx: pipe tables become rows (bold purple header); non-table lines are
+    written into column A above/around them."""
+    import io as _io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (re.sub(r"[^\w \-]+", "", str(title or "Лист"))[:28] or "Лист")
+    hfont = Font(bold=True, color="FFFFFF")
+    hfill = PatternFill("solid", fgColor="5440F6")
+    wrap = Alignment(wrap_text=True, vertical="top")
+    r = 1
+    had_table = False
+    for kind, val in _b24_split_doc_blocks(text):
+        if kind == "table":
+            had_table = True
+            for ri, row in enumerate(val):
+                for ci, c in enumerate(row, 1):
+                    cell = ws.cell(row=r, column=ci, value=_b24_plain(c))
+                    cell.alignment = wrap
+                    if ri == 0:
+                        cell.font = hfont
+                        cell.fill = hfill
+                r += 1
+            r += 1
+        else:
+            s = _b24_plain(val).rstrip()
+            if s.strip():
+                ws.cell(row=r, column=1, value=s)
+                r += 1
+    for col in ws.columns:
+        try:
+            width = min(60, max((len(str(c.value)) for c in col if c.value is not None), default=10) + 2)
+            ws.column_dimensions[col[0].column_letter].width = width
+        except Exception:  # noqa: BLE001
+            pass
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _b24_text_to_docx(title: str, text: str) -> bytes:
+    """Build a real .docx: headings, bullets, paragraphs (bold runs), and pipe tables become Word tables."""
+    import io as _io
+    from docx import Document
+    doc = Document()
+    if title:
+        doc.add_heading(_b24_plain(title), level=0)
+    for kind, val in _b24_split_doc_blocks(text):
+        if kind == "table":
+            ncols = max((len(r) for r in val), default=1) or 1
+            t = doc.add_table(rows=0, cols=ncols)
+            try:
+                t.style = "Light Grid Accent 1"
+            except Exception:  # noqa: BLE001
+                pass
+            for ri, row in enumerate(val):
+                cells = t.add_row().cells
+                for ci in range(ncols):
+                    cells[ci].text = _b24_plain(row[ci]) if ci < len(row) else ""
+                    if ri == 0:
+                        for p in cells[ci].paragraphs:
+                            for run in p.runs:
+                                run.bold = True
+            doc.add_paragraph("")
+            continue
+        line = val.rstrip()
+        if not line.strip():
+            continue
+        st = line.lstrip()
+        if st.startswith("# "):
+            doc.add_heading(_b24_plain(st[2:]), level=1)
+        elif st.startswith("## "):
+            doc.add_heading(_b24_plain(st[3:]), level=2)
+        elif st.startswith(("- ", "• ", "* ")):
+            doc.add_paragraph(_b24_plain(st[2:]), style="List Bullet")
+        else:
+            p = doc.add_paragraph()
+            for seg, isb in _b24_bold_segments(line):
+                p.add_run(seg).bold = isb
+    buf = _io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _b24_save_export(data: bytes, name: str, ext: str = "pdf") -> str:
+    """Save a generated document (pdf/xlsx/docx) to the export dir and return a public,
+    token-protected, time-limited download URL (same mechanism as the PDF export)."""
+    base = re.sub(r"[^\w.\-() а-яёА-ЯЁ]+", "_", str(name or "Документ")).strip() or "Документ"
+    base = re.sub(r"\.(pdf|xlsx|docx)$", "", base, flags=re.I) + "." + ext
+    fname = "%d_%s" % (int(time.time()), base)
+    ZOOM_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_zoom_exports()
+    (ZOOM_EXPORT_DIR / fname).write_bytes(data)
+    url = _zoom_export_public_url(fname)
+    if url.startswith("/"):
+        url = "https://mcp.m4s.ru" + url
+    return url
+
+
 def _b24_extract_deliver(answer: str):
-    """Strip a [[DELIVER_PDF: name]] marker; return (clean_text, pdf_filename|None)."""
+    """Strip a [[DELIVER_<fmt>: name]] marker; return (clean_text, name|None, fmt|None),
+    where fmt is one of 'pdf' | 'xlsx' | 'docx'."""
     m = _B24_DELIVER_RE.search(answer or "")
     if not m:
-        return answer, None
-    name = (m.group(1) or "").strip() or "Документ"
+        return answer, None, None
+    fmt = _B24_DELIVER_FMT.get((m.group(1) or "").lower(), "pdf")
+    name = (m.group(2) or "").strip() or "Документ"
     clean = _B24_DELIVER_RE.sub("", answer).strip()
-    return clean, name
+    return clean, name, fmt
 
 
-def _b24_message_extras(payload: dict):
+def _b24_app_download_url(endpoint: str, access_token: str, fid) -> str:
+    """Resolve a REST DOWNLOAD_URL for a chat file using the BOT's own OAuth token.
+    The bot is a participant of the dialog, so it can read files posted to it once the
+    local app has the 'disk' scope (the inbound webhook user is not a chat member and is
+    denied). Returns '' on any failure."""
+    fid_i = to_int(fid)
+    if fid_i is None or not endpoint or not access_token:
+        return ""
+    try:
+        data = _b24_app_call(endpoint, access_token, "disk.file.get", {"id": fid_i})
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("b24 extras: bot disk.file.get failed fid=%s: %s", fid, repr(exc)[:160])
+        return ""
+    res = data.get("result") if isinstance(data, dict) else None
+    if isinstance(res, dict):
+        for key in ("DOWNLOAD_URL", "DOWNLOAD_URL_EXTERNAL", "SHOW_URL"):
+            value = res.get(key)
+            if isinstance(value, str) and value.strip():
+                return absolute_bitrix_url(value, endpoint) or ""
+    return ""
+
+
+def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = ""):
     """Parse images + documents + reply-context straight from the flattened imbot event payload.
     Files come inline as data[PARAMS][FILES][<id>][field]; the inline _esd urls are session-bound, so
     we resolve a REST DOWNLOAD_URL via disk.file.get (needs the webhook 'disk' scope). Images -> Groq
@@ -22483,17 +22681,30 @@ def _b24_message_extras(payload: dict):
         is_doc = ext in _B24_DOC_EXTS
         if not (is_image or is_doc):
             continue
-        durl = ""
-        try:
-            durl = (_refresh_bitrix_download_url(wh, fid) or "") if wh else ""
-        except Exception:  # noqa: BLE001
-            logging.exception("b24 extras: disk.file.get failed fid=%s", fid)
-        if not durl:
-            logging.warning("b24 extras: no server download URL fid=%s — bot webhook likely needs 'disk' scope", fid)
-            continue
-        data = _b24_fetch_bytes(durl, "")
+        # Download the chat file. The BOT is a member of this dialog, so it can read the
+        # file via its own OAuth token once the local app has the 'disk' scope; the static
+        # inbound webhook user is NOT a chat member (403), so the bot token is tried first
+        # and the webhook only as a fallback. The inline urlDownload is a session-bound ajax
+        # URL (needs a browser cookie) and is intentionally not used server-side.
+        durl = _b24_app_download_url(endpoint, access_token, fid)
+        if not durl and wh:
+            try:
+                durl = _refresh_bitrix_download_url(wh, fid) or ""
+            except Exception:  # noqa: BLE001
+                logging.warning("b24 extras: webhook disk.file.get failed fid=%s", fid)
+        data = _b24_fetch_bytes(durl, access_token) if durl else b""
         if not data:
-            logging.warning("b24 extras: empty download fid=%s", fid)
+            # Never drop a file silently: tell the brain a file arrived but could not be
+            # read, so it asks for a resend / PDF instead of inventing the contents.
+            logging.warning("b24 extras: could not download fid=%s name=%s (app may need 'disk' scope)", fid, name)
+            if is_doc:
+                doc_blocks.append((name or "документ",
+                                   "(\u26a0\ufe0f не удалось скачать файл с сервера Bitrix. Честно скажи "
+                                   "пользователю, что не смог открыть этот файл, и попроси прислать его "
+                                   "ещё раз или в виде PDF. НЕ придумывай и не угадывай содержимое.)"))
+            else:
+                image_texts.append("(\u26a0\ufe0f не удалось получить изображение. Скажи пользователю, что "
+                                   "не смог его открыть, и попроси прислать ещё раз. Не придумывай, что на нём.)")
             continue
         if is_image:
             txt = _b24_vision_ocr(data, name or "image.png")
@@ -22577,8 +22788,13 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> st
         " ФАЙЛ-ОТВЕТ: если пользователь просит ответ ДОКУМЕНТОМ/ФАЙЛОМ (\"пришли PDF\", "
         "\"оформи в PDF\", \"сделай файл\"), сформируй ПОЛНОЕ содержимое документа прямо в ответе "
         "(заголовки [b]…[/b], списки \"- \", абзацы) и в САМОМ конце добавь служебный маркер РОВНО так: "
-        "[[DELIVER_PDF: Краткое-имя-файла]] — система сама соберёт из твоего ответа PDF и пришлёт ссылку, "
-        "сам маркер пользователь не увидит. Без явной просьбы о файле маркер НЕ добавляй."
+        "[[DELIVER_PDF: Имя]] — PDF; [[DELIVER_XLSX: Имя]] — Excel; [[DELIVER_DOCX: Имя]] — Word. "
+        "Формат выбирай по просьбе пользователя: «эксель/xlsx/таблицей» → XLSX, «ворд/docx» → DOCX, иначе PDF. "
+        "Если данные табличные (задачи, отчёты, колонки) — В ФАЙЛЕ оформляй их Markdown-таблицей через «|»: "
+        "строка заголовков, затем строка «| --- | --- |», затем строки данных; система превратит это в "
+        "НАСТОЯЩУЮ таблицу в PDF/Excel/Word. Реальные данные бери из инструментов (задачи — search_tasks и "
+        "т.п.), НЕ выдумывай содержимое. Система сама соберёт файл и пришлёт ссылку; маркер "
+        "пользователь не увидит. Без явной просьбы о файле маркер НЕ добавляй."
     )
     access_rule = (
         " ПРАВИЛО ПРО ДОСТУП (обязательно): если пользователь просит ДЕЙСТВИЕ, которого нет в твоём "
@@ -22757,14 +22973,19 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
         stop_typing.set()
     latency_ms = int((time.monotonic() - started) * 1000)
     answer, escalation_request = _b24_extract_escalation(answer)
-    answer, _deliver_name = _b24_extract_deliver(answer)
+    answer, _deliver_name, _deliver_fmt = _b24_extract_deliver(answer)
     if _deliver_name:
         try:
-            _pdf = _b24_text_to_pdf(_deliver_name, answer or _deliver_name)
-            _link = _b24_save_pdf_export(_pdf, _deliver_name)
-            answer = "📎 Готово, оформил ответ в PDF:\n" + _link + "\n\n(ссылка действует ~30 минут)"
+            if _deliver_fmt == "xlsx":
+                _data, _ext, _label = _b24_text_to_xlsx(_deliver_name, answer or _deliver_name), "xlsx", "Excel"
+            elif _deliver_fmt == "docx":
+                _data, _ext, _label = _b24_text_to_docx(_deliver_name, answer or _deliver_name), "docx", "Word"
+            else:
+                _data, _ext, _label = _b24_text_to_pdf(_deliver_name, answer or _deliver_name), "pdf", "PDF"
+            _link = _b24_save_export(_data, _deliver_name, _ext)
+            answer = "📎 Готово, оформил ответ в " + _label + ":\n" + _link + "\n\n(ссылка действует ~30 минут)"
         except Exception:  # noqa: BLE001
-            logging.exception("b24 testbot: PDF deliver failed — sending text instead")
+            logging.exception("b24 testbot: file deliver failed — sending text instead")
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, answer,
                    keyboard=_b24_keyboard())
     if escalation_request is not None:
@@ -23017,7 +23238,7 @@ def _bitrix_imbot_app_event():
         # The bot must SEE screenshots and understand replies to earlier (possibly reset) messages.
         image_texts, reply_text, doc_blocks = [], "", []
         try:
-            image_texts, reply_text, doc_blocks = _b24_message_extras(payload)
+            image_texts, reply_text, doc_blocks = _b24_message_extras(payload, endpoint, access_token)
         except Exception:  # noqa: BLE001
             logging.exception("b24 testbot: image/reply/doc extras failed")
         if not dialog_id or (not message_text and not image_texts and not reply_text and not doc_blocks):
