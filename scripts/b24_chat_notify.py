@@ -43,6 +43,7 @@ def _save_state(state: dict) -> None:
 def _access_token() -> tuple[str, str]:
     """Return (client_endpoint, access_token); refresh + persist if the cached token is stale.
     Returns ('', '') if not bootstrapped (the bot must receive one event first)."""
+    load_dotenv(ENV_PATH)  # ensure client_id/secret are present even if called directly
     state = _load_state()
     tok = state.get("app_tokens") or {}
     endpoint = (tok.get("client_endpoint") or state.get("client_endpoint") or "").strip()
