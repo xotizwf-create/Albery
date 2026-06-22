@@ -21676,6 +21676,89 @@ def _b24_app_call(client_endpoint: str, access_token: str, method: str, payload:
     return data if isinstance(data, dict) else {"result": data}
 
 
+def _b24_capture_tokens(payload: dict[str, Any], state: dict[str, Any]) -> None:
+    """Persist the app OAuth tokens carried in every event's `auth` block, so cron jobs (which have
+    no live event) can later post AS THE BOT via a refresh_token grant. Best-effort; saves state.
+    state['app_tokens'] = {access_token, refresh_token, expires (unix), client_endpoint}."""
+    access_token = _imbot_auth(payload, "access_token")
+    refresh_token = _imbot_auth(payload, "refresh_token")
+    client_endpoint = _imbot_auth(payload, "client_endpoint")
+    if not access_token and not refresh_token:
+        return
+    try:
+        exp = int(_imbot_auth(payload, "expires") or 0)
+    except ValueError:
+        exp = 0
+    if not exp:
+        try:
+            exp = int(time.time()) + int(_imbot_auth(payload, "expires_in") or 3600)
+        except ValueError:
+            exp = int(time.time()) + 3600
+    tok = dict(state.get("app_tokens") or {})
+    if access_token:
+        tok["access_token"], tok["expires"] = access_token, exp
+    if refresh_token:
+        tok["refresh_token"] = refresh_token
+    if client_endpoint:
+        tok["client_endpoint"] = client_endpoint
+    state["app_tokens"] = tok
+    _b24_save_state(state)
+
+
+def _b24_app_access_token() -> tuple[str, str]:
+    """Return (client_endpoint, access_token) usable for app REST calls OUTSIDE a live event.
+    Reuses the cached token while valid, otherwise refreshes via oauth.bitrix.info using the stored
+    refresh_token and persists the rotated pair — so the weekly cron keeps the chain alive forever.
+    Returns ('', '') if not bootstrapped yet (the bot must receive at least one event first)."""
+    state = _b24_load_state()
+    tok = state.get("app_tokens") or {}
+    endpoint = (tok.get("client_endpoint") or state.get("client_endpoint") or "").strip()
+    access_token = (tok.get("access_token") or "").strip()
+    try:
+        expires = int(tok.get("expires") or 0)
+    except (ValueError, TypeError):
+        expires = 0
+    if access_token and expires - 120 > int(time.time()):
+        return endpoint, access_token
+    refresh_token = (tok.get("refresh_token") or "").strip()
+    client_id = os.getenv("B24_TESTBOT_CLIENT_ID", "").strip()
+    client_secret = os.getenv("B24_TESTBOT_CLIENT_SECRET", "").strip()
+    if not (refresh_token and client_id and client_secret):
+        return endpoint, access_token
+    resp = requests.get(
+        "https://oauth.bitrix.info/oauth/token/",
+        params={"grant_type": "refresh_token", "client_id": client_id,
+                "client_secret": client_secret, "refresh_token": refresh_token},
+        timeout=30,
+    )
+    data = resp.json() if resp.content else {}
+    new_access = (data.get("access_token") or "").strip() if isinstance(data, dict) else ""
+    if not new_access:
+        # A sibling process (the other weekly digest) may have just rotated the token; reuse it.
+        fresh = (_b24_load_state().get("app_tokens") or {})
+        try:
+            fresh_exp = int(fresh.get("expires") or 0)
+        except (ValueError, TypeError):
+            fresh_exp = 0
+        if fresh.get("access_token") and fresh_exp - 120 > int(time.time()):
+            return (fresh.get("client_endpoint") or endpoint).strip(), fresh["access_token"].strip()
+        raise RuntimeError(f"b24 token refresh failed: {str(data)[:300]}")
+    state = _b24_load_state()  # re-read to merge a possibly newer event-stored pair
+    tok = dict(state.get("app_tokens") or {})
+    tok["access_token"] = new_access
+    tok["refresh_token"] = (data.get("refresh_token") or refresh_token).strip()
+    try:
+        tok["expires"] = int(data.get("expires") or (int(time.time()) + int(data.get("expires_in") or 3600)))
+    except (ValueError, TypeError):
+        tok["expires"] = int(time.time()) + 3600
+    new_endpoint = (data.get("client_endpoint") or data.get("server_endpoint") or endpoint).strip()
+    if new_endpoint:
+        tok["client_endpoint"] = new_endpoint
+    state["app_tokens"] = tok
+    _b24_save_state(state)
+    return tok.get("client_endpoint") or endpoint, new_access
+
+
 def _b24_app_register_bot(client_endpoint: str, access_token: str) -> Any:
     payload = {
         "CODE": "hermes_agent",
@@ -23058,28 +23141,28 @@ def _albery_tg_notify(text: str, chat_id: str | None = None) -> tuple[bool, str 
         return False, str(exc)[:300]
 
 
-def _albery_bitrix_notify(text: str, dialog_id: str | None = None) -> tuple[bool, str | None]:
-    """Mirror an Albery notification into the Bitrix24 notifications chat ("Albery Уведомления").
-    Posts as the webhook user (id 22) via im.message.add against B24_TESTBOT_WEBHOOK_BASE — robust
-    (no app-token expiry, works for both event-driven reports and cron digests). The bot's own
-    imbot.message.add needs a Client ID the webhook lacks, so we deliberately post as the service
-    user. Default chat = chat728 (override via ALBERY_BITRIX_NOTIFY_CHAT). Returns (ok, error)."""
-    base = os.getenv("B24_TESTBOT_WEBHOOK_BASE", "").strip().rstrip("/")
+def _albery_bitrix_notify(text: str, dialog_id: str | None = None, *,
+                          client_endpoint: str = "", access_token: str = "",
+                          bot_id: Any = None) -> tuple[bool, str | None]:
+    """Post a notification AS THE BOT into the Bitrix24 notifications chat ("Albery Уведомления")
+    via imbot.message.add. During a live event the caller passes the event's fresh token; otherwise
+    (a cron) we obtain one via _b24_app_access_token() (refresh_token grant — never expires while the
+    weekly job keeps rotating it). The bot must be a member of the chat. Default chat = chat728
+    (override via ALBERY_BITRIX_NOTIFY_CHAT). Returns (ok, error)."""
     dialog_id = (dialog_id or os.getenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat728")).strip()
-    if not base or not dialog_id:
-        return False, "bitrix webhook/chat not configured"
+    if not bot_id:
+        bot_id = _b24_load_state().get("bot_id")
+    if not (client_endpoint and access_token):
+        try:
+            client_endpoint, access_token = _b24_app_access_token()
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)[:300]
+    if not (client_endpoint and access_token and bot_id and dialog_id):
+        return False, "bitrix bot token/chat not bootstrapped yet"
     try:
-        resp = requests.post(
-            f"{base}/im.message.add.json",
-            data={"DIALOG_ID": dialog_id, "MESSAGE": text},
-            timeout=20,
-        )
-        data = resp.json() if resp.content else {}
-        if isinstance(data, dict) and data.get("error"):
-            return False, str(data.get("error_description") or data.get("error"))[:300]
-        if isinstance(data, dict) and data.get("result"):
-            return True, None
-        return False, str(data)[:300]
+        _b24_app_call(client_endpoint, access_token, "imbot.message.add",
+                      {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text})
+        return True, None
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)[:300]
 
@@ -23144,8 +23227,10 @@ def _b24_handle_error_report(client_endpoint: str, access_token: str, bot_id: An
     tg_text = f"⚠️ {name} отправил отчёт об ошибке, текст: {report_text}. Я уже иду разбираться дальше."
     ok, err = _albery_tg_notify(tg_text)
     _b24_log_error_report(dialog_id, from_user_id, name, report_text, ok, err)
-    # Mirror to the Bitrix24 notifications chat (best-effort; never blocks the TG delivery path).
-    b24_ok, b24_err = _albery_bitrix_notify(tg_text)
+    # Mirror to the Bitrix24 notifications chat AS THE BOT (best-effort; never blocks the TG path).
+    # We are inside a live event, so pass its fresh token — no refresh needed here.
+    b24_ok, b24_err = _albery_bitrix_notify(
+        tg_text, client_endpoint=client_endpoint, access_token=access_token, bot_id=bot_id)
     if not b24_ok:
         logging.warning("b24 testbot: error report Bitrix mirror failed: %s", b24_err)
     if message_id:
@@ -23169,6 +23254,8 @@ def _bitrix_imbot_app_event():
     access_token = _imbot_auth(payload, "access_token")
     client_endpoint = _imbot_auth(payload, "client_endpoint")
     state = _b24_load_state()
+    # Persist the app OAuth tokens from this event so cron digests can post as the bot later.
+    _b24_capture_tokens(payload, state)
 
     if event_name in ("ONAPPINSTALL", "ONAPPUPDATE"):
         try:
