@@ -4546,7 +4546,167 @@ def tool_update_ai_capabilities(args: dict[str, Any]) -> dict[str, Any]:
     return {"tier": tier, "mode": mode, "ok": True, "content": new_content}
 
 
+def _b24_webhook_call(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Call the bot-portal (b24-0xrp3s) incoming webhook — that is the portal the company is moving
+    to and where the absence chart («График отсутствий») + calendar scope live. Returns the parsed
+    Bitrix response dict; raises McpError on transport/API error."""
+    base = (shared_load_env_value("B24_TESTBOT_WEBHOOK_BASE") or "").strip().rstrip("/")
+    if not base:
+        raise McpError(-32011, "B24_TESTBOT_WEBHOOK_BASE (bot-portal webhook) is not configured.")
+    import urllib.parse
+    qs = urllib.parse.urlencode(params or {}, doseq=True)
+    url = f"{base}/{method}.json" + (f"?{qs}" if qs else "")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise McpError(-32011, f"{method}: HTTP {exc.code} {detail}")
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32011, f"{method}: {str(exc)[:200]}")
+    if isinstance(data, dict) and data.get("error"):
+        raise McpError(-32011, f"{method}: {data.get('error')} {data.get('error_description') or ''}".strip())
+    return data if isinstance(data, dict) else {"result": data}
+
+
+def _b24_active_users() -> list[dict[str, Any]]:
+    """Active users on the bot portal (b24-0xrp3s), cached 1h. Each: id, full_name, position."""
+    cached = ttl_cache_get(("b24_active_users",))
+    if cached is not None:
+        return cached
+    users: list[dict[str, Any]] = []
+    start = 0
+    for _ in range(20):
+        data = _b24_webhook_call("user.get", {"ACTIVE": "true", "start": start})
+        rows = data.get("result") or []
+        if not isinstance(rows, list) or not rows:
+            break
+        for u in rows:
+            users.append({
+                "id": u.get("ID"),
+                "full_name": " ".join(x for x in (u.get("NAME"), u.get("LAST_NAME")) if x).strip(),
+                "position": u.get("WORK_POSITION") or "",
+            })
+        nxt = data.get("next")
+        if nxt in (None, "", start):
+            break
+        start = nxt
+    ttl_cache_set(("b24_active_users",), users, 3600)
+    return users
+
+
+def _b24_absence_periods(user_ids: list[Any], date_from: str, date_to: str) -> dict[str, list[dict[str, Any]]]:
+    """{user_id: [absence periods]} from calendar.accessibility.get. Keeps only entries the absence
+    chart marks as 'absent' (vacation/sick/trip); regular busy meetings ('busy') are ignored."""
+    if not user_ids:
+        return {}
+    params = {"from": date_from, "to": date_to, "users[]": [str(u) for u in user_ids]}
+    data = _b24_webhook_call("calendar.accessibility.get", params)
+    result = data.get("result") or {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(result, dict):
+        for uid, entries in result.items():
+            periods = []
+            for e in (entries or []):
+                if not isinstance(e, dict):
+                    continue
+                acc = str(e.get("ACCESSIBILITY") or e.get("accessibility") or "").lower()
+                name = str(e.get("NAME") or e.get("name") or "")
+                is_absence = acc == "absent" or "отпуск" in name.lower() or "vacation" in name.lower()
+                if not is_absence:
+                    continue
+                periods.append({
+                    "from": e.get("DATE_FROM") or e.get("dateFrom"),
+                    "to": e.get("DATE_TO") or e.get("dateTo"),
+                    "name": name or "Отсутствие",
+                    "accessibility": acc,
+                })
+            out[str(uid)] = periods
+    return out
+
+
+def tool_get_employee_absences(args: dict[str, Any]) -> dict[str, Any]:
+    """Whether employees are on vacation/absent per the Bitrix «График отсутствий» (bot portal
+    b24-0xrp3s). Resolves by bitrix_user_id or employee_name; with neither, returns everyone who is
+    absent in the period. Use date_from=date_to to check a specific date (e.g. a task deadline)."""
+    df = parse_date_arg(args, "date_from", required=False)
+    dt = parse_date_arg(args, "date_to", required=False)
+    today = date.today()
+    date_from = (df or today).isoformat()
+    date_to = (dt or df or today).isoformat()
+
+    bitrix_user_id = args.get("bitrix_user_id")
+    employee_name = str(args.get("employee_name") or "").strip()
+    actives = _b24_active_users()
+
+    if bitrix_user_id not in (None, ""):
+        try:
+            uid = int(bitrix_user_id)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "bitrix_user_id must be an integer.") from exc
+        match = next((u for u in actives if str(u["id"]) == str(uid)), None)
+        targets = [match or {"id": uid, "full_name": "", "position": ""}]
+    elif employee_name:
+        matches = [u for u in actives if _person_names_match(u["full_name"], employee_name)]
+        if not matches:
+            return {"query": {"employee_name": employee_name}, "matched": 0,
+                    "note": "Сотрудник не найден среди активных на портале b24-0xrp3s.",
+                    "candidates": [u["full_name"] for u in actives if u["full_name"]][:50]}
+        if len(matches) > 1:
+            return {"query": {"employee_name": employee_name}, "matched": len(matches), "ambiguous": True,
+                    "candidates": [{"bitrix_user_id": u["id"], "full_name": u["full_name"]} for u in matches]}
+        targets = matches
+    else:
+        targets = [u for u in actives if u["full_name"]]
+
+    ids = [u["id"] for u in targets if u.get("id") not in (None, "")]
+    absences = _b24_absence_periods(ids, date_from, date_to)
+    results = []
+    for u in targets:
+        periods = absences.get(str(u["id"]), [])
+        results.append({
+            "bitrix_user_id": u["id"],
+            "full_name": u["full_name"],
+            "position": u.get("position") or "",
+            "on_vacation": bool(periods),
+            "absences": periods,
+        })
+    scanning_all = bitrix_user_id in (None, "") and not employee_name
+    if scanning_all:
+        results = [r for r in results if r["on_vacation"]]
+    return {
+        "portal": "b24-0xrp3s",
+        "date_from": date_from,
+        "date_to": date_to,
+        "count": len(results),
+        "employees": results,
+        "note": ("Источник — Bitrix «График отсутствий» (calendar.accessibility.get, accessibility='absent'). "
+                 "Пустой список при проверке конкретного сотрудника = он НЕ в отпуске в этот период."),
+    }
+
+
 TOOLS: dict[str, dict[str, Any]] = {
+    "get_employee_absences": {
+        "description": (
+            "Узнать, в отпуске ли / отсутствует ли сотрудник (Bitrix «График отсутствий», портал b24-0xrp3s). "
+            "Передай bitrix_user_id ИЛИ employee_name (нечёткий поиск среди активных; при неоднозначности "
+            "возвращается список кандидатов). Без обоих — вернёт всех, кто отсутствует в период (по умолчанию "
+            "сегодня). Для проверки на конкретную дату задай date_from=date_to (например дедлайн задачи). "
+            "Возвращает on_vacation и периоды отсутствия. ПРАВИЛО постановки задач: если исполнитель on_vacation "
+            "на дедлайн — задачу не ставить, сообщить владельцу. Только полный доступ (не для FAQ)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "employee_name": {"type": "string", "description": "ФИО или его отличительная часть. Игнорируется, если задан bitrix_user_id."},
+                "bitrix_user_id": {"type": "integer", "description": "Точный id сотрудника на портале b24-0xrp3s (приоритетнее имени)."},
+                "date_from": {"type": "string", "description": "Начало периода YYYY-MM-DD (по умолчанию сегодня)."},
+                "date_to": {"type": "string", "description": "Конец периода YYYY-MM-DD (по умолчанию = date_from)."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_get_employee_absences,
+    },
     "start_here_always_read_ai_instructions": {
         "description": "MANDATORY FIRST TOOL. Always call this before any company analysis, report, recommendation, or answer. It reads live rules from Настройки -> Инструкции для ИИ and tells the assistant exactly how to work.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
