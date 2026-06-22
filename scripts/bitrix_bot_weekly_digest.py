@@ -13,6 +13,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 
 import psycopg
+import requests
 
 ENV_PATH = "/var/www/albery/.env"
 TARGET = os.getenv("B24_DIGEST_TARGET", "telegram:Александр Никитенко")
@@ -24,6 +25,38 @@ def db_url() -> str:
             raw = line.split("=", 1)[1].strip()
             return re.sub(r"^postgresql\+psycopg2?://", "postgresql://", raw)
     raise SystemExit("DATABASE_URL not found in .env")
+
+
+def _env_value(key: str) -> str:
+    """Read a single key from .env (cron runs without the service environment loaded)."""
+    val = os.getenv(key, "").strip()
+    if val:
+        return val
+    try:
+        for line in open(ENV_PATH, encoding="utf-8"):
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def bitrix_send(text: str) -> None:
+    """Mirror the digest into the Bitrix24 notifications chat ("Albery Уведомления") via
+    im.message.add as the webhook user (id 22). Best-effort, never raises."""
+    base = _env_value("B24_TESTBOT_WEBHOOK_BASE").rstrip("/")
+    chat = _env_value("ALBERY_BITRIX_NOTIFY_CHAT") or "chat728"
+    if not base:
+        return
+    for i in range(0, len(text), 3900):
+        try:
+            requests.post(
+                f"{base}/im.message.add.json",
+                data={"DIALOG_ID": chat, "MESSAGE": text[i:i + 3900]},
+                timeout=25,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def build_digest() -> str:
@@ -71,6 +104,7 @@ def main() -> None:
         ["hermes", "send", "--to", TARGET, body],
         cwd="/root", env={**os.environ, "HOME": "/root"}, check=False,
     )
+    bitrix_send(body)
 
 
 if __name__ == "__main__":

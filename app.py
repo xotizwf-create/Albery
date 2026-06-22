@@ -23058,6 +23058,32 @@ def _albery_tg_notify(text: str, chat_id: str | None = None) -> tuple[bool, str 
         return False, str(exc)[:300]
 
 
+def _albery_bitrix_notify(text: str, dialog_id: str | None = None) -> tuple[bool, str | None]:
+    """Mirror an Albery notification into the Bitrix24 notifications chat ("Albery Уведомления").
+    Posts as the webhook user (id 22) via im.message.add against B24_TESTBOT_WEBHOOK_BASE — robust
+    (no app-token expiry, works for both event-driven reports and cron digests). The bot's own
+    imbot.message.add needs a Client ID the webhook lacks, so we deliberately post as the service
+    user. Default chat = chat728 (override via ALBERY_BITRIX_NOTIFY_CHAT). Returns (ok, error)."""
+    base = os.getenv("B24_TESTBOT_WEBHOOK_BASE", "").strip().rstrip("/")
+    dialog_id = (dialog_id or os.getenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat728")).strip()
+    if not base or not dialog_id:
+        return False, "bitrix webhook/chat not configured"
+    try:
+        resp = requests.post(
+            f"{base}/im.message.add.json",
+            data={"DIALOG_ID": dialog_id, "MESSAGE": text},
+            timeout=20,
+        )
+        data = resp.json() if resp.content else {}
+        if isinstance(data, dict) and data.get("error"):
+            return False, str(data.get("error_description") or data.get("error"))[:300]
+        if isinstance(data, dict) and data.get("result"):
+            return True, None
+        return False, str(data)[:300]
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)[:300]
+
+
 def _b24_user_name(client_endpoint: str, access_token: str, user_id: Any) -> str:
     """Best-effort '<First Last>' for a Bitrix user id (empty string if unavailable)."""
     uid = to_int(user_id)
@@ -23118,6 +23144,10 @@ def _b24_handle_error_report(client_endpoint: str, access_token: str, bot_id: An
     tg_text = f"⚠️ {name} отправил отчёт об ошибке, текст: {report_text}. Я уже иду разбираться дальше."
     ok, err = _albery_tg_notify(tg_text)
     _b24_log_error_report(dialog_id, from_user_id, name, report_text, ok, err)
+    # Mirror to the Bitrix24 notifications chat (best-effort; never blocks the TG delivery path).
+    b24_ok, b24_err = _albery_bitrix_notify(tg_text)
+    if not b24_ok:
+        logging.warning("b24 testbot: error report Bitrix mirror failed: %s", b24_err)
     if message_id:
         _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
         _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)

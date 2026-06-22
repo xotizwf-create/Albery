@@ -73,6 +73,31 @@ def tg_send(text: str, chat_id: str) -> tuple[bool, str | None]:
     return ok_all, err
 
 
+def bitrix_send(text: str) -> tuple[bool, str | None]:
+    """Mirror the digest into the Bitrix24 notifications chat ("Albery Уведомления") via
+    im.message.add as the webhook user (id 22). Best-effort; reuses the bot-portal webhook
+    (B24_TESTBOT_WEBHOOK_BASE) + ALBERY_BITRIX_NOTIFY_CHAT (default chat728). Env is already loaded
+    by db_dsn()'s load_dotenv. Returns (ok, error)."""
+    base = os.getenv("B24_TESTBOT_WEBHOOK_BASE", "").strip().rstrip("/")
+    chat = os.getenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat728").strip()
+    if not base or not chat:
+        return False, "bitrix webhook/chat not configured"
+    ok_all, err = True, None
+    for i in range(0, len(text), 3900):
+        try:
+            resp = requests.post(
+                f"{base}/im.message.add.json",
+                data={"DIALOG_ID": chat, "MESSAGE": text[i:i + 3900]},
+                timeout=25,
+            )
+            data = resp.json() if resp.content else {}
+            if isinstance(data, dict) and data.get("error"):
+                ok_all, err = False, str(data.get("error_description") or data.get("error"))[:300]
+        except Exception as exc:  # noqa: BLE001
+            ok_all, err = False, str(exc)[:300]
+    return ok_all, err
+
+
 def load_watermark() -> int:
     try:
         return int(json.loads(STATE_PATH.read_text(encoding="utf-8")).get("last_report_id", 0))
@@ -180,7 +205,9 @@ def main(argv=None) -> int:
     ok, err = tg_send(text, chat)
     if ok and rows:
         save_watermark(max_id)
-    print(f"sent={ok} err={err} reports={len(rows)} watermark->{max_id if ok else watermark}")
+    b24_ok, b24_err = bitrix_send(text)
+    print(f"sent={ok} err={err} bitrix={b24_ok} bitrix_err={b24_err} "
+          f"reports={len(rows)} watermark->{max_id if ok else watermark}")
     return 0 if ok else 1
 
 
