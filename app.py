@@ -5142,7 +5142,12 @@ def format_zoom_dispatch_summary(call: dict[str, Any]) -> str:
 
 
 def zoom_call_participants(call: dict[str, Any]) -> list[dict[str, Any]]:
-    """Actual call participants from the saved report (people.actual_participants)."""
+    """Actual call participants from saved AI reports.
+
+    New reports store people.actual_participants. Older reports only store
+    analysis.leaders_present; dispatch still must identify the call lead from
+    that field instead of treating the report as having no participants.
+    """
     analysis = _zoom_ai_analysis(call)
     people = analysis.get("people") if isinstance(analysis.get("people"), dict) else {}
     raw = people.get("actual_participants") if isinstance(people.get("actual_participants"), list) else []
@@ -5159,6 +5164,21 @@ def zoom_call_participants(call: dict[str, Any]) -> list[dict[str, Any]]:
             "org_match": str(person.get("org_match") or "").strip().lower(),
             "is_leader": bool(person.get("is_leader")),
             "role_on_call": str(person.get("role_on_call") or "").strip().lower(),
+        })
+    if result:
+        return result
+
+    leaders_present = analysis.get("leaders_present") if isinstance(analysis.get("leaders_present"), list) else []
+    for index, leader in enumerate(leaders_present):
+        name = str(leader.get("person_name") if isinstance(leader, dict) else leader or "").strip()
+        if not name:
+            continue
+        result.append({
+            "name": name,
+            "bitrix_user_id": to_int(leader.get("bitrix_user_id")) if isinstance(leader, dict) else None,
+            "org_match": str(leader.get("org_match") or "").strip().lower() if isinstance(leader, dict) else "",
+            "is_leader": True,
+            "role_on_call": "host" if index == 0 else "leader",
         })
     return result
 
@@ -5262,22 +5282,23 @@ def zoom_dispatch_title(call: dict[str, Any]) -> str:
 
 
 def format_zoom_lead_task_list(tasks: list[dict[str, Any]]) -> str:
-    """Task list for the lead card: assignee + task + deadline + criterion + artifact."""
-    lines: list[str] = []
+    """Task list for the lead card — each task is a separate multi-line block so nothing blends."""
+    blocks: list[str] = []
     for index, task in enumerate(tasks, start=1):
         assignee = str(task.get("assignee_name") or "Требует назначения").strip()
-        task_text = sentence_case_ru(task.get("task_text"))
+        task_text = sentence_case_ru(task.get("task_text")).strip().rstrip(".")
         result_criteria = str(task.get("result_criteria") or "").strip().rstrip(".")
         expected_artifact = str(task.get("expected_artifact") or "").strip().rstrip(".")
-        deadline_text = str(task.get("deadline_text") or "срок не указан").strip().rstrip(".")
-        line = f"{index}. {assignee}: {task_text}."
-        line += f" Срок: {deadline_text}."
+        deadline_text = (str(task.get("deadline_text") or "").strip().rstrip(".")) or "срок не указан"
+        rows = [f"{index}. {assignee}"]
+        rows.append(f"   • Задача: {task_text}.")
+        rows.append(f"   • Срок: {deadline_text}.")
         if result_criteria:
-            line += f" Критерий: {result_criteria}."
+            rows.append(f"   • Критерий: {result_criteria}.")
         if expected_artifact:
-            line += f" Подтверждение: {expected_artifact}."
-        lines.append(line)
-    return "\n".join(lines).strip()
+            rows.append(f"   • Подтверждение: {expected_artifact}.")
+        blocks.append("\n".join(rows))
+    return "\n\n".join(blocks).strip()
 
 
 def build_zoom_lead_card_description(
@@ -5285,20 +5306,22 @@ def build_zoom_lead_card_description(
     leader_message: str,
     tasks: list[dict[str, Any]],
 ) -> str:
-    """Lead card: call summary, the lead's leader evaluation, then ALL tasks to assign."""
+    """Lead card with clear sections and separators: summary, leader evaluation, tasks to assign."""
+    sep = "\n\n──────────────────────────────\n\n"
     parts: list[str] = []
     if dispatch_summary.strip():
-        parts.append(dispatch_summary.strip())
+        parts.append("📋 Сводка созвона\n\n" + dispatch_summary.strip())
     if leader_message.strip():
-        parts.append(f"Оценка Вас как руководителя: {leader_message.strip()}")
+        parts.append("🧭 Оценка вас как руководителя\n\n" + leader_message.strip())
     task_text = format_zoom_lead_task_list(tasks)
     if task_text:
         parts.append(
-            "Задачи для постановки сотрудникам (поставьте задачи подчинённым в Битрикс; "
-            "в конце дня отметьте в комментарии, что поставили, а что нет, и подтвердите артефактом):\n\n"
+            "✅ Задачи для постановки сотрудникам\n"
+            "Поставьте задачи подчинённым в Битрикс; в конце дня отметьте в комментарии, "
+            "что поставили, а что нет, и подтвердите артефактом.\n\n"
             + task_text
         )
-    return "\n\n".join(parts).strip()
+    return sep.join(parts).strip()
 
 
 def build_zoom_operational_task_cards(
