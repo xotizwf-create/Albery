@@ -21367,14 +21367,12 @@ def bitrix_team_event_webhook(secret: str):
     payload = flatten_request_payload()
     event_name = normalize_bitrix_event_name(first_non_empty(payload.get("event"), payload.get("EVENT")))
     supported_events = {
-        "OnAfterUserAdd",
-        "OnAfterUserUpdate",
-        "OnAfterUserDelete",
-        "OnAfterDepartmentAdd",
-        "OnAfterDepartmentUpdate",
-        "OnAfterDepartmentDelete",
+        "onuseradd", "onuserupdate", "onuserdelete",
+        "onafteruseradd", "onafteruserupdate", "onafteruserdelete",
+        "ondepartmentadd", "ondepartmentupdate", "ondepartmentdelete",
+        "onafterdepartmentadd", "onafterdepartmentupdate", "onafterdepartmentdelete",
     }
-    if event_name and event_name not in supported_events:
+    if event_name and event_name.lower() not in supported_events:
         return jsonify({"ok": True, "event": event_name, "ignored": True, "reason": "unsupported_event"}), 200
 
     webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
