@@ -2603,6 +2603,8 @@ def normalize_zoom_operational_tasks_for_raw_json(report_text: str, analysis: di
             ).rstrip("."),
             "status": _first_text_value(item.get("status"), "planned"),
             "source": _first_text_value(item.get("source"), item.get("timecode"), ", ".join(evidence_times)).rstrip("."),
+            "expected_artifact": _first_text_value(item.get("expected_artifact"), "").rstrip("."),
+            "responsibility_check": item.get("responsibility_check") if isinstance(item.get("responsibility_check"), dict) else None,
             "raw": item,
         })
     section = _extract_zoom_operational_tasks_section(report_text)
@@ -2611,9 +2613,9 @@ def normalize_zoom_operational_tasks_for_raw_json(report_text: str, analysis: di
         parsed = _parse_zoom_operational_task_line(raw, len(section_tasks) + 1)
         if parsed:
             section_tasks.append(parsed)
-    if section_tasks and len(section_tasks) > len(tasks):
-        return section_tasks
-    return tasks or section_tasks
+    if tasks:
+        return tasks
+    return section_tasks
 
 
 def tool_save_zoom_call_report(args: dict[str, Any]) -> dict[str, Any]:
@@ -5230,7 +5232,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "zoom_uuid": {"type": "string", "description": "Zoom UUID, alternative to call_id."},
                 "summary": {"type": "string"},
                 "report_text": {"type": "string", "description": "Human-readable Zoom report to store in zoom_calls.analytical_note."},
-                "analysis": {"type": "object", "description": "Structured Zoom report JSON from the zoom_processing prompt."},
+                "analysis": {"type": "object", "description": "ОБЯЗАТЕЛЬНО передай ВЕСЬ JSON-объект из контракта zoom_processing ЦЕЛИКОМ и без сокращений: dispatch_summary, leader_evaluations, people, и operational_tasks где у каждой задачи assignee_name, bitrix_user_id, deadline_text, result_criteria, expected_artifact, responsibility_check, status, source. НЕ передавай урезанный/сводный analysis (например {leaders_present, operational_tasks_count}) — иначе рассылка теряет сводку, оценку руководителя и артефакты."},
                 "model": {"type": "string"},
                 "status": {"type": "string", "enum": ["done", "error"]},
                 "raw_input": {"type": "object", "description": "Source manifest: transcript ids/segments, prompt id, checked context."},
