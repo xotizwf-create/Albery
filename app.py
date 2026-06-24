@@ -4823,8 +4823,16 @@ def split_zoom_operational_task_items(section: str) -> list[str]:
     return lines
 
 
+ZOOM_ARTIFACT_LABELS = {
+    "screenshot": "скриншот", "link": "ссылка", "file": "файл",
+    "comment": "комментарий", "photo": "фото",
+    "скриншот": "скриншот", "ссылка": "ссылка", "файл": "файл",
+    "комментарий": "комментарий", "фото": "фото",
+}
+
+
 def extract_zoom_labeled_parts(text: str) -> tuple[str, dict[str, str]]:
-    label_pattern = re.compile(r"(Срок|Критерий(?:\s+результата)?|Статус|Источник)\s*:", re.IGNORECASE)
+    label_pattern = re.compile(r"(Срок|Критерий(?:\s+результата)?|Подтверждение|Статус|Источник)\s*:", re.IGNORECASE)
     matches = list(label_pattern.finditer(text))
     if not matches:
         return text.strip().strip(". "), {}
@@ -4863,6 +4871,7 @@ def parse_zoom_operational_task_line(line: str, fallback_number: int) -> dict[st
     body = re.sub(r"^Задача:\s*", "", body, flags=re.IGNORECASE).strip()
     task_text, labels = extract_zoom_labeled_parts(body)
     result_criteria = first_text_value(labels.get("критерий_результата"), labels.get("критерий"))
+    expected_artifact = first_text_value(labels.get("подтверждение"), "")
     deadline_text = first_text_value(labels.get("срок"), "срок не указан")
     status = first_text_value(labels.get("статус"), "planned")
     source = first_text_value(labels.get("источник"), "")
@@ -4875,6 +4884,7 @@ def parse_zoom_operational_task_line(line: str, fallback_number: int) -> dict[st
         "task_text": sentence_case_ru(task_text),
         "deadline_text": deadline_text.strip().rstrip(".") or "срок не указан",
         "result_criteria": result_criteria.strip().rstrip("."),
+        "expected_artifact": expected_artifact.strip().rstrip("."),
         "status": status.strip().rstrip(".") or "planned",
         "source": source.strip().rstrip("."),
         "raw": {"source_line": text},
@@ -4912,6 +4922,8 @@ def normalize_zoom_operational_tasks(
             item.get("criteria"),
             item.get("criterion"),
         )
+        expected_artifact = first_text_value(item.get("expected_artifact"), "")
+        expected_artifact = ZOOM_ARTIFACT_LABELS.get(expected_artifact.strip().lower(), expected_artifact.strip())
         deadline_text = first_text_value(item.get("deadline_text"), item.get("deadline"), "срок не указан")
         assignee_name = first_text_value(
             item.get("assignee_name"),
@@ -4932,6 +4944,7 @@ def normalize_zoom_operational_tasks(
             "task_text": sentence_case_ru(task_text),
             "deadline_text": deadline_text.strip().rstrip(".") or "срок не указан",
             "result_criteria": result_criteria.strip().rstrip("."),
+            "expected_artifact": expected_artifact,
             "status": first_text_value(item.get("status"), "planned"),
             "source": first_text_value(item.get("source"), item.get("timecode"), ", ".join(evidence_times)),
             "raw": item.get("raw") if isinstance(item.get("raw"), dict) else item,
@@ -4952,11 +4965,14 @@ def format_zoom_operational_tasks_for_bitrix(tasks: list[dict[str, Any]]) -> str
     for index, task in enumerate(tasks, start=1):
         task_text = sentence_case_ru(task.get("task_text"))
         result_criteria = str(task.get("result_criteria") or "").strip().rstrip(".")
+        expected_artifact = str(task.get("expected_artifact") or "").strip().rstrip(".")
         deadline_text = str(task.get("deadline_text") or "срок не указан").strip().rstrip(".")
         line = f"{index}. {task_text}."
         line += f" Срок: {deadline_text}."
         if result_criteria:
             line += f" Критерий: {result_criteria}."
+        if expected_artifact:
+            line += f" Подтверждение: {expected_artifact}."
         lines.append(line)
     return "\n".join(lines).strip()
 
@@ -5245,6 +5261,46 @@ def zoom_dispatch_title(call: dict[str, Any]) -> str:
     return f"Итоги созвона {suffix or 'созвон'}".strip()
 
 
+def format_zoom_lead_task_list(tasks: list[dict[str, Any]]) -> str:
+    """Task list for the lead card: assignee + task + deadline + criterion + artifact."""
+    lines: list[str] = []
+    for index, task in enumerate(tasks, start=1):
+        assignee = str(task.get("assignee_name") or "Требует назначения").strip()
+        task_text = sentence_case_ru(task.get("task_text"))
+        result_criteria = str(task.get("result_criteria") or "").strip().rstrip(".")
+        expected_artifact = str(task.get("expected_artifact") or "").strip().rstrip(".")
+        deadline_text = str(task.get("deadline_text") or "срок не указан").strip().rstrip(".")
+        line = f"{index}. {assignee}: {task_text}."
+        line += f" Срок: {deadline_text}."
+        if result_criteria:
+            line += f" Критерий: {result_criteria}."
+        if expected_artifact:
+            line += f" Подтверждение: {expected_artifact}."
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def build_zoom_lead_card_description(
+    dispatch_summary: str,
+    leader_message: str,
+    tasks: list[dict[str, Any]],
+) -> str:
+    """Lead card: call summary, the lead's leader evaluation, then ALL tasks to assign."""
+    parts: list[str] = []
+    if dispatch_summary.strip():
+        parts.append(dispatch_summary.strip())
+    if leader_message.strip():
+        parts.append(f"Оценка Вас как руководителя: {leader_message.strip()}")
+    task_text = format_zoom_lead_task_list(tasks)
+    if task_text:
+        parts.append(
+            "Задачи для постановки сотрудникам (поставьте задачи подчинённым в Битрикс; "
+            "в конце дня отметьте в комментарии, что поставили, а что нет, и подтвердите артефактом):\n\n"
+            + task_text
+        )
+    return "\n\n".join(parts).strip()
+
+
 def build_zoom_operational_task_cards(
     tasks: list[dict[str, Any]],
     participants: list[dict[str, Any]],
@@ -5255,78 +5311,65 @@ def build_zoom_operational_task_cards(
     deadline: str | None,
     deadline_text: str,
 ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
-    """One card per call participant (plus any task assignee), enriched with the
-    summary, leader evaluation and that person's tasks.
-
-    Returns (cards, unmatched_assignees, unmatched_participants). Unmatched people
-    are surfaced for owner confirmation instead of being silently dropped.
-    """
+    """Single aggregated card to the call HOST (lead). Per owner 2026-06-24: the summary,
+    the lead's leader evaluation and ALL operational tasks (assignee/deadline/criterion/
+    artifact) go to the meeting lead only; the lead then assigns tasks to subordinates."""
     name_aliases = load_employee_name_aliases()
-    cards_by_key: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
     unmatched_assignees: list[str] = []
     unmatched_participants: list[str] = []
 
-    def ensure_card(name: Any, bitrix_user_id: int | None, *, is_participant: bool) -> dict[str, Any] | None:
-        clean_name = str(name or "").strip()
-        recipient = resolve_zoom_recipient(clean_name, bitrix_user_id, team, name_aliases)
-        if recipient is None:
-            bucket = unmatched_participants if is_participant else unmatched_assignees
-            if clean_name and clean_name != "Требует назначения" and clean_name not in bucket:
-                bucket.append(clean_name)
-            return None
-        key = f"user:{recipient['user_id']}"
-        card = cards_by_key.get(key)
-        if card is None:
-            card = {
-                "recipient": recipient,
-                "assignee_name": recipient["name"],
-                "title": title,
-                "description": "",
-                "deadline": deadline,
-                "deadline_text": deadline_text,
-                "tasks": [],
-                "is_leader": False,
-                "leader_verdict": None,
-                "leader_message": "",
-                "has_tasks": False,
-            }
-            cards_by_key[key] = card
-            order.append(key)
-        return card
-
-    # 1) Seed a card for every actual participant, so everyone present gets the summary.
-    for person in participants:
-        ensure_card(person.get("name"), to_int(person.get("bitrix_user_id")), is_participant=True)
-
-    # 2) Attach operational tasks. Per the v9 contract the assignee is a participant
-    #    (tasks for absentees are reassigned upstream with delegate_to); still, if a
-    #    task assignee was not seeded, add them so no task is lost.
     for task in tasks:
-        card = ensure_card(task.get("assignee_name"), to_int(task.get("bitrix_user_id")), is_participant=False)
-        if card is not None:
-            card["tasks"].append(task)
+        nm = str(task.get("assignee_name") or "").strip()
+        if nm and nm != "Требует назначения" and nm not in unmatched_assignees:
+            if resolve_zoom_recipient(nm, to_int(task.get("bitrix_user_id")), team, name_aliases) is None:
+                unmatched_assignees.append(nm)
 
-    # 3) Attach leader evaluations to their recipients.
-    for key in order:
-        card = cards_by_key[key]
-        recipient = card["recipient"]
-        ev = find_zoom_leader_evaluation(
-            str(recipient.get("name") or ""), to_int(recipient.get("user_id")), leader_evals, name_aliases
-        )
-        if ev is not None:
-            card["is_leader"] = True
-            card["leader_verdict"] = str(ev.get("verdict") or "").strip().lower() or None
-            # message_for_leader is the personal note; fall back to result_for_owner
-            # if the model only produced the owner-facing line.
-            card["leader_message"] = str(ev.get("message_for_leader") or ev.get("result_for_owner") or "").strip()
+    host = None
+    for person in participants:
+        if str(person.get("role_on_call") or "").strip().lower() == "host":
+            host = person
+            break
+    if host is None:
+        for person in participants:
+            if person.get("is_leader"):
+                host = person
+                break
+    if host is None:
+        return [], unmatched_assignees, unmatched_participants
 
-    # 4) Render descriptions.
-    cards = [cards_by_key[key] for key in order]
-    for card in cards:
-        card["has_tasks"] = bool(card["tasks"])
-        card["description"] = build_zoom_card_description(dispatch_summary, card["leader_message"], card["tasks"])
-    return cards, unmatched_assignees, unmatched_participants
+    recipient = resolve_zoom_recipient(
+        str(host.get("name") or ""), to_int(host.get("bitrix_user_id")), team, name_aliases
+    )
+    if recipient is None:
+        nm = str(host.get("name") or "").strip()
+        if nm and nm not in unmatched_participants:
+            unmatched_participants.append(nm)
+        return [], unmatched_assignees, unmatched_participants
+
+    ev = find_zoom_leader_evaluation(
+        str(recipient.get("name") or ""), to_int(recipient.get("user_id")), leader_evals, name_aliases
+    )
+    leader_message = ""
+    leader_verdict = None
+    if ev is not None:
+        leader_message = str(ev.get("message_for_leader") or ev.get("result_for_owner") or "").strip()
+        leader_verdict = str(ev.get("verdict") or "").strip().lower() or None
+
+    card = {
+        "recipient": recipient,
+        "assignee_name": recipient["name"],
+        "title": title,
+        "description": build_zoom_lead_card_description(dispatch_summary, leader_message, tasks),
+        "deadline": deadline,
+        "deadline_text": deadline_text,
+        "tasks": tasks,
+        "is_leader": True,
+        "leader_verdict": leader_verdict,
+        "leader_message": leader_message,
+        "has_tasks": bool(tasks),
+        "is_lead_card": True,
+    }
+    return [card], unmatched_assignees, unmatched_participants
 
 
 def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = False) -> dict[str, Any]:
