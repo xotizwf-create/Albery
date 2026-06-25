@@ -1555,11 +1555,43 @@ def _bitrix_call_with_fallback(method: str, payload: dict[str, Any]) -> dict[str
         raise McpError(-32010, f"Bitrix API call failed: {exc}") from exc
 
 
+def _deadline_in_past(deadline: str) -> "datetime | None":
+    """Return the parsed deadline (MSK-aware) if it is at/before 'now' in Europe/Moscow, else None.
+    Deterministic backstop so an already-overdue task is never created without explicit confirmation."""
+    s = str(deadline or "").strip()
+    dt = None
+    for cand in (s, s + ":00"):
+        try:
+            dt = datetime.fromisoformat(cand)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_MSK_TZ)
+    now = datetime.now(_MSK_TZ)
+    return dt if dt <= now else None
+
+
 def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     title = str(args.get("title") or "").strip()
     if not title:
         raise McpError(-32602, "Нужно указать название задачи: title.")
     deadline = _normalize_bitrix_deadline(args.get("deadline"))
+    _confirm_past = args.get("confirm_past_deadline")
+    _confirm_past = _confirm_past is True or str(_confirm_past or "").strip().lower() in {"true", "1", "yes", "да"}
+    if not _confirm_past:
+        _past = _deadline_in_past(deadline)
+        if _past is not None:
+            _now = datetime.now(_MSK_TZ)
+            raise McpError(
+                -32602,
+                "Срок " + _past.strftime("%d.%m.%Y %H:%M") + " уже в прошлом (сейчас "
+                + _now.strftime("%d.%m.%Y %H:%M") + " МСК). НЕ ставь задачу молча: спроси пользователя — "
+                "поставить с этим сроком как есть или указать новый. Если подтвердил как есть — повтори "
+                "вызов с confirm_past_deadline=true; если дал новый срок — вызови с новым deadline.",
+            )
     responsible = _resolve_active_bitrix_user(args.get("responsible_bitrix_user_id"), args.get("responsible_name"))
     description = str(args.get("description") or "").strip() or title
     priority_raw = str(args.get("priority") or "normal").strip().lower()
@@ -4950,7 +4982,9 @@ TOOLS: dict[str, dict[str, Any]] = {
             "of observers (if any), and periodic schedule (if any). Every task is created with "
             "«результат обязателен» — it cannot be completed without a result. The "
             "постановщик (creator_bitrix_user_id/creator_name) defaults to the current chat user; "
-            "set another person only when explicitly asked."
+            "set another person only when explicitly asked. If the deadline is already in the past, the "
+            "tool refuses unless confirm_past_deadline=true — ask the user whether to keep it as-is (then "
+            "re-call with confirm_past_deadline=true) or give a new future deadline."
         ),
         "inputSchema": {
             "type": "object",
@@ -4963,6 +4997,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "priority": {"type": "string", "enum": ["normal", "high", "critical"]},
                 "creator_bitrix_user_id": {"type": "integer", "description": "Bitrix user id of the task CREATOR (постановщик). Default: the CURRENT chat user (whoever asked to create the task) — pass their id. Use a different id ONLY if the user explicitly asks to make someone else the постановщик."},
                 "creator_name": {"type": "string", "description": "Full name of the task CREATOR (постановщик) from the org structure, used when the id is unknown. Same default rule as creator_bitrix_user_id."},
+                "confirm_past_deadline": {"type": "boolean", "description": "Set to true ONLY after the user explicitly confirmed creating a task whose deadline is already in the past, as-is. Normally omit. If the deadline is in the past and this is not set, the tool refuses — ask the user first, then either re-call with confirm_past_deadline=true (keep as-is) or with a new future deadline."},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "auditor_names": {
                     "type": "array",
