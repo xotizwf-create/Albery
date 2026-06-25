@@ -5628,6 +5628,7 @@ def dispatch_leader_evaluations_digest(
             "DESCRIPTION": digest_text,
             "RESPONSIBLE_ID": recipient["user_id"],
             "DEADLINE": deadline_at.isoformat(),
+            "SE_PARAMETER": [{"CODE": 3, "VALUE": "Y"}],
         }
     }
     response = client.call_with_fallback("tasks.task.add", task_payload, prefer_api=True)
@@ -5802,6 +5803,7 @@ def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[st
                 "TITLE": item_title,
                 "DESCRIPTION": item_description,
                 "RESPONSIBLE_ID": bitrix_id,
+                "SE_PARAMETER": [{"CODE": 3, "VALUE": "Y"}],
             }
         }
         if item_deadline:
@@ -15563,6 +15565,7 @@ def send_owner_report_recommendations_to_bitrix(
                 "RESPONSIBLE_ID": user_id,
                 "DEADLINE": deadline,
                 "ALLOW_CHANGE_DEADLINE": "N",
+                "SE_PARAMETER": [{"CODE": 3, "VALUE": "Y"}],
             }
         }
         try:
@@ -21599,6 +21602,7 @@ def _b24_testbot_exec_tool(client: BitrixClient, name: str, args: dict[str, Any]
                 fields["DESCRIPTION"] = str(args["description"])
             if args.get("deadline"):
                 fields["DEADLINE"] = str(args["deadline"])
+            fields["SE_PARAMETER"] = [{"CODE": 3, "VALUE": "Y"}]
             data = _b24_testbot_call(client, "tasks.task.add", {"fields": fields})
             task = (data.get("result") or {}).get("task") or {}
             return json.dumps({"created_task_id": to_int(task.get("id")), "title": task.get("title")}, ensure_ascii=False)
@@ -22914,7 +22918,7 @@ def _b24_recent_history(dialog_id: str, limit: int = 6) -> list[tuple[str, str]]
         return []
 
 
-def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> str:
+def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_user_id: Any = "") -> str:
     """Run one turn through the local Hermes brain. Toolset is chosen by access tier:
     admin → full MCP `albery` (incl. instruction/settings edits + deletes); ops → `albery-ops`
     (operational, no admin tools); everyone else → read-only `albery-faq`. Session lifecycle
@@ -23008,6 +23012,15 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq") -> st
             "его web_app_url, script_id И editor_url (ссылку на редактор), чтобы в будущем легко найти и "
             "переопубликовать именно его (а не плодить новые копии). Проверяя доступность ссылки, бери "
             "АКТУАЛЬНЫЙ web_app_url из своей истории, а не угадывай."
+        )
+    if tier in ("ops", "admin") and str(from_user_id).strip():
+        parts.append(
+            "ПОСТАНОВЩИК ЗАДАЧ (важно): по умолчанию постановщик создаваемой задачи — "
+            "ТЕКУЩИЙ собеседник, его Bitrix id=" + str(from_user_id) + ". При вызове "
+            "create_bitrix_task передавай creator_bitrix_user_id=" + str(from_user_id) + ", "
+            "КРОМЕ случая, когда пользователь явно просит сделать постановщиком другого "
+            "человека — тогда укажи creator_name этого человека. У каждой задачи "
+            "результат обязателен (завершить без результата нельзя)."
         )
     if seed:
         parts.append("Сводка более ранней части разговора: " + seed)
@@ -23111,7 +23124,7 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
 
     threading.Thread(target=_typing_keepalive, daemon=True).start()
     try:
-        answer = hermes_brain_answer(user_text, dialog_id, tier)
+        answer = hermes_brain_answer(user_text, dialog_id, tier, from_user_id)
     except Exception as exc:  # noqa: BLE001
         logging.exception("b24 testbot: hermes brain failed")
         status, error = "error", str(exc)[:500]

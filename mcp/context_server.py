@@ -1583,6 +1583,19 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     if auditors:
         fields["AUDITORS"] = [int(u["bitrix_user_id"]) for u in auditors]
 
+    # Always require a result before the task can be completed
+    # (SE_PARAMETER code 3 = "do not complete the task without a result").
+    fields["SE_PARAMETER"] = [{"CODE": 3, "VALUE": "Y"}]
+
+    # Постановщик (CREATED_BY): default = the requesting chat user (passed by the agent),
+    # or an explicitly named person. If neither is given, Bitrix keeps the webhook user.
+    creator_info = None
+    if args.get("creator_bitrix_user_id") not in (None, "") or args.get("creator_name"):
+        creator_info = _resolve_active_bitrix_user(
+            args.get("creator_bitrix_user_id"), args.get("creator_name")
+        )
+        fields["CREATED_BY"] = int(creator_info["bitrix_user_id"])
+
     tags = args.get("tags")
     if isinstance(tags, list):
         clean_tags = [str(tag).strip() for tag in tags if str(tag or "").strip()]
@@ -1625,6 +1638,15 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
             }
             for u in auditors
         ],
+        "creator": (
+            {
+                "bitrix_user_id": creator_info.get("bitrix_user_id"),
+                "full_name": creator_info.get("full_name"),
+            }
+            if creator_info
+            else None
+        ),
+        "require_result": True,
         "is_periodic": is_periodic,
         "regular_parameters": regular_parameters,
         "bitrix_response": response.get("result") if isinstance(response, dict) else response,
@@ -4925,7 +4947,10 @@ TOOLS: dict[str, dict[str, Any]] = {
             "first. The tool resolves responsible_name and auditor_names through the active org structure and "
             "refuses ambiguous matches. To make the task recurring, pass periodic={type, ...}; otherwise the "
             "task is one-off. Before creating, confirm with the user: title, responsible, deadline, full list "
-            "of observers (if any), and periodic schedule (if any)."
+            "of observers (if any), and periodic schedule (if any). Every task is created with "
+            "«результат обязателен» — it cannot be completed without a result. The "
+            "постановщик (creator_bitrix_user_id/creator_name) defaults to the current chat user; "
+            "set another person only when explicitly asked."
         ),
         "inputSchema": {
             "type": "object",
@@ -4936,6 +4961,8 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "responsible_bitrix_user_id": {"type": "integer", "description": "Exact Bitrix user id of the responsible employee. Preferred over responsible_name when known."},
                 "deadline": {"type": "string", "description": "Required deadline: YYYY-MM-DD, DD.MM.YYYY, or ISO datetime. For recurring tasks this is the first instance deadline."},
                 "priority": {"type": "string", "enum": ["normal", "high", "critical"]},
+                "creator_bitrix_user_id": {"type": "integer", "description": "Bitrix user id of the task CREATOR (постановщик). Default: the CURRENT chat user (whoever asked to create the task) — pass their id. Use a different id ONLY if the user explicitly asks to make someone else the постановщик."},
+                "creator_name": {"type": "string", "description": "Full name of the task CREATOR (постановщик) from the org structure, used when the id is unknown. Same default rule as creator_bitrix_user_id."},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "auditor_names": {
                     "type": "array",
