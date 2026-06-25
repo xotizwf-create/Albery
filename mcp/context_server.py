@@ -1532,18 +1532,30 @@ def _build_bitrix_regular_parameters(periodic: dict[str, Any]) -> dict[str, Any]
 
 
 def _normalize_bitrix_deadline(value: Any) -> str:
+    """Accept the natural deadline formats the model produces, not only ISO-with-T.
+    Supported: YYYY-MM-DD and DD.MM.YYYY (date-only -> 19:00 MSK); the same dates
+    followed by ' HH:MM[:SS]' (space OR 'T'); and full ISO with optional tz.
+    A space-separated date+time (e.g. '2026-06-28 15:00') was previously REJECTED,
+    which made the model loop on format retries and report a phantom tool timeout."""
     raw = str(value or "").strip()
     if not raw:
         raise McpError(-32602, "Нужно указать крайний срок задачи: deadline.")
-    if re.match(r"^\d{2}\.\d{2}\.\d{4}$", raw):
-        parsed = datetime.strptime(raw, "%d.%m.%Y").date()
-        return f"{parsed.isoformat()}T19:00:00+03:00"
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
-        return f"{raw}T19:00:00+03:00"
-    if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", raw):
-        return raw
-    raise McpError(-32602, "deadline должен быть в формате YYYY-MM-DD, DD.MM.YYYY или ISO datetime.")
-
+    # DD.MM.YYYY  optionally followed by  (space|T) HH:MM[:SS]
+    m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$", raw)
+    if m:
+        d, mo, y, hh, mm, ss = m.groups()
+        if hh is None:
+            return f"{y}-{mo}-{d}T19:00:00+03:00"
+        return f"{y}-{mo}-{d}T{int(hh):02d}:{mm}:{ss or '00'}+03:00"
+    # YYYY-MM-DD  optionally followed by  (space|T) HH:MM[:SS]  optional tz
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(Z|[+-]\d{2}:?\d{2})?)?$", raw)
+    if m:
+        y, mo, d, hh, mm, ss, tz = m.groups()
+        if hh is None:
+            return f"{y}-{mo}-{d}T19:00:00+03:00"
+        tzs = "+03:00" if not tz else ("+00:00" if tz == "Z" else tz)
+        return f"{y}-{mo}-{d}T{int(hh):02d}:{mm}:{ss or '00'}{tzs}"
+    raise McpError(-32602, "deadline должен быть в формате YYYY-MM-DD[ HH:MM], DD.MM.YYYY[ HH:MM] или ISO datetime.")
 
 def _bitrix_call_with_fallback(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     workflow = app_workflow_function("bitrix_method_call")
