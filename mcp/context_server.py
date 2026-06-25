@@ -1578,6 +1578,14 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     title = str(args.get("title") or "").strip()
     if not title:
         raise McpError(-32602, "Нужно указать название задачи: title.")
+    result_criteria = str(args.get("result_criteria") or "").strip()
+    if not result_criteria:
+        raise McpError(
+            -32602,
+            "У задачи ОБЯЗАН быть результат. Спроси пользователя: какой результат/критерий выполнения "
+            "у этой задачи — по чему поймём, что сделано, и чем подтверждается (скрин/ссылка/файл)? "
+            "Затем повтори вызов create_bitrix_task с параметром result_criteria=...",
+        )
     deadline = _normalize_bitrix_deadline(args.get("deadline"))
     _confirm_past = args.get("confirm_past_deadline")
     _confirm_past = _confirm_past is True or str(_confirm_past or "").strip().lower() in {"true", "1", "yes", "да"}
@@ -1594,6 +1602,8 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
             )
     responsible = _resolve_active_bitrix_user(args.get("responsible_bitrix_user_id"), args.get("responsible_name"))
     description = str(args.get("description") or "").strip() or title
+    if "Критерий результата" not in description:
+        description = description + "\n\nКритерий результата: " + result_criteria
     priority_raw = str(args.get("priority") or "normal").strip().lower()
     priority = 2 if priority_raw in {"high", "critical", "2", "важно", "высокий"} else 1
 
@@ -4984,7 +4994,9 @@ TOOLS: dict[str, dict[str, Any]] = {
             "постановщик (creator_bitrix_user_id/creator_name) defaults to the current chat user; "
             "set another person only when explicitly asked. If the deadline is already in the past, the "
             "tool refuses unless confirm_past_deadline=true — ask the user whether to keep it as-is (then "
-            "re-call with confirm_past_deadline=true) or give a new future deadline."
+            "re-call with confirm_past_deadline=true) or give a new future deadline. Every task MUST have "
+            "result_criteria (what counts as done + how it is proven); if the user did not specify it, ASK — "
+            "never invent it. The tool refuses to create a task without result_criteria."
         ),
         "inputSchema": {
             "type": "object",
@@ -4994,6 +5006,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "responsible_name": {"type": "string", "description": "Responsible employee name from org structure (fuzzy-matched against active users)."},
                 "responsible_bitrix_user_id": {"type": "integer", "description": "Exact Bitrix user id of the responsible employee. Preferred over responsible_name when known."},
                 "deadline": {"type": "string", "description": "Required deadline: YYYY-MM-DD, DD.MM.YYYY, or ISO datetime. For recurring tasks this is the first instance deadline."},
+                "result_criteria": {"type": "string", "description": "ОБЯЗАТЕЛЬНО. Что должно быть результатом задачи: критерий выполнения (по чему поймём, что сделано) + чем подтверждается (скрин/ссылка/файл/артефакт). Если пользователь не указал — СПРОСИ, не выдумывай. Без него инструмент откажет."},
                 "priority": {"type": "string", "enum": ["normal", "high", "critical"]},
                 "creator_bitrix_user_id": {"type": "integer", "description": "Bitrix user id of the task CREATOR (постановщик). Default: the CURRENT chat user (whoever asked to create the task) — pass their id. Use a different id ONLY if the user explicitly asks to make someone else the постановщик."},
                 "creator_name": {"type": "string", "description": "Full name of the task CREATOR (постановщик) from the org structure, used when the id is unknown. Same default rule as creator_bitrix_user_id."},
