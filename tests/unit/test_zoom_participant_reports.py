@@ -9,7 +9,10 @@ def _sample_call(dispatched: bool = False):
                 "actual_participants": [
                     {"person_name": "Иван Иванов", "bitrix_user_id": 101, "role_on_call": "host"},
                     {"person_name": "Мария Петрова", "bitrix_user_id": 102, "role_on_call": "participant"},
-                ]
+                ],
+                "mentioned_people": [
+                    {"person_name": "Сергей Сидоров", "bitrix_user_id": 103},
+                ],
             },
             "person_summaries": [
                 {"person_name": "Мария Петрова", "bitrix_user_id": 102, "score": 9, "message_for_person": "Хорошо включалась в обсуждение, следующий шаг — короче фиксировать решения."}
@@ -33,19 +36,36 @@ def _sample_call(dispatched: bool = False):
     }
 
 
-def test_preview_zoom_participant_reports_uses_person_summaries_and_soft_fallback(app_module, monkeypatch):
+def test_zoom_participant_reports_uses_actual_participants_only(app_module, monkeypatch):
     monkeypatch.setattr(app_module, "load_zoom_call_detail", lambda call_id: _sample_call())
     monkeypatch.setattr(app_module, "load_team_members", lambda: [{"name": "Иван Иванов", "user_id": 101}, {"name": "Мария Петрова", "user_id": 102}])
     monkeypatch.setattr(app_module, "load_employee_name_aliases", lambda: {})
 
-    preview = app_module.preview_zoom_participant_reports("call-1")
+    payload = app_module.build_zoom_participant_reports_dispatch("call-1")
 
-    assert len(preview["task_cards"]) == 2
-    by_name = {card["recipient"]["name"]: card for card in preview["task_cards"]}
+    assert len(payload["task_cards"]) == 2
+    by_name = {card["recipient"]["name"]: card for card in payload["task_cards"]}
+    assert set(by_name) == {"Иван Иванов", "Мария Петрова"}
+    assert "Сергей Сидоров" not in by_name
     assert "План продаж" in by_name["Мария Петрова"]["description"]
     assert "Хорошо включалась" in by_name["Мария Петрова"]["description"]
     assert "поддерживающая обратная связь" in by_name["Иван Иванов"]["description"].lower()
-    assert preview["unmatched_participants"] == []
+    assert payload["unmatched_participants"] == []
+
+
+def test_operational_dispatch_preview_combines_tasks_and_participant_reports(app_module, monkeypatch):
+    monkeypatch.setattr(app_module, "load_zoom_call_detail", lambda call_id: _sample_call())
+    monkeypatch.setattr(app_module, "load_team_members", lambda: [{"name": "Иван Иванов", "user_id": 101}, {"name": "Мария Петрова", "user_id": 102}])
+    monkeypatch.setattr(app_module, "load_employee_name_aliases", lambda: {})
+
+    preview = app_module.preview_zoom_operational_tasks("call-1")
+
+    assert [card["card_kind"] for card in preview["task_cards"]] == ["operational", "participant_report", "participant_report"]
+    assert preview["task_cards"][0]["recipient"]["user_id"] == 101
+    assert preview["task_cards"][0]["is_lead_card"] is True
+    assert "Задачи для постановки" in preview["task_cards"][0]["description"]
+    assert len(preview["participant_task_cards"]) == 2
+    assert preview["participant_reports_error"] == ""
 
 
 def test_participant_reports_refuse_duplicate_without_touching_operational_status(app_module, monkeypatch):
@@ -56,16 +76,3 @@ def test_participant_reports_refuse_duplicate_without_touching_operational_statu
         assert "уже отправлены" in str(exc)
     else:
         raise AssertionError("expected duplicate dispatch guard")
-
-
-def test_operational_dispatch_preview_still_builds_lead_card(app_module, monkeypatch):
-    monkeypatch.setattr(app_module, "load_zoom_call_detail", lambda call_id: _sample_call())
-    monkeypatch.setattr(app_module, "load_team_members", lambda: [{"name": "Иван Иванов", "user_id": 101}, {"name": "Мария Петрова", "user_id": 102}])
-    monkeypatch.setattr(app_module, "load_employee_name_aliases", lambda: {})
-
-    preview = app_module.preview_zoom_operational_tasks("call-1")
-
-    assert len(preview["task_cards"]) == 1
-    assert preview["task_cards"][0]["recipient"]["user_id"] == 101
-    assert preview["task_cards"][0]["is_lead_card"] is True
-    assert "Задачи для постановки" in preview["task_cards"][0]["description"]

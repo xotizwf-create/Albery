@@ -736,8 +736,10 @@ type ZoomOperationalTasksPreview = {
     deadline: string | null;
     deadline_text: string;
     tasks?: Array<Record<string, unknown>>;
+    card_kind?: "operational" | "participant_report";
   }>;
   unmatched_assignees?: string[];
+  participant_reports_error?: string;
   title: string;
   description: string;
   deadline: string | null;
@@ -2182,8 +2184,6 @@ export default function App() {
   const [zoomCallDetailLoading, setZoomCallDetailLoading] = useState(false);
   const [zoomDispatchPreview, setZoomDispatchPreview] = useState<ZoomOperationalTasksPreview | null>(null);
   const [zoomDispatchCall, setZoomDispatchCall] = useState<ZoomCall | null>(null);
-  const [zoomParticipantPreview, setZoomParticipantPreview] = useState<ZoomOperationalTasksPreview | null>(null);
-  const [zoomParticipantCall, setZoomParticipantCall] = useState<ZoomCall | null>(null);
   const [zoomTranscriptVisible, setZoomTranscriptVisible] = useState(false);
   const [zoomFolder, setZoomFolder] = useState<{ year?: number; month?: number; date?: string }>({});
   const [accountingTab, setAccountingTab] = useState<
@@ -4416,60 +4416,6 @@ export default function App() {
       setZoomDispatchCall(null);
     } catch (error) {
       setZoomCallsMessage(error instanceof Error ? error.message : "Не удалось отправить задачи исполнителям.");
-    } finally {
-      setZoomCallDetailLoading(false);
-    }
-  };
-
-  const previewZoomParticipantReports = async (call: ZoomCall) => {
-    setZoomCallDetailLoading(true);
-    setZoomCallsMessage("");
-    try {
-      const payload = await fetchJsonSafe(
-        `/api/zoom-calls/${encodeURIComponent(call.id)}/dispatch-participant-reports/preview`,
-        undefined,
-        60000,
-      );
-      setZoomParticipantCall(call);
-      setZoomParticipantPreview(payload.result);
-    } catch (error) {
-      setZoomCallsMessage(error instanceof Error ? error.message : "Не удалось подготовить персональные итоги.");
-    } finally {
-      setZoomCallDetailLoading(false);
-    }
-  };
-
-  const dispatchZoomParticipantReports = async () => {
-    if (!zoomParticipantCall) return;
-    const call = zoomParticipantCall;
-    setZoomCallDetailLoading(true);
-    setZoomCallsMessage("");
-    try {
-      const payload = await fetchJsonSafe(
-        `/api/zoom-calls/${encodeURIComponent(call.id)}/dispatch-participant-reports`,
-        { method: "POST", headers: { "Content-Type": "application/json" } },
-        180000,
-      );
-      const updatedCall = payload.call || call;
-      setSelectedZoomCall(updatedCall);
-      setZoomCallsTree((current) => ({
-        ...current,
-        years: current.years.map((year) => ({
-          ...year,
-          months: year.months.map((month) => ({
-            ...month,
-            dates: month.dates.map((day) => ({
-              ...day,
-              calls: day.calls.map((item) => (item.id === call.id ? updatedCall : item)),
-            })),
-          })),
-        })),
-      }));
-      setZoomCallsMessage(payload.message || "Персональные итоги отправлены участникам.");
-      setZoomParticipantPreview(null);
-      setZoomParticipantCall(null);
-    } catch (error) {
-      setZoomCallsMessage(error instanceof Error ? error.message : "Не удалось отправить персональные итоги.");
     } finally {
       setZoomCallDetailLoading(false);
     }
@@ -8309,15 +8255,6 @@ export default function App() {
                   <ArrowRight className="w-4 h-4" />
                 </button>
                 <button
-                  onClick={() => void previewZoomParticipantReports(selectedZoomCall)}
-                  disabled={zoomCallDetailLoading || !selectedZoomCall.analytical_note}
-                  className="h-10 px-4 rounded-xl bg-violet-50 hover:bg-violet-100 text-violet-700 text-[13px] font-bold flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
-                  title="Отправить персональные итоги участникам"
-                >
-                  <Users className="w-4 h-4" />
-                  Участникам
-                </button>
-                <button
                   onClick={() => void deleteZoomCallReport(selectedZoomCall)}
                   disabled={zoomCallDetailLoading || !selectedZoomCall.analytical_note}
                   className="h-10 px-4 rounded-xl bg-red-50 hover:bg-red-100 text-red-700 text-[13px] font-bold flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
@@ -8431,7 +8368,7 @@ export default function App() {
               </section>
 
               <section>
-                <p className="text-xs font-black uppercase tracking-wider text-slate-400 mb-2">Карточки задач</p>
+                <p className="text-xs font-black uppercase tracking-wider text-slate-400 mb-2">Карточки задач и персональных итогов</p>
                 <div className="space-y-3">
                   {(zoomDispatchPreview.task_cards?.length
                     ? zoomDispatchPreview.task_cards
@@ -8446,8 +8383,13 @@ export default function App() {
                     <div key={`${card.recipient?.user_id || card.assignee_name}-${index}`} className="rounded-xl border border-slate-100 bg-white p-4 shadow-sm">
                       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                         <div className="min-w-0">
-                          <div className="text-xs font-black uppercase tracking-wider text-slate-400">Исполнитель</div>
-                          <div className="mt-1 inline-flex max-w-full items-center gap-1.5 rounded-lg bg-blue-50 px-3 py-1.5 text-xs font-black text-blue-700">
+                          <div className="text-xs font-black uppercase tracking-wider text-slate-400">
+                            {card.card_kind === "participant_report" ? "Участник" : "Исполнитель"}
+                          </div>
+                          <div className={cn(
+                            "mt-1 inline-flex max-w-full items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-black",
+                            card.card_kind === "participant_report" ? "bg-violet-50 text-violet-700" : "bg-blue-50 text-blue-700",
+                          )}>
                             <Users className="h-3.5 w-3.5 shrink-0" />
                             <span className="truncate">{card.recipient?.name || card.assignee_name}</span>
                           </div>
@@ -8475,6 +8417,11 @@ export default function App() {
                     Не найдены в Bitrix: {zoomDispatchPreview.unmatched_assignees.join(", ")}
                   </div>
                 ) : null}
+                {zoomDispatchPreview.participant_reports_error ? (
+                  <div className="mt-3 rounded-xl bg-amber-50 px-4 py-3 text-[13px] font-bold text-amber-700">
+                    Персональные итоги не добавлены: {zoomDispatchPreview.participant_reports_error}
+                  </div>
+                ) : null}
               </section>
             </div>
 
@@ -8500,48 +8447,6 @@ export default function App() {
                 Отправить
               </button>
               </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {zoomParticipantPreview && (
-        <div className="fixed inset-0 z-[91] flex items-center justify-center p-4 sm:p-6 animate-in fade-in duration-150">
-          <div className="absolute inset-0 bg-slate-950/45 backdrop-blur-sm" onClick={() => setZoomParticipantPreview(null)}></div>
-          <div className="relative w-full max-w-2xl max-h-[86vh] overflow-hidden rounded-2xl bg-white shadow-2xl ring-1 ring-slate-200 flex flex-col" onClick={(event) => event.stopPropagation()}>
-            <div className="px-5 py-4 border-b border-slate-100 flex items-start justify-between gap-4">
-              <div>
-                <h3 className="text-lg font-black text-slate-950">Персональные итоги участникам</h3>
-                <p className="mt-1 text-xs font-bold text-slate-400">Одна Bitrix-задача каждому сопоставленному участнику</p>
-              </div>
-              <button onClick={() => setZoomParticipantPreview(null)} className="w-9 h-9 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-500 flex items-center justify-center" aria-label="Закрыть"><X className="w-5 h-5" /></button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-5 space-y-5">
-              <section>
-                <p className="text-xs font-black uppercase tracking-wider text-slate-400 mb-2">Кому</p>
-                <div className="flex flex-wrap gap-2">
-                  {zoomParticipantPreview.recipients.map((recipient) => (
-                    <span key={recipient.user_id} className="inline-flex items-center gap-1.5 rounded-lg bg-violet-50 px-3 py-1.5 text-xs font-black text-violet-700"><Users className="h-3.5 w-3.5" />{recipient.name}</span>
-                  ))}
-                </div>
-              </section>
-              <section>
-                <p className="text-xs font-black uppercase tracking-wider text-slate-400 mb-2">Карточки персональных итогов</p>
-                <div className="space-y-3">
-                  {(zoomParticipantPreview.task_cards || []).map((card, index) => (
-                    <div key={`${card.recipient?.user_id || card.assignee_name}-${index}`} className="rounded-xl border border-slate-100 bg-white p-4 shadow-sm">
-                      <div className="flex items-center justify-between gap-3"><div className="font-black text-slate-900">{card.recipient?.name || card.assignee_name}</div><div className="text-xs font-bold text-slate-400">{card.deadline_text}</div></div>
-                      <div className="mt-2 text-sm font-bold text-slate-900">{card.title}</div>
-                      <pre className="mt-4 max-h-56 overflow-y-auto whitespace-pre-wrap rounded-xl border border-slate-100 bg-slate-50 p-4 text-[13px] leading-relaxed text-slate-800 font-sans">{card.description}</pre>
-                    </div>
-                  ))}
-                </div>
-                {zoomParticipantPreview.unmatched_participants?.length ? <div className="mt-3 rounded-xl bg-amber-50 px-4 py-3 text-[13px] font-bold text-amber-700">Не найдены в Bitrix: {zoomParticipantPreview.unmatched_participants.join(", ")}</div> : null}
-              </section>
-            </div>
-            <div className="px-5 py-4 border-t border-slate-100 bg-slate-50 flex items-center justify-end gap-2">
-              <button onClick={() => setZoomParticipantPreview(null)} className="h-10 px-4 rounded-xl bg-white hover:bg-slate-100 text-slate-600 text-[13px] font-black border border-slate-200">Отмена</button>
-              <button onClick={() => void dispatchZoomParticipantReports()} disabled={zoomCallDetailLoading} className="h-10 px-4 rounded-xl bg-violet-600 hover:bg-violet-700 text-white text-[13px] font-black flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"><Users className="w-4 h-4" />Отправить участникам</button>
             </div>
           </div>
         </div>

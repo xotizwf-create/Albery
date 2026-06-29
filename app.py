@@ -5460,22 +5460,8 @@ def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = 
 
 
 def preview_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
-    payload = build_zoom_operational_tasks_dispatch(call_id)
-    return {
-        "recipients": payload["recipients"],
-        "title": payload["title"],
-        "description": payload["description"],
-        "deadline": payload["deadline"],
-        "deadline_text": payload["deadline_text"],
-        "dispatch_summary": payload["dispatch_summary"],
-        "operational_section": payload["operational_section"],
-        "operational_tasks": payload["operational_tasks"],
-        "participants": payload["participants"],
-        "leader_evaluations": payload["leader_evaluations"],
-        "task_cards": payload["task_cards"],
-        "unmatched_assignees": payload["unmatched_assignees"],
-        "unmatched_participants": payload["unmatched_participants"],
-    }
+    payload = build_zoom_combined_dispatch(call_id)
+    return {k: v for k, v in payload.items() if k != "call"}
 
 
 def _zoom_person_summaries(call: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5528,22 +5514,14 @@ def _participant_feedback_text(recipient_name: str, recipient_id: int | None, pe
 
 
 def _zoom_report_people_for_participant_reports(call: dict[str, Any]) -> list[dict[str, Any]]:
-    """Actual participants plus explicitly mentioned employees for participant report dispatch."""
-    people = list(zoom_call_participants(call))
-    analysis = _zoom_ai_analysis(call)
-    people_block = analysis.get("people") if isinstance(analysis.get("people"), dict) else {}
-    for key in ("mentioned_people", "mentioned_employees", "mentioned_participants"):
-        raw = people_block.get(key) if isinstance(people_block.get(key), list) else []
-        for item in raw:
-            if isinstance(item, dict):
-                name = str(item.get("person_name") or item.get("raw_name") or item.get("name") or "").strip()
-                bitrix_user_id = to_int(item.get("bitrix_user_id"))
-            else:
-                name = str(item or "").strip()
-                bitrix_user_id = None
-            if name:
-                people.append({"name": name, "bitrix_user_id": bitrix_user_id, "org_match": "", "is_leader": False, "role_on_call": "mentioned"})
-    return people
+    """People eligible for personal participant reports.
+
+    Personal reports go only to people who were factually present under their own
+    names in `people.actual_participants`. Mentioned employees, task assignees,
+    leader digest names, and technical Zoom accounts must not receive personal
+    meeting reports.
+    """
+    return list(zoom_call_participants(call))
 
 
 def build_zoom_participant_reports_dispatch(call_id: str, require_webhook: bool = False) -> dict[str, Any]:
@@ -5596,6 +5574,46 @@ def preview_zoom_participant_reports(call_id: str) -> dict[str, Any]:
     return {k: v for k, v in payload.items() if k != "call"}
 
 
+def build_zoom_combined_dispatch(call_id: str, require_webhook: bool = False) -> dict[str, Any]:
+    operational = build_zoom_operational_tasks_dispatch(call_id, require_webhook=require_webhook)
+    cards: list[dict[str, Any]] = []
+    for card in operational.get("task_cards") or []:
+        if isinstance(card, dict):
+            cards.append({**card, "card_kind": "operational"})
+
+    participant_payload: dict[str, Any] | None = None
+    participant_error = ""
+    try:
+        participant_payload = build_zoom_participant_reports_dispatch(call_id, require_webhook=require_webhook)
+    except ValueError as exc:
+        participant_error = str(exc)
+
+    if participant_payload:
+        for card in participant_payload.get("task_cards") or []:
+            if isinstance(card, dict):
+                cards.append({**card, "card_kind": "participant_report"})
+
+    recipients_by_id: dict[int, dict[str, Any]] = {}
+    for card in cards:
+        recipient = card.get("recipient") if isinstance(card.get("recipient"), dict) else None
+        user_id = to_int(recipient.get("user_id")) if recipient else None
+        if recipient and user_id is not None:
+            recipients_by_id[user_id] = recipient
+
+    return {
+        **operational,
+        "recipients": list(recipients_by_id.values()),
+        "task_cards": cards,
+        "participant_task_cards": (participant_payload or {}).get("task_cards") or [],
+        "participant_reports_error": participant_error,
+        "unmatched_participants": list(dict.fromkeys([
+            *(operational.get("unmatched_participants") or []),
+            *((participant_payload or {}).get("unmatched_participants") or []),
+        ])),
+        "dispatch_mode": "combined",
+    }
+
+
 def mark_zoom_participant_reports_dispatched(call_id: str, results: list[dict[str, Any]]) -> None:
     if not postgres_enabled():
         return
@@ -5629,9 +5647,14 @@ def dispatch_zoom_participant_reports(call_id: str) -> dict[str, Any]:
 
 
 def dispatch_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
-    payload = build_zoom_operational_tasks_dispatch(call_id, require_webhook=True)
+    payload = build_zoom_combined_dispatch(call_id, require_webhook=True)
     result = dispatch_prepared_zoom_operational_tasks(payload)
-    mark_zoom_operational_tasks_dispatched(call_id, result.get("results") or [])
+    sent_results = result.get("results") or []
+    operational_results = [item for item in sent_results if isinstance(item, dict) and item.get("card_kind") != "participant_report"]
+    participant_results = [item for item in sent_results if isinstance(item, dict) and item.get("card_kind") == "participant_report"]
+    mark_zoom_operational_tasks_dispatched(call_id, operational_results)
+    if participant_results:
+        mark_zoom_participant_reports_dispatched(call_id, participant_results)
     result["call_id"] = call_id
     # Surface people we could not match so Hermes can ask the owner to map them.
     existing_skipped = result.get("skipped_assignees") or []
@@ -5641,6 +5664,7 @@ def dispatch_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
             merged_skipped.append(name)
     result["skipped_assignees"] = merged_skipped
     result["unmatched_participants"] = payload.get("unmatched_participants") or []
+    result["participant_reports_sent"] = len(participant_results)
     return result
 
 
@@ -5968,6 +5992,7 @@ def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[st
             "user_id": bitrix_id,
             "task_id": to_int(task_id) or task_id,
             "title": item_title,
+            "card_kind": item.get("card_kind") or "operational",
         })
         time.sleep(client.request_delay)
     return {
