@@ -246,11 +246,11 @@
 
 ## 7. Приоритетные несостыковки для исправления
 
-1. `create_bitrix_task` в MCP — добавить обязательный confirm-gate и/или отдельный preview-инструмент.
+1. `create_bitrix_task` в MCP — закрыто: обязательный `confirm=true` включён; перед вызовом нужен preview точной задачи, ответственного и дедлайна.
 2. Legacy HTTP отправки в Bitrix (`/api/owner/.../send`, `/send-full`, `/api/zoom-calls/.../dispatch-operational-tasks`) — закрыто: legacy API по умолчанию 410; при включении внешние POST требуют server-side `confirm=true`.
-3. `process_chat_ocr` — переклассифицировать из “служебного чтения” в workflow-запись; решить, нужен ли confirm или достаточно ограничений по дате/чату/force.
-4. `upsert_ai_instruction` и UI-редактирование AI-инструкций — считать изменением поведения агента; добавить версионность/preview/журнал принятия изменений.
-5. `fetch_url` — добавить allowlist/denylist и запрет внутренних адресов, чтобы не превращать MCP в произвольный сетевой fetcher.
+3. `process_chat_ocr` — закрыто: переклассифицирован как workflow-запись; handler требует `confirm=true` после preview диапазона дат/чата и режима `force`.
+4. `upsert_ai_instruction` и UI-редактирование AI-инструкций — закрыто на MCP-границе: preview → явное подтверждение → `confirm=true`; перезапись поддерживает `expected_current_content` guard от stale-preview.
+5. `fetch_url` — закрыто: external-read contract требует `user_provided=true` или `confirm_external=true`; private/internal hosts блокируются до запроса и после редиректа.
 6. Документацию обновить: `mcp/README.md` не должен говорить read-only без оговорок; root `README.md` должен описывать реальный Albery, а не старый Bitrix weekly export.
 
 ## 8. Что делать дальше
