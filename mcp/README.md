@@ -1,6 +1,23 @@
 # Employee Context MCP
 
-Read-only MCP server for Claude Code / Claude Desktop. It exposes the local PostgreSQL analytics database through domain tools instead of unrestricted SQL.
+Domain-scoped MCP server for Claude Code / Claude Desktop. It exposes the local PostgreSQL analytics database through domain tools instead of unrestricted SQL, and also contains explicitly confirmation-gated workflow tools that can write reports/instructions or perform external Bitrix actions.
+
+Safety rule: tools with side effects must follow `review → preview → explicit user confirmation → call with confirm=true`. Read-only labels are not enough; check each tool contract and handler before treating it as safe.
+
+Important permission model: Albery MCP must not ask for 1000 confirmations during normal analysis. A user request to analyze, prepare a report, inspect tasks, or collect recommendations gives the assistant permission to use the relevant fast read-only route inside that work scope. Extra confirmation is needed only for external actions and high-impact current-state changes.
+
+## Fast route / permission model
+
+For analysis and report work, use short routes instead of broad random exploration:
+
+1. `start_here_always_read_ai_instructions` — read the live execution contract once.
+2. `get_context_guide(intent=...)` — pick the shortest workflow for the current task.
+3. Use index tools before detail tools: `get_period_index`, `get_report_readiness`, `list_chats`, `list_zoom_calls`, `list_company_files`.
+4. Read exact evidence with bounded arguments: date range, `dialog_id`, `call_id`, `bitrix_task_id`, `limit`, `offset`.
+5. Build a preview for any action.
+6. Call external action tools only after the owner approves the exact preview and pass `confirm=true`.
+
+The MCP registry exposes risk metadata for every tool: `risk_class`, `permission_scope`, `side_effects`, `requires_confirm`, `writes_db`, `external_action`, and `route_hint`. This metadata is for routing and safety checks; it is not a new argument the assistant has to pass.
 
 ## Tools
 
@@ -20,6 +37,8 @@ Read-only MCP server for Claude Code / Claude Desktop. It exposes the local Post
 - `get_org_structure` - departments, users, managers, memberships.
 - `search_tasks` - Bitrix task search; rows include `comments_total_count` and `comments_human_count`.
 - `get_task_comments` - read the comment thread of one task by `bitrix_task_id`, with author names and BB-code-cleaned text (system notifications excluded unless `include_service=true`).
+- `create_bitrix_task` - create one Bitrix task only after previewing the exact title/responsible/deadline/observers/periodicity and receiving explicit user confirmation; `confirm=true` is mandatory.
+- `delete_bitrix_task` - delete one exact Bitrix task only after showing task details and receiving explicit user confirmation; `confirm=true` is mandatory.
 - `list_chats` - active chat listing.
 - `search_messages` - raw chat message search.
 - `get_chat_transcript` - raw chat transcript by `dialog_id` and period, including OCR for image/PDF attachments.
@@ -37,6 +56,8 @@ Read-only MCP server for Claude Code / Claude Desktop. It exposes the local Post
 
 ## Recommended Usage Pattern
 
+For the full agent workflow, confirmation rules, and instruction map, see `docs/playbooks/mcp-agent-workflow.md`.
+
 For any company analysis, report, recommendation, or answer, start with `start_here_always_read_ai_instructions`. It reads the live editable rules from "Настройки -> Инструкции для ИИ" and returns the mandatory execution contract.
 
 For new analysis requests, call `get_context_guide` after `start_here_always_read_ai_instructions`. Pass `intent` to get only the route for the current task (for example `get_context_guide(intent="owner_daily_report_creation")`); without `intent` it returns the full guide. The routes it covers:
@@ -50,6 +71,8 @@ For new analysis requests, call `get_context_guide` after `start_here_always_rea
 - recommendations and management answers: the instructions already arrived from `start_here_always_read_ai_instructions`; read prior owner context, relevant chat reports, company knowledge, and concrete Bitrix tasks before answering.
 
 This keeps the model from scanning sources randomly and gives it a stable map of the system.
+
+Complex requests may take as long as needed for quality, especially when many sources and tools are genuinely required. Still, the assistant should optimize the route: prefer indexes, narrow queries, explicit periods, exact ids, and pagination instead of unbounded random scans. Use `get_compact_export` only for bounded periods and only when a bundled read is genuinely faster than separate targeted reads.
 
 When the user asks an underspecified question, the agent should ask a clarifying question instead of inventing the missing scope. Answers must use concrete task names, not bare ids: write `task 318099: Сформировать реестр платежей`, with owner/status/deadline/source when available.
 

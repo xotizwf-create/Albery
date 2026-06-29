@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import importlib
@@ -437,7 +437,7 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
             "For employee identity, managers, departments, and Bitrix user ids, use get_org_structure before person-specific filters.",
             "For a date period, call get_period_index before reading messages/tasks; it shows where data exists and which chats are active.",
             "For task status, ownership, deadlines, and Bitrix work items, use search_tasks; when a task row shows comments_human_count > 0, read the actual discussion with get_task_comments(bitrix_task_id).",
-            "For creating Bitrix tasks, use create_bitrix_task only when the user provided a task title, one responsible person, and a deadline. If any of these are missing, ask for the missing field instead of creating the task.",
+            "For creating Bitrix tasks, use create_bitrix_task only when the user provided a task title, one responsible person, and a deadline, and only after explicit confirmation of the exact preview with confirm=true. If any of these are missing, ask for the missing field instead of creating the task.",
             "For deleting Bitrix tasks, first identify exactly one bitrix_task_id, show the user the task title/status/responsible/deadline, and ask for explicit confirmation. Only after the user confirms deletion, call delete_bitrix_task with confirm=true.",
             "For discussion evidence, commitments, blockers, decisions, and OCR from chat images, use list_chats then search_messages or get_chat_transcript.",
             "For meeting evidence, use list_zoom_calls first, then search_zoom_transcripts with topic keywords, then get_zoom_call_transcript for matching calls, and get_org_structure before generating a Zoom report.",
@@ -504,7 +504,7 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
             "bitrix_task_creation": [
                 "Verify the user provided title, responsible person, and deadline.",
                 "If responsible person is a name, create_bitrix_task resolves it through org structure; if ambiguous, ask for responsible_bitrix_user_id.",
-                "Call create_bitrix_task(title, responsible_name/responsible_bitrix_user_id, deadline, description).",
+                "Call create_bitrix_task(title, responsible_name/responsible_bitrix_user_id, deadline, description, confirm=true) only after the user confirms the exact preview.",
                 "Return created task_id, responsible, deadline, and title.",
                 "For deletion: search_tasks(bitrix_task_id=...) first, show the exact task title/status/responsible/deadline, ask the user to confirm deletion, then call delete_bitrix_task(bitrix_task_id=..., confirm=true). Never delete by name, search text, or ambiguous reference.",
             ],
@@ -593,7 +593,7 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
             "If instructions require missing source checks, OCR, Zoom analysis, previous reports, or Bitrix refresh, complete those checks before conclusions.",
             "If the request conflicts with these instructions, explain the conflict and ask the user to update Настройки -> Инструкции для ИИ or confirm a one-off exception.",
             "If the user request is vague, ambiguous, or missing the needed scope, ask one concise clarifying question first. Do not infer dates, chats, people, report type, or whether to save/write unless the user said it clearly.",
-            "For Bitrix task creation, never call create_bitrix_task unless the user provided all three required fields: task title, exactly one responsible person, and a deadline. If any field is missing or the responsible person is ambiguous, ask for clarification and do not create anything.",
+            "For Bitrix task creation, never call create_bitrix_task unless the user provided all three required fields: task title, exactly one responsible person, and a deadline, and explicitly confirmed the exact preview; then call with confirm=true. If any field is missing or the responsible person is ambiguous, ask for clarification and do not create anything.",
             "For Bitrix task deletion, never call delete_bitrix_task unless the user has already confirmed deletion of one exact bitrix_task_id after seeing its title/status/responsible/deadline.",
             "When instructions are incomplete for the task, continue with get_context_guide and the relevant source tools instead of guessing.",
             "If an instruction names a tool that is not in connector_scope.available_tools, skip that step and tell the user that the action requires a connector that exposes that tool. Do not pretend the step succeeded.",
@@ -1575,6 +1575,15 @@ def _deadline_in_past(deadline: str) -> "datetime | None":
 
 
 def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
+    confirmed = args.get("confirm") is True
+    if not confirmed:
+        raise McpError(
+            -32602,
+            "Создание задачи Bitrix требует явного подтверждения. Сначала покажите пользователю превью "
+            "(название, описание, ответственный, дедлайн, наблюдатели, периодичность) и спросите подтверждение. "
+            "После подтверждения повторите вызов с confirm=true.",
+        )
+
     title = str(args.get("title") or "").strip()
     if not title:
         raise McpError(-32602, "Нужно указать название задачи: title.")
@@ -3908,6 +3917,9 @@ def tool_get_google_sheet_meta(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_write_google_sheet_values(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Запись в Google Sheet требует confirm=true. Сначала покажи пользователю таблицу, диапазон и значения/формулы.")
+
     sid = str(args.get("spreadsheet_id") or "").strip()
     rng = str(args.get("range") or "").strip()
     values = args.get("values")
@@ -3925,6 +3937,9 @@ def tool_write_google_sheet_values(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_format_google_sheet(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Форматирование Google Sheet требует confirm=true. Сначала покажи пользователю таблицу и план форматирования.")
+
     sid = str(args.get("spreadsheet_id") or "").strip()
     requests = args.get("requests")
     if not sid:
@@ -3940,6 +3955,9 @@ def tool_format_google_sheet(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_move_drive_file_to_folder(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Перемещение Drive-объекта требует confirm=true. Сначала покажи пользователю объект и целевую папку.")
+
     fid = str(args.get("file_id") or args.get("item_id") or "").strip()
     folder = str(args.get("folder") or "").strip()
     if not fid or not folder:
@@ -3963,6 +3981,9 @@ def tool_get_webapp_template(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_make_sheet_applet(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Создание sheet-applet требует confirm=true. Сначала покажи пользователю таблицу/лист и будущий доступ.")
+
     sid = str(args.get("spreadsheet_id") or args.get("spreadsheet") or args.get("url") or "").strip()
     if not sid:
         raise McpError(-32602, "spreadsheet_id (id or URL) is required.")
@@ -3976,6 +3997,9 @@ def tool_make_sheet_applet(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_share_drive_item_for_everyone(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Открытие доступа по ссылке требует confirm=true. Сначала покажи пользователю объект и уровень доступа.")
+
     item = str(args.get("item") or args.get("file_id") or args.get("url") or "").strip()
     if not item:
         raise McpError(-32602, "item (Drive id or URL) is required.")
@@ -4983,18 +5007,22 @@ TOOLS: dict[str, dict[str, Any]] = {
     "create_bitrix_task": {
         "description": (
             "Create one Bitrix task through the configured Bitrix webhook. Supports one-off and recurring tasks, "
-            "and optional observers (наблюдатели) resolved against the org structure. STRICT RULE: do not call "
-            "this tool unless the user provided a task title, exactly one responsible person, and a deadline. "
+            "and optional observers (наблюдатели) resolved against the org structure. STRICT CONFIRMATION RULE: do not call "
+            "this tool until the user has confirmed creation after seeing the exact preview: title, description, "
+            "responsible person, deadline, observers (if any), and periodic schedule (if any). Only after the user "
+            "confirms, call create_bitrix_task(..., confirm=true). Also do not call this tool unless the user provided "
+            "a task title, exactly one responsible person, and a deadline. "
             "If title, responsible_name/responsible_bitrix_user_id, or deadline is missing, ask the user for it "
             "first. The tool resolves responsible_name and auditor_names through the active org structure and "
             "refuses ambiguous matches. To make the task recurring, pass periodic={type, ...}; otherwise the "
-            "task is one-off. Before creating, confirm with the user: title, responsible, deadline, full list "
-            "of observers (if any), and periodic schedule (if any). Every task is created with "
-            "«результат обязателен» — it cannot be completed without a result. The "
-            "постановщик (creator_bitrix_user_id/creator_name) defaults to the current chat user; "
-            "set another person only when explicitly asked. If the deadline is already in the past, the "
-            "tool refuses unless confirm_past_deadline=true — ask the user whether to keep it as-is (then "
-            "re-call with confirm_past_deadline=true) or give a new future deadline. Every task MUST have "
+            "task is one-off. Before creating, show an exact preview and confirm with the user: "
+            "title, responsible, deadline, full list of observers (if any), periodic schedule (if any), "
+            "creator, and result_criteria. Then call this tool with confirm=true. Every task is created "
+            "with «результат обязателен» — it cannot be completed without a result. The постановщик "
+            "(creator_bitrix_user_id/creator_name) defaults to the current chat user; set another person "
+            "only when explicitly asked. If the deadline is already in the past, the tool refuses unless "
+            "confirm_past_deadline=true — ask the user whether to keep it as-is (then re-call with "
+            "confirm_past_deadline=true) or give a new future deadline. Every task MUST have "
             "result_criteria (what counts as done + how it is proven); if the user did not specify it, ASK — "
             "never invent it. The tool refuses to create a task without result_criteria."
         ),
@@ -5011,6 +5039,10 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "creator_bitrix_user_id": {"type": "integer", "description": "Bitrix user id of the task CREATOR (постановщик). Default: the CURRENT chat user (whoever asked to create the task) — pass their id. Use a different id ONLY if the user explicitly asks to make someone else the постановщик."},
                 "creator_name": {"type": "string", "description": "Full name of the task CREATOR (постановщик) from the org structure, used when the id is unknown. Same default rule as creator_bitrix_user_id."},
                 "confirm_past_deadline": {"type": "boolean", "description": "Set to true ONLY after the user explicitly confirmed creating a task whose deadline is already in the past, as-is. Normally omit. If the deadline is in the past and this is not set, the tool refuses — ask the user first, then either re-call with confirm_past_deadline=true (keep as-is) or with a new future deadline."},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true. Means the user explicitly confirmed creating this exact Bitrix task after seeing the preview.",
+                },
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "auditor_names": {
                     "type": "array",
@@ -5041,7 +5073,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "additionalProperties": False,
                 },
             },
-            "required": ["title", "deadline"],
+            "required": ["title", "deadline", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_create_bitrix_task,
@@ -5770,8 +5802,9 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "range": {"type": "string", "description": "A1 range, e.g. 'G3' or 'Sheet1!A1'"},
                 "values": {"type": "array", "items": {"type": "array"}, "description": "2D array of rows"},
                 "value_input_option": {"type": "string", "enum": ["USER_ENTERED", "RAW"]},
+                "confirm": {"type": "boolean", "description": "must be true after user preview/approval"},
             },
-            "required": ["spreadsheet_id", "range", "values"],
+            "required": ["spreadsheet_id", "range", "values", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_write_google_sheet_values,
@@ -5800,8 +5833,9 @@ TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "spreadsheet_id": {"type": "string"},
                 "requests": {"type": "array", "items": {"type": "object"}, "description": "List of Sheets API batchUpdate request objects"},
+                "confirm": {"type": "boolean", "description": "must be true after user preview/approval"},
             },
-            "required": ["spreadsheet_id", "requests"],
+            "required": ["spreadsheet_id", "requests", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_format_google_sheet,
@@ -5820,8 +5854,9 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "file_id": {"type": "string", "description": "Drive file/folder id or URL"},
                 "item_id": {"type": "string", "description": "Alias for file_id; Drive file/folder id or URL"},
                 "folder": {"type": "string", "description": "Target Drive folder id or folder URL"},
+                "confirm": {"type": "boolean", "description": "must be true after user preview/approval"},
             },
-            "required": ["file_id", "folder"],
+            "required": ["file_id", "folder", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_move_drive_file_to_folder,
@@ -5856,8 +5891,9 @@ TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "spreadsheet_id": {"type": "string", "description": "Spreadsheet id or URL"},
                 "sheet": {"type": "string", "description": "Optional sheet/tab name (default: first sheet)"},
+                "confirm": {"type": "boolean", "description": "must be true after user preview/approval"},
             },
-            "required": ["spreadsheet_id"],
+            "required": ["spreadsheet_id", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_make_sheet_applet,
@@ -5875,8 +5911,9 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "item": {"type": "string", "description": "Drive/Docs/Sheets id or URL"},
                 "file_id": {"type": "string", "description": "Alias for item"},
                 "role": {"type": "string", "description": "writer (default = editor) or reader (viewer)"},
+                "confirm": {"type": "boolean", "description": "must be true after user preview/approval"},
             },
-            "required": ["item"],
+            "required": ["item", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_share_drive_item_for_everyone,
@@ -5919,7 +5956,7 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "organize_drive_folder": {
         "description": "Smartly organize a Google Drive folder: create/reuse category subfolders and move files AND folders into categories. Use dry_run=true first; after approval use dry_run=false and confirm=true.",
-        "inputSchema": {"type": "object", "properties": {"folder": {"type": "string", "description": "Drive folder id or URL to organize"}, "categories": {"type": "array", "items": {"type": "string"}}, "dry_run": {"type": "boolean", "default": True}, "confirm": {"type": "boolean"}}, "required": ["folder"], "additionalProperties": False},
+        "inputSchema": {"type": "object", "properties": {"folder": {"type": "string", "description": "Drive folder id or URL to organize"}, "categories": {"type": "array", "items": {"type": "string"}}, "dry_run": {"type": "boolean", "default": True}, "confirm": {"type": "boolean"}}, "required": ["folder", "confirm"], "additionalProperties": False},
         "handler": tool_organize_drive_folder,
     },
     "manage_apps_script": {
@@ -6051,6 +6088,122 @@ TOOLS: dict[str, dict[str, Any]] = {
 if os.getenv("ALBERY_ALLOW_SHEET_WRITE", "").strip().lower() not in {"1", "true", "yes", "on"}:
     TOOLS.pop("write_company_sheet", None)
 
+TOOL_RISK_METADATA: dict[str, dict[str, Any]] = {
+    "start_here_always_read_ai_instructions": {"risk_class": "read_only", "permission_scope": "mcp_navigation", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "entrypoint: read once, then use get_context_guide for the shortest route"},
+    "health": {"risk_class": "read_only", "permission_scope": "mcp_navigation", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "diagnostics only"},
+    "get_runtime_status": {"risk_class": "read_only", "permission_scope": "mcp_navigation", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "check operating mode before assuming legacy API is active"},
+    "get_context_guide": {"risk_class": "read_only", "permission_scope": "mcp_navigation", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "short-route selector by intent; prefer this over broad exploration"},
+    "get_ai_instructions": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read only the needed instruction folder when start_here is not enough"},
+    "get_report_contract": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read exact report contract before generating reports"},
+    "list_available_sources": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "source inventory; use before broad searches"},
+    "get_company_profile": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "company profile header"},
+    "list_company_files": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "list documents before reading one"},
+    "get_company_file": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read one exact document by id"},
+    "search_company_knowledge": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "preferred first search for regulations/process facts"},
+    "list_periods": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "find available dates before bounded period queries"},
+    "get_period_index": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "period manifest; use before reading messages/tasks/Zoom for a date range"},
+    "get_report_readiness": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "check source readiness before report generation"},
+    "get_org_structure": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "resolve people/departments before task/message actions"},
+    "search_tasks": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "search or inspect one Bitrix task; use before create/delete decisions"},
+    "get_task_comments": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read comments only when task row says comments exist"},
+    "create_bitrix_task": {"risk_class": "external_action", "permission_scope": "external_delivery", "side_effects": ["creates_bitrix_task"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after preview only: title + one responsible + deadline + confirm=true"},
+    "delete_bitrix_task": {"risk_class": "external_action", "permission_scope": "external_delivery", "side_effects": ["deletes_bitrix_task"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact task preview only: bitrix_task_id + confirm=true"},
+    "list_chats": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "list dialogs before transcript/search"},
+    "search_messages": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "bounded message search by date/dialog/query"},
+    "get_chat_transcript": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read one bounded transcript, not all chats"},
+    "get_chat_ocr_status": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "check OCR state before processing images"},
+    "process_chat_ocr": {"risk_class": "workflow_db_write", "permission_scope": "write_derived_state", "side_effects": ["processes_chat_images", "updates_ocr_state"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "bounded workflow by date/chat; not a read-only route"},
+    "list_zoom_calls": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "list calls before exact transcript/report"},
+    "get_zoom_call_transcript": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read one call transcript by id/date/topic match"},
+    "export_zoom_call_markdown": {"risk_class": "local_export", "permission_scope": "local_artifact", "side_effects": ["creates_local_markdown_export"], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "local artifact only; report created file/link"},
+    "export_zoom_transcripts_markdown": {"risk_class": "local_export", "permission_scope": "local_artifact", "side_effects": ["creates_local_markdown_export"], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "local artifact only; keep date/query bounded"},
+    "search_zoom_transcripts": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "search transcript snippets before reading full call"},
+    "save_zoom_call_report": {"risk_class": "db_write_current", "permission_scope": "write_current_report", "side_effects": ["writes_zoom_report"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "save current report only after source checks"},
+    "delete_zoom_call_report": {"risk_class": "db_write_current", "permission_scope": "write_current_report", "side_effects": ["deletes_zoom_report"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "delete report state; use deliberately"},
+    "get_owner_reports": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read existing owner reports"},
+    "list_recommendations": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read recommendation rows/status"},
+    "get_recommendation_feedback_context": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read feedback context before deciding follow-up"},
+    "save_recommendation_event": {"risk_class": "db_write_draft", "permission_scope": "write_draft_state", "side_effects": ["writes_recommendation_event"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "record draft/status event; does not send externally"},
+    "get_previous_owner_daily_context": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "continuity context only, not current-day evidence"},
+    "save_owner_daily_report": {"risk_class": "db_write_current", "permission_scope": "write_current_report", "side_effects": ["writes_current_owner_daily_report"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "save report after readiness/source checks; does not send"},
+    "save_owner_weekly_report": {"risk_class": "db_write_current", "permission_scope": "write_current_report", "side_effects": ["writes_current_owner_weekly_report"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "save report after readiness/source checks; does not send"},
+    "send_owner_weekly_report_pdf": {"risk_class": "external_action", "permission_scope": "external_delivery", "side_effects": ["sends_weekly_report_pdf"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "send only after exact preview + confirm=true"},
+    "list_pending_zoom_operational_dispatches": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "find pending dispatch candidates before preview"},
+    "preview_zoom_operational_tasks": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "preview tasks before external dispatch"},
+    "dispatch_zoom_operational_tasks": {"risk_class": "external_action", "permission_scope": "external_delivery", "side_effects": ["creates_or_sends_zoom_operational_tasks"], "requires_confirm": True, "writes_db": True, "external_action": True, "route_hint": "after preview only: call_id + confirm=true"},
+    "list_leader_evaluations": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read evaluations before digest"},
+    "dispatch_leader_evaluations_digest": {"risk_class": "external_action", "permission_scope": "external_delivery", "side_effects": ["sends_leader_evaluations_digest"], "requires_confirm": True, "writes_db": True, "external_action": True, "route_hint": "send digest only after exact text preview + confirm=true"},
+    "list_pending_owner_recommendations": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read unsent recommendation candidates before preview/send"},
+    "send_owner_recommendations_to_bitrix": {"risk_class": "external_action", "permission_scope": "external_delivery", "side_effects": ["sends_owner_recommendations_to_bitrix"], "requires_confirm": True, "writes_db": True, "external_action": True, "route_hint": "send only after per-recipient exact preview + confirm=true"},
+    "send_bitrix_message": {"risk_class": "external_action", "permission_scope": "external_delivery", "side_effects": ["sends_bitrix_personal_message"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "send only after exact recipient/text preview + confirm=true"},
+    "cancel_owner_recommendation": {"risk_class": "db_write_current", "permission_scope": "write_current_state", "side_effects": ["cancels_owner_recommendation", "writes_recommendation_event"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "current-state change, but no external send"},
+    "fetch_url": {"risk_class": "external_read", "permission_scope": "external_read_user_link", "side_effects": ["http_get_external_url"], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "only for user-provided links; prefer internal Albery sources first"},
+    "upsert_ai_instruction": {"risk_class": "db_write_current", "permission_scope": "write_runtime_ai_behavior", "side_effects": ["updates_live_ai_instruction"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "changes live AI behavior; require preview/change summary in operator flow"},
+    "get_ai_capabilities": {"risk_class": "read_only", "permission_scope": "read_ai_capabilities", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read the tier-specific capabilities before answering what the AI can do"},
+    "update_ai_capabilities": {"risk_class": "db_write_current", "permission_scope": "write_runtime_ai_behavior", "side_effects": ["updates_ai_capabilities"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "owner/admin configuration change; preview the capability text before saving"},
+    "list_bitrix_bot_sessions": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "list AI assistant conversations before reading one transcript"},
+    "get_bitrix_bot_chat": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read one bounded AI assistant conversation transcript"},
+    "get_employee_absences": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read employee absence data for a bounded period"},
+    "create_google_sheet": {"risk_class": "external_action", "permission_scope": "external_google_workspace", "side_effects": ["creates_google_sheet", "may_share_sheet_for_editing"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact preview only: title + initial rows + sharing mode + confirm=true"},
+    "get_google_sheet_meta": {"risk_class": "external_read", "permission_scope": "external_google_workspace", "side_effects": ["reads_google_sheet_metadata"], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "inspect exact spreadsheet metadata before edits"},
+    "write_google_sheet_values": {"risk_class": "external_action", "permission_scope": "external_google_workspace", "side_effects": ["writes_google_sheet_values"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact range/value preview only: spreadsheet + range + confirm=true"},
+    "format_google_sheet": {"risk_class": "external_action", "permission_scope": "external_google_workspace", "side_effects": ["formats_google_sheet"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact formatting preview only: spreadsheet + requests + confirm=true"},
+    "move_drive_file_to_folder": {"risk_class": "external_action", "permission_scope": "external_google_workspace", "side_effects": ["moves_drive_item"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact item/folder preview only: item + destination + confirm=true"},
+    "get_webapp_template": {"risk_class": "read_only", "permission_scope": "read_templates", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "retrieve template before creating Apps Script/web app artifacts"},
+    "make_sheet_applet": {"risk_class": "external_action", "permission_scope": "external_google_workspace", "side_effects": ["creates_or_updates_sheet_applet"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact spreadsheet/applet preview only: spreadsheet + sheet + confirm=true"},
+    "share_drive_item_for_everyone": {"risk_class": "external_action", "permission_scope": "external_google_workspace", "side_effects": ["changes_drive_sharing"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact item/share preview only: item + permission + confirm=true"},
+    "remove_drive_item_from_folder": {"risk_class": "external_action", "permission_scope": "external_google_workspace", "side_effects": ["removes_drive_item_from_folder"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact item/folder preview only: item + folder + confirm=true"},
+    "list_drive_folder_items": {"risk_class": "external_read", "permission_scope": "external_google_workspace", "side_effects": ["reads_drive_folder_listing"], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "list exact Drive folder before move/delete/share decisions"},
+    "create_drive_folder": {"risk_class": "external_action", "permission_scope": "external_google_workspace", "side_effects": ["creates_drive_folder"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact folder preview only: name + parent + confirm=true"},
+    "organize_drive_folder": {"risk_class": "external_action", "permission_scope": "external_google_workspace", "side_effects": ["moves_or_renames_drive_items"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact organization preview only: folder + plan + confirm=true"},
+    "manage_apps_script": {"risk_class": "external_action", "permission_scope": "external_google_workspace", "side_effects": ["runs_apps_script_management_action"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "after exact Apps Script action preview only: action + target + confirm=true"},
+    "get_compact_export": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "fast bundled read for a bounded period; avoid large unbounded exploration"},
+}
+
+
+TOOL_RISK_CLASSES: set[str] = {
+    "read_only",
+    "external_read",
+    "local_export",
+    "workflow_db_write",
+    "db_write_draft",
+    "db_write_current",
+    "external_action",
+}
+
+
+def _apply_tool_risk_metadata() -> None:
+    missing = set(TOOLS) - set(TOOL_RISK_METADATA)
+    extra = set(TOOL_RISK_METADATA) - set(TOOLS)
+    if missing or extra:
+        raise RuntimeError(
+            "MCP tool risk metadata mismatch: "
+            f"missing={sorted(missing)} extra={sorted(extra)}"
+        )
+    for name, metadata in TOOL_RISK_METADATA.items():
+        risk_class = metadata.get("risk_class")
+        if risk_class not in TOOL_RISK_CLASSES:
+            raise RuntimeError(f"Invalid MCP risk_class for {name}: {risk_class}")
+        TOOLS[name]["risk_metadata"] = metadata
+
+
+def _tool_description_with_contract(name: str, spec: dict[str, Any]) -> str:
+    metadata = spec.get("risk_metadata") or {}
+    route_hint = metadata.get("route_hint") or ""
+    contract = (
+        f"[action_class={metadata.get('risk_class')}; "
+        f"scope={metadata.get('permission_scope')}; "
+        f"requires_confirm={str(bool(metadata.get('requires_confirm'))).lower()}; "
+        f"route={route_hint}] "
+    )
+    base_description = spec["description"]
+    if name == "start_here_always_read_ai_instructions":
+        return contract + base_description
+    return TOOL_USAGE_CONTRACT + contract + base_description
+
+
+_apply_tool_risk_metadata()
+
 
 FAQ_TOOL_NAMES: set[str] = {
     "start_here_always_read_ai_instructions",
@@ -6096,11 +6249,7 @@ def list_tools(tool_names: set[str] | None = None) -> list[dict[str, Any]]:
     return [
         {
             "name": name,
-            "description": (
-                spec["description"]
-                if name == "start_here_always_read_ai_instructions"
-                else TOOL_USAGE_CONTRACT + spec["description"]
-            ),
+            "description": _tool_description_with_contract(name, spec),
             "inputSchema": spec["inputSchema"],
         }
         for name, spec in _allowed_tools(tool_names).items()

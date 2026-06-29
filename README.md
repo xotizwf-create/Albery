@@ -1,116 +1,166 @@
-# Bitrix24 Weekly Export (Mini App)
+# Albery
 
-Local web app that:
-- lets you pick a week in UI (`Monday -> Sunday`);
-- pulls Bitrix24 tasks created in this week;
-- builds weekly analytics (`total`, `completed`, `overdue`);
-- saves full result into JSON and lets you download it.
+Albery — управленческая AI/MCP-система для анализа работы компании по данным Bitrix, Zoom, чатов и корпоративных документов. Проект собирает контекст из внешних источников, строит отчёты и рекомендации, помогает владельцу и руководителям видеть задачи, риски, итоги созвонов и управленческие выводы.
 
-## PostgreSQL database
+Изначально проект начинался как Bitrix weekly export mini app. Этот режим теперь считается историческим/legacy-контекстом: текущий Albery шире и включает backend, веб-интерфейс, PostgreSQL, MCP-сервер для Hermes, AI-инструкции, Zoom/Bitrix/Google Drive-интеграции, OCR, отчёты и внешние действия в Bitrix.
 
-The approved PostgreSQL v1 schema is in:
 
-```text
-database/postgres_schema_v1.sql
-```
+## Bitrix operational requirement
 
-Set `DATABASE_URL` in `.env`, then run:
+Active Bitrix Marketplace subscription is mandatory. Without it, message delivery and pulling information from Bitrix may stop working.
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe .\scripts\init_postgres.py --dry-run
-.\.venv\Scripts\python.exe .\scripts\init_postgres.py --create-db
-```
+## Что делает проект
 
-The Flask runtime is PostgreSQL-only. `DATABASE_URL` is required; local SQLite databases are not used.
+Основные возможности:
 
-## 1) Bitrix webhook
+- собирает и хранит данные из Bitrix, Zoom, чатов и Google Drive / Apps Script;
+- строит ежедневные и недельные управленческие отчёты;
+- анализирует Zoom-созвоны, транскрипты, участников, задачи и оценки руководителей;
+- формирует owner-рекомендации и контекст для дальнейших решений;
+- работает с OCR вложений из чатов;
+- даёт Hermes/ИИ доступ к доменным инструментам через MCP;
+- создаёт, удаляет и отправляет отдельные действия в Bitrix только по правилам подтверждения;
+- хранит редактируемые AI-инструкции, которые влияют на поведение агента.
 
-Important Bitrix requirement:
-- Active Bitrix Marketplace subscription is mandatory. Without it, message delivery and pulling information from Bitrix may stop working.
+## Основные компоненты
 
-Create incoming webhook in Bitrix24 and grant scopes:
-- `task`
-- `user`
-- `im`
-- `disk`
-- `department` (optional but recommended)
+- Backend — Flask-приложение: маршруты, workflow, отчёты, интеграции, webhooks, Bitrix/Zoom/Drive/OCR logic.
+- Frontend — React/Vite веб-интерфейс для просмотра данных, отчётов, настроек, AI-инструкций и ручных действий.
+- PostgreSQL — основной источник данных и состояния проекта.
+- MCP — доменный сервер инструментов для Hermes/ИИ. Он не является чисто read-only: часть инструментов читает, часть пишет, часть запускает workflow, часть выполняет внешние действия.
+- Hermes workflows — промпты, cron-сценарии и живые AI-инструкции для Telegram-оператора.
+- Вебхуки — входящие события Bitrix, Zoom и Google Drive.
+- Скрипты — инициализация БД, миграции, обновление AI-промптов, синхронизации и вспомогательные проверки.
 
-Put webhook base into `.env`:
+## Архитектурный принцип
 
-```env
-BITRIX_WEBHOOK_BASE=https://yourcompany.bitrix24.ru/rest/1/xxxxxxxxxxxx
-FLASK_SECRET_KEY=replace-with-random-string
-BITRIX_EXPORT_MODE=audit
-BITRIX_REQUEST_DELAY=0.05
-BITRIX_LOOKBACK_DAYS=30
-```
+Текущий целевой контур управления — MCP-first:
 
-## 2) Run app (Windows PowerShell)
+1. Hermes/ИИ получает контекст через MCP-инструменты.
+2. Чтение, preview, запись и внешние действия разделяются по классам риска.
+3. Опасные действия идут по правилу: просмотр → preview → явное подтверждение владельца → вызов с `confirm=true`.
+4. Legacy HTTP API не должен считаться безопасным активным контуром без отдельного решения и тех же confirmation rules.
+5. UI нужно рассматривать как отдельную manual/admin-поверхность, которую надо привести к тем же правилам, что и MCP.
 
-```powershell
-cd "G:\OneDrive\Рабочий стол\Мои проекты\Евгений. Разработка"
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item .env.example .env
-# edit .env and paste your real webhook URL
-python app.py
-```
+## Классы действий и подтверждения
 
-Open browser:
+Единый стандарт для MCP, backend API и UI:
 
-```text
-http://127.0.0.1:5000
-```
+- `read_only` — только чтение локального контекста; подтверждение не требуется.
+- `external_read` — внешний запрос без записи; нужен allowlist или отдельный регламент.
+- `local_export` — создание локального файла/ссылки; нужно явно сообщать, что создан артефакт.
+- `webhook_ingest_sync` — автоматический входящий webhook; подтверждение владельца не требуется, но нужны секрет/подпись, идемпотентность и логирование.
+- `db_write_draft` — запись черновика, события или версии без внешней отправки.
+- `db_write_current` — изменение текущего состояния или живых AI-инструкций; нужен preview/summary изменения.
+- `external_action` — создание/удаление задач, отправка сообщений, PDF, рекомендаций или дайджестов во внешние системы; всегда нужен server-side `confirm=true` после preview и явного согласования.
 
-## 3) How to use
-1. Pick week in the UI.
-2. Click `Build JSON + Analytics`.
-3. Download JSON with `Download JSON`.
+## MCP и AI-агент
 
-Exported files are stored in `exports/`.
+MCP-сервер — это граница доступа ИИ к данным и действиям проекта. Он даёт Hermes доменные инструменты вместо произвольного SQL и прямого доступа к сервисам.
 
-## Notes
-- Filtering is by `CREATED_DATE` in the selected week.
-- `BITRIX_EXPORT_MODE=fast` builds the report quickly from task list data and user profiles.
-- `BITRIX_EXPORT_MODE=audit` loads full task details, comments, checklist and available history for tasks in the selected period. Use this for AI analysis.
-- `BITRIX_EXPORT_MODE=full` is reserved for the same deep export behavior and can take longer on large periods.
-- Audit mode uses Bitrix `batch` requests (up to 50 commands per request) to reduce API calls and avoid rate limits.
-- `BITRIX_LOOKBACK_DAYS=30` limits how far back the scanner goes before the requested week. Increase it if you need very old open tasks in fresh weekly reports.
-- The app tries both endpoint styles:
-  - `/rest/{user}/{token}/method`
-  - `/rest/api/{user}/{token}/method`
-- The app auto-detects webhook scope:
-  - `tasks` (REST v3) — uses `tasks.task.*` via `/rest/api/`
-  - `task` (REST v2/legacy) — uses legacy-compatible methods
-- If `tasks.task.list` is unavailable on your portal, the app auto-falls back to legacy list methods (`task.item.list` / `task.ctasks.getlist`).
-- If some method is unavailable for your Bitrix plan or rights, JSON still includes task data and stores method error for that section.
+Важно:
 
-## One-command startup
+- MCP-инструменты нельзя считать безопасными только по названию.
+- Перед использованием нужно смотреть tool contract и фактический handler.
+- Инструменты записи и внешних действий должны иметь явную confirmation policy.
+- `create_bitrix_task` требует `confirm=true`.
+- Инструменты удаления/отправки/dispatch также должны требовать `confirm=true`.
+- `upsert_ai_instruction` меняет поведение агента в runtime и должен считаться изменением текущего состояния, а не обычным редактированием текста.
+- `fetch_url` относится к external read и требует отдельной политики доменов/ссылок.
 
-Windows PowerShell:
+## Legacy API и веб-интерфейс
 
-```powershell
-.\start.ps1
-```
+В проекте есть legacy HTTP API и веб-интерфейс, который всё ещё содержит много вызовов к `/api/*`.
 
-What it does:
-- creates `.venv` if needed;
-- installs Python dependencies;
-- creates and initializes PostgreSQL if needed;
-- installs frontend dependencies if needed;
-- builds `Интерфейс/dist`;
-- starts Flask on `http://127.0.0.1:5001`.
+Текущее правило аудита:
 
-Fast restart after dependencies are installed:
+- `/api/*` по умолчанию считается legacy-поверхностью;
+- если legacy API используется, для него должны действовать те же классы риска и подтверждения, что и для MCP;
+- если legacy API не используется, это должно быть явно отражено в документации и UI-политике;
+- UI-кнопки внешних отправок не должны полагаться только на модальное окно в браузере: server-side confirm-gate обязателен.
 
-```powershell
-.\start.ps1 -SkipInstall
-```
+## База данных и миграции
 
-Custom backend port:
+Проект использует PostgreSQL.
 
-```powershell
-.\start.ps1 -Port 5000
-```
+Текущий стандарт миграций:
+
+- базовая схема — v1;
+- последующие миграции идут поверх базовой схемы, начиная со следующего номера;
+- отсутствие первой отдельной миграции не считается потерей, если базовая схема выступает как v1;
+- перед любыми изменениями схемы на production нужна отдельная проверка бэкапа, preflight и явное решение владельца.
+
+Миграционную систему сейчас не нужно переписывать. Сначала нужно закрепить текущий стандарт в архитектурной документации и тестах.
+
+## Тесты и проверки
+
+В проекте есть:
+
+- unit-тесты чистой логики;
+- интеграционные тесты с mock/fake зависимостями;
+- MCP contract-тесты;
+- DB-тесты, которые должны запускаться только на тестовой базе;
+- backend CI с PostgreSQL;
+- frontend type-check/build;
+- security audit зависимостей.
+
+Рекомендуемый порядок безопасной проверки изменений:
+
+1. Точечный тест на изменённое поведение.
+2. Ближайший набор contract/regression tests.
+3. Лёгкая статическая проверка изменённых Python-файлов.
+4. Полный релевантный suite только в подготовленном окружении.
+5. Production-проверки, миграции и деплой — только через отдельный preflight.
+
+## Текущий аудит и найденные риски
+
+В репозитории есть аудит-артефакты:
+
+- аудит MCP как границы доступа ИИ;
+- матрица UI/API/MCP действий и правил подтверждения;
+- аудит качества, технических рисков и стандартизации.
+
+Ключевые выводы аудита:
+
+- Albery уже является большой управленческой системой, а не mini app для weekly export.
+- Главный технический риск — несколько очень крупных central/god-object файлов.
+- MCP, UI и legacy API являются параллельными поверхностями управления и должны иметь единые safety rules.
+- Документация прежних эпох противоречила текущей архитектуре.
+- Внешние действия должны иметь preview и обязательный server-side confirm.
+- Тесты и CI есть, но safety-покрытие external actions нужно расширять.
+
+## Приоритеты стабилизации
+
+Нельзя начинать с большого рефакторинга. Сначала нужны маленькие, проверяемые изменения:
+
+1. Закрыть явные safety gaps вокруг внешних действий.
+2. Сделать документацию честной и единой.
+3. Добавить machine-readable risk model для MCP-инструментов и API/UI действий.
+4. Расширить tests around confirmation gates и legacy API policy.
+5. Только после этого постепенно выделять домены из крупных backend/frontend/MCP-файлов.
+
+## Документы, которые нужно поддерживать
+
+Рекомендуемый набор источников правды:
+
+- `README.md` — короткий главный вход в проект: что это, из чего состоит, какие правила безопасности.
+- `docs/about-project.md` — подробное описание продукта, бизнес-логики, потоков данных и интеграций.
+- `docs/architecture-standard.md` — архитектурный стандарт: MCP-first, legacy API policy, UI policy, confirmation policy, migration policy, testing policy.
+- `docs/playbooks/` — отдельные operational playbooks вместо накопления всего в одном большом файле.
+- `mcp/README.md` — контракт MCP-инструментов, классы риска и правила подтверждения.
+- `agent.md` — короткий operational index, а не единственное место для всей истории проекта.
+
+## Что не делать без отдельного решения
+
+- Не переписывать главный backend-файл целиком.
+- Не удалять legacy API без проверки реального production/UI режима.
+- Не запускать миграции по боевой БД без backup-check и preflight.
+- Не менять живые AI-инструкции без preview, версии и плана отката.
+- Не менять Hermes cron/промпты без отдельного operational playbook.
+- Не считать frontend мёртвым только потому, что часть API помечена legacy.
+
+## Историческая заметка: Bitrix weekly export
+
+Старый режим проекта был сфокусирован на выборе недели, выгрузке Bitrix-задач, построении weekly analytics и сохранении JSON export. Эти функции остаются частью истории и отдельных возможностей проекта, но больше не описывают весь Albery.
+
+Если нужно восстановить старый локальный сценарий запуска или export-процесс, его следует вынести в отдельный legacy-документ, а не держать как главный README проекта.

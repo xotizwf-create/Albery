@@ -87,3 +87,52 @@ def test_faq_cannot_call_a_full_only_tool(ctx):
         tool_names=ctx.FAQ_TOOL_NAMES,
     )
     assert resp["error"]["code"] == -32601
+
+
+
+def test_every_tool_has_risk_metadata(ctx):
+    required_fields = {
+        "risk_class",
+        "permission_scope",
+        "side_effects",
+        "requires_confirm",
+        "writes_db",
+        "external_action",
+        "route_hint",
+    }
+    allowed_classes = ctx.TOOL_RISK_CLASSES
+    for name, spec in ctx.TOOLS.items():
+        metadata = spec.get("risk_metadata")
+        assert isinstance(metadata, dict), f"{name}: missing risk_metadata"
+        missing = required_fields - set(metadata)
+        assert not missing, f"{name}: missing risk metadata fields: {sorted(missing)}"
+        assert metadata["risk_class"] in allowed_classes, f"{name}: invalid risk_class"
+        assert isinstance(metadata["side_effects"], list), f"{name}: side_effects must be a list"
+        assert isinstance(metadata["requires_confirm"], bool), f"{name}: requires_confirm must be bool"
+        assert isinstance(metadata["writes_db"], bool), f"{name}: writes_db must be bool"
+        assert isinstance(metadata["external_action"], bool), f"{name}: external_action must be bool"
+        assert isinstance(metadata["route_hint"], str) and metadata["route_hint"].strip(), f"{name}: route_hint missing"
+
+
+def test_external_actions_require_confirm_in_schema(ctx):
+    for name, spec in ctx.TOOLS.items():
+        metadata = spec["risk_metadata"]
+        schema = spec["inputSchema"]
+        required = set(schema.get("required") or [])
+        properties = schema.get("properties") or {}
+        if metadata["external_action"]:
+            assert metadata["risk_class"] == "external_action", f"{name}: external_action must use external_action risk class"
+            assert metadata["requires_confirm"] is True, f"{name}: external actions must require confirm"
+            assert "confirm" in required, f"{name}: confirm must be required in schema"
+            assert properties.get("confirm", {}).get("type") == "boolean", f"{name}: confirm must be a boolean property"
+        else:
+            assert metadata["risk_class"] != "external_action", f"{name}: external_action risk class must set external_action=true"
+
+
+def test_tool_list_exposes_short_route_contract(ctx):
+    resp = ctx.handle_request({"jsonrpc": "2.0", "id": 20, "method": "tools/list"})
+    for tool in resp["result"]["tools"]:
+        description = tool["description"]
+        assert "action_class=" in description, f"{tool['name']}: action_class not exposed"
+        assert "scope=" in description, f"{tool['name']}: permission scope not exposed"
+        assert "route=" in description, f"{tool['name']}: route hint not exposed"
