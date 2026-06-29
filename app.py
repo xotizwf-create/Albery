@@ -19,7 +19,7 @@ import time
 from collections import Counter
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from uuid import UUID, uuid4
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
@@ -20439,6 +20439,19 @@ def legacy_http_api_enabled() -> bool:
     return os.getenv("ALLOW_LEGACY_HTTP_API", "").strip() == "1"
 
 
+def legacy_external_action_confirmed(payload: Mapping[str, Any]) -> bool:
+    """Server-side gate for legacy HTTP routes that send data outside the app."""
+    return payload.get("confirm") is True
+
+
+def legacy_external_action_confirm_error():
+    return error_response(
+        "External action requires confirm=true after preview and explicit owner approval.",
+        400,
+        "confirm_required",
+    )
+
+
 def error_response(message: str, status_code: int = 400, code: str = "error", *, request_id: str | None = None):
     payload = {"error": {"code": code, "message": message}}
     if request_id:
@@ -21185,8 +21198,10 @@ def api_zoom_call_report_delete(call_id: str):
 
 @app.post("/api/zoom-calls/<call_id>/dispatch-operational-tasks")
 def api_zoom_call_dispatch_operational_tasks(call_id: str):
+    request_payload = request.get_json(silent=True) or {}
+    if not legacy_external_action_confirmed(request_payload):
+        return legacy_external_action_confirm_error()
     try:
-        request_payload = request.get_json(silent=True) or {}
         preview_payload = request_payload.get("preview") if isinstance(request_payload.get("preview"), dict) else None
         result = dispatch_prepared_zoom_operational_tasks(preview_payload) if preview_payload else dispatch_zoom_operational_tasks(call_id)
     except ValueError as exc:
@@ -24852,6 +24867,8 @@ def api_owner_daily_reports_list():
 @app.post("/api/owner/daily-reports/<report_id>/send")
 def api_owner_daily_report_send(report_id: str):
     payload = request.get_json(silent=True) or {}
+    if not legacy_external_action_confirmed(payload):
+        return legacy_external_action_confirm_error()
     recipient_ids = payload.get("recipient_ids") or payload.get("recipients") or []
     recipient_recommendations = payload.get("recipient_recommendations") or payload.get("recommendations_by_recipient")
     if not isinstance(recipient_ids, list):
@@ -24877,6 +24894,8 @@ def api_owner_daily_report_send(report_id: str):
 @app.post("/api/owner/daily-reports/<report_id>/send-full")
 def api_owner_daily_report_send_full(report_id: str):
     payload = request.get_json(silent=True) or {}
+    if not legacy_external_action_confirmed(payload):
+        return legacy_external_action_confirm_error()
     recipient_ids = payload.get("recipient_ids") or payload.get("recipients") or []
     if not isinstance(recipient_ids, list):
         return jsonify({"error": "recipient_ids должен быть списком Bitrix user id."}), 400
@@ -24964,6 +24983,8 @@ def api_owner_weekly_reports_list():
 @app.post("/api/owner/weekly-reports/<report_id>/send")
 def api_owner_weekly_report_send(report_id: str):
     payload = request.get_json(silent=True) or {}
+    if not legacy_external_action_confirmed(payload):
+        return legacy_external_action_confirm_error()
     recipient_ids = payload.get("recipient_ids") or payload.get("recipients") or []
     recipient_recommendations = payload.get("recipient_recommendations") or payload.get("recommendations_by_recipient")
     if not isinstance(recipient_ids, list):
@@ -24989,6 +25010,8 @@ def api_owner_weekly_report_send(report_id: str):
 @app.post("/api/owner/weekly-reports/<report_id>/send-full")
 def api_owner_weekly_report_send_full(report_id: str):
     payload = request.get_json(silent=True) or {}
+    if not legacy_external_action_confirmed(payload):
+        return legacy_external_action_confirm_error()
     recipient_ids = payload.get("recipient_ids") or payload.get("recipients") or []
     if not isinstance(recipient_ids, list):
         return jsonify({"error": "recipient_ids должен быть списком Bitrix user id."}), 400
