@@ -157,13 +157,13 @@
 - POST `/api/registry/sync` → `api_registry_sync`: db_write_or_workflow; режим: legacy_http_api_only_by_default_410; подтверждение: review_recommended
 
 ### 4.3. Внешние действия и отправки
-- POST `/api/zoom-calls/<call_id>/dispatch-operational-tasks` → `api_zoom_call_dispatch_operational_tasks`: external_action; режим: legacy_http_api_only_by_default_410; подтверждение: missing_or_ui_only
-- POST `/api/owner/daily-reports/<report_id>/send` → `api_owner_daily_report_send`: external_action; режим: legacy_http_api_only_by_default_410; подтверждение: missing_or_ui_only
-- POST `/api/owner/daily-reports/<report_id>/send-full` → `api_owner_daily_report_send_full`: external_action; режим: legacy_http_api_only_by_default_410; подтверждение: missing_or_ui_only
-- POST `/api/owner/weekly-reports/<report_id>/send` → `api_owner_weekly_report_send`: external_action; режим: legacy_http_api_only_by_default_410; подтверждение: missing_or_ui_only
-- POST `/api/owner/weekly-reports/<report_id>/send-full` → `api_owner_weekly_report_send_full`: external_action; режим: legacy_http_api_only_by_default_410; подтверждение: missing_or_ui_only
+- POST `/api/zoom-calls/<call_id>/dispatch-operational-tasks` → `api_zoom_call_dispatch_operational_tasks`: external_action; режим: legacy_http_api_only_by_default_410; подтверждение: server_side_confirm_true
+- POST `/api/owner/daily-reports/<report_id>/send` → `api_owner_daily_report_send`: external_action; режим: legacy_http_api_only_by_default_410; подтверждение: server_side_confirm_true
+- POST `/api/owner/daily-reports/<report_id>/send-full` → `api_owner_daily_report_send_full`: external_action; режим: legacy_http_api_only_by_default_410; подтверждение: server_side_confirm_true
+- POST `/api/owner/weekly-reports/<report_id>/send` → `api_owner_weekly_report_send`: external_action; режим: legacy_http_api_only_by_default_410; подтверждение: server_side_confirm_true
+- POST `/api/owner/weekly-reports/<report_id>/send-full` → `api_owner_weekly_report_send_full`: external_action; режим: legacy_http_api_only_by_default_410; подтверждение: server_side_confirm_true
 
-Наблюдение: в HTTP legacy API внешние отправки выполняются POST-маршрутами без явного `confirm=true` на уровне маршрута. Возможно, подтверждение есть только в UI через модалки/кнопки. Для стандарта этого недостаточно: внешнее действие должно иметь server-side confirm-gate, как уже сделано в части MCP-инструментов.
+Статус после стандартизации: даже если legacy HTTP API включён флагом, внешние POST-отправки требуют server-side `confirm=true`; UI передаёт этот флаг только после своего preview/модального подтверждения.
 
 ## 5. Frontend-вызовы `/api/*`
 
@@ -247,7 +247,7 @@
 ## 7. Приоритетные несостыковки для исправления
 
 1. `create_bitrix_task` в MCP — добавить обязательный confirm-gate и/или отдельный preview-инструмент.
-2. Legacy HTTP отправки в Bitrix (`/api/owner/.../send`, `/send-full`, `/api/zoom-calls/.../dispatch-operational-tasks`) — если legacy API будет использоваться, добавить server-side подтверждение; если не будет — явно задокументировать как отключённое.
+2. Legacy HTTP отправки в Bitrix (`/api/owner/.../send`, `/send-full`, `/api/zoom-calls/.../dispatch-operational-tasks`) — закрыто: legacy API по умолчанию 410; при включении внешние POST требуют server-side `confirm=true`.
 3. `process_chat_ocr` — переклассифицировать из “служебного чтения” в workflow-запись; решить, нужен ли confirm или достаточно ограничений по дате/чату/force.
 4. `upsert_ai_instruction` и UI-редактирование AI-инструкций — считать изменением поведения агента; добавить версионность/preview/журнал принятия изменений.
 5. `fetch_url` — добавить allowlist/denylist и запрет внутренних адресов, чтобы не превращать MCP в произвольный сетевой fetcher.

@@ -2450,6 +2450,7 @@ export default function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            confirm: true,
             recipient_ids: ownerReportRecipientIds,
             ...(ownerReportSendMode === "recommendations"
               ? {
@@ -4388,7 +4389,7 @@ export default function App() {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ preview: zoomDispatchPreview }),
+          body: JSON.stringify({ confirm: true, preview: zoomDispatchPreview }),
         },
         180000,
       );
