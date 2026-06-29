@@ -43,13 +43,13 @@ def test_zoom_participant_reports_uses_actual_participants_only(app_module, monk
 
     payload = app_module.build_zoom_participant_reports_dispatch("call-1")
 
-    assert len(payload["task_cards"]) == 2
+    assert len(payload["task_cards"]) == 1
     by_name = {card["recipient"]["name"]: card for card in payload["task_cards"]}
-    assert set(by_name) == {"Иван Иванов", "Мария Петрова"}
+    assert set(by_name) == {"Мария Петрова"}
     assert "Сергей Сидоров" not in by_name
+    assert "Иван Иванов" not in by_name
     assert "План продаж" in by_name["Мария Петрова"]["description"]
     assert "Хорошо включалась" in by_name["Мария Петрова"]["description"]
-    assert "поддерживающая обратная связь" in by_name["Иван Иванов"]["description"].lower()
     assert payload["unmatched_participants"] == []
 
 
@@ -60,11 +60,12 @@ def test_operational_dispatch_preview_combines_tasks_and_participant_reports(app
 
     preview = app_module.preview_zoom_operational_tasks("call-1")
 
-    assert [card["card_kind"] for card in preview["task_cards"]] == ["operational", "participant_report", "participant_report"]
+    assert [card["card_kind"] for card in preview["task_cards"]] == ["operational", "participant_report"]
     assert preview["task_cards"][0]["recipient"]["user_id"] == 101
     assert preview["task_cards"][0]["is_lead_card"] is True
     assert "Задачи для постановки" in preview["task_cards"][0]["description"]
-    assert len(preview["participant_task_cards"]) == 2
+    assert len(preview["participant_task_cards"]) == 1
+    assert preview["participant_task_cards"][0]["recipient"]["user_id"] == 102
     assert preview["participant_reports_error"] == ""
 
 

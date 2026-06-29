@@ -5543,6 +5543,23 @@ def build_zoom_participant_reports_dispatch(call_id: str, require_webhook: bool 
     name_aliases = load_employee_name_aliases()
     title = zoom_dispatch_title(call)
     deadline, deadline_text = zoom_dispatch_deadline(call)
+    lead_recipient_id: int | None = None
+    lead_person = next(
+        (person for person in participants if str(person.get("role_on_call") or "").strip().lower() == "host"),
+        None,
+    )
+    if lead_person is None:
+        lead_person = next((person for person in participants if person.get("is_leader")), None)
+    if lead_person is not None:
+        lead_recipient = resolve_zoom_recipient(
+            str(lead_person.get("name") or ""),
+            to_int(lead_person.get("bitrix_user_id")),
+            team,
+            name_aliases,
+        )
+        if lead_recipient is not None:
+            lead_recipient_id = to_int(lead_recipient.get("user_id"))
+
     cards: list[dict[str, Any]] = []
     unmatched: list[str] = []
     seen: set[str] = set()
@@ -5554,6 +5571,9 @@ def build_zoom_participant_reports_dispatch(call_id: str, require_webhook: bool 
         if recipient is None:
             if name not in unmatched:
                 unmatched.append(name)
+            continue
+        recipient_id = to_int(recipient.get("user_id"))
+        if lead_recipient_id is not None and recipient_id == lead_recipient_id:
             continue
         key = f"user:{recipient['user_id']}"
         if key in seen:
