@@ -2694,6 +2694,58 @@ def normalize_zoom_operational_tasks_for_raw_json(report_text: str, analysis: di
     return section_tasks
 
 
+ZOOM_REPORT_REQUIRED_ANALYSIS_KEYS = ("dispatch_summary", "leader_evaluations", "people", "operational_tasks")
+ZOOM_REPORT_REQUIRED_TASK_KEYS = (
+    "assignee_name",
+    "bitrix_user_id",
+    "deadline_text",
+    "result_criteria",
+    "expected_artifact",
+    "responsibility_check",
+    "status",
+    "source",
+)
+
+
+def validate_zoom_call_report_analysis(analysis: dict[str, Any], status: str = "done") -> None:
+    """Reject abbreviated Zoom report JSON before it can be persisted.
+
+    The human-readable `report_text` is useful for reading, but downstream Zoom
+    dispatch relies on the structured `analysis` payload for the summary,
+    participants/mentioned people, leader evaluations, and per-task artifacts.
+    A shortened payload such as {leaders_present, operational_tasks_count}
+    looks superficially valid JSON but silently drops those fields.
+    """
+    if status == "error":
+        return
+    if not isinstance(analysis, dict) or not analysis:
+        raise McpError(-32602, "analysis must be the full zoom_processing JSON object")
+
+    missing = [key for key in ZOOM_REPORT_REQUIRED_ANALYSIS_KEYS if key not in analysis]
+    if missing:
+        raise McpError(-32602, "analysis is incomplete; missing keys: " + ", ".join(missing))
+
+    if not str(analysis.get("dispatch_summary") or "").strip():
+        raise McpError(-32602, "analysis.dispatch_summary must be non-empty")
+    if not isinstance(analysis.get("leader_evaluations"), list):
+        raise McpError(-32602, "analysis.leader_evaluations must be a list")
+    if not isinstance(analysis.get("people"), dict):
+        raise McpError(-32602, "analysis.people must be an object")
+
+    operational_tasks = analysis.get("operational_tasks")
+    if not isinstance(operational_tasks, list):
+        raise McpError(-32602, "analysis.operational_tasks must be a list")
+    for index, task in enumerate(operational_tasks, start=1):
+        if not isinstance(task, dict):
+            raise McpError(-32602, f"analysis.operational_tasks[{index}] must be an object")
+        task_missing = [key for key in ZOOM_REPORT_REQUIRED_TASK_KEYS if key not in task]
+        if task_missing:
+            raise McpError(
+                -32602,
+                f"analysis.operational_tasks[{index}] is incomplete; missing keys: " + ", ".join(task_missing),
+            )
+
+
 def tool_save_zoom_call_report(args: dict[str, Any]) -> dict[str, Any]:
     call_id = str(args.get("call_id") or "").strip()
     zoom_uuid = str(args.get("zoom_uuid") or "").strip()
@@ -2714,6 +2766,7 @@ def tool_save_zoom_call_report(args: dict[str, Any]) -> dict[str, Any]:
     if status not in {"done", "error"}:
         raise McpError(-32602, "status must be done or error")
 
+    validate_zoom_call_report_analysis(analysis, status)
     operational_tasks = normalize_zoom_operational_tasks_for_raw_json(report_text, analysis)
     report_payload = {
         "source": "mcp_save_zoom_call_report",
