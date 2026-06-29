@@ -81,9 +81,9 @@
 - `save_owner_daily_report` — создаёт новую версию ежедневного owner-отчёта и снимает `is_current` со старой.
 - `save_owner_weekly_report` — создаёт новую версию недельного owner-отчёта и снимает `is_current` со старой.
 - `cancel_owner_recommendation` — меняет статус рекомендации на cancelled и пишет событие.
-- `upsert_ai_instruction` — создаёт/обновляет папки и живые AI-инструкции.
+- `upsert_ai_instruction` — создаёт/обновляет папки и живые AI-инструкции; в safety-пакете добавлен server-side `confirm=true`, preview wording в tool contract и `expected_current_content` guard, чтобы не перезаписывать инструкцию, если она изменилась после preview.
 
-Общий вывод: эти инструменты не отправляют наружу, но меняют источник правды. Для них нужен стандарт “какая запись считается черновиком, какая текущей версией, можно ли перезаписать без preview”. Особенно критичен `upsert_ai_instruction`, потому что меняет поведение агента в рантайме.
+Общий вывод: эти инструменты не отправляют наружу, но меняют источник правды. Для них нужен стандарт “какая запись считается черновиком, какая текущей версией, можно ли перезаписать без preview”. Для `upsert_ai_instruction` этот стандарт уже закреплён на MCP-границе: preview → явное подтверждение → `confirm=true`, а при перезаписи можно передать `expected_current_content` для защиты от stale-preview.
 
 ### 6. Внешние действия / Bitrix / отправки
 
@@ -96,11 +96,11 @@
 - `send_owner_weekly_report_pdf` — требует `confirm=true`; отправляет PDF недельного отчёта в Bitrix.
 - `send_bitrix_message` — требует `confirm=true`; отправляет личное сообщение в Bitrix.
 
-Без confirm-gate обнаружено:
+Без confirm-gate было обнаружено:
 
-- `create_bitrix_task` — сразу вызывает Bitrix `tasks.task.add`. Есть проверки обязательных полей и неоднозначности ответственного, но нет обязательного `confirm=true` и preview-gate.
+- `create_bitrix_task` — на момент аудита сразу вызывал Bitrix `tasks.task.add`. В safety-пакете закрыто: теперь обязательны preview и `confirm=true`.
 
-Это главная несостыковка MCP-границы на текущем этапе.
+Эта главная несостыковка MCP-границы закрыта в safety-пакете.
 
 ## Связанные backend workflow из `app.py`
 

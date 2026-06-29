@@ -51,7 +51,7 @@ The MCP registry exposes risk metadata for every tool: `risk_class`, `permission
 - `get_owner_reports` - read recent current owner daily/weekly reports for recommendation continuity.
 - `save_owner_daily_report` - write a generated daily owner report to `owner_daily_reports`.
 - `save_owner_weekly_report` - write a generated weekly owner report to `owner_weekly_reports`.
-- `upsert_ai_instruction` - create or update an instruction folder under "Настройки -> Инструкции для ИИ".
+- `upsert_ai_instruction` - create or update an instruction folder under "Настройки -> Инструкции для ИИ" only after previewing the exact path/content and receiving explicit confirmation; `confirm=true` is mandatory, and overwrites can use `expected_current_content` to reject stale previews.
 - `get_compact_export` - compact bundle generated from live PostgreSQL data.
 
 ## Recommended Usage Pattern
