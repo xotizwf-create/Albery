@@ -52,6 +52,7 @@ The MCP registry exposes risk metadata for every tool: `risk_class`, `permission
 - `save_owner_daily_report` - write a generated daily owner report to `owner_daily_reports`.
 - `save_owner_weekly_report` - write a generated weekly owner report to `owner_weekly_reports`.
 - `upsert_ai_instruction` - create or update an instruction folder under "Настройки -> Инструкции для ИИ" only after previewing the exact path/content and receiving explicit confirmation; `confirm=true` is mandatory, and overwrites can use `expected_current_content` to reject stale previews.
+- `fetch_url` - fetch a user-provided (`user_provided=true`) or explicitly approved (`confirm_external=true`) external URL as bounded plain text; Google Sheets/Docs links are auto-rewritten to export endpoints, and private/internal hosts are blocked before request and after redirects.
 - `get_compact_export` - compact bundle generated from live PostgreSQL data.
 
 ## Recommended Usage Pattern

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import importlib
 import logging
 import os
@@ -4374,12 +4375,38 @@ def _strip_html_to_text(html: str) -> str:
     return text.strip()
 
 
+def _validate_fetch_url_scope(url: str, *, user_provided: bool = False, confirm_external: bool = False) -> None:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise McpError(-32602, "url must include a hostname.")
+    if parsed.username or parsed.password:
+        raise McpError(-32602, "url must not include credentials.")
+    if host in {"localhost", "ip6-localhost", "ip6-loopback"} or host.endswith(".local") or host.endswith(".localhost"):
+        raise McpError(-32602, "fetch_url cannot fetch localhost or private/internal hosts.")
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        ip = None
+    if ip and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        raise McpError(-32602, "fetch_url cannot fetch private, loopback, link-local, or reserved IP addresses.")
+    if not (user_provided or confirm_external):
+        raise McpError(
+            -32602,
+            "External URL fetches require user_provided=true for a link supplied by the user, "
+            "or confirm_external=true after an explicit external-read preview.",
+        )
+
+
 def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
     url = str(args.get("url") or "").strip()
     if not url:
         raise McpError(-32602, "url is required.")
     if not re.match(r"^https?://", url):
         raise McpError(-32602, "url must start with http:// or https://.")
+    user_provided = args.get("user_provided") is True
+    confirm_external = args.get("confirm_external") is True
+    _validate_fetch_url_scope(url, user_provided=user_provided, confirm_external=confirm_external)
     max_chars_raw = args.get("max_chars")
     if max_chars_raw in (None, ""):
         max_chars = 50_000
@@ -4407,6 +4434,7 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
             content_type = response.headers.get("Content-Type", "") or ""
             raw_bytes = response.read(max_chars * 6 + 4096)
             final_url = response.geturl() or fetched_url
+            _validate_fetch_url_scope(final_url, user_provided=True, confirm_external=True)
     except urllib.error.HTTPError as exc:
         try:
             body_preview = exc.read().decode("utf-8", "replace")[:500]
@@ -6071,6 +6099,14 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "boolean",
                     "description": "Strip HTML tags to plain text when the response looks like HTML. Default true.",
                 },
+                "user_provided": {
+                    "type": "boolean",
+                    "description": "Set true only when the URL was supplied by the user in chat/request. Required unless confirm_external=true.",
+                },
+                "confirm_external": {
+                    "type": "boolean",
+                    "description": "Set true only after an explicit external-read preview/approval for non-user-supplied URLs. Private/internal hosts remain blocked.",
+                },
             },
             "required": ["url"],
             "additionalProperties": False,
@@ -6174,7 +6210,7 @@ TOOL_RISK_METADATA: dict[str, dict[str, Any]] = {
     "send_owner_recommendations_to_bitrix": {"risk_class": "external_action", "permission_scope": "external_delivery", "side_effects": ["sends_owner_recommendations_to_bitrix"], "requires_confirm": True, "writes_db": True, "external_action": True, "route_hint": "send only after per-recipient exact preview + confirm=true"},
     "send_bitrix_message": {"risk_class": "external_action", "permission_scope": "external_delivery", "side_effects": ["sends_bitrix_personal_message"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "send only after exact recipient/text preview + confirm=true"},
     "cancel_owner_recommendation": {"risk_class": "db_write_current", "permission_scope": "write_current_state", "side_effects": ["cancels_owner_recommendation", "writes_recommendation_event"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "current-state change, but no external send"},
-    "fetch_url": {"risk_class": "external_read", "permission_scope": "external_read_user_link", "side_effects": ["http_get_external_url"], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "only for user-provided links; prefer internal Albery sources first"},
+    "fetch_url": {"risk_class": "external_read", "permission_scope": "external_read_user_link", "side_effects": ["http_get_external_url"], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "only for user-provided links (user_provided=true) or explicitly approved external reads (confirm_external=true); private/internal hosts are blocked"},
     "upsert_ai_instruction": {"risk_class": "db_write_current", "permission_scope": "write_runtime_ai_behavior", "side_effects": ["updates_live_ai_instruction"], "requires_confirm": True, "writes_db": True, "external_action": False, "route_hint": "changes live AI behavior; exact path + content preview + confirm=true; use expected_current_content for overwrites"},
     "get_ai_capabilities": {"risk_class": "read_only", "permission_scope": "read_ai_capabilities", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read the tier-specific capabilities before answering what the AI can do"},
     "update_ai_capabilities": {"risk_class": "db_write_current", "permission_scope": "write_runtime_ai_behavior", "side_effects": ["updates_ai_capabilities"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "owner/admin configuration change; preview the capability text before saving"},
