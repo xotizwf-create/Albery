@@ -2331,6 +2331,11 @@ def tool_get_chat_ocr_status(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_process_chat_ocr(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "OCR processing requires confirm=true. First show the user the date range/dialog and whether force=true will reprocess files.",
+        )
     date_from = parse_date_arg(args, "date_from")
     date_to = parse_date_arg(args, "date_to", required=False) or date_from
     dialog_id = str(args.get("dialog_id") or "").strip()
@@ -5224,8 +5229,9 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "date_to": {"type": "string", "description": "YYYY-MM-DD"},
                 "dialog_id": {"type": "string"},
                 "force": {"type": "boolean"},
+                "confirm": {"type": "boolean", "description": "must be true after user preview/approval"},
             },
-            "required": ["date_from"],
+            "required": ["date_from", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_process_chat_ocr,
@@ -6112,7 +6118,7 @@ TOOL_RISK_METADATA: dict[str, dict[str, Any]] = {
     "search_messages": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "bounded message search by date/dialog/query"},
     "get_chat_transcript": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read one bounded transcript, not all chats"},
     "get_chat_ocr_status": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "check OCR state before processing images"},
-    "process_chat_ocr": {"risk_class": "workflow_db_write", "permission_scope": "write_derived_state", "side_effects": ["processes_chat_images", "updates_ocr_state"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "bounded workflow by date/chat; not a read-only route"},
+    "process_chat_ocr": {"risk_class": "workflow_db_write", "permission_scope": "write_derived_state", "side_effects": ["processes_chat_images", "updates_ocr_state"], "requires_confirm": True, "writes_db": True, "external_action": False, "route_hint": "preview exact date/dialog/force scope, then call with confirm=true"},
     "list_zoom_calls": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "list calls before exact transcript/report"},
     "get_zoom_call_transcript": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read one call transcript by id/date/topic match"},
     "export_zoom_call_markdown": {"risk_class": "local_export", "permission_scope": "local_artifact", "side_effects": ["creates_local_markdown_export"], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "local artifact only; report created file/link"},
