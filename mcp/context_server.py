@@ -4157,16 +4157,29 @@ def tool_cancel_owner_recommendation(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_upsert_ai_instruction(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "AI instruction changes require confirm=true. First show the owner the exact path, change summary, "
+            "and replacement content preview; pass expected_current_content when overwriting an existing instruction.",
+        )
+
     raw_path = str(args.get("path") or "").strip()
     content = str(args.get("content") or "")
+    expected_current_content = args.get("expected_current_content")
+    if expected_current_content is not None:
+        expected_current_content = str(expected_current_content)
     if not raw_path:
         raise McpError(-32602, "Missing required argument: path")
     if len(content) > 500_000:
         raise McpError(-32602, "content is too large; maximum is 500000 characters")
+    if expected_current_content is not None and len(expected_current_content) > 500_000:
+        raise McpError(-32602, "expected_current_content is too large; maximum is 500000 characters")
     path_parts = [part.strip() for part in raw_path.replace("\\", "/").split("/") if part.strip()]
     if not path_parts:
         raise McpError(-32602, "path must include at least one folder name")
 
+    previous_content = None
     with connect() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -4177,7 +4190,7 @@ def tool_upsert_ai_instruction(args: dict[str, Any]) -> dict[str, Any]:
                 for index, name in enumerate(path_parts):
                     cur.execute(
                         """
-                        SELECT id, name
+                        SELECT id, name, content
                         FROM ai_instruction_folders
                         WHERE ((%s::uuid IS NULL AND parent_id IS NULL) OR parent_id = %s::uuid)
                           AND lower(name) = lower(%s)
@@ -4200,13 +4213,19 @@ def tool_upsert_ai_instruction(args: dict[str, Any]) -> dict[str, Any]:
                             """
                             INSERT INTO ai_instruction_folders (parent_id, name, content, sort_order)
                             VALUES (%s, %s, '', %s)
-                            RETURNING id, name
+                            RETURNING id, name, content
                             """,
                             (parent_id, name, sort_order),
                         )
                         current = cur.fetchone()
                     parent_id = current["id"]
                     if index == len(path_parts) - 1:
+                        previous_content = current.get("content") or ""
+                        if expected_current_content is not None and previous_content != expected_current_content:
+                            raise McpError(
+                                -32000,
+                                "AI instruction was changed since preview; read it again before overwriting.",
+                            )
                         cur.execute(
                             """
                             UPDATE ai_instruction_folders
@@ -4218,7 +4237,12 @@ def tool_upsert_ai_instruction(args: dict[str, Any]) -> dict[str, Any]:
                         )
                         current = cur.fetchone()
     ttl_cache_delete_prefix(("ai_instruction_rows",))
-    return {"folder": current, "path": " / ".join(path_parts)}
+    return {
+        "folder": current,
+        "path": " / ".join(path_parts),
+        "previous_content_chars": len(previous_content or ""),
+        "content_chars": len(content),
+    }
 
 
 def _compact_owner_report(report: dict[str, Any]) -> dict[str, Any]:
@@ -6054,14 +6078,21 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_fetch_url,
     },
     "upsert_ai_instruction": {
-        "description": "Create or update one editable AI instruction folder by path in Настройки -> Инструкции для ИИ.",
+        "description": (
+            "Create or update one editable AI instruction folder by path in Настройки -> Инструкции для ИИ. "
+            "This changes live AI behavior: show the exact path, change summary, and replacement content preview, "
+            "then call only after approval with confirm=true. For overwrites, pass expected_current_content from "
+            "the preview so concurrent edits are not lost."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Folder path separated by /, for example: Формирование отчетов/Ежедневный отчет по компании"},
                 "content": {"type": "string"},
+                "expected_current_content": {"type": "string", "description": "Optional current content from preview; write fails if it no longer matches"},
+                "confirm": {"type": "boolean", "description": "must be true after owner/admin preview approval"},
             },
-            "required": ["path", "content"],
+            "required": ["path", "content", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_upsert_ai_instruction,
@@ -6144,7 +6175,7 @@ TOOL_RISK_METADATA: dict[str, dict[str, Any]] = {
     "send_bitrix_message": {"risk_class": "external_action", "permission_scope": "external_delivery", "side_effects": ["sends_bitrix_personal_message"], "requires_confirm": True, "writes_db": False, "external_action": True, "route_hint": "send only after exact recipient/text preview + confirm=true"},
     "cancel_owner_recommendation": {"risk_class": "db_write_current", "permission_scope": "write_current_state", "side_effects": ["cancels_owner_recommendation", "writes_recommendation_event"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "current-state change, but no external send"},
     "fetch_url": {"risk_class": "external_read", "permission_scope": "external_read_user_link", "side_effects": ["http_get_external_url"], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "only for user-provided links; prefer internal Albery sources first"},
-    "upsert_ai_instruction": {"risk_class": "db_write_current", "permission_scope": "write_runtime_ai_behavior", "side_effects": ["updates_live_ai_instruction"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "changes live AI behavior; require preview/change summary in operator flow"},
+    "upsert_ai_instruction": {"risk_class": "db_write_current", "permission_scope": "write_runtime_ai_behavior", "side_effects": ["updates_live_ai_instruction"], "requires_confirm": True, "writes_db": True, "external_action": False, "route_hint": "changes live AI behavior; exact path + content preview + confirm=true; use expected_current_content for overwrites"},
     "get_ai_capabilities": {"risk_class": "read_only", "permission_scope": "read_ai_capabilities", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "read the tier-specific capabilities before answering what the AI can do"},
     "update_ai_capabilities": {"risk_class": "db_write_current", "permission_scope": "write_runtime_ai_behavior", "side_effects": ["updates_ai_capabilities"], "requires_confirm": False, "writes_db": True, "external_action": False, "route_hint": "owner/admin configuration change; preview the capability text before saving"},
     "list_bitrix_bot_sessions": {"risk_class": "read_only", "permission_scope": "read_company_context", "side_effects": [], "requires_confirm": False, "writes_db": False, "external_action": False, "route_hint": "list AI assistant conversations before reading one transcript"},
