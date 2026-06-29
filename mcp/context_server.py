@@ -3631,6 +3631,24 @@ def tool_dispatch_zoom_operational_tasks(args: dict[str, Any]) -> dict[str, Any]
     return json_safe(result)
 
 
+def tool_preview_zoom_participant_reports(args: dict[str, Any]) -> dict[str, Any]:
+    call_id = str(args.get("call_id") or "").strip()
+    if not call_id:
+        raise McpError(-32602, "Missing required argument: call_id")
+    workflow = app_workflow_function("preview_zoom_participant_reports")
+    return json_safe(workflow(call_id))
+
+
+def tool_dispatch_zoom_participant_reports(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Sending requires confirm=true. The owner/user must explicitly approve sending personal participant reports as Bitrix tasks.")
+    call_id = str(args.get("call_id") or "").strip()
+    if not call_id:
+        raise McpError(-32602, "Missing required argument: call_id")
+    workflow = app_workflow_function("dispatch_zoom_participant_reports")
+    return json_safe(workflow(call_id))
+
+
 def tool_list_leader_evaluations(args: dict[str, Any]) -> dict[str, Any]:
     date_from = parse_date_arg(args, "date_from", required=False)
     date_to = parse_date_arg(args, "date_to", required=False)
@@ -5629,6 +5647,37 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_dispatch_zoom_operational_tasks,
+    },
+    "preview_zoom_participant_reports": {
+        "description": (
+            "Preview personal participant report Bitrix tasks for one Zoom call WITHOUT sending: one supportive task per matched participant, "
+            "with shared call outcomes plus personal soft evaluation. Uses raw_json.ai_report.analysis dispatch_summary, people, "
+            "leader_evaluations and person_summaries when present. Separate from operational task dispatch."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"call_id": {"type": "string", "description": "Zoom call UUID."}},
+            "required": ["call_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_preview_zoom_participant_reports,
+    },
+    "dispatch_zoom_participant_reports": {
+        "description": (
+            "Create personal participant report Bitrix tasks for one Zoom call: one task per matched participant, containing shared summary "
+            "and supportive personal feedback. Requires confirm=true. Marks raw_json.ai_report.participant_reports_dispatched_at and "
+            "participant_report_task_ids; does NOT affect operational bitrix_dispatch status."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "call_id": {"type": "string", "description": "Zoom call UUID."},
+                "confirm": {"type": "boolean", "description": "Must be true after explicit approval."},
+            },
+            "required": ["call_id", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_dispatch_zoom_participant_reports,
     },
     "list_leader_evaluations": {
         "description": (

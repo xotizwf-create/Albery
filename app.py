@@ -5478,6 +5478,156 @@ def preview_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
     }
 
 
+def _zoom_person_summaries(call: dict[str, Any]) -> list[dict[str, Any]]:
+    analysis = _zoom_ai_analysis(call)
+    raw = analysis.get("person_summaries") if isinstance(analysis.get("person_summaries"), list) else []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _find_person_summary(name: str, bitrix_user_id: int | None, summaries: list[dict[str, Any]], name_aliases: dict[str, str]) -> dict[str, Any] | None:
+    for item in summaries:
+        item_id = to_int(item.get("bitrix_user_id"))
+        if item_id is not None and bitrix_user_id is not None and item_id == bitrix_user_id:
+            return item
+    target = name_aliases.get(normalize_person_name(name), name)
+    for item in summaries:
+        item_name_raw = str(item.get("person_name") or item.get("name") or "").strip()
+        item_name = name_aliases.get(normalize_person_name(item_name_raw), item_name_raw)
+        if item_name and target and person_names_match(item_name, target):
+            return item
+    return None
+
+
+def _participant_feedback_text(recipient_name: str, recipient_id: int | None, person_summary: dict[str, Any] | None, leader_eval: dict[str, Any] | None, person_tasks: list[dict[str, Any]]) -> str:
+    if person_summary:
+        text = str(person_summary.get("message_for_person") or person_summary.get("personal_feedback") or person_summary.get("summary") or "").strip()
+        score = person_summary.get("score") or person_summary.get("rating")
+        positives = person_summary.get("positives") if isinstance(person_summary.get("positives"), list) else []
+        remarks = person_summary.get("remarks") if isinstance(person_summary.get("remarks"), list) else []
+        if not text:
+            parts = []
+            if positives:
+                parts.append("Сильные стороны: " + "; ".join(str(x).strip() for x in positives if str(x).strip()))
+            if remarks:
+                parts.append("Зона роста: " + "; ".join(str(x).strip() for x in remarks if str(x).strip()))
+            text = "\n".join(parts).strip()
+        if score and "10/10" not in text:
+            text = f"Оценка: {score}/10. {text}".strip()
+        if text:
+            return text
+    if leader_eval:
+        message = str(leader_eval.get("message_for_leader") or leader_eval.get("result_for_owner") or "").strip()
+        verdict = str(leader_eval.get("verdict") or "").strip().lower()
+        if verdict in {"issue", "critical", "bad", "very_bad"}:
+            return (message or "Есть точки роста по участию в созвоне.") + "\n\n" + "Это поддерживающая обратная связь: выберите один конкретный шаг для следующей встречи, сохраняя сильные стороны. Это не повод демотивироваться."
+        if message:
+            return message
+    if person_tasks:
+        return "Вы были полезны на созвоне: по итогам встречи за вами закреплены понятные следующие шаги. Оценка: 10/10 — замечаний по участию нет."
+    return "Спасибо за участие в созвоне. Замечаний по вашему участию нет — оценка 10/10. Продолжайте в том же темпе."
+
+
+def _zoom_report_people_for_participant_reports(call: dict[str, Any]) -> list[dict[str, Any]]:
+    """Actual participants plus explicitly mentioned employees for participant report dispatch."""
+    people = list(zoom_call_participants(call))
+    analysis = _zoom_ai_analysis(call)
+    people_block = analysis.get("people") if isinstance(analysis.get("people"), dict) else {}
+    for key in ("mentioned_people", "mentioned_employees", "mentioned_participants"):
+        raw = people_block.get(key) if isinstance(people_block.get(key), list) else []
+        for item in raw:
+            if isinstance(item, dict):
+                name = str(item.get("person_name") or item.get("raw_name") or item.get("name") or "").strip()
+                bitrix_user_id = to_int(item.get("bitrix_user_id"))
+            else:
+                name = str(item or "").strip()
+                bitrix_user_id = None
+            if name:
+                people.append({"name": name, "bitrix_user_id": bitrix_user_id, "org_match": "", "is_leader": False, "role_on_call": "mentioned"})
+    return people
+
+
+def build_zoom_participant_reports_dispatch(call_id: str, require_webhook: bool = False) -> dict[str, Any]:
+    call = load_zoom_call_detail(call_id)
+    if not call:
+        raise ValueError("Zoom-созвон не найден.")
+    if require_webhook and not os.getenv("BITRIX_WEBHOOK_BASE", "").strip():
+        raise ValueError("Укажите BITRIX_WEBHOOK_BASE в файле .env.")
+    raw_json = call.get("raw_json") if isinstance(call.get("raw_json"), dict) else {}
+    ai_report = raw_json.get("ai_report") if isinstance(raw_json.get("ai_report"), dict) else {}
+    if ai_report.get("participant_reports_dispatched_at"):
+        raise ValueError("Персональные итоги участникам уже отправлены по этому созвону.")
+    participants = _zoom_report_people_for_participant_reports(call)
+    tasks = zoom_call_operational_tasks(call)
+    leader_evals = zoom_call_leader_evaluations(call)
+    person_summaries = _zoom_person_summaries(call)
+    dispatch_summary = format_zoom_dispatch_summary(call) or str(call.get("analytical_note") or "").strip()[:1500]
+    team = load_team_members()
+    name_aliases = load_employee_name_aliases()
+    title = zoom_dispatch_title(call)
+    deadline, deadline_text = zoom_dispatch_deadline(call)
+    cards: list[dict[str, Any]] = []
+    unmatched: list[str] = []
+    seen: set[str] = set()
+    for person in participants:
+        name = str(person.get("name") or "").strip()
+        if not name:
+            continue
+        recipient = resolve_zoom_recipient(name, to_int(person.get("bitrix_user_id")), team, name_aliases)
+        if recipient is None:
+            if name not in unmatched:
+                unmatched.append(name)
+            continue
+        key = f"user:{recipient['user_id']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        recipient_tasks = [t for t in tasks if resolve_zoom_recipient(str(t.get("assignee_name") or ""), to_int(t.get("bitrix_user_id")), team, name_aliases) == recipient]
+        summary = _find_person_summary(recipient["name"], to_int(recipient["user_id"]), person_summaries, name_aliases)
+        leader_eval = find_zoom_leader_evaluation(recipient["name"], to_int(recipient["user_id"]), leader_evals, name_aliases)
+        feedback = _participant_feedback_text(recipient["name"], to_int(recipient["user_id"]), summary, leader_eval, recipient_tasks)
+        cards.append({"recipient": recipient, "assignee_name": recipient["name"], "title": title, "description": "\n\n".join(["📋 Общие итоги созвона", dispatch_summary.strip(), "🌱 Персональная обратная связь", feedback.strip()]).strip(), "deadline": deadline, "deadline_text": deadline_text, "personal_feedback": feedback, "person_summary": summary})
+    if not cards:
+        raise ValueError("Не удалось собрать ни одного сопоставленного участника для персональной рассылки.")
+    return {"call": call, "recipients": [c["recipient"] for c in cards], "title": title, "description": cards[0]["description"], "deadline": deadline, "deadline_text": deadline_text, "dispatch_summary": dispatch_summary, "task_cards": cards, "unmatched_participants": unmatched}
+
+
+def preview_zoom_participant_reports(call_id: str) -> dict[str, Any]:
+    payload = build_zoom_participant_reports_dispatch(call_id)
+    return {k: v for k, v in payload.items() if k != "call"}
+
+
+def mark_zoom_participant_reports_dispatched(call_id: str, results: list[dict[str, Any]]) -> None:
+    if not postgres_enabled():
+        return
+    task_ids = [to_int(item.get("task_id")) for item in results if isinstance(item, dict)]
+    task_ids = [tid for tid in task_ids if tid is not None]
+    dispatched_at = datetime.now(MSK_TZ).isoformat()
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE zoom_calls
+                    SET raw_json = jsonb_set(
+                            jsonb_set(jsonb_set(COALESCE(raw_json, '{}'::jsonb), '{ai_report}', COALESCE(raw_json->'ai_report', '{}'::jsonb), true),
+                            '{ai_report,participant_reports_dispatched_at}', to_jsonb(%s::text), true),
+                            '{ai_report,participant_report_task_ids}', %s::jsonb, true),
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (dispatched_at, pg_json(task_ids), call_id),
+                )
+
+
+def dispatch_zoom_participant_reports(call_id: str) -> dict[str, Any]:
+    payload = build_zoom_participant_reports_dispatch(call_id, require_webhook=True)
+    result = dispatch_prepared_zoom_operational_tasks(payload)
+    mark_zoom_participant_reports_dispatched(call_id, result.get("results") or [])
+    result["call_id"] = call_id
+    result["unmatched_participants"] = payload.get("unmatched_participants") or []
+    return result
+
+
 def dispatch_zoom_operational_tasks(call_id: str) -> dict[str, Any]:
     payload = build_zoom_operational_tasks_dispatch(call_id, require_webhook=True)
     result = dispatch_prepared_zoom_operational_tasks(payload)
@@ -21205,6 +21355,29 @@ def api_zoom_call_dispatch_operational_tasks_preview(call_id: str):
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"Не удалось подготовить список задач: {exc}"}), 500
+    return jsonify({"ok": True, "result": result})
+
+
+@app.post("/api/zoom-calls/<call_id>/dispatch-participant-reports")
+def api_zoom_call_dispatch_participant_reports(call_id: str):
+    try:
+        result = dispatch_zoom_participant_reports(call_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Не удалось отправить персональные итоги участникам: {exc}"}), 500
+    call = load_zoom_call_detail(call_id)
+    return jsonify({"ok": True, "call": call, "result": result, "message": f"Персональные итоги отправлены: {result.get('sent', 0)}"})
+
+
+@app.get("/api/zoom-calls/<call_id>/dispatch-participant-reports/preview")
+def api_zoom_call_dispatch_participant_reports_preview(call_id: str):
+    try:
+        result = preview_zoom_participant_reports(call_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Не удалось подготовить персональные итоги: {exc}"}), 500
     return jsonify({"ok": True, "result": result})
 
 
