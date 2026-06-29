@@ -251,7 +251,7 @@
 3. `process_chat_ocr` — закрыто: переклассифицирован как workflow-запись; handler требует `confirm=true` после preview диапазона дат/чата и режима `force`.
 4. `upsert_ai_instruction` и UI-редактирование AI-инструкций — закрыто на MCP-границе: preview → явное подтверждение → `confirm=true`; перезапись поддерживает `expected_current_content` guard от stale-preview.
 5. `fetch_url` — закрыто: external-read contract требует `user_provided=true` или `confirm_external=true`; private/internal hosts блокируются до запроса и после редиректа.
-6. Документацию обновить: `mcp/README.md` не должен говорить read-only без оговорок; root `README.md` должен описывать реальный Albery, а не старый Bitrix weekly export.
+6. Документация — закрыто: `mcp/README.md` больше не описывает MCP как чисто read-only, root `README.md` описывает текущий Albery, а старый Bitrix weekly export помечен как legacy-контекст.
 
 ## 8. Что делать дальше
 
