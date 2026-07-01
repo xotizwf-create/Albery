@@ -1,6 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
+import csv
+import io
 import importlib
 import logging
 import os
@@ -4373,23 +4375,120 @@ _GOOGLE_GID_RE = re.compile(r"[?&#]gid=(\d+)")
 
 
 def _rewrite_url_for_export(url: str) -> tuple[str, str]:
+    # Non-Google URLs are still fetched directly. Google Docs/Sheets are read through
+    # the agent's OAuth account in _fetch_google_url_with_oauth, so private files shared
+    # with a9ent.ai@gmail.com work without opening public link access.
+    return (url, "raw")
+
+
+def _google_url_kind(url: str) -> tuple[str, str | None, str | None]:
     m = _GOOGLE_SHEETS_RE.search(url)
     if m:
-        sheet_id = m.group(1)
         gid_match = _GOOGLE_GID_RE.search(url)
-        gid_part = f"&gid={gid_match.group(1)}" if gid_match else ""
-        return (
-            f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_part}",
-            "google_sheet_csv",
-        )
+        return ("google_sheet_csv", m.group(1), gid_match.group(1) if gid_match else None)
     m = _GOOGLE_DOCS_RE.search(url)
     if m:
-        doc_id = m.group(1)
-        return (
-            f"https://docs.google.com/document/d/{doc_id}/export?format=txt",
-            "google_doc_text",
-        )
-    return (url, "raw")
+        return ("google_doc_text", m.group(1), None)
+    return ("raw", None, None)
+
+
+def _google_creds_for_fetch() -> Any:
+    try:
+        return app_workflow_function("_google_user_credentials")()
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Google OAuth credentials are unavailable: {exc}") from exc
+
+
+def _csv_text_from_sheet_values(values: list[list[Any]]) -> str:
+    out = io.StringIO()
+    writer = csv.writer(out)
+    for row in values or []:
+        writer.writerow(["" if cell is None else cell for cell in row])
+    return out.getvalue()
+
+
+def _extract_google_doc_text(document: dict[str, Any]) -> str:
+    parts: list[str] = []
+
+    def walk(elements: Any) -> None:
+        if not isinstance(elements, list):
+            return
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+            text_run = el.get("textRun")
+            if isinstance(text_run, dict):
+                parts.append(str(text_run.get("content") or ""))
+            paragraph = el.get("paragraph")
+            if isinstance(paragraph, dict):
+                walk(paragraph.get("elements"))
+            table = el.get("table")
+            if isinstance(table, dict):
+                for row in table.get("tableRows") or []:
+                    for cell in (row or {}).get("tableCells") or []:
+                        walk((cell or {}).get("content"))
+                    parts.append("\n")
+            if el.get("sectionBreak") is not None:
+                parts.append("\n")
+
+    body = document.get("body") if isinstance(document, dict) else {}
+    walk((body or {}).get("content"))
+    text = "".join(parts)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _fetch_google_url_with_oauth(url: str, max_chars: int) -> dict[str, Any] | None:
+    kind, file_id, gid = _google_url_kind(url)
+    if kind == "raw" or not file_id:
+        return None
+    try:
+        from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
+
+        creds = _google_creds_for_fetch()
+        if kind == "google_sheet_csv":
+            sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+            meta = sheets.spreadsheets().get(
+                spreadsheetId=file_id,
+                fields="properties(title),sheets(properties(sheetId,title,index))",
+            ).execute()
+            sheets_props = [s.get("properties") or {} for s in (meta.get("sheets") or [])]
+            chosen = None
+            if gid is not None:
+                for props in sheets_props:
+                    if str(props.get("sheetId")) == str(gid):
+                        chosen = props
+                        break
+            if chosen is None and sheets_props:
+                chosen = sorted(sheets_props, key=lambda item: item.get("index", 0))[0]
+            if not chosen:
+                raise McpError(-32010, "Google Sheet has no readable tabs.")
+            title = str(chosen.get("title") or "Sheet1")
+            safe_title = title.replace("'", "''")
+            resp = sheets.spreadsheets().values().get(
+                spreadsheetId=file_id,
+                range=f"'{safe_title}'",
+                valueRenderOption="FORMATTED_VALUE",
+            ).execute()
+            text = _csv_text_from_sheet_values(resp.get("values") or [])
+            return {"status": 200, "content_type": "text/csv; charset=utf-8", "text": text, "final_url": url, "kind": kind}
+
+        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        exported = drive.files().export(fileId=file_id, mimeType="text/plain").execute()
+        if isinstance(exported, bytes):
+            text = exported.decode("utf-8", "replace")
+        else:
+            text = str(exported or "")
+        return {"status": 200, "content_type": "text/plain; charset=utf-8", "text": text.strip(), "final_url": url, "kind": kind}
+    except McpError:
+        raise
+    except HttpError as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None) or 0
+        raise McpError(-32010, f"Google API HTTP {status}: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Google API fetch failed: {exc}") from exc
 
 
 def _strip_html_to_text(html: str) -> str:
@@ -4423,51 +4522,52 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
     strip_html_flag = bool(args.get("strip_html", True))
 
     fetched_url, kind = _rewrite_url_for_export(url)
-    request = urllib.request.Request(
-        fetched_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; AlberyMCP/0.7 fetch_url)",
-            "Accept": "text/csv,text/plain,text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            status = response.status
-            content_type = response.headers.get("Content-Type", "") or ""
-            raw_bytes = response.read(max_chars * 6 + 4096)
-            final_url = response.geturl() or fetched_url
-    except urllib.error.HTTPError as exc:
+    google_result = _fetch_google_url_with_oauth(url, max_chars)
+    if google_result is not None:
+        status = int(google_result["status"])
+        content_type = str(google_result["content_type"])
+        text = str(google_result.get("text") or "")
+        final_url = str(google_result.get("final_url") or url)
+        kind = str(google_result.get("kind") or kind)
+    else:
+        request = urllib.request.Request(
+            fetched_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; AlberyMCP/0.7 fetch_url)",
+                "Accept": "text/csv,text/plain,text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+            },
+            method="GET",
+        )
         try:
-            body_preview = exc.read().decode("utf-8", "replace")[:500]
-        except Exception:  # noqa: BLE001
-            body_preview = ""
-        hint = ""
-        if kind in {"google_sheet_csv", "google_doc_text"} and exc.code in (401, 403, 302, 401):
-            hint = (
-                "Похоже, документ Google закрыт. Откройте доступ «Любой, у кого есть ссылка — Просмотр» "
-                "(Поделиться → изменить доступ → Любой, у кого есть ссылка), либо положите файл в Drive-папку, "
-                "которую читает Albery через Apps Script, и используйте search_company_knowledge / list_company_files."
-            )
-        return {
-            "ok": False,
-            "original_url": url,
-            "fetched_url": fetched_url,
-            "kind": kind,
-            "status": exc.code,
-            "error": f"HTTP {exc.code}",
-            "body_preview": body_preview,
-            "hint": hint,
-        }
-    except Exception as exc:  # noqa: BLE001
-        raise McpError(-32010, f"Fetch failed: {exc}") from exc
+            with urllib.request.urlopen(request, timeout=30) as response:
+                status = response.status
+                content_type = response.headers.get("Content-Type", "") or ""
+                raw_bytes = response.read(max_chars * 6 + 4096)
+                final_url = response.geturl() or fetched_url
+        except urllib.error.HTTPError as exc:
+            try:
+                body_preview = exc.read().decode("utf-8", "replace")[:500]
+            except Exception:  # noqa: BLE001
+                body_preview = ""
+            return {
+                "ok": False,
+                "original_url": url,
+                "fetched_url": fetched_url,
+                "kind": kind,
+                "status": exc.code,
+                "error": f"HTTP {exc.code}",
+                "body_preview": body_preview,
+                "hint": "",
+            }
+        except Exception as exc:  # noqa: BLE001
+            raise McpError(-32010, f"Fetch failed: {exc}") from exc
 
-    charset_match = re.search(r"charset=([a-zA-Z0-9_\-]+)", content_type)
-    charset = charset_match.group(1) if charset_match else "utf-8"
-    try:
-        text = raw_bytes.decode(charset, errors="replace")
-    except LookupError:
-        text = raw_bytes.decode("utf-8", errors="replace")
+        charset_match = re.search(r"charset=([a-zA-Z0-9_\-]+)", content_type)
+        charset = charset_match.group(1) if charset_match else "utf-8"
+        try:
+            text = raw_bytes.decode(charset, errors="replace")
+        except LookupError:
+            text = raw_bytes.decode("utf-8", errors="replace")
 
     looks_html = ("html" in content_type.lower()) or text.lstrip().lower().startswith(("<!doctype", "<html"))
     if strip_html_flag and looks_html and kind == "raw":
