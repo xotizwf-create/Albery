@@ -401,14 +401,16 @@ def _server_memory() -> tuple[float, float] | None:
         return None
 
 
-def monitoring_payload() -> dict[str, Any]:
-    """Live monitoring snapshot; shared by the SPA endpoint and the agent's
-    get_agent_monitoring MCP tool."""
+def monitoring_payload(chart_days: int = 1) -> dict[str, Any]:
+    """Live monitoring snapshot; shared by the SPA endpoint, the agent's
+    get_agent_monitoring MCP tool and the half-hourly health watchdog."""
+    chart_days = min(max(int(chart_days or 1), 1), 90)
     now_msk = msk_now()
     today_start = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
     yday_start = today_start - timedelta(days=1)
     yday_same_time = now_msk - timedelta(days=1)
     day_ago = now_msk - timedelta(hours=24)
+    chart_since = now_msk - timedelta(days=chart_days)
     week_ago = now_msk - timedelta(days=7)
     db_t0 = time.perf_counter()
     with pg_connect() as conn:
@@ -432,7 +434,7 @@ def monitoring_payload() -> dict[str, Any]:
             cur.execute(
                 "SELECT created_at, latency_ms, status FROM bitrix_bot_interactions"
                 " WHERE created_at >= %s ORDER BY created_at",
-                (day_ago,),
+                (chart_since,),
             )
             turn_rows = cur.fetchall()
             cur.execute(
@@ -459,10 +461,11 @@ def monitoring_payload() -> dict[str, Any]:
                 logging.warning("agent_center: zoom/drive freshness query failed", exc_info=True)
     db_ms = int((time.perf_counter() - db_t0) * 1000)
 
-    # Minute-precision speed chart: every turn of the last 24h is its own point.
+    # Minute-precision speed chart: every turn of the window is its own point.
+    time_fmt = "%H:%M" if chart_days == 1 else "%d.%m %H:%M"
     chart = [
         {
-            "time": r["created_at"].astimezone(MSK_TZ).strftime("%H:%M"),
+            "time": r["created_at"].astimezone(MSK_TZ).strftime(time_fmt),
             "speed": round(int(r["latency_ms"]) / 1000) if r["latency_ms"] else 0,
             "error": r["status"] != "ok",
         }
@@ -594,10 +597,67 @@ def monitoring_payload() -> dict[str, Any]:
 @app.get("/api/agent-center/monitoring")
 def agent_center_monitoring():
     try:
-        return jsonify(monitoring_payload())
+        chart_days = int(request.args.get("chart_days") or 1)
+    except (TypeError, ValueError):
+        chart_days = 1
+    try:
+        return jsonify(monitoring_payload(chart_days))
     except Exception:  # noqa: BLE001
         logging.exception("agent_center monitoring failed")
         return jsonify({"error": "Не удалось загрузить мониторинг."}), 500
+
+
+# --- Health watchdog: proactive checks every 30 min with instant TG alerts ------------------
+# The monitoring page only shows problems when someone looks at it; this loop looks at it
+# FOR us (same health snapshot: DB, MCP, brain freshness, Bitrix, Zoom, Drive, RAM) and
+# alerts the Albery notifications group the moment something goes red — plus one
+# recovery message when everything is green again. Per-problem cooldown avoids spam.
+
+_WATCHDOG_INTERVAL_S = int(os.getenv("AGENT_HEALTH_CHECK_INTERVAL_S", "1800"))
+_WATCHDOG_COOLDOWN_S = int(os.getenv("AGENT_HEALTH_ALERT_COOLDOWN_S", "10800"))
+_watchdog_last_alert: dict[str, float] = {}
+_watchdog_had_problems = False
+
+
+def _health_watchdog_once() -> None:
+    global _watchdog_had_problems
+    payload = monitoring_payload()
+    problems = payload.get("problems") or []
+    now = time.monotonic()
+    fresh = [p for p in problems if now - _watchdog_last_alert.get(p, -_WATCHDOG_COOLDOWN_S) >= _WATCHDOG_COOLDOWN_S]
+    from b24bot import _albery_tg_notify
+    if fresh:
+        for p in fresh:
+            _watchdog_last_alert[p] = now
+        text = "⚠️ Мониторинг Albery: проблемы\n" + "\n".join(f"— {p}" for p in problems) + \
+            "\nДетали: /agent-monitoring (повторы приглушены на " + str(_WATCHDOG_COOLDOWN_S // 3600) + " ч)"
+        ok, err = _albery_tg_notify(text)
+        if not ok:
+            logging.error("agent_center watchdog: alert delivery failed: %s", err)
+    if problems:
+        _watchdog_had_problems = True
+    elif _watchdog_had_problems:
+        _watchdog_had_problems = False
+        _watchdog_last_alert.clear()
+        ok, err = _albery_tg_notify("✅ Мониторинг Albery: все системы снова в норме")
+        if not ok:
+            logging.error("agent_center watchdog: recovery delivery failed: %s", err)
+
+
+def _health_watchdog_loop() -> None:
+    time.sleep(120)  # let the app finish booting before the first check
+    while True:
+        try:
+            _health_watchdog_once()
+        except Exception:  # noqa: BLE001
+            logging.exception("agent_center: health watchdog check failed")
+        time.sleep(_WATCHDOG_INTERVAL_S)
+
+
+if os.getenv("AGENT_HEALTH_WATCHDOG", "1").strip() != "0":
+    import threading
+
+    threading.Thread(target=_health_watchdog_loop, daemon=True, name="agent-health-watchdog").start()
 
 
 # --- Usage accounting (/api/agent-center/usage) ---------------------------------------------

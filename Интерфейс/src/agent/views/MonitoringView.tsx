@@ -36,6 +36,7 @@ export function MonitoringView() {
   const [activeAgentId, setActiveAgentId] = useState("");
   const [data, setData] = useState<MonitoringData | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [chartDays, setChartDays] = useState(1);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -49,14 +50,14 @@ export function MonitoringView() {
 
   const load = useCallback(() => {
     setRefreshing(true);
-    fetchMonitoring()
+    fetchMonitoring(chartDays)
       .then((d) => {
         setData(d);
         setError("");
       })
       .catch((e: Error) => setError(e.message))
       .finally(() => setRefreshing(false));
-  }, []);
+  }, [chartDays]);
 
   useEffect(() => {
     load();
@@ -235,14 +236,35 @@ export function MonitoringView() {
         {/* Charts & Health Row */}
         <div className="grid grid-cols-3 gap-6">
           <div className="col-span-2 bg-white p-6 rounded-2xl border border-gray-100 shadow-sm">
-            <div className="flex items-center gap-2 mb-6">
+            <div className="flex items-center gap-2 mb-6 flex-wrap">
               <Clock className="w-4 h-4 text-gray-400" />
               <h3 className="font-semibold text-gray-900">
-                Скорость ответов за 24 часа, сек — каждый ход
+                Скорость ответов, сек — каждый ход
               </h3>
-              <span className="ml-auto text-[11px] font-bold text-gray-400">
-                {data?.chart.length ?? 0} ходов
-              </span>
+              <div className="ml-auto flex items-center gap-2">
+                <span className="text-[11px] font-bold text-gray-400 mr-1">
+                  {data?.chart.length ?? 0} ходов
+                </span>
+                {[
+                  { d: 1, label: "24 часа" },
+                  { d: 3, label: "3 дня" },
+                  { d: 7, label: "7 дней" },
+                  { d: 30, label: "30 дней" },
+                ].map((p) => (
+                  <button
+                    key={p.d}
+                    onClick={() => setChartDays(p.d)}
+                    className={cn(
+                      "px-2.5 py-1 rounded-lg text-[11.5px] font-bold transition-colors",
+                      chartDays === p.d
+                        ? "bg-indigo-50 text-indigo-700"
+                        : "bg-gray-50 text-gray-500 hover:bg-gray-100",
+                    )}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
             </div>
             <div className="h-[200px] w-full focus:outline-none">
               <ResponsiveContainer

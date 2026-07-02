@@ -155,8 +155,12 @@ export interface MonitoringData {
   problems: string[];
 }
 
-export async function fetchMonitoring(): Promise<MonitoringData> {
-  return (await fetchJsonSafe("/api/agent-center/monitoring", undefined, 30000)) as MonitoringData;
+export async function fetchMonitoring(chartDays = 1): Promise<MonitoringData> {
+  return (await fetchJsonSafe(
+    `/api/agent-center/monitoring?chart_days=${chartDays}`,
+    undefined,
+    30000,
+  )) as MonitoringData;
 }
 
 // --- Usage accounting ---
@@ -236,7 +240,8 @@ export async function fetchBitrixUsers(): Promise<BitrixUser[]> {
   return (data.users || []) as BitrixUser[];
 }
 
-export async function upsertAccess(userId: number, tier: AccessTier, displayName?: string): Promise<void> {
+// Bot semantics: no row = default «faq»; an explicit "none" row is the only real deny.
+export async function upsertAccess(userId: number, tier: AccessTier | "none", displayName?: string): Promise<void> {
   await fetchJsonSafe(
     "/api/agent-access",
     {
@@ -246,10 +251,6 @@ export async function upsertAccess(userId: number, tier: AccessTier, displayName
     },
     30000,
   );
-}
-
-export async function deleteAccess(userId: number): Promise<void> {
-  await fetchJsonSafe(`/api/agent-access/${userId}`, { method: "DELETE" }, 30000);
 }
 
 export async function fetchKnowledge(): Promise<KnowledgeItem[]> {

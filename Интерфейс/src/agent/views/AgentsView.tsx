@@ -18,7 +18,6 @@ import {
   BitrixUser,
   McpTool,
   TIER_LABELS,
-  deleteAccess,
   fetchAccessMembers,
   fetchAgents,
   fetchBitrixUsers,
@@ -114,13 +113,15 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
     }
   };
 
-  const changeTier = (m: AccessMember, tier: AccessTier) => {
+  const changeTier = (m: AccessMember, tier: AccessTier | "none") => {
     setActiveDropdown(null);
     void runAccessOp(() => upsertAccess(m.bitrix_user_id, tier, memberName(m)));
   };
 
+  // Explicit "none" row = the bot stops responding (deleting the row would
+  // silently fall back to the default faq level instead).
   const removeMember = (m: AccessMember) => {
-    void runAccessOp(() => deleteAccess(m.bitrix_user_id));
+    void runAccessOp(() => upsertAccess(m.bitrix_user_id, "none", memberName(m)));
   };
 
   const addMember = (u: BitrixUser) => {
@@ -309,7 +310,7 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
                             className="fixed inset-0 z-10"
                             onClick={() => setActiveDropdown(null)}
                           />
-                          <div className="absolute top-full left-0 mt-1 w-36 bg-white rounded-xl shadow-lg border border-gray-100 py-1 z-20">
+                          <div className="absolute top-full left-0 mt-1 w-40 bg-white rounded-xl shadow-lg border border-gray-100 py-1 z-20">
                             {(Object.keys(TIER_LABELS) as AccessTier[]).map((tier) => (
                               <button
                                 key={tier}
@@ -324,6 +325,12 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
                                 {TIER_LABELS[tier]}
                               </button>
                             ))}
+                            <button
+                              onClick={() => changeTier(m, "none")}
+                              className="w-full text-left px-3 py-1.5 text-[11px] font-bold text-rose-500 hover:bg-rose-50 transition-colors border-t border-gray-50"
+                            >
+                              Нет доступа (бот молчит)
+                            </button>
                           </div>
                         </>
                       )}
