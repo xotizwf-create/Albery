@@ -37,6 +37,17 @@ from b24bot import _b24_portal_user_directory
 _DIALOGS_LIMIT_DEFAULT = 100
 _MESSAGES_LIMIT_DEFAULT = 200
 
+
+# Direct URLs for the Центр Агента pages (the SPA routes itself by pathname).
+@app.get("/agent")
+@app.get("/agent-dialogs")
+@app.get("/agent-knowledge")
+@app.get("/agent-monitoring")
+@app.get("/agent-usage")
+def agent_center_spa():
+    from app import index
+    return index()
+
 # There is exactly one live agent today: the Bitrix24 bot. Access tiers
 # (admin/ops/faq) are per-employee grants INSIDE it (agent_access), not separate
 # agents. When subagents arrive (own Bitrix app/user each) they become extra rows.
@@ -550,6 +561,83 @@ def agent_center_monitoring():
         "health": health,
         "events": events,
     })
+
+
+# --- Usage accounting (/api/agent-center/usage) ---------------------------------------------
+
+def _duration_label(ms: float | int | None) -> str:
+    total_min = int((ms or 0) // 60000)
+    if total_min < 1:
+        return f"{int((ms or 0) // 1000)} сек"
+    hours, minutes = divmod(total_min, 60)
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    return f"{minutes} мин"
+
+
+@app.get("/api/agent-center/usage")
+def agent_center_usage():
+    """Per-employee usage for a period: turns, total agent working time (sum of
+    turn latencies) and an estimated token spend. Tokens are estimated from the
+    question+answer text volume (~3 chars/token for Russian) — the bot does not
+    log exact usage from Hermes yet; when it does, this switches to real numbers."""
+    period = (request.args.get("period") or "7").strip().lower()
+    now_msk = msk_now()
+    if period == "today":
+        since = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        try:
+            days = min(max(int(period), 1), 365)
+        except (TypeError, ValueError):
+            days = 7
+        since = now_msk - timedelta(days=days)
+    rows = []
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT bitrix_user_id,"
+                    " COUNT(*) AS turns,"
+                    " COALESCE(SUM(latency_ms), 0) AS total_ms,"
+                    " AVG(latency_ms) AS avg_ms,"
+                    " COUNT(*) FILTER (WHERE status <> 'ok') AS errors,"
+                    " COALESCE(SUM(length(COALESCE(question, '')) + length(COALESCE(answer, ''))), 0) AS chars,"
+                    " MAX(created_at) AS last_at"
+                    " FROM bitrix_bot_interactions"
+                    " WHERE created_at >= %s"
+                    " GROUP BY bitrix_user_id",
+                    (since,),
+                )
+                agg = cur.fetchall()
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center usage failed")
+        return jsonify({"error": "Не удалось загрузить статистику использования."}), 500
+    names = _user_names()
+    for r in agg:
+        uid = int(r["bitrix_user_id"]) if r["bitrix_user_id"] is not None else None
+        info = names.get(uid or -1, {})
+        tokens = int(r["chars"]) // 3
+        rows.append({
+            "bitrix_user_id": uid,
+            "name": info.get("name") or (f"Сотрудник #{uid}" if uid else "Без имени"),
+            "position": info.get("position") or "",
+            "turns": int(r["turns"]),
+            "time_ms": int(r["total_ms"]),
+            "time_label": _duration_label(r["total_ms"]),
+            "avg_label": f"{round(float(r['avg_ms']) / 1000)} сек" if r["avg_ms"] else "—",
+            "errors": int(r["errors"]),
+            "tokens_est": tokens,
+            "last_at": _when_label(r["last_at"]),
+        })
+    rows.sort(key=lambda x: x["tokens_est"], reverse=True)
+    totals = {
+        "turns": sum(x["turns"] for x in rows),
+        "time_ms": sum(x["time_ms"] for x in rows),
+        "time_label": _duration_label(sum(x["time_ms"] for x in rows)),
+        "tokens_est": sum(x["tokens_est"] for x in rows),
+        "users": len(rows),
+    }
+    return jsonify({"period": period, "rows": rows, "totals": totals})
 
 
 _HERMES_SKILLS_DIR = Path(os.getenv("HERMES_SKILLS_DIR", "/root/.hermes/skills"))

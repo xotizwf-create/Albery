@@ -46,13 +46,23 @@ export function DialogsView() {
   const [turnsLoading, setTurnsLoading] = useState(false);
   const [error, setError] = useState("");
   const messagesRef = useRef<HTMLDivElement>(null);
+  const atBottomRef = useRef(true);
+  const initialScrollRef = useRef(true);
 
-  // Open a dialog at its latest messages, like any messenger.
+  // Open a dialog at its latest messages, like any messenger; on live updates
+  // stick to the bottom only if the reader was already there.
   useEffect(() => {
-    if (!turnsLoading && turns.length > 0) {
+    if (turnsLoading || turns.length === 0) return;
+    if (initialScrollRef.current || atBottomRef.current) {
       messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight });
+      initialScrollRef.current = false;
     }
-  }, [turnsLoading, turns, activeChatId]);
+  }, [turnsLoading, turns]);
+
+  const onMessagesScroll = () => {
+    const el = messagesRef.current;
+    if (el) atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  };
 
   const scrollMessages = (toTop: boolean) => {
     const el = messagesRef.current;
@@ -112,6 +122,8 @@ export function DialogsView() {
       return;
     }
     let cancelled = false;
+    initialScrollRef.current = true;
+    atBottomRef.current = true;
     setTurnsLoading(true);
     fetchDialogTurns(activeChatId)
       .then((loaded) => {
@@ -123,10 +135,36 @@ export function DialogsView() {
       .finally(() => {
         if (!cancelled) setTurnsLoading(false);
       });
+    // Live updates: silently re-pull the open conversation (state changes only
+    // when a new turn actually arrived, so no flicker while reading).
+    const timer = window.setInterval(() => {
+      fetchDialogTurns(activeChatId)
+        .then((loaded) => {
+          if (cancelled) return;
+          setTurns((prev) => {
+            const changed =
+              loaded.length !== prev.length ||
+              (loaded.length > 0 && prev.length > 0 && loaded[loaded.length - 1].id !== prev[prev.length - 1].id);
+            return changed ? loaded : prev;
+          });
+        })
+        .catch(() => {});
+    }, 12000);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
   }, [activeChatId]);
+
+  // Live refresh of the dialog list (new dialogs / previews / error tags).
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      fetchAgentDialogs({ channel, q: query })
+        .then(({ chats: loaded }) => setChats(loaded))
+        .catch(() => {});
+    }, 20000);
+    return () => window.clearInterval(timer);
+  }, [channel, query]);
 
   const agentIcon = (iconType: AgentConfig["iconType"]) =>
     iconType === "zap" ? Zap : iconType === "book" ? BookOpen : iconType === "crown" ? Crown : Package;
@@ -341,6 +379,7 @@ export function DialogsView() {
             <div className="relative flex-1 min-h-0 min-w-0 overflow-hidden bg-slate-50/50">
               <div
                 ref={messagesRef}
+                onScroll={onMessagesScroll}
                 className="h-full w-full overflow-y-auto overflow-x-hidden p-6 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full"
               >
                 <div className="w-full max-w-[860px] mx-auto space-y-6">

@@ -88,6 +88,14 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
       .then(setKnowledgeItems)
       .catch(() => {})
       .finally(() => setKnowledgeLoading(false));
+    // Live refresh: access grants can change from the Настройки tab or another
+    // browser window; stats and the knowledge library drift over time too.
+    const timer = window.setInterval(() => {
+      fetchAccessMembers().then(setMembers).catch(() => {});
+      fetchMcpTools().then(setTools).catch(() => {});
+      fetchKnowledge().then(setKnowledgeItems).catch(() => {});
+    }, 60000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const memberName = (m: AccessMember) =>
@@ -578,12 +586,16 @@ export function AgentsView() {
   const [, setForceUpdate] = useState(0);
 
   useEffect(() => {
-    fetchAgents()
-      .then((loaded) => {
-        setAgents(loaded);
-        if (loaded.length > 0) setActiveAgentId(loaded[0].id);
-      })
-      .catch(() => {});
+    const load = (first: boolean) =>
+      fetchAgents()
+        .then((loaded) => {
+          setAgents(loaded);
+          if (first && loaded.length > 0) setActiveAgentId(loaded[0].id);
+        })
+        .catch(() => {});
+    void load(true);
+    const timer = window.setInterval(() => void load(false), 60000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const activeAgent = agents.find((a) => a.id === activeAgentId) || agents[0];

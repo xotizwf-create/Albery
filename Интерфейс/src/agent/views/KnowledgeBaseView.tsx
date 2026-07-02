@@ -16,6 +16,10 @@ export function KnowledgeBaseView() {
       .then(setItems)
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false));
+    const timer = window.setInterval(() => {
+      fetchKnowledge().then(setItems).catch(() => {});
+    }, 60000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const typeCounts = items.reduce<Record<string, number>>((acc, k) => {

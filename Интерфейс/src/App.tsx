@@ -59,11 +59,13 @@ import {
   BookOpen,
   Activity,
   MessageSquare,
+  BarChart3,
 } from "lucide-react";
 import { DialogsView } from "./agent/views/DialogsView";
 import { AgentsView } from "./agent/views/AgentsView";
 import { KnowledgeBaseView } from "./agent/views/KnowledgeBaseView";
 import { MonitoringView } from "./agent/views/MonitoringView";
+import { UsageView } from "./agent/views/UsageView";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import {
@@ -325,7 +327,20 @@ const AGENT_MENU_ITEMS = [
   { label: "Агенты", icon: Bot },
   { label: "База знаний", icon: BookOpen },
   { label: "Мониторинг", icon: Activity },
+  { label: "Использование", icon: BarChart3 },
 ];
+// Every Центр Агента page has its own URL; the SPA syncs activeTab ↔ pathname
+// (agent_center.py serves index.html on these paths for direct opens).
+const AGENT_TAB_ROUTES: Record<string, string> = {
+  "Агенты": "/agent",
+  "Диалоги": "/agent-dialogs",
+  "База знаний": "/agent-knowledge",
+  "Мониторинг": "/agent-monitoring",
+  "Использование": "/agent-usage",
+};
+const AGENT_ROUTE_TABS: Record<string, string> = Object.fromEntries(
+  Object.entries(AGENT_TAB_ROUTES).map(([tab, path]) => [path, tab]),
+);
 const COMPANY_MENU_ITEMS = VISIBLE_MENU_ITEMS.filter((item) => item.label !== "Настройки");
 const OTHER_MENU_ITEMS = VISIBLE_MENU_ITEMS.filter((item) => item.label === "Настройки");
 const SIDEBAR_GROUPS = [
@@ -2013,7 +2028,27 @@ type PromptVersion = {
 };
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState("Сводная аналитика");
+  const [activeTab, setActiveTab] = useState(
+    () => AGENT_ROUTE_TABS[window.location.pathname] || "Сводная аналитика",
+  );
+
+  useEffect(() => {
+    const route = AGENT_TAB_ROUTES[activeTab];
+    const current = window.location.pathname;
+    if (route) {
+      if (current !== route) window.history.pushState({}, "", route);
+    } else if (AGENT_ROUTE_TABS[current]) {
+      window.history.pushState({}, "", "/main");
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      setActiveTab(AGENT_ROUTE_TABS[window.location.pathname] || "Сводная аналитика");
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
   const [summaryTab, setSummaryTab] = useState<"overview" | "reports">("reports");
   const [tasksSubTab, setTasksSubTab] = useState<"reports" | "registry" | "chats" | "prompts" | "ai_requests">(
     window.location.pathname === "/registry" ? "registry" : "reports",
@@ -6374,6 +6409,14 @@ export default function App() {
       return (
         <div className="animate-in fade-in duration-200">
           <MonitoringView />
+        </div>
+      );
+    }
+
+    if (activeTab === "Использование") {
+      return (
+        <div className="animate-in fade-in duration-200">
+          <UsageView />
         </div>
       );
     }

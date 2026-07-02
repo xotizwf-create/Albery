@@ -158,6 +158,32 @@ export async function fetchMonitoring(): Promise<MonitoringData> {
   return (await fetchJsonSafe("/api/agent-center/monitoring", undefined, 30000)) as MonitoringData;
 }
 
+// --- Usage accounting ---
+
+export interface UsageRow {
+  bitrix_user_id: number | null;
+  name: string;
+  position: string;
+  turns: number;
+  time_ms: number;
+  time_label: string;
+  avg_label: string;
+  errors: number;
+  tokens_est: number;
+  last_at: string;
+}
+
+export interface UsageData {
+  period: string;
+  rows: UsageRow[];
+  totals: { turns: number; time_ms: number; time_label: string; tokens_est: number; users: number };
+}
+
+export async function fetchUsage(period: string): Promise<UsageData> {
+  const search = new URLSearchParams({ period });
+  return (await fetchJsonSafe(`/api/agent-center/usage?${search}`, undefined, 30000)) as UsageData;
+}
+
 // --- Team access (existing /api/agent-access CRUD, shared with the Настройки tab) ---
 
 export type AccessTier = "admin" | "ops" | "faq";
