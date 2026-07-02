@@ -21,3 +21,12 @@ dist/
 *.backup
 *.log
 *.tmp
+
+# in-place patch backups and runtime state files must never enter git
+*.bak
+*.bak.*
+*.bak-*
+*.predeploy.*
+.b24_testbot_state.json
+.error_digest_state.json
+tmp_*.py

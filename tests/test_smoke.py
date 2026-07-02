@@ -32,12 +32,20 @@ def test_app_imports_with_routes(app_module):
     assert len(rules) >= 100
 
 
+def test_b24bot_routes_registered(app_module):
+    """The chat-bot lives in b24bot.py (extracted 2026-07-02) but must still register
+    its routes on the shared Flask app when app.py is imported."""
+    paths = {r.rule for r in app_module.app.url_map.iter_rules()}
+    assert "/bitrix/imbot/<secret>" in paths
+    assert "/api/agent-access" in paths
+
+
 def test_mcp_imports_with_tools(ctx):
     assert len(ctx.TOOLS) >= 30
     assert callable(ctx.handle_request)
 
 
-@pytest.mark.parametrize("rel_path", ["app.py", "mcp/context_server.py"])
+@pytest.mark.parametrize("rel_path", ["app.py", "b24bot.py", "mcp/context_server.py"])
 def test_no_undefined_names(rel_path):
     offenders = _undefined_names(rel_path)
     assert offenders == [], f"{rel_path} has undefined names:\n" + "\n".join(offenders)
