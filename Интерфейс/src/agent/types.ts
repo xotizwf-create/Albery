@@ -8,7 +8,7 @@ export interface Chat {
   avatarColor: string;
   time: string;
   lastMessage: string;
-  tag: 'ops' | 'faq' | 'ошибка';
+  tag: 'ops' | 'faq' | 'admin' | 'ошибка';
   channel: 'Bitrix' | 'Telegram';
 }
 

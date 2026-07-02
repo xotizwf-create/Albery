@@ -18449,6 +18449,7 @@ from bitrix import (  # noqa: E402
     upsert_task_records,
 )
 import b24bot  # noqa: E402,F401
+import agent_center  # noqa: E402,F401
 
 
 if __name__ == "__main__":

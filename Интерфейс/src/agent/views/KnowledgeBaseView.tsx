@@ -1,14 +1,32 @@
-import { useState } from 'react';
-import { Search, Plus, BookOpen, Wrench, FileText, Lock } from 'lucide-react';
-import { mockKnowledge } from '../data';
+import { useEffect, useState } from 'react';
+import { Search, Plus, Lock, Loader2, AlertTriangle } from 'lucide-react';
+import { fetchKnowledge } from '../api';
+import { KnowledgeItem } from '../types';
 import { cn } from '../../lib/utils';
 
 export function KnowledgeBaseView() {
   const [searchQuery, setSearchQuery] = useState('');
-  
-  const filteredKnowledge = mockKnowledge.filter(k => 
-    k.title.toLowerCase().includes(searchQuery.toLowerCase()) || 
-    k.description.toLowerCase().includes(searchQuery.toLowerCase())
+  const [items, setItems] = useState<KnowledgeItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [typeFilter, setTypeFilter] = useState<'Все' | KnowledgeItem['type']>('Все');
+
+  useEffect(() => {
+    fetchKnowledge()
+      .then(setItems)
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const typeCounts = items.reduce<Record<string, number>>((acc, k) => {
+    acc[k.type] = (acc[k.type] || 0) + 1;
+    return acc;
+  }, {});
+
+  const filteredKnowledge = items.filter(k =>
+    (typeFilter === 'Все' || k.type === typeFilter) &&
+    (k.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      k.description.toLowerCase().includes(searchQuery.toLowerCase()))
   );
 
   return (
@@ -39,22 +57,47 @@ export function KnowledgeBaseView() {
 
       {/* Tabs */}
       <div className="flex flex-wrap gap-2.5">
-        <button className="px-4 py-2 bg-indigo-50 text-indigo-700 rounded-xl text-sm font-bold transition-colors">
-          Все <span className="ml-1.5 text-indigo-400 font-semibold bg-indigo-100/50 px-1.5 py-0.5 rounded-md">{mockKnowledge.length}</span>
-        </button>
-        <button className="px-4 py-2 bg-white text-gray-600 hover:bg-gray-50 border border-gray-200 rounded-xl text-sm font-bold transition-colors shadow-sm">
-          Инструкции <span className="ml-1.5 text-gray-400 font-semibold bg-gray-100 px-1.5 py-0.5 rounded-md">8</span>
-        </button>
-        <button className="px-4 py-2 bg-white text-gray-600 hover:bg-gray-50 border border-gray-200 rounded-xl text-sm font-bold transition-colors shadow-sm">
-          Скиллы <span className="ml-1.5 text-gray-400 font-semibold bg-gray-100 px-1.5 py-0.5 rounded-md">4</span>
-        </button>
-        <button className="px-4 py-2 bg-white text-gray-600 hover:bg-gray-50 border border-gray-200 rounded-xl text-sm font-bold transition-colors shadow-sm">
-          Регламенты <span className="ml-1.5 text-gray-400 font-semibold bg-gray-100 px-1.5 py-0.5 rounded-md">2</span>
-        </button>
+        {(['Все', 'Инструкция', 'Скилл', 'Регламент'] as const).map((t) => {
+          const count = t === 'Все' ? items.length : typeCounts[t] || 0;
+          const label = t === 'Все' ? 'Все' : t === 'Инструкция' ? 'Инструкции' : t === 'Скилл' ? 'Скиллы' : 'Регламенты';
+          const isActive = typeFilter === t;
+          return (
+            <button
+              key={t}
+              onClick={() => setTypeFilter(t)}
+              className={cn(
+                'px-4 py-2 rounded-xl text-sm font-bold transition-colors',
+                isActive
+                  ? 'bg-indigo-50 text-indigo-700'
+                  : 'bg-white text-gray-600 hover:bg-gray-50 border border-gray-200 shadow-sm',
+              )}
+            >
+              {label}{' '}
+              <span
+                className={cn(
+                  'ml-1.5 font-semibold px-1.5 py-0.5 rounded-md',
+                  isActive ? 'text-indigo-400 bg-indigo-100/50' : 'text-gray-400 bg-gray-100',
+                )}
+              >
+                {count}
+              </span>
+            </button>
+          );
+        })}
       </div>
 
       {/* List */}
       <div className="flex flex-col gap-3">
+        {loading && (
+          <div className="flex items-center justify-center gap-2 py-12 text-gray-400 text-[13px] font-bold bg-white rounded-2xl border border-gray-200 border-dashed">
+            <Loader2 className="w-4 h-4 animate-spin" /> Загрузка базы знаний…
+          </div>
+        )}
+        {!loading && error && (
+          <div className="flex items-center gap-2 p-4 rounded-2xl bg-rose-50 border border-rose-100 text-rose-600 text-[13px] font-bold">
+            <AlertTriangle className="w-4 h-4 shrink-0" /> {error}
+          </div>
+        )}
         {filteredKnowledge.map((item) => (
           <div key={item.id} className="bg-white p-4 sm:px-6 rounded-2xl border border-gray-200/80 shadow-sm hover:shadow-md hover:border-indigo-300 transition-all group cursor-pointer flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="flex items-center gap-4 flex-1 min-w-0">
@@ -81,16 +124,15 @@ export function KnowledgeBaseView() {
                 <span className="text-[12px] font-semibold text-gray-400 hidden lg:inline-block">{item.updatedAt}</span>
               </div>
               <div className="flex gap-1.5">
-                <div className="w-7 h-7 rounded-lg border border-orange-100 bg-orange-50 flex items-center justify-center text-orange-500 shadow-sm" title="Использует Основной агент">⚡</div>
-                {item.type === 'Инструкция' && <div className="w-7 h-7 rounded-lg border border-blue-100 bg-blue-50 flex items-center justify-center text-blue-500 shadow-sm" title="Использует Агент склада">📦</div>}
+                <div className="w-7 h-7 rounded-lg border border-orange-100 bg-orange-50 flex items-center justify-center text-orange-500 shadow-sm" title="Используют все агенты">⚡</div>
               </div>
             </div>
           </div>
         ))}
 
-        {filteredKnowledge.length === 0 && (
+        {!loading && !error && filteredKnowledge.length === 0 && (
           <div className="py-12 text-center text-gray-400 font-medium bg-white rounded-2xl border border-gray-200 border-dashed">
-            По запросу «{searchQuery}» ничего не найдено
+            {searchQuery ? `По запросу «${searchQuery}» ничего не найдено` : 'Пока пусто'}
           </div>
         )}
 

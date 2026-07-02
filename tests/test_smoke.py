@@ -40,13 +40,22 @@ def test_b24bot_routes_registered(app_module):
     assert "/api/agent-access" in paths
 
 
+def test_agent_center_routes_registered(app_module):
+    """The Agent Center read-only API (agent_center.py) must register on the shared app."""
+    paths = {r.rule for r in app_module.app.url_map.iter_rules()}
+    assert "/api/agent-center/dialogs" in paths
+    assert "/api/agent-center/dialog-messages" in paths
+    assert "/api/agent-center/agents" in paths
+    assert "/api/agent-center/knowledge" in paths
+
+
 def test_mcp_imports_with_tools(ctx):
     assert len(ctx.TOOLS) >= 30
     assert callable(ctx.handle_request)
 
 
-@pytest.mark.parametrize("rel_path", ["app.py", "b24bot.py", "bitrix.py", "config.py",
-                                      "gdrive.py", "llm.py", "utils.py", "zoom.py",
+@pytest.mark.parametrize("rel_path", ["app.py", "agent_center.py", "b24bot.py", "bitrix.py",
+                                      "config.py", "gdrive.py", "llm.py", "utils.py", "zoom.py",
                                       "mcp/context_server.py"])
 def test_no_undefined_names(rel_path):
     offenders = _undefined_names(rel_path)

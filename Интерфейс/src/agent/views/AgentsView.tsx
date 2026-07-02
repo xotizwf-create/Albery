@@ -1,11 +1,9 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   Plus,
-  Bot,
   BookOpen,
   Crown,
   Package,
-  Lock,
   Check,
   MessageSquare,
   Send,
@@ -15,6 +13,8 @@ import {
   User,
 } from "lucide-react";
 import { mockAgents, mockKnowledge } from "../data";
+import { fetchAgents } from "../api";
+import { AgentConfig } from "../types";
 import { cn } from "../../lib/utils";
 
 const toolsList = [
@@ -556,8 +556,20 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
 };
 
 export function AgentsView() {
-  const [activeAgentId, setActiveAgentId] = useState(mockAgents[3].id);
+  const [agents, setAgents] = useState<AgentConfig[]>(mockAgents);
+  const [activeAgentId, setActiveAgentId] = useState(mockAgents[0].id);
   const [, setForceUpdate] = useState(0);
+
+  useEffect(() => {
+    fetchAgents()
+      .then((loaded) => {
+        if (loaded.length > 0) {
+          setAgents(loaded);
+          setActiveAgentId(loaded[0].id);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   return (
     <div className="flex flex-col lg:flex-row items-start gap-6 h-[calc(100vh-8rem)] min-h-[700px]">
@@ -571,7 +583,7 @@ export function AgentsView() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-3 space-y-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-          {mockAgents.map((agent) => {
+          {agents.map((agent) => {
             const isActive = agent.id === activeAgentId;
             const Icon =
               agent.iconType === "zap"
@@ -652,7 +664,7 @@ export function AgentsView() {
         <AgentEditor
           key={activeAgentId}
           agent={
-            mockAgents.find((a) => a.id === activeAgentId) || mockAgents[3]
+            agents.find((a) => a.id === activeAgentId) || agents[0]
           }
           onToggleActive={() => setForceUpdate((prev) => prev + 1)}
         />
