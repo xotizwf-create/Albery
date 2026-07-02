@@ -55,7 +55,15 @@ import {
   FolderOpen,
   Sparkles,
   Download,
+  Bot,
+  BookOpen,
+  Activity,
+  MessageSquare,
 } from "lucide-react";
+import { DialogsView } from "./agent/views/DialogsView";
+import { AgentsView } from "./agent/views/AgentsView";
+import { KnowledgeBaseView } from "./agent/views/KnowledgeBaseView";
+import { MonitoringView } from "./agent/views/MonitoringView";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import {
@@ -312,6 +320,19 @@ const MENU_ITEMS = [
 ];
 const HIDDEN_MAIN_MENU_LABELS = new Set(["Бухгалтерия", "Склад", "Справочники"]);
 const VISIBLE_MENU_ITEMS = MENU_ITEMS.filter((item) => !HIDDEN_MAIN_MENU_LABELS.has(item.label));
+const AGENT_MENU_ITEMS = [
+  { label: "Диалоги", icon: MessageSquare },
+  { label: "Агенты", icon: Bot },
+  { label: "База знаний", icon: BookOpen },
+  { label: "Мониторинг", icon: Activity },
+];
+const COMPANY_MENU_ITEMS = VISIBLE_MENU_ITEMS.filter((item) => item.label !== "Настройки");
+const OTHER_MENU_ITEMS = VISIBLE_MENU_ITEMS.filter((item) => item.label === "Настройки");
+const SIDEBAR_GROUPS = [
+  { title: "Компания", items: COMPANY_MENU_ITEMS, accent: false },
+  { title: "Центр Агента", items: AGENT_MENU_ITEMS, accent: true },
+  { title: "Прочее", items: OTHER_MENU_ITEMS, accent: false },
+];
 const HIDDEN_HEADER_LINKS = new Set(["Бухгалтерия", "Склад"]);
 
 const MONTHS = [
@@ -6325,6 +6346,38 @@ export default function App() {
       );
     }
 
+    if (activeTab === "Диалоги") {
+      return (
+        <div className="animate-in fade-in duration-200">
+          <DialogsView />
+        </div>
+      );
+    }
+
+    if (activeTab === "Агенты") {
+      return (
+        <div className="animate-in fade-in duration-200">
+          <AgentsView />
+        </div>
+      );
+    }
+
+    if (activeTab === "База знаний") {
+      return (
+        <div className="animate-in fade-in duration-200">
+          <KnowledgeBaseView />
+        </div>
+      );
+    }
+
+    if (activeTab === "Мониторинг") {
+      return (
+        <div className="animate-in fade-in duration-200">
+          <MonitoringView />
+        </div>
+      );
+    }
+
     if (activeTab === "Настройки") {
       return settingsSubTab === "agent_settings" ? renderAgentAccessSettings() : renderAiInstructionsSettings();
     }
@@ -8038,34 +8091,47 @@ export default function App() {
           </div>
         </div>
 
-        <nav className="flex-1 px-4 py-7 flex flex-col gap-2 overflow-y-auto custom-scrollbar">
-          {VISIBLE_MENU_ITEMS.map((item) => {
-            const isActive = activeTab === item.label;
-            return (
-              <button
-                key={item.label}
-                onClick={() => setActiveTab(item.label)}
+        <nav className="flex-1 px-4 py-6 flex flex-col gap-7 overflow-y-auto custom-scrollbar">
+          {SIDEBAR_GROUPS.map((group) => (
+            <div key={group.title}>
+              <h3
                 className={cn(
-                  "relative flex items-center gap-3.5 w-full px-4 py-3 rounded-xl font-bold text-[14px] transition-all group",
-                  isActive
-                    ? "bg-[#5440F6] text-white shadow-lg shadow-[#5440F6]/25"
-                    : "text-slate-600 hover:bg-[#F1F5F9] hover:text-slate-950",
+                  "px-3 text-xs font-semibold tracking-wider uppercase mb-3",
+                  group.accent ? "text-[#8B7CFF]" : "text-slate-400",
                 )}
               >
-                {isActive && (
-                  <span className="absolute left-0 top-1/2 h-7 w-1 -translate-y-1/2 rounded-r-full bg-white/80" />
-                )}
-                <item.icon
-                  className={cn(
-                    "w-[20px] h-[20px] transition-transform",
-                    isActive ? "scale-110 text-white" : "text-slate-500 group-hover:text-slate-800 group-hover:scale-110",
-                  )}
-                  strokeWidth={isActive ? 2.7 : 2.3}
-                />
-                {item.label}
-              </button>
-            );
-          })}
+                {group.title}
+              </h3>
+              <div className="space-y-1">
+                {group.items.map((item) => {
+                  const isActive = activeTab === item.label;
+                  return (
+                    <button
+                      key={item.label}
+                      onClick={() => setActiveTab(item.label)}
+                      className={cn(
+                        "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-[14px] font-bold transition-all duration-200 group",
+                        isActive
+                          ? "bg-[#EEF2FF] text-[#5440F6]"
+                          : "text-slate-600 hover:bg-slate-100 hover:text-slate-950",
+                      )}
+                    >
+                      <item.icon
+                        className={cn(
+                          "w-[18px] h-[18px] transition-transform",
+                          isActive
+                            ? "text-[#5440F6]"
+                            : "text-slate-400 group-hover:text-slate-700 group-hover:scale-110",
+                        )}
+                        strokeWidth={isActive ? 2.6 : 2.2}
+                      />
+                      {item.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
         </nav>
 
         <div className="p-4 flex flex-col gap-2 border-t border-[#E2E8F0] bg-white">
