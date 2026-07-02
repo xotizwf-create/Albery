@@ -23280,7 +23280,29 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
             cwd="/root", env={**os.environ, "HOME": "/root"},
         )
     except subprocess.TimeoutExpired:
-        return "Долго думаю — попробуй короче или переформулируй вопрос."
+        logging.warning(
+            "b24 testbot: hermes timed out after %ss dialog_id=%s tier=%s user_id=%s prompt_chars=%s",
+            timeout_s, dialog_id, tier, from_user_id, len(prompt),
+        )
+        sheets_like = re.search(
+            "(google|гугл|таблиц|spreadsheet|sheet|лист|артикул|баркод|barcode|размер|остатк|заказ)",
+            user_text or "",
+            re.IGNORECASE,
+        )
+        if sheets_like:
+            return (
+                ("[b]Операция с Google-таблицами превысила лимит %s сек.[/b]\\n\\n" % timeout_s)
+                + "Это не проблема формулировки: задача слишком большая для одного синхронного сообщения "
+                + "в Битриксе (много строк/листов/формул или долгие Google API-вызовы). Я не буду "
+                + "писать, что файл готов, пока он реально не создан.\\n\\n"
+                + "Нужно запускать такую задачу пакетно/в фоне или сначала собрать тест на 1-2 артикула, "
+                + "проверить результат и затем масштабировать на остальные."
+            )
+        return (
+            ("[b]Операция превысила лимит %s сек.[/b]\\n\\n" % timeout_s)
+            + "Я остановил ожидание, чтобы не держать чат бесконечно. Если это длинная операция, ее нужно "
+            + "запускать пакетно/в фоне или разбить на короткие этапы."
+        )
     answer = (proc.stdout or "").strip()
     if not answer:
         logging.error("hermes brain empty: rc=%s err=%s", proc.returncode, (proc.stderr or "")[:300])

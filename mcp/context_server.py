@@ -6192,12 +6192,12 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "fetch_url": {
         "description": (
-            "Fetch the contents of a web URL the user sent in chat (article, public Google Sheet, public Google Doc, "
+            "Fetch the contents of a web URL the user sent in chat (article, Google Sheet, Google Doc, "
             "raw text file, etc.) and return it as plain text. Use this when the user shares a link and asks you to "
-            "read, summarize, or extract data from it. Special handling: Google Sheets URLs are auto-rewritten to "
-            "CSV export, Google Docs URLs to TXT export. HTML pages are stripped to text by default. Size is hard-"
-            "capped (default 50000 chars, max 200000) to protect the context window. On 401/403 from Google docs, "
-            "the response includes a hint about opening link sharing or using the synced Drive folder. Do NOT use "
+            "read, summarize, or extract data from it. Special handling: Google Sheets and Google Docs are read with the agent authorized Google account; "
+            "private files shared with that account can be read without public link access. HTML pages are stripped to text by default. Size is hard-"
+            "capped (default 50000 chars, max 200000) to protect the context window. On 403/404 from Google docs, "
+            "the file is not accessible to the agent Google account; do not describe that as public CSV export failure. Do NOT use "
             "this for company knowledge that already lives in Albery — prefer search_company_knowledge, "
             "list_company_files, get_company_file, search_messages, get_zoom_call_transcript for that."
         ),
@@ -6206,7 +6206,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "Full http(s) URL to fetch. Google Sheets/Docs links are auto-rewritten to export endpoints.",
+                    "description": "Full http(s) URL to fetch. Google Sheets/Docs links are read through the agent authorized Google account when possible.",
                 },
                 "max_chars": {
                     "type": "integer",
