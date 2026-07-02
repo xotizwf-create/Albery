@@ -12,8 +12,18 @@ import {
   Search,
   User,
 } from "lucide-react";
-import { mockAgents, mockKnowledge } from "../data";
-import { fetchAgents } from "../api";
+import { mockKnowledge } from "../data";
+import {
+  AccessMember,
+  AccessTier,
+  BitrixUser,
+  TIER_LABELS,
+  deleteAccess,
+  fetchAccessMembers,
+  fetchAgents,
+  fetchBitrixUsers,
+  upsertAccess,
+} from "../api";
 import { AgentConfig } from "../types";
 import { cn } from "../../lib/utils";
 
@@ -86,35 +96,60 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
   const [searchMcp, setSearchMcp] = useState("");
   const [searchKnowledge, setSearchKnowledge] = useState("");
 
-  const [teamAccess, setTeamAccess] = useState<Record<string, string>>({
-    "Евгений Петров": "Полный доступ",
-    "Мария Алексеева": "Все функции",
-    "Иван Ковалёв": "Доступ к FAQ",
-  });
-  const [activeDropdown, setActiveDropdown] = useState<string | null>(null);
+  // Team access = the real agent_access table (same CRUD the Настройки tab uses).
+  const [members, setMembers] = useState<AccessMember[]>([]);
+  const [bitrixUsers, setBitrixUsers] = useState<BitrixUser[]>([]);
+  const [accessError, setAccessError] = useState("");
+  const [accessBusy, setAccessBusy] = useState(false);
+  const [activeDropdown, setActiveDropdown] = useState<number | null>(null);
 
   const [showUserSearch, setShowUserSearch] = useState(false);
   const [userSearchQuery, setUserSearchQuery] = useState("");
 
-  const allUsers = [
-    "Евгений Петров",
-    "Мария Алексеева",
-    "Иван Ковалёв",
-    "Александр Смирнов",
-    "Дмитрий Строгонов",
-    "Анна Иванова",
-    "Сергей Васильев",
-  ];
-  const accessLevels = [
-    "Полный доступ",
-    "Все функции",
-    "Доступ к FAQ",
-    "Нет доступа",
-  ];
+  useEffect(() => {
+    fetchAccessMembers()
+      .then(setMembers)
+      .catch((e: Error) => setAccessError(e.message));
+    fetchBitrixUsers()
+      .then(setBitrixUsers)
+      .catch(() => {});
+  }, []);
 
-  const unselectedUsers = allUsers.filter(
-    (u) =>
-      !teamAccess[u] && u.toLowerCase().includes(userSearchQuery.toLowerCase()),
+  const memberName = (m: AccessMember) =>
+    bitrixUsers.find((u) => u.id === m.bitrix_user_id)?.name || m.display_name;
+
+  const runAccessOp = async (op: () => Promise<void>) => {
+    setAccessBusy(true);
+    setAccessError("");
+    try {
+      await op();
+      setMembers(await fetchAccessMembers());
+    } catch (e) {
+      setAccessError((e as Error).message);
+    } finally {
+      setAccessBusy(false);
+    }
+  };
+
+  const changeTier = (m: AccessMember, tier: AccessTier) => {
+    setActiveDropdown(null);
+    void runAccessOp(() => upsertAccess(m.bitrix_user_id, tier, memberName(m)));
+  };
+
+  const removeMember = (m: AccessMember) => {
+    void runAccessOp(() => deleteAccess(m.bitrix_user_id));
+  };
+
+  const addMember = (u: BitrixUser) => {
+    setShowUserSearch(false);
+    setUserSearchQuery("");
+    // Least privilege by default: new members start at FAQ; raise via the dropdown.
+    void runAccessOp(() => upsertAccess(u.id, "faq", u.name));
+  };
+
+  const memberIds = new Set(members.map((m) => m.bitrix_user_id));
+  const unselectedUsers = bitrixUsers.filter(
+    (u) => !memberIds.has(u.id) && u.name.toLowerCase().includes(userSearchQuery.toLowerCase()),
   );
 
   const filteredTools = toolsList.filter(
@@ -258,77 +293,78 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
                 Команда и доступы
               </label>
               <span className="text-xs font-bold text-gray-500 bg-gray-100 px-2 py-0.5 rounded-md">
-                {Object.keys(teamAccess).length} сотрудника
+                {members.length} сотрудников
               </span>
             </div>
-            <div className="p-2.5 bg-gray-50/80 border border-gray-200/80 rounded-2xl flex flex-wrap gap-2 items-center shadow-sm">
-              {Object.entries(teamAccess).map(([user, access]) => (
-                <div
-                  key={user}
-                  className="pl-1.5 pr-2 py-1.5 bg-white border border-gray-200/80 rounded-xl flex items-center gap-2 shadow-sm relative"
-                >
-                  <div className="w-7 h-7 rounded-lg bg-indigo-50 border border-indigo-100 text-indigo-700 flex items-center justify-center text-[10px] font-bold shrink-0">
-                    {user
-                      .split(" ")
-                      .map((n) => n[0])
-                      .join("")}
-                  </div>
-                  <div className="flex flex-col">
-                    <span className="text-[13px] font-bold text-gray-800 leading-tight mb-0.5">
-                      {user}
-                    </span>
-                    <button
-                      onClick={() =>
-                        setActiveDropdown(activeDropdown === user ? null : user)
-                      }
-                      className="text-[10px] font-bold text-gray-400 bg-transparent border-none outline-none p-0 h-auto leading-tight cursor-pointer hover:text-indigo-600 transition-colors text-left flex items-center gap-1"
-                    >
-                      {access}
-                      <span className="text-[8px]">▼</span>
-                    </button>
-                    {activeDropdown === user && (
-                      <>
-                        <div
-                          className="fixed inset-0 z-10"
-                          onClick={() => setActiveDropdown(null)}
-                        />
-                        <div className="absolute top-full left-0 mt-1 w-36 bg-white rounded-xl shadow-lg border border-gray-100 py-1 z-20">
-                          {accessLevels.map((level) => (
-                            <button
-                              key={level}
-                              onClick={() => {
-                                setTeamAccess((prev) => ({
-                                  ...prev,
-                                  [user]: level,
-                                }));
-                                setActiveDropdown(null);
-                              }}
-                              className={cn(
-                                "w-full text-left px-3 py-1.5 text-[11px] font-bold transition-colors",
-                                level === access
-                                  ? "text-indigo-600 bg-indigo-50/50"
-                                  : "text-gray-600 hover:bg-gray-50",
-                              )}
-                            >
-                              {level}
-                            </button>
-                          ))}
-                        </div>
-                      </>
-                    )}
-                  </div>
-                  <button
-                    onClick={() => {
-                      const newAccess = { ...teamAccess };
-                      delete newAccess[user];
-                      setTeamAccess(newAccess);
-                    }}
-                    className="text-gray-400 hover:text-rose-500 transition-colors bg-gray-50 hover:bg-rose-50 rounded-md p-1 ml-1 shrink-0"
+            <div
+              className={cn(
+                "p-2.5 bg-gray-50/80 border border-gray-200/80 rounded-2xl flex flex-wrap gap-2 items-center shadow-sm transition-opacity",
+                accessBusy && "opacity-60 pointer-events-none",
+              )}
+            >
+              {members.map((m) => {
+                const name = memberName(m);
+                return (
+                  <div
+                    key={m.bitrix_user_id}
+                    className="pl-1.5 pr-2 py-1.5 bg-white border border-gray-200/80 rounded-xl flex items-center gap-2 shadow-sm relative"
                   >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ))}
+                    <div className="w-7 h-7 rounded-lg bg-indigo-50 border border-indigo-100 text-indigo-700 flex items-center justify-center text-[10px] font-bold shrink-0">
+                      {name
+                        .split(/\s+/)
+                        .filter(Boolean)
+                        .slice(0, 2)
+                        .map((n) => n[0])
+                        .join("")}
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-[13px] font-bold text-gray-800 leading-tight mb-0.5">
+                        {name}
+                      </span>
+                      <button
+                        onClick={() =>
+                          setActiveDropdown(activeDropdown === m.bitrix_user_id ? null : m.bitrix_user_id)
+                        }
+                        className="text-[10px] font-bold text-gray-400 bg-transparent border-none outline-none p-0 h-auto leading-tight cursor-pointer hover:text-indigo-600 transition-colors text-left flex items-center gap-1"
+                      >
+                        {TIER_LABELS[m.tier]}
+                        <span className="text-[8px]">▼</span>
+                      </button>
+                      {activeDropdown === m.bitrix_user_id && (
+                        <>
+                          <div
+                            className="fixed inset-0 z-10"
+                            onClick={() => setActiveDropdown(null)}
+                          />
+                          <div className="absolute top-full left-0 mt-1 w-36 bg-white rounded-xl shadow-lg border border-gray-100 py-1 z-20">
+                            {(Object.keys(TIER_LABELS) as AccessTier[]).map((tier) => (
+                              <button
+                                key={tier}
+                                onClick={() => changeTier(m, tier)}
+                                className={cn(
+                                  "w-full text-left px-3 py-1.5 text-[11px] font-bold transition-colors",
+                                  tier === m.tier
+                                    ? "text-indigo-600 bg-indigo-50/50"
+                                    : "text-gray-600 hover:bg-gray-50",
+                                )}
+                              >
+                                {TIER_LABELS[tier]}
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => removeMember(m)}
+                      title="Забрать доступ"
+                      className="text-gray-400 hover:text-rose-500 transition-colors bg-gray-50 hover:bg-rose-50 rounded-md p-1 ml-1 shrink-0"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                );
+              })}
               <div className="flex-1 min-w-[140px] flex items-center gap-2 px-2 relative">
                 <User className="w-4 h-4 text-gray-400" />
                 <input
@@ -353,31 +389,33 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
                       {unselectedUsers.length > 0 ? (
                         unselectedUsers.map((u) => (
                           <button
-                            key={u}
-                            onClick={() => {
-                              setTeamAccess((prev) => ({
-                                ...prev,
-                                [u]: "Полный доступ",
-                              }));
-                              setShowUserSearch(false);
-                              setUserSearchQuery("");
-                            }}
+                            key={u.id}
+                            onClick={() => addMember(u)}
                             className="w-full text-left px-3 py-2 hover:bg-gray-50 flex items-center gap-2 transition-colors"
                           >
                             <div className="w-6 h-6 rounded-md bg-gray-100 text-gray-600 flex items-center justify-center text-[9px] font-bold">
-                              {u
-                                .split(" ")
+                              {u.name
+                                .split(/\s+/)
+                                .filter(Boolean)
+                                .slice(0, 2)
                                 .map((n) => n[0])
                                 .join("")}
                             </div>
-                            <span className="text-[13px] font-bold text-gray-700">
-                              {u}
-                            </span>
+                            <div className="flex flex-col min-w-0">
+                              <span className="text-[13px] font-bold text-gray-700 truncate">
+                                {u.name}
+                              </span>
+                              {u.position && (
+                                <span className="text-[11px] font-medium text-gray-400 truncate">
+                                  {u.position}
+                                </span>
+                              )}
+                            </div>
                           </button>
                         ))
                       ) : (
                         <div className="px-3 py-4 text-center text-[12px] font-medium text-gray-400">
-                          Сотрудники не найдены
+                          {bitrixUsers.length === 0 ? "Загрузка сотрудников…" : "Сотрудники не найдены"}
                         </div>
                       )}
                     </div>
@@ -385,6 +423,9 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
                 )}
               </div>
             </div>
+            {accessError && (
+              <div className="mt-2 text-[12px] font-bold text-rose-500">{accessError}</div>
+            )}
           </div>
         </div>
 
@@ -556,20 +597,20 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
 };
 
 export function AgentsView() {
-  const [agents, setAgents] = useState<AgentConfig[]>(mockAgents);
-  const [activeAgentId, setActiveAgentId] = useState(mockAgents[0].id);
+  const [agents, setAgents] = useState<AgentConfig[]>([]);
+  const [activeAgentId, setActiveAgentId] = useState("");
   const [, setForceUpdate] = useState(0);
 
   useEffect(() => {
     fetchAgents()
       .then((loaded) => {
-        if (loaded.length > 0) {
-          setAgents(loaded);
-          setActiveAgentId(loaded[0].id);
-        }
+        setAgents(loaded);
+        if (loaded.length > 0) setActiveAgentId(loaded[0].id);
       })
       .catch(() => {});
   }, []);
+
+  const activeAgent = agents.find((a) => a.id === activeAgentId) || agents[0];
 
   return (
     <div className="flex flex-col lg:flex-row items-start gap-6 h-[calc(100vh-8rem)] min-h-[700px]">
@@ -661,13 +702,17 @@ export function AgentsView() {
 
       {/* Right Content - Editor */}
       <div className="flex-1 min-w-0 h-full overflow-y-auto">
-        <AgentEditor
-          key={activeAgentId}
-          agent={
-            agents.find((a) => a.id === activeAgentId) || agents[0]
-          }
-          onToggleActive={() => setForceUpdate((prev) => prev + 1)}
-        />
+        {activeAgent ? (
+          <AgentEditor
+            key={activeAgent.id}
+            agent={activeAgent}
+            onToggleActive={() => setForceUpdate((prev) => prev + 1)}
+          />
+        ) : (
+          <div className="bg-white rounded-3xl shadow-sm border border-gray-200/60 flex items-center justify-center min-h-[400px] text-gray-400 text-[14px] font-medium">
+            Загрузка агента…
+          </div>
+        )}
       </div>
     </div>
   );

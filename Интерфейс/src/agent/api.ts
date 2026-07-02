@@ -124,6 +124,61 @@ export async function fetchAgents(): Promise<AgentConfig[]> {
   return ((data.agents || []) as RawAgent[]).map(toAgent);
 }
 
+// --- Team access (existing /api/agent-access CRUD, shared with the Настройки tab) ---
+
+export type AccessTier = "admin" | "ops" | "faq";
+
+export const TIER_LABELS: Record<AccessTier, string> = {
+  admin: "Полный доступ",
+  ops: "Все функции",
+  faq: "Доступ к FAQ",
+};
+
+export interface AccessMember {
+  bitrix_user_id: number;
+  tier: AccessTier;
+  display_name: string;
+}
+
+export interface BitrixUser {
+  id: number;
+  name: string;
+  email: string;
+  position: string;
+}
+
+export async function fetchAccessMembers(): Promise<AccessMember[]> {
+  const data = await fetchJsonSafe("/api/agent-access", undefined, 30000);
+  return ((data.rows || []) as Array<{ bitrix_user_id: number; tier: string; display_name: string | null }>)
+    .filter((r) => r.tier === "admin" || r.tier === "ops" || r.tier === "faq")
+    .map((r) => ({
+      bitrix_user_id: r.bitrix_user_id,
+      tier: r.tier as AccessTier,
+      display_name: r.display_name || `#${r.bitrix_user_id}`,
+    }));
+}
+
+export async function fetchBitrixUsers(): Promise<BitrixUser[]> {
+  const data = await fetchJsonSafe("/api/agent-access/bitrix-users", undefined, 60000);
+  return (data.users || []) as BitrixUser[];
+}
+
+export async function upsertAccess(userId: number, tier: AccessTier, displayName?: string): Promise<void> {
+  await fetchJsonSafe(
+    "/api/agent-access",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bitrix_user_id: userId, tier, display_name: displayName }),
+    },
+    30000,
+  );
+}
+
+export async function deleteAccess(userId: number): Promise<void> {
+  await fetchJsonSafe(`/api/agent-access/${userId}`, { method: "DELETE" }, 30000);
+}
+
 export async function fetchKnowledge(): Promise<KnowledgeItem[]> {
   const data = await fetchJsonSafe("/api/agent-center/knowledge", undefined, 30000);
   const items = (data.items || []) as Array<{

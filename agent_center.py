@@ -29,27 +29,15 @@ from b24bot import _b24_portal_user_directory
 _DIALOGS_LIMIT_DEFAULT = 100
 _MESSAGES_LIMIT_DEFAULT = 200
 
-# The three live "agents" today = the bot access tiers. When real subagent profiles
-# get their own table this map becomes seed/meta for the system rows only.
-_TIER_META = {
-    "admin": {
-        "name": "Админ",
-        "kind": "системный • полный доступ",
-        "icon": "crown",
-        "icon_bg": "bg-amber-100 text-amber-500",
-    },
-    "ops": {
-        "name": "Основной агент",
-        "kind": "системный • все функции",
-        "icon": "zap",
-        "icon_bg": "bg-orange-100 text-orange-500",
-    },
-    "faq": {
-        "name": "FAQ-агент",
-        "kind": "системный • только знания",
-        "icon": "book",
-        "icon_bg": "bg-emerald-100 text-emerald-500",
-    },
+# There is exactly one live agent today: the Bitrix24 bot. Access tiers
+# (admin/ops/faq) are per-employee grants INSIDE it (agent_access), not separate
+# agents. When subagents arrive (own Bitrix app/user each) they become extra rows.
+_MAIN_AGENT_META = {
+    "id": "main",
+    "name": "Основной агент",
+    "kind": "Bitrix24-бот • Мозг Гермеса",
+    "icon": "zap",
+    "icon_bg": "bg-orange-100 text-orange-500",
 }
 
 _B24_MARKUP_RE = re.compile(r"\[/?(?:b|i|u|s|code|quote|url(?:=[^\]]*)?)\]", re.IGNORECASE)
@@ -209,58 +197,45 @@ def agent_center_dialog_messages():
 def agent_center_agents():
     day_start = msk_now().replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = day_start - timedelta(days=7)
-    stats: dict[str, dict[str, Any]] = {}
-    members: dict[str, list[str]] = {}
+    st: dict[str, Any] = {}
+    users: list[str] = []
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT tier,"
+                    "SELECT"
                     " COUNT(*) FILTER (WHERE created_at >= %s) AS turns_today,"
                     " COUNT(*) FILTER (WHERE created_at >= %s) AS turns_7d,"
                     " COUNT(*) FILTER (WHERE status <> 'ok' AND created_at >= %s) AS errors_7d,"
                     " AVG(latency_ms) FILTER (WHERE created_at >= %s AND latency_ms IS NOT NULL) AS avg_latency_7d,"
                     " MAX(created_at) AS last_at"
-                    " FROM bitrix_bot_interactions GROUP BY tier",
+                    " FROM bitrix_bot_interactions",
                     (day_start, week_start, week_start, week_start),
                 )
-                for r in cur.fetchall():
-                    stats[(r["tier"] or "faq")] = dict(r)
-                cur.execute(
-                    "SELECT a.tier, a.bitrix_user_id, a.display_name FROM agent_access a ORDER BY a.bitrix_user_id"
-                )
+                st = dict(cur.fetchone() or {})
+                cur.execute("SELECT bitrix_user_id, display_name FROM agent_access ORDER BY bitrix_user_id")
                 access_rows = cur.fetchall()
         names = _user_names()
         for r in access_rows:
             uid = int(r["bitrix_user_id"])
-            name = names.get(uid, {}).get("name") or r["display_name"] or f"#{uid}"
-            members.setdefault(r["tier"], []).append(name)
+            users.append(names.get(uid, {}).get("name") or r["display_name"] or f"#{uid}")
     except Exception:  # noqa: BLE001
         logging.exception("agent_center agents failed")
         return jsonify({"error": "Не удалось загрузить агентов."}), 500
-    agents = []
-    for tier in ("ops", "faq", "admin"):
-        meta = _TIER_META[tier]
-        st = stats.get(tier, {})
-        users = members.get(tier, [])
-        avg_ms = st.get("avg_latency_7d")
-        agents.append({
-            "id": tier,
-            "name": meta["name"],
-            "kind": meta["kind"],
-            "icon": meta["icon"],
-            "icon_bg": meta["icon_bg"],
-            "is_active": True,
-            "channels": ["Bitrix"],
-            "users_count": len(users),
-            "users_preview": ", ".join(users[:3]) + (f" +{len(users) - 3}" if len(users) > 3 else ""),
-            "turns_today": int(st.get("turns_today") or 0),
-            "turns_7d": int(st.get("turns_7d") or 0),
-            "errors_7d": int(st.get("errors_7d") or 0),
-            "avg_speed": f"{round(float(avg_ms) / 1000)} сек" if avg_ms else "—",
-            "last_at": _when_label(st.get("last_at")),
-        })
-    return jsonify({"agents": agents})
+    avg_ms = st.get("avg_latency_7d")
+    agent = {
+        **_MAIN_AGENT_META,
+        "is_active": True,
+        "channels": ["Bitrix"],
+        "users_count": len(users),
+        "users_preview": ", ".join(users[:3]) + (f" +{len(users) - 3}" if len(users) > 3 else ""),
+        "turns_today": int(st.get("turns_today") or 0),
+        "turns_7d": int(st.get("turns_7d") or 0),
+        "errors_7d": int(st.get("errors_7d") or 0),
+        "avg_speed": f"{round(float(avg_ms) / 1000)} сек" if avg_ms else "—",
+        "last_at": _when_label(st.get("last_at")),
+    }
+    return jsonify({"agents": [agent]})
 
 
 @app.get("/api/agent-center/knowledge")

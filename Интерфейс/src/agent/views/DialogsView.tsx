@@ -72,15 +72,16 @@ export function DialogsView() {
     };
   }, [channel, query]);
 
+  // A single live agent today, so the agents pane is a selector for the future
+  // multi-agent case; only the tag chips actually narrow the list.
   const visibleChats = useMemo(
     () =>
       chats.filter((c) => {
         if (filter === "errors" && c.tag !== "ошибка") return false;
         if ((filter === "ops" || filter === "faq") && c.tag !== filter) return false;
-        if (activeAgentId !== "all" && c.tag !== "ошибка" && c.tag !== activeAgentId) return false;
         return true;
       }),
-    [chats, filter, activeAgentId],
+    [chats, filter],
   );
 
   const activeChat =

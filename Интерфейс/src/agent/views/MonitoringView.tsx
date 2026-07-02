@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   RefreshCw,
   Play,
@@ -21,7 +21,8 @@ import {
   CartesianGrid,
 } from "recharts";
 import { cn } from "../../lib/utils";
-import { mockAgents } from "../data";
+import { fetchAgents } from "../api";
+import { AgentConfig } from "../types";
 
 const chartData = [
   { time: "15:00", speed: 45 },
@@ -72,9 +73,19 @@ const events = [
 ];
 
 export function MonitoringView() {
-  const [activeAgentId, setActiveAgentId] = useState(mockAgents[0].id);
-  const activeAgent =
-    mockAgents.find((a) => a.id === activeAgentId) || mockAgents[0];
+  const [agents, setAgents] = useState<AgentConfig[]>([]);
+  const [activeAgentId, setActiveAgentId] = useState("");
+
+  useEffect(() => {
+    fetchAgents()
+      .then((loaded) => {
+        setAgents(loaded);
+        if (loaded.length > 0) setActiveAgentId(loaded[0].id);
+      })
+      .catch(() => {});
+  }, []);
+
+  const activeAgent = agents.find((a) => a.id === activeAgentId) || agents[0];
 
   return (
     <div className="flex flex-col lg:flex-row items-start gap-6 h-[calc(100vh-8rem)] min-h-[700px]">
@@ -87,7 +98,7 @@ export function MonitoringView() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-3 space-y-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-          {mockAgents
+          {agents
             .filter((a) => a.isActive)
             .map((agent) => {
               const isActive = agent.id === activeAgentId;
@@ -153,7 +164,7 @@ export function MonitoringView() {
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-bold text-gray-900 mb-1">
-              Мониторинг: {activeAgent.name}
+              Мониторинг: {activeAgent?.name || "Основной агент"}
             </h1>
             <p className="text-gray-500 text-sm">
               Доступность агента, ошибки и скорость — всё в одном месте
