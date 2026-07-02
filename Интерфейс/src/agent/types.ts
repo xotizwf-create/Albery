@@ -50,4 +50,5 @@ export interface KnowledgeItem {
   type: 'Инструкция' | 'Скилл' | 'Регламент';
   updatedAt: string;
   isLocked?: boolean;
+  custom?: boolean;
 }

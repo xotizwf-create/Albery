@@ -1,8 +1,10 @@
 """Agent Center read-only API (/api/agent-center/*) — backs the "Центр Агента" SPA section.
 
-Serves data that already lives in PostgreSQL: employee↔bot dialogs
-(bitrix_bot_interactions), tier-derived agent profiles with usage stats
-(agent_access + interactions) and the instruction library (ai_instruction_folders).
+Serves data that already lives in PostgreSQL and on this box: employee↔bot dialogs
+(bitrix_bot_interactions), the main agent profile with usage stats (agent_access +
+interactions), the instruction library (ai_instruction_folders) and the Hermes
+skill library (/root/.hermes/skills/**/SKILL.md — the agent's gateway loads them
+from there; custom ones are versioned in this repo under scripts/hermes_skills).
 
 Registers routes on the shared Flask `app` at import time (same pattern as b24bot);
 app.py imports this module at the bottom. Every endpoint is GET/read-only and sits
@@ -11,11 +13,15 @@ behind the site's admin session login + /api gate (require_admin_auth in app.py)
 from __future__ import annotations
 
 import logging
+import os
 import re
 
+from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from flask import jsonify
 from flask import request
+from pathlib import Path
 from typing import Any
 
 from app import (
@@ -272,6 +278,53 @@ def agent_center_tools():
     return jsonify({"tools": tools, "total": len(tools)})
 
 
+_HERMES_SKILLS_DIR = Path(os.getenv("HERMES_SKILLS_DIR", "/root/.hermes/skills"))
+_REPO_SKILLS_DIR = Path(__file__).resolve().parent / "scripts" / "hermes_skills"
+_FRONTMATTER_FIELD_RE = re.compile(r"^(name|description):\s*(.*)$")
+
+
+def _skill_frontmatter(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return out
+    for line in lines[1:60]:
+        if line.strip() == "---":
+            break
+        m = _FRONTMATTER_FIELD_RE.match(line.strip())
+        if m:
+            out[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return out
+
+
+def _hermes_skills() -> list[dict[str, Any]]:
+    """The skill library the agent's Hermes gateway loads (all SKILL.md under the
+    skills dir; no allowlist in config → everything is advertised to the model)."""
+    skills: list[dict[str, Any]] = []
+    if not _HERMES_SKILLS_DIR.is_dir():
+        return skills
+    custom_names = {p.name for p in _REPO_SKILLS_DIR.iterdir() if p.is_dir()} if _REPO_SKILLS_DIR.is_dir() else set()
+    for skill_md in sorted(_HERMES_SKILLS_DIR.glob("*/SKILL.md")) + sorted(_HERMES_SKILLS_DIR.glob("*/*/SKILL.md")):
+        try:
+            meta = _skill_frontmatter(skill_md.read_text(encoding="utf-8", errors="replace"))
+            name = meta.get("name") or skill_md.parent.name
+            mtime = datetime.fromtimestamp(skill_md.stat().st_mtime, tz=timezone.utc)
+            desc = re.sub(r"\s+", " ", meta.get("description") or "").strip()
+            skills.append({
+                "id": f"skill:{skill_md.parent.name}",
+                "title": name,
+                "parent": skill_md.parent.parent.name if skill_md.parent.parent != _HERMES_SKILLS_DIR else "",
+                "description": (desc[:160].rstrip() + "…") if len(desc) > 160 else desc,
+                "type": "Скилл",
+                "custom": skill_md.parent.name in custom_names,
+                "has_content": True,
+                "updated": "обновлено " + _when_label(mtime),
+            })
+        except Exception:  # noqa: BLE001
+            logging.exception("agent_center: skill parse failed for %s", skill_md)
+    return skills
+
+
 @app.get("/api/agent-center/knowledge")
 def agent_center_knowledge():
     items = []
@@ -292,10 +345,13 @@ def agent_center_knowledge():
                         "title": r["name"],
                         "parent": r["parent_name"] or "",
                         "description": (content[:160].rstrip() + "…") if len(content) > 160 else content,
+                        "type": "Инструкция",
+                        "custom": True,
                         "has_content": bool(content),
                         "updated": ("обновлено " + _when_label(r["updated_at"])) if r["updated_at"] else "",
                     })
     except Exception:  # noqa: BLE001
         logging.exception("agent_center knowledge failed")
         return jsonify({"error": "Не удалось загрузить базу знаний."}), 500
+    items.extend(_hermes_skills())
     return jsonify({"items": items})

@@ -121,6 +121,9 @@ export function KnowledgeBaseView() {
             <div className="flex items-center justify-between sm:justify-end gap-6 shrink-0 mt-2 sm:mt-0 border-t sm:border-0 border-gray-50 pt-3 sm:pt-0">
               <div className="flex items-center gap-3">
                 <span className="bg-gray-50 border border-gray-100 px-2.5 py-1 rounded-lg text-[12px] font-bold text-gray-500">{item.type}</span>
+                {item.type === 'Скилл' && item.custom && (
+                  <span className="bg-emerald-50 border border-emerald-100 px-2.5 py-1 rounded-lg text-[12px] font-bold text-emerald-600">свой · в GitHub</span>
+                )}
                 <span className="text-[12px] font-semibold text-gray-400 hidden lg:inline-block">{item.updatedAt}</span>
               </div>
               <div className="flex gap-1.5">

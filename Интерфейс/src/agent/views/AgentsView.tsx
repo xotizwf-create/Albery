@@ -12,7 +12,6 @@ import {
   Search,
   User,
 } from "lucide-react";
-import { mockKnowledge } from "../data";
 import {
   AccessMember,
   AccessTier,
@@ -23,10 +22,11 @@ import {
   fetchAccessMembers,
   fetchAgents,
   fetchBitrixUsers,
+  fetchKnowledge,
   fetchMcpTools,
   upsertAccess,
 } from "../api";
-import { AgentConfig } from "../types";
+import { AgentConfig, KnowledgeItem } from "../types";
 import { cn } from "../../lib/utils";
 
 const toolIcon = (name: string): string => {
@@ -57,10 +57,8 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
   const [tools, setTools] = useState<McpTool[]>([]);
   const [toolsLoading, setToolsLoading] = useState(true);
 
-  const [selectedKnowledge, setSelectedKnowledge] = useState<string[]>([
-    "Постановка задач",
-    "Стиль общения",
-  ]);
+  const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>([]);
+  const [knowledgeLoading, setKnowledgeLoading] = useState(true);
 
   const [searchMcp, setSearchMcp] = useState("");
   const [searchKnowledge, setSearchKnowledge] = useState("");
@@ -86,6 +84,10 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
       .then(setTools)
       .catch(() => {})
       .finally(() => setToolsLoading(false));
+    fetchKnowledge()
+      .then(setKnowledgeItems)
+      .catch(() => {})
+      .finally(() => setKnowledgeLoading(false));
   }, []);
 
   const memberName = (m: AccessMember) =>
@@ -131,7 +133,7 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
       t.description.toLowerCase().includes(searchMcp.toLowerCase()),
   );
 
-  const filteredKnowledge = mockKnowledge.filter(
+  const filteredKnowledge = knowledgeItems.filter(
     (k) =>
       k.title.toLowerCase().includes(searchKnowledge.toLowerCase()) ||
       k.description.toLowerCase().includes(searchKnowledge.toLowerCase()),
@@ -142,12 +144,6 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
       prev.includes(channel)
         ? prev.filter((c) => c !== channel)
         : [...prev, channel],
-    );
-  };
-
-  const toggleKnowledge = (skill: string) => {
-    setSelectedKnowledge((prev) =>
-      prev.includes(skill) ? prev.filter((s) => s !== skill) : [...prev, skill],
     );
   };
 
@@ -498,7 +494,7 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
                 Инструкции и Скиллы
               </div>
               <span className="text-[11px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-0.5 rounded-md border border-indigo-100">
-                {selectedKnowledge.length} выбрано
+                {knowledgeItems.length} подключено
               </span>
             </div>
 
@@ -514,52 +510,56 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
             </div>
 
             <div className="overflow-y-auto pr-2 space-y-2 flex-1 min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-              {filteredKnowledge.map((k) => {
-                const isSelected = selectedKnowledge.includes(k.title);
-                return (
-                  <div
-                    key={k.id}
-                    className={cn(
-                      "flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl transition-all cursor-pointer group",
-                      isSelected
-                        ? "bg-white border border-gray-100 shadow-sm"
-                        : "bg-transparent border border-transparent hover:bg-white/60",
-                    )}
-                    onClick={() => toggleKnowledge(k.title)}
-                  >
-                    <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
-                      {k.type === "Инструкция" && !k.isLocked
-                        ? "💬"
-                        : k.type === "Скилл"
-                          ? "🔧"
-                          : k.type === "Регламент"
-                            ? "📋"
-                            : "🔒"}
-                    </div>
-                    <div className="flex-1 min-w-0 pr-4">
-                      <div className="flex items-center gap-2 mb-0.5">
-                        <span className="font-bold text-gray-900 text-[14px] truncate">
-                          {k.title}
-                        </span>
-                      </div>
-                      <p className="text-[12.5px] font-medium text-gray-500 truncate">
-                        {k.description}
-                      </p>
-                    </div>
-                    <div
-                      className={cn(
-                        "w-6 h-6 rounded-md border flex items-center justify-center shrink-0 transition-colors shadow-sm",
-                        isSelected
-                          ? "bg-indigo-500 border-indigo-500 text-white"
-                          : "bg-white border-gray-200 text-transparent group-hover:border-indigo-300",
-                      )}
-                    >
-                      <Check className="w-4 h-4" />
-                    </div>
+              {knowledgeLoading && (
+                <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">
+                  Загрузка базы знаний…
+                </div>
+              )}
+              {filteredKnowledge.map((k) => (
+                <div
+                  key={k.id}
+                  title={k.description}
+                  className="flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm group"
+                >
+                  <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
+                    {k.type === "Скилл" ? "🔧" : "💬"}
                   </div>
-                );
-              })}
-              {filteredKnowledge.length === 0 && (
+                  <div className="flex-1 min-w-0 pr-4">
+                    <div className="flex items-center gap-2 mb-0.5">
+                      <span className="font-bold text-gray-900 text-[14px] truncate">
+                        {k.title}
+                      </span>
+                      <div className="gap-1.5 hidden sm:flex shrink-0">
+                        <span
+                          className={cn(
+                            "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm",
+                            k.type === "Скилл"
+                              ? "bg-slate-100 border-slate-200 text-slate-600"
+                              : "bg-indigo-50 border-indigo-100 text-indigo-600",
+                          )}
+                        >
+                          {k.type === "Скилл" ? "скилл" : "инструкция"}
+                        </span>
+                        {k.type === "Скилл" && k.custom && (
+                          <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md bg-emerald-50 border border-emerald-100 text-emerald-600 shadow-sm">
+                            свой · в github
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <p className="text-[12.5px] font-medium text-gray-500 truncate">
+                      {k.description}
+                    </p>
+                  </div>
+                  <div
+                    title="Подключено у агента. Выборочный набор появится вместе с субагентами."
+                    className="w-6 h-6 rounded-md border flex items-center justify-center shrink-0 bg-indigo-500 border-indigo-500 text-white shadow-sm cursor-default"
+                  >
+                    <Check className="w-4 h-4" />
+                  </div>
+                </div>
+              ))}
+              {!knowledgeLoading && filteredKnowledge.length === 0 && (
                 <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">
                   Ничего не найдено
                 </div>

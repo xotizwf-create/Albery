@@ -200,6 +200,8 @@ export async function fetchKnowledge(): Promise<KnowledgeItem[]> {
     title: string;
     parent: string;
     description: string;
+    type: string;
+    custom: boolean;
     has_content: boolean;
     updated: string;
   }>;
@@ -209,7 +211,8 @@ export async function fetchKnowledge(): Promise<KnowledgeItem[]> {
       id: i.id,
       title: i.parent ? `${i.parent} / ${i.title}` : i.title,
       description: i.description,
-      type: "Инструкция" as const,
+      type: (i.type === "Скилл" ? "Скилл" : "Инструкция") as KnowledgeItem["type"],
       updatedAt: i.updated,
+      custom: i.custom,
     }));
 }
