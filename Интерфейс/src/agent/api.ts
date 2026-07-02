@@ -124,6 +124,20 @@ export async function fetchAgents(): Promise<AgentConfig[]> {
   return ((data.agents || []) as RawAgent[]).map(toAgent);
 }
 
+// --- MCP tools (the real registry the agent runs on) ---
+
+export interface McpTool {
+  name: string;
+  description: string;
+  tiers: string[];
+  core: boolean;
+}
+
+export async function fetchMcpTools(): Promise<McpTool[]> {
+  const data = await fetchJsonSafe("/api/agent-center/tools", undefined, 30000);
+  return (data.tools || []) as McpTool[];
+}
+
 // --- Team access (existing /api/agent-access CRUD, shared with the Настройки tab) ---
 
 export type AccessTier = "admin" | "ops" | "faq";

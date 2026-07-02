@@ -17,60 +17,35 @@ import {
   AccessMember,
   AccessTier,
   BitrixUser,
+  McpTool,
   TIER_LABELS,
   deleteAccess,
   fetchAccessMembers,
   fetchAgents,
   fetchBitrixUsers,
+  fetchMcpTools,
   upsertAccess,
 } from "../api";
 import { AgentConfig } from "../types";
 import { cn } from "../../lib/utils";
 
-const toolsList = [
-  {
-    id: "bitrix",
-    icon: "📝",
-    title: "Задачи Bitrix",
-    desc: "Поиск, постановка и комментирование задач",
-    scopes: ["read", "write"],
-  },
-  {
-    id: "knowledge",
-    icon: "📚",
-    title: "База знаний",
-    desc: "Поиск по регламентам, документам и оргструктуре",
-    scopes: ["search"],
-  },
-  {
-    id: "zoom",
-    icon: "🎥",
-    title: "Zoom-созвоны",
-    desc: "Транскрипты, списки участников и итоги",
-    scopes: ["read"],
-  },
-  {
-    id: "docs",
-    icon: "📊",
-    title: "Google-документы",
-    desc: "Чтение и запись таблиц, создание отчётов",
-    scopes: ["read", "write"],
-  },
-  {
-    id: "telegram",
-    icon: "📱",
-    title: "Telegram API",
-    desc: "Отправка уведомлений и файлов в чаты",
-    scopes: ["write"],
-  },
-  {
-    id: "analytics",
-    icon: "📈",
-    title: "Сводная аналитика",
-    desc: "Доступ к дашбордам и метрикам",
-    scopes: ["read"],
-  },
-];
+const toolIcon = (name: string): string => {
+  if (/bitrix|task/.test(name)) return "📝";
+  if (/zoom|call/.test(name)) return "🎥";
+  if (/google|sheet|drive|doc|file/.test(name)) return "📊";
+  if (/knowledge|search|context/.test(name)) return "📚";
+  if (/chat|message|dialog/.test(name)) return "💬";
+  if (/report|analytic|index|period/.test(name)) return "📈";
+  if (/employee|org|team|user|absence|access/.test(name)) return "👥";
+  if (/instruction|capabilit|prompt/.test(name)) return "🧠";
+  return "🔧";
+};
+
+const TOOL_TIER_CHIP: Record<string, string> = {
+  ops: "bg-emerald-50 border-emerald-100 text-emerald-600",
+  faq: "bg-indigo-50 border-indigo-100 text-indigo-600",
+  admin: "bg-amber-50 border-amber-100 text-amber-600",
+};
 
 const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
   agent,
@@ -79,14 +54,8 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
   const [activeChannels, setActiveChannels] = useState<string[]>(
     agent.channels,
   );
-  const [activeTools, setActiveTools] = useState<Record<string, boolean>>({
-    bitrix: true,
-    knowledge: true,
-    zoom: false,
-    docs: false,
-    telegram: false,
-    analytics: false,
-  });
+  const [tools, setTools] = useState<McpTool[]>([]);
+  const [toolsLoading, setToolsLoading] = useState(true);
 
   const [selectedKnowledge, setSelectedKnowledge] = useState<string[]>([
     "Постановка задач",
@@ -113,6 +82,10 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
     fetchBitrixUsers()
       .then(setBitrixUsers)
       .catch(() => {});
+    fetchMcpTools()
+      .then(setTools)
+      .catch(() => {})
+      .finally(() => setToolsLoading(false));
   }, []);
 
   const memberName = (m: AccessMember) =>
@@ -152,10 +125,10 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
     (u) => !memberIds.has(u.id) && u.name.toLowerCase().includes(userSearchQuery.toLowerCase()),
   );
 
-  const filteredTools = toolsList.filter(
+  const filteredTools = tools.filter(
     (t) =>
-      t.title.toLowerCase().includes(searchMcp.toLowerCase()) ||
-      t.desc.toLowerCase().includes(searchMcp.toLowerCase()),
+      t.name.toLowerCase().includes(searchMcp.toLowerCase()) ||
+      t.description.toLowerCase().includes(searchMcp.toLowerCase()),
   );
 
   const filteredKnowledge = mockKnowledge.filter(
@@ -170,10 +143,6 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
         ? prev.filter((c) => c !== channel)
         : [...prev, channel],
     );
-  };
-
-  const toggleTool = (tool: string) => {
-    setActiveTools((prev) => ({ ...prev, [tool]: !prev[tool] }));
   };
 
   const toggleKnowledge = (skill: string) => {
@@ -439,7 +408,7 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
                 Инструменты (MCP)
               </div>
               <span className="text-[11px] font-bold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-md border border-emerald-100">
-                {Object.values(activeTools).filter(Boolean).length} активно
+                {tools.length} активно
               </span>
             </div>
 
@@ -455,58 +424,65 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
             </div>
 
             <div className="overflow-y-auto pr-2 space-y-2 flex-1 min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {toolsLoading && (
+                <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">
+                  Загрузка инструментов…
+                </div>
+              )}
               {filteredTools.map((tool) => (
                 <div
-                  key={tool.id}
-                  className={cn(
-                    "flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl transition-all cursor-pointer group",
-                    activeTools[tool.id]
-                      ? "bg-white border border-gray-100 shadow-sm"
-                      : "bg-transparent border border-transparent hover:bg-white/60",
-                  )}
-                  onClick={() => toggleTool(tool.id)}
+                  key={tool.name}
+                  title={tool.description}
+                  className="flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm group"
                 >
                   <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
-                    {tool.icon}
+                    {toolIcon(tool.name)}
                   </div>
                   <div className="flex-1 min-w-0 pr-4">
                     <div className="flex items-center gap-2.5 mb-0.5">
                       <span className="font-bold text-gray-900 text-[14px] truncate">
-                        {tool.title}
+                        {tool.name}
                       </span>
-                      <div className="flex gap-1.5 hidden sm:flex">
-                        {tool.scopes.map((s) => (
-                          <span
-                            key={s}
-                            className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md bg-gray-50 border border-gray-100 text-gray-500 shadow-sm"
-                          >
-                            {s}
+                      <div className="gap-1.5 hidden sm:flex shrink-0">
+                        {tool.tiers.length === 1 && tool.tiers[0] === "admin" ? (
+                          <span className={cn("text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm", TOOL_TIER_CHIP.admin)}>
+                            только админ
                           </span>
-                        ))}
+                        ) : (
+                          tool.tiers
+                            .filter((t) => t !== "admin")
+                            .map((t) => (
+                              <span
+                                key={t}
+                                className={cn(
+                                  "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm",
+                                  TOOL_TIER_CHIP[t] || TOOL_TIER_CHIP.ops,
+                                )}
+                              >
+                                {t}
+                              </span>
+                            ))
+                        )}
+                        {tool.core && (
+                          <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md bg-slate-100 border border-slate-200 text-slate-600 shadow-sm">
+                            ядро
+                          </span>
+                        )}
                       </div>
                     </div>
                     <p className="text-[12.5px] font-medium text-gray-500 truncate">
-                      {tool.desc}
+                      {tool.description}
                     </p>
                   </div>
                   <div
-                    className={cn(
-                      "w-10 h-6 rounded-full flex items-center px-0.5 transition-colors shrink-0",
-                      activeTools[tool.id]
-                        ? "bg-indigo-500"
-                        : "bg-gray-200 group-hover:bg-gray-300",
-                    )}
+                    title="Инструмент подключён. Выборочное отключение появится вместе с субагентами."
+                    className="w-10 h-6 rounded-full flex items-center px-0.5 bg-indigo-500 shrink-0 cursor-default opacity-90"
                   >
-                    <div
-                      className={cn(
-                        "w-5 h-5 rounded-full bg-white transition-transform shadow-sm",
-                        activeTools[tool.id] && "translate-x-4",
-                      )}
-                    />
+                    <div className="w-5 h-5 rounded-full bg-white shadow-sm translate-x-4" />
                   </div>
                 </div>
               ))}
-              {filteredTools.length === 0 && (
+              {!toolsLoading && filteredTools.length === 0 && (
                 <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">
                   Ничего не найдено
                 </div>

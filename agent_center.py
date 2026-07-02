@@ -238,6 +238,40 @@ def agent_center_agents():
     return jsonify({"agents": [agent]})
 
 
+@app.get("/api/agent-center/tools")
+def agent_center_tools():
+    """The real MCP tool registry with tier availability (admin=/mcp, ops=/mcp-ops,
+    faq=/mcp-faq) and the core-toolset flag (the compact set the chat-bot runs on).
+    Same lazy-import idiom the /mcp* HTTP handlers in app.py use."""
+    try:
+        from mcp.context_server import (
+            CORE_TOOL_NAMES,
+            FAQ_TOOL_NAMES,
+            OPS_TOOL_NAMES,
+            TOOLS,
+        )
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center tools: context_server import failed")
+        return jsonify({"error": "Не удалось загрузить список инструментов."}), 500
+    tools = []
+    for name, spec in TOOLS.items():
+        desc = re.sub(r"\s+", " ", str(spec.get("description") or "")).strip()
+        first_sentence = desc.split(". ")[0].strip()
+        short = first_sentence if 0 < len(first_sentence) <= 200 else desc[:180].rstrip() + ("…" if len(desc) > 180 else "")
+        tiers = ["admin"]
+        if name in OPS_TOOL_NAMES:
+            tiers.append("ops")
+        if name in FAQ_TOOL_NAMES:
+            tiers.append("faq")
+        tools.append({
+            "name": name,
+            "description": short,
+            "tiers": tiers,
+            "core": name in CORE_TOOL_NAMES,
+        })
+    return jsonify({"tools": tools, "total": len(tools)})
+
+
 @app.get("/api/agent-center/knowledge")
 def agent_center_knowledge():
     items = []
