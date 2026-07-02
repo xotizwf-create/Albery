@@ -6401,6 +6401,22 @@ META_TOOL_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
+# Live activity feed for the chat bot's status message: every tools/call on the CORE
+# connectors (the bot's own) is recorded here, so the bridge can show what the agent is doing
+# right now. Cron agents use the full connectors (core=False) and never pollute this feed.
+import collections as _collections
+
+_RECENT_CORE_TOOL_CALLS: "_collections.deque" = _collections.deque(maxlen=64)
+
+
+def record_core_tool_call(name: str) -> None:
+    _RECENT_CORE_TOOL_CALLS.append((time.time(), str(name)))
+
+
+def recent_core_tool_calls(since_ts: float) -> list:
+    return [(ts, name) for ts, name in list(_RECENT_CORE_TOOL_CALLS) if ts >= since_ts]
+
+
 def _find_tool_matches(query: Any, tool_names: set[str] | None, limit: int) -> list[dict[str, Any]]:
     tokens = [t for t in re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ_]+", str(query or "").lower()) if len(t) >= 3]
     if not tokens:
@@ -6481,6 +6497,7 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
             name = params.get("name")
             args = params.get("arguments") or {}
             if core and name == "find_tool":
+                record_core_tool_call("find_tool")
                 matches = _find_tool_matches(args.get("query"), tool_names, int(args.get("limit") or 5))
                 return {"jsonrpc": "2.0", "id": request_id, "result": text_response({
                     "matches": matches,
@@ -6500,6 +6517,8 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
             # connector's tool set, refuse here.
             if name in OWNER_ONLY_TOOL_NAMES and tool_names is not None:
                 raise McpError(-32601, f"Unknown or unavailable tool: {name}")
+            if core:
+                record_core_tool_call(name)
             if name in ("start_here_always_read_ai_instructions", "get_ai_capabilities"):
                 connector_id = "faq" if tool_names == FAQ_TOOL_NAMES else "full"
                 args = {
