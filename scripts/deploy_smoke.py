@@ -28,11 +28,13 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv(BASE / ".env")
 
 APP_URL = "http://127.0.0.1:5002"
-MIN_TOOLS = {"/mcp": 60, "/mcp-ops": 55, "/mcp-faq": 10}
+MIN_TOOLS = {"/mcp": 60, "/mcp-ops": 55, "/mcp-faq": 10, "/mcp-core": 20, "/mcp-ops-core": 20}
 TOKEN_ENV = {
     "/mcp": "MCP_SHARED_SECRET",
     "/mcp-ops": "MCP_OPS_SHARED_SECRET",
     "/mcp-faq": "MCP_FAQ_SHARED_SECRET",
+    "/mcp-core": "MCP_SHARED_SECRET",
+    "/mcp-ops-core": "MCP_OPS_SHARED_SECRET",
 }
 
 failures: list[str] = []
@@ -79,6 +81,34 @@ for path, min_tools in MIN_TOOLS.items():
             print(f"{path}: OK, {len(tools)} инструментов")
     except Exception as exc:  # noqa: BLE001
         failures.append(f"{path}: {exc}")
+
+# 2b. Two-stage tools on the core connectors must actually work.
+def call_mcp(path: str, tool: str, arguments: dict) -> dict:
+    token = os.getenv(TOKEN_ENV[path], "").strip()
+    _status, body = post_json(
+        f"{APP_URL}{path}",
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+         "params": {"name": tool, "arguments": arguments}},
+        {"Authorization": f"Bearer {token}"},
+    )
+    return body
+
+
+try:
+    body = call_mcp("/mcp-core", "find_tool", {"query": "delete task"})
+    text = json.dumps(body, ensure_ascii=False)
+    if "delete_bitrix_task" not in text:
+        failures.append(f"/mcp-core find_tool('delete task') не нашёл delete_bitrix_task: {text[:200]}")
+    else:
+        print("/mcp-core find_tool: OK")
+    body = call_mcp("/mcp-ops-core", "call_tool", {"name": "health", "arguments": {}})
+    text = json.dumps(body, ensure_ascii=False)
+    if "error" in body or "ok" not in text.lower():
+        failures.append(f"/mcp-ops-core call_tool(health) не прошёл: {text[:200]}")
+    else:
+        print("/mcp-ops-core call_tool: OK")
+except Exception as exc:  # noqa: BLE001
+    failures.append(f"core meta-tools: {exc}")
 
 # 3. The site itself must be up.
 try:

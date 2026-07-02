@@ -1726,6 +1726,11 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
     (idle reset + cap rotation + carried summary) is handled by _b24_session_prepare."""
     session, seed = _b24_session_prepare(dialog_id)
     toolset = {"admin": "albery", "ops": "albery-ops"}.get(tier, "albery-faq")
+    core_toolset = tier in ("admin", "ops") and os.getenv("B24_CORE_TOOLSET", "").strip() == "1"
+    if core_toolset:
+        # Two-stage tools: the bot registers a curated core + find_tool/call_tool (fast turns,
+        # small context); the full connectors stay untouched for cron agents.
+        toolset = {"admin": "albery-core", "ops": "albery-ops-core"}[tier]
     timeout_s = int(os.getenv("B24_TESTBOT_HERMES_TIMEOUT", "170"))
     fmt = (
         " СТИЛЬ И ФОРМАТ ОТВЕТА (важно): пиши КРАТКО и по делу, но КРАСИВО и удобно для чтения — "
@@ -1801,6 +1806,14 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         "Текущие дата и время: " + msk_now().strftime("%d.%m.%Y %H:%M")
         + " МСК (Europe/Moscow) — это «сегодня/сейчас» для любых расчётов сроков и дат."
     )
+    if core_toolset:
+        parts.append(
+            "ИНСТРУМЕНТЫ — ДВУХСТУПЕНЧАТАЯ СХЕМА (важно): в твоём списке — ядро самых нужных "
+            "инструментов. Если нужного действия в списке НЕТ — не отвечай «не умею/нет доступа»: "
+            "сначала вызови find_tool (query — короткие английские ключевые слова, например "
+            "'delete task', 'zoom report', 'drive folder'), возьми из результата точное имя и "
+            "схему аргументов и выполни действие через call_tool(name=..., arguments={...})."
+        )
     if tier in ("admin", "ops"):
         parts.append(
             "ПАМЯТЬ И КОНТЕКСТ (важно). Это диалог Битрикса dialog_id=`" + str(dialog_id) + "`. У тебя "

@@ -16032,6 +16032,81 @@ def mcp_ops_http(path_token: str | None = None):
     return jsonify(response), mcp_status_code(response)
 
 
+# --- Core connectors: curated tool core + find_tool/call_tool (two-stage loading). Used by the
+# Bitrix chat bot to keep per-turn context small; cron agents keep the full /mcp and /mcp-ops
+# connectors, so their scripted tool names are unaffected.
+@app.get("/mcp-core")
+@app.get("/mcp-core/<path:path_token>")
+def mcp_core_info(path_token: str | None = None):
+    if not mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    return jsonify({
+        "name": "employee-analytics-context-core",
+        "transport": "http-json-rpc",
+        "endpoint": "/mcp-core",
+        "auth": "shared-secret",
+        "scope": "curated core of the full connector + find_tool/call_tool for the rest",
+        "methods": ["initialize", "tools/list", "tools/call"],
+    })
+
+
+@app.post("/mcp-core")
+@app.post("/mcp-core/<path:path_token>")
+def mcp_core_http(path_token: str | None = None):
+    if not mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    from mcp.context_server import handle_request
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Request body must be JSON."},
+        }), 400
+
+    response = handle_request(payload, core=True)
+    if response is None:
+        return ("", 202)
+    return jsonify(response), mcp_status_code(response)
+
+
+@app.get("/mcp-ops-core")
+@app.get("/mcp-ops-core/<path:path_token>")
+def mcp_ops_core_info(path_token: str | None = None):
+    if not ops_mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    return jsonify({
+        "name": "employee-analytics-context-ops-core",
+        "transport": "http-json-rpc",
+        "endpoint": "/mcp-ops-core",
+        "auth": "shared-secret",
+        "scope": "curated core of the ops connector + find_tool/call_tool for the rest",
+        "methods": ["initialize", "tools/list", "tools/call"],
+    })
+
+
+@app.post("/mcp-ops-core")
+@app.post("/mcp-ops-core/<path:path_token>")
+def mcp_ops_core_http(path_token: str | None = None):
+    if not ops_mcp_auth_ok(path_token):
+        return mcp_auth_error()
+    from mcp.context_server import OPS_TOOL_NAMES, handle_request
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Request body must be JSON."},
+        }), 400
+
+    response = handle_request(payload, tool_names=OPS_TOOL_NAMES, core=True)
+    if response is None:
+        return ("", 202)
+    return jsonify(response), mcp_status_code(response)
+
+
 @app.get("/sse")
 @app.get("/sse/<path:path_token>")
 def mcp_sse(path_token: str | None = None):

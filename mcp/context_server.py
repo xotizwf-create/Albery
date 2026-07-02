@@ -575,6 +575,7 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
 def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[str, Any]:
     instructions = load_ai_instructions()
     available_tools = list(args.get("_connector_tools") or sorted(TOOLS.keys()))
+    hidden_tools = list(args.get("_connector_hidden_tools") or [])
     connector_id = args.get("_connector_id") or "full"
     is_faq = connector_id == "faq" or set(available_tools) == FAQ_TOOL_NAMES
     connector_label = "FAQ MCP (read-only)" if is_faq else "Full MCP"
@@ -586,6 +587,15 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
             "connector_id": connector_id,
             "connector_label": connector_label,
             "available_tools": sorted(available_tools),
+            **({
+                "more_tools_via_call_tool": hidden_tools,
+                "two_stage_note": (
+                    "ВАЖНО: инструменты из more_tools_via_call_tool тебе ТОЖЕ доступны — найди "
+                    "нужный через find_tool и вызывай через call_tool(name=..., arguments={...}). "
+                    "Правило «нет доступа» применяй ТОЛЬКО к тому, чего нет ни в available_tools, "
+                    "ни в more_tools_via_call_tool."
+                ),
+            } if hidden_tools else {}),
             "rules": [
                 "STEP 0 (before any planning): inspect this connector's available_tools list above. Treat it as the complete and only set of capabilities you have right now.",
                 "Do not assume access to any tool, data source, table, file, integration, web search, or external service that is not in available_tools. Do not invoke or describe tools by name that are not in the list.",
@@ -6308,6 +6318,115 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
 # Operational-full connector: every registered tool EXCEPT the admin-only ones above.
 OPS_TOOL_NAMES: set[str] = set(TOOLS) - OWNER_ONLY_TOOL_NAMES
 
+# --- Core toolset: two-stage tool loading for the chat bot (/mcp-core, /mcp-ops-core) --------
+# The chat bot registers only this curated core (picked from real usage stats in the Hermes
+# session DB: ~82% of all historical calls, plus every tool the bot prompt names explicitly)
+# and two meta-tools. Everything else is discovered via find_tool and invoked via call_tool.
+# Cron agents keep the full /mcp and /mcp-ops connectors, so their scripted tool names are
+# unaffected by this list.
+CORE_TOOL_NAMES: set[str] = {
+    # entry / self-knowledge
+    "start_here_always_read_ai_instructions",
+    "get_ai_instructions",
+    "get_ai_capabilities",
+    "get_context_guide",
+    # company knowledge
+    "search_company_knowledge",
+    "list_company_files",
+    "get_company_file",
+    "get_org_structure",
+    "get_employee_absences",
+    # tasks
+    "search_tasks",
+    "get_task_comments",
+    "create_bitrix_task",
+    # zoom
+    "list_zoom_calls",
+    "get_zoom_call_transcript",
+    "search_zoom_transcripts",
+    # dialog memory
+    "get_bitrix_bot_chat",
+    "list_bitrix_bot_sessions",
+    # messaging / web
+    "send_bitrix_message",
+    "fetch_url",
+    # google workflow the bot prompt teaches
+    "create_google_sheet",
+    "get_google_sheet_meta",
+    "write_google_sheet_values",
+    "share_drive_item_for_everyone",
+    "get_webapp_template",
+    "make_sheet_applet",
+    "manage_apps_script",
+}
+
+META_TOOL_SPECS: dict[str, dict[str, Any]] = {
+    "find_tool": {
+        "description": (
+            "Найди инструмент по задаче. Твой список инструментов — ЯДРО самых частых; у "
+            "коннектора есть и другие. Если нужного действия нет в списке — НЕ отвечай «не "
+            "умею»: вызови этот поиск, получи имя/описание/схему аргументов и выполни действие "
+            "через call_tool. Query — короткие английские ключевые слова по смыслу действия "
+            "(например 'delete task', 'zoom report', 'drive folder', 'owner recommendations')."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Английские ключевые слова: что нужно сделать.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Сколько кандидатов вернуть (по умолчанию 5).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    "call_tool": {
+        "description": (
+            "Вызови любой инструмент коннектора по точному имени — в том числе не входящий в "
+            "ядро. Сначала найди его через find_tool и заполни arguments по его inputSchema."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Точное имя инструмента (из find_tool)."},
+                "arguments": {"type": "object", "description": "Аргументы по схеме инструмента."},
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+
+def _find_tool_matches(query: Any, tool_names: set[str] | None, limit: int) -> list[dict[str, Any]]:
+    tokens = [t for t in re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ_]+", str(query or "").lower()) if len(t) >= 3]
+    if not tokens:
+        raise McpError(-32602, "Нужен запрос: find_tool(query='что нужно сделать', английскими словами).")
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for name, spec in _allowed_tools(tool_names).items():
+        hay_name = name.lower()
+        hay_desc = str(spec.get("description") or "").lower()
+        score = 0
+        for tok in tokens:
+            if tok in hay_name:
+                score += 30
+            score += 3 * hay_desc.count(tok)
+        if score:
+            scored.append((score, name, spec))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [
+        {
+            "name": name,
+            "description": spec["description"],
+            "inputSchema": spec["inputSchema"],
+            "how_to_call": "call_tool(name='" + name + "', arguments={...})",
+        }
+        for _score, name, spec in scored[: max(1, limit)]
+    ]
+
 
 def _allowed_tools(tool_names: set[str] | None = None) -> dict[str, dict[str, Any]]:
     if tool_names is None:
@@ -6315,8 +6434,11 @@ def _allowed_tools(tool_names: set[str] | None = None) -> dict[str, dict[str, An
     return {name: TOOLS[name] for name in tool_names if name in TOOLS}
 
 
-def list_tools(tool_names: set[str] | None = None) -> list[dict[str, Any]]:
-    return [
+def list_tools(tool_names: set[str] | None = None, core: bool = False) -> list[dict[str, Any]]:
+    registry = _allowed_tools(tool_names)
+    if core:
+        registry = {name: registry[name] for name in sorted(CORE_TOOL_NAMES) if name in registry}
+    items = [
         {
             "name": name,
             "description": (
@@ -6326,11 +6448,18 @@ def list_tools(tool_names: set[str] | None = None) -> list[dict[str, Any]]:
             ),
             "inputSchema": spec["inputSchema"],
         }
-        for name, spec in _allowed_tools(tool_names).items()
+        for name, spec in registry.items()
     ]
+    if core:
+        items.extend(
+            {"name": name, "description": spec["description"], "inputSchema": spec["inputSchema"]}
+            for name, spec in META_TOOL_SPECS.items()
+        )
+    return items
 
 
-def handle_request(request: dict[str, Any], tool_names: set[str] | None = None) -> dict[str, Any] | None:
+def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
+                   core: bool = False) -> dict[str, Any] | None:
     request_id = request.get("id")
     method = request.get("method")
     available_tools = _allowed_tools(tool_names)
@@ -6346,12 +6475,25 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None) 
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             }
         elif method == "tools/list":
-            result = {"tools": list_tools(tool_names)}
+            result = {"tools": list_tools(tool_names, core=core)}
         elif method == "tools/call":
             params = request.get("params") or {}
             name = params.get("name")
             args = params.get("arguments") or {}
+            if core and name == "find_tool":
+                matches = _find_tool_matches(args.get("query"), tool_names, int(args.get("limit") or 5))
+                return {"jsonrpc": "2.0", "id": request_id, "result": text_response({
+                    "matches": matches,
+                    "note": "Вызывай выбранный инструмент через call_tool(name=..., arguments={...}) по его inputSchema.",
+                })}
+            if core and name == "call_tool":
+                inner_args = args.get("arguments")
+                name = str(args.get("name") or "").strip()
+                args = inner_args if isinstance(inner_args, dict) else {}
+                logger.info("mcp_call_tool_proxy name=%s", name)
             if name not in available_tools:
+                if core:
+                    raise McpError(-32601, f"Unknown or unavailable tool: {name}. Найди точное имя через find_tool.")
                 raise McpError(-32601, f"Unknown or unavailable tool: {name}")
             # Defense-in-depth: admin-only tools are reachable ONLY via the full/admin connector
             # (tool_names is None). Even if a future config mistakenly added them to a scoped
@@ -6365,6 +6507,13 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None) 
                     "_connector_tools": sorted(available_tools.keys()),
                     "_connector_id": connector_id,
                 }
+                if core:
+                    args["_connector_tools"] = sorted(
+                        (set(available_tools.keys()) & CORE_TOOL_NAMES) | set(META_TOOL_SPECS)
+                    )
+                    args["_connector_hidden_tools"] = sorted(
+                        set(available_tools.keys()) - CORE_TOOL_NAMES
+                    )
             started = time.perf_counter()
             result_payload = available_tools[name]["handler"](args)
             duration_ms = round((time.perf_counter() - started) * 1000, 1)
