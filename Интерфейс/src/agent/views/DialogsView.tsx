@@ -119,7 +119,7 @@ export function DialogsView() {
   let lastDate = "";
 
   return (
-    <div className="flex h-[calc(100vh-6rem)] bg-white rounded-3xl shadow-sm border border-gray-200/60 overflow-hidden">
+    <div className="flex h-[calc(100vh-14rem)] min-h-[520px] bg-white rounded-3xl shadow-sm border border-gray-200/60 overflow-hidden">
       {/* Leftmost Pane - Agents */}
       <div className="w-[280px] border-r border-gray-100 flex flex-col bg-slate-50/50 shrink-0">
         <div className="p-4 border-b border-gray-100 h-16 flex items-center shrink-0">
@@ -323,7 +323,7 @@ export function DialogsView() {
               </div>
             </div>
 
-            <div className="flex-1 min-h-0 overflow-y-auto p-6 space-y-6 bg-slate-50/50 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+            <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-6 space-y-6 bg-slate-50/50 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
               {turnsLoading && (
                 <div className="flex items-center justify-center gap-2 py-10 text-gray-400 text-[13px] font-bold">
                   <Loader2 className="w-4 h-4 animate-spin" /> Загрузка переписки…
@@ -346,19 +346,19 @@ export function DialogsView() {
                         </div>
                       )}
                       {turn.question && (
-                        <div className="flex flex-col max-w-[85%] items-start">
-                          <div className="px-5 py-3.5 rounded-2xl text-[14px] font-medium leading-relaxed shadow-sm bg-white text-gray-800 rounded-tl-sm border border-gray-100 whitespace-pre-wrap">
+                        <div className="flex flex-col max-w-[min(85%,44rem)] items-start">
+                          <div className="max-w-full min-w-0 px-5 py-3.5 rounded-2xl text-[14px] font-medium leading-relaxed shadow-sm bg-white text-gray-800 rounded-tl-sm border border-gray-100 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
                             {turn.question}
                           </div>
                           <span className="text-[10.5px] font-bold text-gray-400 mt-1.5 px-1">{turn.time}</span>
                         </div>
                       )}
                       {turn.status !== "ok" ? (
-                        <div className="flex flex-col max-w-[85%] items-end ml-auto">
+                        <div className="flex flex-col max-w-[min(85%,44rem)] items-end ml-auto">
                           <div className="p-5 rounded-2xl w-full max-w-[420px] shadow-sm border bg-rose-500 border-rose-400 text-white">
                             <div className="font-bold text-[15px] mb-2">Ошибка обработки</div>
                             {(turn.error || turn.answer) && (
-                              <div className="text-[13.5px] text-rose-50 font-medium leading-relaxed whitespace-pre-wrap">
+                              <div className="text-[13.5px] text-rose-50 font-medium leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
                                 {turn.error || turn.answer}
                               </div>
                             )}
@@ -370,8 +370,8 @@ export function DialogsView() {
                         </div>
                       ) : (
                         turn.answer && (
-                          <div className="flex flex-col max-w-[85%] items-end ml-auto">
-                            <div className="px-5 py-3.5 rounded-2xl text-[14px] font-medium leading-relaxed shadow-sm bg-indigo-600 text-white rounded-tr-sm whitespace-pre-wrap">
+                          <div className="flex flex-col max-w-[min(85%,44rem)] items-end ml-auto">
+                            <div className="max-w-full min-w-0 px-5 py-3.5 rounded-2xl text-[14px] font-medium leading-relaxed shadow-sm bg-indigo-600 text-white rounded-tr-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
                               {turn.answer}
                             </div>
                             <span className="text-[10.5px] font-bold text-gray-400 mt-1.5 px-1">

@@ -88,7 +88,7 @@ export function MonitoringView() {
   const activeAgent = agents.find((a) => a.id === activeAgentId) || agents[0];
 
   return (
-    <div className="flex flex-col lg:flex-row items-start gap-6 h-[calc(100vh-8rem)] min-h-[700px]">
+    <div className="flex flex-col lg:flex-row items-start gap-6 h-[calc(100vh-14rem)] min-h-[560px]">
       {/* Left Sidebar - Agents List */}
       <div className="w-full lg:w-[320px] xl:w-[340px] shrink-0 flex flex-col h-full bg-white rounded-3xl border border-gray-200/60 shadow-sm overflow-hidden">
         <div className="p-4 border-b border-gray-100 bg-slate-50/50 h-[72px] flex items-center shrink-0">
