@@ -1,7 +1,6 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   RefreshCw,
-  Play,
   CheckCircle2,
   AlertTriangle,
   AlertCircle,
@@ -21,60 +20,23 @@ import {
   CartesianGrid,
 } from "recharts";
 import { cn } from "../../lib/utils";
-import { fetchAgents } from "../api";
+import { MonitoringData, fetchAgents, fetchMonitoring } from "../api";
 import { AgentConfig } from "../types";
 
-const chartData = [
-  { time: "15:00", speed: 45 },
-  { time: "16:00", speed: 40 },
-  { time: "17:00", speed: 38 },
-  { time: "18:00", speed: 42 },
-  { time: "19:00", speed: 35 },
-  { time: "20:00", speed: 48 },
-  { time: "21:00", speed: 95 }, // The spike / timeout
-  { time: "22:00", speed: 32 },
-  { time: "23:00", speed: 28 },
-  { time: "00:00", speed: 30 },
-  { time: "сейчас", speed: 25 },
-];
+const CARD_TONE: Record<string, string> = {
+  good: "text-emerald-500",
+  bad: "text-rose-500",
+  muted: "text-gray-400",
+};
 
-const events = [
-  {
-    id: 1,
-    time: "15:00",
-    type: "success",
-    text: "Selfcheck: всё чисто, проблем не найдено",
-  },
-  {
-    id: 2,
-    time: "14:32",
-    type: "deploy",
-    text: "Деплой: живой статус агента (коммит 8e8e85c) — смоук пройден",
-  },
-  {
-    id: 3,
-    time: "11:04",
-    type: "error",
-    text: "Таймаут хода — диалог 22, мозг не ответил за 600с. Алерт отправлен в Telegram → исправлено в 14:20",
-    resolved: true,
-  },
-  {
-    id: 4,
-    time: "10:15",
-    type: "info",
-    text: "Наталья Ким запросила расширение доступа → передано Александру",
-  },
-  {
-    id: 5,
-    time: "09:00",
-    type: "success",
-    text: "Утренняя проверка: Bitrix, Google, Zoom — все интеграции живы",
-  },
-];
+const REFRESH_MS = 30000;
 
 export function MonitoringView() {
   const [agents, setAgents] = useState<AgentConfig[]>([]);
   const [activeAgentId, setActiveAgentId] = useState("");
+  const [data, setData] = useState<MonitoringData | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState("");
 
   useEffect(() => {
     fetchAgents()
@@ -85,7 +47,25 @@ export function MonitoringView() {
       .catch(() => {});
   }, []);
 
+  const load = useCallback(() => {
+    setRefreshing(true);
+    fetchMonitoring()
+      .then((d) => {
+        setData(d);
+        setError("");
+      })
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setRefreshing(false));
+  }, []);
+
+  useEffect(() => {
+    load();
+    const timer = window.setInterval(load, REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
   const activeAgent = agents.find((a) => a.id === activeAgentId) || agents[0];
+  const online = !!data && !error;
 
   return (
     <div className="flex flex-col lg:flex-row items-start gap-6 h-[calc(100vh-14rem)] min-h-[560px]">
@@ -167,74 +147,68 @@ export function MonitoringView() {
               Мониторинг: {activeAgent?.name || "Основной агент"}
             </h1>
             <p className="text-gray-500 text-sm">
-              Доступность агента, ошибки и скорость — всё в одном месте
+              Доступность агента, ошибки и скорость — живые данные, обновление каждые 30 сек
             </p>
           </div>
-          <div className="flex gap-3">
-            <button className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 text-gray-700 rounded-xl text-sm font-semibold hover:bg-gray-50 transition-all shadow-sm">
-              <RefreshCw className="w-4 h-4 text-gray-400" />
-              Прогнать проверку
-            </button>
-            <button className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-semibold hover:bg-indigo-700 transition-all shadow-sm shadow-indigo-600/20">
-              <Play className="w-4 h-4 fill-current" />
-              Перезапустить бота
-            </button>
-          </div>
+          <button
+            onClick={load}
+            disabled={refreshing}
+            className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-200 text-gray-700 rounded-xl text-sm font-semibold hover:bg-gray-50 transition-all shadow-sm disabled:opacity-60"
+          >
+            <RefreshCw className={cn("w-4 h-4 text-gray-400", refreshing && "animate-spin")} />
+            Обновить
+          </button>
         </div>
 
+        {error && (
+          <div className="flex items-center gap-2 p-4 rounded-2xl bg-rose-50 border border-rose-100 text-rose-600 text-[13px] font-bold">
+            <AlertTriangle className="w-4 h-4 shrink-0" /> {error}
+          </div>
+        )}
+
         {/* Status Bar */}
-        <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-sm flex items-center justify-between">
-          <div className="flex items-center gap-4">
+        <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-sm flex items-center justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-4 flex-wrap">
             <div className="flex items-center gap-2">
               <div className="relative flex h-3 w-3">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+                {online && (
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                )}
+                <span
+                  className={cn(
+                    "relative inline-flex rounded-full h-3 w-3",
+                    online ? "bg-emerald-500" : "bg-gray-300",
+                  )}
+                ></span>
               </div>
-              <span className="font-bold text-gray-900">Агент в строю</span>
+              <span className="font-bold text-gray-900">
+                {online ? "Агент в строю" : "Нет данных"}
+              </span>
             </div>
-            <span className="px-2.5 py-1 bg-emerald-50 text-emerald-600 text-xs font-bold rounded-md">
-              аптайм 14 дней
-            </span>
-            <span className="text-sm font-medium text-gray-500 bg-gray-50 px-3 py-1 rounded-md">
-              последний ход — 2 мин назад
-            </span>
-            <span className="text-sm font-medium text-gray-500 bg-gray-50 px-3 py-1 rounded-md">
-              очередь 0 из 3
-            </span>
+            {data && (
+              <>
+                <span className="px-2.5 py-1 bg-emerald-50 text-emerald-600 text-xs font-bold rounded-md">
+                  аптайм {data.status.uptime}
+                </span>
+                <span className="text-sm font-medium text-gray-500 bg-gray-50 px-3 py-1 rounded-md">
+                  последний ход — {data.status.last_turn}
+                </span>
+                {data.status.slots_total !== null && (
+                  <span className="text-sm font-medium text-gray-500 bg-gray-50 px-3 py-1 rounded-md">
+                    очередь {data.status.slots_busy} из {data.status.slots_total}
+                  </span>
+                )}
+              </>
+            )}
           </div>
           <div className="text-sm font-mono text-gray-400">
-            прод 186 • v2026.07.02
+            прод 186 {data?.status.version ? `• ${data.status.version}` : ""}
           </div>
         </div>
 
         {/* Metrics Cards */}
         <div className="grid grid-cols-4 gap-4">
-          {[
-            {
-              label: "Ходов сегодня",
-              value: "47",
-              sub: "▲ +18% к вчера",
-              subColor: "text-emerald-500",
-            },
-            {
-              label: "Средняя скорость",
-              value: "36 сек",
-              sub: "▼ быстрее на 9 сек",
-              subColor: "text-emerald-500",
-            },
-            {
-              label: "Ошибки за 24 часа",
-              value: "1",
-              sub: "таймаут • 11:03 • решено",
-              subColor: "text-gray-400",
-            },
-            {
-              label: "Лимиты мозга",
-              value: "62%",
-              sub: "■ обновятся в 19:00",
-              subColor: "text-orange-500",
-            },
-          ].map((stat, i) => (
+          {(data?.cards || []).map((stat, i) => (
             <div
               key={i}
               className="bg-white p-5 rounded-2xl border border-gray-100 shadow-sm flex flex-col"
@@ -246,12 +220,16 @@ export function MonitoringView() {
                 {stat.value}
               </span>
               <span
-                className={cn("text-xs font-semibold mt-auto", stat.subColor)}
+                className={cn("text-xs font-semibold mt-auto", CARD_TONE[stat.tone] || CARD_TONE.muted)}
               >
                 {stat.sub}
               </span>
             </div>
           ))}
+          {!data &&
+            [0, 1, 2, 3].map((i) => (
+              <div key={i} className="bg-white p-5 rounded-2xl border border-gray-100 shadow-sm h-[110px] animate-pulse" />
+            ))}
         </div>
 
         {/* Charts & Health Row */}
@@ -260,7 +238,7 @@ export function MonitoringView() {
             <div className="flex items-center gap-2 mb-6">
               <Clock className="w-4 h-4 text-gray-400" />
               <h3 className="font-semibold text-gray-900">
-                Скорость ответов за 24 часа
+                Скорость ответов за 24 часа, сек
               </h3>
             </div>
             <div className="h-[200px] w-full focus:outline-none">
@@ -270,7 +248,7 @@ export function MonitoringView() {
                 className="focus:outline-none [&_*]:focus:outline-none"
               >
                 <LineChart
-                  data={chartData}
+                  data={data?.chart || []}
                   margin={{ top: 5, right: 10, left: -20, bottom: 0 }}
                 >
                   <CartesianGrid
@@ -284,6 +262,7 @@ export function MonitoringView() {
                     tickLine={false}
                     tick={{ fontSize: 11, fill: "#94a3b8" }}
                     dy={10}
+                    interval={3}
                   />
                   <YAxis
                     axisLine={false}
@@ -291,6 +270,10 @@ export function MonitoringView() {
                     tick={{ fontSize: 11, fill: "#94a3b8" }}
                   />
                   <Tooltip
+                    formatter={(value: any, _name: any, entry: any) => [
+                      `${value} сек • ходов: ${entry?.payload?.turns ?? 0}`,
+                      "скорость",
+                    ]}
                     contentStyle={{
                       borderRadius: "12px",
                       border: "none",
@@ -308,11 +291,13 @@ export function MonitoringView() {
                     dataKey="speed"
                     stroke="#4f46e5"
                     strokeWidth={3}
-                    dot={(props) => {
-                      const { cx, cy, payload } = props;
-                      if (payload.speed > 90) {
+                    connectNulls
+                    dot={(props: any) => {
+                      const { cx, cy, payload, index } = props;
+                      if (payload.speed !== null && payload.speed > 120) {
                         return (
                           <circle
+                            key={`dot-${index}`}
                             cx={cx}
                             cy={cy}
                             r={4}
@@ -321,7 +306,7 @@ export function MonitoringView() {
                           />
                         );
                       }
-                      return <circle cx={cx} cy={cy} r={0} />;
+                      return <circle key={`dot-${index}`} cx={cx} cy={cy} r={0} />;
                     }}
                     activeDot={{
                       r: 6,
@@ -341,21 +326,7 @@ export function MonitoringView() {
               <h3 className="font-semibold text-gray-900">Здоровье систем</h3>
             </div>
             <div className="space-y-5 flex-1">
-              {[
-                {
-                  label: "Мозг агента (ChatGPT)",
-                  status: "отвечает • 1.2 с",
-                  type: "ok",
-                },
-                {
-                  label: "MCP-инструменты (145)",
-                  status: "все живы",
-                  type: "ok",
-                },
-                { label: "Bitrix REST", status: "ok • 0.4 с", type: "ok" },
-                { label: "Google API", status: "ok • 0.7 с", type: "ok" },
-                { label: "Память сервера", status: "1.1 / 2 ГБ", type: "warn" },
-              ].map((sys, i) => (
+              {(data?.health || []).map((sys, i) => (
                 <div key={i} className="flex items-center justify-between">
                   <div className="flex items-center gap-2.5">
                     <div
@@ -373,6 +344,11 @@ export function MonitoringView() {
                   </span>
                 </div>
               ))}
+              {!data && (
+                <div className="text-center text-gray-400 text-[13px] font-medium py-6">
+                  Загрузка…
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -385,19 +361,19 @@ export function MonitoringView() {
               <h3 className="font-semibold text-gray-900">Лента событий</h3>
             </div>
             <span className="px-3 py-1 bg-white border border-gray-200 rounded-lg text-xs font-medium text-gray-500 shadow-sm">
-              автообновление
+              автообновление 30 сек
             </span>
           </div>
           <div className="p-2">
-            {events.map((event, i) => (
+            {(data?.events || []).map((event, i) => (
               <div
-                key={event.id}
+                key={i}
                 className="flex items-start gap-4 p-3 hover:bg-gray-50 rounded-xl transition-colors"
               >
-                <span className="text-xs font-medium text-gray-400 w-12 pt-0.5">
+                <span className="text-xs font-medium text-gray-400 w-16 pt-0.5 shrink-0">
                   {event.time}
                 </span>
-                <div className="mt-0.5">
+                <div className="mt-0.5 shrink-0">
                   {event.type === "success" && (
                     <CheckCircle2 className="w-4 h-4 text-emerald-500" />
                   )}
@@ -407,30 +383,23 @@ export function MonitoringView() {
                   {event.type === "error" && (
                     <AlertTriangle className="w-4 h-4 text-rose-500" />
                   )}
+                  {event.type === "report" && (
+                    <UserIcon className="w-4 h-4 text-indigo-500" />
+                  )}
                   {event.type === "info" && (
-                    <User className="w-4 h-4 text-indigo-500" />
+                    <AlertCircle className="w-4 h-4 text-orange-400" />
                   )}
                 </div>
-                <div className="flex-1 text-sm text-gray-700 leading-relaxed font-medium">
-                  {event.text.includes("8e8e85c") ? (
-                    <>
-                      Деплой: живой статус агента (коммит{" "}
-                      <span className="font-bold text-gray-900 bg-gray-100 px-1 rounded">
-                        8e8e85c
-                      </span>
-                      ) — смоук пройден
-                    </>
-                  ) : (
-                    event.text
-                  )}
-                  {event.resolved && (
-                    <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-50 text-emerald-600">
-                      решено
-                    </span>
-                  )}
+                <div className="flex-1 text-sm text-gray-700 leading-relaxed font-medium break-words [overflow-wrap:anywhere]">
+                  {event.text}
                 </div>
               </div>
             ))}
+            {!data && (
+              <div className="text-center text-gray-400 text-[13px] font-medium py-8">
+                Загрузка событий…
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -438,7 +407,7 @@ export function MonitoringView() {
   );
 }
 
-function User(props: any) {
+function UserIcon(props: any) {
   return (
     <svg
       xmlns="http://www.w3.org/2000/svg"

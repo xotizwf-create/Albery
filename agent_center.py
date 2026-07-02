@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import subprocess
+import time
 
 from datetime import datetime
 from datetime import timedelta
@@ -276,6 +278,278 @@ def agent_center_tools():
             "core": name in CORE_TOOL_NAMES,
         })
     return jsonify({"tools": tools, "total": len(tools)})
+
+
+# --- Monitoring (/api/agent-center/monitoring) ---------------------------------------------
+
+_STARTED_MONO = time.monotonic()
+_APP_DIR = Path(__file__).resolve().parent
+_HEALTH_CACHE: dict[str, Any] = {"at": 0.0, "bitrix": None}
+_GIT_CACHE: dict[str, Any] = {"at": 0.0, "head": "", "log": []}
+
+
+def _uptime_label() -> str:
+    total_min = int((time.monotonic() - _STARTED_MONO) // 60)
+    days, rem = divmod(total_min, 1440)
+    hours, minutes = divmod(rem, 60)
+    if days:
+        return f"{days} дн {hours} ч"
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    return f"{minutes} мин"
+
+
+def _ago_label(dt: Any) -> str:
+    if not dt:
+        return "нет данных"
+    minutes = int((msk_now() - dt.astimezone(MSK_TZ)).total_seconds() // 60)
+    if minutes < 1:
+        return "только что"
+    if minutes < 60:
+        return f"{minutes} мин назад"
+    if minutes < 1440:
+        return f"{minutes // 60} ч назад"
+    return f"{minutes // 1440} дн назад"
+
+
+def _event_time_label(dt: Any) -> str:
+    if not dt:
+        return ""
+    local = dt.astimezone(MSK_TZ)
+    return local.strftime("%H:%M") if local.date() == msk_now().date() else local.strftime("%d.%m %H:%M")
+
+
+def _git_info() -> dict[str, Any]:
+    """HEAD sha + recent commits for the deploy feed; cached 60s."""
+    now = time.monotonic()
+    if now - _GIT_CACHE["at"] < 60:
+        return _GIT_CACHE
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=_APP_DIR,
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        raw = subprocess.run(
+            ["git", "log", "-3", "--pretty=%ct|%h|%s"], cwd=_APP_DIR,
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        log = []
+        for line in raw.splitlines():
+            ts, sha, subject = line.split("|", 2)
+            log.append({"at": datetime.fromtimestamp(int(ts), tz=timezone.utc), "sha": sha, "subject": subject})
+        _GIT_CACHE.update(at=now, head=head, log=log)
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center: git info failed")
+    return _GIT_CACHE
+
+
+def _bitrix_ping_ms() -> int | None:
+    """Light Bitrix REST liveness (server.time via the bot portal client), cached 60s."""
+    now = time.monotonic()
+    if now - _HEALTH_CACHE["at"] < 60:
+        return _HEALTH_CACHE["bitrix"]
+    ping: int | None = None
+    try:
+        from b24bot import _b24_testbot_call, b24_testbot_client
+        t0 = time.perf_counter()
+        _b24_testbot_call(b24_testbot_client(), "server.time", {})
+        ping = int((time.perf_counter() - t0) * 1000)
+    except Exception:  # noqa: BLE001
+        logging.warning("agent_center: bitrix ping failed", exc_info=True)
+    _HEALTH_CACHE.update(at=now, bitrix=ping)
+    return ping
+
+
+def _server_memory() -> tuple[float, float] | None:
+    try:
+        info: dict[str, int] = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            parts = line.split()
+            info[parts[0].rstrip(":")] = int(parts[1])
+        total_gb = info["MemTotal"] / 1048576
+        used_gb = (info["MemTotal"] - info["MemAvailable"]) / 1048576
+        return used_gb, total_gb
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@app.get("/api/agent-center/monitoring")
+def agent_center_monitoring():
+    now_msk = msk_now()
+    today_start = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    yday_start = today_start - timedelta(days=1)
+    yday_same_time = now_msk - timedelta(days=1)
+    day_ago = now_msk - timedelta(hours=24)
+    week_ago = now_msk - timedelta(days=7)
+    try:
+        db_t0 = time.perf_counter()
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT"
+                    " COUNT(*) FILTER (WHERE created_at >= %(today)s) AS turns_today,"
+                    " COUNT(*) FILTER (WHERE created_at >= %(yday)s AND created_at < %(yday_same)s) AS turns_yday_same,"
+                    " AVG(latency_ms) FILTER (WHERE created_at >= %(today)s AND status = 'ok') AS avg_today,"
+                    " AVG(latency_ms) FILTER (WHERE created_at >= %(yday)s AND created_at < %(today)s AND status = 'ok') AS avg_yday,"
+                    " COUNT(*) FILTER (WHERE created_at >= %(day_ago)s AND status <> 'ok') AS errors_24h,"
+                    " MAX(created_at) FILTER (WHERE status <> 'ok' AND created_at >= %(day_ago)s) AS last_error_at,"
+                    " COUNT(DISTINCT dialog_id) FILTER (WHERE created_at >= %(week_ago)s) AS dialogs_7d,"
+                    " MAX(created_at) AS last_turn_at,"
+                    " MAX(created_at) FILTER (WHERE status = 'ok') AS last_ok_at"
+                    " FROM bitrix_bot_interactions",
+                    {"today": today_start, "yday": yday_start, "yday_same": yday_same_time,
+                     "day_ago": day_ago, "week_ago": week_ago},
+                )
+                st = dict(cur.fetchone() or {})
+                cur.execute(
+                    "SELECT created_at, latency_ms, status FROM bitrix_bot_interactions"
+                    " WHERE created_at >= %s ORDER BY created_at",
+                    (day_ago,),
+                )
+                turn_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT created_at, dialog_id, bitrix_user_id, error, latency_ms, status"
+                    " FROM bitrix_bot_interactions"
+                    " WHERE created_at >= %s AND (status <> 'ok' OR latency_ms > 300000)"
+                    " ORDER BY id DESC LIMIT 12",
+                    (week_ago,),
+                )
+                notable_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT created_at, reporter_name, report_text FROM bitrix_error_reports"
+                    " WHERE created_at >= %s ORDER BY id DESC LIMIT 8",
+                    (week_ago,),
+                )
+                report_rows = cur.fetchall()
+        db_ms = int((time.perf_counter() - db_t0) * 1000)
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center monitoring failed")
+        return jsonify({"error": "Не удалось загрузить мониторинг."}), 500
+
+    # Hourly speed chart for the last 24h (MSK buckets).
+    buckets: dict[str, list[int]] = {}
+    order: list[str] = []
+    for offset in range(23, -1, -1):
+        label = (now_msk - timedelta(hours=offset)).strftime("%H:00")
+        order.append(label)
+        buckets[label] = []
+    for r in turn_rows:
+        if r["latency_ms"] and r["status"] == "ok":
+            label = r["created_at"].astimezone(MSK_TZ).strftime("%H:00")
+            if label in buckets:
+                buckets[label].append(int(r["latency_ms"]))
+    chart = [
+        {
+            "time": label,
+            "speed": round(sum(vals) / len(vals) / 1000) if vals else None,
+            "turns": len(vals),
+        }
+        for label, vals in ((label, buckets[label]) for label in order)
+    ]
+
+    # Cards with day-over-day deltas.
+    turns_today = int(st.get("turns_today") or 0)
+    turns_yday_same = int(st.get("turns_yday_same") or 0)
+    turns_delta = (
+        f"{'▲ +' if turns_today >= turns_yday_same else '▼ '}{round((turns_today - turns_yday_same) / turns_yday_same * 100)}% к вчера"
+        if turns_yday_same else "вчера к этому часу — 0"
+    )
+    avg_today = float(st["avg_today"]) / 1000 if st.get("avg_today") else None
+    avg_yday = float(st["avg_yday"]) / 1000 if st.get("avg_yday") else None
+    if avg_today is not None and avg_yday is not None:
+        diff = round(avg_yday - avg_today)
+        speed_delta = f"▲ быстрее на {diff} сек" if diff >= 0 else f"▼ медленнее на {-diff} сек"
+    else:
+        speed_delta = "вчера данных нет"
+    errors_24h = int(st.get("errors_24h") or 0)
+    cards = [
+        {"label": "Ходов сегодня", "value": str(turns_today), "sub": turns_delta,
+         "tone": "good" if turns_today >= turns_yday_same else "muted"},
+        {"label": "Средняя скорость", "value": f"{round(avg_today)} сек" if avg_today is not None else "—",
+         "sub": speed_delta, "tone": "good" if avg_today is not None and (avg_yday or 0) >= avg_today else "muted"},
+        {"label": "Ошибки за 24 часа", "value": str(errors_24h),
+         "sub": ("последняя " + _event_time_label(st.get("last_error_at"))) if errors_24h else "чисто ✨",
+         "tone": "bad" if errors_24h else "good"},
+        {"label": "Диалогов за 7 дней", "value": str(int(st.get("dialogs_7d") or 0)),
+         "sub": "уникальных чатов с агентом", "tone": "muted"},
+    ]
+
+    # System health.
+    health = [{"label": "База данных (PostgreSQL)", "status": f"ok • {db_ms} мс", "type": "ok"}]
+    try:
+        from mcp.context_server import TOOLS
+        health.append({"label": f"MCP-инструменты ({len(TOOLS)})", "status": "зарегистрированы", "type": "ok"})
+    except Exception:  # noqa: BLE001
+        health.append({"label": "MCP-инструменты", "status": "модуль не загрузился", "type": "warn"})
+    last_ok = st.get("last_ok_at")
+    ok_fresh = bool(last_ok and (now_msk - last_ok.astimezone(MSK_TZ)) < timedelta(hours=24))
+    health.append({
+        "label": "Мозг агента (Hermes)",
+        "status": f"успешный ход {_ago_label(last_ok)}",
+        "type": "ok" if ok_fresh else "warn",
+    })
+    bitrix_ms = _bitrix_ping_ms()
+    health.append({
+        "label": "Bitrix REST",
+        "status": f"ok • {bitrix_ms / 1000:.1f} с".replace(".", ",") if bitrix_ms is not None else "не отвечает",
+        "type": "ok" if bitrix_ms is not None else "warn",
+    })
+    mem = _server_memory()
+    if mem:
+        used_gb, total_gb = mem
+        health.append({
+            "label": "Память сервера",
+            "status": f"{used_gb:.1f} / {total_gb:.0f} ГБ".replace(".", ","),
+            "type": "warn" if (total_gb - used_gb) < 0.3 else "ok",
+        })
+
+    # Events feed: errors + slow turns + user error-reports + deploys, newest first.
+    names = _user_names()
+    stamped: list[tuple[Any, dict[str, Any]]] = []
+    for r in notable_rows:
+        uid = int(r["bitrix_user_id"]) if r["bitrix_user_id"] is not None else None
+        who = names.get(uid or -1, {}).get("name") or (f"#{uid}" if uid else "сотрудник")
+        if r["status"] != "ok":
+            err = re.sub(r"\s+", " ", (r["error"] or "ошибка без текста")).strip()[:140]
+            text = f"Ошибка в диалоге {r['dialog_id']} ({who}): {err}"
+            etype = "error"
+        else:
+            text = f"Медленный ход ({round((r['latency_ms'] or 0) / 60000)} мин) — диалог {r['dialog_id']} ({who})"
+            etype = "info"
+        stamped.append((r["created_at"], {"type": etype, "text": text}))
+    for r in report_rows:
+        text = f"«Сообщить об ошибке» от {r['reporter_name'] or 'сотрудника'}: " + re.sub(r"\s+", " ", r["report_text"]).strip()[:140]
+        stamped.append((r["created_at"], {"type": "report", "text": text}))
+    for c in _git_info()["log"]:
+        stamped.append((c["at"], {"type": "deploy", "text": f"Деплой: {c['subject']} ({c['sha']})"}))
+    stamped.sort(key=lambda pair: pair[0], reverse=True)
+    events = [
+        {"time": _event_time_label(at), **payload}
+        for at, payload in stamped[:20]
+    ]
+    if not events:
+        events = [{"time": _event_time_label(now_msk), "type": "success", "text": "Событий нет — всё чисто"}]
+
+    try:
+        from b24bot import _HERMES_MAX_CONCURRENCY, _HERMES_RUN_SLOTS
+        slots_total = _HERMES_MAX_CONCURRENCY
+        slots_busy = max(0, slots_total - _HERMES_RUN_SLOTS._value)  # noqa: SLF001 — live gauge
+    except Exception:  # noqa: BLE001
+        slots_total, slots_busy = None, None
+
+    return jsonify({
+        "status": {
+            "uptime": _uptime_label(),
+            "last_turn": _ago_label(st.get("last_turn_at")),
+            "slots_busy": slots_busy,
+            "slots_total": slots_total,
+            "version": _git_info()["head"],
+        },
+        "cards": cards,
+        "chart": chart,
+        "health": health,
+        "events": events,
+    })
 
 
 _HERMES_SKILLS_DIR = Path(os.getenv("HERMES_SKILLS_DIR", "/root/.hermes/skills"))

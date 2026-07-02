@@ -138,6 +138,26 @@ export async function fetchMcpTools(): Promise<McpTool[]> {
   return (data.tools || []) as McpTool[];
 }
 
+// --- Monitoring ---
+
+export interface MonitoringData {
+  status: {
+    uptime: string;
+    last_turn: string;
+    slots_busy: number | null;
+    slots_total: number | null;
+    version: string;
+  };
+  cards: Array<{ label: string; value: string; sub: string; tone: "good" | "bad" | "muted" }>;
+  chart: Array<{ time: string; speed: number | null; turns: number }>;
+  health: Array<{ label: string; status: string; type: "ok" | "warn" }>;
+  events: Array<{ time: string; type: string; text: string }>;
+}
+
+export async function fetchMonitoring(): Promise<MonitoringData> {
+  return (await fetchJsonSafe("/api/agent-center/monitoring", undefined, 30000)) as MonitoringData;
+}
+
 // --- Team access (existing /api/agent-access CRUD, shared with the Настройки tab) ---
 
 export type AccessTier = "admin" | "ops" | "faq";
