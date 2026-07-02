@@ -304,16 +304,17 @@ def _hermes_skills() -> list[dict[str, Any]]:
     if not _HERMES_SKILLS_DIR.is_dir():
         return skills
     custom_names = {p.name for p in _REPO_SKILLS_DIR.iterdir() if p.is_dir()} if _REPO_SKILLS_DIR.is_dir() else set()
-    for skill_md in sorted(_HERMES_SKILLS_DIR.glob("*/SKILL.md")) + sorted(_HERMES_SKILLS_DIR.glob("*/*/SKILL.md")):
+    for skill_md in sorted(_HERMES_SKILLS_DIR.rglob("SKILL.md")):
         try:
+            rel_parts = skill_md.relative_to(_HERMES_SKILLS_DIR).parts
             meta = _skill_frontmatter(skill_md.read_text(encoding="utf-8", errors="replace"))
             name = meta.get("name") or skill_md.parent.name
             mtime = datetime.fromtimestamp(skill_md.stat().st_mtime, tz=timezone.utc)
             desc = re.sub(r"\s+", " ", meta.get("description") or "").strip()
             skills.append({
-                "id": f"skill:{skill_md.parent.name}",
+                "id": "skill:" + "/".join(rel_parts[:-1]),
                 "title": name,
-                "parent": skill_md.parent.parent.name if skill_md.parent.parent != _HERMES_SKILLS_DIR else "",
+                "parent": rel_parts[0] if len(rel_parts) > 2 else "",
                 "description": (desc[:160].rstrip() + "…") if len(desc) > 160 else desc,
                 "type": "Скилл",
                 "custom": skill_md.parent.name in custom_names,
