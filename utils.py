@@ -232,3 +232,36 @@ def extract_collection(data: dict[str, Any], *keys: str) -> list[Any]:
             if all(isinstance(item, dict) for item in dict_values):
                 return dict_values
     return []
+
+
+RU_MONTH_NAMES = {
+    1: ("Январь", "января"),
+    2: ("Февраль", "февраля"),
+    3: ("Март", "марта"),
+    4: ("Апрель", "апреля"),
+    5: ("Май", "мая"),
+    6: ("Июнь", "июня"),
+    7: ("Июль", "июля"),
+    8: ("Август", "августа"),
+    9: ("Сентябрь", "сентября"),
+    10: ("Октябрь", "октября"),
+    11: ("Ноябрь", "ноября"),
+    12: ("Декабрь", "декабря"),
+}
+def sentence_case_ru(value: Any) -> str:
+    text = str(value or "").strip().rstrip(".")
+    return text[:1].upper() + text[1:] if text else text
+def first_text_value(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+def safe_parse_date(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None

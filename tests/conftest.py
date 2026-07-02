@@ -52,6 +52,22 @@ def bitrix_module():
     return bitrix_module
 
 
+@pytest.fixture(scope="session")
+def zoom_module():
+    """The Zoom integration module (extracted from app.py 2026-07-02) — patch/call here."""
+    import zoom as zoom_module
+
+    return zoom_module
+
+
+@pytest.fixture(scope="session")
+def gdrive_module():
+    """The Google Drive integration module (extracted from app.py 2026-07-02) — patch/call here."""
+    import gdrive as gdrive_module
+
+    return gdrive_module
+
+
 @pytest.fixture()
 def client(app_module):
     """Flask test client."""

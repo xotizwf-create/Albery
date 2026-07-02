@@ -53,14 +53,14 @@ def test_sync_zoom_calls_dedups_uuids(app_module, fake_pg, monkeypatch):
     assert result["calls_synced"] == 1
 
 
-def test_dedupe_zoom_participants(app_module):
+def test_dedupe_zoom_participants(zoom_module):
     participants = [
         {"name": "Иван", "email": "ivan@x.ru"},
         {"name": "Иван", "email": "ivan@x.ru"},  # exact dup
         {"name": "", "email": ""},  # empty -> dropped
         {"name": "Пётр", "email": ""},
     ]
-    result = app_module.dedupe_zoom_participants(participants)
+    result = zoom_module.dedupe_zoom_participants(participants)
     assert len(result) == 2
     assert {p["name"] for p in result} == {"Иван", "Пётр"}
 
