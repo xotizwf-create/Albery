@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Search,
   ExternalLink,
@@ -9,6 +9,8 @@ import {
   BookOpen,
   Crown,
   Package,
+  ArrowUp,
+  ArrowDown,
 } from "lucide-react";
 import { fetchAgentDialogs, fetchAgents, fetchDialogTurns, DialogTurn } from "../api";
 import { AgentConfig, Chat } from "../types";
@@ -43,6 +45,19 @@ export function DialogsView() {
   const [chatsLoading, setChatsLoading] = useState(true);
   const [turnsLoading, setTurnsLoading] = useState(false);
   const [error, setError] = useState("");
+  const messagesRef = useRef<HTMLDivElement>(null);
+
+  // Open a dialog at its latest messages, like any messenger.
+  useEffect(() => {
+    if (!turnsLoading && turns.length > 0) {
+      messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight });
+    }
+  }, [turnsLoading, turns, activeChatId]);
+
+  const scrollMessages = (toTop: boolean) => {
+    const el = messagesRef.current;
+    if (el) el.scrollTo({ top: toTop ? 0 : el.scrollHeight, behavior: "smooth" });
+  };
 
   useEffect(() => {
     fetchAgents().then(setAgents).catch(() => setAgents([]));
@@ -289,7 +304,7 @@ export function DialogsView() {
       </div>
 
       {/* Right Chat Area */}
-      <div className="flex-1 flex flex-col bg-white min-w-0">
+      <div className="flex-1 flex flex-col bg-white min-w-0 max-w-full overflow-hidden">
         {!activeChat ? (
           <div className="flex-1 flex items-center justify-center text-gray-400 text-[14px] font-medium">
             Выберите диалог слева
@@ -323,68 +338,94 @@ export function DialogsView() {
               </div>
             </div>
 
-            <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-6 space-y-6 bg-slate-50/50 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-              {turnsLoading && (
-                <div className="flex items-center justify-center gap-2 py-10 text-gray-400 text-[13px] font-bold">
-                  <Loader2 className="w-4 h-4 animate-spin" /> Загрузка переписки…
+            <div className="relative flex-1 min-h-0 min-w-0 overflow-hidden bg-slate-50/50">
+              <div
+                ref={messagesRef}
+                className="h-full w-full overflow-y-auto overflow-x-hidden p-6 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full"
+              >
+                <div className="w-full max-w-[860px] mx-auto space-y-6">
+                  {turnsLoading && (
+                    <div className="flex items-center justify-center gap-2 py-10 text-gray-400 text-[13px] font-bold">
+                      <Loader2 className="w-4 h-4 animate-spin" /> Загрузка переписки…
+                    </div>
+                  )}
+                  {!turnsLoading && turns.length === 0 && (
+                    <div className="py-10 text-center text-gray-400 text-[13px] font-medium">Сообщений нет</div>
+                  )}
+                  {!turnsLoading &&
+                    turns.map((turn) => {
+                      const showDate = turn.date !== lastDate;
+                      lastDate = turn.date;
+                      return (
+                        <div key={turn.id} className="space-y-6 w-full max-w-full min-w-0">
+                          {showDate && (
+                            <div className="flex justify-center">
+                              <span className="text-[11px] font-bold text-gray-400 bg-white border border-gray-200 px-3 py-1 rounded-lg shadow-sm">
+                                {turn.date}
+                              </span>
+                            </div>
+                          )}
+                          {turn.question && (
+                            <div className="flex flex-col items-start w-full">
+                              <div className="w-fit max-w-[85%] min-w-0 px-5 py-3.5 rounded-2xl text-[14px] font-medium leading-relaxed shadow-sm bg-white text-gray-800 rounded-tl-sm border border-gray-100 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                                {turn.question}
+                              </div>
+                              <span className="text-[10.5px] font-bold text-gray-400 mt-1.5 px-1">{turn.time}</span>
+                            </div>
+                          )}
+                          {turn.status !== "ok" ? (
+                            <div className="flex flex-col items-end w-full">
+                              <div className="w-fit max-w-[85%] min-w-0 p-5 rounded-2xl shadow-sm border bg-rose-500 border-rose-400 text-white">
+                                <div className="font-bold text-[15px] mb-2">Ошибка обработки</div>
+                                {(turn.error || turn.answer) && (
+                                  <div className="text-[13.5px] text-rose-50 font-medium leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                                    {turn.error || turn.answer}
+                                  </div>
+                                )}
+                                <div className="mt-3 text-[11px] font-bold text-rose-100 uppercase tracking-wider">
+                                  {turn.time}
+                                  {turn.latency_ms ? ` • ⏱ ${Math.round(turn.latency_ms / 1000)} сек` : ""} • {turn.tier}
+                                </div>
+                              </div>
+                            </div>
+                          ) : (
+                            turn.answer && (
+                              <div className="flex flex-col items-end w-full">
+                                <div className="w-fit max-w-[85%] min-w-0 px-5 py-3.5 rounded-2xl text-[14px] font-medium leading-relaxed shadow-sm bg-indigo-600 text-white rounded-tr-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                                  {turn.answer}
+                                </div>
+                                <span className="text-[10.5px] font-bold text-gray-400 mt-1.5 px-1">
+                                  {turn.time}
+                                  {turn.latency_ms ? ` • ⏱ ${Math.round(turn.latency_ms / 1000)} сек` : ""}
+                                  {turn.session_name ? ` • ${turn.session_name}` : ""}
+                                </span>
+                              </div>
+                            )
+                          )}
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+
+              {turns.length > 0 && !turnsLoading && (
+                <div className="absolute right-4 bottom-4 flex flex-col gap-2 z-10">
+                  <button
+                    onClick={() => scrollMessages(true)}
+                    title="К началу переписки"
+                    className="w-10 h-10 rounded-full bg-white border border-gray-200 shadow-md flex items-center justify-center text-gray-500 hover:text-indigo-600 hover:border-indigo-200 hover:shadow-lg active:scale-95 transition-all"
+                  >
+                    <ArrowUp className="w-5 h-5" strokeWidth={2.5} />
+                  </button>
+                  <button
+                    onClick={() => scrollMessages(false)}
+                    title="К последним сообщениям"
+                    className="w-10 h-10 rounded-full bg-white border border-gray-200 shadow-md flex items-center justify-center text-gray-500 hover:text-indigo-600 hover:border-indigo-200 hover:shadow-lg active:scale-95 transition-all"
+                  >
+                    <ArrowDown className="w-5 h-5" strokeWidth={2.5} />
+                  </button>
                 </div>
               )}
-              {!turnsLoading && turns.length === 0 && (
-                <div className="py-10 text-center text-gray-400 text-[13px] font-medium">Сообщений нет</div>
-              )}
-              {!turnsLoading &&
-                turns.map((turn) => {
-                  const showDate = turn.date !== lastDate;
-                  lastDate = turn.date;
-                  return (
-                    <div key={turn.id} className="space-y-6">
-                      {showDate && (
-                        <div className="flex justify-center">
-                          <span className="text-[11px] font-bold text-gray-400 bg-white border border-gray-200 px-3 py-1 rounded-lg shadow-sm">
-                            {turn.date}
-                          </span>
-                        </div>
-                      )}
-                      {turn.question && (
-                        <div className="flex flex-col max-w-[min(85%,44rem)] items-start">
-                          <div className="max-w-full min-w-0 px-5 py-3.5 rounded-2xl text-[14px] font-medium leading-relaxed shadow-sm bg-white text-gray-800 rounded-tl-sm border border-gray-100 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-                            {turn.question}
-                          </div>
-                          <span className="text-[10.5px] font-bold text-gray-400 mt-1.5 px-1">{turn.time}</span>
-                        </div>
-                      )}
-                      {turn.status !== "ok" ? (
-                        <div className="flex flex-col max-w-[min(85%,44rem)] items-end ml-auto">
-                          <div className="p-5 rounded-2xl w-full max-w-[420px] shadow-sm border bg-rose-500 border-rose-400 text-white">
-                            <div className="font-bold text-[15px] mb-2">Ошибка обработки</div>
-                            {(turn.error || turn.answer) && (
-                              <div className="text-[13.5px] text-rose-50 font-medium leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-                                {turn.error || turn.answer}
-                              </div>
-                            )}
-                            <div className="mt-3 text-[11px] font-bold text-rose-100 uppercase tracking-wider">
-                              {turn.time}
-                              {turn.latency_ms ? ` • ⏱ ${Math.round(turn.latency_ms / 1000)} сек` : ""} • {turn.tier}
-                            </div>
-                          </div>
-                        </div>
-                      ) : (
-                        turn.answer && (
-                          <div className="flex flex-col max-w-[min(85%,44rem)] items-end ml-auto">
-                            <div className="max-w-full min-w-0 px-5 py-3.5 rounded-2xl text-[14px] font-medium leading-relaxed shadow-sm bg-indigo-600 text-white rounded-tr-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-                              {turn.answer}
-                            </div>
-                            <span className="text-[10.5px] font-bold text-gray-400 mt-1.5 px-1">
-                              {turn.time}
-                              {turn.latency_ms ? ` • ⏱ ${Math.round(turn.latency_ms / 1000)} сек` : ""}
-                              {turn.session_name ? ` • ${turn.session_name}` : ""}
-                            </span>
-                          </div>
-                        )
-                      )}
-                    </div>
-                  );
-                })}
             </div>
 
             <div className="p-3.5 text-center border-t border-gray-100 bg-white text-[12px] text-gray-400 font-bold uppercase tracking-wider">
