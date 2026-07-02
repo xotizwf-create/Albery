@@ -41,6 +41,17 @@ def app_module():
     return app_module
 
 
+@pytest.fixture(scope="session")
+def bitrix_module():
+    """The Bitrix integration module (extracted from app.py 2026-07-02).
+
+    Sync orchestration lives here now, and it holds its own bindings of
+    BitrixClient/pg_connect — patch THIS module, not app, to affect it."""
+    import bitrix as bitrix_module
+
+    return bitrix_module
+
+
 @pytest.fixture()
 def client(app_module):
     """Flask test client."""

@@ -45,7 +45,8 @@ def test_mcp_imports_with_tools(ctx):
     assert callable(ctx.handle_request)
 
 
-@pytest.mark.parametrize("rel_path", ["app.py", "b24bot.py", "mcp/context_server.py"])
+@pytest.mark.parametrize("rel_path", ["app.py", "b24bot.py", "bitrix.py", "config.py",
+                                      "llm.py", "utils.py", "mcp/context_server.py"])
 def test_no_undefined_names(rel_path):
     offenders = _undefined_names(rel_path)
     assert offenders == [], f"{rel_path} has undefined names:\n" + "\n".join(offenders)

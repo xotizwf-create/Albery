@@ -88,23 +88,23 @@ def test_build_task_record_requires_id(app_module):
         app_module.build_task_record(_sample_client(), {})
 
 
-def test_sync_bitrix_task_upserts(app_module, fake_pg, monkeypatch):
+def test_sync_bitrix_task_upserts(bitrix_module, fake_pg, monkeypatch):
     monkeypatch.setenv("BITRIX_WEBHOOK_BASE", "https://example.bitrix24.ru/rest/1/token/")
-    monkeypatch.setattr(app_module, "BitrixClient", lambda base: _sample_client())
-    cur = fake_pg(app_module)
+    monkeypatch.setattr(bitrix_module, "BitrixClient", lambda base: _sample_client())
+    cur = fake_pg(bitrix_module)
 
-    result = app_module.sync_bitrix_task_by_id(318241, event_name="ONTASKUPDATE")
+    result = bitrix_module.sync_bitrix_task_by_id(318241, event_name="ONTASKUPDATE")
 
     assert result["action"] == "upserted"
     assert result["task_id"] == 318241
     assert any("INSERT INTO bitrix_tasks" in sql for sql, _ in cur.executed)
 
 
-def test_sync_bitrix_task_delete_event(app_module, fake_pg, monkeypatch):
+def test_sync_bitrix_task_delete_event(bitrix_module, fake_pg, monkeypatch):
     monkeypatch.setenv("BITRIX_WEBHOOK_BASE", "https://example.bitrix24.ru/rest/1/token/")
-    cur = fake_pg(app_module)
+    cur = fake_pg(bitrix_module)
 
-    result = app_module.sync_bitrix_task_by_id(999, event_name="ONTASKDELETE")
+    result = bitrix_module.sync_bitrix_task_by_id(999, event_name="ONTASKDELETE")
 
     assert result["action"] == "deleted"
     assert any("DELETE FROM bitrix_tasks" in sql for sql, _ in cur.executed)
