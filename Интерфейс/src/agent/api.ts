@@ -149,9 +149,10 @@ export interface MonitoringData {
     version: string;
   };
   cards: Array<{ label: string; value: string; sub: string; tone: "good" | "bad" | "muted" }>;
-  chart: Array<{ time: string; speed: number | null; turns: number }>;
+  chart: Array<{ time: string; speed: number; error: boolean }>;
   health: Array<{ label: string; status: string; type: "ok" | "warn" }>;
   events: Array<{ time: string; type: string; text: string }>;
+  problems: string[];
 }
 
 export async function fetchMonitoring(): Promise<MonitoringData> {
@@ -167,16 +168,28 @@ export interface UsageRow {
   turns: number;
   time_ms: number;
   time_label: string;
-  avg_label: string;
+  agent_time_label: string;
   errors: number;
   tokens_est: number;
+  cache_tokens: number;
+  matched: number;
   last_at: string;
 }
 
 export interface UsageData {
   period: string;
   rows: UsageRow[];
-  totals: { turns: number; time_ms: number; time_label: string; tokens_est: number; users: number };
+  totals: {
+    turns: number;
+    time_ms: number;
+    time_label: string;
+    agent_time_label: string;
+    tokens_est: number;
+    cache_tokens: number;
+    users: number;
+    matched_turns: number;
+    coverage_pct: number;
+  };
 }
 
 export async function fetchUsage(period: string): Promise<UsageData> {

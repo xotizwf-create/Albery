@@ -238,8 +238,11 @@ export function MonitoringView() {
             <div className="flex items-center gap-2 mb-6">
               <Clock className="w-4 h-4 text-gray-400" />
               <h3 className="font-semibold text-gray-900">
-                Скорость ответов за 24 часа, сек
+                Скорость ответов за 24 часа, сек — каждый ход
               </h3>
+              <span className="ml-auto text-[11px] font-bold text-gray-400">
+                {data?.chart.length ?? 0} ходов
+              </span>
             </div>
             <div className="h-[200px] w-full focus:outline-none">
               <ResponsiveContainer
@@ -262,7 +265,7 @@ export function MonitoringView() {
                     tickLine={false}
                     tick={{ fontSize: 11, fill: "#94a3b8" }}
                     dy={10}
-                    interval={3}
+                    interval={Math.max(0, Math.ceil((data?.chart.length ?? 0) / 10) - 1)}
                   />
                   <YAxis
                     axisLine={false}
@@ -271,7 +274,7 @@ export function MonitoringView() {
                   />
                   <Tooltip
                     formatter={(value: any, _name: any, entry: any) => [
-                      `${value} сек • ходов: ${entry?.payload?.turns ?? 0}`,
+                      `${value} сек${entry?.payload?.error ? " • ход с ошибкой" : ""}`,
                       "скорость",
                     ]}
                     contentStyle={{
@@ -290,11 +293,11 @@ export function MonitoringView() {
                     type="monotone"
                     dataKey="speed"
                     stroke="#4f46e5"
-                    strokeWidth={3}
+                    strokeWidth={2.5}
                     connectNulls
                     dot={(props: any) => {
                       const { cx, cy, payload, index } = props;
-                      if (payload.speed !== null && payload.speed > 120) {
+                      if (payload.error || payload.speed > 120) {
                         return (
                           <circle
                             key={`dot-${index}`}
@@ -306,7 +309,7 @@ export function MonitoringView() {
                           />
                         );
                       }
-                      return <circle key={`dot-${index}`} cx={cx} cy={cy} r={0} />;
+                      return <circle key={`dot-${index}`} cx={cx} cy={cy} r={2} fill="#a5b4fc" stroke="none" />;
                     }}
                     activeDot={{
                       r: 6,

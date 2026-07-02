@@ -371,6 +371,23 @@ def _bitrix_ping_ms() -> int | None:
     return ping
 
 
+def _zoom_ping_ok() -> bool:
+    """Zoom OAuth liveness (token issuance), cached 5 min — the cheapest signal
+    that the integration credentials still work."""
+    now = time.monotonic()
+    cached = _HEALTH_CACHE.get("zoom")
+    if cached is not None and now - _HEALTH_CACHE.get("zoom_at", 0.0) < 300:
+        return cached
+    ok = False
+    try:
+        from zoom import zoom_access_token
+        ok = bool(zoom_access_token())
+    except Exception:  # noqa: BLE001
+        logging.warning("agent_center: zoom ping failed", exc_info=True)
+    _HEALTH_CACHE.update(zoom=ok, zoom_at=now)
+    return ok
+
+
 def _server_memory() -> tuple[float, float] | None:
     try:
         info: dict[str, int] = {}
@@ -384,78 +401,72 @@ def _server_memory() -> tuple[float, float] | None:
         return None
 
 
-@app.get("/api/agent-center/monitoring")
-def agent_center_monitoring():
+def monitoring_payload() -> dict[str, Any]:
+    """Live monitoring snapshot; shared by the SPA endpoint and the agent's
+    get_agent_monitoring MCP tool."""
     now_msk = msk_now()
     today_start = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
     yday_start = today_start - timedelta(days=1)
     yday_same_time = now_msk - timedelta(days=1)
     day_ago = now_msk - timedelta(hours=24)
     week_ago = now_msk - timedelta(days=7)
-    try:
-        db_t0 = time.perf_counter()
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT"
-                    " COUNT(*) FILTER (WHERE created_at >= %(today)s) AS turns_today,"
-                    " COUNT(*) FILTER (WHERE created_at >= %(yday)s AND created_at < %(yday_same)s) AS turns_yday_same,"
-                    " AVG(latency_ms) FILTER (WHERE created_at >= %(today)s AND status = 'ok') AS avg_today,"
-                    " AVG(latency_ms) FILTER (WHERE created_at >= %(yday)s AND created_at < %(today)s AND status = 'ok') AS avg_yday,"
-                    " COUNT(*) FILTER (WHERE created_at >= %(day_ago)s AND status <> 'ok') AS errors_24h,"
-                    " MAX(created_at) FILTER (WHERE status <> 'ok' AND created_at >= %(day_ago)s) AS last_error_at,"
-                    " COUNT(DISTINCT dialog_id) FILTER (WHERE created_at >= %(week_ago)s) AS dialogs_7d,"
-                    " MAX(created_at) AS last_turn_at,"
-                    " MAX(created_at) FILTER (WHERE status = 'ok') AS last_ok_at"
-                    " FROM bitrix_bot_interactions",
-                    {"today": today_start, "yday": yday_start, "yday_same": yday_same_time,
-                     "day_ago": day_ago, "week_ago": week_ago},
-                )
-                st = dict(cur.fetchone() or {})
-                cur.execute(
-                    "SELECT created_at, latency_ms, status FROM bitrix_bot_interactions"
-                    " WHERE created_at >= %s ORDER BY created_at",
-                    (day_ago,),
-                )
-                turn_rows = cur.fetchall()
-                cur.execute(
-                    "SELECT created_at, dialog_id, bitrix_user_id, error, latency_ms, status"
-                    " FROM bitrix_bot_interactions"
-                    " WHERE created_at >= %s AND (status <> 'ok' OR latency_ms > 300000)"
-                    " ORDER BY id DESC LIMIT 12",
-                    (week_ago,),
-                )
-                notable_rows = cur.fetchall()
-                cur.execute(
-                    "SELECT created_at, reporter_name, report_text FROM bitrix_error_reports"
-                    " WHERE created_at >= %s ORDER BY id DESC LIMIT 8",
-                    (week_ago,),
-                )
-                report_rows = cur.fetchall()
-        db_ms = int((time.perf_counter() - db_t0) * 1000)
-    except Exception:  # noqa: BLE001
-        logging.exception("agent_center monitoring failed")
-        return jsonify({"error": "Не удалось загрузить мониторинг."}), 500
+    db_t0 = time.perf_counter()
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT"
+                " COUNT(*) FILTER (WHERE created_at >= %(today)s) AS turns_today,"
+                " COUNT(*) FILTER (WHERE created_at >= %(yday)s AND created_at < %(yday_same)s) AS turns_yday_same,"
+                " AVG(latency_ms) FILTER (WHERE created_at >= %(today)s AND status = 'ok') AS avg_today,"
+                " AVG(latency_ms) FILTER (WHERE created_at >= %(yday)s AND created_at < %(today)s AND status = 'ok') AS avg_yday,"
+                " COUNT(*) FILTER (WHERE created_at >= %(day_ago)s AND status <> 'ok') AS errors_24h,"
+                " MAX(created_at) FILTER (WHERE status <> 'ok' AND created_at >= %(day_ago)s) AS last_error_at,"
+                " COUNT(DISTINCT dialog_id) FILTER (WHERE created_at >= %(week_ago)s) AS dialogs_7d,"
+                " MAX(created_at) AS last_turn_at,"
+                " MAX(created_at) FILTER (WHERE status = 'ok') AS last_ok_at"
+                " FROM bitrix_bot_interactions",
+                {"today": today_start, "yday": yday_start, "yday_same": yday_same_time,
+                 "day_ago": day_ago, "week_ago": week_ago},
+            )
+            st = dict(cur.fetchone() or {})
+            cur.execute(
+                "SELECT created_at, latency_ms, status FROM bitrix_bot_interactions"
+                " WHERE created_at >= %s ORDER BY created_at",
+                (day_ago,),
+            )
+            turn_rows = cur.fetchall()
+            cur.execute(
+                "SELECT created_at, dialog_id, bitrix_user_id, error, latency_ms, status"
+                " FROM bitrix_bot_interactions"
+                " WHERE created_at >= %s AND (status <> 'ok' OR latency_ms > 300000)"
+                " ORDER BY id DESC LIMIT 12",
+                (week_ago,),
+            )
+            notable_rows = cur.fetchall()
+            cur.execute(
+                "SELECT created_at, reporter_name, report_text FROM bitrix_error_reports"
+                " WHERE created_at >= %s ORDER BY id DESC LIMIT 8",
+                (week_ago,),
+            )
+            report_rows = cur.fetchall()
+            zoom_last_at = drive_last_at = None
+            try:
+                cur.execute("SELECT MAX(synced_at) AS m FROM zoom_calls")
+                zoom_last_at = (cur.fetchone() or {}).get("m")
+                cur.execute("SELECT MAX(last_seen_at) AS m FROM company_drive_sources")
+                drive_last_at = (cur.fetchone() or {}).get("m")
+            except Exception:  # noqa: BLE001
+                logging.warning("agent_center: zoom/drive freshness query failed", exc_info=True)
+    db_ms = int((time.perf_counter() - db_t0) * 1000)
 
-    # Hourly speed chart for the last 24h (MSK buckets).
-    buckets: dict[str, list[int]] = {}
-    order: list[str] = []
-    for offset in range(23, -1, -1):
-        label = (now_msk - timedelta(hours=offset)).strftime("%H:00")
-        order.append(label)
-        buckets[label] = []
-    for r in turn_rows:
-        if r["latency_ms"] and r["status"] == "ok":
-            label = r["created_at"].astimezone(MSK_TZ).strftime("%H:00")
-            if label in buckets:
-                buckets[label].append(int(r["latency_ms"]))
+    # Minute-precision speed chart: every turn of the last 24h is its own point.
     chart = [
         {
-            "time": label,
-            "speed": round(sum(vals) / len(vals) / 1000) if vals else None,
-            "turns": len(vals),
+            "time": r["created_at"].astimezone(MSK_TZ).strftime("%H:%M"),
+            "speed": round(int(r["latency_ms"]) / 1000) if r["latency_ms"] else 0,
+            "error": r["status"] != "ok",
         }
-        for label, vals in ((label, buckets[label]) for label in order)
+        for r in turn_rows
     ]
 
     # Cards with day-over-day deltas.
@@ -505,6 +516,22 @@ def agent_center_monitoring():
         "status": f"ok • {bitrix_ms / 1000:.1f} с".replace(".", ",") if bitrix_ms is not None else "не отвечает",
         "type": "ok" if bitrix_ms is not None else "warn",
     })
+    zoom_ok = _zoom_ping_ok()
+    zoom_fresh = bool(zoom_last_at and (now_msk - zoom_last_at.astimezone(MSK_TZ)) < timedelta(days=4))
+    health.append({
+        "label": "Zoom API",
+        "status": (
+            ("токен ok" if zoom_ok else "токен не выдаётся")
+            + (f" • синк {_ago_label(zoom_last_at)}" if zoom_last_at else " • синков не было")
+        ),
+        "type": "ok" if zoom_ok and zoom_fresh else "warn",
+    })
+    drive_fresh = bool(drive_last_at and (now_msk - drive_last_at.astimezone(MSK_TZ)) < timedelta(days=2))
+    health.append({
+        "label": "Google Drive (документы)",
+        "status": f"синк {_ago_label(drive_last_at)}" if drive_last_at else "синков не было",
+        "type": "ok" if drive_fresh else "warn",
+    })
     mem = _server_memory()
     if mem:
         used_gb, total_gb = mem
@@ -548,7 +575,7 @@ def agent_center_monitoring():
     except Exception:  # noqa: BLE001
         slots_total, slots_busy = None, None
 
-    return jsonify({
+    return {
         "status": {
             "uptime": _uptime_label(),
             "last_turn": _ago_label(st.get("last_turn_at")),
@@ -560,7 +587,17 @@ def agent_center_monitoring():
         "chart": chart,
         "health": health,
         "events": events,
-    })
+        "problems": [h["label"] + ": " + h["status"] for h in health if h["type"] != "ok"],
+    }
+
+
+@app.get("/api/agent-center/monitoring")
+def agent_center_monitoring():
+    try:
+        return jsonify(monitoring_payload())
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center monitoring failed")
+        return jsonify({"error": "Не удалось загрузить мониторинг."}), 500
 
 
 # --- Usage accounting (/api/agent-center/usage) ---------------------------------------------
@@ -575,13 +612,47 @@ def _duration_label(ms: float | int | None) -> str:
     return f"{minutes} мин"
 
 
-@app.get("/api/agent-center/usage")
-def agent_center_usage():
-    """Per-employee usage for a period: turns, total agent working time (sum of
-    turn latencies) and an estimated token spend. Tokens are estimated from the
-    question+answer text volume (~3 chars/token for Russian) — the bot does not
-    log exact usage from Hermes yet; when it does, this switches to real numbers."""
-    period = (request.args.get("period") or "7").strip().lower()
+_HERMES_STATE_DB = os.getenv("HERMES_STATE_DB", "/root/.hermes/state.db")
+_SESSION_MATCH_TOLERANCE_S = 90
+_ACTIVITY_GAP_MIN = 30
+
+
+def _hermes_cli_sessions(since_epoch: float) -> list[dict[str, Any]]:
+    """Real per-run token usage from the Hermes CLI session store (state.db).
+    Every bot turn spawns one `hermes -z` run = one session row here."""
+    import sqlite3
+    try:
+        db = sqlite3.connect(f"file:{_HERMES_STATE_DB}?mode=ro", uri=True, timeout=3)
+        try:
+            rows = db.execute(
+                "SELECT started_at, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens"
+                " FROM sessions WHERE source = 'cli' AND started_at >= ? ORDER BY started_at",
+                (since_epoch,),
+            ).fetchall()
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        logging.warning("agent_center: hermes state.db unavailable", exc_info=True)
+        return []
+    return [
+        {
+            "start": float(r[0] or 0),
+            "tokens": int(r[1] or 0) + int(r[2] or 0) + int(r[3] or 0),
+            "cache": int(r[4] or 0),
+            "used": False,
+        }
+        for r in rows
+    ]
+
+
+def usage_payload(period: str) -> dict[str, Any]:
+    """Per-employee usage for a period. Tokens are REAL where possible: each bot
+    turn is matched by start time (created_at − latency) to its `hermes -z` CLI
+    session in state.db (±90s); unmatched turns fall back to a text-size estimate.
+    Two times are reported: сколько сотрудник провёл в работе с агентом (turns
+    grouped into activity sessions with 30-min gaps) and сколько работал сам агент
+    (sum of turn latencies)."""
+    period = (period or "7").strip().lower()
     now_msk = msk_now()
     if period == "today":
         since = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -591,53 +662,108 @@ def agent_center_usage():
         except (TypeError, ValueError):
             days = 7
         since = now_msk - timedelta(days=days)
-    rows = []
-    try:
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT bitrix_user_id,"
-                    " COUNT(*) AS turns,"
-                    " COALESCE(SUM(latency_ms), 0) AS total_ms,"
-                    " AVG(latency_ms) AS avg_ms,"
-                    " COUNT(*) FILTER (WHERE status <> 'ok') AS errors,"
-                    " COALESCE(SUM(length(COALESCE(question, '')) + length(COALESCE(answer, ''))), 0) AS chars,"
-                    " MAX(created_at) AS last_at"
-                    " FROM bitrix_bot_interactions"
-                    " WHERE created_at >= %s"
-                    " GROUP BY bitrix_user_id",
-                    (since,),
-                )
-                agg = cur.fetchall()
-    except Exception:  # noqa: BLE001
-        logging.exception("agent_center usage failed")
-        return jsonify({"error": "Не удалось загрузить статистику использования."}), 500
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT bitrix_user_id, created_at, latency_ms, status,"
+                " length(COALESCE(question, '')) + length(COALESCE(answer, '')) AS chars"
+                " FROM bitrix_bot_interactions WHERE created_at >= %s ORDER BY created_at",
+                (since,),
+            )
+            turns = cur.fetchall()
+
+    sessions = _hermes_cli_sessions(since.timestamp() - _SESSION_MATCH_TOLERANCE_S)
+    per_user: dict[int | None, dict[str, Any]] = {}
+    matched_turns = 0
+    for t in turns:
+        uid = int(t["bitrix_user_id"]) if t["bitrix_user_id"] is not None else None
+        u = per_user.setdefault(uid, {
+            "turns": 0, "errors": 0, "agent_ms": 0, "tokens": 0, "cache": 0,
+            "matched": 0, "starts": [], "last_at": None,
+        })
+        latency = int(t["latency_ms"] or 0)
+        turn_start = t["created_at"].timestamp() - latency / 1000
+        u["turns"] += 1
+        u["agent_ms"] += latency
+        u["errors"] += 1 if t["status"] != "ok" else 0
+        u["starts"].append((turn_start, latency))
+        u["last_at"] = t["created_at"]
+        best = None
+        for s in sessions:
+            if s["used"]:
+                continue
+            delta = abs(s["start"] - turn_start)
+            if delta <= _SESSION_MATCH_TOLERANCE_S and (best is None or delta < best[0]):
+                best = (delta, s)
+        if best is not None:
+            best[1]["used"] = True
+            u["tokens"] += best[1]["tokens"]
+            u["cache"] += best[1]["cache"]
+            u["matched"] += 1
+            matched_turns += 1
+        else:
+            u["tokens"] += int(t["chars"] or 0) // 3  # fallback: text-size estimate
+
     names = _user_names()
-    for r in agg:
-        uid = int(r["bitrix_user_id"]) if r["bitrix_user_id"] is not None else None
+    rows = []
+    for uid, u in per_user.items():
+        # Employee time with the agent: group turns into sessions by 30-min gaps.
+        activity_ms = 0
+        block_start = block_end = None
+        for start, latency in sorted(u["starts"]):
+            end = start + latency / 1000
+            if block_start is None or start - block_end > _ACTIVITY_GAP_MIN * 60:
+                if block_start is not None:
+                    activity_ms += int((block_end - block_start) * 1000)
+                block_start, block_end = start, end
+            else:
+                block_end = max(block_end, end)
+        if block_start is not None:
+            activity_ms += int((block_end - block_start) * 1000)
         info = names.get(uid or -1, {})
-        tokens = int(r["chars"]) // 3
         rows.append({
             "bitrix_user_id": uid,
             "name": info.get("name") or (f"Сотрудник #{uid}" if uid else "Без имени"),
             "position": info.get("position") or "",
-            "turns": int(r["turns"]),
-            "time_ms": int(r["total_ms"]),
-            "time_label": _duration_label(r["total_ms"]),
-            "avg_label": f"{round(float(r['avg_ms']) / 1000)} сек" if r["avg_ms"] else "—",
-            "errors": int(r["errors"]),
-            "tokens_est": tokens,
-            "last_at": _when_label(r["last_at"]),
+            "turns": u["turns"],
+            "time_ms": activity_ms,
+            "time_label": _duration_label(activity_ms),
+            "agent_time_label": _duration_label(u["agent_ms"]),
+            "errors": u["errors"],
+            "tokens_est": u["tokens"],
+            "cache_tokens": u["cache"],
+            "matched": u["matched"],
+            "last_at": _when_label(u["last_at"]),
         })
     rows.sort(key=lambda x: x["tokens_est"], reverse=True)
+    total_turns = sum(x["turns"] for x in rows)
     totals = {
-        "turns": sum(x["turns"] for x in rows),
+        "turns": total_turns,
         "time_ms": sum(x["time_ms"] for x in rows),
         "time_label": _duration_label(sum(x["time_ms"] for x in rows)),
+        "agent_time_label": _duration_label(sum(u["agent_ms"] for u in per_user.values())),
         "tokens_est": sum(x["tokens_est"] for x in rows),
+        "cache_tokens": sum(x["cache_tokens"] for x in rows),
         "users": len(rows),
+        "matched_turns": matched_turns,
+        "coverage_pct": round(matched_turns / total_turns * 100) if total_turns else 0,
     }
-    return jsonify({"period": period, "rows": rows, "totals": totals})
+    return {"period": period, "rows": rows, "totals": totals}
+
+
+@app.get("/api/agent-center/usage")
+def agent_center_usage():
+    try:
+        return jsonify(usage_payload(request.args.get("period") or "7"))
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center usage failed")
+        return jsonify({"error": "Не удалось загрузить статистику использования."}), 500
+
+
+def agent_center_report(period: str = "7") -> dict[str, Any]:
+    """Combined monitoring + usage snapshot for the agent's own analysis
+    (resolved via app_workflow_function by the get_agent_monitoring MCP tool)."""
+    return {"monitoring": monitoring_payload(), "usage": usage_payload(str(period))}
 
 
 _HERMES_SKILLS_DIR = Path(os.getenv("HERMES_SKILLS_DIR", "/root/.hermes/skills"))

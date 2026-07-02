@@ -142,7 +142,7 @@ def local_app_base_url() -> str:
 
 # app.py is being split module-by-module (move-only refactor), so a workflow may now
 # live in an extracted module; resolve across all of them, app first.
-WORKFLOW_MODULES = ("app", "bitrix", "gdrive", "zoom", "b24bot", "llm", "utils")
+WORKFLOW_MODULES = ("app", "bitrix", "gdrive", "zoom", "b24bot", "llm", "utils", "agent_center")
 
 
 def app_workflow_function(name: str) -> Any:
@@ -4893,6 +4893,14 @@ def _b24_absence_periods(user_ids: list[Any], date_from: str, date_to: str) -> d
     return out
 
 
+def tool_get_agent_monitoring(args: dict[str, Any]) -> dict[str, Any]:
+    """Live self-monitoring + usage accounting (same data as the Центр Агента pages):
+    health of every integration, speed chart, event feed, and per-employee usage
+    (turns, time with the agent, real token spend from the Hermes session store)."""
+    period = str(args.get("period") or "7")
+    return app_workflow_function("agent_center_report")(period)
+
+
 def tool_get_employee_absences(args: dict[str, Any]) -> dict[str, Any]:
     """Whether employees are on vacation/absent per the Bitrix «График отсутствий» (bot portal
     b24-0xrp3s). Resolves by bitrix_user_id or employee_name; with neither, returns everyone who is
@@ -4954,6 +4962,26 @@ def tool_get_employee_absences(args: dict[str, Any]) -> dict[str, Any]:
 
 
 TOOLS: dict[str, dict[str, Any]] = {
+    "get_agent_monitoring": {
+        "description": (
+            "Мониторинг и учёт использования самого агента (живые данные страниц «Центра Агента»): "
+            "здоровье всех систем (БД, MCP, мозг, Bitrix REST, Zoom, Google Drive, память сервера) "
+            "с полем problems (что не ок — подсвети владельцу), скорость каждого хода за 24 часа, "
+            "лента событий (ошибки, медленные ходы, жалобы, деплои) и расход по сотрудникам за период: "
+            "ходы, время в работе с агентом, время работы агента и реальные токены из сессий Hermes. "
+            "Используй для анализа «кто сколько потребляет», «почему агент тормозил», «всё ли работает»."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "description": "Период учёта использования: today, либо число дней (7, 30, 90). По умолчанию 7.",
+                },
+            },
+        },
+        "handler": tool_get_agent_monitoring,
+    },
     "get_employee_absences": {
         "description": (
             "Узнать, в отпуске ли / отсутствует ли сотрудник (Bitrix «График отсутствий», портал b24-0xrp3s). "
@@ -6313,6 +6341,8 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
     "update_ai_capabilities",
     "delete_bitrix_task",
     "delete_zoom_call_report",
+    # Per-employee usage/monitoring is management data — admin connector only.
+    "get_agent_monitoring",
 }
 
 # Operational-full connector: every registered tool EXCEPT the admin-only ones above.

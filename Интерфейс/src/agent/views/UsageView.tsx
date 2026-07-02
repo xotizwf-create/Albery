@@ -43,8 +43,13 @@ export function UsageView() {
   const cards = data
     ? [
         { label: "Ходов агента", value: String(data.totals.turns), icon: MessageSquare, iconCls: "bg-indigo-50 text-indigo-500" },
-        { label: "Время работы агента", value: data.totals.time_label, icon: Clock, iconCls: "bg-emerald-50 text-emerald-500" },
-        { label: "≈ Токенов потрачено", value: fmtTokens(data.totals.tokens_est), icon: Coins, iconCls: "bg-amber-50 text-amber-500" },
+        { label: "Время в работе с агентом", value: data.totals.time_label, icon: Clock, iconCls: "bg-emerald-50 text-emerald-500" },
+        {
+          label: `Токенов • реальные данные ${data.totals.coverage_pct}% ходов`,
+          value: fmtTokens(data.totals.tokens_est),
+          icon: Coins,
+          iconCls: "bg-amber-50 text-amber-500",
+        },
         { label: "Активных сотрудников", value: String(data.totals.users), icon: Users, iconCls: "bg-sky-50 text-sky-500" },
       ]
     : [];
@@ -126,10 +131,10 @@ export function UsageView() {
               <tr className="text-[11px] font-bold text-gray-400 uppercase tracking-wider border-b border-gray-50">
                 <th className="px-5 py-3">Сотрудник</th>
                 <th className="px-4 py-3 text-right">Ходов</th>
-                <th className="px-4 py-3 text-right">Время работы</th>
-                <th className="px-4 py-3 text-right">Ср. ход</th>
+                <th className="px-4 py-3 text-right">В работе с агентом</th>
+                <th className="px-4 py-3 text-right">Работа агента</th>
                 <th className="px-4 py-3 text-right">Ошибки</th>
-                <th className="px-5 py-3 w-[280px]">≈ Токены</th>
+                <th className="px-5 py-3 w-[280px]">Токены</th>
                 <th className="px-4 py-3 text-right">Активность</th>
               </tr>
             </thead>
@@ -156,7 +161,7 @@ export function UsageView() {
                   </td>
                   <td className="px-4 py-3.5 text-right font-bold text-gray-900 text-[13.5px]">{row.turns}</td>
                   <td className="px-4 py-3.5 text-right font-medium text-gray-600 text-[13.5px]">{row.time_label}</td>
-                  <td className="px-4 py-3.5 text-right font-medium text-gray-500 text-[13px]">{row.avg_label}</td>
+                  <td className="px-4 py-3.5 text-right font-medium text-gray-500 text-[13px]">{row.agent_time_label}</td>
                   <td className="px-4 py-3.5 text-right">
                     {row.errors > 0 ? (
                       <span className="text-[12px] font-bold text-rose-600 bg-rose-50 border border-rose-100 px-2 py-0.5 rounded-md">
@@ -200,8 +205,11 @@ export function UsageView() {
           </table>
         </div>
         <div className="px-5 py-3 border-t border-gray-50 bg-gray-50/40 text-[11.5px] font-medium text-gray-400">
-          ≈ Токены — оценка по объёму переписки (~3 символа на токен). Точный учёт подключим, когда бот начнёт
-          логировать usage из Hermes.
+          Токены — реальный расход из сессий Hermes (вход + выход + reasoning; кэш-чтения не считаются):
+          каждый ход бота сматчен по времени со своей сессией
+          {data ? ` — покрыто ${data.totals.coverage_pct}% ходов (${data.totals.matched_turns} из ${data.totals.turns})` : ""}.
+          Несматченные ходы учтены оценкой по тексту. «В работе с агентом» — время активности сотрудника
+          (серии ходов с паузами до 30 мин), «Работа агента» — чистое время обработки.
         </div>
       </div>
     </div>
