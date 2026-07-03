@@ -1735,6 +1735,19 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         # Two-stage tools: the bot registers a curated core + find_tool/call_tool (fast turns,
         # small context); the full connectors stay untouched for cron agents.
         toolset = {"admin": "albery-core", "ops": "albery-ops-core"}[tier]
+    # Universal (main) agent: when enabled, the main bot runs on ONE configurable набор
+    # (its own /mcp-agent/main connector) for everyone allowed, instead of per-user tiers —
+    # capped at ops (no admin). Guarded + falls back to the classic connectors if not ready.
+    if agent is None:
+        try:
+            from agent_center import universal_main_connector
+            universal = universal_main_connector()
+        except Exception:  # noqa: BLE001
+            universal = None
+        if universal:
+            tier = "ops"
+            core_toolset = False
+            toolset = universal
     if agent is not None:
         toolset = f"agent-{agent['slug']}"
     timeout_s = int(os.getenv("B24_TESTBOT_HERMES_TIMEOUT", "170"))

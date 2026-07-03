@@ -446,8 +446,8 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void; onRenamed?
           </div>
         </div>
 
-        {/* Right Column - Constructor (Knowledge & Tools) */}
-        <div className="flex-1 space-y-6 min-w-0">
+        {/* Right Column - legacy read-only showcase, replaced by the live AgentCapabilityPanel below */}
+        <div className="hidden">
           {/* Integrations & Tools (MCP) */}
           <div className="bg-slate-50/50 p-6 rounded-3xl border border-gray-100 flex flex-col h-[380px]">
             <div className="flex items-center justify-between mb-4">
@@ -620,6 +620,8 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void; onRenamed?
           </div>
         </div>
       </div>
+
+      <AgentCapabilityPanel slug="main" version={0} />
     </div>
   );
 };

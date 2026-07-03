@@ -276,6 +276,8 @@ def agent_center_agents():
                     sub_stats[r["agent_slug"]] = dict(r)
         names = _user_names()
         for a in _load_agents_full():
+            if a["slug"] == MAIN_AGENT_SLUG:
+                continue  # the universal agent is rendered as the main card above, not as a subagent
             ss = sub_stats.get(a["slug"], {})
             member_names = [names.get(uid, {}).get("name") or f"#{uid}" for uid in sorted(a["members"])]
             sub_avg = ss.get("avg_ms")
@@ -807,6 +809,66 @@ def _agent_by_slug(slug: str) -> dict[str, Any] | None:
     return _AGENT_CACHE["by_slug"].get(slug)
 
 
+# --- Universal (main) agent as a first-class configurable Agent ------------------------------
+# The main Bitrix bot is modelled as an ordinary agent row (slug='main', level 'ops') so it
+# shares the exact same editor and enforcement as the others — it is simply the broadest one.
+# Its bitrix_bot_id stays NULL on purpose so agent_for_bot_id() never resolves the main bot to
+# it (main-bot turns keep the general assistant prompt, not the specialised-subagent one); the
+# main turn is instead routed to this agent's own connector when the universal mode is on.
+MAIN_AGENT_SLUG = "main"
+
+
+def ensure_main_agent() -> dict[str, Any] | None:
+    """Idempotently make sure the universal (main) agent row + its /mcp-agent/main connector
+    exist. Best-effort and non-fatal: a failure here must never break app boot or the live bot
+    (the turn path falls back to the classic tier connectors). Touches only the DB and the
+    Hermes config file — never b24bot — so it is import-order safe."""
+    import secrets
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT mcp_token FROM agents WHERE slug = %s", (MAIN_AGENT_SLUG,))
+                row = cur.fetchone()
+                if row:
+                    token = row["mcp_token"]
+                else:
+                    token = secrets.token_urlsafe(32)
+                    cur.execute(
+                        "INSERT INTO agents (slug, name, role_prompt, tier, mcp_token, color, is_active)"
+                        " VALUES (%s, %s, %s, 'ops', %s, 'ORANGE', TRUE) ON CONFLICT (slug) DO NOTHING",
+                        (MAIN_AGENT_SLUG, "Универсальный агент", "", token),
+                    )
+                    cur.execute("SELECT mcp_token FROM agents WHERE slug = %s", (MAIN_AGENT_SLUG,))
+                    token = cur.fetchone()["mcp_token"]
+        try:
+            _hermes_connector_add(MAIN_AGENT_SLUG, token)
+        except Exception:  # noqa: BLE001
+            logging.exception("ensure_main_agent: hermes connector add failed")
+        _agent_cache_bust()
+        return _agent_by_slug(MAIN_AGENT_SLUG)
+    except Exception:  # noqa: BLE001
+        logging.exception("ensure_main_agent failed")
+        return None
+
+
+def universal_main_connector() -> str | None:
+    """Toolset name for the universal main turn, or None if not ready (→ classic fallback).
+    Ready = the row exists AND its connector line is present in the Hermes config, AND the
+    UNIVERSAL_MAIN_AGENT flag is on. Read live each call so the flag can be flipped via env
+    without a code deploy (safe rollout: deploy dormant → verify connector → flip → verify bot)."""
+    if os.getenv("UNIVERSAL_MAIN_AGENT", "0").strip() != "1":
+        return None
+    agent = _agent_by_slug(MAIN_AGENT_SLUG)
+    if not agent or not agent.get("is_active"):
+        return None
+    try:
+        if f"  agent-{MAIN_AGENT_SLUG}:" not in _HERMES_CONFIG.read_text(encoding="utf-8"):
+            return None
+    except OSError:
+        return None
+    return f"agent-{MAIN_AGENT_SLUG}"
+
+
 # --- Bitrix bot auto-registration (same local application, new CODE per agent) --------------
 
 def _register_agent_bot(slug: str, name: str, color: str) -> Any:
@@ -1009,22 +1071,39 @@ def agent_center_agent_detail(slug: str):
 @app.patch("/api/agent-center/agents/<slug>")
 def agent_center_agent_update(slug: str):
     body = request.get_json(silent=True) or {}
-    if slug == "main":
-        # The main agent lives in Bitrix only; renaming it = renaming the main bot.
-        name = str(body.get("name") or "").strip()[:60]
-        if not name:
-            return jsonify({"error": "Укажите имя."}), 400
+    if slug == MAIN_AGENT_SLUG:
+        # The universal agent is a real row now; persist its editable fields (name/role
+        # prompt/active) AND, on a name change, rename the actual Bitrix bot. Tier is fixed
+        # to 'ops' (no admin) and members are managed via agent_access, not here.
+        ensure_main_agent()
+        warnings: list[str] = []
         try:
-            from b24bot import _b24_load_state
-            main_bot_id = (_b24_load_state() or {}).get("bot_id")
-            if not main_bot_id:
-                return jsonify({"error": "Основной бот не найден в state — напишите ему сообщение и повторите."}), 409
-            _rename_bitrix_bot(main_bot_id, name)
-        except Exception as exc:  # noqa: BLE001
-            logging.exception("main agent rename failed")
-            return jsonify({"error": f"Не удалось переименовать бота: {str(exc)[:200]}"}), 502
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    if "name" in body and str(body["name"]).strip():
+                        new_name = str(body["name"]).strip()[:60]
+                        cur.execute("UPDATE agents SET name = %s, updated_at = now() WHERE slug = %s",
+                                    (new_name, MAIN_AGENT_SLUG))
+                        try:
+                            from b24bot import _b24_load_state
+                            main_bot_id = (_b24_load_state() or {}).get("bot_id")
+                            if main_bot_id:
+                                _rename_bitrix_bot(main_bot_id, new_name)
+                        except Exception as exc:  # noqa: BLE001
+                            logging.exception("main agent bitrix rename failed")
+                            warnings.append(f"Имя в Bitrix не обновилось: {str(exc)[:160]}")
+                    if "role_prompt" in body:
+                        cur.execute("UPDATE agents SET role_prompt = %s, updated_at = now() WHERE slug = %s",
+                                    (str(body["role_prompt"] or "").strip()[:4000], MAIN_AGENT_SLUG))
+                    if "is_active" in body:
+                        cur.execute("UPDATE agents SET is_active = %s, updated_at = now() WHERE slug = %s",
+                                    (bool(body["is_active"]), MAIN_AGENT_SLUG))
+        except Exception:  # noqa: BLE001
+            logging.exception("main agent update failed")
+            return jsonify({"error": "Не удалось сохранить изменения."}), 500
         _AGENT_CACHE.update(main_name_at=0.0)
-        return jsonify({"ok": True})
+        _agent_cache_bust()
+        return jsonify({"ok": True, "warnings": warnings})
     agent = _agent_by_slug(slug)
     if not agent:
         return jsonify({"error": "Агент не найден."}), 404
@@ -1096,6 +1175,8 @@ def agent_center_agent_register_bot(slug: str):
 
 @app.delete("/api/agent-center/agents/<slug>")
 def agent_center_agent_delete(slug: str):
+    if slug == MAIN_AGENT_SLUG:
+        return jsonify({"error": "Универсальный (основной) агент удалить нельзя."}), 400
     agent = _agent_by_slug(slug)
     if not agent:
         return jsonify({"error": "Агент не найден."}), 404
@@ -1797,3 +1878,14 @@ def agent_center_knowledge():
         return jsonify({"error": "Не удалось загрузить базу знаний."}), 500
     items.extend(_hermes_skills())
     return jsonify({"items": items})
+
+
+# Bootstrap the universal (main) agent row + connector once at import. Best-effort: guarded
+# inside ensure_main_agent, never fatal. Routing to it stays behind UNIVERSAL_MAIN_AGENT (off
+# by default), so this only prepares the dormant connector — the live bot is untouched until
+# the flag is flipped. Set ENSURE_MAIN_AGENT=0 to skip entirely.
+if os.getenv("ENSURE_MAIN_AGENT", "1").strip() != "0":
+    try:
+        ensure_main_agent()
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center: ensure_main_agent bootstrap failed")
