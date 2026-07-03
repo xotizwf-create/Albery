@@ -51,6 +51,8 @@ def test_agent_center_routes_registered(app_module):
     assert "/api/agent-center/usage" in paths
     assert "/agent" in paths
     assert "/agent-dialogs" in paths
+    assert "/api/agent-center/agents/<slug>" in paths
+    assert "/mcp-agent/<slug>/<path:path_token>" in paths
 
 
 def test_mcp_imports_with_tools(ctx):

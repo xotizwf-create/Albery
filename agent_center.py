@@ -242,8 +242,9 @@ def agent_center_agents():
         logging.exception("agent_center agents failed")
         return jsonify({"error": "Не удалось загрузить агентов."}), 500
     avg_ms = st.get("avg_latency_7d")
-    agent = {
+    main_agent = {
         **_MAIN_AGENT_META,
+        "is_system": True,
         "is_active": True,
         "channels": ["Bitrix"],
         "users_count": len(users),
@@ -254,7 +255,47 @@ def agent_center_agents():
         "avg_speed": f"{round(float(avg_ms) / 1000)} сек" if avg_ms else "—",
         "last_at": _when_label(st.get("last_at")),
     }
-    return jsonify({"agents": [agent]})
+    agents = [main_agent]
+    try:
+        sub_stats: dict[str, dict[str, Any]] = {}
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT agent_slug,"
+                    " COUNT(*) FILTER (WHERE created_at >= %s) AS turns_today,"
+                    " COUNT(*) FILTER (WHERE created_at >= %s) AS turns_7d,"
+                    " AVG(latency_ms) FILTER (WHERE created_at >= %s AND latency_ms IS NOT NULL) AS avg_ms,"
+                    " MAX(created_at) AS last_at"
+                    " FROM bitrix_bot_interactions WHERE agent_slug IS NOT NULL GROUP BY agent_slug",
+                    (day_start, week_start, week_start),
+                )
+                for r in cur.fetchall():
+                    sub_stats[r["agent_slug"]] = dict(r)
+        names = _user_names()
+        for a in _load_agents_full():
+            ss = sub_stats.get(a["slug"], {})
+            member_names = [names.get(uid, {}).get("name") or f"#{uid}" for uid in sorted(a["members"])]
+            sub_avg = ss.get("avg_ms")
+            agents.append({
+                "id": a["slug"],
+                "name": a["name"],
+                "kind": f"субагент • {'все функции' if a['tier'] == 'ops' else 'база знаний'}",
+                "icon": "box",
+                "icon_bg": "bg-blue-100 text-blue-500",
+                "is_system": False,
+                "is_active": bool(a["is_active"]),
+                "channels": ["Bitrix"] if a["bitrix_bot_id"] else [],
+                "users_count": len(member_names),
+                "users_preview": ", ".join(member_names[:3]) + (f" +{len(member_names) - 3}" if len(member_names) > 3 else ""),
+                "turns_today": int(ss.get("turns_today") or 0),
+                "turns_7d": int(ss.get("turns_7d") or 0),
+                "errors_7d": 0,
+                "avg_speed": f"{round(float(sub_avg) / 1000)} сек" if sub_avg else "—",
+                "last_at": _when_label(ss.get("last_at")),
+            })
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center: subagents list failed")
+    return jsonify({"agents": agents})
 
 
 @app.get("/api/agent-center/tools")
@@ -658,6 +699,535 @@ if os.getenv("AGENT_HEALTH_WATCHDOG", "1").strip() != "0":
     import threading
 
     threading.Thread(target=_health_watchdog_loop, daemon=True, name="agent-health-watchdog").start()
+
+
+# --- Subagents ------------------------------------------------------------------------------
+# A subagent = its own Bitrix bot (registered through the SAME local application via
+# imbot.register — no new app needed), its own hermes connector (mcp_servers entry in
+# /root/.hermes/config.yaml pointing at /mcp-agent/<slug>/<token>; the bot's CLI runs
+# read the config fresh every turn, so no gateway restart), a member allowlist and a
+# personal instruction store the agent extends itself (self-learning, scoped by the
+# connector URL so an agent can only ever write to ITS OWN store).
+
+_HERMES_CONFIG = Path(os.getenv("HERMES_CONFIG", "/root/.hermes/config.yaml"))
+_AGENT_MCP_PUBLIC_BASE = os.getenv("AGENT_MCP_PUBLIC_BASE", "https://mcp.m4s.ru")
+_AGENT_SELF_INSTRUCTIONS_MAX = int(os.getenv("AGENT_SELF_INSTRUCTIONS_MAX", "30"))
+_AGENT_INSTRUCTION_CHARS_MAX = 8000
+_AGENT_CACHE: dict[str, Any] = {"at": 0.0, "by_bot": {}, "by_slug": {}}
+_AGENT_COLORS = ("GREEN", "MINT", "PINK", "ORANGE", "PURPLE", "AQUA", "LIGHT_BLUE", "GRAY")
+
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z",
+    "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def _agent_slug(name: str) -> str:
+    out = "".join(_TRANSLIT.get(ch, ch) for ch in name.lower())
+    out = re.sub(r"[^a-z0-9]+", "-", out).strip("-")[:32]
+    return out or "agent"
+
+
+def _agent_cache_bust() -> None:
+    _AGENT_CACHE.update(at=0.0, by_bot={}, by_slug={})
+
+
+def _load_agents_full() -> list[dict[str, Any]]:
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id::text AS id, slug, name, role_prompt, tier, tools, bitrix_bot_id,"
+                " mcp_token, is_active, color, created_at FROM agents ORDER BY created_at"
+            )
+            agents = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT agent_id::text AS agent_id, bitrix_user_id FROM agent_members")
+            members = cur.fetchall()
+            cur.execute(
+                "SELECT id::text AS id, agent_id::text AS agent_id, name, content, source, updated_at"
+                " FROM agent_instructions ORDER BY created_at"
+            )
+            instructions = cur.fetchall()
+    by_id = {a["id"]: a for a in agents}
+    for a in agents:
+        a["members"] = set()
+        a["instructions"] = []
+    for m in members:
+        if m["agent_id"] in by_id:
+            by_id[m["agent_id"]]["members"].add(int(m["bitrix_user_id"]))
+    for i in instructions:
+        if i["agent_id"] in by_id:
+            by_id[i["agent_id"]]["instructions"].append(dict(i))
+    return agents
+
+
+def agent_for_bot_id(bot_id: Any) -> dict[str, Any] | None:
+    """Resolve an incoming Bitrix BOT_ID to a subagent profile (60s cache).
+    Returns None for the main bot / unknown ids. Called by b24bot on every event."""
+    key = str(bot_id or "").strip()
+    if not key:
+        return None
+    now = time.monotonic()
+    if now - _AGENT_CACHE["at"] > 60:
+        try:
+            agents = _load_agents_full()
+            _AGENT_CACHE.update(
+                at=now,
+                by_bot={str(a["bitrix_bot_id"]): a for a in agents if a["bitrix_bot_id"]},
+                by_slug={a["slug"]: a for a in agents},
+            )
+        except Exception:  # noqa: BLE001
+            logging.exception("agent_center: agents cache reload failed")
+    return _AGENT_CACHE["by_bot"].get(key)
+
+
+def _agent_by_slug(slug: str) -> dict[str, Any] | None:
+    agent_for_bot_id("0")  # refresh cache if stale
+    return _AGENT_CACHE["by_slug"].get(slug)
+
+
+# --- Bitrix bot auto-registration (same local application, new CODE per agent) --------------
+
+def _register_agent_bot(slug: str, name: str, color: str) -> Any:
+    from b24bot import B24_APP_HANDLER_URL, _b24_app_access_token, _b24_app_call
+    endpoint, access = _b24_app_access_token()
+    if not endpoint or not access:
+        raise RuntimeError("Нет OAuth-токенов приложения Bitrix (state пуст) — переустановите локальное приложение.")
+    payload = {
+        "CODE": f"albery_agent_{slug}"[:50].replace("-", "_"),
+        "TYPE": "B",
+        "OPENLINE": "N",
+        "EVENT_MESSAGE_ADD": B24_APP_HANDLER_URL,
+        "EVENT_WELCOME_MESSAGE": B24_APP_HANDLER_URL,
+        "EVENT_BOT_DELETE": B24_APP_HANDLER_URL,
+        "PROPERTIES": {"NAME": name, "COLOR": color, "WORK_POSITION": "ИИ-агент Albery"},
+    }
+    result = _b24_app_call(endpoint, access, "imbot.register", payload).get("result")
+    if not result:
+        raise RuntimeError("imbot.register вернул пустой результат")
+    return result
+
+
+def _unregister_agent_bot(bot_id: Any) -> None:
+    if not bot_id:
+        return
+    from b24bot import _b24_app_access_token, _b24_app_call
+    try:
+        endpoint, access = _b24_app_access_token()
+        _b24_app_call(endpoint, access, "imbot.unregister", {"BOT_ID": bot_id})
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center: imbot.unregister failed for bot %s", bot_id)
+
+
+# --- Hermes connector management (textual config edit, comments preserved) ------------------
+
+def _hermes_connector_add(slug: str, token: str) -> None:
+    """Insert an mcp_servers entry `agent-<slug>` right after the `mcp_servers:` line.
+    Textual edit (no yaml re-dump) keeps the hand-tuned config comments intact; the
+    result is validated by parsing, with an automatic backup restore on failure."""
+    if not _HERMES_CONFIG.exists():
+        raise RuntimeError(f"Hermes config не найден: {_HERMES_CONFIG}")
+    text = _HERMES_CONFIG.read_text(encoding="utf-8")
+    marker = f"  agent-{slug}:"
+    if marker in text:
+        return
+    lines = text.splitlines(keepends=True)
+    insert_at = next((i + 1 for i, line in enumerate(lines) if line.rstrip() == "mcp_servers:"), None)
+    if insert_at is None:
+        raise RuntimeError("В hermes config нет секции mcp_servers")
+    block = (
+        f"  agent-{slug}:\n"
+        f"    url: {_AGENT_MCP_PUBLIC_BASE}/mcp-agent/{slug}/{token}\n"
+        f"    enabled: true\n"
+        f"    timeout: 300\n"
+    )
+    backup = _HERMES_CONFIG.with_name(f"config.yaml.bak-agent-{slug}-{int(time.time())}")
+    backup.write_text(text, encoding="utf-8")
+    new_text = "".join(lines[:insert_at]) + block + "".join(lines[insert_at:])
+    import yaml
+    yaml.safe_load(new_text)  # validate before touching the live file
+    _HERMES_CONFIG.write_text(new_text, encoding="utf-8")
+
+
+def _hermes_connector_remove(slug: str) -> None:
+    try:
+        text = _HERMES_CONFIG.read_text(encoding="utf-8")
+    except OSError:
+        return
+    lines = text.splitlines(keepends=True)
+    out, skipping = [], False
+    for line in lines:
+        if line.rstrip() == f"  agent-{slug}:":
+            skipping = True
+            continue
+        if skipping:
+            if line.startswith("    ") or not line.strip():
+                continue
+            skipping = False
+        out.append(line)
+    new_text = "".join(out)
+    if new_text != text:
+        import yaml
+        yaml.safe_load(new_text)
+        _HERMES_CONFIG.write_text(new_text, encoding="utf-8")
+
+
+# --- Subagent CRUD API ----------------------------------------------------------------------
+
+@app.post("/api/agent-center/agents")
+def agent_center_create_agent():
+    import secrets
+    body = request.get_json(silent=True) or {}
+    name = str(body.get("name") or "").strip()
+    if not name or len(name) > 60:
+        return jsonify({"error": "Укажите имя агента (до 60 символов)."}), 400
+    tier = str(body.get("tier") or "faq").strip()
+    if tier not in ("faq", "ops"):
+        return jsonify({"error": "Уровень должен быть faq или ops."}), 400
+    role_prompt = str(body.get("role_prompt") or "").strip()[:4000]
+    members = [int(m) for m in (body.get("members") or []) if str(m).strip().isdigit()]
+    slug = _agent_slug(name)
+    token = secrets.token_urlsafe(32)
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM agents WHERE slug = %s", (slug,))
+                if cur.fetchone():
+                    return jsonify({"error": f"Агент со slug «{slug}» уже есть — назовите иначе."}), 409
+                cur.execute("SELECT COUNT(*) AS n FROM agents")
+                color = _AGENT_COLORS[int(cur.fetchone()["n"]) % len(_AGENT_COLORS)]
+                cur.execute(
+                    "INSERT INTO agents (slug, name, role_prompt, tier, mcp_token, color)"
+                    " VALUES (%s, %s, %s, %s, %s, %s) RETURNING id::text AS id",
+                    (slug, name, role_prompt, tier, token, color),
+                )
+                agent_id = cur.fetchone()["id"]
+                for uid in members:
+                    cur.execute(
+                        "INSERT INTO agent_members (agent_id, bitrix_user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                        (agent_id, uid),
+                    )
+    except Exception:  # noqa: BLE001
+        logging.exception("agent create: db insert failed")
+        return jsonify({"error": "Не удалось сохранить агента."}), 500
+
+    warnings = []
+    bot_id = None
+    try:
+        bot_id = _register_agent_bot(slug, name, color)
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE agents SET bitrix_bot_id = %s, updated_at = now() WHERE id = %s", (bot_id, agent_id))
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("agent create: bitrix bot registration failed")
+        warnings.append(f"Bitrix-бот не зарегистрирован: {str(exc)[:200]}")
+    try:
+        _hermes_connector_add(slug, token)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("agent create: hermes connector add failed")
+        warnings.append(f"Hermes-коннектор не добавлен: {str(exc)[:200]}")
+    _agent_cache_bust()
+    return jsonify({"ok": True, "slug": slug, "bitrix_bot_id": bot_id, "warnings": warnings})
+
+
+@app.get("/api/agent-center/agents/<slug>")
+def agent_center_agent_detail(slug: str):
+    agent = _agent_by_slug(slug)
+    if not agent:
+        return jsonify({"error": "Агент не найден."}), 404
+    names = _user_names()
+    return jsonify({
+        "slug": agent["slug"],
+        "name": agent["name"],
+        "role_prompt": agent["role_prompt"],
+        "tier": agent["tier"],
+        "is_active": agent["is_active"],
+        "bitrix_bot_id": agent["bitrix_bot_id"],
+        "members": [
+            {"id": uid, "name": names.get(uid, {}).get("name") or f"#{uid}"}
+            for uid in sorted(agent["members"])
+        ],
+        "instructions": [
+            {"id": i["id"], "name": i["name"], "content": i["content"], "source": i["source"],
+             "updated": _when_label(i["updated_at"])}
+            for i in agent["instructions"]
+        ],
+    })
+
+
+@app.patch("/api/agent-center/agents/<slug>")
+def agent_center_agent_update(slug: str):
+    agent = _agent_by_slug(slug)
+    if not agent:
+        return jsonify({"error": "Агент не найден."}), 404
+    body = request.get_json(silent=True) or {}
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                if "name" in body and str(body["name"]).strip():
+                    cur.execute("UPDATE agents SET name = %s, updated_at = now() WHERE slug = %s",
+                                (str(body["name"]).strip()[:60], slug))
+                if "role_prompt" in body:
+                    cur.execute("UPDATE agents SET role_prompt = %s, updated_at = now() WHERE slug = %s",
+                                (str(body["role_prompt"] or "").strip()[:4000], slug))
+                if "tier" in body and str(body["tier"]) in ("faq", "ops"):
+                    cur.execute("UPDATE agents SET tier = %s, updated_at = now() WHERE slug = %s",
+                                (str(body["tier"]), slug))
+                if "is_active" in body:
+                    cur.execute("UPDATE agents SET is_active = %s, updated_at = now() WHERE slug = %s",
+                                (bool(body["is_active"]), slug))
+                if isinstance(body.get("members"), list):
+                    members = [int(m) for m in body["members"] if str(m).strip().isdigit()]
+                    cur.execute("DELETE FROM agent_members WHERE agent_id = (SELECT id FROM agents WHERE slug = %s)", (slug,))
+                    for uid in members:
+                        cur.execute(
+                            "INSERT INTO agent_members (agent_id, bitrix_user_id)"
+                            " SELECT id, %s FROM agents WHERE slug = %s ON CONFLICT DO NOTHING",
+                            (uid, slug),
+                        )
+    except Exception:  # noqa: BLE001
+        logging.exception("agent update failed")
+        return jsonify({"error": "Не удалось сохранить изменения."}), 500
+    _agent_cache_bust()
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/agent-center/agents/<slug>")
+def agent_center_agent_delete(slug: str):
+    agent = _agent_by_slug(slug)
+    if not agent:
+        return jsonify({"error": "Агент не найден."}), 404
+    _unregister_agent_bot(agent.get("bitrix_bot_id"))
+    try:
+        _hermes_connector_remove(slug)
+    except Exception:  # noqa: BLE001
+        logging.exception("agent delete: hermes connector remove failed")
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM agents WHERE slug = %s", (slug,))
+    except Exception:  # noqa: BLE001
+        logging.exception("agent delete failed")
+        return jsonify({"error": "Не удалось удалить агента."}), 500
+    _agent_cache_bust()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/agent-center/agents/<slug>/instructions")
+def agent_center_instruction_add(slug: str):
+    agent = _agent_by_slug(slug)
+    if not agent:
+        return jsonify({"error": "Агент не найден."}), 404
+    body = request.get_json(silent=True) or {}
+    name = str(body.get("name") or "").strip()[:80]
+    content = str(body.get("content") or "").strip()[:_AGENT_INSTRUCTION_CHARS_MAX]
+    if not name or not content:
+        return jsonify({"error": "Нужны name и content."}), 400
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO agent_instructions (agent_id, name, content, source)"
+                    " SELECT id, %s, %s, 'owner' FROM agents WHERE slug = %s"
+                    " ON CONFLICT (agent_id, name) DO UPDATE SET content = EXCLUDED.content, updated_at = now()",
+                    (name, content, slug),
+                )
+    except Exception:  # noqa: BLE001
+        logging.exception("agent instruction add failed")
+        return jsonify({"error": "Не удалось сохранить инструкцию."}), 500
+    _agent_cache_bust()
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/agent-center/agents/<slug>/instructions/<inst_id>")
+def agent_center_instruction_delete(slug: str, inst_id: str):
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM agent_instructions WHERE id::text = %s"
+                    " AND agent_id = (SELECT id FROM agents WHERE slug = %s)",
+                    (inst_id, slug),
+                )
+    except Exception:  # noqa: BLE001
+        logging.exception("agent instruction delete failed")
+        return jsonify({"error": "Не удалось удалить."}), 500
+    _agent_cache_bust()
+    return jsonify({"ok": True})
+
+
+# --- Per-agent MCP endpoint (/mcp-agent/<slug>/<token>) with self-learning ------------------
+# The agent's ONLY connector. Tool scope = its tier set (faq → read-only knowledge;
+# ops → operational, no admin tools) ∩ optional per-agent whitelist, PLUS three
+# self-learning tools handled RIGHT HERE with the slug from the URL — so an agent
+# can read/write exclusively its own instruction store, never global instructions,
+# never another agent's. Global admin tools are structurally unreachable.
+
+_SELF_TOOL_SPECS: dict[str, dict[str, Any]] = {
+    "upsert_my_instruction": {
+        "description": (
+            "САМООБУЧЕНИЕ: сохрани или обнови СВОЮ личную инструкцию/навык (только твою, "
+            "других агентов и глобальные правила ты трогать не можешь). Используй, когда узнал "
+            "устойчивое правило работы, специфику команды или полезный приём — сформулируй кратко "
+            "и по делу. name — короткое имя (например «Формат отчёта по остаткам»), content — сам текст."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Короткое имя инструкции (до 80 символов)."},
+                "content": {"type": "string", "description": "Текст инструкции/навыка (до 8000 символов)."},
+            },
+            "required": ["name", "content"],
+        },
+    },
+    "list_my_instructions": {
+        "description": "САМООБУЧЕНИЕ: список твоих личных инструкций/навыков (имя, источник, текст).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    "delete_my_instruction": {
+        "description": (
+            "САМООБУЧЕНИЕ: удали СВОЮ личную инструкцию по имени. Удалять можно только те, "
+            "что ты сам создал (source=self); инструкции владельца защищены."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Имя инструкции."}},
+            "required": ["name"],
+        },
+    },
+}
+
+
+def _agent_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, Any]) -> dict[str, Any]:
+    slug = agent["slug"]
+    if name == "list_my_instructions":
+        rows = [
+            {"name": i["name"], "source": i["source"], "content": i["content"]}
+            for i in (_agent_by_slug(slug) or agent).get("instructions", [])
+        ]
+        return {"instructions": rows, "count": len(rows)}
+    inst_name = str(args.get("name") or "").strip()[:80]
+    if not inst_name:
+        raise ValueError("Укажите name.")
+    if name == "upsert_my_instruction":
+        content = str(args.get("content") or "").strip()[:_AGENT_INSTRUCTION_CHARS_MAX]
+        if not content:
+            raise ValueError("Укажите content.")
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM agent_instructions"
+                    " WHERE agent_id = (SELECT id FROM agents WHERE slug = %s) AND source = 'self'",
+                    (slug,),
+                )
+                if int(cur.fetchone()["n"]) >= _AGENT_SELF_INSTRUCTIONS_MAX:
+                    raise ValueError(
+                        f"Лимит {_AGENT_SELF_INSTRUCTIONS_MAX} самоинструкций: удали неактуальную "
+                        "(delete_my_instruction) или объедини несколько в одну."
+                    )
+                cur.execute(
+                    "INSERT INTO agent_instructions (agent_id, name, content, source)"
+                    " SELECT id, %s, %s, 'self' FROM agents WHERE slug = %s"
+                    " ON CONFLICT (agent_id, name) DO UPDATE SET content = EXCLUDED.content, updated_at = now()",
+                    (inst_name, content, slug),
+                )
+        _agent_cache_bust()
+        return {"ok": True, "saved": inst_name}
+    if name == "delete_my_instruction":
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM agent_instructions WHERE name = %s AND source = 'self'"
+                    " AND agent_id = (SELECT id FROM agents WHERE slug = %s)",
+                    (inst_name, slug),
+                )
+                deleted = cur.rowcount
+        _agent_cache_bust()
+        if not deleted:
+            raise ValueError("Такой самоинструкции нет (инструкции владельца удалять нельзя).")
+        return {"ok": True, "deleted": inst_name}
+    raise ValueError(f"Неизвестный инструмент: {name}")
+
+
+def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
+    from mcp.context_server import FAQ_TOOL_NAMES, OPS_TOOL_NAMES
+    base = set(OPS_TOOL_NAMES) if agent["tier"] == "ops" else set(FAQ_TOOL_NAMES)
+    whitelist = {t for t in (agent.get("tools") or []) if t}
+    return (base & whitelist) if whitelist else base
+
+
+def _mcp_agent_auth(slug: str, path_token: str | None) -> dict[str, Any] | None:
+    import hmac as _hmac
+    agent = _agent_by_slug(slug)
+    if not agent or not path_token:
+        return None
+    if not _hmac.compare_digest(str(path_token), str(agent["mcp_token"])):
+        return None
+    return agent
+
+
+@app.get("/mcp-agent/<slug>/<path:path_token>")
+def mcp_agent_info(slug: str, path_token: str | None = None):
+    agent = _mcp_agent_auth(slug, path_token)
+    if not agent:
+        return jsonify({"error": "forbidden"}), 403
+    return jsonify({
+        "name": f"albery-agent-{slug}",
+        "transport": "http-json-rpc",
+        "endpoint": f"/mcp-agent/{slug}",
+        "scope": f"tier={agent['tier']} + личное самообучение агента «{agent['name']}»",
+        "methods": ["initialize", "tools/list", "tools/call"],
+        "tools": sorted(_agent_tool_names(agent) | set(_SELF_TOOL_SPECS)),
+    })
+
+
+@app.post("/mcp-agent/<slug>/<path:path_token>")
+def mcp_agent_http(slug: str, path_token: str | None = None):
+    agent = _mcp_agent_auth(slug, path_token)
+    if not agent:
+        return jsonify({"jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32001, "message": "forbidden"}}), 403
+    if not agent["is_active"]:
+        return jsonify({"jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32002, "message": "агент выключен"}}), 403
+    from mcp.context_server import handle_request
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32700, "message": "Request body must be JSON."}}), 400
+    method = str(payload.get("method") or "")
+    req_id = payload.get("id")
+    tool_names = _agent_tool_names(agent)
+
+    if method == "tools/call":
+        tool = str(((payload.get("params") or {}).get("name")) or "")
+        if tool in _SELF_TOOL_SPECS:
+            args = ((payload.get("params") or {}).get("arguments")) or {}
+            try:
+                result = _agent_self_tool_call(agent, tool, args)
+                import json as _json
+                body = {"jsonrpc": "2.0", "id": req_id,
+                        "result": {"content": [{"type": "text", "text": _json.dumps(result, ensure_ascii=False)}]}}
+            except ValueError as exc:
+                body = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": str(exc)}}
+            except Exception:  # noqa: BLE001
+                logging.exception("agent self-tool failed: %s/%s", slug, tool)
+                body = {"jsonrpc": "2.0", "id": req_id,
+                        "error": {"code": -32000, "message": "внутренняя ошибка самообучения"}}
+            return jsonify(body), 200
+
+    response = handle_request(payload, tool_names=tool_names)
+    if response is None:
+        return ("", 202)
+    if method == "tools/list" and isinstance(response, dict):
+        tools_list = ((response.get("result") or {}).get("tools"))
+        if isinstance(tools_list, list):
+            for name, spec in _SELF_TOOL_SPECS.items():
+                tools_list.append({"name": name, "description": spec["description"],
+                                   "inputSchema": spec["inputSchema"]})
+    from app import mcp_status_code
+    return jsonify(response), mcp_status_code(response)
 
 
 # --- Usage accounting (/api/agent-center/usage) ---------------------------------------------

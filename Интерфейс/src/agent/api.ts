@@ -37,6 +37,7 @@ interface RawAgent {
   kind: string;
   icon: string;
   icon_bg: string;
+  is_system: boolean;
   is_active: boolean;
   channels: string[];
   users_count: number;
@@ -96,6 +97,7 @@ const toAgent = (a: RawAgent): AgentConfig => ({
   name: a.name,
   type: a.kind,
   isActive: a.is_active,
+  isSystem: !!a.is_system,
   channels: a.channels as AgentConfig["channels"],
   toolsCount: 0,
   skillsCount: 0,
@@ -105,6 +107,63 @@ const toAgent = (a: RawAgent): AgentConfig => ({
   iconBg: a.icon_bg,
   iconType: ICON_TYPES[a.icon] || "box",
 });
+
+// --- Subagents ---
+
+export interface AgentDetail {
+  slug: string;
+  name: string;
+  role_prompt: string;
+  tier: "faq" | "ops";
+  is_active: boolean;
+  bitrix_bot_id: number | null;
+  members: Array<{ id: number; name: string }>;
+  instructions: Array<{ id: string; name: string; content: string; source: "owner" | "self"; updated: string }>;
+}
+
+export async function createAgent(body: {
+  name: string;
+  tier: "faq" | "ops";
+  role_prompt: string;
+  members: number[];
+}): Promise<{ slug: string; bitrix_bot_id: number | null; warnings: string[] }> {
+  return await fetchJsonSafe(
+    "/api/agent-center/agents",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    60000,
+  );
+}
+
+export async function fetchAgentDetail(slug: string): Promise<AgentDetail> {
+  return (await fetchJsonSafe(`/api/agent-center/agents/${slug}`, undefined, 30000)) as AgentDetail;
+}
+
+export async function updateAgent(
+  slug: string,
+  body: Partial<{ name: string; role_prompt: string; tier: string; is_active: boolean; members: number[] }>,
+): Promise<void> {
+  await fetchJsonSafe(
+    `/api/agent-center/agents/${slug}`,
+    { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    30000,
+  );
+}
+
+export async function deleteAgent(slug: string): Promise<void> {
+  await fetchJsonSafe(`/api/agent-center/agents/${slug}`, { method: "DELETE" }, 60000);
+}
+
+export async function addAgentInstruction(slug: string, name: string, content: string): Promise<void> {
+  await fetchJsonSafe(
+    `/api/agent-center/agents/${slug}/instructions`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, content }) },
+    30000,
+  );
+}
+
+export async function deleteAgentInstruction(slug: string, instId: string): Promise<void> {
+  await fetchJsonSafe(`/api/agent-center/agents/${slug}/instructions/${instId}`, { method: "DELETE" }, 30000);
+}
 
 export async function fetchAgentDialogs(params: { channel: string; q?: string }): Promise<{ chats: Chat[]; note?: string }> {
   const search = new URLSearchParams({ channel: params.channel.toLowerCase() });

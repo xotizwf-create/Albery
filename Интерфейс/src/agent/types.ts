@@ -30,6 +30,7 @@ export interface AgentConfig {
   name: string;
   type: string;
   isActive: boolean;
+  isSystem: boolean;
   channels: ('Bitrix' | 'Telegram')[];
   toolsCount: number;
   skillsCount: number;

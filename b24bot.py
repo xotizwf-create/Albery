@@ -1719,11 +1719,15 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
         _HERMES_RUN_SLOTS.release()
 
 
-def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_user_id: Any = "") -> str:
+def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_user_id: Any = "",
+                        agent: dict[str, Any] | None = None) -> str:
     """Run one turn through the local Hermes brain. Toolset is chosen by access tier:
     admin → full MCP `albery` (incl. instruction/settings edits + deletes); ops → `albery-ops`
-    (operational, no admin tools); everyone else → read-only `albery-faq`. Session lifecycle
-    (idle reset + cap rotation + carried summary) is handled by _b24_session_prepare."""
+    (operational, no admin tools); everyone else → read-only `albery-faq`. A subagent turn
+    (`agent` profile from agent_center) uses the agent's OWN connector `agent-<slug>` —
+    its tier toolset plus personal self-learning tools, scoped to that agent only.
+    Session lifecycle (idle reset + cap rotation + carried summary) is handled by
+    _b24_session_prepare."""
     session, seed = _b24_session_prepare(dialog_id)
     toolset = {"admin": "albery", "ops": "albery-ops"}.get(tier, "albery-faq")
     core_toolset = tier in ("admin", "ops") and os.getenv("B24_CORE_TOOLSET", "").strip() == "1"
@@ -1731,6 +1735,8 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         # Two-stage tools: the bot registers a curated core + find_tool/call_tool (fast turns,
         # small context); the full connectors stay untouched for cron agents.
         toolset = {"admin": "albery-core", "ops": "albery-ops-core"}[tier]
+    if agent is not None:
+        toolset = f"agent-{agent['slug']}"
     timeout_s = int(os.getenv("B24_TESTBOT_HERMES_TIMEOUT", "170"))
     fmt = (
         " СТИЛЬ И ФОРМАТ ОТВЕТА (важно): пиши КРАТКО и по делу, но КРАСИВО и удобно для чтения — "
@@ -1783,7 +1789,13 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         "через инструмент get_webapp_template — фирменный стиль Albery (светлый фон, белые карточки, фиолетовый #5440F6, шрифт Inter) — и собирай интерфейс на его CSS-классах "
         "(.card/.btn-primary/.input/.field/table/.badge/.stat); приложения должны выглядеть единообразно и красиво, как наш прод-сайт, а не случайно."
     )
-    if tier == "admin":
+    if agent is not None:
+        role = (agent.get("role_prompt") or "").strip() or "специализированный помощник компании"
+        head = ("[Канал: Битрикс24. Ты — специализированный агент «" + str(agent.get("name") or "Агент")
+                + "». ТВОЯ РОЛЬ: " + role + " Работай СТРОГО в рамках своей роли: по вопросам вне её "
+                "вежливо скажи, что этим занимается Основной агент Албери, и не пытайся выполнить сам. "
+                "Отвечай по-русски." + access_rule + fmt + "]")
+    elif tier == "admin":
         head = ("[Канал: Битрикс24. Уровень доступа пользователя: ПОЛНЫЙ — доступны все инструменты, "
                 "включая изменение настроек/инструкций. Любое изменение данных сначала подтверждай. "
                 "Отвечай по-русски." + access_rule + fmt + "]")
@@ -1802,6 +1814,21 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                 "ставить/закрывать задачи, отправлять сообщения, что-либо менять в системах. "
                 "Отвечай по-русски." + access_rule + fmt + "]")
     parts = [head]
+    if agent is not None:
+        learned = agent.get("instructions") or []
+        if learned:
+            parts.append(
+                "ТВОИ ЛИЧНЫЕ ИНСТРУКЦИИ И НАВЫКИ (накоплены обучением, применяй обязательно):\n"
+                + "\n\n".join(f"— {i['name']}:\n{i['content']}" for i in learned)
+            )
+        parts.append(
+            "САМООБУЧЕНИЕ (важно): если в диалоге выяснилось УСТОЙЧИВОЕ правило работы, формат, "
+            "специфика команды или полезный приём, который пригодится в будущих диалогах, — сохрани "
+            "его себе через upsert_my_instruction (коротко и по делу). Устаревшую свою инструкцию "
+            "обнови тем же инструментом или удали через delete_my_instruction. НЕ сохраняй разовые "
+            "факты, персональные данные и содержимое конкретных диалогов. Это ТВОИ личные навыки — "
+            "глобальные правила и других агентов ты изменить не можешь."
+        )
     parts.append(
         "Текущие дата и время: " + msk_now().strftime("%d.%m.%Y %H:%M")
         + " МСК (Europe/Moscow) — это «сегодня/сейчас» для любых расчётов сроков и дат."
@@ -1905,7 +1932,8 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
 
 
 def _b24_log_interaction(dialog_id: str, from_user_id: Any, tier: str, question: str, answer: str,
-                         latency_ms: int, status: str, error: str | None) -> None:
+                         latency_ms: int, status: str, error: str | None,
+                         agent_slug: str | None = None) -> None:
     """Best-effort analytics row (never breaks the reply path)."""
     try:
         session = "bitrix-" + re.sub(r"[^A-Za-z0-9_-]", "", str(dialog_id))[:40]
@@ -1915,11 +1943,11 @@ def _b24_log_interaction(dialog_id: str, from_user_id: Any, tier: str, question:
                     cur.execute(
                         """
                         INSERT INTO bitrix_bot_interactions
-                          (dialog_id, bitrix_user_id, tier, session_name, question, answer, latency_ms, status, error)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                          (dialog_id, bitrix_user_id, tier, session_name, question, answer, latency_ms, status, error, agent_slug)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (str(dialog_id), to_int(from_user_id), tier, session,
-                         question, answer, latency_ms, status, error),
+                         question, answer, latency_ms, status, error, agent_slug),
                     )
     except Exception:  # noqa: BLE001
         logging.exception("b24 testbot: interaction log failed")
@@ -2087,9 +2115,10 @@ def _b24_status_finish(client_endpoint: str, access_token: str, bot_id: Any, mes
 
 
 def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
-                     user_text: str, message_id: Any = "", from_user_id: Any = "") -> None:
+                     user_text: str, message_id: Any = "", from_user_id: Any = "",
+                     agent: dict[str, Any] | None = None) -> None:
     started = time.monotonic()
-    tier = _b24_tier_for(from_user_id)
+    tier = str(agent["tier"]) if agent is not None else _b24_tier_for(from_user_id)
     status, error = "ok", None
     # Live progress: one status message edited in place while the brain works, plus the native
     # 'typing…' indicator (it fades after ~30s on its own and the bot would look frozen).
@@ -2129,7 +2158,7 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
 
     threading.Thread(target=_typing_keepalive, daemon=True).start()
     try:
-        answer = hermes_brain_answer(user_text, dialog_id, tier, from_user_id)
+        answer = hermes_brain_answer(user_text, dialog_id, tier, from_user_id, agent=agent)
     except Exception as exc:  # noqa: BLE001
         logging.exception("b24 testbot: hermes brain failed")
         status, error = "error", str(exc)[:500]
@@ -2168,7 +2197,8 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
     _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
     _b24_session_touch(dialog_id)
     _b24_ensure_command_registered(client_endpoint, access_token, bot_id)
-    _b24_log_interaction(dialog_id, from_user_id, tier, user_text, answer, latency_ms, status, error)
+    _b24_log_interaction(dialog_id, from_user_id, tier, user_text, answer, latency_ms, status, error,
+                         agent_slug=(agent or {}).get("slug"))
 
 
 def _b24_do_reset(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
@@ -2365,20 +2395,51 @@ def _bitrix_imbot_app_event():
     endpoint = client_endpoint or state.get("client_endpoint", "")
     dialog_id = str(_imbot_event_param(payload, "DIALOG_ID") or "")
 
+    # Subagent routing: every bot registered by this application posts to this same
+    # handler; the event's BOT_ID tells us WHICH bot was addressed. Unknown ids fall
+    # back to the main agent so a stale cache can never silence the bot entirely.
+    agent = None
+    event_bot_id = str(_imbot_scan(payload, "BOT_ID") or "").strip()
+    if event_bot_id and str(bot_id or "") != event_bot_id:
+        try:
+            from agent_center import agent_for_bot_id
+            agent = agent_for_bot_id(event_bot_id)
+        except Exception:  # noqa: BLE001
+            logging.exception("b24 testbot: subagent resolve failed for bot %s", event_bot_id)
+    if agent is not None:
+        bot_id = event_bot_id  # reply as the addressed bot, not the main one
+
+    def _agent_allows(user_id: Any) -> bool:
+        """Subagent access: its explicit member list; empty list = agent open to everyone
+        who is not globally denied ('none' tier)."""
+        if agent is None:
+            return True
+        members = agent.get("members") or set()
+        uid = to_int(user_id)
+        if members:
+            return uid in members
+        return _b24_tier_for(user_id) != "none"
+
     # Self-heal: ensure the /new command is registered (background, one-time, no-op after).
     if access_token and bot_id and endpoint and event_name in ("ONIMBOTMESSAGEADD", "ONIMCOMMANDADD"):
         _b24_ensure_command_registered(endpoint, access_token, bot_id)
 
     if event_name == "ONIMBOTJOINCHAT":
         if dialog_id:
-            _b24_app_reply(
-                endpoint, access_token, bot_id, dialog_id,
-                "👋 Я — ИИ-агент Албери, и я могу сильно упростить вашу работу: подскажу по компании "
-                "и регламентам, разберу Zoom-созвоны, помогу с задачами и отчётами.\n\n"
-                "Чтобы пользоваться мной эффективно, пройдите короткое обучение (1 минута) — или "
-                "сразу задайте свой вопрос. Поехали! 🚀",
-                keyboard=_b24_welcome_keyboard(),
-            )
+            if agent is not None:
+                welcome = (f"👋 Я — {agent['name']}, специализированный ИИ-агент Албери.\n\n"
+                           f"{(agent.get('role_prompt') or '').strip()[:300]}\n\n"
+                           "Просто напишите свой вопрос — поехали! 🚀").replace("\n\n\n\n", "\n\n")
+                _b24_app_reply(endpoint, access_token, bot_id, dialog_id, welcome)
+            else:
+                _b24_app_reply(
+                    endpoint, access_token, bot_id, dialog_id,
+                    "👋 Я — ИИ-агент Албери, и я могу сильно упростить вашу работу: подскажу по компании "
+                    "и регламентам, разберу Zoom-созвоны, помогу с задачами и отчётами.\n\n"
+                    "Чтобы пользоваться мной эффективно, пройдите короткое обучение (1 минута) — или "
+                    "сразу задайте свой вопрос. Поехали! 🚀",
+                    keyboard=_b24_welcome_keyboard(),
+                )
             _b24_ensure_command_registered(endpoint, access_token, bot_id)
         return jsonify({"ok": True, "event": event_name})
 
@@ -2396,7 +2457,10 @@ def _bitrix_imbot_app_event():
         message_id = _imbot_scan(payload, "MESSAGE_ID")
         command_id = _imbot_scan(payload, "COMMAND_ID")
         cmd_user = _imbot_scan(payload, "USER_ID")
-        if cmd_dialog and cmd_user and _b24_tier_for(cmd_user) == "none":
+        cmd_denied = (
+            (_b24_tier_for(cmd_user) == "none") if agent is None else not _agent_allows(cmd_user)
+        )
+        if cmd_dialog and cmd_user and cmd_denied:
             try:
                 _b24_app_call(endpoint, access_token, "imbot.message.add", {
                     "BOT_ID": bot_id, "DIALOG_ID": cmd_dialog,
@@ -2446,13 +2510,18 @@ def _bitrix_imbot_app_event():
             logging.exception("b24 testbot: image/reply/doc extras failed")
         if not dialog_id or (not message_text and not image_texts and not reply_text and not doc_blocks):
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
-        # Access gate: users explicitly set to 'none' get a plain system notice (no model,
-        # no disclaimer, no buttons) instead of silence, so they know to request access.
-        if _b24_tier_for(from_user_id) == "none":
+        # Access gate: users explicitly set to 'none' (main agent) or outside a subagent's
+        # member list get a plain system notice (no model, no disclaimer, no buttons)
+        # instead of silence, so they know to request access.
+        denied = (_b24_tier_for(from_user_id) == "none") if agent is None else not _agent_allows(from_user_id)
+        if agent is not None and not agent.get("is_active", True):
+            denied = True
+        if denied:
             try:
                 _b24_app_call(endpoint, access_token, "imbot.message.add", {
                     "BOT_ID": bot_id, "DIALOG_ID": dialog_id,
-                    "MESSAGE": "😔 К сожалению, у вас нет доступа к агенту.\n\n"
+                    "MESSAGE": ("😔 Этот агент сейчас выключен." if agent is not None and not agent.get("is_active", True)
+                                else "😔 К сожалению, у вас нет доступа к агенту.") + "\n\n"
                                "Пожалуйста, обратитесь к вашему руководителю или к Александру Никитенко 🙌",
                 })
             except Exception:  # noqa: BLE001
@@ -2480,6 +2549,7 @@ def _bitrix_imbot_app_event():
             target=_b24_app_process,
             args=(endpoint, access_token, bot_id, dialog_id,
                   _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks), message_id, from_user_id),
+            kwargs={"agent": agent},
             daemon=True,
         ).start()
         return jsonify({"ok": True, "event": event_name, "accepted": True})
