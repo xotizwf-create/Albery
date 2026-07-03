@@ -57,6 +57,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "038_agent_config.sql",
     # Idempotent: add the 'developer' access level (drop/recreate tier CHECK).
     "039_agent_developer_level.sql",
+    # Idempotent: agent job title (position) synced with Bitrix WORK_POSITION.
+    "040_agent_position.sql",
 ]
 
 

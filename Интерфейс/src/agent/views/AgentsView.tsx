@@ -74,6 +74,7 @@ const CreateAgentModal: React.FC<{
   onCreated: (slug: string, warnings: string[]) => void;
 }> = ({ onClose, onCreated }) => {
   const [name, setName] = useState("");
+  const [position, setPosition] = useState("");
   const [rolePrompt, setRolePrompt] = useState("");
   const [members, setMembers] = useState<BitrixUser[]>([]);
   const [users, setUsers] = useState<BitrixUser[]>([]);
@@ -101,7 +102,7 @@ const CreateAgentModal: React.FC<{
     }
     setBusy(true);
     setError("");
-    createAgent({ name: name.trim(), tier: "ops", role_prompt: rolePrompt.trim(), members: members.map((m) => m.id) })
+    createAgent({ name: name.trim(), tier: "ops", position: position.trim(), role_prompt: rolePrompt.trim(), members: members.map((m) => m.id) })
       .then((res) => onCreated(res.slug, res.warnings || []))
       .catch((e: Error) => setError(e.message))
       .finally(() => setBusy(false));
@@ -119,17 +120,29 @@ const CreateAgentModal: React.FC<{
         </div>
 
         <div className="space-y-5">
-          <div>
-            <label className="block text-sm font-bold text-gray-900 mb-2">Имя агента</label>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Например: Агент склада"
-              className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all font-bold shadow-sm"
-            />
-            <p className="text-[11.5px] font-medium text-gray-400 mt-1.5">
-              Bitrix-бот с этим именем зарегистрируется автоматически и появится в мессенджере портала.
+          <div className="flex gap-4 flex-wrap">
+            <div className="flex-1 min-w-[200px]">
+              <label className="block text-sm font-bold text-gray-900 mb-2">Имя агента</label>
+              <input
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="Например: Агент склада"
+                className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all font-bold shadow-sm"
+              />
+            </div>
+            <div className="flex-1 min-w-[200px]">
+              <label className="block text-sm font-bold text-gray-900 mb-2">Должность <span className="text-gray-400 font-medium">(в Bitrix)</span></label>
+              <input
+                type="text"
+                value={position}
+                onChange={(e) => setPosition(e.target.value)}
+                placeholder="ИИ-агент Albery"
+                className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all font-bold shadow-sm"
+              />
+            </div>
+            <p className="w-full text-[11.5px] font-medium text-gray-400 -mt-1">
+              Bitrix-бот с этим именем и должностью зарегистрируется автоматически и появится в мессенджере портала.
             </p>
           </div>
 
@@ -483,6 +496,7 @@ const AgentEditor: React.FC<{
 }> = ({ slug, onChanged, onDeleted }) => {
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [name, setName] = useState("");
+  const [position, setPosition] = useState("");
   const [rolePrompt, setRolePrompt] = useState("");
   const [users, setUsers] = useState<BitrixUser[]>([]);
   const [userQuery, setUserQuery] = useState("");
@@ -499,6 +513,7 @@ const AgentEditor: React.FC<{
       .then((d) => {
         setDetail(d);
         setName(d.name);
+        setPosition(d.position || "");
         setRolePrompt(d.role_prompt);
       })
       .catch((e: Error) => setError(e.message));
@@ -600,7 +615,7 @@ const AgentEditor: React.FC<{
           <button
             onClick={() =>
               run(async () => {
-                await updateAgent(slug, { name: name.trim(), role_prompt: rolePrompt.trim() });
+                await updateAgent(slug, { name: name.trim(), position: position.trim(), role_prompt: rolePrompt.trim() });
                 setSaved(true);
               }, true)
             }
@@ -614,14 +629,30 @@ const AgentEditor: React.FC<{
 
       <div className="p-6 md:p-8 flex flex-col xl:flex-row gap-8">
         <div className="flex-1 space-y-8 min-w-0">
-          <div>
-            <label className="block text-sm font-bold text-gray-900 mb-2">Имя агента</label>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all font-bold shadow-sm"
-            />
+          <div className="flex gap-4 flex-wrap">
+            <div className="flex-1 min-w-[200px]">
+              <label className="block text-sm font-bold text-gray-900 mb-2">
+                Имя агента <span className="text-gray-400 font-medium">(как в Bitrix)</span>
+              </label>
+              <input
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all font-bold shadow-sm"
+              />
+            </div>
+            <div className="flex-1 min-w-[200px]">
+              <label className="block text-sm font-bold text-gray-900 mb-2">
+                Должность <span className="text-gray-400 font-medium">(синхр. с Bitrix)</span>
+              </label>
+              <input
+                type="text"
+                value={position}
+                onChange={(e) => setPosition(e.target.value)}
+                placeholder="ИИ-агент Albery"
+                className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all font-bold shadow-sm"
+              />
+            </div>
           </div>
 
           <div>

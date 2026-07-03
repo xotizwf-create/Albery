@@ -6390,6 +6390,194 @@ CORE_TOOL_NAMES: set[str] = {
     "manage_apps_script",
 }
 
+
+# --- Agent-system management tools (owner-only): let a top-access agent run the agent center ---
+# These wrap the same /api/agent-center/* logic the UI uses (via a nested request context, so
+# validation/enforcement is identical) and let a trusted agent create/edit/delete agents, toggle
+# their tools and manage teams from chat. They are OWNER_ONLY (admin class) and only reach an
+# agent whose owner explicitly enabled them — keep such an agent's team to trusted people.
+
+def _mgmt_endpoint(method: str, path: str, view, *view_args, json_body=None) -> dict[str, Any]:
+    from app import app
+    with app.test_request_context(path, method=method, json=(json_body or {})):
+        resp = view(*view_args)
+    if isinstance(resp, tuple):
+        data, status = resp[0].get_json(), resp[1]
+    else:
+        data, status = resp.get_json(), 200
+    if status >= 400 or (isinstance(data, dict) and data.get("error")):
+        raise McpError(-32000, (data or {}).get("error") if isinstance(data, dict) else f"HTTP {status}")
+    return data or {}
+
+
+def _mgmt_resolve(items) -> tuple[list[int], list[str]]:
+    import agent_center
+    ids, unresolved = [], []
+    for it in (items or []):
+        uid, _ = agent_center.resolve_bitrix_user(it)
+        (ids.append(uid) if uid is not None else unresolved.append(str(it)))
+    return ids, unresolved
+
+
+def tool_list_agents(args: dict[str, Any]) -> dict[str, Any]:
+    import agent_center
+    return agent_center.mgmt_list_agents()
+
+
+def tool_create_agent(args: dict[str, Any]) -> dict[str, Any]:
+    import agent_center
+    name = str(args.get("name") or "").strip()
+    if not name:
+        raise McpError(-32602, "Укажите name нового агента.")
+    member_ids, unresolved = _mgmt_resolve(args.get("members"))
+    body = {"name": name, "tier": "ops", "role_prompt": str(args.get("role_prompt") or ""),
+            "position": str(args.get("position") or ""), "members": member_ids}
+    data = _mgmt_endpoint("POST", "/api/agent-center/agents", agent_center.agent_center_create_agent, json_body=body)
+    if unresolved:
+        data["unresolved_members"] = unresolved
+    return data
+
+
+def tool_update_agent(args: dict[str, Any]) -> dict[str, Any]:
+    import agent_center
+    slug = str(args.get("slug") or "").strip()
+    if not slug:
+        raise McpError(-32602, "Укажите slug агента (см. list_agents).")
+    body = {k: args[k] for k in ("name", "position", "role_prompt", "is_active") if k in args}
+    if not body:
+        raise McpError(-32602, "Нечего менять: передайте name/position/role_prompt/is_active.")
+    return _mgmt_endpoint("PATCH", f"/api/agent-center/agents/{slug}", agent_center.agent_center_agent_update, slug, json_body=body)
+
+
+def tool_delete_agent(args: dict[str, Any]) -> dict[str, Any]:
+    import agent_center
+    slug = str(args.get("slug") or "").strip()
+    if not slug:
+        raise McpError(-32602, "Укажите slug агента.")
+    return _mgmt_endpoint("DELETE", f"/api/agent-center/agents/{slug}", agent_center.agent_center_agent_delete, slug)
+
+
+def tool_set_agent_tools(args: dict[str, Any]) -> dict[str, Any]:
+    import agent_center
+    slug = str(args.get("slug") or "").strip()
+    if not slug:
+        raise McpError(-32602, "Укажите slug агента.")
+    cfg = _mgmt_endpoint("GET", f"/api/agent-center/agents/{slug}/config", agent_center.agent_center_agent_config, slug)
+    valid = {t["name"] for t in cfg["tools"]}
+    enabled = {t["name"] for t in cfg["tools"] if t["enabled"]}
+    enable = {str(t) for t in (args.get("enable") or [])}
+    bad = enable - valid
+    if bad:
+        raise McpError(-32602, f"Неизвестные инструменты: {', '.join(sorted(bad))}. Точные имена — в list_agents/config.")
+    new_enabled = (enabled | (enable & valid)) - {str(t) for t in (args.get("disable") or [])}
+    body = {"tools": sorted(new_enabled),
+            "instructions": [i["id"] for i in cfg["instructions"] if i["selected"]],
+            "skills": [s["id"] for s in cfg["skills"] if s["selected"]]}
+    return _mgmt_endpoint("PUT", f"/api/agent-center/agents/{slug}/config", agent_center.agent_center_agent_config_save, slug, json_body=body)
+
+
+def tool_set_agent_team(args: dict[str, Any]) -> dict[str, Any]:
+    import agent_center
+    slug = str(args.get("slug") or "").strip()
+    if not slug:
+        raise McpError(-32602, "Укажите slug агента ('main' для универсального).")
+    detail = _mgmt_endpoint("GET", f"/api/agent-center/agents/{slug}", agent_center.agent_center_agent_detail, slug)
+    current = {int(m["id"]) for m in detail.get("members", [])}
+    add_ids, un1 = _mgmt_resolve(args.get("add"))
+    rem_ids, un2 = _mgmt_resolve(args.get("remove"))
+    new_members = sorted((current | set(add_ids)) - set(rem_ids))
+    data = _mgmt_endpoint("PATCH", f"/api/agent-center/agents/{slug}", agent_center.agent_center_agent_update, slug,
+                          json_body={"members": new_members})
+    data["team_size"] = len(new_members)
+    if un1 or un2:
+        data["unresolved"] = un1 + un2
+    return data
+
+
+AGENT_MGMT_TOOL_SPECS: dict[str, dict[str, Any]] = {
+    "list_agents": {
+        "description": "Список всех агентов системы (универсальный + субагенты) с их настройками: имя, должность, вкл/выкл, сколько инструментов включено, команда. Начинай управление отсюда — здесь точные slug'и.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "handler": tool_list_agents,
+    },
+    "create_agent": {
+        "description": "Создать нового субагента (Bitrix-бот зарегистрируется автоматически). Стартует с широкого набора «все функции» — дальше настрой инструменты через set_agent_tools.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Имя агента (как в Bitrix)."},
+                "position": {"type": "string", "description": "Должность (WORK_POSITION в Bitrix)."},
+                "role_prompt": {"type": "string", "description": "Роль/системный промпт агента."},
+                "members": {"type": "array", "items": {"type": "string"}, "description": "Кому доступен: имена или id сотрудников (пусто = всем с доступом)."},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+        "handler": tool_create_agent,
+    },
+    "update_agent": {
+        "description": "Изменить агента: имя/должность (синхронизируются с Bitrix), роль-промпт, вкл/выкл. slug бери из list_agents ('main' — универсальный).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string"},
+                "name": {"type": "string"},
+                "position": {"type": "string"},
+                "role_prompt": {"type": "string"},
+                "is_active": {"type": "boolean"},
+            },
+            "required": ["slug"],
+            "additionalProperties": False,
+        },
+        "handler": tool_update_agent,
+    },
+    "delete_agent": {
+        "description": "Удалить субагента (разрегистрирует Bitrix-бота, чистит коннектор и данные). Универсального ('main') удалить нельзя.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"slug": {"type": "string"}},
+            "required": ["slug"],
+            "additionalProperties": False,
+        },
+        "handler": tool_delete_agent,
+    },
+    "set_agent_tools": {
+        "description": "Включить/выключить MCP-инструменты у агента. enable/disable — точные имена инструментов (см. list_agents → возможности). Базовые инструменты остаются всегда.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string"},
+                "enable": {"type": "array", "items": {"type": "string"}},
+                "disable": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["slug"],
+            "additionalProperties": False,
+        },
+        "handler": tool_set_agent_tools,
+    },
+    "set_agent_team": {
+        "description": "Добавить/убрать людей из команды агента (кому он доступен). add/remove — имена или id. Для универсального (slug='main') это выдаёт/снимает доступ к основному боту.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string"},
+                "add": {"type": "array", "items": {"type": "string"}},
+                "remove": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["slug"],
+            "additionalProperties": False,
+        },
+        "handler": tool_set_agent_team,
+    },
+}
+
+TOOLS.update(AGENT_MGMT_TOOL_SPECS)
+# Owner-only/admin class: they manage the agent system itself. Kept out of the ops/faq
+# connectors (OPS_TOOL_NAMES was already materialised above without them) and shown with the
+# 'admin' chip + confirm in the UI; only reach an agent whose owner explicitly enabled them.
+OWNER_ONLY_TOOL_NAMES.update(AGENT_MGMT_TOOL_SPECS.keys())
+
+
 META_TOOL_SPECS: dict[str, dict[str, Any]] = {
     "find_tool": {
         "description": (

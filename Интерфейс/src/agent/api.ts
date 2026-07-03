@@ -121,6 +121,7 @@ export const LEVEL_LABELS: Record<AgentLevel, string> = {
 export interface AgentDetail {
   slug: string;
   name: string;
+  position: string;
   role_prompt: string;
   tier: AgentLevel;
   is_main?: boolean;
@@ -133,6 +134,7 @@ export interface AgentDetail {
 export async function createAgent(body: {
   name: string;
   tier: AgentLevel;
+  position?: string;
   role_prompt: string;
   members: number[];
 }): Promise<{ slug: string; bitrix_bot_id: number | null; warnings: string[] }> {
@@ -149,7 +151,7 @@ export async function fetchAgentDetail(slug: string): Promise<AgentDetail> {
 
 export async function updateAgent(
   slug: string,
-  body: Partial<{ name: string; role_prompt: string; tier: string; is_active: boolean; members: number[] }>,
+  body: Partial<{ name: string; position: string; role_prompt: string; tier: string; is_active: boolean; members: number[] }>,
 ): Promise<void> {
   await fetchJsonSafe(
     `/api/agent-center/agents/${slug}`,

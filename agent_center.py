@@ -748,7 +748,7 @@ def _load_agents_full() -> list[dict[str, Any]]:
     with pg_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id::text AS id, slug, name, role_prompt, tier, tools, tools_customized,"
+                "SELECT id::text AS id, slug, name, role_prompt, position, tier, tools, tools_customized,"
                 " bitrix_bot_id, mcp_token, is_active, color, created_at FROM agents ORDER BY created_at"
             )
             agents = [dict(r) for r in cur.fetchall()]
@@ -871,7 +871,7 @@ def universal_main_connector() -> str | None:
 
 # --- Bitrix bot auto-registration (same local application, new CODE per agent) --------------
 
-def _register_agent_bot(slug: str, name: str, color: str) -> Any:
+def _register_agent_bot(slug: str, name: str, color: str, position: str = "") -> Any:
     from b24bot import B24_APP_HANDLER_URL, _b24_app_access_token, _b24_app_call
     endpoint, access = _b24_app_access_token()
     if not endpoint or not access:
@@ -883,7 +883,7 @@ def _register_agent_bot(slug: str, name: str, color: str) -> Any:
         "EVENT_MESSAGE_ADD": B24_APP_HANDLER_URL,
         "EVENT_WELCOME_MESSAGE": B24_APP_HANDLER_URL,
         "EVENT_BOT_DELETE": B24_APP_HANDLER_URL,
-        "PROPERTIES": {"NAME": name, "COLOR": color, "WORK_POSITION": "ИИ-агент Albery"},
+        "PROPERTIES": {"NAME": name, "COLOR": color, "WORK_POSITION": position or "ИИ-агент Albery"},
     }
     result = _b24_app_call(endpoint, access, "imbot.register", payload).get("result")
     if not result:
@@ -902,14 +902,25 @@ def _unregister_agent_bot(bot_id: Any) -> None:
         logging.exception("agent_center: imbot.unregister failed for bot %s", bot_id)
 
 
-def _rename_bitrix_bot(bot_id: Any, name: str) -> None:
-    """Push a UI rename to the Bitrix bot so the messenger shows the same name."""
+def _sync_bitrix_bot(bot_id: Any, name: str | None = None, position: str | None = None) -> None:
+    """Push name and/or job title (должность) to the Bitrix bot so the messenger shows exactly
+    what's set in the app — one source of truth. Only the provided fields are sent."""
+    props: dict[str, Any] = {}
+    if name is not None:
+        props["NAME"] = name
+    if position is not None:
+        props["WORK_POSITION"] = position
+    if not props:
+        return
     from b24bot import _b24_app_access_token, _b24_app_call
     endpoint, access = _b24_app_access_token()
     if not (endpoint and access):
         raise RuntimeError("Нет OAuth-токенов приложения Bitrix — напишите боту любое сообщение и повторите.")
-    _b24_app_call(endpoint, access, "imbot.update",
-                  {"BOT_ID": bot_id, "FIELDS": {"PROPERTIES": {"NAME": name}}})
+    _b24_app_call(endpoint, access, "imbot.update", {"BOT_ID": bot_id, "FIELDS": {"PROPERTIES": props}})
+
+
+def _rename_bitrix_bot(bot_id: Any, name: str) -> None:
+    _sync_bitrix_bot(bot_id, name=name)
 
 
 def _main_bot_name() -> str | None:
@@ -1000,6 +1011,7 @@ def agent_center_create_agent():
     if tier not in AGENT_LEVELS:
         tier = "ops"
     role_prompt = str(body.get("role_prompt") or "").strip()[:4000]
+    position = str(body.get("position") or "").strip()[:100] or "ИИ-агент Albery"
     members = [int(m) for m in (body.get("members") or []) if str(m).strip().isdigit()]
     slug = _agent_slug(name)
     token = secrets.token_urlsafe(32)
@@ -1012,9 +1024,9 @@ def agent_center_create_agent():
                 cur.execute("SELECT COUNT(*) AS n FROM agents")
                 color = _AGENT_COLORS[int(cur.fetchone()["n"]) % len(_AGENT_COLORS)]
                 cur.execute(
-                    "INSERT INTO agents (slug, name, role_prompt, tier, mcp_token, color)"
-                    " VALUES (%s, %s, %s, %s, %s, %s) RETURNING id::text AS id",
-                    (slug, name, role_prompt, tier, token, color),
+                    "INSERT INTO agents (slug, name, role_prompt, position, tier, mcp_token, color)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id::text AS id",
+                    (slug, name, role_prompt, position, tier, token, color),
                 )
                 agent_id = cur.fetchone()["id"]
                 for uid in members:
@@ -1029,7 +1041,7 @@ def agent_center_create_agent():
     warnings = []
     bot_id = None
     try:
-        bot_id = _register_agent_bot(slug, name, color)
+        bot_id = _register_agent_bot(slug, name, color, position)
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("UPDATE agents SET bitrix_bot_id = %s, updated_at = now() WHERE id = %s", (bot_id, agent_id))
@@ -1058,6 +1070,50 @@ def _main_access_member_ids() -> list[int]:
     return out
 
 
+# --- Management surface for a top-access agent (wrapped by MCP tools; see context_server) ----
+
+def resolve_bitrix_user(name_or_id: Any) -> tuple[int | None, str]:
+    """Resolve a Bitrix user name (or numeric id) to (id, display_name). Name match is a
+    case-insensitive substring against the portal directory; ambiguous/none → (None, input)."""
+    s = str(name_or_id or "").strip()
+    if not s:
+        return None, s
+    names = _user_names()
+    if s.isdigit():
+        uid = int(s)
+        return uid, names.get(uid, {}).get("name") or f"#{uid}"
+    matches = [(uid, info.get("name") or "") for uid, info in names.items()
+               if s.lower() in (info.get("name") or "").lower()]
+    if len(matches) == 1:
+        return matches[0][0], matches[0][1]
+    # Prefer an exact (case-insensitive) full-name hit if the substring was ambiguous.
+    exact = [m for m in matches if (m[1] or "").lower() == s.lower()]
+    if len(exact) == 1:
+        return exact[0]
+    return None, s
+
+
+def mgmt_list_agents() -> dict[str, Any]:
+    """Every agent (universal + subagents) with its live config summary — for a managing agent."""
+    names = _user_names()
+    out = []
+    for a in _load_agents_full():
+        is_main = a["slug"] == MAIN_AGENT_SLUG
+        member_ids = _main_access_member_ids() if is_main else sorted(a["members"])
+        out.append({
+            "slug": a["slug"],
+            "name": a["name"],
+            "position": a.get("position") or "",
+            "kind": "универсальный" if is_main else "субагент",
+            "is_active": bool(a["is_active"]),
+            "tools_enabled": len(_agent_tool_names(a)),
+            "instructions_linked": len(a.get("linked_instruction_ids") or set()),
+            "skills_linked": len(a.get("linked_skill_ids") or set()),
+            "team": [names.get(uid, {}).get("name") or f"#{uid}" for uid in member_ids],
+        })
+    return {"agents": out, "count": len(out)}
+
+
 @app.get("/api/agent-center/agents/<slug>")
 def agent_center_agent_detail(slug: str):
     if slug == MAIN_AGENT_SLUG:
@@ -1071,6 +1127,7 @@ def agent_center_agent_detail(slug: str):
     return jsonify({
         "slug": agent["slug"],
         "name": agent["name"],
+        "position": agent.get("position") or "",
         "role_prompt": agent["role_prompt"],
         "tier": agent["tier"],
         "is_main": slug == MAIN_AGENT_SLUG,
@@ -1100,18 +1157,23 @@ def agent_center_agent_update(slug: str):
         try:
             with pg_connect() as conn:
                 with conn.cursor() as cur:
-                    if "name" in body and str(body["name"]).strip():
-                        new_name = str(body["name"]).strip()[:60]
+                    new_name = str(body.get("name") or "").strip()[:60] if "name" in body else None
+                    new_pos = str(body.get("position") or "").strip()[:100] if "position" in body else None
+                    if new_name:
                         cur.execute("UPDATE agents SET name = %s, updated_at = now() WHERE slug = %s",
                                     (new_name, MAIN_AGENT_SLUG))
+                    if new_pos is not None:
+                        cur.execute("UPDATE agents SET position = %s, updated_at = now() WHERE slug = %s",
+                                    (new_pos, MAIN_AGENT_SLUG))
+                    if new_name or new_pos is not None:
                         try:
                             from b24bot import _b24_load_state
                             main_bot_id = (_b24_load_state() or {}).get("bot_id")
                             if main_bot_id:
-                                _rename_bitrix_bot(main_bot_id, new_name)
+                                _sync_bitrix_bot(main_bot_id, name=new_name, position=new_pos)
                         except Exception as exc:  # noqa: BLE001
-                            logging.exception("main agent bitrix rename failed")
-                            warnings.append(f"Имя в Bitrix не обновилось: {str(exc)[:160]}")
+                            logging.exception("main agent bitrix sync failed")
+                            warnings.append(f"Имя/должность в Bitrix не обновились: {str(exc)[:160]}")
                     if "role_prompt" in body:
                         cur.execute("UPDATE agents SET role_prompt = %s, updated_at = now() WHERE slug = %s",
                                     (str(body["role_prompt"] or "").strip()[:4000], MAIN_AGENT_SLUG))
@@ -1145,16 +1207,23 @@ def agent_center_agent_update(slug: str):
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
-                if "name" in body and str(body["name"]).strip():
-                    new_name = str(body["name"]).strip()[:60]
+                new_name = str(body.get("name") or "").strip()[:60] if ("name" in body and str(body.get("name")).strip()) else None
+                new_pos = str(body.get("position") or "").strip()[:100] if "position" in body else None
+                if new_name:
                     cur.execute("UPDATE agents SET name = %s, updated_at = now() WHERE slug = %s",
                                 (new_name, slug))
-                    if agent.get("bitrix_bot_id") and new_name != agent["name"]:
-                        try:
-                            _rename_bitrix_bot(agent["bitrix_bot_id"], new_name)
-                        except Exception as exc:  # noqa: BLE001
-                            logging.exception("agent rename in bitrix failed")
-                            warnings.append(f"Имя в Bitrix не обновилось: {str(exc)[:160]}")
+                if new_pos is not None:
+                    cur.execute("UPDATE agents SET position = %s, updated_at = now() WHERE slug = %s",
+                                (new_pos, slug))
+                # Push name/должность to the Bitrix bot so app and messenger match exactly.
+                sync_name = new_name if (new_name and new_name != agent["name"]) else None
+                sync_pos = new_pos if (new_pos is not None and new_pos != (agent.get("position") or "")) else None
+                if agent.get("bitrix_bot_id") and (sync_name or sync_pos):
+                    try:
+                        _sync_bitrix_bot(agent["bitrix_bot_id"], name=sync_name, position=sync_pos)
+                    except Exception as exc:  # noqa: BLE001
+                        logging.exception("agent name/position sync in bitrix failed")
+                        warnings.append(f"Имя/должность в Bitrix не обновились: {str(exc)[:160]}")
                 if "role_prompt" in body:
                     cur.execute("UPDATE agents SET role_prompt = %s, updated_at = now() WHERE slug = %s",
                                 (str(body["role_prompt"] or "").strip()[:4000], slug))
@@ -1191,7 +1260,7 @@ def agent_center_agent_register_bot(slug: str):
     bot_id = agent.get("bitrix_bot_id")
     if not bot_id:
         try:
-            bot_id = _register_agent_bot(slug, agent["name"], agent.get("color") or "GREEN")
+            bot_id = _register_agent_bot(slug, agent["name"], agent.get("color") or "GREEN", agent.get("position") or "")
             with pg_connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute("UPDATE agents SET bitrix_bot_id = %s, updated_at = now() WHERE slug = %s",
