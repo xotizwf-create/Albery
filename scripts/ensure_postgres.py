@@ -49,6 +49,9 @@ ALWAYS_APPLY_MIGRATIONS = [
     "030_bitrix_bot_session_reset.sql",
     "033_error_report_context_views.sql",
     "035_agent_access_none_tier.sql",
+    # Fully idempotent (IF NOT EXISTS everywhere) — covers both the subagent
+    # tables and the agent_slug column on bitrix_bot_interactions.
+    "037_agents.sql",
 ]
 
 
