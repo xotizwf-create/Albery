@@ -244,6 +244,7 @@ def agent_center_agents():
     avg_ms = st.get("avg_latency_7d")
     main_agent = {
         **_MAIN_AGENT_META,
+        "name": _main_bot_name() or _MAIN_AGENT_META["name"],
         "is_system": True,
         "is_active": True,
         "channels": ["Bitrix"],
@@ -820,6 +821,36 @@ def _unregister_agent_bot(bot_id: Any) -> None:
         logging.exception("agent_center: imbot.unregister failed for bot %s", bot_id)
 
 
+def _rename_bitrix_bot(bot_id: Any, name: str) -> None:
+    """Push a UI rename to the Bitrix bot so the messenger shows the same name."""
+    from b24bot import _b24_app_access_token, _b24_app_call
+    endpoint, access = _b24_app_access_token()
+    if not (endpoint and access):
+        raise RuntimeError("Нет OAuth-токенов приложения Bitrix — напишите боту любое сообщение и повторите.")
+    _b24_app_call(endpoint, access, "imbot.update",
+                  {"BOT_ID": bot_id, "FIELDS": {"PROPERTIES": {"NAME": name}}})
+
+
+def _main_bot_name() -> str | None:
+    """The main bot's CURRENT display name straight from the portal (10-min cache)."""
+    now = time.monotonic()
+    if now - _AGENT_CACHE.get("main_name_at", 0.0) < 600:
+        return _AGENT_CACHE.get("main_name")
+    name = None
+    try:
+        from b24bot import _b24_load_state, _b24_testbot_call, b24_testbot_client
+        bot_id = (_b24_load_state() or {}).get("bot_id")
+        if bot_id:
+            data = _b24_testbot_call(b24_testbot_client(), "user.get", {"ID": bot_id})
+            users = data.get("result") or []
+            if users and isinstance(users[0], dict):
+                name = " ".join(p for p in (users[0].get("NAME"), users[0].get("LAST_NAME")) if p).strip() or None
+    except Exception:  # noqa: BLE001
+        logging.warning("agent_center: main bot name lookup failed", exc_info=True)
+    _AGENT_CACHE.update(main_name_at=now, main_name=name)
+    return name
+
+
 # --- Hermes connector management (textual config edit, comments preserved) ------------------
 
 def _hermes_connector_add(slug: str, token: str) -> None:
@@ -958,16 +989,40 @@ def agent_center_agent_detail(slug: str):
 
 @app.patch("/api/agent-center/agents/<slug>")
 def agent_center_agent_update(slug: str):
+    body = request.get_json(silent=True) or {}
+    if slug == "main":
+        # The main agent lives in Bitrix only; renaming it = renaming the main bot.
+        name = str(body.get("name") or "").strip()[:60]
+        if not name:
+            return jsonify({"error": "Укажите имя."}), 400
+        try:
+            from b24bot import _b24_load_state
+            main_bot_id = (_b24_load_state() or {}).get("bot_id")
+            if not main_bot_id:
+                return jsonify({"error": "Основной бот не найден в state — напишите ему сообщение и повторите."}), 409
+            _rename_bitrix_bot(main_bot_id, name)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("main agent rename failed")
+            return jsonify({"error": f"Не удалось переименовать бота: {str(exc)[:200]}"}), 502
+        _AGENT_CACHE.update(main_name_at=0.0)
+        return jsonify({"ok": True})
     agent = _agent_by_slug(slug)
     if not agent:
         return jsonify({"error": "Агент не найден."}), 404
-    body = request.get_json(silent=True) or {}
+    warnings = []
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 if "name" in body and str(body["name"]).strip():
+                    new_name = str(body["name"]).strip()[:60]
                     cur.execute("UPDATE agents SET name = %s, updated_at = now() WHERE slug = %s",
-                                (str(body["name"]).strip()[:60], slug))
+                                (new_name, slug))
+                    if agent.get("bitrix_bot_id") and new_name != agent["name"]:
+                        try:
+                            _rename_bitrix_bot(agent["bitrix_bot_id"], new_name)
+                        except Exception as exc:  # noqa: BLE001
+                            logging.exception("agent rename in bitrix failed")
+                            warnings.append(f"Имя в Bitrix не обновилось: {str(exc)[:160]}")
                 if "role_prompt" in body:
                     cur.execute("UPDATE agents SET role_prompt = %s, updated_at = now() WHERE slug = %s",
                                 (str(body["role_prompt"] or "").strip()[:4000], slug))
@@ -990,7 +1045,34 @@ def agent_center_agent_update(slug: str):
         logging.exception("agent update failed")
         return jsonify({"error": "Не удалось сохранить изменения."}), 500
     _agent_cache_bust()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "warnings": warnings})
+
+
+@app.post("/api/agent-center/agents/<slug>/register-bot")
+def agent_center_agent_register_bot(slug: str):
+    """Retry Bitrix bot registration for an agent created while the app tokens were
+    unavailable; also re-ensures the hermes connector (both are idempotent)."""
+    agent = _agent_by_slug(slug)
+    if not agent:
+        return jsonify({"error": "Агент не найден."}), 404
+    warnings = []
+    bot_id = agent.get("bitrix_bot_id")
+    if not bot_id:
+        try:
+            bot_id = _register_agent_bot(slug, agent["name"], agent.get("color") or "GREEN")
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE agents SET bitrix_bot_id = %s, updated_at = now() WHERE slug = %s",
+                                (bot_id, slug))
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("agent register-bot retry failed")
+            return jsonify({"error": f"Регистрация не удалась: {str(exc)[:200]}"}), 502
+    try:
+        _hermes_connector_add(slug, agent["mcp_token"])
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"Hermes-коннектор: {str(exc)[:160]}")
+    _agent_cache_bust()
+    return jsonify({"ok": True, "bitrix_bot_id": bot_id, "warnings": warnings})
 
 
 @app.delete("/api/agent-center/agents/<slug>")

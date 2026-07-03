@@ -153,6 +153,10 @@ export async function deleteAgent(slug: string): Promise<void> {
   await fetchJsonSafe(`/api/agent-center/agents/${slug}`, { method: "DELETE" }, 60000);
 }
 
+export async function registerAgentBot(slug: string): Promise<{ bitrix_bot_id: number | null; warnings: string[] }> {
+  return await fetchJsonSafe(`/api/agent-center/agents/${slug}/register-bot`, { method: "POST" }, 60000);
+}
+
 export async function addAgentInstruction(slug: string, name: string, content: string): Promise<void> {
   await fetchJsonSafe(
     `/api/agent-center/agents/${slug}/instructions`,

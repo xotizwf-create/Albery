@@ -29,6 +29,7 @@ import {
   fetchBitrixUsers,
   fetchKnowledge,
   fetchMcpTools,
+  registerAgentBot,
   updateAgent,
   upsertAccess,
 } from "../api";
@@ -53,13 +54,32 @@ const TOOL_TIER_CHIP: Record<string, string> = {
   admin: "bg-amber-50 border-amber-100 text-amber-600",
 };
 
-const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
+const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void; onRenamed?: () => void }> = ({
   agent,
   onToggleActive,
+  onRenamed,
 }) => {
   const [activeChannels, setActiveChannels] = useState<string[]>(
     agent.channels,
   );
+  const [mainName, setMainName] = useState<string>(agent.name);
+  const [nameBusy, setNameBusy] = useState(false);
+  const [nameSaved, setNameSaved] = useState(false);
+  const [nameError, setNameError] = useState("");
+
+  const saveMainName = () => {
+    if (!mainName.trim() || mainName.trim() === agent.name) return;
+    setNameBusy(true);
+    setNameError("");
+    setNameSaved(false);
+    updateAgent("main", { name: mainName.trim() })
+      .then(() => {
+        setNameSaved(true);
+        onRenamed?.();
+      })
+      .catch((e: Error) => setNameError(e.message))
+      .finally(() => setNameBusy(false));
+  };
   const [tools, setTools] = useState<McpTool[]>([]);
   const [toolsLoading, setToolsLoading] = useState(true);
 
@@ -202,11 +222,12 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <button className="px-5 py-2.5 bg-white text-gray-700 border border-gray-200 rounded-xl text-sm font-bold hover:bg-gray-50 transition-all shadow-sm">
-            В песочницу
-          </button>
-          <button className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-bold hover:bg-indigo-700 shadow-sm shadow-indigo-600/20 transition-all">
-            Сохранить
+          <button
+            onClick={saveMainName}
+            disabled={nameBusy || !mainName.trim() || mainName.trim() === agent.name}
+            className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-bold hover:bg-indigo-700 shadow-sm shadow-indigo-600/20 transition-all disabled:opacity-50"
+          >
+            {nameSaved ? "Сохранено ✓" : "Сохранить"}
           </button>
         </div>
       </div>
@@ -216,13 +237,15 @@ const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void }> = ({
         <div className="flex-1 space-y-8 min-w-0">
           <div>
             <label className="block text-sm font-bold text-gray-900 mb-2">
-              Имя агента
+              Имя агента <span className="text-gray-400 font-medium">(синхронизируется с ботом в Bitrix)</span>
             </label>
             <input
               type="text"
-              defaultValue={agent.name}
+              value={mainName}
+              onChange={(e) => setMainName(e.target.value)}
               className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all font-bold shadow-sm"
             />
+            {nameError && <div className="mt-1.5 text-[12px] font-bold text-rose-500">{nameError}</div>}
           </div>
 
           <div>
@@ -611,12 +634,16 @@ const CreateAgentModal: React.FC<{
   const [rolePrompt, setRolePrompt] = useState("");
   const [members, setMembers] = useState<BitrixUser[]>([]);
   const [users, setUsers] = useState<BitrixUser[]>([]);
+  const [usersError, setUsersError] = useState("");
   const [userQuery, setUserQuery] = useState("");
+  const [showUsers, setShowUsers] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    fetchBitrixUsers().then(setUsers).catch(() => {});
+    fetchBitrixUsers()
+      .then(setUsers)
+      .catch((e: Error) => setUsersError(e.message));
   }, []);
 
   const memberIds = new Set(members.map((m) => m.id));
@@ -664,11 +691,11 @@ const CreateAgentModal: React.FC<{
           </div>
 
           <div>
-            <label className="block text-sm font-bold text-gray-900 mb-2">Уровень инструментов</label>
+            <label className="block text-sm font-bold text-gray-900 mb-2">Уровень доступа агента</label>
             <div className="flex p-1 bg-gray-50/80 border border-gray-200/60 rounded-2xl shadow-sm">
               {([
-                { v: "faq", label: "База знаний", hint: "только чтение — безопасно" },
-                { v: "ops", label: "Все функции", hint: "задачи, документы, действия" },
+                { v: "faq", label: "Доступ к базе знаний", hint: "только чтение и ответы — безопасно" },
+                { v: "ops", label: "Доступ ко всем функциям", hint: "задачи, документы, действия" },
               ] as const).map((t) => (
                 <button
                   key={t.v}
@@ -715,11 +742,17 @@ const CreateAgentModal: React.FC<{
                 type="text"
                 value={userQuery}
                 onChange={(e) => setUserQuery(e.target.value)}
-                placeholder="Поиск сотрудника…"
+                onFocus={() => setShowUsers(true)}
+                placeholder="Нажмите, чтобы выбрать сотрудника…"
                 className="w-full bg-transparent border-none outline-none text-[13px] font-medium text-gray-700 placeholder:text-gray-400 py-1 px-1"
               />
-              {userQuery && (
-                <div className="mt-1 space-y-0.5">
+              {usersError && (
+                <div className="px-2 py-1.5 text-[12px] font-bold text-rose-500">
+                  Список сотрудников недоступен: {usersError}
+                </div>
+              )}
+              {(showUsers || userQuery) && !usersError && (
+                <div className="mt-1 space-y-0.5 max-h-44 overflow-y-auto">
                   {candidates.map((u) => (
                     <button
                       key={u.id}
@@ -734,7 +767,9 @@ const CreateAgentModal: React.FC<{
                     </button>
                   ))}
                   {candidates.length === 0 && (
-                    <div className="px-2 py-1.5 text-[12px] font-medium text-gray-400">Не найдено</div>
+                    <div className="px-2 py-1.5 text-[12px] font-medium text-gray-400">
+                      {users.length === 0 ? "Загружаю сотрудников…" : "Не найдено"}
+                    </div>
                   )}
                 </div>
               )}
@@ -843,16 +878,25 @@ const SubagentEditor: React.FC<{
               >
                 {detail.is_active ? "включён" : "выключен"}
               </button>
-              <span
-                className={cn(
-                  "px-2 py-0.5 border text-[10px] font-bold rounded-md uppercase tracking-wider",
-                  detail.bitrix_bot_id
-                    ? "bg-indigo-50 border-indigo-100 text-indigo-600"
-                    : "bg-rose-50 border-rose-100 text-rose-600",
-                )}
-              >
-                {detail.bitrix_bot_id ? `bitrix-бот #${detail.bitrix_bot_id}` : "бот не зарегистрирован"}
-              </span>
+              {detail.bitrix_bot_id ? (
+                <span className="px-2 py-0.5 border text-[10px] font-bold rounded-md uppercase tracking-wider bg-indigo-50 border-indigo-100 text-indigo-600">
+                  bitrix-бот #{detail.bitrix_bot_id}
+                </span>
+              ) : (
+                <button
+                  onClick={() =>
+                    run(async () => {
+                      const res = await registerAgentBot(slug);
+                      if (res.warnings?.length) setError(res.warnings.join(" · "));
+                    }, true)
+                  }
+                  disabled={busy}
+                  className="px-2 py-0.5 border text-[10px] font-bold rounded-md uppercase tracking-wider bg-amber-50 border-amber-200 text-amber-700 hover:bg-amber-100 transition-colors disabled:opacity-60"
+                  title="Бот не зарегистрирован в Bitrix — нажмите, чтобы повторить регистрацию"
+                >
+                  ⚠ зарегистрировать бота
+                </button>
+              )}
             </div>
             <p className="text-sm text-gray-500 font-medium mt-1">
               субагент · {detail.tier === "ops" ? "все функции" : "база знаний"} · самообучение включено
@@ -1198,9 +1242,10 @@ export function AgentsView() {
         {activeAgent ? (
           activeAgent.isSystem ? (
             <AgentEditor
-              key={activeAgent.id}
+              key={activeAgent.id + activeAgent.name}
               agent={activeAgent}
               onToggleActive={() => setForceUpdate((prev) => prev + 1)}
+              onRenamed={() => void reloadAgents()}
             />
           ) : (
             <SubagentEditor

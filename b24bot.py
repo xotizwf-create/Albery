@@ -2384,11 +2384,32 @@ def _bitrix_imbot_app_event():
             return jsonify({"ok": False, "event": event_name, "error": str(exc)[:300]}), 200
 
     stored = state.get("application_token", "")
+    if not stored and app_token:
+        # Self-heal after an accidental state wipe (the pre-fix ONIMBOTDELETE bug erased the
+        # whole state when a SUBAGENT bot was deleted): every event of this install keeps
+        # carrying the same application_token, so trust it once, persist, and keep serving.
+        logging.warning("b24 testbot: empty stored application_token — self-healing from event")
+        state["application_token"] = stored = app_token
+        if client_endpoint:
+            state["client_endpoint"] = client_endpoint
+        _b24_save_state(state)
     if not stored or not app_token or not hmac.compare_digest(app_token, stored):
         return jsonify({"error": "forbidden"}), 403
 
     if event_name in ("ONAPPUNINSTALL", "ONIMBOTDELETE"):
-        _b24_save_state({})
+        # Wipe the install state ONLY when the whole app is removed or the MAIN bot is
+        # deleted; a deleted SUBAGENT bot must never take the main bot's tokens with it.
+        deleted_bot = str(_imbot_scan(payload, "BOT_ID") or "").strip()
+        main_bot = str(state.get("bot_id") or "")
+        if event_name == "ONAPPUNINSTALL" or (deleted_bot and deleted_bot == main_bot):
+            _b24_save_state({})
+        else:
+            logging.info("b24 testbot: subagent bot %s deleted — main state kept", deleted_bot or "?")
+            try:
+                from agent_center import _agent_cache_bust
+                _agent_cache_bust()
+            except Exception:  # noqa: BLE001
+                pass
         return jsonify({"ok": True, "event": event_name})
 
     bot_id = state.get("bot_id")
@@ -2408,6 +2429,11 @@ def _bitrix_imbot_app_event():
             logging.exception("b24 testbot: subagent resolve failed for bot %s", event_bot_id)
     if agent is not None:
         bot_id = event_bot_id  # reply as the addressed bot, not the main one
+    elif not bot_id and event_bot_id:
+        # Second half of the self-heal: restore the main bot id lost with the wiped state.
+        state["bot_id"] = bot_id = event_bot_id
+        _b24_save_state(state)
+        logging.warning("b24 testbot: restored main bot_id=%s from event", event_bot_id)
 
     def _agent_allows(user_id: Any) -> bool:
         """Subagent access: its explicit member list; empty list = agent open to everyone
