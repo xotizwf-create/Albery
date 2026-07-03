@@ -938,6 +938,22 @@ def _main_bot_name() -> str | None:
             users = data.get("result") or []
             if users and isinstance(users[0], dict):
                 name = " ".join(p for p in (users[0].get("NAME"), users[0].get("LAST_NAME")) if p).strip() or None
+            if not name:
+                # Bots usually aren't returned by user.get — read the bot registry (its NAME
+                # property is the messenger display name, e.g. «Агент Албери»).
+                from b24bot import _b24_app_access_token, _b24_app_call
+                ep, ac = _b24_app_access_token()
+                if ep and ac:
+                    res = _b24_app_call(ep, ac, "imbot.bot.list", {}).get("result")
+                    entries = list(res.values()) if isinstance(res, dict) else (res or [])
+                    for info in entries:
+                        if not isinstance(info, dict):
+                            continue
+                        if str(info.get("ID") or info.get("BOT_ID") or "") != str(bot_id):
+                            continue
+                        props = info.get("PROPERTIES") if isinstance(info.get("PROPERTIES"), dict) else {}
+                        name = (info.get("NAME") or props.get("NAME") or "").strip() or None
+                        break
     except Exception:  # noqa: BLE001
         logging.warning("agent_center: main bot name lookup failed", exc_info=True)
     _AGENT_CACHE.update(main_name_at=now, main_name=name)
