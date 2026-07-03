@@ -32,7 +32,6 @@ from app import (
     msk_now,
     pg_connect,
 )
-from b24bot import _b24_portal_user_directory
 
 _DIALOGS_LIMIT_DEFAULT = 100
 _MESSAGES_LIMIT_DEFAULT = 200
@@ -100,6 +99,9 @@ def _user_names() -> dict[int, dict[str, str]]:
     except Exception:  # noqa: BLE001
         logging.exception("agent_center: access-name fallback load failed")
     try:
+        # Lazy import: b24bot may still be mid-import when a script imports it first
+        # (b24bot → app → agent_center), so never touch it at module level here.
+        from b24bot import _b24_portal_user_directory
         for uid, info in _b24_portal_user_directory().items():
             out[uid] = {"name": info.get("name") or f"#{uid}", "position": info.get("position") or ""}
     except Exception:  # noqa: BLE001
