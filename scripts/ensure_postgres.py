@@ -52,6 +52,9 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Fully idempotent (IF NOT EXISTS everywhere) — covers both the subagent
     # tables and the agent_slug column on bitrix_bot_interactions.
     "037_agents.sql",
+    # Idempotent: per-agent tool/instruction/skill config (tools_customized flag
+    # + agent_knowledge_links link table).
+    "038_agent_config.sql",
 ]
 
 

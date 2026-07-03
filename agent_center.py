@@ -741,8 +741,8 @@ def _load_agents_full() -> list[dict[str, Any]]:
     with pg_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id::text AS id, slug, name, role_prompt, tier, tools, bitrix_bot_id,"
-                " mcp_token, is_active, color, created_at FROM agents ORDER BY created_at"
+                "SELECT id::text AS id, slug, name, role_prompt, tier, tools, tools_customized,"
+                " bitrix_bot_id, mcp_token, is_active, color, created_at FROM agents ORDER BY created_at"
             )
             agents = [dict(r) for r in cur.fetchall()]
             cur.execute("SELECT agent_id::text AS agent_id, bitrix_user_id FROM agent_members")
@@ -752,16 +752,28 @@ def _load_agents_full() -> list[dict[str, Any]]:
                 " FROM agent_instructions ORDER BY created_at"
             )
             instructions = cur.fetchall()
+            cur.execute("SELECT agent_id::text AS agent_id, kind, ref_id FROM agent_knowledge_links")
+            links = cur.fetchall()
     by_id = {a["id"]: a for a in agents}
     for a in agents:
         a["members"] = set()
         a["instructions"] = []
+        a["linked_instruction_ids"] = set()
+        a["linked_skill_ids"] = set()
     for m in members:
         if m["agent_id"] in by_id:
             by_id[m["agent_id"]]["members"].add(int(m["bitrix_user_id"]))
     for i in instructions:
         if i["agent_id"] in by_id:
             by_id[i["agent_id"]]["instructions"].append(dict(i))
+    for lk in links:
+        a = by_id.get(lk["agent_id"])
+        if not a:
+            continue
+        if lk["kind"] == "instruction":
+            a["linked_instruction_ids"].add(lk["ref_id"])
+        elif lk["kind"] == "skill":
+            a["linked_skill_ids"].add(lk["ref_id"])
     return agents
 
 
@@ -1141,6 +1153,165 @@ def agent_center_instruction_delete(slug: str, inst_id: str):
     return jsonify({"ok": True})
 
 
+# --- Per-agent config: tools / library instructions / skills --------------------------------
+# The single place the owner shapes an agent's capability surface. Every toggle here has
+# real backend teeth: tool toggles change what the connector serves (invisible when off);
+# instruction/skill selections change exactly what is injected into the agent's turn (an
+# agent cannot apply a library doc it is not linked to). A fixed baseline (mandatory tools)
+# stays on regardless — that is the "settings that don't change" the owner asked for.
+
+def _library_instructions() -> list[dict[str, Any]]:
+    """Instruction folders from the shared library (ai_instruction_folders) that carry
+    real content — the pool an agent can be given, same source the knowledge page shows."""
+    out: list[dict[str, Any]] = []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT f.id::text AS id, f.name, p.name AS parent_name, f.content"
+                " FROM ai_instruction_folders f"
+                " LEFT JOIN ai_instruction_folders p ON p.id = f.parent_id"
+                " ORDER BY f.sort_order, f.name"
+            )
+            for r in cur.fetchall():
+                content = re.sub(r"\s+", " ", (r["content"] or "")).strip()
+                if not content:
+                    continue
+                out.append({
+                    "id": r["id"],
+                    "title": r["name"],
+                    "parent": r["parent_name"] or "",
+                    "content": content,
+                    "description": (content[:160].rstrip() + "…") if len(content) > 160 else content,
+                })
+    return out
+
+
+@app.get("/api/agent-center/agents/<slug>/config")
+def agent_center_agent_config(slug: str):
+    """The agent's full capability surface for the constructor: every tier tool with its
+    on/off + fixed state, and the whole instruction/skill library with what's selected."""
+    agent = _agent_by_slug(slug)
+    if not agent:
+        return jsonify({"error": "Агент не найден."}), 404
+    try:
+        from mcp.context_server import CORE_TOOL_NAMES, FAQ_TOOL_NAMES, OPS_TOOL_NAMES, TOOLS
+    except Exception:  # noqa: BLE001
+        logging.exception("agent config: context_server import failed")
+        return jsonify({"error": "Не удалось загрузить инструменты."}), 500
+    base = _agent_tier_base(agent)
+    enabled = _agent_tool_names(agent)  # effective set the connector serves
+    fixed = MANDATORY_AGENT_TOOLS & base
+    tools = []
+    for name in sorted(base):
+        spec = TOOLS.get(name, {})
+        desc = re.sub(r"\s+", " ", str(spec.get("description") or "")).strip()
+        first = desc.split(". ")[0].strip()
+        short = first if 0 < len(first) <= 200 else desc[:180].rstrip() + ("…" if len(desc) > 180 else "")
+        tiers = ["admin"] + (["ops"] if name in OPS_TOOL_NAMES else []) + (["faq"] if name in FAQ_TOOL_NAMES else [])
+        tools.append({
+            "name": name, "description": short, "tiers": tiers,
+            "core": name in CORE_TOOL_NAMES,
+            "fixed": name in fixed, "enabled": name in enabled,
+        })
+    sel_instr = agent.get("linked_instruction_ids") or set()
+    instructions = [
+        {**i, "selected": i["id"] in sel_instr, "content": None}  # content hidden from the list payload
+        for i in _library_instructions()
+    ]
+    sel_skills = agent.get("linked_skill_ids") or set()
+    skills = [
+        {"id": s["id"], "title": s["title"], "parent": s.get("parent") or "",
+         "description": s["description"], "custom": s.get("custom", False),
+         "selected": s["id"] in sel_skills}
+        for s in _hermes_skills()
+    ]
+    return jsonify({
+        "slug": slug,
+        "tier": agent["tier"],
+        "tools_customized": bool(agent.get("tools_customized")),
+        "tools": tools,
+        "instructions": instructions,
+        "skills": skills,
+    })
+
+
+@app.put("/api/agent-center/agents/<slug>/config")
+def agent_center_agent_config_save(slug: str):
+    """Persist the constructor state: which tier tools are enabled (mandatory ones are
+    always kept), and which library instructions/skills are linked. Values are validated
+    against the real tier set / library so the stored config can never grant something
+    outside the agent's tier."""
+    agent = _agent_by_slug(slug)
+    if not agent:
+        return jsonify({"error": "Агент не найден."}), 404
+    body = request.get_json(silent=True) or {}
+    base = _agent_tier_base(agent)
+    fixed = MANDATORY_AGENT_TOOLS & base
+    # Tools: keep only real tier tools; the mandatory baseline is always included.
+    requested_tools = {str(t) for t in (body.get("tools") or []) if str(t)}
+    enabled_tools = sorted((requested_tools & base) | fixed)
+    valid_instr = {i["id"] for i in _library_instructions()}
+    valid_skills = {s["id"] for s in _hermes_skills()}
+    instr_ids = sorted({str(x) for x in (body.get("instructions") or [])} & valid_instr)
+    skill_ids = sorted({str(x) for x in (body.get("skills") or [])} & valid_skills)
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM agents WHERE slug = %s", (slug,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Агент не найден."}), 404
+                agent_id = row["id"]
+                cur.execute(
+                    "UPDATE agents SET tools = %s, tools_customized = TRUE, updated_at = now() WHERE id = %s",
+                    (enabled_tools, agent_id),
+                )
+                cur.execute("DELETE FROM agent_knowledge_links WHERE agent_id = %s", (agent_id,))
+                for rid in instr_ids:
+                    cur.execute(
+                        "INSERT INTO agent_knowledge_links (agent_id, kind, ref_id) VALUES (%s, 'instruction', %s)"
+                        " ON CONFLICT DO NOTHING",
+                        (agent_id, rid),
+                    )
+                for rid in skill_ids:
+                    cur.execute(
+                        "INSERT INTO agent_knowledge_links (agent_id, kind, ref_id) VALUES (%s, 'skill', %s)"
+                        " ON CONFLICT DO NOTHING",
+                        (agent_id, rid),
+                    )
+    except Exception:  # noqa: BLE001
+        logging.exception("agent config save failed")
+        return jsonify({"error": "Не удалось сохранить настройки."}), 500
+    _agent_cache_bust()
+    return jsonify({"ok": True, "tools": enabled_tools, "instructions": instr_ids, "skills": skill_ids})
+
+
+def agent_selected_knowledge(agent: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Resolve an agent's linked library items to injectable content for its turn.
+    Returns {instructions: [{title, content}], skills: [{title, description}]}. Only
+    linked items are returned — this is what makes the selection a real capability
+    boundary rather than a cosmetic list."""
+    instr_ids = agent.get("linked_instruction_ids") or set()
+    skill_ids = agent.get("linked_skill_ids") or set()
+    instructions: list[dict[str, Any]] = []
+    if instr_ids:
+        for i in _library_instructions():
+            if i["id"] in instr_ids:
+                instructions.append({
+                    "title": (f"{i['parent']} / {i['title']}" if i["parent"] else i["title"]),
+                    "content": i["content"],
+                })
+    skills: list[dict[str, Any]] = []
+    if skill_ids:
+        for s in _hermes_skills():
+            if s["id"] in skill_ids:
+                skills.append({
+                    "title": (f"{s['parent']} / {s['title']}" if s.get("parent") else s["title"]),
+                    "description": s["description"],
+                })
+    return {"instructions": instructions, "skills": skills}
+
+
 # --- Per-agent MCP endpoint (/mcp-agent/<slug>/<token>) with self-learning ------------------
 # The agent's ONLY connector. Tool scope = its tier set (faq → read-only knowledge;
 # ops → operational, no admin tools) ∩ optional per-agent whitelist, PLUS three
@@ -1234,11 +1405,35 @@ def _agent_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, Any]
     raise ValueError(f"Неизвестный инструмент: {name}")
 
 
-def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
+# Fixed baseline: tools EVERY agent always keeps, no matter how its tools are
+# customized — the minimum needed to read its own instructions, orient itself and
+# answer from company knowledge. Intersected with the tier set below, so a faq agent
+# never gains an ops tool through the baseline. Shown locked-on in the UI.
+MANDATORY_AGENT_TOOLS: set[str] = {
+    "start_here_always_read_ai_instructions",
+    "get_context_guide",
+    "get_ai_instructions",
+    "search_company_knowledge",
+}
+
+
+def _agent_tier_base(agent: dict[str, Any]) -> set[str]:
     from mcp.context_server import FAQ_TOOL_NAMES, OPS_TOOL_NAMES
-    base = set(OPS_TOOL_NAMES) if agent["tier"] == "ops" else set(FAQ_TOOL_NAMES)
-    whitelist = {t for t in (agent.get("tools") or []) if t}
-    return (base & whitelist) if whitelist else base
+    return set(OPS_TOOL_NAMES) if agent["tier"] == "ops" else set(FAQ_TOOL_NAMES)
+
+
+def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
+    """Tools the agent's connector actually serves. Default (never customized) =
+    the full tier set. Once customized, only the enabled whitelist is served, but
+    the mandatory baseline is always forced on. This is the hard gate: tools/list
+    over the connector returns exactly this set, so a disabled tool is invisible
+    and uncallable regardless of the prompt."""
+    base = _agent_tier_base(agent)
+    fixed = MANDATORY_AGENT_TOOLS & base
+    if agent.get("tools_customized"):
+        whitelist = {t for t in (agent.get("tools") or []) if t}
+        return fixed | (base & whitelist)
+    return base
 
 
 def _mcp_agent_auth(slug: str, path_token: str | None) -> dict[str, Any] | None:

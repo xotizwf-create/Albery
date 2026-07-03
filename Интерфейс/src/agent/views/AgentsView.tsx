@@ -15,6 +15,9 @@ import {
 import {
   AccessMember,
   AccessTier,
+  AgentCapabilityConfig,
+  AgentConfigKnowledge,
+  AgentConfigTool,
   AgentDetail,
   BitrixUser,
   McpTool,
@@ -24,12 +27,14 @@ import {
   deleteAgent,
   deleteAgentInstruction,
   fetchAccessMembers,
+  fetchAgentConfig,
   fetchAgentDetail,
   fetchAgents,
   fetchBitrixUsers,
   fetchKnowledge,
   fetchMcpTools,
   registerAgentBot,
+  saveAgentConfig,
   updateAgent,
   upsertAccess,
 } from "../api";
@@ -796,6 +801,251 @@ const CreateAgentModal: React.FC<{
   );
 };
 
+// The capability constructor for a subagent: MCP tool toggles + instruction/skill
+// checklists, all backed by /api/agent-center/agents/<slug>/config. A disabled tool is
+// removed from the agent's connector; an unselected instruction/skill is never injected
+// into its turn. Mandatory (fixed) tools are shown locked-on.
+const AgentCapabilityPanel: React.FC<{ slug: string }> = ({ slug }) => {
+  const [config, setConfig] = useState<AgentCapabilityConfig | null>(null);
+  const [tools, setTools] = useState<Set<string>>(new Set<string>());
+  const [instr, setInstr] = useState<Set<string>>(new Set<string>());
+  const [skills, setSkills] = useState<Set<string>>(new Set<string>());
+  const [toolQuery, setToolQuery] = useState("");
+  const [knowQuery, setKnowQuery] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    fetchAgentConfig(slug)
+      .then((c) => {
+        setConfig(c);
+        setTools(new Set(c.tools.filter((t) => t.enabled).map((t) => t.name)));
+        setInstr(new Set(c.instructions.filter((i) => i.selected).map((i) => i.id)));
+        setSkills(new Set(c.skills.filter((s) => s.selected).map((s) => s.id)));
+      })
+      .catch((e: Error) => setError(e.message));
+  }, [slug]);
+
+  if (!config) {
+    return (
+      <div className="border-t border-gray-100 p-6 md:p-8 text-gray-400 text-[13.5px] font-medium">
+        {error || "Загрузка настроек…"}
+      </div>
+    );
+  }
+
+  const dirty = (() => {
+    const enabledNow = new Set<string>(config.tools.filter((t) => t.enabled).map((t) => t.name));
+    const selInstr = new Set<string>(config.instructions.filter((i) => i.selected).map((i) => i.id));
+    const selSkills = new Set<string>(config.skills.filter((s) => s.selected).map((s) => s.id));
+    const same = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every((x) => b.has(x));
+    return !(same(tools, enabledNow) && same(instr, selInstr) && same(skills, selSkills));
+  })();
+
+  const toggleTool = (t: AgentConfigTool) => {
+    if (t.fixed) return;
+    setTools((prev) => {
+      const next = new Set(prev);
+      next.has(t.name) ? next.delete(t.name) : next.add(t.name);
+      return next;
+    });
+  };
+  const toggleSet = (setter: React.Dispatch<React.SetStateAction<Set<string>>>, id: string) =>
+    setter((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
+  const save = async () => {
+    setBusy(true);
+    setError("");
+    setSaved(false);
+    try {
+      await saveAgentConfig(slug, { tools: [...tools], instructions: [...instr], skills: [...skills] });
+      const fresh = await fetchAgentConfig(slug);
+      setConfig(fresh);
+      setTools(new Set(fresh.tools.filter((t) => t.enabled).map((t) => t.name)));
+      setInstr(new Set(fresh.instructions.filter((i) => i.selected).map((i) => i.id)));
+      setSkills(new Set(fresh.skills.filter((s) => s.selected).map((s) => s.id)));
+      setSaved(true);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const filteredTools = config.tools.filter(
+    (t) => t.name.toLowerCase().includes(toolQuery.toLowerCase()) || t.description.toLowerCase().includes(toolQuery.toLowerCase()),
+  );
+  const q = knowQuery.toLowerCase();
+  const matchK = (k: AgentConfigKnowledge) =>
+    k.title.toLowerCase().includes(q) || (k.parent || "").toLowerCase().includes(q) || k.description.toLowerCase().includes(q);
+  const filteredInstr = config.instructions.filter(matchK);
+  const filteredSkills = config.skills.filter(matchK);
+
+  return (
+    <div className="border-t border-gray-100 p-6 md:p-8">
+      <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+        <div>
+          <h3 className="text-[15px] font-bold text-gray-900">Возможности агента</h3>
+          <p className="text-[12.5px] font-medium text-gray-500 mt-0.5">
+            Что агент видит и чем может пользоваться. Отключённое недоступно ему физически. Уровень:{" "}
+            {config.tier === "ops" ? "все функции" : "база знаний"}.
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          {saved && !dirty && <span className="text-[12.5px] font-bold text-emerald-600">Сохранено ✓</span>}
+          <button
+            onClick={save}
+            disabled={busy || !dirty}
+            className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-bold hover:bg-indigo-700 shadow-sm shadow-indigo-600/20 transition-all disabled:opacity-50"
+          >
+            {busy ? "Сохраняю…" : "Сохранить возможности"}
+          </button>
+        </div>
+      </div>
+      {error && <div className="text-[13px] font-bold text-rose-500 mb-4">{error}</div>}
+
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        {/* MCP tools */}
+        <div className="bg-slate-50/50 p-6 rounded-3xl border border-gray-100 flex flex-col h-[420px]">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2 text-gray-900 font-bold text-[15px]">
+              <Network className="w-5 h-5 text-emerald-500" />
+              Инструменты (MCP)
+            </div>
+            <span className="text-[11px] font-bold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-md border border-emerald-100">
+              {tools.size} из {config.tools.length}
+            </span>
+          </div>
+          <div className="relative mb-4 shrink-0">
+            <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
+            <input
+              type="text"
+              placeholder="Поиск инструментов…"
+              value={toolQuery}
+              onChange={(e) => setToolQuery(e.target.value)}
+              className="w-full pl-10 pr-4 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13.5px] font-medium focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none transition-all shadow-sm"
+            />
+          </div>
+          <div className="overflow-y-auto pr-2 space-y-2 flex-1 min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+            {filteredTools.map((t) => {
+              const on = tools.has(t.name);
+              return (
+                <div
+                  key={t.name}
+                  title={t.description}
+                  className="flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm"
+                >
+                  <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
+                    {toolIcon(t.name)}
+                  </div>
+                  <div className="flex-1 min-w-0 pr-4">
+                    <div className="flex items-center gap-2 mb-0.5">
+                      <span className="font-bold text-gray-900 text-[14px] truncate">{t.name}</span>
+                      {t.fixed && (
+                        <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md bg-slate-100 border border-slate-200 text-slate-600 shadow-sm shrink-0">
+                          базовый
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[12.5px] font-medium text-gray-500 truncate">{t.description}</p>
+                  </div>
+                  <button
+                    onClick={() => toggleTool(t)}
+                    disabled={t.fixed}
+                    title={t.fixed ? "Базовый инструмент — всегда включён" : on ? "Отключить" : "Включить"}
+                    className={cn(
+                      "w-10 h-6 rounded-full flex items-center px-0.5 shrink-0 transition-colors",
+                      on ? "bg-indigo-500" : "bg-gray-200",
+                      t.fixed ? "cursor-default opacity-70" : "cursor-pointer",
+                    )}
+                  >
+                    <div className={cn("w-5 h-5 rounded-full bg-white shadow-sm transition-transform", on && "translate-x-4")} />
+                  </button>
+                </div>
+              );
+            })}
+            {filteredTools.length === 0 && (
+              <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">Ничего не найдено</div>
+            )}
+          </div>
+        </div>
+
+        {/* Instructions & skills from the library */}
+        <div className="bg-slate-50/50 p-6 rounded-3xl border border-gray-100 flex flex-col h-[420px]">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2 text-gray-900 font-bold text-[15px]">
+              <BookOpen className="w-5 h-5 text-indigo-500" />
+              Инструкции и Скиллы
+            </div>
+            <span className="text-[11px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-0.5 rounded-md border border-indigo-100">
+              {instr.size + skills.size} подключено
+            </span>
+          </div>
+          <div className="relative mb-4 shrink-0">
+            <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
+            <input
+              type="text"
+              placeholder="Поиск по базе знаний…"
+              value={knowQuery}
+              onChange={(e) => setKnowQuery(e.target.value)}
+              className="w-full pl-10 pr-4 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13.5px] font-medium focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all shadow-sm"
+            />
+          </div>
+          <div className="overflow-y-auto pr-2 space-y-2 flex-1 min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+            {[
+              ...filteredInstr.map((i) => ({ item: i, kind: "instruction" as const, on: instr.has(i.id), toggle: () => toggleSet(setInstr, i.id) })),
+              ...filteredSkills.map((s) => ({ item: s, kind: "skill" as const, on: skills.has(s.id), toggle: () => toggleSet(setSkills, s.id) })),
+            ].map(({ item, kind, on, toggle }) => (
+              <button
+                key={`${kind}:${item.id}`}
+                onClick={toggle}
+                title={item.description}
+                className="w-full text-left flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm hover:border-indigo-200 transition-colors"
+              >
+                <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
+                  {kind === "skill" ? "🔧" : "💬"}
+                </div>
+                <div className="flex-1 min-w-0 pr-4">
+                  <div className="flex items-center gap-2 mb-0.5">
+                    <span className="font-bold text-gray-900 text-[14px] truncate">
+                      {item.parent ? `${item.parent} / ${item.title}` : item.title}
+                    </span>
+                    <span
+                      className={cn(
+                        "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm shrink-0",
+                        kind === "skill" ? "bg-slate-100 border-slate-200 text-slate-600" : "bg-indigo-50 border-indigo-100 text-indigo-600",
+                      )}
+                    >
+                      {kind === "skill" ? "скилл" : "инструкция"}
+                    </span>
+                  </div>
+                  <p className="text-[12.5px] font-medium text-gray-500 truncate">{item.description}</p>
+                </div>
+                <div
+                  className={cn(
+                    "w-6 h-6 rounded-md border flex items-center justify-center shrink-0 shadow-sm transition-colors",
+                    on ? "bg-indigo-500 border-indigo-500 text-white" : "bg-white border-gray-300 text-transparent",
+                  )}
+                >
+                  <Check className="w-4 h-4" />
+                </div>
+              </button>
+            ))}
+            {filteredInstr.length + filteredSkills.length === 0 && (
+              <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">Ничего не найдено</div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const SubagentEditor: React.FC<{
   slug: string;
   onChanged: () => void;
@@ -1107,6 +1357,8 @@ const SubagentEditor: React.FC<{
           </div>
         </div>
       </div>
+
+      <AgentCapabilityPanel slug={slug} />
     </div>
   );
 };

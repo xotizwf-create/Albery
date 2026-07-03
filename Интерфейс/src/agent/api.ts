@@ -169,6 +169,52 @@ export async function deleteAgentInstruction(slug: string, instId: string): Prom
   await fetchJsonSafe(`/api/agent-center/agents/${slug}/instructions/${instId}`, { method: "DELETE" }, 30000);
 }
 
+// --- Per-agent capability config (tools / library instructions / skills) ---
+// Every field maps to real backend enforcement: a disabled tool is not served by the
+// agent's connector; an unselected instruction/skill is never injected into its turn.
+
+export interface AgentConfigTool {
+  name: string;
+  description: string;
+  tiers: string[];
+  core: boolean;
+  fixed: boolean; // mandatory baseline — always on, cannot be disabled
+  enabled: boolean;
+}
+
+export interface AgentConfigKnowledge {
+  id: string;
+  title: string;
+  parent: string;
+  description: string;
+  custom?: boolean;
+  selected: boolean;
+}
+
+export interface AgentCapabilityConfig {
+  slug: string;
+  tier: "faq" | "ops";
+  tools_customized: boolean;
+  tools: AgentConfigTool[];
+  instructions: AgentConfigKnowledge[];
+  skills: AgentConfigKnowledge[];
+}
+
+export async function fetchAgentConfig(slug: string): Promise<AgentCapabilityConfig> {
+  return (await fetchJsonSafe(`/api/agent-center/agents/${slug}/config`, undefined, 30000)) as AgentCapabilityConfig;
+}
+
+export async function saveAgentConfig(
+  slug: string,
+  body: { tools: string[]; instructions: string[]; skills: string[] },
+): Promise<void> {
+  await fetchJsonSafe(
+    `/api/agent-center/agents/${slug}/config`,
+    { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    30000,
+  );
+}
+
 export async function fetchAgentDialogs(params: { channel: string; q?: string }): Promise<{ chats: Chat[]; note?: string }> {
   const search = new URLSearchParams({ channel: params.channel.toLowerCase() });
   if (params.q) search.set("q", params.q);

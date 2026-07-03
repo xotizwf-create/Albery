@@ -1815,6 +1815,28 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                 "Отвечай по-русски." + access_rule + fmt + "]")
     parts = [head]
     if agent is not None:
+        # Library knowledge the owner explicitly linked to this agent in the constructor.
+        # Injecting the selected items (and ONLY them) is what enforces the selection:
+        # the agent's usable instructions/skills are exactly what appears here.
+        try:
+            from agent_center import agent_selected_knowledge
+            selected = agent_selected_knowledge(agent)
+        except Exception:  # noqa: BLE001
+            logging.exception("subagent %s: selected knowledge load failed", agent.get("slug"))
+            selected = {"instructions": [], "skills": []}
+        if selected["instructions"]:
+            parts.append(
+                "ИНСТРУКЦИИ КОМПАНИИ (подключены к тебе владельцем — применяй обязательно):\n"
+                + "\n\n".join(f"— {i['title']}:\n{i['content']}" for i in selected["instructions"])
+            )
+        if selected["skills"]:
+            parts.append(
+                "ТВОИ НАВЫКИ (подключены владельцем): "
+                + "; ".join(f"«{s['title']}» — {s['description']}" for s in selected["skills"])
+                + ". Пользуйся ТОЛЬКО этими навыками. Если для задачи нужен навык, которого нет в "
+                "этом списке, не выдумывай и не применяй сторонние приёмы — скажи, что этим "
+                "занимается Основной агент Албери."
+            )
         learned = agent.get("instructions") or []
         if learned:
             parts.append(
