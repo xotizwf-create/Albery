@@ -123,6 +123,7 @@ export interface AgentDetail {
   name: string;
   role_prompt: string;
   tier: AgentLevel;
+  is_main?: boolean;
   is_active: boolean;
   bitrix_bot_id: number | null;
   members: Array<{ id: number; name: string }>;

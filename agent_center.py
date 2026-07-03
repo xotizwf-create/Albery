@@ -994,9 +994,11 @@ def agent_center_create_agent():
     name = str(body.get("name") or "").strip()
     if not name or len(name) > 60:
         return jsonify({"error": "Укажите имя агента (до 60 символов)."}), 400
-    tier = str(body.get("tier") or "faq").strip()
+    # No level selector any more: a new agent starts with the broad 'ops' preset (все функции,
+    # без admin); the owner then narrows/extends its tools in the capability panel.
+    tier = str(body.get("tier") or "ops").strip()
     if tier not in AGENT_LEVELS:
-        return jsonify({"error": "Уровень должен быть faq, ops или developer."}), 400
+        tier = "ops"
     role_prompt = str(body.get("role_prompt") or "").strip()[:4000]
     members = [int(m) for m in (body.get("members") or []) if str(m).strip().isdigit()]
     slug = _agent_slug(name)
@@ -1043,22 +1045,40 @@ def agent_center_create_agent():
     return jsonify({"ok": True, "slug": slug, "bitrix_bot_id": bot_id, "warnings": warnings})
 
 
+def _main_access_member_ids() -> list[int]:
+    """The universal agent's team = people with an explicit non-'none' agent_access grant."""
+    out: list[int] = []
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT bitrix_user_id FROM agent_access WHERE tier <> 'none' ORDER BY bitrix_user_id")
+                out = [int(r["bitrix_user_id"]) for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        logging.exception("main access members load failed")
+    return out
+
+
 @app.get("/api/agent-center/agents/<slug>")
 def agent_center_agent_detail(slug: str):
+    if slug == MAIN_AGENT_SLUG:
+        ensure_main_agent()
     agent = _agent_by_slug(slug)
     if not agent:
         return jsonify({"error": "Агент не найден."}), 404
     names = _user_names()
+    # The universal agent's team lives in agent_access (company-wide); subagents' in agent_members.
+    member_ids = _main_access_member_ids() if slug == MAIN_AGENT_SLUG else sorted(agent["members"])
     return jsonify({
         "slug": agent["slug"],
         "name": agent["name"],
         "role_prompt": agent["role_prompt"],
         "tier": agent["tier"],
+        "is_main": slug == MAIN_AGENT_SLUG,
         "is_active": agent["is_active"],
         "bitrix_bot_id": agent["bitrix_bot_id"],
         "members": [
             {"id": uid, "name": names.get(uid, {}).get("name") or f"#{uid}"}
-            for uid in sorted(agent["members"])
+            for uid in member_ids
         ],
         "instructions": [
             {"id": i["id"], "name": i["name"], "content": i["content"], "source": i["source"],
@@ -1098,6 +1118,20 @@ def agent_center_agent_update(slug: str):
                     if "is_active" in body:
                         cur.execute("UPDATE agents SET is_active = %s, updated_at = now() WHERE slug = %s",
                                     (bool(body["is_active"]), MAIN_AGENT_SLUG))
+                    # The universal agent's team lives in agent_access: grant the listed users
+                    # (все функции) and drop the rows of those removed (back to default).
+                    if isinstance(body.get("members"), list):
+                        want = {int(m) for m in body["members"] if str(m).strip().isdigit()}
+                        cur.execute("SELECT bitrix_user_id FROM agent_access WHERE tier <> 'none'")
+                        have = {int(r["bitrix_user_id"]) for r in cur.fetchall()}
+                        for uid in want - have:
+                            cur.execute(
+                                "INSERT INTO agent_access (bitrix_user_id, tier) VALUES (%s, 'ops')"
+                                " ON CONFLICT (bitrix_user_id) DO UPDATE SET tier = 'ops'",
+                                (uid,),
+                            )
+                        for uid in have - want:
+                            cur.execute("DELETE FROM agent_access WHERE bitrix_user_id = %s", (uid,))
         except Exception:  # noqa: BLE001
             logging.exception("main agent update failed")
             return jsonify({"error": "Не удалось сохранить изменения."}), 500
@@ -1522,16 +1556,12 @@ MANDATORY_AGENT_TOOLS: set[str] = {
 
 
 def _agent_allowed_pool(agent: dict[str, Any]) -> set[str]:
-    """The tools an agent of this LEVEL is permitted to be given at all. Any agent may
-    be given any tool from the full registry EXCEPT the owner-only/dangerous ones
-    (delete task/report, edit the company brain's instructions/settings, management
-    monitoring) — those require the 'developer' level. This is the security boundary;
-    below it, tool selection is free."""
-    from mcp.context_server import OWNER_ONLY_TOOL_NAMES, TOOLS
-    pool = set(TOOLS)
-    if agent.get("tier") == "developer":
-        return pool
-    return pool - set(OWNER_ONLY_TOOL_NAMES)
+    """The tools an agent may be given. There is no separate access-level gate any more —
+    an agent's power is simply defined by which tools are enabled (owner asked to drop the
+    level concept, 2026-07-03). Any tool from the full registry can be enabled, including
+    dangerous admin ones (those still carry the 'admin' chip + a confirm in the UI)."""
+    from mcp.context_server import TOOLS
+    return set(TOOLS)
 
 
 def _agent_preset_default(agent: dict[str, Any]) -> set[str]:

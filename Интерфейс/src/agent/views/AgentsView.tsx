@@ -61,571 +61,6 @@ const TOOL_TIER_CHIP: Record<string, string> = {
   admin: "bg-amber-50 border-amber-100 text-amber-600",
 };
 
-const AgentEditor: React.FC<{ agent: any; onToggleActive: () => void; onRenamed?: () => void }> = ({
-  agent,
-  onToggleActive,
-  onRenamed,
-}) => {
-  const [activeChannels, setActiveChannels] = useState<string[]>(
-    agent.channels,
-  );
-  const [mainName, setMainName] = useState<string>(agent.name);
-  const [nameBusy, setNameBusy] = useState(false);
-  const [nameSaved, setNameSaved] = useState(false);
-  const [nameError, setNameError] = useState("");
-
-  const saveMainName = () => {
-    if (!mainName.trim() || mainName.trim() === agent.name) return;
-    setNameBusy(true);
-    setNameError("");
-    setNameSaved(false);
-    updateAgent("main", { name: mainName.trim() })
-      .then(() => {
-        setNameSaved(true);
-        onRenamed?.();
-      })
-      .catch((e: Error) => setNameError(e.message))
-      .finally(() => setNameBusy(false));
-  };
-  const [tools, setTools] = useState<McpTool[]>([]);
-  const [toolsLoading, setToolsLoading] = useState(true);
-
-  const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>([]);
-  const [knowledgeLoading, setKnowledgeLoading] = useState(true);
-
-  const [searchMcp, setSearchMcp] = useState("");
-  const [searchKnowledge, setSearchKnowledge] = useState("");
-
-  // Team access = the real agent_access table (same CRUD the Настройки tab uses).
-  const [members, setMembers] = useState<AccessMember[]>([]);
-  const [bitrixUsers, setBitrixUsers] = useState<BitrixUser[]>([]);
-  const [accessError, setAccessError] = useState("");
-  const [accessBusy, setAccessBusy] = useState(false);
-  const [activeDropdown, setActiveDropdown] = useState<number | null>(null);
-
-  const [showUserSearch, setShowUserSearch] = useState(false);
-  const [userSearchQuery, setUserSearchQuery] = useState("");
-
-  useEffect(() => {
-    fetchAccessMembers()
-      .then(setMembers)
-      .catch((e: Error) => setAccessError(e.message));
-    fetchBitrixUsers()
-      .then(setBitrixUsers)
-      .catch(() => {});
-    fetchMcpTools()
-      .then(setTools)
-      .catch(() => {})
-      .finally(() => setToolsLoading(false));
-    fetchKnowledge()
-      .then(setKnowledgeItems)
-      .catch(() => {})
-      .finally(() => setKnowledgeLoading(false));
-    // Live refresh: access grants can change from the Настройки tab or another
-    // browser window; stats and the knowledge library drift over time too.
-    const timer = window.setInterval(() => {
-      fetchAccessMembers().then(setMembers).catch(() => {});
-      fetchMcpTools().then(setTools).catch(() => {});
-      fetchKnowledge().then(setKnowledgeItems).catch(() => {});
-    }, 60000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  const memberName = (m: AccessMember) =>
-    bitrixUsers.find((u) => u.id === m.bitrix_user_id)?.name || m.display_name;
-
-  const runAccessOp = async (op: () => Promise<void>) => {
-    setAccessBusy(true);
-    setAccessError("");
-    try {
-      await op();
-      setMembers(await fetchAccessMembers());
-    } catch (e) {
-      setAccessError((e as Error).message);
-    } finally {
-      setAccessBusy(false);
-    }
-  };
-
-  const changeTier = (m: AccessMember, tier: AccessTier | "none") => {
-    setActiveDropdown(null);
-    void runAccessOp(() => upsertAccess(m.bitrix_user_id, tier, memberName(m)));
-  };
-
-  // Explicit "none" row = the bot stops responding (deleting the row would
-  // silently fall back to the default faq level instead).
-  const removeMember = (m: AccessMember) => {
-    void runAccessOp(() => upsertAccess(m.bitrix_user_id, "none", memberName(m)));
-  };
-
-  const addMember = (u: BitrixUser) => {
-    setShowUserSearch(false);
-    setUserSearchQuery("");
-    // Least privilege by default: new members start at FAQ; raise via the dropdown.
-    void runAccessOp(() => upsertAccess(u.id, "faq", u.name));
-  };
-
-  const memberIds = new Set(members.map((m) => m.bitrix_user_id));
-  const unselectedUsers = bitrixUsers.filter(
-    (u) => !memberIds.has(u.id) && u.name.toLowerCase().includes(userSearchQuery.toLowerCase()),
-  );
-
-  const filteredTools = tools.filter(
-    (t) =>
-      t.name.toLowerCase().includes(searchMcp.toLowerCase()) ||
-      t.description.toLowerCase().includes(searchMcp.toLowerCase()),
-  );
-
-  const filteredKnowledge = knowledgeItems.filter(
-    (k) =>
-      k.title.toLowerCase().includes(searchKnowledge.toLowerCase()) ||
-      k.description.toLowerCase().includes(searchKnowledge.toLowerCase()),
-  );
-
-  const toggleChannel = (channel: string) => {
-    setActiveChannels((prev) =>
-      prev.includes(channel)
-        ? prev.filter((c) => c !== channel)
-        : [...prev, channel],
-    );
-  };
-
-  return (
-    <div className="bg-white rounded-3xl shadow-sm border border-gray-200/60 flex flex-col">
-      {/* Editor Header */}
-      <div className="bg-slate-50/50 p-6 md:px-8 border-b border-gray-100 flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div
-            className={cn(
-              "w-12 h-12 rounded-xl flex items-center justify-center shadow-sm",
-              agent.iconBg,
-            )}
-          >
-            <Package className="w-6 h-6" />
-          </div>
-          <div>
-            <div className="flex items-center gap-3 mb-0.5">
-              <h2 className="text-xl font-bold text-gray-900 leading-none">
-                {agent.name}
-              </h2>
-              <button
-                onClick={() => {
-                  agent.isActive = !agent.isActive;
-                  onToggleActive();
-                }}
-                className={cn(
-                  "px-2 py-0.5 border text-[10px] font-bold rounded-md uppercase tracking-wider transition-colors",
-                  agent.isActive
-                    ? "bg-emerald-50 border-emerald-100 text-emerald-600 hover:bg-emerald-100"
-                    : "bg-gray-100 border-gray-200 text-gray-500 hover:bg-gray-200",
-                )}
-              >
-                {agent.isActive ? "включён" : "выключен"}
-              </button>
-            </div>
-            <p className="text-sm text-gray-500 font-medium mt-1">
-              Режим конструктора: изменения применяются моментально
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-3">
-          <button
-            onClick={saveMainName}
-            disabled={nameBusy || !mainName.trim() || mainName.trim() === agent.name}
-            className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-bold hover:bg-indigo-700 shadow-sm shadow-indigo-600/20 transition-all disabled:opacity-50"
-          >
-            {nameSaved ? "Сохранено ✓" : "Сохранить"}
-          </button>
-        </div>
-      </div>
-
-      <div className="p-6 md:p-8 flex flex-col xl:flex-row gap-8">
-        {/* Left Column - General Settings */}
-        <div className="flex-1 space-y-8 min-w-0">
-          <div>
-            <label className="block text-sm font-bold text-gray-900 mb-2">
-              Имя агента <span className="text-gray-400 font-medium">(синхронизируется с ботом в Bitrix)</span>
-            </label>
-            <input
-              type="text"
-              value={mainName}
-              onChange={(e) => setMainName(e.target.value)}
-              className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all font-bold shadow-sm"
-            />
-            {nameError && <div className="mt-1.5 text-[12px] font-bold text-rose-500">{nameError}</div>}
-          </div>
-
-          <div>
-            <label className="block text-sm font-bold text-gray-900 mb-2">
-              Каналы связи
-            </label>
-            <div className="flex p-1 bg-gray-50/80 border border-gray-200/60 rounded-2xl shadow-sm">
-              <button
-                onClick={() => toggleChannel("Bitrix")}
-                className={cn(
-                  "flex items-center justify-center gap-2 py-2.5 rounded-xl transition-all font-bold text-[13.5px] flex-1",
-                  activeChannels.includes("Bitrix")
-                    ? "bg-white text-gray-900 shadow-sm border border-gray-100"
-                    : "text-gray-500 hover:text-gray-700 hover:bg-gray-100/50",
-                )}
-              >
-                <MessageSquare className="w-4 h-4 text-blue-500" />
-                Bitrix24
-              </button>
-              <button
-                onClick={() => toggleChannel("Telegram")}
-                className={cn(
-                  "flex items-center justify-center gap-2 py-2.5 rounded-xl transition-all font-bold text-[13.5px] flex-1",
-                  activeChannels.includes("Telegram")
-                    ? "bg-white text-gray-900 shadow-sm border border-gray-100"
-                    : "text-gray-500 hover:text-gray-700 hover:bg-gray-100/50",
-                )}
-              >
-                <Send className="w-4 h-4 text-sky-500" />
-                Telegram
-              </button>
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-sm font-bold text-gray-900 mb-2">
-              Роль и системный промпт
-            </label>
-            <textarea
-              rows={4}
-              defaultValue="Ты — помощник склада. Отвечаешь только по остаткам, поставкам и задачам склада. Задачи ставишь только на сотрудников склада. Финансовые вопросы переадресуй Александру."
-              className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-[13.5px] focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all resize-none font-medium leading-relaxed shadow-sm"
-            />
-          </div>
-
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <label className="block text-sm font-bold text-gray-900">
-                Команда и доступы
-              </label>
-              <span className="text-xs font-bold text-gray-500 bg-gray-100 px-2 py-0.5 rounded-md">
-                {members.length} сотрудников
-              </span>
-            </div>
-            <div
-              className={cn(
-                "p-2.5 bg-gray-50/80 border border-gray-200/80 rounded-2xl flex flex-wrap gap-2 items-center shadow-sm transition-opacity",
-                accessBusy && "opacity-60 pointer-events-none",
-              )}
-            >
-              {members.map((m) => {
-                const name = memberName(m);
-                return (
-                  <div
-                    key={m.bitrix_user_id}
-                    className="pl-1.5 pr-2 py-1.5 bg-white border border-gray-200/80 rounded-xl flex items-center gap-2 shadow-sm relative"
-                  >
-                    <div className="w-7 h-7 rounded-lg bg-indigo-50 border border-indigo-100 text-indigo-700 flex items-center justify-center text-[10px] font-bold shrink-0">
-                      {name
-                        .split(/\s+/)
-                        .filter(Boolean)
-                        .slice(0, 2)
-                        .map((n) => n[0])
-                        .join("")}
-                    </div>
-                    <div className="flex flex-col">
-                      <span className="text-[13px] font-bold text-gray-800 leading-tight mb-0.5">
-                        {name}
-                      </span>
-                      <button
-                        onClick={() =>
-                          setActiveDropdown(activeDropdown === m.bitrix_user_id ? null : m.bitrix_user_id)
-                        }
-                        className="text-[10px] font-bold text-gray-400 bg-transparent border-none outline-none p-0 h-auto leading-tight cursor-pointer hover:text-indigo-600 transition-colors text-left flex items-center gap-1"
-                      >
-                        {TIER_LABELS[m.tier]}
-                        <span className="text-[8px]">▼</span>
-                      </button>
-                      {activeDropdown === m.bitrix_user_id && (
-                        <>
-                          <div
-                            className="fixed inset-0 z-10"
-                            onClick={() => setActiveDropdown(null)}
-                          />
-                          <div className="absolute top-full left-0 mt-1 w-40 bg-white rounded-xl shadow-lg border border-gray-100 py-1 z-20">
-                            {(Object.keys(TIER_LABELS) as AccessTier[]).map((tier) => (
-                              <button
-                                key={tier}
-                                onClick={() => changeTier(m, tier)}
-                                className={cn(
-                                  "w-full text-left px-3 py-1.5 text-[11px] font-bold transition-colors",
-                                  tier === m.tier
-                                    ? "text-indigo-600 bg-indigo-50/50"
-                                    : "text-gray-600 hover:bg-gray-50",
-                                )}
-                              >
-                                {TIER_LABELS[tier]}
-                              </button>
-                            ))}
-                            <button
-                              onClick={() => changeTier(m, "none")}
-                              className="w-full text-left px-3 py-1.5 text-[11px] font-bold text-rose-500 hover:bg-rose-50 transition-colors border-t border-gray-50"
-                            >
-                              Нет доступа (бот молчит)
-                            </button>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                    <button
-                      onClick={() => removeMember(m)}
-                      title="Забрать доступ"
-                      className="text-gray-400 hover:text-rose-500 transition-colors bg-gray-50 hover:bg-rose-50 rounded-md p-1 ml-1 shrink-0"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                );
-              })}
-              <div className="flex-1 min-w-[140px] flex items-center gap-2 px-2 relative">
-                <User className="w-4 h-4 text-gray-400" />
-                <input
-                  type="text"
-                  placeholder="Добавить..."
-                  value={userSearchQuery}
-                  onChange={(e) => {
-                    setUserSearchQuery(e.target.value);
-                    setShowUserSearch(true);
-                  }}
-                  onFocus={() => setShowUserSearch(true)}
-                  className="w-full bg-transparent border-none outline-none text-[13.5px] font-bold text-gray-700 placeholder:text-gray-400 placeholder:font-medium py-1.5"
-                />
-
-                {showUserSearch && (
-                  <>
-                    <div
-                      className="fixed inset-0 z-10"
-                      onClick={() => setShowUserSearch(false)}
-                    />
-                    <div className="absolute top-full left-0 mt-2 w-full min-w-[200px] bg-white rounded-2xl shadow-xl border border-gray-100 py-1.5 z-20 max-h-48 overflow-y-auto">
-                      {unselectedUsers.length > 0 ? (
-                        unselectedUsers.map((u) => (
-                          <button
-                            key={u.id}
-                            onClick={() => addMember(u)}
-                            className="w-full text-left px-3 py-2 hover:bg-gray-50 flex items-center gap-2 transition-colors"
-                          >
-                            <div className="w-6 h-6 rounded-md bg-gray-100 text-gray-600 flex items-center justify-center text-[9px] font-bold">
-                              {u.name
-                                .split(/\s+/)
-                                .filter(Boolean)
-                                .slice(0, 2)
-                                .map((n) => n[0])
-                                .join("")}
-                            </div>
-                            <div className="flex flex-col min-w-0">
-                              <span className="text-[13px] font-bold text-gray-700 truncate">
-                                {u.name}
-                              </span>
-                              {u.position && (
-                                <span className="text-[11px] font-medium text-gray-400 truncate">
-                                  {u.position}
-                                </span>
-                              )}
-                            </div>
-                          </button>
-                        ))
-                      ) : (
-                        <div className="px-3 py-4 text-center text-[12px] font-medium text-gray-400">
-                          {bitrixUsers.length === 0 ? "Загрузка сотрудников…" : "Сотрудники не найдены"}
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
-            {accessError && (
-              <div className="mt-2 text-[12px] font-bold text-rose-500">{accessError}</div>
-            )}
-          </div>
-        </div>
-
-        {/* Right Column - legacy read-only showcase, replaced by the live AgentCapabilityPanel below */}
-        <div className="hidden">
-          {/* Integrations & Tools (MCP) */}
-          <div className="bg-slate-50/50 p-6 rounded-3xl border border-gray-100 flex flex-col h-[380px]">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-2 text-gray-900 font-bold text-[15px]">
-                <Network className="w-5 h-5 text-emerald-500" />
-                Инструменты (MCP)
-              </div>
-              <span className="text-[11px] font-bold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-md border border-emerald-100">
-                {tools.length} активно
-              </span>
-            </div>
-
-            <div className="relative mb-4 shrink-0">
-              <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
-              <input
-                type="text"
-                placeholder="Умный поиск инструментов..."
-                value={searchMcp}
-                onChange={(e) => setSearchMcp(e.target.value)}
-                className="w-full pl-10 pr-4 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13.5px] font-medium focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none transition-all shadow-sm"
-              />
-            </div>
-
-            <div className="overflow-y-auto pr-2 space-y-2 flex-1 min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-              {toolsLoading && (
-                <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">
-                  Загрузка инструментов…
-                </div>
-              )}
-              {filteredTools.map((tool) => (
-                <div
-                  key={tool.name}
-                  title={tool.description}
-                  className="flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm group"
-                >
-                  <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
-                    {toolIcon(tool.name)}
-                  </div>
-                  <div className="flex-1 min-w-0 pr-4">
-                    <div className="flex items-center gap-2.5 mb-0.5">
-                      <span className="font-bold text-gray-900 text-[14px] truncate">
-                        {tool.name}
-                      </span>
-                      <div className="gap-1.5 hidden sm:flex shrink-0">
-                        {tool.tiers.length === 1 && tool.tiers[0] === "admin" ? (
-                          <span className={cn("text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm", TOOL_TIER_CHIP.admin)}>
-                            только админ
-                          </span>
-                        ) : (
-                          tool.tiers
-                            .filter((t) => t !== "admin")
-                            .map((t) => (
-                              <span
-                                key={t}
-                                className={cn(
-                                  "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm",
-                                  TOOL_TIER_CHIP[t] || TOOL_TIER_CHIP.ops,
-                                )}
-                              >
-                                {t}
-                              </span>
-                            ))
-                        )}
-                        {tool.core && (
-                          <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md bg-slate-100 border border-slate-200 text-slate-600 shadow-sm">
-                            ядро
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    <p className="text-[12.5px] font-medium text-gray-500 truncate">
-                      {tool.description}
-                    </p>
-                  </div>
-                  <div
-                    title="Инструмент подключён. Выборочное отключение появится вместе с субагентами."
-                    className="w-10 h-6 rounded-full flex items-center px-0.5 bg-indigo-500 shrink-0 cursor-default opacity-90"
-                  >
-                    <div className="w-5 h-5 rounded-full bg-white shadow-sm translate-x-4" />
-                  </div>
-                </div>
-              ))}
-              {!toolsLoading && filteredTools.length === 0 && (
-                <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">
-                  Ничего не найдено
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Knowledge & Skills */}
-          <div className="bg-slate-50/50 p-6 rounded-3xl border border-gray-100 flex flex-col h-[380px]">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-2 text-gray-900 font-bold text-[15px]">
-                <BookOpen className="w-5 h-5 text-indigo-500" />
-                Инструкции и Скиллы
-              </div>
-              <span className="text-[11px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-0.5 rounded-md border border-indigo-100">
-                {knowledgeItems.length} подключено
-              </span>
-            </div>
-
-            <div className="relative mb-4 shrink-0">
-              <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
-              <input
-                type="text"
-                placeholder="Умный поиск по базе знаний..."
-                value={searchKnowledge}
-                onChange={(e) => setSearchKnowledge(e.target.value)}
-                className="w-full pl-10 pr-4 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13.5px] font-medium focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all shadow-sm"
-              />
-            </div>
-
-            <div className="overflow-y-auto pr-2 space-y-2 flex-1 min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-              {knowledgeLoading && (
-                <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">
-                  Загрузка базы знаний…
-                </div>
-              )}
-              {filteredKnowledge.map((k) => (
-                <div
-                  key={k.id}
-                  title={k.description}
-                  className="flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm group"
-                >
-                  <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
-                    {k.type === "Скилл" ? "🔧" : "💬"}
-                  </div>
-                  <div className="flex-1 min-w-0 pr-4">
-                    <div className="flex items-center gap-2 mb-0.5">
-                      <span className="font-bold text-gray-900 text-[14px] truncate">
-                        {k.title}
-                      </span>
-                      <div className="gap-1.5 hidden sm:flex shrink-0">
-                        <span
-                          className={cn(
-                            "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm",
-                            k.type === "Скилл"
-                              ? "bg-slate-100 border-slate-200 text-slate-600"
-                              : "bg-indigo-50 border-indigo-100 text-indigo-600",
-                          )}
-                        >
-                          {k.type === "Скилл" ? "скилл" : "инструкция"}
-                        </span>
-                        {k.type === "Скилл" && k.custom && (
-                          <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md bg-emerald-50 border border-emerald-100 text-emerald-600 shadow-sm">
-                            свой · в github
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    <p className="text-[12.5px] font-medium text-gray-500 truncate">
-                      {k.description}
-                    </p>
-                  </div>
-                  <div
-                    title="Подключено у агента. Выборочный набор появится вместе с субагентами."
-                    className="w-6 h-6 rounded-md border flex items-center justify-center shrink-0 bg-indigo-500 border-indigo-500 text-white shadow-sm cursor-default"
-                  >
-                    <Check className="w-4 h-4" />
-                  </div>
-                </div>
-              ))}
-              {!knowledgeLoading && filteredKnowledge.length === 0 && (
-                <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">
-                  Ничего не найдено
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <AgentCapabilityPanel slug="main" version={0} />
-    </div>
-  );
-};
-
 const initials2 = (name: string) =>
   name
     .split(/\s+/)
@@ -639,7 +74,6 @@ const CreateAgentModal: React.FC<{
   onCreated: (slug: string, warnings: string[]) => void;
 }> = ({ onClose, onCreated }) => {
   const [name, setName] = useState("");
-  const [tier, setTier] = useState<AgentLevel>("faq");
   const [rolePrompt, setRolePrompt] = useState("");
   const [members, setMembers] = useState<BitrixUser[]>([]);
   const [users, setUsers] = useState<BitrixUser[]>([]);
@@ -667,7 +101,7 @@ const CreateAgentModal: React.FC<{
     }
     setBusy(true);
     setError("");
-    createAgent({ name: name.trim(), tier, role_prompt: rolePrompt.trim(), members: members.map((m) => m.id) })
+    createAgent({ name: name.trim(), tier: "ops", role_prompt: rolePrompt.trim(), members: members.map((m) => m.id) })
       .then((res) => onCreated(res.slug, res.warnings || []))
       .catch((e: Error) => setError(e.message))
       .finally(() => setBusy(false));
@@ -697,38 +131,6 @@ const CreateAgentModal: React.FC<{
             <p className="text-[11.5px] font-medium text-gray-400 mt-1.5">
               Bitrix-бот с этим именем зарегистрируется автоматически и появится в мессенджере портала.
             </p>
-          </div>
-
-          <div>
-            <label className="block text-sm font-bold text-gray-900 mb-2">Уровень доступа агента</label>
-            <div className="flex p-1 bg-gray-50/80 border border-gray-200/60 rounded-2xl shadow-sm">
-              {([
-                { v: "faq", label: "База знаний", hint: "только чтение — безопасно" },
-                { v: "ops", label: "Все функции", hint: "задачи, документы, действия" },
-                { v: "developer", label: "Разработчик", hint: "включая admin-инструменты" },
-              ] as const).map((t) => (
-                <button
-                  key={t.v}
-                  onClick={() => {
-                    if (t.v === "developer" && !window.confirm(
-                      "Уровень «Разработчик» открывает опасные admin-инструменты (удаление задач/отчётов, правка инструкций и настроек мозга всей компании). Давайте доступ к такому агенту только узкому кругу. Продолжить?",
-                    )) return;
-                    setTier(t.v);
-                  }}
-                  className={cn(
-                    "flex flex-col items-center justify-center py-2.5 rounded-xl transition-all flex-1",
-                    tier === t.v
-                      ? t.v === "developer"
-                        ? "bg-amber-500 text-white shadow-sm"
-                        : "bg-white text-gray-900 shadow-sm border border-gray-100"
-                      : "text-gray-500 hover:text-gray-700",
-                  )}
-                >
-                  <span className="font-bold text-[13px]">{t.label}</span>
-                  <span className={cn("text-[10.5px] font-medium", tier === t.v && t.v === "developer" ? "text-amber-50" : "text-gray-400")}>{t.hint}</span>
-                </button>
-              ))}
-            </div>
           </div>
 
           <div>
@@ -858,7 +260,12 @@ const AgentCapabilityPanel: React.FC<{ slug: string; version: number }> = ({ slu
   })();
 
   const toggleTool = (t: AgentConfigTool) => {
-    if (t.fixed || !t.allowed) return;
+    if (t.fixed) return;
+    const turningOn = !tools.has(t.name);
+    // Dangerous admin tools carry a confirm — the safety net that replaced the access level.
+    if (turningOn && t.class === "admin" && !window.confirm(
+      `«${t.name}» — опасный admin-инструмент (удаление данных / правка инструкций и настроек мозга всей компании). Включить его этому агенту?`,
+    )) return;
     setTools((prev) => {
       const next = new Set(prev);
       next.has(t.name) ? next.delete(t.name) : next.add(t.name);
@@ -921,15 +328,6 @@ const AgentCapabilityPanel: React.FC<{ slug: string; version: number }> = ({ slu
           </button>
         </div>
       </div>
-      {config.tier === "developer" && (
-        <div className="mb-4 flex items-start gap-2.5 p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-800">
-          <span className="text-lg leading-none mt-0.5">⚠️</span>
-          <p className="text-[12.5px] font-semibold leading-snug">
-            Уровень «Разработчик»: агенту можно включить <b>опасные admin-инструменты</b> (удаление задач/отчётов,
-            правка инструкций и настроек мозга всей компании). Держите доступ к такому агенту у узкого круга людей.
-          </p>
-        </div>
-      )}
       {error && <div className="text-[13px] font-bold text-rose-500 mb-4">{error}</div>}
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
@@ -957,15 +355,12 @@ const AgentCapabilityPanel: React.FC<{ slug: string; version: number }> = ({ slu
           <div className="overflow-y-auto pr-2 space-y-2 flex-1 min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
             {filteredTools.map((t) => {
               const on = tools.has(t.name);
-              const locked = t.fixed || !t.allowed;
+              const locked = t.fixed;
               return (
                 <div
                   key={t.name}
-                  title={!t.allowed ? "Admin-инструмент — доступен только на уровне «Разработчик»" : t.description}
-                  className={cn(
-                    "flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm",
-                    !t.allowed && "opacity-55",
-                  )}
+                  title={t.description}
+                  className="flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm"
                 >
                   <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
                     {toolIcon(t.name)}
@@ -989,15 +384,7 @@ const AgentCapabilityPanel: React.FC<{ slug: string; version: number }> = ({ slu
                   <button
                     onClick={() => toggleTool(t)}
                     disabled={locked}
-                    title={
-                      !t.allowed
-                        ? "Только для уровня «Разработчик»"
-                        : t.fixed
-                          ? "Базовый инструмент — всегда включён"
-                          : on
-                            ? "Отключить"
-                            : "Включить"
-                    }
+                    title={t.fixed ? "Базовый инструмент — всегда включён" : on ? "Отключить" : "Включить"}
                     className={cn(
                       "w-10 h-6 rounded-full flex items-center px-0.5 shrink-0 transition-colors",
                       on ? "bg-indigo-500" : "bg-gray-200",
@@ -1086,7 +473,10 @@ const AgentCapabilityPanel: React.FC<{ slug: string; version: number }> = ({ slu
   );
 };
 
-const SubagentEditor: React.FC<{
+// The single unified editor for EVERY agent — the universal (main) one and subagents alike.
+// Identical layout for all; only data differences (main can't be deleted, its team is the
+// company-wide agent_access) are branched on `detail.is_main`.
+const AgentEditor: React.FC<{
   slug: string;
   onChanged: () => void;
   onDeleted: () => void;
@@ -1190,21 +580,23 @@ const SubagentEditor: React.FC<{
               )}
             </div>
             <p className="text-sm text-gray-500 font-medium mt-1">
-              субагент · {LEVEL_LABELS[detail.tier].toLowerCase()} · самообучение включено
+              {detail.is_main ? "универсальный агент · для всех сотрудников" : "субагент · самообучение включено"}
             </p>
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <button
-            onClick={() => {
-              if (window.confirm(`Удалить агента «${detail.name}»? Бот в Bitrix будет разрегистрирован, его инструкции удалятся.`)) {
-                void run(() => deleteAgent(slug)).then(onDeleted);
-              }
-            }}
-            className="px-5 py-2.5 bg-white text-rose-600 border border-rose-200 rounded-xl text-sm font-bold hover:bg-rose-50 transition-all shadow-sm"
-          >
-            Удалить
-          </button>
+          {!detail.is_main && (
+            <button
+              onClick={() => {
+                if (window.confirm(`Удалить агента «${detail.name}»? Бот в Bitrix будет разрегистрирован, его инструкции удалятся.`)) {
+                  void run(() => deleteAgent(slug)).then(onDeleted);
+                }
+              }}
+              className="px-5 py-2.5 bg-white text-rose-600 border border-rose-200 rounded-xl text-sm font-bold hover:bg-rose-50 transition-all shadow-sm"
+            >
+              Удалить
+            </button>
+          )}
           <button
             onClick={() =>
               run(async () => {
@@ -1233,6 +625,18 @@ const SubagentEditor: React.FC<{
           </div>
 
           <div>
+            <label className="block text-sm font-bold text-gray-900 mb-2">Каналы связи</label>
+            <div className="flex gap-3">
+              <div className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-white border border-gray-200/80 text-gray-800 font-bold text-[13.5px] shadow-sm">
+                <MessageSquare className="w-4 h-4" /> Bitrix24
+              </div>
+              <div className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-gray-50 border border-dashed border-gray-200 text-gray-400 font-bold text-[13.5px]">
+                <Send className="w-4 h-4" /> Telegram
+              </div>
+            </div>
+          </div>
+
+          <div>
             <label className="block text-sm font-bold text-gray-900 mb-2">Роль и системный промпт</label>
             <textarea
               rows={6}
@@ -1240,41 +644,6 @@ const SubagentEditor: React.FC<{
               onChange={(e) => setRolePrompt(e.target.value)}
               className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-[13.5px] focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all resize-y font-medium leading-relaxed shadow-sm"
             />
-          </div>
-
-          <div>
-            <label className="block text-sm font-bold text-gray-900 mb-2">Уровень доступа</label>
-            <div className={cn("flex gap-2 flex-wrap", busy && "opacity-60 pointer-events-none")}>
-              {(["faq", "ops", "developer"] as AgentLevel[]).map((lvl) => (
-                <button
-                  key={lvl}
-                  onClick={() => {
-                    if (detail.tier === lvl) return;
-                    if (lvl === "developer" && !window.confirm(
-                      "Уровень «Разработчик» позволяет включить опасные admin-инструменты (удаление задач/отчётов, правка инструкций и настроек мозга всей компании). Давайте доступ к такому агенту только узкому кругу. Продолжить?",
-                    )) return;
-                    void run(async () => {
-                      await updateAgent(slug, { tier: lvl });
-                      setConfigVersion((v) => v + 1);
-                    }, true);
-                  }}
-                  className={cn(
-                    "px-4 py-2 rounded-xl text-[13px] font-bold border transition-all shadow-sm",
-                    detail.tier === lvl
-                      ? lvl === "developer"
-                        ? "bg-amber-500 border-amber-500 text-white"
-                        : "bg-indigo-600 border-indigo-600 text-white"
-                      : "bg-white border-gray-200 text-gray-600 hover:border-gray-300",
-                  )}
-                >
-                  {LEVEL_LABELS[lvl]}
-                </button>
-              ))}
-            </div>
-            <p className="text-[12px] font-medium text-gray-400 mt-2">
-              Пресет набора инструментов. «Разработчик» дополнительно открывает admin-инструменты. Точечно
-              инструменты настраиваются ниже в «Возможностях агента».
-            </p>
           </div>
 
           <div>
@@ -1565,24 +934,15 @@ export function AgentsView() {
         </div>
       </div>
 
-      {/* Right Content - Editor */}
+      {/* Right Content - Editor: one unified editor for every agent (universal + subagents) */}
       <div className="flex-1 min-w-0 h-full overflow-y-auto">
         {activeAgent ? (
-          activeAgent.isSystem ? (
-            <AgentEditor
-              key={activeAgent.id + activeAgent.name}
-              agent={activeAgent}
-              onToggleActive={() => setForceUpdate((prev) => prev + 1)}
-              onRenamed={() => void reloadAgents()}
-            />
-          ) : (
-            <SubagentEditor
-              key={activeAgent.id}
-              slug={activeAgent.id}
-              onChanged={() => void reloadAgents()}
-              onDeleted={() => void reloadAgents(true)}
-            />
-          )
+          <AgentEditor
+            key={activeAgent.id}
+            slug={activeAgent.id}
+            onChanged={() => void reloadAgents()}
+            onDeleted={() => void reloadAgents(true)}
+          />
         ) : (
           <div className="bg-white rounded-3xl shadow-sm border border-gray-200/60 flex items-center justify-center min-h-[400px] text-gray-400 text-[14px] font-medium">
             Загрузка агента…
