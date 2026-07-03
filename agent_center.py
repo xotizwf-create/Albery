@@ -244,9 +244,10 @@ def agent_center_agents():
         logging.exception("agent_center agents failed")
         return jsonify({"error": "Не удалось загрузить агентов."}), 500
     avg_ms = st.get("avg_latency_7d")
+    main_row = _agent_by_slug(MAIN_AGENT_SLUG)
     main_agent = {
         **_MAIN_AGENT_META,
-        "name": _main_bot_name() or _MAIN_AGENT_META["name"],
+        "name": _main_bot_name() or (main_row and main_row.get("name")) or _MAIN_AGENT_META["name"],
         "is_system": True,
         "is_active": True,
         "channels": ["Bitrix"],
@@ -1116,8 +1117,28 @@ def mgmt_list_agents() -> dict[str, Any]:
 
 @app.get("/api/agent-center/agents/<slug>")
 def agent_center_agent_detail(slug: str):
+    display_bot_id: Any = None
     if slug == MAIN_AGENT_SLUG:
         ensure_main_agent()
+        # The main bot pre-exists in Bitrix — its name/id there are the source of truth. Adopt the
+        # live name into the row (so app == Bitrix, e.g. «Агент Албери») and show the real bot id
+        # (the row keeps bitrix_bot_id NULL on purpose, so agent_for_bot_id never treats the main
+        # bot as a subagent). No register button then — the main bot is already registered.
+        live_name = _main_bot_name()
+        try:
+            from b24bot import _b24_load_state
+            display_bot_id = (_b24_load_state() or {}).get("bot_id")
+        except Exception:  # noqa: BLE001
+            logging.warning("main detail: bot id lookup failed", exc_info=True)
+        if live_name:
+            try:
+                with pg_connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE agents SET name = %s, updated_at = now()"
+                                    " WHERE slug = %s AND name <> %s", (live_name, MAIN_AGENT_SLUG, live_name))
+                _agent_cache_bust()
+            except Exception:  # noqa: BLE001
+                logging.exception("main detail: name self-heal failed")
     agent = _agent_by_slug(slug)
     if not agent:
         return jsonify({"error": "Агент не найден."}), 404
@@ -1132,7 +1153,7 @@ def agent_center_agent_detail(slug: str):
         "tier": agent["tier"],
         "is_main": slug == MAIN_AGENT_SLUG,
         "is_active": agent["is_active"],
-        "bitrix_bot_id": agent["bitrix_bot_id"],
+        "bitrix_bot_id": display_bot_id if slug == MAIN_AGENT_SLUG else agent["bitrix_bot_id"],
         "members": [
             {"id": uid, "name": names.get(uid, {}).get("name") or f"#{uid}"}
             for uid in member_ids
