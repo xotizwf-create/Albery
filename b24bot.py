@@ -986,6 +986,17 @@ def _b24_tier_for(from_user_id: Any) -> str:
     return tier if tier in ("admin", "ops", "faq", "none") else "faq"
 
 
+def _b24_main_allows(from_user_id: Any) -> bool:
+    """Access to the UNIVERSAL (main) agent is a strict allowlist = its «Команда и доступы»
+    (agent_access rows with a non-'none' tier). Anyone NOT in that list gets no answer — the
+    team list IS the access list (owner rule 2026-07-03). The bootstrap owner id(s) are always
+    allowed so nobody can lock themselves out by removing their own row."""
+    uid = to_int(from_user_id)
+    if uid in _b24_owner_user_ids():
+        return True
+    return _agent_access_map().get(uid) not in (None, "none")
+
+
 # --- Session lifecycle: 30-min idle reset + turn-cap rotation with carried summary ----
 # Hermes auto-compression is disabled on this box (it failed on codex), so we bound the
 # context ourselves: each Bitrix dialog maps to an epoch'd session. Idle >30 min starts a
@@ -2519,7 +2530,7 @@ def _bitrix_imbot_app_event():
         command_id = _imbot_scan(payload, "COMMAND_ID")
         cmd_user = _imbot_scan(payload, "USER_ID")
         cmd_denied = (
-            (_b24_tier_for(cmd_user) == "none") if agent is None else not _agent_allows(cmd_user)
+            (not _b24_main_allows(cmd_user)) if agent is None else not _agent_allows(cmd_user)
         )
         if cmd_dialog and cmd_user and cmd_denied:
             try:
@@ -2571,10 +2582,10 @@ def _bitrix_imbot_app_event():
             logging.exception("b24 testbot: image/reply/doc extras failed")
         if not dialog_id or (not message_text and not image_texts and not reply_text and not doc_blocks):
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
-        # Access gate: users explicitly set to 'none' (main agent) or outside a subagent's
-        # member list get a plain system notice (no model, no disclaimer, no buttons)
-        # instead of silence, so they know to request access.
-        denied = (_b24_tier_for(from_user_id) == "none") if agent is None else not _agent_allows(from_user_id)
+        # Access gate: the universal (main) agent answers ONLY its team (allowlist =
+        # non-'none' agent_access grants); a subagent answers only its member list. Everyone
+        # else gets a plain system notice (no model, no disclaimer) so they know to ask for access.
+        denied = (not _b24_main_allows(from_user_id)) if agent is None else not _agent_allows(from_user_id)
         if agent is not None and not agent.get("is_active", True):
             denied = True
         if denied:
