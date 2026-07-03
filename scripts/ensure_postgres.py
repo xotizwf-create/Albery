@@ -55,6 +55,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Idempotent: per-agent tool/instruction/skill config (tools_customized flag
     # + agent_knowledge_links link table).
     "038_agent_config.sql",
+    # Idempotent: add the 'developer' access level (drop/recreate tier CHECK).
+    "039_agent_developer_level.sql",
 ]
 
 

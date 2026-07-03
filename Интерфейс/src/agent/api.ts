@@ -110,11 +110,19 @@ const toAgent = (a: RawAgent): AgentConfig => ({
 
 // --- Subagents ---
 
+export type AgentLevel = "faq" | "ops" | "developer";
+
+export const LEVEL_LABELS: Record<AgentLevel, string> = {
+  faq: "База знаний",
+  ops: "Все функции",
+  developer: "Разработчик",
+};
+
 export interface AgentDetail {
   slug: string;
   name: string;
   role_prompt: string;
-  tier: "faq" | "ops";
+  tier: AgentLevel;
   is_active: boolean;
   bitrix_bot_id: number | null;
   members: Array<{ id: number; name: string }>;
@@ -123,7 +131,7 @@ export interface AgentDetail {
 
 export async function createAgent(body: {
   name: string;
-  tier: "faq" | "ops";
+  tier: AgentLevel;
   role_prompt: string;
   members: number[];
 }): Promise<{ slug: string; bitrix_bot_id: number | null; warnings: string[] }> {
@@ -177,9 +185,11 @@ export interface AgentConfigTool {
   name: string;
   description: string;
   tiers: string[];
+  class: "faq" | "ops" | "admin"; // admin = owner-only/dangerous
   core: boolean;
   fixed: boolean; // mandatory baseline — always on, cannot be disabled
   enabled: boolean;
+  allowed: boolean; // false = this level may not hold it (admin tool on a non-developer)
 }
 
 export interface AgentConfigKnowledge {
@@ -193,9 +203,10 @@ export interface AgentConfigKnowledge {
 
 export interface AgentCapabilityConfig {
   slug: string;
-  tier: "faq" | "ops";
+  tier: AgentLevel;
   tools_customized: boolean;
   tools: AgentConfigTool[];
+  tools_total: number;
   instructions: AgentConfigKnowledge[];
   skills: AgentConfigKnowledge[];
 }

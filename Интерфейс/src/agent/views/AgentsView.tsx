@@ -19,7 +19,9 @@ import {
   AgentConfigKnowledge,
   AgentConfigTool,
   AgentDetail,
+  AgentLevel,
   BitrixUser,
+  LEVEL_LABELS,
   McpTool,
   TIER_LABELS,
   addAgentInstruction,
@@ -635,7 +637,7 @@ const CreateAgentModal: React.FC<{
   onCreated: (slug: string, warnings: string[]) => void;
 }> = ({ onClose, onCreated }) => {
   const [name, setName] = useState("");
-  const [tier, setTier] = useState<"faq" | "ops">("faq");
+  const [tier, setTier] = useState<AgentLevel>("faq");
   const [rolePrompt, setRolePrompt] = useState("");
   const [members, setMembers] = useState<BitrixUser[]>([]);
   const [users, setUsers] = useState<BitrixUser[]>([]);
@@ -699,19 +701,29 @@ const CreateAgentModal: React.FC<{
             <label className="block text-sm font-bold text-gray-900 mb-2">Уровень доступа агента</label>
             <div className="flex p-1 bg-gray-50/80 border border-gray-200/60 rounded-2xl shadow-sm">
               {([
-                { v: "faq", label: "Доступ к базе знаний", hint: "только чтение и ответы — безопасно" },
-                { v: "ops", label: "Доступ ко всем функциям", hint: "задачи, документы, действия" },
+                { v: "faq", label: "База знаний", hint: "только чтение — безопасно" },
+                { v: "ops", label: "Все функции", hint: "задачи, документы, действия" },
+                { v: "developer", label: "Разработчик", hint: "включая admin-инструменты" },
               ] as const).map((t) => (
                 <button
                   key={t.v}
-                  onClick={() => setTier(t.v)}
+                  onClick={() => {
+                    if (t.v === "developer" && !window.confirm(
+                      "Уровень «Разработчик» открывает опасные admin-инструменты (удаление задач/отчётов, правка инструкций и настроек мозга всей компании). Давайте доступ к такому агенту только узкому кругу. Продолжить?",
+                    )) return;
+                    setTier(t.v);
+                  }}
                   className={cn(
                     "flex flex-col items-center justify-center py-2.5 rounded-xl transition-all flex-1",
-                    tier === t.v ? "bg-white text-gray-900 shadow-sm border border-gray-100" : "text-gray-500 hover:text-gray-700",
+                    tier === t.v
+                      ? t.v === "developer"
+                        ? "bg-amber-500 text-white shadow-sm"
+                        : "bg-white text-gray-900 shadow-sm border border-gray-100"
+                      : "text-gray-500 hover:text-gray-700",
                   )}
                 >
-                  <span className="font-bold text-[13.5px]">{t.label}</span>
-                  <span className="text-[10.5px] font-medium text-gray-400">{t.hint}</span>
+                  <span className="font-bold text-[13px]">{t.label}</span>
+                  <span className={cn("text-[10.5px] font-medium", tier === t.v && t.v === "developer" ? "text-amber-50" : "text-gray-400")}>{t.hint}</span>
                 </button>
               ))}
             </div>
@@ -805,7 +817,7 @@ const CreateAgentModal: React.FC<{
 // checklists, all backed by /api/agent-center/agents/<slug>/config. A disabled tool is
 // removed from the agent's connector; an unselected instruction/skill is never injected
 // into its turn. Mandatory (fixed) tools are shown locked-on.
-const AgentCapabilityPanel: React.FC<{ slug: string }> = ({ slug }) => {
+const AgentCapabilityPanel: React.FC<{ slug: string; version: number }> = ({ slug, version }) => {
   const [config, setConfig] = useState<AgentCapabilityConfig | null>(null);
   const [tools, setTools] = useState<Set<string>>(new Set<string>());
   const [instr, setInstr] = useState<Set<string>>(new Set<string>());
@@ -825,7 +837,7 @@ const AgentCapabilityPanel: React.FC<{ slug: string }> = ({ slug }) => {
         setSkills(new Set(c.skills.filter((s) => s.selected).map((s) => s.id)));
       })
       .catch((e: Error) => setError(e.message));
-  }, [slug]);
+  }, [slug, version]);
 
   if (!config) {
     return (
@@ -844,7 +856,7 @@ const AgentCapabilityPanel: React.FC<{ slug: string }> = ({ slug }) => {
   })();
 
   const toggleTool = (t: AgentConfigTool) => {
-    if (t.fixed) return;
+    if (t.fixed || !t.allowed) return;
     setTools((prev) => {
       const next = new Set(prev);
       next.has(t.name) ? next.delete(t.name) : next.add(t.name);
@@ -893,7 +905,7 @@ const AgentCapabilityPanel: React.FC<{ slug: string }> = ({ slug }) => {
           <h3 className="text-[15px] font-bold text-gray-900">Возможности агента</h3>
           <p className="text-[12.5px] font-medium text-gray-500 mt-0.5">
             Что агент видит и чем может пользоваться. Отключённое недоступно ему физически. Уровень:{" "}
-            {config.tier === "ops" ? "все функции" : "база знаний"}.
+            {LEVEL_LABELS[config.tier]}.
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -907,6 +919,15 @@ const AgentCapabilityPanel: React.FC<{ slug: string }> = ({ slug }) => {
           </button>
         </div>
       </div>
+      {config.tier === "developer" && (
+        <div className="mb-4 flex items-start gap-2.5 p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-800">
+          <span className="text-lg leading-none mt-0.5">⚠️</span>
+          <p className="text-[12.5px] font-semibold leading-snug">
+            Уровень «Разработчик»: агенту можно включить <b>опасные admin-инструменты</b> (удаление задач/отчётов,
+            правка инструкций и настроек мозга всей компании). Держите доступ к такому агенту у узкого круга людей.
+          </p>
+        </div>
+      )}
       {error && <div className="text-[13px] font-bold text-rose-500 mb-4">{error}</div>}
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
@@ -918,7 +939,7 @@ const AgentCapabilityPanel: React.FC<{ slug: string }> = ({ slug }) => {
               Инструменты (MCP)
             </div>
             <span className="text-[11px] font-bold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-md border border-emerald-100">
-              {tools.size} из {config.tools.length}
+              {tools.size} из {config.tools_total}
             </span>
           </div>
           <div className="relative mb-4 shrink-0">
@@ -934,11 +955,15 @@ const AgentCapabilityPanel: React.FC<{ slug: string }> = ({ slug }) => {
           <div className="overflow-y-auto pr-2 space-y-2 flex-1 min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
             {filteredTools.map((t) => {
               const on = tools.has(t.name);
+              const locked = t.fixed || !t.allowed;
               return (
                 <div
                   key={t.name}
-                  title={t.description}
-                  className="flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm"
+                  title={!t.allowed ? "Admin-инструмент — доступен только на уровне «Разработчик»" : t.description}
+                  className={cn(
+                    "flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm",
+                    !t.allowed && "opacity-55",
+                  )}
                 >
                   <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
                     {toolIcon(t.name)}
@@ -946,6 +971,11 @@ const AgentCapabilityPanel: React.FC<{ slug: string }> = ({ slug }) => {
                   <div className="flex-1 min-w-0 pr-4">
                     <div className="flex items-center gap-2 mb-0.5">
                       <span className="font-bold text-gray-900 text-[14px] truncate">{t.name}</span>
+                      {t.class === "admin" && (
+                        <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md bg-amber-50 border border-amber-100 text-amber-600 shadow-sm shrink-0">
+                          admin
+                        </span>
+                      )}
                       {t.fixed && (
                         <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md bg-slate-100 border border-slate-200 text-slate-600 shadow-sm shrink-0">
                           базовый
@@ -956,12 +986,20 @@ const AgentCapabilityPanel: React.FC<{ slug: string }> = ({ slug }) => {
                   </div>
                   <button
                     onClick={() => toggleTool(t)}
-                    disabled={t.fixed}
-                    title={t.fixed ? "Базовый инструмент — всегда включён" : on ? "Отключить" : "Включить"}
+                    disabled={locked}
+                    title={
+                      !t.allowed
+                        ? "Только для уровня «Разработчик»"
+                        : t.fixed
+                          ? "Базовый инструмент — всегда включён"
+                          : on
+                            ? "Отключить"
+                            : "Включить"
+                    }
                     className={cn(
                       "w-10 h-6 rounded-full flex items-center px-0.5 shrink-0 transition-colors",
                       on ? "bg-indigo-500" : "bg-gray-200",
-                      t.fixed ? "cursor-default opacity-70" : "cursor-pointer",
+                      locked ? "cursor-not-allowed opacity-70" : "cursor-pointer",
                     )}
                   >
                     <div className={cn("w-5 h-5 rounded-full bg-white shadow-sm transition-transform", on && "translate-x-4")} />
@@ -1062,6 +1100,7 @@ const SubagentEditor: React.FC<{
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
+  const [configVersion, setConfigVersion] = useState(0);
 
   const load = () =>
     fetchAgentDetail(slug)
@@ -1149,7 +1188,7 @@ const SubagentEditor: React.FC<{
               )}
             </div>
             <p className="text-sm text-gray-500 font-medium mt-1">
-              субагент · {detail.tier === "ops" ? "все функции" : "база знаний"} · самообучение включено
+              субагент · {LEVEL_LABELS[detail.tier].toLowerCase()} · самообучение включено
             </p>
           </div>
         </div>
@@ -1199,6 +1238,41 @@ const SubagentEditor: React.FC<{
               onChange={(e) => setRolePrompt(e.target.value)}
               className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-[13.5px] focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all resize-y font-medium leading-relaxed shadow-sm"
             />
+          </div>
+
+          <div>
+            <label className="block text-sm font-bold text-gray-900 mb-2">Уровень доступа</label>
+            <div className={cn("flex gap-2 flex-wrap", busy && "opacity-60 pointer-events-none")}>
+              {(["faq", "ops", "developer"] as AgentLevel[]).map((lvl) => (
+                <button
+                  key={lvl}
+                  onClick={() => {
+                    if (detail.tier === lvl) return;
+                    if (lvl === "developer" && !window.confirm(
+                      "Уровень «Разработчик» позволяет включить опасные admin-инструменты (удаление задач/отчётов, правка инструкций и настроек мозга всей компании). Давайте доступ к такому агенту только узкому кругу. Продолжить?",
+                    )) return;
+                    void run(async () => {
+                      await updateAgent(slug, { tier: lvl });
+                      setConfigVersion((v) => v + 1);
+                    }, true);
+                  }}
+                  className={cn(
+                    "px-4 py-2 rounded-xl text-[13px] font-bold border transition-all shadow-sm",
+                    detail.tier === lvl
+                      ? lvl === "developer"
+                        ? "bg-amber-500 border-amber-500 text-white"
+                        : "bg-indigo-600 border-indigo-600 text-white"
+                      : "bg-white border-gray-200 text-gray-600 hover:border-gray-300",
+                  )}
+                >
+                  {LEVEL_LABELS[lvl]}
+                </button>
+              ))}
+            </div>
+            <p className="text-[12px] font-medium text-gray-400 mt-2">
+              Пресет набора инструментов. «Разработчик» дополнительно открывает admin-инструменты. Точечно
+              инструменты настраиваются ниже в «Возможностях агента».
+            </p>
           </div>
 
           <div>
@@ -1358,7 +1432,7 @@ const SubagentEditor: React.FC<{
         </div>
       </div>
 
-      <AgentCapabilityPanel slug={slug} />
+      <AgentCapabilityPanel slug={slug} version={configVersion} />
     </div>
   );
 };

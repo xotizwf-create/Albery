@@ -282,7 +282,7 @@ def agent_center_agents():
             agents.append({
                 "id": a["slug"],
                 "name": a["name"],
-                "kind": f"субагент • {'все функции' if a['tier'] == 'ops' else 'база знаний'}",
+                "kind": f"субагент • {_LEVEL_LABELS.get(a['tier'], 'база знаний')}",
                 "icon": "box",
                 "icon_bg": "bg-blue-100 text-blue-500",
                 "is_system": False,
@@ -719,6 +719,11 @@ _AGENT_INSTRUCTION_CHARS_MAX = 8000
 _AGENT_CACHE: dict[str, Any] = {"at": 0.0, "by_bot": {}, "by_slug": {}}
 _AGENT_COLORS = ("GREEN", "MINT", "PINK", "ORANGE", "PURPLE", "AQUA", "LIGHT_BLUE", "GRAY")
 
+# Access levels are presets + the owner-only-tools gate (see _agent_allowed_pool), not a
+# hard tool cap. 'developer' = может держать опасные admin-инструменты.
+AGENT_LEVELS = ("faq", "ops", "developer")
+_LEVEL_LABELS = {"faq": "база знаний", "ops": "все функции", "developer": "разработчик"}
+
 _TRANSLIT = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z",
     "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
@@ -928,8 +933,8 @@ def agent_center_create_agent():
     if not name or len(name) > 60:
         return jsonify({"error": "Укажите имя агента (до 60 символов)."}), 400
     tier = str(body.get("tier") or "faq").strip()
-    if tier not in ("faq", "ops"):
-        return jsonify({"error": "Уровень должен быть faq или ops."}), 400
+    if tier not in AGENT_LEVELS:
+        return jsonify({"error": "Уровень должен быть faq, ops или developer."}), 400
     role_prompt = str(body.get("role_prompt") or "").strip()[:4000]
     members = [int(m) for m in (body.get("members") or []) if str(m).strip().isdigit()]
     slug = _agent_slug(name)
@@ -1040,7 +1045,7 @@ def agent_center_agent_update(slug: str):
                 if "role_prompt" in body:
                     cur.execute("UPDATE agents SET role_prompt = %s, updated_at = now() WHERE slug = %s",
                                 (str(body["role_prompt"] or "").strip()[:4000], slug))
-                if "tier" in body and str(body["tier"]) in ("faq", "ops"):
+                if "tier" in body and str(body["tier"]) in AGENT_LEVELS:
                     cur.execute("UPDATE agents SET tier = %s, updated_at = now() WHERE slug = %s",
                                 (str(body["tier"]), slug))
                 if "is_active" in body:
@@ -1194,24 +1199,40 @@ def agent_center_agent_config(slug: str):
     if not agent:
         return jsonify({"error": "Агент не найден."}), 404
     try:
-        from mcp.context_server import CORE_TOOL_NAMES, FAQ_TOOL_NAMES, OPS_TOOL_NAMES, TOOLS
+        from mcp.context_server import (
+            CORE_TOOL_NAMES,
+            FAQ_TOOL_NAMES,
+            OPS_TOOL_NAMES,
+            OWNER_ONLY_TOOL_NAMES,
+            TOOLS,
+        )
     except Exception:  # noqa: BLE001
         logging.exception("agent config: context_server import failed")
         return jsonify({"error": "Не удалось загрузить инструменты."}), 500
-    base = _agent_tier_base(agent)
-    enabled = _agent_tool_names(agent)  # effective set the connector serves
-    fixed = MANDATORY_AGENT_TOOLS & base
+    pool = _agent_allowed_pool(agent)          # what this level may hold
+    enabled = _agent_tool_names(agent)          # effective set the connector serves
+    fixed = MANDATORY_AGENT_TOOLS & pool
+    # The whole registry — the level is a preset, not a cap. Tools outside the level's
+    # allowed pool (owner-only for non-developers) are shown but locked (allowed=false).
     tools = []
-    for name in sorted(base):
+    for name in sorted(TOOLS):
         spec = TOOLS.get(name, {})
         desc = re.sub(r"\s+", " ", str(spec.get("description") or "")).strip()
         first = desc.split(". ")[0].strip()
         short = first if 0 < len(first) <= 200 else desc[:180].rstrip() + ("…" if len(desc) > 180 else "")
+        # Privilege class of the tool itself (for chips/lock): admin = owner-only/dangerous.
+        if name in OWNER_ONLY_TOOL_NAMES:
+            cls = "admin"
+        elif name in FAQ_TOOL_NAMES:
+            cls = "faq"
+        else:
+            cls = "ops"
         tiers = ["admin"] + (["ops"] if name in OPS_TOOL_NAMES else []) + (["faq"] if name in FAQ_TOOL_NAMES else [])
         tools.append({
-            "name": name, "description": short, "tiers": tiers,
+            "name": name, "description": short, "tiers": tiers, "class": cls,
             "core": name in CORE_TOOL_NAMES,
             "fixed": name in fixed, "enabled": name in enabled,
+            "allowed": name in pool,
         })
     sel_instr = agent.get("linked_instruction_ids") or set()
     instructions = [
@@ -1230,6 +1251,7 @@ def agent_center_agent_config(slug: str):
         "tier": agent["tier"],
         "tools_customized": bool(agent.get("tools_customized")),
         "tools": tools,
+        "tools_total": len(TOOLS),
         "instructions": instructions,
         "skills": skills,
     })
@@ -1245,11 +1267,12 @@ def agent_center_agent_config_save(slug: str):
     if not agent:
         return jsonify({"error": "Агент не найден."}), 404
     body = request.get_json(silent=True) or {}
-    base = _agent_tier_base(agent)
-    fixed = MANDATORY_AGENT_TOOLS & base
-    # Tools: keep only real tier tools; the mandatory baseline is always included.
+    pool = _agent_allowed_pool(agent)
+    fixed = MANDATORY_AGENT_TOOLS & pool
+    # Tools: keep only what this level is allowed to hold (owner-only tools are dropped
+    # for non-developers); the mandatory baseline is always included.
     requested_tools = {str(t) for t in (body.get("tools") or []) if str(t)}
-    enabled_tools = sorted((requested_tools & base) | fixed)
+    enabled_tools = sorted((requested_tools & pool) | fixed)
     valid_instr = {i["id"] for i in _library_instructions()}
     valid_skills = {s["id"] for s in _hermes_skills()}
     instr_ids = sorted({str(x) for x in (body.get("instructions") or [])} & valid_instr)
@@ -1417,23 +1440,44 @@ MANDATORY_AGENT_TOOLS: set[str] = {
 }
 
 
-def _agent_tier_base(agent: dict[str, Any]) -> set[str]:
-    from mcp.context_server import FAQ_TOOL_NAMES, OPS_TOOL_NAMES
-    return set(OPS_TOOL_NAMES) if agent["tier"] == "ops" else set(FAQ_TOOL_NAMES)
+def _agent_allowed_pool(agent: dict[str, Any]) -> set[str]:
+    """The tools an agent of this LEVEL is permitted to be given at all. Any agent may
+    be given any tool from the full registry EXCEPT the owner-only/dangerous ones
+    (delete task/report, edit the company brain's instructions/settings, management
+    monitoring) — those require the 'developer' level. This is the security boundary;
+    below it, tool selection is free."""
+    from mcp.context_server import OWNER_ONLY_TOOL_NAMES, TOOLS
+    pool = set(TOOLS)
+    if agent.get("tier") == "developer":
+        return pool
+    return pool - set(OWNER_ONLY_TOOL_NAMES)
+
+
+def _agent_preset_default(agent: dict[str, Any]) -> set[str]:
+    """Enabled set for an agent that was never customized — seeded from the level preset:
+    база знаний → read-only faq set, все функции → operational set, разработчик → everything."""
+    from mcp.context_server import FAQ_TOOL_NAMES, OPS_TOOL_NAMES, TOOLS
+    tier = agent.get("tier")
+    if tier == "developer":
+        return set(TOOLS)
+    if tier == "ops":
+        return set(OPS_TOOL_NAMES)
+    return set(FAQ_TOOL_NAMES)
 
 
 def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
-    """Tools the agent's connector actually serves. Default (never customized) =
-    the full tier set. Once customized, only the enabled whitelist is served, but
-    the mandatory baseline is always forced on. This is the hard gate: tools/list
-    over the connector returns exactly this set, so a disabled tool is invisible
-    and uncallable regardless of the prompt."""
-    base = _agent_tier_base(agent)
-    fixed = MANDATORY_AGENT_TOOLS & base
+    """Tools the agent's connector actually serves. Selection is from the FULL registry
+    (the level is a preset, not a cap), but always intersected with the level's allowed
+    pool so a non-developer agent can never end up holding an owner-only tool, and the
+    mandatory baseline is always forced on. Default (never customized) = the level preset.
+    This is the hard gate: tools/list over the connector returns exactly this set, so a
+    disabled tool is invisible and uncallable regardless of the prompt."""
+    pool = _agent_allowed_pool(agent)
+    fixed = MANDATORY_AGENT_TOOLS & pool
     if agent.get("tools_customized"):
         whitelist = {t for t in (agent.get("tools") or []) if t}
-        return fixed | (base & whitelist)
-    return base
+        return fixed | (whitelist & pool)
+    return (_agent_preset_default(agent) & pool) | fixed
 
 
 def _mcp_agent_auth(slug: str, path_token: str | None) -> dict[str, Any] | None:
