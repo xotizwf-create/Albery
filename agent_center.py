@@ -121,13 +121,27 @@ def agent_center_dialogs():
     if channel == "telegram":
         return jsonify({"dialogs": [], "note": "Telegram-переписка появится после моста с Hermes."})
     q = (request.args.get("q") or "").strip()
+    # Each bot keeps its OWN dialog history — do not pool them. Subagent turns carry
+    # agent_slug=<slug>; the universal/main agent's turns have agent_slug IS NULL.
+    # agent="all" (or absent) = no filter; agent=<slug>/"main" = only that bot's dialogs.
+    agent = (request.args.get("agent") or "all").strip()
+    agent_filter = ""
+    agent_params: list[Any] = []
+    if agent and agent != "all":
+        if agent == MAIN_AGENT_SLUG:
+            agent_filter = " AND agent_slug IS NULL"
+        else:
+            agent_filter = " AND agent_slug = %s"
+            agent_params = [agent]
     limit = _limit_arg(_DIALOGS_LIMIT_DEFAULT, 500)
-    sql = """
+    # A dialog_id is bot-specific (one chat = one bot), so filtering the `last` CTE is
+    # enough; the join then constrains `agg` and the search subquery to the same bot.
+    sql = f"""
         WITH last AS (
             SELECT DISTINCT ON (dialog_id)
-                   dialog_id, bitrix_user_id, tier, question, status, created_at
+                   dialog_id, bitrix_user_id, tier, question, status, created_at, agent_slug
             FROM bitrix_bot_interactions
-            WHERE dialog_id IS NOT NULL
+            WHERE dialog_id IS NOT NULL{agent_filter}
             ORDER BY dialog_id, id DESC
         ),
         agg AS (
@@ -139,11 +153,11 @@ def agent_center_dialogs():
             WHERE dialog_id IS NOT NULL
             GROUP BY dialog_id
         )
-        SELECT l.dialog_id, l.bitrix_user_id, l.tier, l.question, l.status,
+        SELECT l.dialog_id, l.bitrix_user_id, l.tier, l.question, l.status, l.agent_slug,
                a.turns, a.errors, a.last_at
         FROM last l JOIN agg a USING (dialog_id)
     """
-    params: list[Any] = []
+    params: list[Any] = list(agent_params)
     if q:
         sql += (
             " WHERE l.dialog_id IN (SELECT DISTINCT dialog_id FROM bitrix_bot_interactions"
@@ -172,6 +186,7 @@ def agent_center_dialogs():
                 "user_name": info.get("name") or (f"Сотрудник #{uid}" if uid else "Сотрудник"),
                 "user_position": info.get("position") or "",
                 "tier": r["tier"] or "faq",
+                "agent_slug": r["agent_slug"] or MAIN_AGENT_SLUG,
                 "last_message": preview,
                 "last_status": r["status"],
                 "turns": int(r["turns"]),
@@ -236,7 +251,9 @@ def agent_center_agents():
                     " COUNT(*) FILTER (WHERE status <> 'ok' AND created_at >= %s) AS errors_7d,"
                     " AVG(latency_ms) FILTER (WHERE created_at >= %s AND latency_ms IS NOT NULL) AS avg_latency_7d,"
                     " MAX(created_at) AS last_at"
-                    " FROM bitrix_bot_interactions",
+                    # main card = the universal agent only; subagent turns (agent_slug set)
+                    # belong to their own cards, so keep the counts unmixed here too.
+                    " FROM bitrix_bot_interactions WHERE agent_slug IS NULL",
                     (day_start, week_start, week_start, week_start),
                 )
                 st = dict(cur.fetchone() or {})

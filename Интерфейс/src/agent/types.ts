@@ -2,6 +2,7 @@ export type TabType = 'analytics' | 'wb' | 'zoom' | 'team' | 'dialogs' | 'agents
 
 export interface Chat {
   id: string;
+  agentId: string; // which bot this dialog belongs to ('main' or a subagent slug)
   userName: string;
   userRole: string;
   avatarInitials: string;

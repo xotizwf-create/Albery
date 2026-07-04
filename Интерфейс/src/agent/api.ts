@@ -24,6 +24,7 @@ interface RawDialog {
   user_name: string;
   user_position: string;
   tier: string;
+  agent_slug: string | null;
   last_message: string;
   last_status: string;
   turns: number;
@@ -76,6 +77,7 @@ const avatarColor = (key: string) => {
 
 const toChat = (d: RawDialog): Chat => ({
   id: d.dialog_id,
+  agentId: d.agent_slug || "main",
   userName: d.user_name,
   userRole: d.user_position || `диалог ${d.dialog_id}`,
   avatarInitials: initials(d.user_name),
@@ -261,9 +263,14 @@ export async function setInstructionScope(path: string, scope: "universal" | "op
   );
 }
 
-export async function fetchAgentDialogs(params: { channel: string; q?: string }): Promise<{ chats: Chat[]; note?: string }> {
+export async function fetchAgentDialogs(params: { channel: string; q?: string; agent?: string }): Promise<{
+  chats: Chat[];
+  note?: string;
+}> {
   const search = new URLSearchParams({ channel: params.channel.toLowerCase() });
   if (params.q) search.set("q", params.q);
+  // Per-agent isolation: "all" = every bot; otherwise only the selected bot's dialogs.
+  if (params.agent && params.agent !== "all") search.set("agent", params.agent);
   const data = await fetchJsonSafe(`/api/agent-center/dialogs?${search}`, undefined, 30000);
   return { chats: ((data.dialogs || []) as RawDialog[]).map(toChat), note: data.note };
 }

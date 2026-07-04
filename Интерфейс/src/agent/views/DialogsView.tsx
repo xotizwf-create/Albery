@@ -73,12 +73,19 @@ export function DialogsView() {
     fetchAgents().then(setAgents).catch(() => setAgents([]));
   }, []);
 
+  // Switching the selected bot: drop the open dialog and the previous list so one bot's
+  // conversation can never linger under another; the fetch effect reloads this bot's own.
+  useEffect(() => {
+    setActiveChatId(null);
+    setChats([]);
+  }, [activeAgentId]);
+
   useEffect(() => {
     let cancelled = false;
     const timer = window.setTimeout(() => {
       setChatsLoading(true);
       setError("");
-      fetchAgentDialogs({ channel, q: query })
+      fetchAgentDialogs({ channel, q: query, agent: activeAgentId })
         .then(({ chats: loaded, note }) => {
           if (cancelled) return;
           setChats(loaded);
@@ -95,10 +102,10 @@ export function DialogsView() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [channel, query]);
+  }, [channel, query, activeAgentId]);
 
-  // A single live agent today, so the agents pane is a selector for the future
-  // multi-agent case; only the tag chips actually narrow the list.
+  // The agents pane narrows the list to one bot server-side (each bot has its own
+  // dialog history — never pooled); here only the tag chips narrow it further.
   const visibleChats = useMemo(
     () =>
       chats.filter((c) => {
@@ -159,12 +166,12 @@ export function DialogsView() {
   // Live refresh of the dialog list (new dialogs / previews / error tags).
   useEffect(() => {
     const timer = window.setInterval(() => {
-      fetchAgentDialogs({ channel, q: query })
+      fetchAgentDialogs({ channel, q: query, agent: activeAgentId })
         .then(({ chats: loaded }) => setChats(loaded))
         .catch(() => {});
     }, 20000);
     return () => window.clearInterval(timer);
-  }, [channel, query]);
+  }, [channel, query, activeAgentId]);
 
   const agentIcon = (iconType: AgentConfig["iconType"]) =>
     iconType === "zap" ? Zap : iconType === "book" ? BookOpen : iconType === "crown" ? Crown : Package;
