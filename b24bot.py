@@ -2746,16 +2746,19 @@ def _bitrix_imbot_app_event():
         if _b24_is_reset_command(message_text):
             _b24_do_reset(endpoint, access_token, bot_id, dialog_id, message_id)
             return jsonify({"ok": True, "event": event_name, "reset": True})
-        # Read signal: 👀 reaction + typing indicator, then run the agent in the background.
-        _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
-        _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
-        threading.Thread(
-            target=_b24_app_process,
-            args=(endpoint, access_token, bot_id, dialog_id,
-                  _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks), message_id, from_user_id),
-            kwargs={"agent": agent},
-            daemon=True,
-        ).start()
+        # Return to Bitrix immediately. Even cosmetic pre-processing calls (reaction/typing)
+        # can hang during Bitrix/network degradation; if they run before the HTTP response,
+        # Bitrix retries or drops the webhook. Do those signals inside the background worker.
+        def _process_message_async() -> None:
+            _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
+            _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
+            _b24_app_process(
+                endpoint, access_token, bot_id, dialog_id,
+                _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks),
+                message_id, from_user_id, agent=agent,
+            )
+
+        threading.Thread(target=_process_message_async, daemon=True).start()
         return jsonify({"ok": True, "event": event_name, "accepted": True})
 
     return jsonify({"ok": True, "event": event_name, "ignored": True}), 200
