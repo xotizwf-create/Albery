@@ -1446,44 +1446,162 @@ def _b24_text_to_xlsx(title: str, text: str) -> bytes:
 
 
 def _b24_text_to_docx(title: str, text: str) -> bytes:
-    """Build a real .docx: headings, bullets, paragraphs (bold runs), and pipe tables become Word tables."""
+    """Build a real .docx.
+
+    Ordinary files keep the compact answer-style layout. Contracts and other official/legal
+    documents are formatted as a clean Russian business document: A4, GOST-like margins,
+    Times New Roman, 14 pt, 1.5 spacing, justified paragraphs and first-line indent.
+    """
     import io as _io
     from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Cm, Pt, RGBColor
+
+    def is_official_doc(name: str, body: str) -> bool:
+        hay = (str(name or "") + "\n" + str(body or "")).lower()
+        return bool(re.search(r"\b(договор|соглашение|акт|контракт|оферт|гост)\b", hay, flags=re.I))
+
+    official = is_official_doc(title, text)
     doc = Document()
-    if title:
+
+    def set_run_font(run, *, size=14, bold=None):
+        run.font.name = "Times New Roman"
+        run._element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
+        run.font.size = Pt(size)
+        run.font.color.rgb = RGBColor(0, 0, 0)
+        if bold is not None:
+            run.bold = bold
+
+    def apply_paragraph_format(p, *, align=None, first_line=True, space_after=0):
+        pf = p.paragraph_format
+        pf.space_before = Pt(0)
+        pf.space_after = Pt(space_after)
+        pf.line_spacing = 1.5 if official else 1.15
+        if official:
+            pf.first_line_indent = Cm(1.25) if first_line else Cm(0)
+        if align is not None:
+            p.alignment = align
+        elif official:
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+    def add_runs(p, line: str, *, force_bold=False, size=14):
+        for seg, isb in _b24_bold_segments(line):
+            run = p.add_run(seg)
+            set_run_font(run, size=size, bold=(force_bold or isb))
+
+    def set_cell_text(cell, value: str, *, header=False):
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        cell.text = ""
+        p = cell.paragraphs[0]
+        apply_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.CENTER if header else WD_ALIGN_PARAGRAPH.LEFT,
+                               first_line=False, space_after=0)
+        run = p.add_run(_b24_plain(value))
+        set_run_font(run, size=12 if official else 11, bold=header)
+
+    def set_table_borders(table):
+        tbl = table._tbl
+        tblPr = tbl.tblPr
+        borders = tblPr.first_child_found_in("w:tblBorders")
+        if borders is None:
+            borders = OxmlElement("w:tblBorders")
+            tblPr.append(borders)
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            tag = "w:" + edge
+            elem = borders.find(qn(tag))
+            if elem is None:
+                elem = OxmlElement(tag)
+                borders.append(elem)
+            elem.set(qn("w:val"), "single")
+            elem.set(qn("w:sz"), "6")
+            elem.set(qn("w:space"), "0")
+            elem.set(qn("w:color"), "000000")
+
+    if official:
+        section = doc.sections[0]
+        section.page_width = Cm(21)
+        section.page_height = Cm(29.7)
+        section.left_margin = Cm(3)
+        section.right_margin = Cm(1)
+        section.top_margin = Cm(2)
+        section.bottom_margin = Cm(2)
+        for style_name in ("Normal", "Body Text"):
+            try:
+                style = doc.styles[style_name]
+                style.font.name = "Times New Roman"
+                style._element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
+                style.font.size = Pt(14)
+            except Exception:  # noqa: BLE001
+                pass
+        if title:
+            p = doc.add_paragraph()
+            apply_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.CENTER, first_line=False, space_after=6)
+            add_runs(p, _b24_plain(title).upper(), force_bold=True, size=14)
+    elif title:
         doc.add_heading(_b24_plain(title), level=0)
+
     for kind, val in _b24_split_doc_blocks(text):
         if kind == "table":
             ncols = max((len(r) for r in val), default=1) or 1
             t = doc.add_table(rows=0, cols=ncols)
-            try:
-                t.style = "Light Grid Accent 1"
-            except Exception:  # noqa: BLE001
-                pass
+            t.alignment = WD_TABLE_ALIGNMENT.CENTER
+            if not official:
+                try:
+                    t.style = "Table Grid"
+                except Exception:  # noqa: BLE001
+                    pass
+            set_table_borders(t)
             for ri, row in enumerate(val):
                 cells = t.add_row().cells
                 for ci in range(ncols):
-                    cells[ci].text = _b24_plain(row[ci]) if ci < len(row) else ""
-                    if ri == 0:
-                        for p in cells[ci].paragraphs:
-                            for run in p.runs:
-                                run.bold = True
+                    set_cell_text(cells[ci], row[ci] if ci < len(row) else "", header=(ri == 0))
             doc.add_paragraph("")
             continue
         line = val.rstrip()
         if not line.strip():
             continue
         st = line.lstrip()
-        if st.startswith("# "):
-            doc.add_heading(_b24_plain(st[2:]), level=1)
-        elif st.startswith("## "):
-            doc.add_heading(_b24_plain(st[3:]), level=2)
-        elif st.startswith(("- ", "• ", "* ")):
-            doc.add_paragraph(_b24_plain(st[2:]), style="List Bullet")
+        plain = _b24_plain(st)
+        if official:
+            if re.match(r"^(?:#\s*)?(?:ДОГОВОР|СОГЛАШЕНИЕ|АКТ|КОНТРАКТ)\b", plain, flags=re.I):
+                p = doc.add_paragraph()
+                apply_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.CENTER, first_line=False, space_after=6)
+                add_runs(p, plain.upper(), force_bold=True, size=14)
+            elif re.match(r"^\d+(?:\.\d+)*\.\s+\S", plain):
+                is_section_heading = bool(re.match(r"^\d+\.\s+[^.]{3,80}$", plain))
+                p = doc.add_paragraph()
+                apply_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line=not is_section_heading, space_after=0)
+                add_runs(p, plain, force_bold=is_section_heading, size=14)
+            elif re.match(r"^(г\.|город\s+)\s*\S+", plain, flags=re.I) or "___" in plain and "20" in plain:
+                p = doc.add_paragraph()
+                apply_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.LEFT, first_line=False, space_after=0)
+                add_runs(p, plain, size=14)
+            elif st.startswith(("# ", "## ")):
+                p = doc.add_paragraph()
+                apply_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.CENTER, first_line=False, space_after=6)
+                add_runs(p, _b24_plain(re.sub(r"^#+\s*", "", st)).upper(), force_bold=True, size=14)
+            elif st.startswith(("- ", "• ", "* ")):
+                p = doc.add_paragraph()
+                apply_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line=True, space_after=0)
+                add_runs(p, "— " + _b24_plain(st[2:]), size=14)
+            else:
+                p = doc.add_paragraph()
+                apply_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line=True, space_after=0)
+                add_runs(p, line, size=14)
         else:
-            p = doc.add_paragraph()
-            for seg, isb in _b24_bold_segments(line):
-                p.add_run(seg).bold = isb
+            if st.startswith("# "):
+                doc.add_heading(_b24_plain(st[2:]), level=1)
+            elif st.startswith("## "):
+                doc.add_heading(_b24_plain(st[3:]), level=2)
+            elif st.startswith(("- ", "• ", "* ")):
+                doc.add_paragraph(_b24_plain(st[2:]), style="List Bullet")
+            else:
+                p = doc.add_paragraph()
+                for seg, isb in _b24_bold_segments(line):
+                    run = p.add_run(seg)
+                    set_run_font(run, size=11, bold=isb)
     buf = _io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
