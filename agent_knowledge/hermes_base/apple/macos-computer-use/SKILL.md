@@ -21,7 +21,7 @@ Your actions do NOT move the user's cursor, steal keyboard focus, or switch
 Spaces. The user can keep typing in their editor while you click around in
 Safari in another Space. This is the opposite of pyautogui-style automation.
 
-Everything here works with any tool-capable model — Claude, GPT, Gemini, or
+Everything here works with any tool-capable model — Claude, GPT, Codex, or
 an open model running through a local OpenAI-compatible endpoint. There is
 no Anthropic-native schema to learn.
 

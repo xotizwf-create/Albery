@@ -359,7 +359,7 @@ def _b24_testbot_exec_tool(client: BitrixClient, name: str, args: dict[str, Any]
 def b24_testbot_run_agent(user_text: str) -> str:
     api_key = llm_api_key()
     if not api_key:
-        return "LLM не настроен (нет OPENAI_API_KEY/GOOGLE_API_KEY)."
+        return "LLM не настроен (нет OPENAI_API_KEY)."
     model = os.getenv("B24_TESTBOT_MODEL", "").strip() or os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
     client = b24_testbot_client()
     messages: list[dict[str, Any]] = [

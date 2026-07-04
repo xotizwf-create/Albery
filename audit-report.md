@@ -35,7 +35,7 @@
 - **2026-05-26, 3.4:** выставил session cookie флаги `HttpOnly`, `SameSite=Lax`, `Secure` для HTTPS-конфигурации с override через `SESSION_COOKIE_SECURE` и добавил Origin/Referer-проверку для state-changing `/api/*` запросов.
 - **2026-05-26, 3.2 / 3.6:** MCP/FAQ секреты сравниваются через `hmac.compare_digest`; URL path-token больше не принимается по умолчанию и оставлен только как явный legacy-режим `MCP_ALLOW_PATH_TOKEN=1`.
 - **2026-05-26, 3.7:** добавил security headers в HTTPS server-блоки nginx: HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`.
-- **2026-05-26, 3.8:** удалил инъекцию `process.env.GEMINI_API_KEY` из Vite-бандла и убрал неиспользуемые фронтовые зависимости `@google/genai`, `dotenv`, `express`, `@types/express`.
+- **2026-05-26, 3.8:** удалил инъекцию `process.env.OPENAI_API_KEY` из Vite-бандла и убрал неиспользуемые фронтовые зависимости `@google/genai`, `dotenv`, `express`, `@types/express`.
 - **2026-05-26, 3.9:** добавил GitHub Actions workflow `.github/workflows/security-audit.yml` с `pip-audit -r requirements.txt` и `npm audit --omit=dev`; локально оба аудита завершились без найденных уязвимостей.
 - **2026-05-26, 1.5 / 3.5:** настроил базовый `logging` в backend и MCP; MCP теперь логирует неперехваченные исключения на сервере и возвращает клиенту обобщённые ошибки вместо сырого `str(exc)`.
 - **2026-05-26, 1.1 / 2.4:** удалил runtime-DDL из `app.py` и `mcp/context_server.py`; старые `ensure_*_schema()` теперь только проверяют наличие таблиц и требуют применения миграций.
@@ -52,7 +52,7 @@
 
 ## Карта системы (контекст)
 
-Внутренняя бизнес-аналитическая платформа: собирает данные из Bitrix24 (задачи, сотрудники, чаты), Zoom (звонки/транскрипты), Google Drive (документы), прогоняет через LLM (OpenAI/Gemini) и генерирует отчёты (по чатам, сотрудникам, для владельца) + рекомендации. Поверх — MCP-сервер для внешнего ИИ (Claude Web).
+Внутренняя бизнес-аналитическая платформа: собирает данные из Bitrix24 (задачи, сотрудники, чаты), Zoom (звонки/транскрипты), Google Drive (документы), прогоняет через LLM (OpenAI/Codex) и генерирует отчёты (по чатам, сотрудникам, для владельца) + рекомендации. Поверх — MCP-сервер для внешнего ИИ (Claude Web).
 
 | Компонент | Файл | Технологии | Размер |
 |---|---|---|---|
@@ -91,7 +91,7 @@
 | 19 | Пробел в индексах под запрос отчётов | 2 | 🟡 | schema:679 |
 | 20 | MCP-секрет сравнивается `==`, не `compare_digest` | 3 | 🟡 | app.py:20498 |
 | 21 | Нет security-заголовков в nginx | 3 | 🟡 | nginx |
-| 22 | Остаток AI-Studio: ключ Gemini в клиентский бандл | 3 | 🟡 | vite.config.ts:11 |
+| 22 | Остаток AI-Studio: ключ Codex в клиентский бандл | 3 | 🟡 | vite.config.ts:11 |
 | 23 | Зависимости без авто-проверки CVE | 3 | 🟡 | requirements.txt |
 
 ---
@@ -260,8 +260,8 @@
 **Исправление:** добавить заголовки (минимум HSTS и X-Content-Type-Options) в server-блоки 443.
 **Сделано:** в HTTPS server-блоки добавлены HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`.
 
-### [x] 3.8. Остаток AI-Studio: ключ Gemini впечатывается в клиентский бандл
-**Где:** [vite.config.ts:11-13](Интерфейс/vite.config.ts#L11) `define: {'process.env.GEMINI_API_KEY': ...}`. Сейчас не эксплуатируется (`App.tsx` ключ не использует, в `Интерфейс/.env` его нет, `dist` не в git), но footgun.
+### [x] 3.8. Остаток AI-Studio: ключ Codex впечатывается в клиентский бандл
+**Где:** [vite.config.ts:11-13](Интерфейс/vite.config.ts#L11) `define: {'process.env.OPENAI_API_KEY': ...}`. Сейчас не эксплуатируется (`App.tsx` ключ не использует, в `Интерфейс/.env` его нет, `dist` не в git), но footgun.
 **Исправление:** удалить `define`-инъекцию и неиспользуемые фронт-зависимости (`@google/genai`, `express`, `dotenv`).
 **Сделано:** `define`-инъекция удалена из `vite.config.ts`; зависимости `@google/genai`, `express`, `dotenv`, `@types/express` удалены из `package.json`/`package-lock.json`.
 

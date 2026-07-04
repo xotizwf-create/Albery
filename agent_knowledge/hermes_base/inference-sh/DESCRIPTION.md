@@ -10,9 +10,9 @@ Run 150+ AI applications in the cloud via the [inference.sh](https://inference.s
 
 ## What's Included
 
-- **Image Generation**: FLUX, Reve, Seedream, Grok Imagine, Gemini
+- **Image Generation**: FLUX, Reve, Seedream, Grok Imagine, Codex
 - **Video Generation**: Veo, Wan, Seedance, OmniHuman, HunyuanVideo
-- **LLMs**: Claude, Gemini, Kimi, GLM-4 (via OpenRouter)
+- **LLMs**: Claude, Codex, Kimi, GLM-4 (via OpenRouter)
 - **Search**: Tavily, Exa
 - **3D**: Rodin
 - **Social**: Twitter/X automation

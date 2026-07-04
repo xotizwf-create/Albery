@@ -17,7 +17,6 @@ import requests
 def llm_api_base_url() -> str:
     base = (
         os.getenv("OPENAI_BASE_URL", "").strip()
-        or os.getenv("GOOGLE_API_BASE_URL", "").strip()
         or "https://api.openai.com/v1"
     )
     return base.rstrip("/")
@@ -27,19 +26,12 @@ def llm_api_url(path: str) -> str:
 def llm_auth_headers(api_key: str) -> dict[str, str]:
     base_url = llm_api_base_url().lower()
     headers = {"Content-Type": "application/json"}
-    if "generativelanguage.googleapis.com" in base_url and "/openai" not in base_url:
-        headers["x-goog-api-key"] = api_key
-        return headers
     headers["Authorization"] = f"Bearer {api_key}"
     return headers
 def llm_api_key() -> str:
-    return os.getenv("OPENAI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
-def is_google_genai_base() -> bool:
-    return "generativelanguage.googleapis.com" in llm_api_base_url().lower()
+    return os.getenv("OPENAI_API_KEY", "").strip()
 def llm_provider_name() -> str:
     base = llm_api_base_url().lower()
-    if "generativelanguage.googleapis.com" in base:
-        return "google"
     if "anthropic" in base:
         return "anthropic"
     if "yandex" in base:
@@ -52,7 +44,7 @@ def llm_model_for_request(request_type: str) -> str:
             os.getenv("OWNER_DAILY_MODEL", "").strip()
             or os.getenv("OWNER_REPORT_MODEL", "").strip()
             or os.getenv("OPENAI_OWNER_DAILY_MODEL", "").strip()
-            or "gemini-2.0-flash"
+            or "gpt-5.5"
         )
     if request_type == "owner_weekly_report":
         return (
@@ -67,22 +59,14 @@ def llm_model_for_request(request_type: str) -> str:
 def _parse_model_list(raw: str) -> list[str]:
     items = [part.strip() for part in (raw or "").split(",")]
     return [item for item in items if item]
-def _google_ocr_model_candidates(primary_model: str) -> list[str]:
-    explicit = _parse_model_list(os.getenv("GOOGLE_OCR_MODEL_CANDIDATES", "").strip())
-    if explicit:
-        return explicit
-    default_fallback = _parse_model_list(
-        os.getenv("GOOGLE_OCR_FALLBACK_MODELS", "gemini-2.0-flash")
-    )
-    primary = primary_model if primary_model.startswith("gemini-") else "gemini-2.0-flash"
-    ordered = [primary] + default_fallback
-    dedup: list[str] = []
-    seen: set[str] = set()
-    for model_name in ordered:
-        if model_name not in seen:
-            seen.add(model_name)
-            dedup.append(model_name)
-    return dedup
+def _ocr_model_candidates(primary_model: str) -> list[str]:
+    primary = primary_model.strip() or os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    return [primary]
+# Backward-compatible aliases for app.py re-export; provider path is OpenAI/Codex only.
+def is_google_genai_base() -> bool:
+    return False
+_google_ocr_model_candidates = _ocr_model_candidates
+
 def _retry_after_seconds(response: requests.Response) -> float | None:
     value = response.headers.get("Retry-After")
     if not value:

@@ -319,7 +319,7 @@ The registry of record is `hermes_cli/commands.py` — every consumer
 /commands [page]     Browse all commands (gateway)
 /usage               Token usage
 /insights [days]     Usage analytics
-/gquota              Show Google Gemini Code Assist quota usage (CLI)
+/gquota              Show OpenAI Codex Code Assist quota usage (CLI)
 /status              Session info (gateway)
 /profile             Active profile info
 /debug               Upload debug report (system info + logs) and get shareable links
@@ -378,7 +378,7 @@ Full config reference: https://hermes-agent.nousresearch.com/docs/user-guide/con
 | Nous Portal | OAuth | `hermes auth` |
 | OpenAI Codex | OAuth | `hermes auth` |
 | GitHub Copilot | Token | `COPILOT_GITHUB_TOKEN` |
-| Google Gemini | API key | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
+| OpenAI Codex | API key | `OPENAI_API_KEY` |
 | DeepSeek | API key | `DEEPSEEK_API_KEY` |
 | xAI / Grok | API key | `XAI_API_KEY` |
 | Hugging Face | Token | `HF_TOKEN` |
@@ -844,7 +844,7 @@ Common gateway problems:
 - **Windows-specific issues** (`Alt+Enter` newline, WinError 10106, UTF-8 BOM config, test suite, line endings): see the dedicated **Windows-Specific Quirks** section above.
 
 ### Auxiliary models not working
-If `auxiliary` tasks (vision, compression, session_search) fail silently, the `auto` provider can't find a backend. Either set `OPENROUTER_API_KEY` or `GOOGLE_API_KEY`, or explicitly configure each auxiliary task's provider:
+If `auxiliary` tasks (vision, compression, session_search) fail silently, the `auto` provider can't find a backend. Either set `OPENROUTER_API_KEY`, or explicitly configure each auxiliary task's provider:
 ```bash
 hermes config set auxiliary.vision.provider <your_provider>
 hermes config set auxiliary.vision.model <model_name>

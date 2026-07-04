@@ -2954,7 +2954,7 @@ def generate_zoom_call_report_if_needed(call_id: str) -> None:
 
     api_key = llm_api_key()
     if not api_key:
-        raise ValueError("Для ИИ-отчета по Zoom укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+        raise ValueError("Для ИИ-отчета по Zoom укажите OPENAI_API_KEY в .env")
 
     model = llm_model_for_request("zoom_processing")
     provider = llm_provider_name()
@@ -3718,7 +3718,7 @@ def recognize_image_text_with_openai(
 ) -> tuple[str, str, dict[str, Any]]:
     api_key = llm_api_key()
     if not api_key:
-        raise ValueError("Для OCR изображений укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+        raise ValueError("Для OCR изображений укажите OPENAI_API_KEY в .env")
     model = os.getenv("OPENAI_OCR_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")).strip()
     b64 = base64.b64encode(content).decode("ascii")
     prompt = prompt_override or (
@@ -3737,7 +3737,7 @@ def recognize_image_text_with_openai(
         quota_exhausted = False
         for google_model in model_candidates:
             response = llm_post_with_retry(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{google_model}:generateContent?key={api_key}",
+                f"https://api.openai.com/v1/chat/completions",
                 headers={"Content-Type": "application/json"},
                 payload={
                     "contents": [
@@ -3778,7 +3778,7 @@ def recognize_image_text_with_openai(
             last_error = f"OCR API вернул пустой текст [{google_model}]"
         if quota_exhausted:
             raise ValueError(
-                "OCR API quota exhausted (Google Gemini): для текущего GOOGLE_API_KEY лимит равен 0. "
+                "OCR API quota exhausted (OpenAI Codex): для текущего OPENAI_API_KEY лимит равен 0. "
                 "Проверьте billing/plan в Google AI Studio или переключите OCR на другой провайдер "
                 "(например, задайте OPENAI_API_KEY и OPENAI_OCR_MODEL)."
             )
@@ -5021,7 +5021,7 @@ def process_chat_image_ocr_for_period(date_from: date, date_to: date, force: boo
         if not webhook_base:
             raise ValueError("Укажите BITRIX_WEBHOOK_BASE в .env для скачивания файлов Bitrix")
         if not llm_api_key():
-            raise ValueError("Для OCR изображений укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+            raise ValueError("Для OCR изображений укажите OPENAI_API_KEY в .env")
 
         processed = 0
         skipped = 0
@@ -5240,7 +5240,7 @@ def sync_work_registry() -> dict[str, Any]:
 def analyze_chat_work_with_ai(dialog_id: str, date_from: date, date_to: date) -> dict[str, Any]:
     api_key = llm_api_key()
     if not api_key:
-        raise ValueError("Для ИИ-анализа чатов укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+        raise ValueError("Для ИИ-анализа чатов укажите OPENAI_API_KEY в .env")
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
     if postgres_enabled():
         with pg_connect() as conn:
@@ -5570,7 +5570,7 @@ def analyze_chat_work_with_ai(dialog_id: str, date_from: date, date_to: date) ->
 
 def analyze_all_chats_work(date_from: date, date_to: date) -> dict[str, Any]:
     if not llm_api_key():
-        raise ValueError("Для ИИ-анализа чатов укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+        raise ValueError("Для ИИ-анализа чатов укажите OPENAI_API_KEY в .env")
     sync_work_registry()
     if postgres_enabled():
         with pg_connect() as conn:
@@ -15488,7 +15488,7 @@ def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = Fal
     zoom_calls_for_prompt = load_zoom_calls_for_chat_prompt(target_date)
     zoom_calls_text = format_zoom_calls_for_chat_prompt(zoom_calls_for_prompt)
     if not api_key:
-        raise ValueError("Для ИИ-отчета по чату укажите OPENAI_API_KEY или GOOGLE_API_KEY в .env")
+        raise ValueError("Для ИИ-отчета по чату укажите OPENAI_API_KEY в .env")
     previous_transcript_for_ai = previous_transcript[:30000]
     transcript_for_ai = transcript[:50000]
     prompt_id = None
