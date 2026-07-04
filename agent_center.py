@@ -1387,13 +1387,35 @@ def agent_center_instruction_delete(slug: str, inst_id: str):
 # stays on regardless — that is the "settings that don't change" the owner asked for.
 
 def _library_instructions() -> list[dict[str, Any]]:
-    """Instruction folders from the shared library (ai_instruction_folders) that carry
-    real content — the pool an agent can be given, same source the knowledge page shows."""
-    out: list[dict[str, Any]] = []
+    """Instruction library — the pool an agent can be given, same source the knowledge
+    page shows. Source of truth is the GitHub registry (agent_knowledge/instructions);
+    falls back to the legacy DB table (ai_instruction_folders) when the registry is
+    absent, so the switch to git is safe. ``id`` is the folder path in registry mode
+    (stable, human-readable) and the DB uuid in fallback mode."""
+    from agent_knowledge import load_instructions  # lazy: no import cycle
+
+    reg = load_instructions()
+    if reg is not None:
+        out: list[dict[str, Any]] = []
+        for i in reg:
+            content = re.sub(r"\s+", " ", (i["content"] or "")).strip()
+            if not content:
+                continue
+            out.append({
+                "id": i["id"],
+                "title": i["name"],
+                "parent": i["parent"],
+                "content": content,
+                "scope": i.get("scope") or "universal",
+                "updated_at": i.get("updated_at"),
+                "description": (content[:160].rstrip() + "…") if len(content) > 160 else content,
+            })
+        return out
+    out = []
     with pg_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT f.id::text AS id, f.name, p.name AS parent_name, f.content"
+                "SELECT f.id::text AS id, f.name, p.name AS parent_name, f.content, f.updated_at"
                 " FROM ai_instruction_folders f"
                 " LEFT JOIN ai_instruction_folders p ON p.id = f.parent_id"
                 " ORDER BY f.sort_order, f.name"
@@ -1407,6 +1429,8 @@ def _library_instructions() -> list[dict[str, Any]]:
                     "title": r["name"],
                     "parent": r["parent_name"] or "",
                     "content": content,
+                    "scope": "universal",
+                    "updated_at": r["updated_at"],
                     "description": (content[:160].rstrip() + "…") if len(content) > 160 else content,
                 })
     return out
@@ -1956,8 +1980,28 @@ def _skill_frontmatter(text: str) -> dict[str, str]:
 
 
 def _hermes_skills() -> list[dict[str, Any]]:
-    """The skill library the agent's Hermes gateway loads (all SKILL.md under the
-    skills dir; no allowlist in config → everything is advertised to the model)."""
+    """The skill library. Source of truth is the GitHub registry
+    (agent_knowledge/skills + agent_knowledge/hermes_base); falls back to the live
+    Hermes skills dir (/root/.hermes/skills) when the registry is absent. Skill ids
+    match across both sources (skill:<path> relative to the skills root)."""
+    from agent_knowledge import load_skills  # lazy: no import cycle
+
+    reg = load_skills()
+    if reg is not None:
+        out: list[dict[str, Any]] = []
+        for s in reg:
+            out.append({
+                "id": s["id"],
+                "title": s["title"],
+                "parent": s.get("parent") or "",
+                "description": s["description"],
+                "type": "Скилл",
+                "custom": bool(s.get("custom")),
+                "kind": s.get("kind") or "shared",
+                "has_content": True,
+                "updated": "обновлено " + _when_label(s["updated_at"]) if s.get("updated_at") else "",
+            })
+        return out
     skills: list[dict[str, Any]] = []
     if not _HERMES_SKILLS_DIR.is_dir():
         return skills
@@ -1986,29 +2030,22 @@ def _hermes_skills() -> list[dict[str, Any]]:
 
 @app.get("/api/agent-center/knowledge")
 def agent_center_knowledge():
+    """Knowledge page: company instructions + skills, sourced from the GitHub
+    registry (with DB fallback via _library_instructions / _hermes_skills)."""
     items = []
     try:
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT f.id::text AS id, f.name, f.content, f.updated_at,"
-                    " p.name AS parent_name"
-                    " FROM ai_instruction_folders f"
-                    " LEFT JOIN ai_instruction_folders p ON p.id = f.parent_id"
-                    " ORDER BY f.sort_order, f.name"
-                )
-                for r in cur.fetchall():
-                    content = re.sub(r"\s+", " ", (r["content"] or "")).strip()
-                    items.append({
-                        "id": r["id"],
-                        "title": r["name"],
-                        "parent": r["parent_name"] or "",
-                        "description": (content[:160].rstrip() + "…") if len(content) > 160 else content,
-                        "type": "Инструкция",
-                        "custom": True,
-                        "has_content": bool(content),
-                        "updated": ("обновлено " + _when_label(r["updated_at"])) if r["updated_at"] else "",
-                    })
+        for i in _library_instructions():
+            items.append({
+                "id": i["id"],
+                "title": i["title"],
+                "parent": i["parent"],
+                "description": i["description"],
+                "type": "Инструкция",
+                "scope": i.get("scope") or "universal",
+                "custom": True,
+                "has_content": True,
+                "updated": ("обновлено " + _when_label(i["updated_at"])) if i.get("updated_at") else "",
+            })
     except Exception:  # noqa: BLE001
         logging.exception("agent_center knowledge failed")
         return jsonify({"error": "Не удалось загрузить базу знаний."}), 500
