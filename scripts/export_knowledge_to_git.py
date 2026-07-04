@@ -120,6 +120,9 @@ def export_skills() -> tuple[int, int]:
     for entry in sorted(LIVE_SKILLS.iterdir()):
         if not entry.is_dir():
             continue
+        if entry.name.startswith("."):
+            # Hermes runtime/state dirs (.hub, .curator_backups, …) — not skills.
+            continue
         if entry.name in custom:
             # Custom skill -> shared library (connectable). Add only if missing so a
             # promoted / hand-edited version is never clobbered.
