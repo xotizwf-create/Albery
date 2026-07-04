@@ -859,7 +859,11 @@ def _b24_ensure_command_registered(client_endpoint: str, access_token: str, bot_
     registered commands return an API error (not a transport one) — treated as success."""
     if not (client_endpoint and access_token and bot_id):
         return
-    if _b24_load_state().get("cmds_registered_v3"):
+    # Commands are registered PER BOT (imbot.command.register takes BOT_ID), so the guard must be
+    # keyed by bot_id — a single global flag let the main bot register and then permanently blocked
+    # every subagent (e.g. the lawyer bot 70), leaving their keyboard buttons dead.
+    reg_key = f"cmds_registered_v3_{bot_id}"
+    if _b24_load_state().get(reg_key):
         return
 
     def _do() -> None:
@@ -886,7 +890,7 @@ def _b24_ensure_command_registered(client_endpoint: str, access_token: str, bot_
                 logging.debug("b24 testbot: command register note for %s: %s", spec["COMMAND"], exc)
         if not transport_failed:  # only retry on a real connectivity failure
             st = _b24_load_state()
-            st["cmds_registered_v3"] = True
+            st[reg_key] = True
             _b24_save_state(st)
 
     threading.Thread(target=_do, daemon=True).start()
@@ -1810,10 +1814,35 @@ def _b24_ops_alert(kind: str, dialog_id: Any, tier: str, from_user_id: Any, deta
     threading.Thread(target=_do, daemon=True).start()
 
 
+# The hermes CLI prints its own failure notice to stdout AND exits rc=0 when an LLM call gives up
+# (e.g. "API call failed after 3 retries. Connection error." / "[Errno 32] Broken pipe" / HTTP 429
+# usage limit / context-window overflow). Left unchecked, b24bot posts that raw diagnostic straight
+# to the employee — this is exactly what surfaced as the "AI-lawyer error". Detect it so the turn is
+# retried and, if it still fails, the user sees a friendly message instead of the raw stack text.
+_HERMES_ERROR_RE = re.compile(r"^\s*API call failed after\s+\d+\s+retr", re.IGNORECASE)
+
+
+def _hermes_answer_is_error(answer: str) -> bool:
+    return bool(answer) and bool(_HERMES_ERROR_RE.match(answer))
+
+
+def _b24_brain_error_message(answer: str) -> str:
+    low = (answer or "").lower()
+    if "usage limit" in low or "429" in low:
+        return ("Сейчас мой ИИ-мозг перегружен лимитами запросов 🙏 Дай минуту-другую и отправь "
+                "сообщение ещё раз — я отвечу.")
+    if "context window" in low or "exceeds the context" in low or "too long" in low:
+        return ("Запрос получился слишком большим для одного сообщения 😅 Попробуй разбить его на "
+                "части или начни новую сессию кнопкой «🆕 Новая сессия» и повтори покороче.")
+    return ("Что-то временно сбоит на стороне ИИ 😔 Обычно это разовый сетевой сбой — попробуй, "
+            "пожалуйста, повторить запрос через минуту.")
+
+
 def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
                         from_user_id: Any, prompt_chars: int):
     """Run the hermes CLI under the concurrency semaphore, retrying once on a quick failure
-    (non-zero rc / empty stdout). Returns (proc, None), (None, 'busy') or (None, 'timeout')."""
+    (non-zero rc / empty stdout / an LLM error sentinel printed as the answer). Returns
+    (proc, None), (None, 'busy') or (None, 'timeout')."""
     if not _HERMES_RUN_SLOTS.acquire(timeout=_HERMES_QUEUE_WAIT_S):
         logging.warning("b24 testbot: hermes slot wait exceeded %ss dialog_id=%s tier=%s user_id=%s",
                         _HERMES_QUEUE_WAIT_S, dialog_id, tier, from_user_id)
@@ -1839,10 +1868,12 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
                 _b24_ops_alert("таймаут хода", dialog_id, tier, from_user_id,
                                f"Мозг не ответил за {timeout_s}с; пользователь получил вежливый отказ.")
                 return None, "timeout"
-            if proc.returncode == 0 and (proc.stdout or "").strip():
+            if (proc.returncode == 0 and (proc.stdout or "").strip()
+                    and not _hermes_answer_is_error(proc.stdout.strip())):
                 return proc, None
-            logging.error("b24 testbot: hermes run failed (attempt %s/2): rc=%s err=%s",
-                          attempt, proc.returncode, (proc.stderr or "")[:300])
+            logging.error("b24 testbot: hermes run failed (attempt %s/2): rc=%s err=%s answer=%s",
+                          attempt, proc.returncode, (proc.stderr or "")[:200],
+                          (proc.stdout or "")[:120])
         return proc, None  # both attempts bad -> caller reports the empty answer
     finally:
         _HERMES_RUN_SLOTS.release()
@@ -2106,6 +2137,13 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         _b24_ops_alert("пустой ответ мозга", dialog_id, tier, from_user_id,
                        f"Два прогона подряд без ответа (rc={proc.returncode}).")
         return "Мозг временно недоступен, попробуй ещё раз чуть позже."
+    if _hermes_answer_is_error(answer):
+        # Both attempts came back as the CLI's own LLM-failure notice (transient network / Broken
+        # pipe / limit / context overflow). Never post that raw text to the employee.
+        logging.error("hermes brain LLM error sentinel dialog_id=%s tier=%s: %s",
+                      dialog_id, tier, answer[:200])
+        _b24_ops_alert("ошибка LLM в ходе", dialog_id, tier, from_user_id, answer[:300])
+        return _b24_brain_error_message(answer)
     return answer
 
 
@@ -2657,10 +2695,17 @@ def _bitrix_imbot_app_event():
         except Exception:  # noqa: BLE001
             pass
         command = (_imbot_scan(payload, "COMMAND") or "").strip().lstrip("/").lower()
-        cmd_dialog = dialog_id or _imbot_scan(payload, "DIALOG_ID")
         message_id = _imbot_scan(payload, "MESSAGE_ID")
         command_id = _imbot_scan(payload, "COMMAND_ID")
-        cmd_user = _imbot_scan(payload, "USER_ID")
+        # A keyboard-button command event carries the clicker in data[PARAMS][FROM_USER_ID] and,
+        # crucially, NO DIALOG_ID for a private 1-1 chat. In Bitrix a private dialog is keyed by
+        # the peer user id, so derive cmd_dialog from the clicker's id when DIALOG_ID is absent —
+        # otherwise every dispatch branch below (they all require cmd_dialog) is skipped and the
+        # button silently does nothing (this was THE bug: buttons acknowledged but no-op'd).
+        cmd_user = (str(_imbot_event_param(payload, "FROM_USER_ID") or "")
+                    or _imbot_scan(payload, "FROM_USER_ID")
+                    or _imbot_scan(payload, "USER_ID"))
+        cmd_dialog = dialog_id or _imbot_scan(payload, "DIALOG_ID") or str(cmd_user or "")
         cmd_denied = (
             (not _b24_main_allows(cmd_user)) if agent is None else not _agent_allows(cmd_user)
         )
