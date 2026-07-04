@@ -3,7 +3,10 @@ from __future__ import annotations
 
 
 def test_start_here_still_returns_full_instruction_bodies_by_default(ctx, monkeypatch):
-    monkeypatch.setattr(ctx, "load_ai_instructions", lambda: [{"path": "A", "content": "full instruction"}])
+    monkeypatch.setattr(
+        ctx, "load_ai_instructions",
+        lambda allowed_paths=None: [{"path": "A", "content": "full instruction"}],
+    )
     result = ctx.tool_start_here_always_read_ai_instructions({})
     assert result["live_ai_instructions"] == [{"path": "A", "content": "full instruction"}]
     assert "mode" not in result

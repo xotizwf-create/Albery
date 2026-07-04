@@ -37,6 +37,7 @@ import {
   fetchMcpTools,
   registerAgentBot,
   saveAgentConfig,
+  setInstructionScope,
   updateAgent,
   upsertAccess,
 } from "../api";
@@ -244,6 +245,7 @@ const AgentCapabilityPanel: React.FC<{ slug: string; version: number }> = ({ slu
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
+  const [scopeBusy, setScopeBusy] = useState("");
 
   useEffect(() => {
     fetchAgentConfig(slug)
@@ -291,6 +293,37 @@ const AgentCapabilityPanel: React.FC<{ slug: string; version: number }> = ({ slu
       next.has(id) ? next.delete(id) : next.add(id);
       return next;
     });
+
+  // Flip an instruction universal<->optional. LIBRARY-level: affects every agent, so we
+  // confirm and edit the registry immediately (separate from the per-agent Save button).
+  const changeScope = async (i: AgentConfigKnowledge) => {
+    const toUniversal = i.scope !== "universal";
+    const next = toUniversal ? "universal" : "optional";
+    if (!window.confirm(
+      toUniversal
+        ? `«${i.title}» станет УНИВЕРСАЛЬНОЙ — будет применяться у ВСЕХ агентов. Продолжить?`
+        : `«${i.title}» станет ПО ВЫБОРУ — перестанет применяться автоматически и будет подключаться каждому агенту отдельно (у кого сейчас не подключена — потеряет её). Продолжить?`,
+    )) return;
+    setScopeBusy(i.id);
+    setError("");
+    try {
+      await setInstructionScope(i.id, next);
+      setConfig((prev) => prev && {
+        ...prev,
+        instructions: prev.instructions.map((x) =>
+          x.id === i.id ? { ...x, scope: next, selected: toUniversal } : x),
+      });
+      setInstr((prev) => {
+        const n = new Set(prev);
+        toUniversal ? n.add(i.id) : n.delete(i.id);
+        return n;
+      });
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setScopeBusy("");
+    }
+  };
 
   const save = async () => {
     setBusy(true);
@@ -437,45 +470,101 @@ const AgentCapabilityPanel: React.FC<{ slug: string; version: number }> = ({ slu
             />
           </div>
           <div className="overflow-y-auto pr-2 space-y-2 flex-1 min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-            {[
-              ...filteredInstr.map((i) => ({ item: i, kind: "instruction" as const, on: instr.has(i.id), toggle: () => toggleSet(setInstr, i.id) })),
-              ...filteredSkills.map((s) => ({ item: s, kind: "skill" as const, on: skills.has(s.id), toggle: () => toggleSet(setSkills, s.id) })),
-            ].map(({ item, kind, on, toggle }) => (
-              <button
-                key={`${kind}:${item.id}`}
-                onClick={toggle}
-                title={item.description}
-                className="w-full text-left flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm hover:border-indigo-200 transition-colors"
-              >
-                <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
-                  {kind === "skill" ? "🔧" : "💬"}
-                </div>
-                <div className="flex-1 min-w-0 pr-4">
-                  <div className="flex items-center gap-2 mb-0.5">
-                    <span className="font-bold text-gray-900 text-[14px] truncate">
-                      {item.parent ? `${item.parent} / ${item.title}` : item.title}
-                    </span>
-                    <span
-                      className={cn(
-                        "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm shrink-0",
-                        kind === "skill" ? "bg-slate-100 border-slate-200 text-slate-600" : "bg-indigo-50 border-indigo-100 text-indigo-600",
-                      )}
-                    >
-                      {kind === "skill" ? "скилл" : "инструкция"}
-                    </span>
-                  </div>
-                  <p className="text-[12.5px] font-medium text-gray-500 truncate">{item.description}</p>
-                </div>
+            {/* Instructions — with universal/optional scope. Universal ones apply to
+                every agent (checkbox locked on); optional ones connect per-agent. */}
+            {filteredInstr.map((i) => {
+              const universal = i.scope === "universal";
+              const on = universal || instr.has(i.id);
+              return (
                 <div
-                  className={cn(
-                    "w-6 h-6 rounded-md border flex items-center justify-center shrink-0 shadow-sm transition-colors",
-                    on ? "bg-indigo-500 border-indigo-500 text-white" : "bg-white border-gray-300 text-transparent",
-                  )}
+                  key={`instruction:${i.id}`}
+                  title={i.description}
+                  className="flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm"
                 >
-                  <Check className="w-4 h-4" />
+                  <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
+                    💬
+                  </div>
+                  <div className="flex-1 min-w-0 pr-3">
+                    <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+                      <span className="font-bold text-gray-900 text-[14px] truncate">
+                        {i.parent ? `${i.parent} / ${i.title}` : i.title}
+                      </span>
+                      <span
+                        className={cn(
+                          "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm shrink-0",
+                          universal
+                            ? "bg-amber-50 border-amber-100 text-amber-600"
+                            : "bg-indigo-50 border-indigo-100 text-indigo-600",
+                        )}
+                      >
+                        {universal ? "для всех" : "по выбору"}
+                      </span>
+                    </div>
+                    <p className="text-[12.5px] font-medium text-gray-500 truncate">{i.description}</p>
+                  </div>
+                  <button
+                    onClick={() => changeScope(i)}
+                    disabled={scopeBusy === i.id}
+                    title={universal ? "Сделать «по выбору» (подключать агентам вручную)" : "Сделать универсальной (у всех агентов)"}
+                    className="text-[11px] font-bold text-gray-400 hover:text-indigo-600 mr-3 shrink-0 disabled:opacity-50 whitespace-nowrap"
+                  >
+                    {scopeBusy === i.id ? "…" : universal ? "→ по выбору" : "→ для всех"}
+                  </button>
+                  <button
+                    onClick={() => !universal && toggleSet(setInstr, i.id)}
+                    disabled={universal}
+                    title={universal ? "Универсальная — применяется у всех агентов" : on ? "Отключить у этого агента" : "Подключить этому агенту"}
+                    className={cn(
+                      "w-6 h-6 rounded-md border flex items-center justify-center shrink-0 shadow-sm transition-colors",
+                      on ? "bg-indigo-500 border-indigo-500 text-white" : "bg-white border-gray-300 text-transparent",
+                      universal && "opacity-60 cursor-not-allowed",
+                    )}
+                  >
+                    <Check className="w-4 h-4" />
+                  </button>
                 </div>
-              </button>
-            ))}
+              );
+            })}
+            {/* Skills — connect per-agent (prompt-level; base skills carry a badge). */}
+            {filteredSkills.map((s) => {
+              const on = skills.has(s.id);
+              return (
+                <button
+                  key={`skill:${s.id}`}
+                  onClick={() => toggleSet(setSkills, s.id)}
+                  title={s.description}
+                  className="w-full text-left flex items-center p-3 sm:px-4 sm:py-3.5 rounded-2xl bg-white border border-gray-100 shadow-sm hover:border-indigo-200 transition-colors"
+                >
+                  <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center text-xl mr-3.5 shrink-0 border border-gray-100 shadow-sm">
+                    🔧
+                  </div>
+                  <div className="flex-1 min-w-0 pr-4">
+                    <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+                      <span className="font-bold text-gray-900 text-[14px] truncate">
+                        {s.parent ? `${s.parent} / ${s.title}` : s.title}
+                      </span>
+                      <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm shrink-0 bg-slate-100 border-slate-200 text-slate-600">
+                        скилл
+                      </span>
+                      {s.kind === "hermes_base" && (
+                        <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-md border shadow-sm shrink-0 bg-slate-50 border-slate-200 text-slate-400">
+                          базовый
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[12.5px] font-medium text-gray-500 truncate">{s.description}</p>
+                  </div>
+                  <div
+                    className={cn(
+                      "w-6 h-6 rounded-md border flex items-center justify-center shrink-0 shadow-sm transition-colors",
+                      on ? "bg-indigo-500 border-indigo-500 text-white" : "bg-white border-gray-300 text-transparent",
+                    )}
+                  >
+                    <Check className="w-4 h-4" />
+                  </div>
+                </button>
+              );
+            })}
             {filteredInstr.length + filteredSkills.length === 0 && (
               <div className="text-center text-gray-400 text-[13.5px] font-medium py-4">Ничего не найдено</div>
             )}

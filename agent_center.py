@@ -745,6 +745,36 @@ def _agent_cache_bust() -> None:
     _AGENT_CACHE.update(at=0.0, by_bot={}, by_slug={})
 
 
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
+def registry_git_sync(message: str) -> None:
+    """Best-effort commit+push of agent_knowledge/ so owner/self edits land on GitHub
+    with history. Runs on the box (root + deploy key). Never raises — the edit is
+    already saved on disk and enforced from there; git is for versioning/backup.
+    Disabled unless REGISTRY_GIT_SYNC=1 (so local/dev never tries to push)."""
+    if os.getenv("REGISTRY_GIT_SYNC", "0").strip() != "1":
+        return
+
+    def _git(*args: str, timeout: int = 45) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    try:
+        _git("add", "agent_knowledge")
+        if not _git("status", "--porcelain", "agent_knowledge").stdout.strip():
+            return  # nothing changed
+        _git("commit", "-m", message)
+        if _git("push", "origin", "HEAD:main", timeout=60).returncode != 0:
+            # origin moved on (a code deploy) — rebase our small registry commit on top.
+            _git("pull", "--rebase", "origin", "main", timeout=60)
+            _git("push", "origin", "HEAD:main", timeout=60)
+    except Exception:  # noqa: BLE001
+        logging.warning("registry_git_sync failed (edit saved on disk, retried next change)", exc_info=True)
+
+
 def _load_agents_full() -> list[dict[str, Any]]:
     with pg_connect() as conn:
         with conn.cursor() as cur:
@@ -760,28 +790,24 @@ def _load_agents_full() -> list[dict[str, Any]]:
                 " FROM agent_instructions ORDER BY created_at"
             )
             instructions = cur.fetchall()
-            cur.execute("SELECT agent_id::text AS agent_id, kind, ref_id FROM agent_knowledge_links")
-            links = cur.fetchall()
     by_id = {a["id"]: a for a in agents}
+    # Per-agent instruction/skill connections live in the GitHub registry manifest
+    # (agent_knowledge/agents/<slug>.yaml), not the DB — that is the versioned source
+    # of truth the owner manages on GitHub. The legacy agent_knowledge_links table is
+    # no longer read.
+    from agent_knowledge import load_manifest
     for a in agents:
         a["members"] = set()
         a["instructions"] = []
-        a["linked_instruction_ids"] = set()
-        a["linked_skill_ids"] = set()
+        manifest = load_manifest(a["slug"])
+        a["linked_instruction_ids"] = set(manifest["instructions"])
+        a["linked_skill_ids"] = set(manifest["skills"])
     for m in members:
         if m["agent_id"] in by_id:
             by_id[m["agent_id"]]["members"].add(int(m["bitrix_user_id"]))
     for i in instructions:
         if i["agent_id"] in by_id:
             by_id[i["agent_id"]]["instructions"].append(dict(i))
-    for lk in links:
-        a = by_id.get(lk["agent_id"])
-        if not a:
-            continue
-        if lk["kind"] == "instruction":
-            a["linked_instruction_ids"].add(lk["ref_id"])
-        elif lk["kind"] == "skill":
-            a["linked_skill_ids"].add(lk["ref_id"])
     return agents
 
 
@@ -1480,14 +1506,19 @@ def agent_center_agent_config(slug: str):
             "allowed": name in pool,
         })
     sel_instr = agent.get("linked_instruction_ids") or set()
+    # scope: universal instructions go to EVERY agent (checkbox locked on); optional
+    # ones are connected per-agent (real teeth via start_here scoping).
     instructions = [
-        {**i, "selected": i["id"] in sel_instr, "content": None}  # content hidden from the list payload
+        {"id": i["id"], "title": i["title"], "parent": i["parent"],
+         "description": i["description"], "scope": i.get("scope") or "universal",
+         "selected": (i.get("scope") == "universal") or (i["id"] in sel_instr)}
         for i in _library_instructions()
     ]
     sel_skills = agent.get("linked_skill_ids") or set()
     skills = [
         {"id": s["id"], "title": s["title"], "parent": s.get("parent") or "",
          "description": s["description"], "custom": s.get("custom", False),
+         "kind": s.get("kind") or "shared",
          "selected": s["id"] in sel_skills}
         for s in _hermes_skills()
     ]
@@ -1518,9 +1549,11 @@ def agent_center_agent_config_save(slug: str):
     # for non-developers); the mandatory baseline is always included.
     requested_tools = {str(t) for t in (body.get("tools") or []) if str(t)}
     enabled_tools = sorted((requested_tools & pool) | fixed)
-    valid_instr = {i["id"] for i in _library_instructions()}
+    # Only OPTIONAL instructions are per-agent connections; universal ones are always
+    # on and never stored in a manifest. Keep the manifest to real, meaningful links.
+    optional_instr = {i["id"] for i in _library_instructions() if (i.get("scope") or "universal") == "optional"}
     valid_skills = {s["id"] for s in _hermes_skills()}
-    instr_ids = sorted({str(x) for x in (body.get("instructions") or [])} & valid_instr)
+    instr_ids = sorted({str(x) for x in (body.get("instructions") or [])} & optional_instr)
     skill_ids = sorted({str(x) for x in (body.get("skills") or [])} & valid_skills)
     try:
         with pg_connect() as conn:
@@ -1530,26 +1563,19 @@ def agent_center_agent_config_save(slug: str):
                 if not row:
                     return jsonify({"error": "Агент не найден."}), 404
                 agent_id = row["id"]
+                # Tools stay operational config in the DB (already enforced per-connector).
                 cur.execute(
                     "UPDATE agents SET tools = %s, tools_customized = TRUE, updated_at = now() WHERE id = %s",
                     (enabled_tools, agent_id),
                 )
-                cur.execute("DELETE FROM agent_knowledge_links WHERE agent_id = %s", (agent_id,))
-                for rid in instr_ids:
-                    cur.execute(
-                        "INSERT INTO agent_knowledge_links (agent_id, kind, ref_id) VALUES (%s, 'instruction', %s)"
-                        " ON CONFLICT DO NOTHING",
-                        (agent_id, rid),
-                    )
-                for rid in skill_ids:
-                    cur.execute(
-                        "INSERT INTO agent_knowledge_links (agent_id, kind, ref_id) VALUES (%s, 'skill', %s)"
-                        " ON CONFLICT DO NOTHING",
-                        (agent_id, rid),
-                    )
+        # Instruction/skill connections -> GitHub registry manifest (versioned source of
+        # truth). Commit+push so the change is on GitHub with history.
+        from agent_knowledge import save_manifest
+        save_manifest(slug, instr_ids, skill_ids)
     except Exception:  # noqa: BLE001
         logging.exception("agent config save failed")
         return jsonify({"error": "Не удалось сохранить настройки."}), 500
+    registry_git_sync(f"agent {slug}: update connected instructions/skills")
     _agent_cache_bust()
     return jsonify({"ok": True, "tools": enabled_tools, "instructions": instr_ids, "skills": skill_ids})
 
@@ -1559,16 +1585,13 @@ def agent_selected_knowledge(agent: dict[str, Any]) -> dict[str, list[dict[str, 
     Returns {instructions: [{title, content}], skills: [{title, description}]}. Only
     linked items are returned — this is what makes the selection a real capability
     boundary rather than a cosmetic list."""
-    instr_ids = agent.get("linked_instruction_ids") or set()
     skill_ids = agent.get("linked_skill_ids") or set()
+    # Instructions are delivered through the SCOPED start_here / get_ai_instructions
+    # tools (universal + this agent's connected optional ones), the single instruction
+    # channel for every agent (main included) — so they are NOT injected here again to
+    # avoid duplicating them in the prompt. Skills, which start_here does not carry,
+    # are injected below.
     instructions: list[dict[str, Any]] = []
-    if instr_ids:
-        for i in _library_instructions():
-            if i["id"] in instr_ids:
-                instructions.append({
-                    "title": (f"{i['parent']} / {i['title']}" if i["parent"] else i["title"]),
-                    "content": i["content"],
-                })
     skills: list[dict[str, Any]] = []
     if skill_ids:
         for s in _hermes_skills():
@@ -1781,7 +1804,12 @@ def mcp_agent_http(slug: str, path_token: str | None = None):
                         "error": {"code": -32000, "message": "внутренняя ошибка самообучения"}}
             return jsonify(body), 200
 
-    response = handle_request(payload, tool_names=tool_names)
+    # Per-agent instruction scope: universal instructions + the ones this agent's
+    # manifest connects. start_here / get_ai_instructions over this connector return
+    # exactly that set, so an unconnected optional instruction is unreadable here.
+    from agent_knowledge import allowed_instruction_paths
+    instruction_scope = allowed_instruction_paths(agent["slug"])
+    response = handle_request(payload, tool_names=tool_names, instruction_scope=instruction_scope)
     if response is None:
         return ("", 202)
     if method == "tools/list" and isinstance(response, dict):
@@ -2051,6 +2079,31 @@ def agent_center_knowledge():
         return jsonify({"error": "Не удалось загрузить базу знаний."}), 500
     items.extend(_hermes_skills())
     return jsonify({"items": items})
+
+
+@app.put("/api/agent-center/knowledge/instruction-scope")
+def agent_center_instruction_scope():
+    """Flip a library instruction between universal (goes to every agent) and optional
+    (connected per-agent). This is a LIBRARY-level change affecting all agents; it edits
+    the instruction's frontmatter in the GitHub registry."""
+    body = request.get_json(silent=True) or {}
+    path = str(body.get("path") or "").strip()
+    scope = str(body.get("scope") or "").strip().lower()
+    if not path or scope not in ("universal", "optional"):
+        return jsonify({"error": "Нужны path и scope (universal|optional)."}), 400
+    try:
+        from agent_knowledge import set_instruction_scope
+        ok = set_instruction_scope(path, scope)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:  # noqa: BLE001
+        logging.exception("instruction scope change failed")
+        return jsonify({"error": "Не удалось изменить область инструкции."}), 500
+    if not ok:
+        return jsonify({"error": "Инструкция не найдена в реестре (нужен git-режим)."}), 404
+    registry_git_sync(f"instruction scope: {path} -> {scope}")
+    _agent_cache_bust()
+    return jsonify({"ok": True, "path": path, "scope": scope})
 
 
 # Bootstrap the universal (main) agent row + connector once at import. Best-effort: guarded

@@ -318,20 +318,46 @@ def tool_list_available_sources(_: dict[str, Any]) -> dict[str, Any]:
     return {"sources": sources}
 
 
-def load_ai_instructions(path_prefix: str | None = None) -> list[dict[str, Any]]:
-    """Live instruction folders from ai_instruction_folders.
+def load_ai_instructions(
+    path_prefix: str | None = None,
+    allowed_paths: set[str] | list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Live instructions. Source of truth is the GitHub registry
+    (agent_knowledge/instructions); falls back to the ai_instruction_folders DB tree
+    when the registry is absent.
 
-    When ``path_prefix`` is given (case-insensitive), only folders whose full
-    path starts with that prefix are returned, so the assistant can fetch a
-    single instruction instead of the whole tree.
+    ``allowed_paths`` (per-agent scoping) — when given, only instructions whose full
+    path is in the set are returned. This is what makes a per-agent instruction
+    selection real: an agent scoped to a subset literally cannot read the rest via
+    start_here / get_ai_instructions. ``None`` = no scoping (the full tree), used by
+    the admin/tier connectors.
+
+    ``path_prefix`` (case-insensitive) — narrow to one folder subtree, so the
+    assistant can re-read a single instruction instead of the whole set.
     """
-    rows = _load_ai_instruction_rows()
+    rows = _all_instruction_rows()
+    if allowed_paths is not None:
+        allowed = set(allowed_paths)
+        rows = [row for row in rows if str(row.get("path") or "") in allowed]
     if not path_prefix:
         return rows
     needle = path_prefix.strip().lower()
     if not needle:
         return rows
     return [row for row in rows if str(row.get("path") or "").lower().startswith(needle)]
+
+
+def _all_instruction_rows() -> list[dict[str, Any]]:
+    """Registry-first instruction rows (git canonical, DB fallback). Rows carry the
+    same ``path`` / ``content`` / ``name`` keys in both modes."""
+    try:
+        from agent_knowledge import load_instructions
+        reg = load_instructions()
+    except Exception:  # noqa: BLE001
+        reg = None
+    if reg is not None:
+        return reg
+    return _load_ai_instruction_rows()
 
 
 def load_ai_instruction_index() -> list[dict[str, Any]]:
@@ -341,7 +367,7 @@ def load_ai_instruction_index() -> list[dict[str, Any]]:
     one via get_ai_instructions(path=...) instead of re-reading the full tree.
     """
     index: list[dict[str, Any]] = []
-    for row in _load_ai_instruction_rows():
+    for row in _all_instruction_rows():
         content = row.get("content")
         index.append(
             {
@@ -573,7 +599,8 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
 
 
 def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[str, Any]:
-    instructions = load_ai_instructions()
+    scope = args.get("_allowed_instruction_paths")
+    instructions = load_ai_instructions(allowed_paths=set(scope) if scope is not None else None)
     available_tools = list(args.get("_connector_tools") or sorted(TOOLS.keys()))
     hidden_tools = list(args.get("_connector_hidden_tools") or [])
     connector_id = args.get("_connector_id") or "full"
@@ -632,7 +659,8 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
 def tool_get_ai_instructions(args: dict[str, Any] | None = None) -> dict[str, Any]:
     args = args or {}
     path = str(args.get("path") or "").strip()
-    instructions = load_ai_instructions(path or None)
+    scope = args.get("_allowed_instruction_paths")
+    instructions = load_ai_instructions(path or None, allowed_paths=set(scope) if scope is not None else None)
     note = "These instructions are loaded live from ai_instruction_folders. Edit them in the UI: Settings -> AI instructions."
     if path:
         note = (
@@ -6728,7 +6756,8 @@ def list_tools(tool_names: set[str] | None = None, core: bool = False) -> list[d
 
 
 def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
-                   core: bool = False) -> dict[str, Any] | None:
+                   core: bool = False,
+                   instruction_scope: set[str] | list[str] | None = None) -> dict[str, Any] | None:
     request_id = request.get("id")
     method = request.get("method")
     available_tools = _allowed_tools(tool_names)
@@ -6786,6 +6815,13 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
                     args["_connector_hidden_tools"] = sorted(
                         set(available_tools.keys()) - CORE_TOOL_NAMES
                     )
+            # Per-agent instruction scope: when this connector is bound to an agent,
+            # start_here / get_ai_instructions return ONLY the agent's allowed paths
+            # (universal + connected). None = no scoping (admin/tier connectors).
+            if instruction_scope is not None and name in (
+                "start_here_always_read_ai_instructions", "get_ai_instructions"
+            ):
+                args = {**args, "_allowed_instruction_paths": list(instruction_scope)}
             started = time.perf_counter()
             result_payload = available_tools[name]["handler"](args)
             duration_ms = round((time.perf_counter() - started) * 1000, 1)

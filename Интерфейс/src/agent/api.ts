@@ -201,6 +201,8 @@ export interface AgentConfigKnowledge {
   parent: string;
   description: string;
   custom?: boolean;
+  scope?: "universal" | "optional"; // instructions: universal = every agent; optional = per-agent
+  kind?: string; // skills: "shared" | "hermes_base"
   selected: boolean;
 }
 
@@ -225,6 +227,16 @@ export async function saveAgentConfig(
   await fetchJsonSafe(
     `/api/agent-center/agents/${slug}/config`,
     { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    30000,
+  );
+}
+
+// Flip a library instruction between universal (all agents) and optional (per-agent).
+// Library-level change: edits the instruction's frontmatter in the GitHub registry.
+export async function setInstructionScope(path: string, scope: "universal" | "optional"): Promise<void> {
+  await fetchJsonSafe(
+    `/api/agent-center/knowledge/instruction-scope`,
+    { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, scope }) },
     30000,
   );
 }

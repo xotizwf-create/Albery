@@ -157,6 +157,88 @@ def load_skills() -> list[dict[str, Any]] | None:
     return _load_skill_dir(SKILLS_DIR, "shared") + _load_skill_dir(HERMES_BASE_DIR, "hermes_base")
 
 
+# --- per-agent manifests ---------------------------------------------------------
+# agent_knowledge/agents/<slug>.yaml lists the OPTIONAL instructions and skills an
+# agent is connected to. Universal instructions are always on regardless. This file
+# is the source of truth for the capability panel and for enforcement, so a doc an
+# agent is not connected to is neither injected nor returned by start_here.
+
+def _manifest_path(slug: str) -> Path:
+    return AGENTS_DIR / f"{slug}.yaml"
+
+
+def load_manifest(slug: str) -> dict[str, list[str]]:
+    """Connected instructions/skills for one agent. Missing file -> empty lists."""
+    path = _manifest_path(slug)
+    if not path.is_file():
+        return {"instructions": [], "skills": []}
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.exception("agent_knowledge: manifest load failed for %s", slug)
+        return {"instructions": [], "skills": []}
+    instr = [str(x) for x in (data.get("instructions") or []) if str(x).strip()]
+    skills = [str(x) for x in (data.get("skills") or []) if str(x).strip()]
+    return {"instructions": instr, "skills": skills}
+
+
+def save_manifest(slug: str, instructions: list[str], skills: list[str]) -> Path:
+    """Persist an agent's connected instructions/skills as a readable yaml manifest.
+    Written to the working tree; a watchdog commits+pushes it to GitHub (history)."""
+    import yaml
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = _manifest_path(slug)
+    payload = {
+        "slug": slug,
+        "instructions": sorted(set(instructions)),
+        "skills": sorted(set(skills)),
+    }
+    path.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def allowed_instruction_paths(slug: str) -> set[str] | None:
+    """Instruction paths this agent may receive = every universal instruction PLUS the
+    optional ones its manifest connects. ``None`` when the registry is absent (caller
+    then applies no scoping = full tree, preserving legacy behaviour)."""
+    items = load_instructions()
+    if items is None:
+        return None
+    all_paths = {i["path"] for i in items}
+    universal = {i["path"] for i in items if i["scope"] == SCOPE_UNIVERSAL}
+    connected = set(load_manifest(slug)["instructions"]) & all_paths
+    return universal | connected
+
+
+def _instruction_file_for_path(path: str) -> Path:
+    parts = [p.strip() for p in path.split(" / ") if p.strip()]
+    return INSTRUCTIONS_DIR.joinpath(*parts).with_suffix(".md")
+
+
+def set_instruction_scope(path: str, scope: str) -> bool:
+    """Flip a library instruction between universal (all agents) and optional
+    (per-agent). Rewrites only the ``scope:`` frontmatter line of its file."""
+    scope = (scope or "").strip().lower()
+    if scope not in (SCOPE_UNIVERSAL, SCOPE_OPTIONAL):
+        raise ValueError("scope must be 'universal' or 'optional'")
+    md = _instruction_file_for_path(path)
+    if not md.is_file():
+        return False
+    text = md.read_text(encoding="utf-8", errors="replace")
+    meta, body = parse_doc(text)
+    meta["scope"] = scope
+    ordered = ["name", "scope", "sort_order", "db_id"]
+    keys = [k for k in ordered if k in meta] + [k for k in meta if k not in ordered]
+    front = "---\n" + "".join(f"{k}: {meta[k]}\n" for k in keys) + "---\n\n"
+    md.write_text(front + body.strip("\n") + "\n", encoding="utf-8")
+    return True
+
+
 # --- helpers ---------------------------------------------------------------------
 
 def _safe_int(value: Any) -> int:

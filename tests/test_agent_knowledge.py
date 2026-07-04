@@ -71,3 +71,63 @@ def test_scope_defaults_to_universal_on_bad_value(tmp_path, monkeypatch):
     items = {i["id"]: i for i in k.load_instructions()}
     assert items["X"]["scope"] == "universal"
     assert items["Y"]["scope"] == "universal"
+
+
+def _base_registry(reg):
+    _write(reg, "instructions/Базовое.md", "---\nname: Базовое\nscope: universal\n---\n\nвсем\n")
+    _write(reg, "instructions/Отдел/Закупки.md", "---\nname: Закупки\nscope: optional\n---\n\nтолько закупкам\n")
+    _write(reg, "instructions/Отдел/Продажи.md", "---\nname: Продажи\nscope: optional\n---\n\nтолько продажам\n")
+
+
+def test_manifest_roundtrip(tmp_path, monkeypatch):
+    reg = tmp_path / "reg"
+    _base_registry(reg)
+    k = _reload_with(reg, monkeypatch)
+    assert k.load_manifest("sales") == {"instructions": [], "skills": []}
+    k.save_manifest("sales", ["Отдел / Продажи"], ["skill:tg-access"])
+    got = k.load_manifest("sales")
+    assert got["instructions"] == ["Отдел / Продажи"]
+    assert got["skills"] == ["skill:tg-access"]
+
+
+def test_allowed_instruction_paths_is_universal_plus_connected(tmp_path, monkeypatch):
+    reg = tmp_path / "reg"
+    _base_registry(reg)
+    k = _reload_with(reg, monkeypatch)
+    # No manifest yet -> only universal.
+    assert k.allowed_instruction_paths("sales") == {"Базовое"}
+    # Connect one optional instruction -> universal + that one, never the other optional.
+    k.save_manifest("sales", ["Отдел / Продажи"], [])
+    assert k.allowed_instruction_paths("sales") == {"Базовое", "Отдел / Продажи"}
+    assert "Отдел / Закупки" not in k.allowed_instruction_paths("sales")
+
+
+def test_allowed_paths_none_when_registry_absent(tmp_path, monkeypatch):
+    k = _reload_with(tmp_path / "nope", monkeypatch)
+    assert k.allowed_instruction_paths("sales") is None
+
+
+def test_set_instruction_scope_flips_frontmatter(tmp_path, monkeypatch):
+    reg = tmp_path / "reg"
+    _base_registry(reg)
+    k = _reload_with(reg, monkeypatch)
+    assert k.set_instruction_scope("Базовое", "optional") is True
+    items = {i["id"]: i for i in k.load_instructions()}
+    assert items["Базовое"]["scope"] == "optional"
+    assert items["Базовое"]["content"].strip() == "всем"  # body preserved
+    assert k.set_instruction_scope("Нет такой", "optional") is False
+
+
+def test_context_server_scopes_instructions(tmp_path, monkeypatch):
+    """load_ai_instructions(allowed_paths=…) returns only the scoped subset; None = all."""
+    reg = tmp_path / "reg"
+    _base_registry(reg)
+    _reload_with(reg, monkeypatch)
+    import mcp.context_server as cs
+
+    all_paths = {r["path"] for r in cs.load_ai_instructions()}
+    assert {"Базовое", "Отдел / Закупки", "Отдел / Продажи"} <= all_paths
+
+    scoped = {r["path"] for r in cs.load_ai_instructions(allowed_paths={"Базовое", "Отдел / Продажи"})}
+    assert scoped == {"Базовое", "Отдел / Продажи"}
+    assert "Отдел / Закупки" not in scoped
