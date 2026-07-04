@@ -188,3 +188,32 @@ def test_promote_learned_to_library_optional(tmp_path, monkeypatch):
     assert any(i["name"] == "Формат остатков" for i in k.load_agent_learned("sales"))
     # missing source -> None
     assert k.promote_learned_to_library("sales", "нет такой") is None
+
+
+def test_resync_preserves_scope_and_removes_stale(tmp_path, monkeypatch):
+    k = _reload_with(tmp_path / "reg", monkeypatch)
+    rows = [
+        {"path": "Базовое", "name": "Базовое", "content": "всем", "sort_order": 0, "id": "u1"},
+        {"path": "Отдел / Закупки", "name": "Закупки", "content": "закуп", "sort_order": 1, "id": "u2"},
+    ]
+    written, removed = k.resync_instructions_to_git(rows)
+    assert (written, removed) == (2, 0)
+    assert {i["id"]: i for i in k.load_instructions()}["Базовое"]["scope"] == "universal"
+
+    # owner marks one optional; a later resync with UNCHANGED content must preserve it
+    k.set_instruction_scope("Базовое", "optional")
+    k.resync_instructions_to_git(rows)
+    assert {i["id"]: i for i in k.load_instructions()}["Базовое"]["scope"] == "optional"
+
+    # a promoted library file (no db_id) must survive a resync
+    promo_dir = k.INSTRUCTIONS_DIR / "Навыки агентов"
+    promo_dir.mkdir(parents=True, exist_ok=True)
+    (promo_dir / "Промо.md").write_text(
+        "---\nname: Промо\nscope: optional\npromoted_from: sales\n---\n\nтело\n", encoding="utf-8")
+
+    # dropping a DB row deletes ITS file (has db_id) but keeps the promoted one
+    k.resync_instructions_to_git([rows[0]])
+    paths = {i["path"] for i in k.load_instructions()}
+    assert "Отдел / Закупки" not in paths        # DB-sourced -> removed
+    assert "Навыки агентов / Промо" in paths       # promoted -> preserved
+    assert "Базовое" in paths

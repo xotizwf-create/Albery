@@ -4337,6 +4337,12 @@ def tool_upsert_ai_instruction(args: dict[str, Any]) -> dict[str, Any]:
                         )
                         current = cur.fetchone()
     ttl_cache_delete_prefix(("ai_instruction_rows",))
+    # Mirror into the git registry so the change actually reaches the agent (reads git).
+    try:
+        import agent_center  # lazy: avoid import cycle at module load
+        agent_center.resync_instructions_to_git()
+    except Exception:  # noqa: BLE001
+        logger.warning("upsert_ai_instruction: git resync failed", exc_info=True)
     return {"folder": current, "path": " / ".join(path_parts)}
 
 

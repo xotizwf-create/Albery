@@ -119,6 +119,57 @@ def universal_instruction_paths() -> set[str]:
     return {i["path"] for i in items if i["scope"] == SCOPE_UNIVERSAL}
 
 
+def resync_instructions_to_git(rows: list[dict[str, Any]]) -> tuple[int, int]:
+    """Mirror DB instruction rows into the git registry so edits made through the
+    app's instruction editor (or the upsert_ai_instruction tool) take effect for the
+    agent, which reads git. ``rows`` = [{path, name, content, sort_order?, id?}] for
+    folders WITH content. Per-file ``scope`` is PRESERVED (owner's universal/optional
+    markings survive). Files that were previously exported from the DB (carry ``db_id``)
+    but are no longer present get removed (rename/delete). Files WITHOUT ``db_id``
+    (promoted or hand-added on GitHub) are never touched. Returns (written, removed)."""
+    INSTRUCTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    current_paths: set[str] = set()
+    written = 0
+    for r in rows:
+        content = (r.get("content") or "").strip()
+        if not content:
+            continue
+        path = r["path"]
+        current_paths.add(path)
+        parts = [_safe_component(p) for p in path.split(" / ")]
+        dest = INSTRUCTIONS_DIR.joinpath(*parts).with_suffix(".md")
+        scope = SCOPE_UNIVERSAL
+        db_id = str(r.get("id")) if r.get("id") is not None else None
+        if dest.is_file():
+            prev_meta, prev_body = parse_doc(dest.read_text(encoding="utf-8", errors="replace"))
+            scope = (prev_meta.get("scope") or scope).strip().lower()
+            db_id = db_id or prev_meta.get("db_id")
+            if prev_body.strip() == content and (prev_meta.get("name") or "").strip() == r["name"].strip():
+                continue  # unchanged — skip rewrite (avoid mtime churn / no-op commits)
+        meta = {"name": r["name"].strip(), "scope": scope}
+        if r.get("sort_order") is not None:
+            meta["sort_order"] = int(r.get("sort_order") or 0)
+        if db_id:
+            meta["db_id"] = db_id
+        front = "---\n" + "".join(f"{kk}: {vv}\n" for kk, vv in meta.items()) + "---\n\n"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(front + content + "\n", encoding="utf-8")
+        written += 1
+    removed = 0
+    for md in list(INSTRUCTIONS_DIR.rglob("*.md")):
+        if _instruction_path_from_file(md) in current_paths:
+            continue
+        meta, _ = parse_doc(md.read_text(encoding="utf-8", errors="replace"))
+        if meta.get("db_id"):   # was DB-sourced, now gone from DB -> mirror the deletion
+            md.unlink()
+            removed += 1
+    # prune now-empty instruction subdirectories
+    for d in sorted(INSTRUCTIONS_DIR.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+    return written, removed
+
+
 # --- skills ----------------------------------------------------------------------
 
 def _load_skill_dir(base: Path, kind: str) -> list[dict[str, Any]]:

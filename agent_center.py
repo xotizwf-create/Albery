@@ -781,6 +781,38 @@ def registry_git_sync(message: str) -> None:
         logging.warning("registry_git_sync failed (edit saved on disk, retried next change)", exc_info=True)
 
 
+def resync_instructions_to_git() -> None:
+    """Mirror the DB instruction tree into the git registry (scope-preserving) and push,
+    so edits made via the app's instruction editor / upsert_ai_instruction take effect
+    (the agent reads git). Best-effort, non-fatal; no-op if the registry is absent."""
+    try:
+        from agent_knowledge import registry_present, resync_instructions_to_git as _write
+        if not registry_present():
+            return
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH RECURSIVE t AS (
+                        SELECT id, parent_id, name, content, sort_order, ARRAY[name]::text[] AS path
+                        FROM ai_instruction_folders WHERE parent_id IS NULL
+                        UNION ALL
+                        SELECT c.id, c.parent_id, c.name, c.content, c.sort_order, t.path || c.name
+                        FROM ai_instruction_folders c JOIN t ON t.id = c.parent_id
+                    )
+                    SELECT id::text AS id, name, content, sort_order,
+                           array_to_string(path, ' / ') AS path
+                    FROM t ORDER BY path
+                    """
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+        written, removed = _write(rows)
+        if written or removed:
+            registry_git_sync("instructions: sync edit from app/upsert to registry")
+    except Exception:  # noqa: BLE001
+        logging.exception("resync_instructions_to_git failed")
+
+
 def _load_agents_full() -> list[dict[str, Any]]:
     with pg_connect() as conn:
         with conn.cursor() as cur:

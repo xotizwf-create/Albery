@@ -17146,6 +17146,8 @@ def api_ai_instruction_folders_put(folder_id: str):
                 if not row:
                     return jsonify({"error": "Папка не найдена"}), 404
                 folder = ai_instruction_folder_to_dict(row)
+    # Mirror the edit into the git registry so the agent (which reads git) sees it.
+    agent_center.resync_instructions_to_git()
     return jsonify({"folder": folder, "message": "Сохранено"})
 
 
@@ -17177,6 +17179,8 @@ def api_ai_instruction_folders_delete(folder_id: str):
                         """,
                         (deleted_name,),
                     )
+    # Mirror the deletion into the git registry (removes the DB-sourced file).
+    agent_center.resync_instructions_to_git()
     return jsonify({"message": "Папка удалена"})
 
 
