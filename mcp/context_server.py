@@ -3677,6 +3677,22 @@ def tool_list_leader_evaluations(args: dict[str, Any]) -> dict[str, Any]:
     return json_safe(workflow(date_from, date_to))
 
 
+def tool_dispatch_owner_weekly_report_task(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Sending requires confirm=true. Creates the weekly owner report as a Bitrix task for "
+            "Евгений Палей with the report PDF attached and deadline next Monday 10:00 МСК. In the "
+            "automated Friday cron this is called automatically after the report is generated and "
+            "saved; interactive callers must confirm.",
+        )
+    report_id = str(args.get("report_id") or "").strip()
+    if not report_id:
+        raise McpError(-32602, "Missing required argument: report_id")
+    workflow = app_workflow_function("dispatch_owner_weekly_report_task")
+    return json_safe(workflow(report_id))
+
+
 def tool_dispatch_leader_evaluations_digest(args: dict[str, Any]) -> dict[str, Any]:
     if args.get("confirm") is not True:
         raise McpError(
@@ -5916,6 +5932,25 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_send_owner_recommendations_to_bitrix,
+    },
+    "dispatch_owner_weekly_report_task": {
+        "description": (
+            "Create the weekly owner report as a Bitrix TASK for Евгений Палей with the report PDF attached "
+            "(UF_TASK_WEBDAV_FILES). Title 'Ознакомиться с недельным отчётом за <период>', deadline next Monday "
+            "10:00 МСК, cannot be completed without a result (SE_PARAMETER code 3). Uses build_owner_report_pdf + "
+            "upload_pdf_to_bitrix_disk + tasks.task.add. confirm=true is mandatory (the Friday cron passes it "
+            "automatically after generating the report)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "report_id": {"type": "string", "description": "owner_weekly_reports.id of the report to attach."},
+                "confirm": {"type": "boolean", "description": "Must be true."},
+            },
+            "required": ["report_id", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_dispatch_owner_weekly_report_task,
     },
     "send_bitrix_message": {
         "description": (

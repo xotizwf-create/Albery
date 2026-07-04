@@ -2748,6 +2748,81 @@ def list_pending_zoom_operational_dispatches(
     return result
 
 
+def _next_monday_10_msk() -> datetime:
+    """Next Monday 10:00 МСК (if today is Monday -> the following Monday)."""
+    today = msk_today()
+    days_ahead = (7 - today.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return datetime.combine(today + timedelta(days=days_ahead), dt_time(10, 0), tzinfo=MSK_TZ)
+
+
+def dispatch_owner_weekly_report_task(report_id, deadline_at=None, recipient_id=None):
+    """Create the weekly owner report as a Bitrix task for Евгений Палей with the PDF attached.
+
+    Renders the report PDF, uploads it to the Bitrix reports Disk folder and attaches it to the
+    task via UF_TASK_WEBDAV_FILES. Deadline defaults to next Monday 10:00 МСК. Mirrors
+    dispatch_leader_evaluations_digest but for the weekly owner report + PDF attachment.
+    """
+    if not os.getenv("BITRIX_WEBHOOK_BASE", "").strip():
+        raise ValueError("Укажите BITRIX_WEBHOOK_BASE в файле .env.")
+    report = load_owner_report_by_id(str(report_id or "").strip(), "weekly")
+    if not report:
+        raise ValueError("Недельный отчёт не найден.")
+    recipient_name = None
+    if recipient_id is None:
+        recipient = _resolve_owner_recipient()
+        recipient_id = recipient["user_id"]
+        recipient_name = recipient.get("name")
+    else:
+        recipient_id = to_int(recipient_id)
+    if recipient_id is None:
+        raise ValueError("Не удалось определить получателя задачи (Евгений Палей).")
+    client = bitrix_webhook_client()
+    pdf_bytes = build_owner_report_pdf(report, "weekly")
+    filename = owner_report_pdf_filename(report, "weekly")
+    uploaded = upload_pdf_to_bitrix_disk(client, filename, pdf_bytes, [recipient_id])
+    file_id = to_int(uploaded.get("ID") or uploaded.get("id"))
+    if file_id is None:
+        raise RuntimeError("Не удалось определить ID PDF после загрузки в Bitrix Disk.")
+    period_text = owner_report_display_period(report, "weekly")
+    title = "Ознакомиться с недельным отчётом за " + period_text
+    summary = str(report.get("summary") or "").strip()
+    description = "Ознакомьтесь с еженедельным управленческим отчётом собственнику (PDF во вложении)."
+    if summary:
+        description += "\n\nКраткий вердикт: " + summary
+    description += "\n\nКритерий результата: отчёт прочитан, ключевые решения приняты или делегированы."
+    if deadline_at is None:
+        deadline_at = _next_monday_10_msk()
+    task_payload = {
+        "fields": {
+            "TITLE": title,
+            "DESCRIPTION": description,
+            "RESPONSIBLE_ID": int(recipient_id),
+            "DEADLINE": deadline_at.isoformat(),
+            "UF_TASK_WEBDAV_FILES": ["n" + str(file_id)],
+            "SE_PARAMETER": [{"CODE": 3, "VALUE": "Y"}],
+        }
+    }
+    response = client.call_with_fallback("tasks.task.add", task_payload, prefer_api=True)
+    result_payload = response.get("result") if isinstance(response, dict) else None
+    task_id = None
+    if isinstance(result_payload, dict):
+        task_obj = result_payload.get("task") if isinstance(result_payload.get("task"), dict) else {}
+        task_id = task_obj.get("id") or result_payload.get("id")
+    return {
+        "sent": 1,
+        "task_id": to_int(task_id) or task_id,
+        "title": title,
+        "recipient_id": int(recipient_id),
+        "recipient_name": recipient_name,
+        "deadline": deadline_at.isoformat(),
+        "file_id": file_id,
+        "pdf_size": len(pdf_bytes),
+        "period": period_text,
+    }
+
+
 def dispatch_prepared_zoom_operational_tasks(payload: dict[str, Any]) -> dict[str, Any]:
     if not os.getenv("BITRIX_WEBHOOK_BASE", "").strip():
         raise ValueError("Укажите BITRIX_WEBHOOK_BASE в файле .env.")
