@@ -896,6 +896,69 @@ def _b24_ensure_command_registered(client_endpoint: str, access_token: str, bot_
     threading.Thread(target=_do, daemon=True).start()
 
 
+def _b24_subagent_bot_ids() -> list[str]:
+    """bitrix_bot_id of every registered subagent, so we can register their keyboard commands too."""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT bitrix_bot_id FROM agents WHERE bitrix_bot_id IS NOT NULL")
+                return [str(r["bitrix_bot_id"]) for r in cur.fetchall() if r["bitrix_bot_id"]]
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: subagent bot ids query failed")
+        return []
+
+
+_b24_bootstrap_lock = threading.Lock()
+_b24_bootstrapped = False
+
+
+def _b24_bootstrap_all_commands(client_endpoint: str, access_token: str, main_bot_id: Any) -> None:
+    """Proactively register keyboard commands for EVERY bot (main + all subagents), so their
+    buttons fire ONIMCOMMANDADD without that bot first needing a text message. Without this a
+    subagent's buttons just hang (a click can't itself trigger registration → chicken-and-egg).
+    Runs ONCE per process, in the background, off the request path; per-bot flags keep it idempotent.
+    Uses the live event's app token, which owns all bots this application registered."""
+    global _b24_bootstrapped
+    if not (client_endpoint and access_token):
+        return
+    with _b24_bootstrap_lock:
+        if _b24_bootstrapped:
+            return
+        _b24_bootstrapped = True
+
+    def _do() -> None:
+        bot_ids: list[str] = []
+        if main_bot_id:
+            bot_ids.append(str(main_bot_id))
+        bot_ids.extend(b for b in _b24_subagent_bot_ids() if b not in bot_ids)
+        for bid in bot_ids:
+            _b24_ensure_command_registered(client_endpoint, access_token, bid)
+        logging.info("b24 testbot: bootstrapped keyboard commands for bots %s", bot_ids)
+
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def _b24_startup_register_commands() -> None:
+    """On process start, register keyboard commands for ALL bots without waiting for an event, so
+    buttons are live immediately after a deploy/restart (not only after the first message). Uses the
+    stored app refresh_token to mint a token off-event; best-effort and idempotent (per-bot flags)."""
+    def _do() -> None:
+        time.sleep(15)  # let the app + DB pool settle after startup
+        try:
+            endpoint, token = _b24_app_access_token()
+        except Exception:  # noqa: BLE001
+            logging.debug("b24 testbot: startup command registration — token not ready", exc_info=True)
+            return
+        if endpoint and token:
+            _b24_bootstrap_all_commands(endpoint, token, _b24_load_state().get("bot_id"))
+
+    threading.Thread(target=_do, daemon=True).start()
+
+
+# Kick off proactive command registration once, right after import (app startup).
+_b24_startup_register_commands()
+
+
 def _b24_app_typing(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str) -> None:
     """Show the bot as 'typing…' — the read/processing signal (no eye reaction on this portal)."""
     if not (client_endpoint and access_token and bot_id and dialog_id):
@@ -1011,13 +1074,25 @@ B24_IDLE_RESET_SECONDS = int(os.getenv("B24_TESTBOT_IDLE_RESET_SECONDS", "1800")
 B24_TURN_CAP = int(os.getenv("B24_TESTBOT_TURN_CAP", "16"))
 
 
-def _b24_summarize_segment(dialog_id: str) -> str | None:
+def _b24_scope(dialog_id: Any, agent_slug: str | None) -> str:
+    """Per-agent session key. In Bitrix a private chat is keyed by the USER id, so the SAME
+    dialog_id is reused by every bot that person talks to — keying the hermes session and the
+    lifecycle row by dialog_id alone made the main bot and every subagent SHARE one conversation.
+    Scope the key by agent so each agent has its own sessions (main agent = bare dialog_id, keeps
+    existing rows working). The real dialog_id is still used for Bitrix replies and for filtering
+    bitrix_bot_interactions (which carries its own agent_slug column)."""
+    slug = (agent_slug or "").strip()
+    return f"{slug}:{dialog_id}" if slug else str(dialog_id)
+
+
+def _b24_summarize_segment(dialog_id: str, agent_slug: str | None = None) -> str | None:
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT question, answer FROM bitrix_bot_interactions WHERE dialog_id=%s ORDER BY id DESC LIMIT 20",
-                    (str(dialog_id),),
+                    "SELECT question, answer FROM bitrix_bot_interactions "
+                    "WHERE dialog_id=%s AND agent_slug IS NOT DISTINCT FROM %s::text ORDER BY id DESC LIMIT 20",
+                    (str(dialog_id), agent_slug),
                 )
                 rows = cur.fetchall()
         if not rows:
@@ -1034,9 +1109,13 @@ def _b24_summarize_segment(dialog_id: str) -> str | None:
         return None
 
 
-def _b24_session_prepare(dialog_id: str) -> tuple[str, str | None]:
-    """Return (session_name, seed_summary_for_this_turn) applying idle reset / cap rotation."""
-    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(dialog_id))[:40]
+def _b24_session_prepare(dialog_id: str, agent_slug: str | None = None) -> tuple[str, str | None]:
+    """Return (session_name, seed_summary_for_this_turn) applying idle reset / cap rotation.
+    Scoped per agent: the lifecycle row and the hermes session name are keyed by
+    (agent_slug, dialog_id), so each agent keeps its own conversation even though the Bitrix
+    dialog_id is shared across bots. The history floor is computed from that agent's own turns."""
+    scope = _b24_scope(dialog_id, agent_slug)
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(scope))[:60]
     now = datetime.now(timezone.utc)
     try:
         with pg_connect() as conn:
@@ -1044,13 +1123,13 @@ def _b24_session_prepare(dialog_id: str) -> tuple[str, str | None]:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT epoch, turns, summary, last_at FROM bitrix_bot_sessions WHERE dialog_id=%s FOR UPDATE",
-                        (str(dialog_id),),
+                        (scope,),
                     )
                     row = cur.fetchone()
                     if not row:
                         cur.execute(
                             "INSERT INTO bitrix_bot_sessions (dialog_id, epoch, turns, last_at) VALUES (%s, 1, 0, %s)",
-                            (str(dialog_id), now),
+                            (scope, now),
                         )
                         return f"bitrix-{safe}-e1", None
                     epoch, turns, summary, last_at = row["epoch"], row["turns"], row["summary"], row["last_at"]
@@ -1062,25 +1141,26 @@ def _b24_session_prepare(dialog_id: str) -> tuple[str, str | None]:
                         # history floor so prior Q/A is no longer injected into the prompt.
                         epoch, turns, summary, idle_reset = epoch + 1, 0, None, True
                     elif turns >= B24_TURN_CAP:
-                        seed = _b24_summarize_segment(dialog_id) or summary
+                        seed = _b24_summarize_segment(dialog_id, agent_slug) or summary
                         epoch, turns, summary = epoch + 1, 0, seed
                     elif turns == 0:
                         seed = summary
                     if idle_reset:
                         cur.execute(
-                            "SELECT COALESCE(MAX(id), 0) AS floor FROM bitrix_bot_interactions WHERE dialog_id=%s",
-                            (str(dialog_id),),
+                            "SELECT COALESCE(MAX(id), 0) AS floor FROM bitrix_bot_interactions "
+                            "WHERE dialog_id=%s AND agent_slug IS NOT DISTINCT FROM %s::text",
+                            (str(dialog_id), agent_slug),
                         )
                         floor = cur.fetchone()["floor"]
                         cur.execute(
                             "UPDATE bitrix_bot_sessions SET epoch=%s, turns=%s, summary=%s, last_at=%s, "
                             "history_floor_id=%s WHERE dialog_id=%s",
-                            (epoch, turns, summary, now, floor, str(dialog_id)),
+                            (epoch, turns, summary, now, floor, scope),
                         )
                     else:
                         cur.execute(
                             "UPDATE bitrix_bot_sessions SET epoch=%s, turns=%s, summary=%s, last_at=%s WHERE dialog_id=%s",
-                            (epoch, turns, summary, now, str(dialog_id)),
+                            (epoch, turns, summary, now, scope),
                         )
                     return f"bitrix-{safe}-e{epoch}", seed
     except Exception:  # noqa: BLE001
@@ -1088,14 +1168,14 @@ def _b24_session_prepare(dialog_id: str) -> tuple[str, str | None]:
         return f"bitrix-{safe}-e1", None
 
 
-def _b24_session_touch(dialog_id: str) -> None:
+def _b24_session_touch(dialog_id: str, agent_slug: str | None = None) -> None:
     try:
         with pg_connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE bitrix_bot_sessions SET turns = turns + 1, last_at = now() WHERE dialog_id = %s",
-                        (str(dialog_id),),
+                        (_b24_scope(dialog_id, agent_slug),),
                     )
     except Exception:  # noqa: BLE001
         logging.exception("b24 testbot: session touch failed")
@@ -1119,18 +1199,21 @@ def _b24_is_reset_command(text: str) -> bool:
     return norm in B24_RESET_TRIGGERS
 
 
-def _b24_session_reset(dialog_id: str) -> None:
+def _b24_session_reset(dialog_id: str, agent_slug: str | None = None) -> None:
     """Manual 'new session': bump the epoch AND raise the history floor so previously
     injected Q/A from bitrix_bot_interactions is no longer carried into the prompt — i.e.
-    a genuinely clean conversation, not just a relabeled session key."""
+    a genuinely clean conversation, not just a relabeled session key. Scoped per agent: the
+    floor is taken from THIS agent's own turns and the lifecycle row is keyed by (agent, dialog)."""
+    scope = _b24_scope(dialog_id, agent_slug)
     now = datetime.now(timezone.utc)
     try:
         with pg_connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT COALESCE(MAX(id), 0) AS floor FROM bitrix_bot_interactions WHERE dialog_id=%s",
-                        (str(dialog_id),),
+                        "SELECT COALESCE(MAX(id), 0) AS floor FROM bitrix_bot_interactions "
+                        "WHERE dialog_id=%s AND agent_slug IS NOT DISTINCT FROM %s::text",
+                        (str(dialog_id), agent_slug),
                     )
                     floor = cur.fetchone()["floor"]
                     cur.execute(
@@ -1142,7 +1225,7 @@ def _b24_session_reset(dialog_id: str) -> None:
                               turns = 0, summary = NULL, last_at = %s,
                               history_floor_id = %s
                         """,
-                        (str(dialog_id), now, floor, now, floor),
+                        (scope, now, floor, now, floor),
                     )
     except Exception:  # noqa: BLE001
         logging.exception("b24 testbot: session reset failed")
@@ -1760,19 +1843,22 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_bl
     return "\n\n".join(blocks) if blocks else text
 
 
-def _b24_recent_history(dialog_id: str, limit: int = 6) -> list[tuple[str, str]]:
-    """Last successful Q/A pairs for this dialog — we inject them into the prompt
-    because `hermes -z` one-shot calls do NOT persist/resume `--continue` sessions,
-    so the agent has no memory of its own. This is how the bot remembers context."""
+def _b24_recent_history(dialog_id: str, limit: int = 6,
+                        agent_slug: str | None = None) -> list[tuple[str, str]]:
+    """Last successful Q/A pairs for THIS agent in this dialog — we inject them into the prompt
+    because `hermes -z` one-shot calls do NOT persist/resume `--continue` sessions, so the agent
+    has no memory of its own. Filtered by agent_slug so an agent only recalls its OWN history
+    (the Bitrix dialog_id is shared across bots); the floor comes from this agent's session row."""
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT question, answer FROM bitrix_bot_interactions "
-                    "WHERE dialog_id=%s AND status='ok' AND question <> '' "
+                    "WHERE dialog_id=%s AND agent_slug IS NOT DISTINCT FROM %s::text "
+                    "AND status='ok' AND question <> '' "
                     "AND id > COALESCE((SELECT history_floor_id FROM bitrix_bot_sessions WHERE dialog_id=%s), 0) "
                     "ORDER BY id DESC LIMIT %s",
-                    (str(dialog_id), str(dialog_id), int(limit)),
+                    (str(dialog_id), agent_slug, _b24_scope(dialog_id, agent_slug), int(limit)),
                 )
                 return [(r["question"], r["answer"]) for r in reversed(cur.fetchall())]
     except Exception:  # noqa: BLE001
@@ -1887,8 +1973,9 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
     (`agent` profile from agent_center) uses the agent's OWN connector `agent-<slug>` —
     its tier toolset plus personal self-learning tools, scoped to that agent only.
     Session lifecycle (idle reset + cap rotation + carried summary) is handled by
-    _b24_session_prepare."""
-    session, seed = _b24_session_prepare(dialog_id)
+    _b24_session_prepare. All session/history keying is scoped to this agent (agent_slug)."""
+    agent_slug = (agent or {}).get("slug")
+    session, seed = _b24_session_prepare(dialog_id, agent_slug)
     toolset = {"admin": "albery", "ops": "albery-ops"}.get(tier, "albery-faq")
     core_toolset = tier in ("admin", "ops") and os.getenv("B24_CORE_TOOLSET", "").strip() == "1"
     if core_toolset:
@@ -2099,7 +2186,7 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         )
     if seed:
         parts.append("Сводка более ранней части разговора: " + seed)
-    history = _b24_recent_history(dialog_id, int(os.getenv("B24_TESTBOT_HISTORY_TURNS", "10")))
+    history = _b24_recent_history(dialog_id, int(os.getenv("B24_TESTBOT_HISTORY_TURNS", "10")), agent_slug)
     if history:
         convo = "\n".join(f"Пользователь: {q}\nАссистент: {a}" for q, a in history)
         parts.append("История этого диалога (предыдущие реплики, помни их):\n" + convo)
@@ -2411,16 +2498,17 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
     # done: swap 👀 (read) → 👍 (done) on the user's message.
     _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
     _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
-    _b24_session_touch(dialog_id)
+    _b24_session_touch(dialog_id, (agent or {}).get("slug"))
     _b24_ensure_command_registered(client_endpoint, access_token, bot_id)
     _b24_log_interaction(dialog_id, from_user_id, tier, user_text, answer, latency_ms, status, error,
                          agent_slug=(agent or {}).get("slug"))
 
 
 def _b24_do_reset(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
-                  message_id: Any = "") -> None:
-    """Reset the dialog's session and confirm — runs WITHOUT calling the model."""
-    _b24_session_reset(dialog_id)
+                  message_id: Any = "", agent_slug: str | None = None) -> None:
+    """Reset the dialog's session and confirm — runs WITHOUT calling the model. Scoped per agent
+    so 'New session' only clears THIS agent's conversation, not another bot's in the same chat."""
+    _b24_session_reset(dialog_id, agent_slug)
     if message_id:
         _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
         _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
@@ -2662,9 +2750,12 @@ def _bitrix_imbot_app_event():
             return uid in members
         return _b24_tier_for(user_id) != "none"
 
-    # Self-heal: ensure the /new command is registered (background, one-time, no-op after).
+    # Self-heal: ensure the /new command is registered (background, one-time, no-op after) for the
+    # addressed bot, AND once per process for EVERY bot (main + subagents) so subagent buttons are
+    # live without needing a priming message.
     if access_token and bot_id and endpoint and event_name in ("ONIMBOTMESSAGEADD", "ONIMCOMMANDADD"):
         _b24_ensure_command_registered(endpoint, access_token, bot_id)
+        _b24_bootstrap_all_commands(endpoint, access_token, state.get("bot_id"))
 
     if event_name == "ONIMBOTJOINCHAT":
         if dialog_id:
@@ -2727,7 +2818,8 @@ def _bitrix_imbot_app_event():
             _b24_send_onboarding(endpoint, access_token, bot_id, cmd_dialog,
                                  _b24_onboarding_step(cmd_dialog) + 1, _b24_tier_for(cmd_user), message_id)
         elif cmd_dialog and command in ("new", "reset", "новая", "сброс"):
-            _b24_do_reset(endpoint, access_token, bot_id, cmd_dialog, message_id)
+            _b24_do_reset(endpoint, access_token, bot_id, cmd_dialog, message_id,
+                          agent_slug=(agent or {}).get("slug"))
         elif cmd_dialog:
             logging.info("b24 testbot: ignored unknown/empty command event: %r", command)
         # Acknowledge the command so Bitrix stops retrying / showing 'typing…' (best-effort).
@@ -2789,7 +2881,8 @@ def _bitrix_imbot_app_event():
             return jsonify({"ok": True, "event": event_name, "error_report": True})
         # 'New session' request (typed /new or 'новая сессия'): reset WITHOUT calling the model.
         if _b24_is_reset_command(message_text):
-            _b24_do_reset(endpoint, access_token, bot_id, dialog_id, message_id)
+            _b24_do_reset(endpoint, access_token, bot_id, dialog_id, message_id,
+                          agent_slug=(agent or {}).get("slug"))
             return jsonify({"ok": True, "event": event_name, "reset": True})
         # Return to Bitrix immediately. Even cosmetic pre-processing calls (reaction/typing)
         # can hang during Bitrix/network degradation; if they run before the HTTP response,
