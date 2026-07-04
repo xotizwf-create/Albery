@@ -128,11 +128,16 @@ export function DialogsView() {
       setTurns([]);
       return;
     }
+    // activeChatId is the composite `${agentId}:${dialogId}`; split once so the thread is
+    // fetched scoped to this bot (a dialog_id is shared across bots).
+    const sep = activeChatId.indexOf(":");
+    const chatAgentId = activeChatId.slice(0, sep);
+    const chatDialogId = activeChatId.slice(sep + 1);
     let cancelled = false;
     initialScrollRef.current = true;
     atBottomRef.current = true;
     setTurnsLoading(true);
-    fetchDialogTurns(activeChatId)
+    fetchDialogTurns(chatDialogId, chatAgentId)
       .then((loaded) => {
         if (!cancelled) setTurns(loaded);
       })
@@ -145,7 +150,7 @@ export function DialogsView() {
     // Live updates: silently re-pull the open conversation (state changes only
     // when a new turn actually arrived, so no flicker while reading).
     const timer = window.setInterval(() => {
-      fetchDialogTurns(activeChatId)
+      fetchDialogTurns(chatDialogId, chatAgentId)
         .then((loaded) => {
           if (cancelled) return;
           setTurns((prev) => {
@@ -378,7 +383,7 @@ export function DialogsView() {
                 </div>
               </div>
               <div className="flex items-center gap-2 px-4 py-2 text-[13px] font-bold text-gray-400 bg-white border border-gray-100 rounded-xl">
-                {activeChat.id}
+                диалог {activeChat.dialogId}
                 <ExternalLink className="w-4 h-4" />
               </div>
             </div>

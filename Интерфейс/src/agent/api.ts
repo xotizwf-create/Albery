@@ -76,7 +76,8 @@ const avatarColor = (key: string) => {
 };
 
 const toChat = (d: RawDialog): Chat => ({
-  id: d.dialog_id,
+  id: `${d.agent_slug || "main"}:${d.dialog_id}`,
+  dialogId: d.dialog_id,
   agentId: d.agent_slug || "main",
   userName: d.user_name,
   userRole: d.user_position || `диалог ${d.dialog_id}`,
@@ -275,8 +276,11 @@ export async function fetchAgentDialogs(params: { channel: string; q?: string; a
   return { chats: ((data.dialogs || []) as RawDialog[]).map(toChat), note: data.note };
 }
 
-export async function fetchDialogTurns(dialogId: string): Promise<DialogTurn[]> {
+export async function fetchDialogTurns(dialogId: string, agent?: string): Promise<DialogTurn[]> {
   const search = new URLSearchParams({ dialog_id: dialogId });
+  // Scope the thread to the bot — a dialog_id is shared across bots, so without this the
+  // thread would mix in other bots' turns with the same user.
+  if (agent && agent !== "all") search.set("agent", agent);
   const data = await fetchJsonSafe(`/api/agent-center/dialog-messages?${search}`, undefined, 30000);
   return (data.turns || []) as DialogTurn[];
 }

@@ -134,37 +134,42 @@ def agent_center_dialogs():
             agent_filter = " AND agent_slug = %s"
             agent_params = [agent]
     limit = _limit_arg(_DIALOGS_LIMIT_DEFAULT, 500)
-    # A dialog_id is bot-specific (one chat = one bot), so filtering the `last` CTE is
-    # enough; the join then constrains `agg` and the search subquery to the same bot.
+    # A "dialog" belongs to a specific bot. In Bitrix a private bot chat is keyed by the
+    # USER (dialog_id = user id), so the SAME dialog_id is reused by every bot that user
+    # messages. Key by (agent_slug, dialog_id) and scope every aggregate to that bot, so
+    # one bot's turns never leak into another's list entry, preview or counts.
     sql = f"""
         WITH last AS (
-            SELECT DISTINCT ON (dialog_id)
-                   dialog_id, bitrix_user_id, tier, question, status, created_at, agent_slug
+            SELECT DISTINCT ON (agent_slug, dialog_id)
+                   dialog_id, agent_slug, bitrix_user_id, tier, question, status, created_at
             FROM bitrix_bot_interactions
             WHERE dialog_id IS NOT NULL{agent_filter}
-            ORDER BY dialog_id, id DESC
+            ORDER BY agent_slug, dialog_id, id DESC
         ),
         agg AS (
-            SELECT dialog_id,
+            SELECT dialog_id, agent_slug,
                    COUNT(*) AS turns,
                    COUNT(*) FILTER (WHERE status <> 'ok') AS errors,
                    MAX(created_at) AS last_at
             FROM bitrix_bot_interactions
-            WHERE dialog_id IS NOT NULL
-            GROUP BY dialog_id
+            WHERE dialog_id IS NOT NULL{agent_filter}
+            GROUP BY dialog_id, agent_slug
         )
-        SELECT l.dialog_id, l.bitrix_user_id, l.tier, l.question, l.status, l.agent_slug,
+        SELECT l.dialog_id, l.agent_slug, l.bitrix_user_id, l.tier, l.question, l.status,
                a.turns, a.errors, a.last_at
-        FROM last l JOIN agg a USING (dialog_id)
+        FROM last l
+        JOIN agg a ON a.dialog_id = l.dialog_id
+                  AND a.agent_slug IS NOT DISTINCT FROM l.agent_slug
     """
-    params: list[Any] = list(agent_params)
+    params: list[Any] = list(agent_params) + list(agent_params)  # last CTE + agg CTE
     if q:
         sql += (
             " WHERE l.dialog_id IN (SELECT DISTINCT dialog_id FROM bitrix_bot_interactions"
-            " WHERE question ILIKE %s OR answer ILIKE %s)"
+            f" WHERE (question ILIKE %s OR answer ILIKE %s){agent_filter})"
         )
         like = f"%{q}%"
         params.extend([like, like])
+        params.extend(agent_params)  # keep search within the selected bot too
     sql += " ORDER BY a.last_at DESC LIMIT %s"
     params.append(limit)
     dialogs = []
@@ -204,6 +209,17 @@ def agent_center_dialog_messages():
     dialog_id = (request.args.get("dialog_id") or "").strip()
     if not dialog_id:
         return jsonify({"error": "Укажите dialog_id."}), 400
+    # Same dialog_id is shared across bots (Bitrix keys a private bot chat by the user),
+    # so a thread MUST be scoped to the bot or it leaks other bots' turns into this one.
+    agent = (request.args.get("agent") or "all").strip()
+    agent_filter = ""
+    agent_params: list[Any] = []
+    if agent and agent != "all":
+        if agent == MAIN_AGENT_SLUG:
+            agent_filter = " AND agent_slug IS NULL"
+        else:
+            agent_filter = " AND agent_slug = %s"
+            agent_params = [agent]
     limit = _limit_arg(_MESSAGES_LIMIT_DEFAULT, 1000)
     turns = []
     try:
@@ -211,8 +227,8 @@ def agent_center_dialog_messages():
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, created_at, question, answer, status, error, latency_ms, tier, session_name"
-                    " FROM bitrix_bot_interactions WHERE dialog_id = %s ORDER BY id DESC LIMIT %s",
-                    (dialog_id, limit),
+                    f" FROM bitrix_bot_interactions WHERE dialog_id = %s{agent_filter} ORDER BY id DESC LIMIT %s",
+                    [dialog_id, *agent_params, limit],
                 )
                 rows = cur.fetchall()
         for r in reversed(rows):
