@@ -700,10 +700,19 @@ def _b24_onboarding_text(step: int, tier: str) -> str:  # noqa: ARG001 — tier 
     ])
 
 
+def _b24_bkey(bot_id: Any, dialog_id: Any) -> str:
+    """Per-bot key for ephemeral per-dialog UI state (awaiting-error / onboarding step / last
+    keyboard). A Bitrix private chat is keyed by the USER id, so the SAME dialog_id is reused by
+    every bot that user talks to — keying this state by dialog_id alone leaked it ACROSS bots (e.g.
+    'Report error' pressed on one bot, then a message to ANOTHER bot got captured as the report).
+    bot_id is available at every call site and uniquely identifies the bot."""
+    return f"{bot_id}:{dialog_id}"
+
+
 def _b24_send_onboarding(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
                          step: int, tier: str, message_id: Any = "") -> None:
     """Send one onboarding step. Steps 1-2 carry a 'Далее ▶️' button; the final step restores the
-    normal keyboard. The current step is remembered per dialog so 'Далее' knows what comes next."""
+    normal keyboard. The current step is remembered per (bot, dialog) so 'Далее' knows what's next."""
     step = max(1, min(step, _B24_ONB_LAST_STEP))
     if message_id:
         _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
@@ -714,16 +723,16 @@ def _b24_send_onboarding(client_endpoint: str, access_token: str, bot_id: Any, d
     st = _b24_load_state()
     onb = st.get("onboarding") or {}
     if step < _B24_ONB_LAST_STEP:
-        onb[str(dialog_id)] = step
+        onb[_b24_bkey(bot_id, dialog_id)] = step
     else:
-        onb.pop(str(dialog_id), None)
+        onb.pop(_b24_bkey(bot_id, dialog_id), None)
     st["onboarding"] = onb
     _b24_save_state(st)
     _b24_ensure_command_registered(client_endpoint, access_token, bot_id)
 
 
-def _b24_onboarding_step(dialog_id: str) -> int:
-    return int((_b24_load_state().get("onboarding") or {}).get(str(dialog_id), 0))
+def _b24_onboarding_step(bot_id: Any, dialog_id: str) -> int:
+    return int((_b24_load_state().get("onboarding") or {}).get(_b24_bkey(bot_id, dialog_id), 0))
 
 
 # --- "keyboard only under the last message" bookkeeping ----------------------
@@ -732,33 +741,34 @@ def _b24_onboarding_step(dialog_id: str) -> int:
 # currently holds the keyboard (per dialog, in the small JSON state) and, when sending a new
 # keyboard'd reply, edit the previous one to drop its keyboard — leaving exactly one live set.
 
-def _b24_get_last_kb(dialog_id: str) -> dict[str, Any] | None:
-    return (_b24_load_state().get("last_kb") or {}).get(str(dialog_id))
+def _b24_get_last_kb(bot_id: Any, dialog_id: str) -> dict[str, Any] | None:
+    return (_b24_load_state().get("last_kb") or {}).get(_b24_bkey(bot_id, dialog_id))
 
 
-def _b24_set_last_kb(dialog_id: str, message_id: Any, text: str) -> None:
+def _b24_set_last_kb(bot_id: Any, dialog_id: str, message_id: Any, text: str) -> None:
     st = _b24_load_state()
     last_kb = st.get("last_kb") or {}
-    last_kb[str(dialog_id)] = {"id": message_id, "text": text}
+    last_kb[_b24_bkey(bot_id, dialog_id)] = {"id": message_id, "text": text}
     if len(last_kb) > 300:  # keep the map bounded on a long-lived box
         last_kb = dict(list(last_kb.items())[-300:])
     st["last_kb"] = last_kb
     _b24_save_state(st)
 
 
-def _b24_set_awaiting_error(dialog_id: str) -> None:
+def _b24_set_awaiting_error(bot_id: Any, dialog_id: str) -> None:
     st = _b24_load_state()
     awaiting = st.get("awaiting_error") or {}
-    awaiting[str(dialog_id)] = int(time.time())
+    awaiting[_b24_bkey(bot_id, dialog_id)] = int(time.time())
     st["awaiting_error"] = awaiting
     _b24_save_state(st)
 
 
-def _b24_pop_awaiting_error(dialog_id: str, ttl_seconds: int = 3600) -> bool:
-    """True (and clears the flag) if this dialog is awaiting an error description set within ttl."""
+def _b24_pop_awaiting_error(bot_id: Any, dialog_id: str, ttl_seconds: int = 3600) -> bool:
+    """True (and clears the flag) if THIS bot's dialog is awaiting an error description set within
+    ttl. Scoped per bot so 'Report error' on one bot never captures a message sent to another."""
     st = _b24_load_state()
     awaiting = st.get("awaiting_error") or {}
-    ts = awaiting.pop(str(dialog_id), None)
+    ts = awaiting.pop(_b24_bkey(bot_id, dialog_id), None)
     if ts is None:
         return False
     st["awaiting_error"] = awaiting
@@ -835,11 +845,12 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
             return None
 
     # Keep the buttons only under the latest message: drop the previous keyboard, remember this one.
+    # Scoped per bot so stripping never touches ANOTHER bot's message in the same shared dialog.
     if keyboard and new_message_id:
-        prev = _b24_get_last_kb(dialog_id)
+        prev = _b24_get_last_kb(bot_id, dialog_id)
         if prev and str(prev.get("id")) != str(new_message_id):
             _b24_strip_keyboard(client_endpoint, access_token, bot_id, prev.get("id"), prev.get("text") or "")
-        _b24_set_last_kb(dialog_id, new_message_id, sent_text)
+        _b24_set_last_kb(bot_id, dialog_id, new_message_id, sent_text)
     return new_message_id
 
 
@@ -2625,8 +2636,9 @@ def _b24_log_error_report(dialog_id: str, from_user_id: Any, reporter_name: str,
 def _b24_start_error_report(client_endpoint: str, access_token: str, bot_id: Any,
                             dialog_id: str, message_id: Any = "") -> None:
     """User pressed '⚠️ Сообщить об ошибке' — ask for the description and arm capture of their
-    next message (handled in ONIMBOTMESSAGEADD via _b24_pop_awaiting_error)."""
-    _b24_set_awaiting_error(dialog_id)
+    next message (handled in ONIMBOTMESSAGEADD via _b24_pop_awaiting_error). Armed per (bot, dialog)
+    so pressing it on one bot never captures a message the user later sends to a DIFFERENT bot."""
+    _b24_set_awaiting_error(bot_id, dialog_id)
     if message_id:
         _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
         _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
@@ -2816,7 +2828,7 @@ def _bitrix_imbot_app_event():
                                  _b24_tier_for(cmd_user), message_id)
         elif cmd_dialog and command == "onb_next":
             _b24_send_onboarding(endpoint, access_token, bot_id, cmd_dialog,
-                                 _b24_onboarding_step(cmd_dialog) + 1, _b24_tier_for(cmd_user), message_id)
+                                 _b24_onboarding_step(bot_id, cmd_dialog) + 1, _b24_tier_for(cmd_user), message_id)
         elif cmd_dialog and command in ("new", "reset", "новая", "сброс"):
             _b24_do_reset(endpoint, access_token, bot_id, cmd_dialog, message_id,
                           agent_slug=(agent or {}).get("slug"))
@@ -2869,8 +2881,9 @@ def _bitrix_imbot_app_event():
                 logging.exception("b24 testbot: no-access notice failed")
             return jsonify({"ok": True, "event": event_name, "no_access": True}), 200
         # Pending error report: this message is the user's error description — capture, forward to
-        # the Albery notifications Telegram group + log it, WITHOUT calling the model.
-        if _b24_pop_awaiting_error(dialog_id):
+        # the Albery notifications Telegram group + log it, WITHOUT calling the model. Scoped to THIS
+        # bot so an error-report armed on another bot can't swallow a normal message here.
+        if _b24_pop_awaiting_error(bot_id, dialog_id):
             reporter = _b24_user_name(endpoint, access_token, from_user_id)
             _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
             threading.Thread(
