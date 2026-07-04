@@ -14,7 +14,10 @@ import {
 } from "lucide-react";
 import { fetchAgentDialogs, fetchAgents, fetchDialogTurns, DialogTurn } from "../api";
 import { AgentConfig, Chat } from "../types";
+import { agentSubSegments, setAgentPath } from "../route";
 import { cn } from "../../lib/utils";
+
+const DIALOGS_BASE = "/agent-dialogs";
 
 const TAG_STYLES: Record<string, string> = {
   ошибка: "text-rose-600 bg-rose-50 border-rose-100",
@@ -40,8 +43,15 @@ export function DialogsView() {
   const [channelNote, setChannelNote] = useState("");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterId>("all");
-  const [activeAgentId, setActiveAgentId] = useState<string>("all");
-  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  // Initial selection comes from the URL (/agent-dialogs/<agent>/<dialog>) so a refresh
+  // or a shared link restores exactly what was open instead of resetting.
+  const [activeAgentId, setActiveAgentId] = useState<string>(
+    () => agentSubSegments(DIALOGS_BASE)[0] || "all",
+  );
+  const [activeChatId, setActiveChatId] = useState<string | null>(() => {
+    const seg = agentSubSegments(DIALOGS_BASE);
+    return seg[0] && seg[1] ? `${seg[0]}:${seg[1]}` : null;
+  });
   const [chatsLoading, setChatsLoading] = useState(true);
   const [turnsLoading, setTurnsLoading] = useState(false);
   const [error, setError] = useState("");
@@ -73,12 +83,36 @@ export function DialogsView() {
     fetchAgents().then(setAgents).catch(() => setAgents([]));
   }, []);
 
-  // Switching the selected bot: drop the open dialog and the previous list so one bot's
-  // conversation can never linger under another; the fetch effect reloads this bot's own.
-  useEffect(() => {
+  // User picked a bot in the left pane: drop the open dialog + stale list so one bot's
+  // conversation never lingers under another. URL-driven changes (deep link / back) set
+  // the selection directly and intentionally skip this reset.
+  const selectAgent = (id: string) => {
+    setActiveAgentId(id);
     setActiveChatId(null);
     setChats([]);
-  }, [activeAgentId]);
+  };
+
+  // Reflect the current selection in the URL (replaceState — survives refresh & is
+  // shareable, without spamming history): /agent-dialogs[/<agent>[/<dialog>]].
+  useEffect(() => {
+    if (activeChatId) {
+      const sep = activeChatId.indexOf(":");
+      setAgentPath(DIALOGS_BASE, [activeChatId.slice(0, sep), activeChatId.slice(sep + 1)]);
+    } else {
+      setAgentPath(DIALOGS_BASE, [activeAgentId !== "all" ? activeAgentId : null]);
+    }
+  }, [activeAgentId, activeChatId]);
+
+  // Back/forward: re-read the selection from the URL.
+  useEffect(() => {
+    const onPop = () => {
+      const seg = agentSubSegments(DIALOGS_BASE);
+      setActiveAgentId(seg[0] || "all");
+      setActiveChatId(seg[0] && seg[1] ? `${seg[0]}:${seg[1]}` : null);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -192,7 +226,7 @@ export function DialogsView() {
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
           <button
-            onClick={() => setActiveAgentId("all")}
+            onClick={() => selectAgent("all")}
             className={cn(
               "w-full flex items-center gap-3 p-3 rounded-2xl transition-all text-left group",
               activeAgentId === "all"
@@ -216,7 +250,7 @@ export function DialogsView() {
               return (
                 <button
                   key={agent.id}
-                  onClick={() => setActiveAgentId(agent.id)}
+                  onClick={() => selectAgent(agent.id)}
                   className={cn(
                     "w-full flex items-center gap-3 p-3 rounded-2xl transition-all text-left group",
                     isActive

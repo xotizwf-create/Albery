@@ -341,6 +341,16 @@ const AGENT_TAB_ROUTES: Record<string, string> = {
 const AGENT_ROUTE_TABS: Record<string, string> = Object.fromEntries(
   Object.entries(AGENT_TAB_ROUTES).map(([tab, path]) => [path, tab]),
 );
+// Match a tab by the URL's BASE, so deep-linked sub-paths (/agent/main,
+// /agent-dialogs/main/22) still resolve to their tab; the view owns the suffix.
+const agentTabForPath = (pathname: string): string | null => {
+  for (const [tab, base] of Object.entries(AGENT_TAB_ROUTES)) {
+    if (pathname === base || pathname.startsWith(base + "/")) return tab;
+  }
+  return null;
+};
+const isUnderAgentRoute = (pathname: string, base: string): boolean =>
+  pathname === base || pathname.startsWith(base + "/");
 const COMPANY_MENU_ITEMS = VISIBLE_MENU_ITEMS.filter((item) => item.label !== "Настройки");
 const OTHER_MENU_ITEMS = VISIBLE_MENU_ITEMS.filter((item) => item.label === "Настройки");
 const SIDEBAR_GROUPS = [
@@ -2029,22 +2039,23 @@ type PromptVersion = {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState(
-    () => AGENT_ROUTE_TABS[window.location.pathname] || "Сводная аналитика",
+    () => agentTabForPath(window.location.pathname) || "Сводная аналитика",
   );
 
   useEffect(() => {
     const route = AGENT_TAB_ROUTES[activeTab];
     const current = window.location.pathname;
     if (route) {
-      if (current !== route) window.history.pushState({}, "", route);
-    } else if (AGENT_ROUTE_TABS[current]) {
+      // Keep any agent/dialog sub-path the view manages; only switch when the base differs.
+      if (!isUnderAgentRoute(current, route)) window.history.pushState({}, "", route);
+    } else if (agentTabForPath(current)) {
       window.history.pushState({}, "", "/main");
     }
   }, [activeTab]);
 
   useEffect(() => {
     const onPopState = () => {
-      setActiveTab(AGENT_ROUTE_TABS[window.location.pathname] || "Сводная аналитика");
+      setActiveTab(agentTabForPath(window.location.pathname) || "Сводная аналитика");
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);

@@ -43,7 +43,10 @@ import {
   upsertAccess,
 } from "../api";
 import { AgentConfig, KnowledgeItem } from "../types";
+import { agentSubSegments, setAgentPath } from "../route";
 import { cn } from "../../lib/utils";
+
+const AGENTS_BASE = "/agent";
 
 const toolIcon = (name: string): string => {
   if (/bitrix|task/.test(name)) return "📝";
@@ -950,7 +953,8 @@ const AgentEditor: React.FC<{
 
 export function AgentsView() {
   const [agents, setAgents] = useState<AgentConfig[]>([]);
-  const [activeAgentId, setActiveAgentId] = useState("");
+  // Initial agent comes from the URL (/agent/<slug>) so a refresh keeps that agent open.
+  const [activeAgentId, setActiveAgentId] = useState(() => agentSubSegments(AGENTS_BASE)[0] || "");
   const [showCreate, setShowCreate] = useState(false);
   const [createNote, setCreateNote] = useState("");
   const [, setForceUpdate] = useState(0);
@@ -966,10 +970,23 @@ export function AgentsView() {
       .catch(() => {});
 
   useEffect(() => {
-    void reloadAgents(true);
+    // Don't force-select the first agent when the URL already names one to open.
+    void reloadAgents(!agentSubSegments(AGENTS_BASE)[0]);
     const timer = window.setInterval(() => void reloadAgents(false), 60000);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Keep the URL in sync with the open agent (replaceState — survives refresh & shareable).
+  useEffect(() => {
+    setAgentPath(AGENTS_BASE, [activeAgentId || null]);
+  }, [activeAgentId]);
+
+  // Back/forward: re-read the open agent from the URL.
+  useEffect(() => {
+    const onPop = () => setActiveAgentId(agentSubSegments(AGENTS_BASE)[0] || "");
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
   }, []);
 
   const activeAgent = agents.find((a) => a.id === activeAgentId) || agents[0];

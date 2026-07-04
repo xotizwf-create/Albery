@@ -37,13 +37,17 @@ _DIALOGS_LIMIT_DEFAULT = 100
 _MESSAGES_LIMIT_DEFAULT = 200
 
 
-# Direct URLs for the Центр Агента pages (the SPA routes itself by pathname).
+# Direct URLs for the Центр Агента pages (the SPA routes itself by pathname). The
+# <path:sub> variants let a specific agent/dialog be deep-linked (e.g. /agent/main,
+# /agent-dialogs/main/22) and survive a refresh — all serve the same SPA index.html.
 @app.get("/agent")
+@app.get("/agent/<path:sub>")
 @app.get("/agent-dialogs")
+@app.get("/agent-dialogs/<path:sub>")
 @app.get("/agent-knowledge")
 @app.get("/agent-monitoring")
 @app.get("/agent-usage")
-def agent_center_spa():
+def agent_center_spa(sub: str = ""):
     from app import index
     return index()
 
