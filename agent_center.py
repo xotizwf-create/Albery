@@ -74,9 +74,15 @@ def _limit_arg(default: int, ceiling: int) -> int:
 
 
 def _when_label(dt: Any) -> str:
-    """15:05 for today, «вчера», DD.MM otherwise — matches the dialog-list design."""
+    """15:05 for today, «вчера», DD.MM otherwise — matches the dialog-list design.
+    Accepts a datetime or an ISO-8601 string (registry frontmatter timestamps)."""
     if not dt:
         return ""
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt)
+        except ValueError:
+            return ""
     local = dt.astimezone(MSK_TZ)
     today = msk_now().date()
     day = local.date()
@@ -785,29 +791,38 @@ def _load_agents_full() -> list[dict[str, Any]]:
             agents = [dict(r) for r in cur.fetchall()]
             cur.execute("SELECT agent_id::text AS agent_id, bitrix_user_id FROM agent_members")
             members = cur.fetchall()
+            # Legacy DB personal instructions — used only as a fallback for agents that
+            # have not been migrated to git files yet (see load_agent_learned).
             cur.execute(
-                "SELECT id::text AS id, agent_id::text AS agent_id, name, content, source, updated_at"
+                "SELECT agent_id::text AS agent_id, name, content, source, updated_at"
                 " FROM agent_instructions ORDER BY created_at"
             )
-            instructions = cur.fetchall()
+            legacy_instructions = cur.fetchall()
     by_id = {a["id"]: a for a in agents}
-    # Per-agent instruction/skill connections live in the GitHub registry manifest
-    # (agent_knowledge/agents/<slug>.yaml), not the DB — that is the versioned source
-    # of truth the owner manages on GitHub. The legacy agent_knowledge_links table is
-    # no longer read.
-    from agent_knowledge import load_manifest
+    # Per-agent connections (instructions/skills) AND personal instructions live in the
+    # GitHub registry, not the DB — the versioned source of truth the owner manages on
+    # GitHub. Manifest = agent_knowledge/agents/<slug>.yaml; personal = .../learned/*.md.
+    from agent_knowledge import load_agent_learned, load_manifest
     for a in agents:
         a["members"] = set()
-        a["instructions"] = []
         manifest = load_manifest(a["slug"])
         a["linked_instruction_ids"] = set(manifest["instructions"])
         a["linked_skill_ids"] = set(manifest["skills"])
+        learned = load_agent_learned(a["slug"])
+        a["instructions"] = learned if learned is not None else []
+        a["_learned_from_files"] = learned is not None
     for m in members:
         if m["agent_id"] in by_id:
             by_id[m["agent_id"]]["members"].add(int(m["bitrix_user_id"]))
-    for i in instructions:
-        if i["agent_id"] in by_id:
-            by_id[i["agent_id"]]["instructions"].append(dict(i))
+    # Fallback: agents not yet migrated to git files keep showing their DB rows.
+    for i in legacy_instructions:
+        a = by_id.get(i["agent_id"])
+        if a and not a["_learned_from_files"]:
+            a["instructions"].append({
+                "id": None, "name": i["name"], "content": i["content"],
+                "source": i["source"], "created_by": "", "created_at": "",
+                "updated_by": "", "updated_at": i["updated_at"], "origin_dialog": "",
+            })
     return agents
 
 
@@ -1202,7 +1217,11 @@ def agent_center_agent_detail(slug: str):
         ],
         "instructions": [
             {"id": i["id"], "name": i["name"], "content": i["content"], "source": i["source"],
-             "updated": _when_label(i["updated_at"])}
+             "created_by": i.get("created_by") or "",
+             "updated_by": i.get("updated_by") or "",
+             "origin_dialog": i.get("origin_dialog") or "",
+             "created": _when_label(i.get("created_at")),
+             "updated": _when_label(i.get("updated_at"))}
             for i in agent["instructions"]
         ],
     })
@@ -1373,34 +1392,43 @@ def agent_center_instruction_add(slug: str):
     if not name or not content:
         return jsonify({"error": "Нужны name и content."}), 400
     try:
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO agent_instructions (agent_id, name, content, source)"
-                    " SELECT id, %s, %s, 'owner' FROM agents WHERE slug = %s"
-                    " ON CONFLICT (agent_id, name) DO UPDATE SET content = EXCLUDED.content, updated_at = now()",
-                    (name, content, slug),
-                )
+        from agent_knowledge import save_agent_learned
+        save_agent_learned(slug, name, content, source="owner", actor="владелец (панель)")
     except Exception:  # noqa: BLE001
         logging.exception("agent instruction add failed")
         return jsonify({"error": "Не удалось сохранить инструкцию."}), 500
+    registry_git_sync(f"agent {slug}: owner instruction «{name}»")
     _agent_cache_bust()
     return jsonify({"ok": True})
 
 
+@app.post("/api/agent-center/agents/<slug>/instructions/<inst_id>/promote")
+def agent_center_instruction_promote(slug: str, inst_id: str):
+    """Promote a personal instruction into the shared library (optional instruction),
+    so it can be connected to other agents. The original personal one stays."""
+    try:
+        from agent_knowledge import promote_learned_to_library
+        result = promote_learned_to_library(slug, inst_id)
+    except Exception:  # noqa: BLE001
+        logging.exception("promote instruction failed")
+        return jsonify({"error": "Не удалось повысить до общих."}), 500
+    if not result:
+        return jsonify({"error": "Личная инструкция не найдена."}), 404
+    registry_git_sync(f"promote {slug}/{inst_id} -> library «{result['name']}»")
+    _agent_cache_bust()
+    return jsonify({"ok": True, **result})
+
+
 @app.delete("/api/agent-center/agents/<slug>/instructions/<inst_id>")
 def agent_center_instruction_delete(slug: str, inst_id: str):
+    # inst_id is the file slug (== _safe_component(name)); owner may delete any source.
     try:
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM agent_instructions WHERE id::text = %s"
-                    " AND agent_id = (SELECT id FROM agents WHERE slug = %s)",
-                    (inst_id, slug),
-                )
+        from agent_knowledge import delete_agent_learned
+        delete_agent_learned(slug, inst_id, only_self=False)
     except Exception:  # noqa: BLE001
         logging.exception("agent instruction delete failed")
         return jsonify({"error": "Не удалось удалить."}), 500
+    registry_git_sync(f"agent {slug}: delete instruction {inst_id}")
     _agent_cache_bust()
     return jsonify({"ok": True})
 
@@ -1646,11 +1674,20 @@ _SELF_TOOL_SPECS: dict[str, dict[str, Any]] = {
 
 
 def _agent_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Personal-instruction self-learning tools, backed by git files (with attribution)."""
+    from agent_knowledge import (
+        count_agent_self_learned,
+        delete_agent_learned,
+        load_agent_learned,
+        save_agent_learned,
+    )
     slug = agent["slug"]
+    actor = f"агент «{agent.get('name') or slug}» (самообучение)"
     if name == "list_my_instructions":
         rows = [
-            {"name": i["name"], "source": i["source"], "content": i["content"]}
-            for i in (_agent_by_slug(slug) or agent).get("instructions", [])
+            {"name": i["name"], "source": i["source"], "content": i["content"],
+             "created_by": i.get("created_by"), "updated_at": i.get("updated_at")}
+            for i in (load_agent_learned(slug) or [])
         ]
         return {"instructions": rows, "count": len(rows)}
     inst_name = str(args.get("name") or "").strip()[:80]
@@ -1660,38 +1697,22 @@ def _agent_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, Any]
         content = str(args.get("content") or "").strip()[:_AGENT_INSTRUCTION_CHARS_MAX]
         if not content:
             raise ValueError("Укажите content.")
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) AS n FROM agent_instructions"
-                    " WHERE agent_id = (SELECT id FROM agents WHERE slug = %s) AND source = 'self'",
-                    (slug,),
-                )
-                if int(cur.fetchone()["n"]) >= _AGENT_SELF_INSTRUCTIONS_MAX:
-                    raise ValueError(
-                        f"Лимит {_AGENT_SELF_INSTRUCTIONS_MAX} самоинструкций: удали неактуальную "
-                        "(delete_my_instruction) или объедини несколько в одну."
-                    )
-                cur.execute(
-                    "INSERT INTO agent_instructions (agent_id, name, content, source)"
-                    " SELECT id, %s, %s, 'self' FROM agents WHERE slug = %s"
-                    " ON CONFLICT (agent_id, name) DO UPDATE SET content = EXCLUDED.content, updated_at = now()",
-                    (inst_name, content, slug),
-                )
+        existing = {i["name"] for i in (load_agent_learned(slug) or []) if i["source"] == "self"}
+        if inst_name not in existing and count_agent_self_learned(slug) >= _AGENT_SELF_INSTRUCTIONS_MAX:
+            raise ValueError(
+                f"Лимит {_AGENT_SELF_INSTRUCTIONS_MAX} самоинструкций: удали неактуальную "
+                "(delete_my_instruction) или объедини несколько в одну."
+            )
+        save_agent_learned(slug, inst_name, content, source="self", actor=actor,
+                           dialog=str(args.get("_dialog_id") or "") or None)
+        registry_git_sync(f"agent {slug}: self-learned «{inst_name}»")
         _agent_cache_bust()
         return {"ok": True, "saved": inst_name}
     if name == "delete_my_instruction":
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM agent_instructions WHERE name = %s AND source = 'self'"
-                    " AND agent_id = (SELECT id FROM agents WHERE slug = %s)",
-                    (inst_name, slug),
-                )
-                deleted = cur.rowcount
-        _agent_cache_bust()
-        if not deleted:
+        if not delete_agent_learned(slug, inst_name, only_self=True):
             raise ValueError("Такой самоинструкции нет (инструкции владельца удалять нельзя).")
+        registry_git_sync(f"agent {slug}: delete self-learned «{inst_name}»")
+        _agent_cache_bust()
         return {"ok": True, "deleted": inst_name}
     raise ValueError(f"Неизвестный инструмент: {name}")
 

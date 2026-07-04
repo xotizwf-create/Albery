@@ -239,6 +239,140 @@ def set_instruction_scope(path: str, scope: str) -> bool:
     return True
 
 
+# --- per-agent personal instructions ("Личные инструкции") -----------------------
+# An agent's own instructions/skills — either taught by the owner (source=owner) or
+# distilled by the agent itself after good work (source=self). Stored as git files with
+# full attribution frontmatter (who created, who last edited, from which dialog) so every
+# change is trackable, plus git history on top.
+
+LEARNED_DIRNAME = "learned"
+
+
+def _msk_now_iso() -> str:
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%dT%H:%M:%S+03:00")
+
+
+def _learned_dir(slug: str) -> Path:
+    return AGENTS_DIR / slug / LEARNED_DIRNAME
+
+
+def _learned_file(slug: str, name: str) -> Path:
+    return _learned_dir(slug) / f"{_safe_component(name)[:80]}.md"
+
+
+def _safe_component(name: str) -> str:
+    cleaned = (name or "").replace("/", "∕").replace("\\", "∖").strip().strip(".")
+    return cleaned or "unnamed"
+
+
+def load_agent_learned(slug: str) -> list[dict[str, Any]] | None:
+    """Personal instructions of one agent, or ``None`` if the agent has no learned dir
+    yet (caller may fall back to the legacy agent_instructions table)."""
+    d = _learned_dir(slug)
+    if not d.is_dir():
+        return None
+    out: list[dict[str, Any]] = []
+    for md in sorted(d.glob("*.md")):
+        try:
+            meta, body = parse_doc(md.read_text(encoding="utf-8", errors="replace"))
+            out.append({
+                "id": md.stem,
+                "name": meta.get("name") or md.stem,
+                "content": body,
+                "source": (meta.get("source") or "owner").strip().lower(),
+                "created_by": meta.get("created_by") or "",
+                "created_at": meta.get("created_at") or "",
+                "updated_by": meta.get("updated_by") or "",
+                "updated_at": meta.get("updated_at") or "",
+                "origin_dialog": meta.get("origin_dialog") or "",
+            })
+        except Exception:  # noqa: BLE001
+            import logging
+            logging.exception("agent_knowledge: learned parse failed for %s", md)
+    return out
+
+
+def count_agent_self_learned(slug: str) -> int:
+    return sum(1 for i in (load_agent_learned(slug) or []) if i["source"] == "self")
+
+
+def save_agent_learned(slug: str, name: str, content: str, source: str,
+                       actor: str, dialog: str | None = None) -> dict[str, Any]:
+    """Create or update a personal instruction as a git file with attribution.
+    Preserves created_by/created_at on update and stamps updated_by/updated_at."""
+    source = "self" if str(source).strip().lower() == "self" else "owner"
+    path = _learned_file(slug, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = _msk_now_iso()
+    created_by, created_at, origin = actor, now, (dialog or "")
+    if path.is_file():
+        prev, _ = parse_doc(path.read_text(encoding="utf-8", errors="replace"))
+        created_by = prev.get("created_by") or created_by
+        created_at = prev.get("created_at") or created_at
+        origin = prev.get("origin_dialog") or origin
+    meta = {
+        "name": name.strip(),
+        "source": source,
+        "created_by": created_by,
+        "created_at": created_at,
+        "updated_by": actor,
+        "updated_at": now,
+    }
+    if origin:
+        meta["origin_dialog"] = origin
+    front = "---\n" + "".join(f"{k}: {v}\n" for k, v in meta.items()) + "---\n\n"
+    path.write_text(front + content.strip() + "\n", encoding="utf-8")
+    return {"id": path.stem, "name": meta["name"], "source": source}
+
+
+PROMOTED_FOLDER = "Навыки агентов"
+
+
+def promote_learned_to_library(slug: str, inst_id: str) -> dict[str, Any] | None:
+    """Promote an agent's personal instruction into the SHARED library as an optional
+    instruction, so the owner can connect it to any agent. Returns the new library path,
+    or None if the source wasn't found. Idempotent by name."""
+    learned = load_agent_learned(slug) or []
+    src = next((i for i in learned if i["id"] == inst_id or i["name"] == inst_id), None)
+    if not src:
+        return None
+    name = src["name"].strip()
+    dest = INSTRUCTIONS_DIR / _safe_component(PROMOTED_FOLDER) / f"{_safe_component(name)}.md"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "name": name,
+        "scope": SCOPE_OPTIONAL,
+        "promoted_from": f"{slug} · {src.get('created_by') or ''}".strip(" ·"),
+        "promoted_at": _msk_now_iso(),
+    }
+    front = "---\n" + "".join(f"{kk}: {vv}\n" for kk, vv in meta.items()) + "---\n\n"
+    dest.write_text(front + (src["content"] or "").strip() + "\n", encoding="utf-8")
+    return {"path": f"{PROMOTED_FOLDER} / {name}", "name": name}
+
+
+def delete_agent_learned(slug: str, name: str, only_self: bool = False) -> bool:
+    """Delete a personal instruction by name (matched via its file slug). When
+    ``only_self`` is set, owner-authored ones are protected (the agent can only remove
+    what it taught itself)."""
+    path = _learned_file(slug, name)
+    if not path.is_file():
+        # also try matching by exact name inside files (slug collisions / renames)
+        for md in _learned_dir(slug).glob("*.md") if _learned_dir(slug).is_dir() else []:
+            meta, _ = parse_doc(md.read_text(encoding="utf-8", errors="replace"))
+            if (meta.get("name") or "").strip() == name.strip():
+                path = md
+                break
+        else:
+            return False
+    if only_self:
+        meta, _ = parse_doc(path.read_text(encoding="utf-8", errors="replace"))
+        if (meta.get("source") or "owner").strip().lower() != "self":
+            return False
+    path.unlink()
+    return True
+
+
 # --- helpers ---------------------------------------------------------------------
 
 def _safe_int(value: Any) -> int:

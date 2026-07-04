@@ -128,7 +128,17 @@ export interface AgentDetail {
   is_active: boolean;
   bitrix_bot_id: number | null;
   members: Array<{ id: number; name: string }>;
-  instructions: Array<{ id: string; name: string; content: string; source: "owner" | "self"; updated: string }>;
+  instructions: Array<{
+    id: string;
+    name: string;
+    content: string;
+    source: "owner" | "self";
+    created_by?: string;
+    updated_by?: string;
+    origin_dialog?: string;
+    created?: string;
+    updated: string;
+  }>;
 }
 
 export async function createAgent(body: {
@@ -178,6 +188,16 @@ export async function addAgentInstruction(slug: string, name: string, content: s
 
 export async function deleteAgentInstruction(slug: string, instId: string): Promise<void> {
   await fetchJsonSafe(`/api/agent-center/agents/${slug}/instructions/${instId}`, { method: "DELETE" }, 30000);
+}
+
+// Promote a personal instruction into the shared library (an optional instruction that
+// can then be connected to any agent). The personal copy stays with the agent.
+export async function promoteAgentInstruction(slug: string, instId: string): Promise<{ name: string; path: string }> {
+  return (await fetchJsonSafe(
+    `/api/agent-center/agents/${slug}/instructions/${instId}/promote`,
+    { method: "POST" },
+    30000,
+  )) as { name: string; path: string };
 }
 
 // --- Per-agent capability config (tools / library instructions / skills) ---

@@ -1839,20 +1839,15 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                 "Отвечай по-русски." + access_rule + fmt + "]")
     parts = [head]
     if agent is not None:
-        # Library knowledge the owner explicitly linked to this agent in the constructor.
-        # Injecting the selected items (and ONLY them) is what enforces the selection:
-        # the agent's usable instructions/skills are exactly what appears here.
+        # Skills the owner connected to THIS subagent (manifest). Injecting only the
+        # selected ones is what enforces the selection at the prompt level. (Instructions
+        # are delivered through the scoped start_here tool, not injected here again.)
         try:
             from agent_center import agent_selected_knowledge
             selected = agent_selected_knowledge(agent)
         except Exception:  # noqa: BLE001
             logging.exception("subagent %s: selected knowledge load failed", agent.get("slug"))
             selected = {"instructions": [], "skills": []}
-        if selected["instructions"]:
-            parts.append(
-                "ИНСТРУКЦИИ КОМПАНИИ (подключены к тебе владельцем — применяй обязательно):\n"
-                + "\n\n".join(f"— {i['title']}:\n{i['content']}" for i in selected["instructions"])
-            )
         if selected["skills"]:
             parts.append(
                 "ТВОИ НАВЫКИ (подключены владельцем): "
@@ -1861,19 +1856,38 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                 "этом списке, не выдумывай и не применяй сторонние приёмы — скажи, что этим "
                 "занимается Основной агент Албери."
             )
-        learned = agent.get("instructions") or []
+    # Personal instructions + self-learning apply to ANY agent that runs on its own
+    # connector: subagents AND the universal (main) agent when it is on agent-main. The
+    # main bot keeps its general head; here we only add its accumulated skills + the
+    # "ask after a good task, then form a skill" nudge.
+    learning_agent = agent
+    if agent is None and universal:
+        try:
+            from agent_center import MAIN_AGENT_SLUG, _agent_by_slug
+            learning_agent = _agent_by_slug(MAIN_AGENT_SLUG)
+        except Exception:  # noqa: BLE001
+            logging.exception("main agent: profile load for self-learning failed")
+            learning_agent = None
+    if learning_agent is not None:
+        learned = learning_agent.get("instructions") or []
         if learned:
             parts.append(
                 "ТВОИ ЛИЧНЫЕ ИНСТРУКЦИИ И НАВЫКИ (накоплены обучением, применяй обязательно):\n"
                 + "\n\n".join(f"— {i['name']}:\n{i['content']}" for i in learned)
             )
         parts.append(
-            "САМООБУЧЕНИЕ (важно): если в диалоге выяснилось УСТОЙЧИВОЕ правило работы, формат, "
-            "специфика команды или полезный приём, который пригодится в будущих диалогах, — сохрани "
-            "его себе через upsert_my_instruction (коротко и по делу). Устаревшую свою инструкцию "
-            "обнови тем же инструментом или удали через delete_my_instruction. НЕ сохраняй разовые "
-            "факты, персональные данные и содержимое конкретных диалогов. Это ТВОИ личные навыки — "
-            "глобальные правила и других агентов ты изменить не можешь."
+            "САМООБУЧЕНИЕ И ОБРАТНАЯ СВЯЗЬ (важно): когда ты ЗАВЕРШИЛ ощутимую задачу для человека "
+            "(подготовил отчёт/файл, решил вопрос, что-то настроил) и работа явно удалась — КОРОТКО "
+            "спроси, всё ли устроило, и предложи закрепить это как правило: «Всё ок? 🙌 Оформить это "
+            "как постоянное правило работы, чтобы делать так и дальше?». НЕ спрашивай в каждом "
+            "сообщении и не по мелочам — только после реально завершённой задачи и не чаще одного раза "
+            "за тему. Если человек подтвердил, что понравилось, — выдели из этой работы МНОГОРАЗОВОЕ "
+            "правило/приём (формат, порядок действий, предпочтение команды) и сохрани его себе через "
+            "upsert_my_instruction (коротко и по делу) — так ты формируешь новый навык из удачной "
+            "работы. Устаревшую свою инструкцию обнови тем же инструментом или удали через "
+            "delete_my_instruction. НЕ сохраняй разовые факты, персональные данные и содержимое "
+            "конкретных диалогов. Это ТВОИ личные навыки — глобальные правила и других агентов ты "
+            "изменить не можешь."
         )
     parts.append(
         "Текущие дата и время: " + msk_now().strftime("%d.%m.%Y %H:%M")

@@ -28,6 +28,7 @@ import {
   createAgent,
   deleteAgent,
   deleteAgentInstruction,
+  promoteAgentInstruction,
   fetchAccessMembers,
   fetchAgentConfig,
   fetchAgentDetail,
@@ -871,7 +872,26 @@ const AgentEditor: React.FC<{
                       </span>
                     </div>
                     <p className="text-[12px] font-medium text-gray-500 truncate">{i.content}</p>
+                    {(i.created_by || i.updated_by) && (
+                      <p className="text-[10.5px] font-medium text-gray-400 truncate mt-0.5">
+                        {i.created_by && <>создал: {i.created_by}{i.created ? ` · ${i.created}` : ""}</>}
+                        {i.created_by && i.updated_by && i.updated_by !== i.created_by && " · "}
+                        {i.updated_by && i.updated_by !== i.created_by && (
+                          <>менял: {i.updated_by}{i.updated ? ` · ${i.updated}` : ""}</>
+                        )}
+                      </p>
+                    )}
                   </div>
+                  <button
+                    onClick={() => {
+                      if (!window.confirm(`Повысить «${i.name}» до общей библиотеки? Она станет подключаемой (по выбору) к любому агенту. Личная копия останется у этого агента.`)) return;
+                      void run(async () => { await promoteAgentInstruction(slug, i.id); });
+                    }}
+                    title="Повысить до общих (в библиотеку, подключать другим агентам)"
+                    className="text-[10.5px] font-bold text-gray-400 hover:text-indigo-600 transition-colors px-1.5 py-1 shrink-0 whitespace-nowrap"
+                  >
+                    ↑ в общие
+                  </button>
                   <button
                     onClick={() => run(() => deleteAgentInstruction(slug, i.id))}
                     title="Удалить инструкцию"

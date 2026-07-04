@@ -131,3 +131,60 @@ def test_context_server_scopes_instructions(tmp_path, monkeypatch):
     scoped = {r["path"] for r in cs.load_ai_instructions(allowed_paths={"Базовое", "Отдел / Продажи"})}
     assert scoped == {"Базовое", "Отдел / Продажи"}
     assert "Отдел / Закупки" not in scoped
+
+
+def test_learned_absent_returns_none(tmp_path, monkeypatch):
+    k = _reload_with(tmp_path / "reg", monkeypatch)
+    assert k.load_agent_learned("sales") is None
+
+
+def test_learned_save_load_attribution(tmp_path, monkeypatch):
+    k = _reload_with(tmp_path / "reg", monkeypatch)
+    k.save_agent_learned("sales", "Формат отчёта", "Всегда таблицей.", source="self",
+                         actor="агент «Продажник» (самообучение)", dialog="chat42")
+    items = k.load_agent_learned("sales")
+    assert len(items) == 1
+    it = items[0]
+    assert it["name"] == "Формат отчёта"
+    assert it["source"] == "self"
+    assert it["created_by"] == "агент «Продажник» (самообучение)"
+    assert it["origin_dialog"] == "chat42"
+    assert it["created_at"] and it["updated_at"]
+    assert k.count_agent_self_learned("sales") == 1
+
+
+def test_learned_update_preserves_creator_stamps_editor(tmp_path, monkeypatch):
+    k = _reload_with(tmp_path / "reg", monkeypatch)
+    k.save_agent_learned("sales", "Правило", "v1", source="self", actor="агент X")
+    first = k.load_agent_learned("sales")[0]
+    k.save_agent_learned("sales", "Правило", "v2", source="owner", actor="владелец")
+    second = k.load_agent_learned("sales")[0]
+    assert second["content"] == "v2"
+    assert second["created_by"] == "агент X"          # creator preserved
+    assert second["created_at"] == first["created_at"]
+    assert second["updated_by"] == "владелец"          # editor updated
+
+
+def test_learned_delete_only_self_protects_owner(tmp_path, monkeypatch):
+    k = _reload_with(tmp_path / "reg", monkeypatch)
+    k.save_agent_learned("sales", "Владельца", "x", source="owner", actor="владелец")
+    assert k.delete_agent_learned("sales", "Владельца", only_self=True) is False  # protected
+    assert k.delete_agent_learned("sales", "Владельца", only_self=False) is True  # owner can
+    k.save_agent_learned("sales", "Своё", "y", source="self", actor="агент")
+    assert k.delete_agent_learned("sales", "Своё", only_self=True) is True
+
+
+def test_promote_learned_to_library_optional(tmp_path, monkeypatch):
+    k = _reload_with(tmp_path / "reg", monkeypatch)
+    k.save_agent_learned("sales", "Формат остатков", "Таблицей по складам.", source="self", actor="агент X")
+    res = k.promote_learned_to_library("sales", "Формат остатков")
+    assert res and res["name"] == "Формат остатков"
+    lib = {i["path"]: i for i in k.load_instructions()}
+    promoted = lib.get(res["path"])
+    assert promoted is not None
+    assert promoted["scope"] == "optional"                 # connectable per-agent, real teeth
+    assert "Таблицей по складам" in promoted["content"]
+    # the personal copy is untouched
+    assert any(i["name"] == "Формат остатков" for i in k.load_agent_learned("sales"))
+    # missing source -> None
+    assert k.promote_learned_to_library("sales", "нет такой") is None
