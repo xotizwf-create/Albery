@@ -1694,12 +1694,20 @@ def agent_selected_knowledge(agent: dict[str, Any]) -> dict[str, list[dict[str, 
     instructions: list[dict[str, Any]] = []
     skills: list[dict[str, Any]] = []
     if skill_ids:
+        from agent_knowledge import load_skill_content
         for s in _hermes_skills():
             if s["id"] in skill_ids:
-                skills.append({
+                entry = {
                     "title": (f"{s['parent']} / {s['title']}" if s.get("parent") else s["title"]),
                     "description": s["description"],
-                })
+                }
+                # Custom (shared) registry skills are NOT loaded by the Hermes gateway —
+                # inject their full body, or the model only ever sees the description line.
+                if s.get("custom"):
+                    content = load_skill_content(s["id"])
+                    if content:
+                        entry["content"] = content[:6000]
+                skills.append(entry)
     return {"instructions": instructions, "skills": skills}
 
 

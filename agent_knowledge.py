@@ -208,6 +208,29 @@ def load_skills() -> list[dict[str, Any]] | None:
     return _load_skill_dir(SKILLS_DIR, "shared") + _load_skill_dir(HERMES_BASE_DIR, "hermes_base")
 
 
+def load_skill_content(skill_id: str) -> str | None:
+    """Full body of a SHARED (custom) registry skill. These live only in the registry —
+    the Hermes gateway does not load them from /root/.hermes/skills — so an agent
+    connected to one must get the body injected into its prompt, otherwise the model
+    only ever sees the one-line description."""
+    sid = str(skill_id or "")
+    if not sid.startswith("skill:"):
+        return None
+    rel = sid[len("skill:"):].strip("/")
+    if not rel or ".." in rel:
+        return None
+    path = SKILLS_DIR / rel / "SKILL.md"
+    if not path.is_file():
+        return None
+    try:
+        _meta, body = parse_doc(path.read_text(encoding="utf-8", errors="replace"))
+        return body.strip() or None
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.exception("agent_knowledge: skill content load failed for %s", sid)
+        return None
+
+
 # --- per-agent manifests ---------------------------------------------------------
 # agent_knowledge/agents/<slug>.yaml lists the OPTIONAL instructions and skills an
 # agent is connected to. Universal instructions are always on regardless. This file
