@@ -4110,6 +4110,37 @@ def tool_get_webapp_template(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"get_webapp_template failed: {exc}") from exc
 
 
+def tool_export_document(args: dict[str, Any]) -> dict[str, Any]:
+    title = str(args.get("title") or "").strip() or "Документ"
+    fmt = str(args.get("format") or "docx").strip().lower()
+    html = str(args.get("html") or "")
+    if fmt != "docx":
+        raise McpError(-32602, "Пока поддерживается только format='docx'.")
+    if not html.strip():
+        raise McpError(-32602, "Передайте html — полное содержимое документа.")
+    if len(html) > 400_000:
+        raise McpError(-32602, "HTML слишком большой (лимит 400 тыс. символов) — сократите документ.")
+    try:
+        from docformat import html_to_docx
+        data = html_to_docx(
+            html,
+            font_size_pt=float(args.get("font_size_pt") or 12),
+            line_spacing=float(args.get("line_spacing") or 1.15),
+        )
+        from b24bot import _b24_save_export
+        url = _b24_save_export(data, title, "docx")
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"export_document failed: {exc}") from exc
+    return {
+        "url": url,
+        "format": "docx",
+        "note": "Файл готов. Пришли пользователю эту ссылку (она token-защищена и временная). "
+                "Если пользователь просит поправить оформление — исправь свой HTML и вызови инструмент снова.",
+    }
+
+
 def tool_make_sheet_applet(args: dict[str, Any]) -> dict[str, Any]:
     sid = str(args.get("spreadsheet_id") or args.get("spreadsheet") or args.get("url") or "").strip()
     if not sid:
@@ -6170,6 +6201,35 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_webapp_template,
+    },
+    "export_document": {
+        "description": (
+            "Собери НАСТОЯЩИЙ файл документа Word (.docx) из СВОЕГО HTML — ты сам полностью управляешь "
+            "оформлением (это главный инструмент для договоров, актов, официальных документов). "
+            "Верни пользователю ссылку url из ответа. ПОДДЕРЖИВАЕМЫЙ HTML: блоки h1..h4, p, div, "
+            "ul/ol/li, table/tr/th/td, br, hr; инлайн b/strong, i/em, u, s; стили text-align "
+            "(left|center|right|justify), font-size:14pt, text-indent:1.25cm, line-height:1.5; "
+            "НОВАЯ СТРАНИЦА: style=\"page-break-before:always\" на блоке (каждое приложение к договору "
+            "начинай с него); таблица БЕЗ рамок: <table border=\"0\"> (реквизиты сторон делай "
+            "двухколоночной таблицей без рамок). Шрифт всегда Times New Roman, поля ГОСТ (лево 3 см), "
+            "А4. Эмодзи вырезаются автоматически — НЕ используй их и BB-коды [b] в html. Нумерацию "
+            "разделов/пунктов (1., 1.1., 5.2.1.) пиши ЯВНО в тексте — так надёжнее списков. "
+            "В html клади ТОЛЬКО сам документ: без комментариев, рекомендаций и пояснений — их пиши "
+            "отдельно в чате."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Имя файла (без расширения), например «Договор поставки ткани»."},
+                "html": {"type": "string", "description": "Полный HTML документа (только содержимое документа)."},
+                "format": {"type": "string", "enum": ["docx"], "description": "Формат файла (пока docx)."},
+                "font_size_pt": {"type": "number", "description": "Базовый размер шрифта, pt (по умолчанию 12)."},
+                "line_spacing": {"type": "number", "description": "Межстрочный интервал (по умолчанию 1.15; для договоров обычно 1.5)."},
+            },
+            "required": ["title", "html"],
+            "additionalProperties": False,
+        },
+        "handler": tool_export_document,
     },
     "make_sheet_applet": {
         "description": (
