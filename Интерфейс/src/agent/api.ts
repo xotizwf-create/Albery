@@ -264,6 +264,65 @@ export async function setInstructionScope(path: string, scope: "universal" | "op
   );
 }
 
+// --- Per-agent scheduled automations (Агенты → Автоматизации) ---
+// kind='system' rows mirror the legacy Hermes cron jobs on the box (read-only showcase);
+// kind='agent' rows are executed by the app itself on the agent's own connector.
+
+export interface AgentAutomation {
+  id: number;
+  agent_slug: string;
+  name: string;
+  description: string;
+  schedule: string;
+  schedule_label: string;
+  prompt: string;
+  deliver_to: string;
+  kind: "agent" | "system";
+  created_by: "owner" | "self";
+  creator_label: string;
+  is_active: boolean;
+  next_run: string;
+  last_run: string;
+  last_status: string;
+  last_result: string;
+  last_error: string;
+}
+
+export async function fetchAgentAutomations(slug: string): Promise<AgentAutomation[]> {
+  const data = await fetchJsonSafe(`/api/agent-center/agents/${slug}/automations`, undefined, 30000);
+  return (data.automations || []) as AgentAutomation[];
+}
+
+export async function createAgentAutomation(
+  slug: string,
+  body: { name: string; description?: string; schedule: string; prompt: string; deliver_to?: string },
+): Promise<void> {
+  await fetchJsonSafe(
+    `/api/agent-center/agents/${slug}/automations`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    30000,
+  );
+}
+
+export async function updateAgentAutomation(
+  id: number,
+  body: Partial<{ name: string; description: string; schedule: string; prompt: string; deliver_to: string; is_active: boolean }>,
+): Promise<void> {
+  await fetchJsonSafe(
+    `/api/agent-center/automations/${id}`,
+    { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    30000,
+  );
+}
+
+export async function deleteAgentAutomation(id: number): Promise<void> {
+  await fetchJsonSafe(`/api/agent-center/automations/${id}`, { method: "DELETE" }, 30000);
+}
+
+export async function runAgentAutomation(id: number): Promise<void> {
+  await fetchJsonSafe(`/api/agent-center/automations/${id}/run`, { method: "POST" }, 30000);
+}
+
 export async function fetchAgentDialogs(params: { channel: string; q?: string; agent?: string }): Promise<{
   chats: Chat[];
   note?: string;

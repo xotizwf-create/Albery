@@ -1744,6 +1744,9 @@ _SELF_TOOL_SPECS: dict[str, dict[str, Any]] = {
 
 def _agent_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Personal-instruction self-learning tools, backed by git files (with attribution)."""
+    from agent_automations import AUTOMATION_SELF_TOOL_SPECS, automation_self_tool_call
+    if name in AUTOMATION_SELF_TOOL_SPECS:
+        return automation_self_tool_call(agent, name, args)
     from agent_knowledge import (
         count_agent_self_learned,
         delete_agent_learned,
@@ -2205,3 +2208,12 @@ if os.getenv("ENSURE_MAIN_AGENT", "1").strip() != "0":
         ensure_main_agent()
     except Exception:  # noqa: BLE001
         logging.exception("agent_center: ensure_main_agent bootstrap failed")
+
+
+# Per-agent scheduled automations: registers its /api/agent-center/* routes and the
+# scheduler thread at import, and contributes three self-tools to every agent connector
+# (schedule/list/delete my automation) — merged into _SELF_TOOL_SPECS so mcp_agent_http
+# advertises and dispatches them alongside the self-learning tools.
+import agent_automations as _agent_automations  # noqa: E402
+
+_SELF_TOOL_SPECS.update(_agent_automations.AUTOMATION_SELF_TOOL_SPECS)
