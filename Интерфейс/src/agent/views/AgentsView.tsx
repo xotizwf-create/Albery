@@ -45,6 +45,7 @@ import {
 import { AgentConfig, KnowledgeItem } from "../types";
 import { agentSubSegments, setAgentPath } from "../route";
 import { cn } from "../../lib/utils";
+import AutomationsPanel from "./AutomationsPanel";
 
 const AGENTS_BASE = "/agent";
 
@@ -600,6 +601,7 @@ const AgentEditor: React.FC<{
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
   const [configVersion, setConfigVersion] = useState(0);
+  const [tab, setTab] = useState<"settings" | "automations">("settings");
 
   const load = () =>
     fetchAgentDetail(slug)
@@ -612,6 +614,7 @@ const AgentEditor: React.FC<{
       .catch((e: Error) => setError(e.message));
 
   useEffect(() => {
+    setTab("settings");
     void load();
     fetchBitrixUsers().then(setUsers).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -720,6 +723,32 @@ const AgentEditor: React.FC<{
         </div>
       </div>
 
+      <div className="px-6 md:px-8 pt-3 border-b border-gray-100 flex gap-1">
+        {(
+          [
+            ["settings", "Настройки"],
+            ["automations", "Автоматизации"],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setTab(key)}
+            className={cn(
+              "px-4 py-2.5 text-[13px] font-bold border-b-2 -mb-px transition-colors",
+              tab === key
+                ? "text-indigo-600 border-indigo-600"
+                : "text-gray-400 border-transparent hover:text-gray-600",
+            )}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "automations" ? (
+        <AutomationsPanel slug={slug} />
+      ) : (
+        <>
       <div className="p-6 md:p-8 flex flex-col xl:flex-row gap-8">
         <div className="flex-1 space-y-8 min-w-0">
           <div className="flex gap-4 flex-wrap">
@@ -947,6 +976,8 @@ const AgentEditor: React.FC<{
       </div>
 
       <AgentCapabilityPanel slug={slug} version={configVersion} />
+        </>
+      )}
     </div>
   );
 };
