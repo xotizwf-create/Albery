@@ -1706,7 +1706,7 @@ def agent_selected_knowledge(agent: dict[str, Any]) -> dict[str, list[dict[str, 
                 if s.get("custom"):
                     content = load_skill_content(s["id"])
                     if content:
-                        entry["content"] = content[:6000]
+                        entry["content"] = content[:_AGENT_INSTRUCTION_CHARS_MAX]
                 skills.append(entry)
     return {"instructions": instructions, "skills": skills}
 
