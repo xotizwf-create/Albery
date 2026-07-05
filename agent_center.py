@@ -1442,6 +1442,9 @@ def agent_center_agent_delete(slug: str):
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
+                # Automations go with the agent — an orphaned row would fire forever
+                # into "агент не найден" errors.
+                cur.execute("DELETE FROM agent_automations WHERE agent_slug = %s", (slug,))
                 cur.execute("DELETE FROM agents WHERE slug = %s", (slug,))
     except Exception:  # noqa: BLE001
         logging.exception("agent delete failed")

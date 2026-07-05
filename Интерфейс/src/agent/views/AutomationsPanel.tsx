@@ -25,6 +25,8 @@ const SCHEDULE_PRESETS: Array<{ label: string; cron: string }> = [
 const statusChip = (a: AgentAutomation): { text: string; cls: string } => {
   if (!a.last_status) return { text: "ещё не запускалась", cls: "bg-gray-100 text-gray-500 border-gray-200" };
   if (a.last_status === "running") return { text: "выполняется…", cls: "bg-sky-50 text-sky-600 border-sky-100 animate-pulse" };
+  if (a.last_status === "interrupted") return { text: `прервана · ${a.last_run}`, cls: "bg-amber-50 text-amber-600 border-amber-100" };
+  if (a.last_status === "skipped") return { text: `пропущена · ${a.last_run}`, cls: "bg-amber-50 text-amber-600 border-amber-100" };
   if (a.last_status === "error") return { text: `ошибка · ${a.last_run}`, cls: "bg-rose-50 text-rose-600 border-rose-100" };
   if (a.last_status === "silent") return { text: `тихо · ${a.last_run}`, cls: "bg-gray-100 text-gray-500 border-gray-200" };
   return { text: `ок · ${a.last_run}`, cls: "bg-emerald-50 text-emerald-600 border-emerald-100" };
@@ -193,6 +195,7 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                   <p className="text-[12px] font-medium text-gray-500 truncate mt-0.5">
                     <span title={a.schedule} className="font-bold text-gray-700">{a.schedule_label}</span>
                     {a.next_run && a.is_active && <> · следующий: {a.next_run}</>}
+                    {a.creator_label && <> · поставил: {a.creator_label}</>}
                     {(a.description || a.prompt) && <> · {a.description || a.prompt}</>}
                   </p>
                 </div>
@@ -254,7 +257,6 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                       <p>
                         <span className="font-bold text-gray-800">Доставка:</span>{" "}
                         {a.deliver_to || "чат уведомлений Albery"}
-                        {a.creator_label && <> · поставил: {a.creator_label}</>}
                       </p>
                       {a.last_error && <p className="text-rose-600">Последняя ошибка: {a.last_error}</p>}
                       {a.last_result && (

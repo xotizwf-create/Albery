@@ -31,6 +31,12 @@ from app import MSK_TZ, app, msk_now, pg_connect
 import cron_schedule
 
 _AUTOMATION_TIMEOUT_S = int(os.getenv("AGENT_AUTOMATION_TIMEOUT_S", "300"))
+# How long a run may wait for the automation slot before it is SKIPPED (not an error):
+# scheduled runs must never pile up behind a slow one or crowd out live employee turns.
+_RUN_SLOT_WAIT_S = int(os.getenv("AGENT_AUTOMATION_SLOT_WAIT_S", "180"))
+# A 'running' row older than timeout+slack means the process restarted mid-run — treat
+# it as interrupted (self-heals: display + run-now unblock instead of a stuck state).
+_RUNNING_STALE_S = _AUTOMATION_TIMEOUT_S + 600
 _SELF_AUTOMATIONS_MAX = int(os.getenv("AGENT_SELF_AUTOMATIONS_MAX", "10"))
 # Every run is a full LLM turn — frequency is capped hard. The owner (UI) may go down
 # to every 15 minutes; an agent scheduling itself from chat — at most hourly.
@@ -88,8 +94,20 @@ def _when(dt: Any) -> str:
         return ""
 
 
+def _running_is_stale(r: dict[str, Any]) -> bool:
+    if r.get("last_status") != "running" or not r.get("last_run_at"):
+        return False
+    try:
+        return (msk_now() - r["last_run_at"].astimezone(MSK_TZ)).total_seconds() > _RUNNING_STALE_S
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _automation_json(r: dict[str, Any]) -> dict[str, Any]:
     nxt = cron_schedule.next_run(r["schedule"], msk_now()) if r["is_active"] else None
+    status = r["last_status"] or ""
+    if _running_is_stale(r):
+        status = "interrupted"
     return {
         "id": r["id"],
         "agent_slug": r["agent_slug"],
@@ -105,7 +123,7 @@ def _automation_json(r: dict[str, Any]) -> dict[str, Any]:
         "is_active": bool(r["is_active"]),
         "next_run": _when(nxt),
         "last_run": _when(r["last_run_at"]),
-        "last_status": r["last_status"] or "",
+        "last_status": status,
         "last_result": r["last_result"] or "",
         "last_error": r["last_error"] or "",
     }
@@ -163,7 +181,7 @@ def agent_automations_create(slug: str):
                     cur.execute(
                         "INSERT INTO agent_automations (agent_slug, name, description, schedule, "
                         "prompt, deliver_to, kind, created_by, creator_label) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, 'agent', 'owner', 'владелец') "
+                        "VALUES (%s, %s, %s, %s, %s, %s, 'agent', 'owner', 'владелец (панель)') "
                         "ON CONFLICT (agent_slug, name) DO NOTHING RETURNING id",
                         (slug, name, str(body.get("description") or "").strip(), schedule,
                          prompt, str(body.get("deliver_to") or "").strip()),
@@ -234,7 +252,7 @@ def agent_automation_run_now(auto_id: int):
         return jsonify({"error": "Автоматизация не найдена."}), 404
     if row["kind"] == "system":
         return jsonify({"error": "Системную автоматизацию запускает Hermes по своему расписанию."}), 403
-    if row["last_status"] == "running":
+    if row["last_status"] == "running" and not _running_is_stale(row):
         return jsonify({"error": "Уже выполняется."}), 409
     threading.Thread(target=_run_automation, args=(row,), daemon=True,
                      name=f"agent-automation-manual-{auto_id}").start()
@@ -249,7 +267,9 @@ def _automation_prompt(agent: dict[str, Any], row: dict[str, Any]) -> str:
         "[Служебный запуск по расписанию — автоматизация «" + row["name"] + "» агента «"
         + str(agent.get("name") or agent["slug"]) + "». Это НЕ сообщение пользователя: молча выполни "
         "задачу автоматизации и верни ГОТОВЫЙ текст, который будет отправлен сообщением в Битрикс "
-        "от твоего имени."
+        "от твоего имени. ИЗОЛЯЦИЯ: ты автономный агент со СВОИМ набором инструментов и инструкций — "
+        "работай ТОЛЬКО ими; другие агенты, их задачи и автоматизации тебя не касаются, не ссылайся "
+        "на них и не пытайся выполнять чужую работу."
         + (" ТВОЯ РОЛЬ: " + role if role else "")
         + " Правила: пиши по-русски, кратко и по делу; БЕЗ Markdown (#, **, `, таблицы) — жирный "
         "только [b]...[/b], перечисления списком «- »; реальные данные бери ТОЛЬКО из инструментов, "
@@ -289,42 +309,56 @@ def _deliver(agent: dict[str, Any], row: dict[str, Any], text: str) -> tuple[boo
                                  dialog_id=target, bot_id=agent.get("bitrix_bot_id"))
 
 
+class _Skip(Exception):
+    """Run skipped because the brain is busy — a graceful miss, NOT a failure. The next
+    scheduled fire proceeds normally; live employee turns always win the contention."""
+
+
 def _run_automation(row: dict[str, Any]) -> None:
     """One automation run: agent turn on its own connector → deliver to Bitrix.
-    Serialized by a semaphore so scheduled runs never crowd out live employee turns."""
+    Serialized by a semaphore (bounded wait) so scheduled runs never pile up on each
+    other and never crowd out live employee turns."""
     status, result_text, error = "ok", "", None
-    with _run_slots:
-        try:
-            from agent_center import _agent_by_slug
-            agent = _agent_by_slug(row["agent_slug"])
-            if not agent:
-                raise RuntimeError("агент не найден")
-            if not agent.get("is_active"):
-                raise RuntimeError("агент выключен")
-            prompt = _automation_prompt(agent, row)
-            from b24bot import _hermes_answer_is_error, _hermes_run_guarded
-            cmd = ["hermes", "-z", prompt, "-t", f"agent-{agent['slug']}", "--yolo"]
-            proc, run_fail = _hermes_run_guarded(
-                cmd, _AUTOMATION_TIMEOUT_S, f"auto:{row['id']}", "auto", "", len(prompt))
-            if run_fail == "busy":
-                raise RuntimeError("мозг занят другими запросами — запуск пропущен")
-            if run_fail == "timeout":
-                raise RuntimeError(f"таймаут {_AUTOMATION_TIMEOUT_S} с")
-            answer = (proc.stdout or "").strip()
-            if not answer:
-                raise RuntimeError("пустой ответ мозга")
-            if _hermes_answer_is_error(answer):
-                raise RuntimeError("ошибка LLM: " + answer[:200])
-            if _is_silent(answer):
-                status = "silent"
-            else:
-                result_text = answer  # kept even on delivery failure so the owner can read it in the UI
-                delivered, derr = _deliver(agent, row, answer)
-                if not delivered:
-                    raise RuntimeError(f"доставка в Битрикс не удалась: {derr}")
-        except Exception as exc:  # noqa: BLE001
-            status, error = "error", str(exc)[:500]
-            logging.warning("agent automation %s (%s) failed: %s", row["id"], row["name"], error)
+    got_slot = _run_slots.acquire(timeout=_RUN_SLOT_WAIT_S)
+    try:
+        if not got_slot:
+            raise _Skip(f"другая автоматизация занимала очередь дольше {_RUN_SLOT_WAIT_S} с")
+        from agent_center import _agent_by_slug
+        agent = _agent_by_slug(row["agent_slug"])
+        if not agent:
+            raise RuntimeError("агент не найден")
+        if not agent.get("is_active"):
+            raise RuntimeError("агент выключен")
+        prompt = _automation_prompt(agent, row)
+        from b24bot import _hermes_answer_is_error, _hermes_run_guarded
+        cmd = ["hermes", "-z", prompt, "-t", f"agent-{agent['slug']}", "--yolo"]
+        proc, run_fail = _hermes_run_guarded(
+            cmd, _AUTOMATION_TIMEOUT_S, f"auto:{row['id']}", "auto", "", len(prompt))
+        if run_fail == "busy":
+            raise _Skip("мозг занят живыми запросами сотрудников")
+        if run_fail == "timeout":
+            raise RuntimeError(f"таймаут {_AUTOMATION_TIMEOUT_S} с")
+        answer = (proc.stdout or "").strip()
+        if not answer:
+            raise RuntimeError("пустой ответ мозга")
+        if _hermes_answer_is_error(answer):
+            raise RuntimeError("ошибка LLM: " + answer[:200])
+        if _is_silent(answer):
+            status = "silent"
+        else:
+            result_text = answer  # kept even on delivery failure so the owner can read it in the UI
+            delivered, derr = _deliver(agent, row, answer)
+            if not delivered:
+                raise RuntimeError(f"доставка в Битрикс не удалась: {derr}")
+    except _Skip as skip:
+        status, error = "skipped", str(skip)[:500]
+        logging.info("agent automation %s (%s) skipped: %s", row["id"], row["name"], error)
+    except Exception as exc:  # noqa: BLE001
+        status, error = "error", str(exc)[:500]
+        logging.warning("agent automation %s (%s) failed: %s", row["id"], row["name"], error)
+    finally:
+        if got_slot:
+            _run_slots.release()
         _finish_run(row["id"], status, result_text, error)
 
 
@@ -399,9 +433,10 @@ AUTOMATION_SELF_TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "schedule": {"type": "string", "description": "Cron из 5 полей, время МСК."},
                 "task": {"type": "string", "description": "Что делать при каждом запуске — подробная постановка."},
                 "deliver_to": {"type": "string", "description": "Bitrix dialog_id получателя результата (текущий диалог)."},
+                "requested_by": {"type": "string", "description": "Имя сотрудника, который попросил автоматизацию (собеседник текущего диалога) — видно владельцу."},
                 "description": {"type": "string", "description": "Необязательное описание для владельца."},
             },
-            "required": ["name", "schedule", "task", "deliver_to"],
+            "required": ["name", "schedule", "task", "deliver_to", "requested_by"],
         },
     },
     "list_my_automations": {
@@ -420,6 +455,24 @@ AUTOMATION_SELF_TOOL_SPECS: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+
+def _requester_name(requested_by: str, deliver_to: str) -> str:
+    """Who asked for this automation — the agent's own words, else the portal directory
+    name behind deliver_to (a private dialog_id IS the user's id)."""
+    requested_by = (requested_by or "").strip()[:80]
+    if requested_by:
+        return requested_by
+    target = (deliver_to or "").strip()
+    if target.isdigit():
+        try:
+            from agent_center import _user_names
+            info = _user_names().get(int(target))
+            if info and info.get("name"):
+                return str(info["name"])
+        except Exception:  # noqa: BLE001
+            logging.exception("automation requester name lookup failed")
+    return ""
 
 
 def automation_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -451,6 +504,9 @@ def automation_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, 
         if len(own) >= _SELF_AUTOMATIONS_MAX and auto_name not in {r["name"] for r in own}:
             raise ValueError(f"Лимит {_SELF_AUTOMATIONS_MAX} автоматизаций: удали неактуальную (delete_my_automation).")
         label = f"агент «{agent.get('name') or slug}» (сам)"
+        requester = _requester_name(str(args.get("requested_by") or ""), str(args.get("deliver_to") or ""))
+        if requester:
+            label += f" · по просьбе: {requester}"
         with pg_connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
