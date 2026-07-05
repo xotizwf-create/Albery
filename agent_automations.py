@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
+import subprocess
 import threading
 import time
 
@@ -31,12 +33,9 @@ from app import MSK_TZ, app, msk_now, pg_connect
 import cron_schedule
 
 _AUTOMATION_TIMEOUT_S = int(os.getenv("AGENT_AUTOMATION_TIMEOUT_S", "300"))
-# How long a run may wait for the automation slot before it is SKIPPED (not an error):
-# scheduled runs must never pile up behind a slow one or crowd out live employee turns.
-_RUN_SLOT_WAIT_S = int(os.getenv("AGENT_AUTOMATION_SLOT_WAIT_S", "180"))
-# A 'running' row older than timeout+slack means the process restarted mid-run — treat
-# it as interrupted (self-heals: display + run-now unblock instead of a stuck state).
-_RUNNING_STALE_S = _AUTOMATION_TIMEOUT_S + 600
+# A 'running' row older than timeout+retry window+slack means the process restarted
+# mid-run — treat it as interrupted (self-heals: display + run-now unblock).
+_RUNNING_STALE_S = _AUTOMATION_TIMEOUT_S * 2 + 900
 _SELF_AUTOMATIONS_MAX = int(os.getenv("AGENT_SELF_AUTOMATIONS_MAX", "10"))
 # Every run is a full LLM turn — frequency is capped hard. The owner (UI) may go down
 # to every 15 minutes; an agent scheduling itself from chat — at most hourly.
@@ -46,7 +45,14 @@ _NAME_MAX = 80
 _TASK_MAX = 4000
 _RESULT_KEEP = 2000
 
-_run_slots = threading.Semaphore(int(os.getenv("AGENT_AUTOMATION_CONCURRENCY", "1")))
+# Automations run in their OWN lane, fully independent of live employee turns: a
+# dedicated worker pool draining a queue, with its own hermes subprocesses that never
+# touch b24bot's _HERMES_RUN_SLOTS. Employees can't starve automations and automations
+# can't eat employee slots — separate brains, separate roads. Every claimed fire is
+# eventually executed (queued, never dropped); transient failures get one delayed retry.
+_AUTOMATION_WORKERS = max(1, int(os.getenv("AGENT_AUTOMATION_CONCURRENCY", "1")))
+_RETRY_DELAY_S = int(os.getenv("AGENT_AUTOMATION_RETRY_DELAY_S", "120"))
+_work_q: "queue.Queue[tuple[dict[str, Any], int]]" = queue.Queue()
 
 
 # --- Storage ---------------------------------------------------------------------------------
@@ -254,8 +260,15 @@ def agent_automation_run_now(auto_id: int):
         return jsonify({"error": "Системную автоматизацию запускает Hermes по своему расписанию."}), 403
     if row["last_status"] == "running" and not _running_is_stale(row):
         return jsonify({"error": "Уже выполняется."}), 409
-    threading.Thread(target=_run_automation, args=(row,), daemon=True,
-                     name=f"agent-automation-manual-{auto_id}").start()
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE agent_automations SET last_status = 'running', "
+                                "last_run_at = now(), updated_at = now() WHERE id = %s", (auto_id,))
+    except Exception:  # noqa: BLE001
+        logging.exception("agent automation %s: manual run mark failed", auto_id)
+    _work_q.put((row, 1))
     return jsonify({"ok": True, "started": True})
 
 
@@ -309,20 +322,38 @@ def _deliver(agent: dict[str, Any], row: dict[str, Any], text: str) -> tuple[boo
                                  dialog_id=target, bot_id=agent.get("bitrix_bot_id"))
 
 
-class _Skip(Exception):
-    """Run skipped because the brain is busy — a graceful miss, NOT a failure. The next
-    scheduled fire proceeds normally; live employee turns always win the contention."""
+def _hermes_oneshot(cmd: list, timeout_s: int, tag: str) -> tuple[Any, str | None]:
+    """Run the hermes CLI in the AUTOMATION lane: two quick attempts, no shared
+    semaphores with employee turns (that's the whole point — a parallel brain).
+    Returns (proc, None) or (None, 'timeout'); like b24bot, an LLM error sentinel
+    or empty stdout triggers the in-place second attempt."""
+    from b24bot import _hermes_answer_is_error
+    proc = None
+    for attempt in (1, 2):
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout_s,
+                cwd="/root", env={**os.environ, "HOME": "/root"},
+            )
+        except subprocess.TimeoutExpired:
+            logging.warning("agent automation %s: hermes timed out after %ss (attempt %s/2)",
+                            tag, timeout_s, attempt)
+            return None, "timeout"
+        if (proc.returncode == 0 and (proc.stdout or "").strip()
+                and not _hermes_answer_is_error(proc.stdout.strip())):
+            return proc, None
+        logging.error("agent automation %s: hermes run failed (attempt %s/2): rc=%s err=%s answer=%s",
+                      tag, attempt, proc.returncode, (proc.stderr or "")[:200],
+                      (proc.stdout or "")[:120])
+    return proc, None
 
 
-def _run_automation(row: dict[str, Any]) -> None:
+def _run_automation(row: dict[str, Any], attempt: int = 1) -> None:
     """One automation run: agent turn on its own connector → deliver to Bitrix.
-    Serialized by a semaphore (bounded wait) so scheduled runs never pile up on each
-    other and never crowd out live employee turns."""
+    A transient failure (timeout / LLM hiccup / delivery error) gets ONE delayed
+    re-run so a momentary glitch never costs the owner a scheduled report."""
     status, result_text, error = "ok", "", None
-    got_slot = _run_slots.acquire(timeout=_RUN_SLOT_WAIT_S)
     try:
-        if not got_slot:
-            raise _Skip(f"другая автоматизация занимала очередь дольше {_RUN_SLOT_WAIT_S} с")
         from agent_center import _agent_by_slug
         agent = _agent_by_slug(row["agent_slug"])
         if not agent:
@@ -330,12 +361,9 @@ def _run_automation(row: dict[str, Any]) -> None:
         if not agent.get("is_active"):
             raise RuntimeError("агент выключен")
         prompt = _automation_prompt(agent, row)
-        from b24bot import _hermes_answer_is_error, _hermes_run_guarded
+        from b24bot import _hermes_answer_is_error
         cmd = ["hermes", "-z", prompt, "-t", f"agent-{agent['slug']}", "--yolo"]
-        proc, run_fail = _hermes_run_guarded(
-            cmd, _AUTOMATION_TIMEOUT_S, f"auto:{row['id']}", "auto", "", len(prompt))
-        if run_fail == "busy":
-            raise _Skip("мозг занят живыми запросами сотрудников")
+        proc, run_fail = _hermes_oneshot(cmd, _AUTOMATION_TIMEOUT_S, f"{row['id']}/{row['name']}")
         if run_fail == "timeout":
             raise RuntimeError(f"таймаут {_AUTOMATION_TIMEOUT_S} с")
         answer = (proc.stdout or "").strip()
@@ -350,16 +378,26 @@ def _run_automation(row: dict[str, Any]) -> None:
             delivered, derr = _deliver(agent, row, answer)
             if not delivered:
                 raise RuntimeError(f"доставка в Битрикс не удалась: {derr}")
-    except _Skip as skip:
-        status, error = "skipped", str(skip)[:500]
-        logging.info("agent automation %s (%s) skipped: %s", row["id"], row["name"], error)
     except Exception as exc:  # noqa: BLE001
         status, error = "error", str(exc)[:500]
-        logging.warning("agent automation %s (%s) failed: %s", row["id"], row["name"], error)
-    finally:
-        if got_slot:
-            _run_slots.release()
-        _finish_run(row["id"], status, result_text, error)
+        logging.warning("agent automation %s (%s) attempt %s failed: %s",
+                        row["id"], row["name"], attempt, error)
+        retriable = "агент не найден" not in error and "агент выключен" not in error
+        if attempt == 1 and retriable:
+            error += f" — повторю через {_RETRY_DELAY_S} с"
+            threading.Timer(_RETRY_DELAY_S, lambda: _work_q.put((row, 2))).start()
+    _finish_run(row["id"], status, result_text, error)
+
+
+def _worker_loop() -> None:
+    while True:
+        row, attempt = _work_q.get()
+        try:
+            _run_automation(row, attempt)
+        except Exception:  # noqa: BLE001
+            logging.exception("agent automation worker crashed on row %s", row.get("id"))
+        finally:
+            _work_q.task_done()
 
 
 # --- Scheduler thread (same pattern as the agent_center health watchdog) ---------------------
@@ -390,8 +428,9 @@ def _scheduler_tick(minute_start) -> None:
         except ValueError:
             continue
         if due and _claim(row["id"], minute_start):
-            threading.Thread(target=_run_automation, args=(row,), daemon=True,
-                             name=f"agent-automation-{row['id']}").start()
+            # Queued, never dropped: the worker lane executes every claimed fire even
+            # if several automations land on the same minute.
+            _work_q.put((row, 1))
 
 
 def _scheduler_loop() -> None:
@@ -410,6 +449,8 @@ def _scheduler_loop() -> None:
 
 if os.getenv("AGENT_AUTOMATIONS", "1").strip() != "0":
     threading.Thread(target=_scheduler_loop, daemon=True, name="agent-automations-scheduler").start()
+    for _n in range(_AUTOMATION_WORKERS):
+        threading.Thread(target=_worker_loop, daemon=True, name=f"agent-automations-worker-{_n}").start()
 
 
 # --- Self-tools on the per-agent MCP connector (merged into agent_center._SELF_TOOL_SPECS) ---
