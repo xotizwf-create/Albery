@@ -301,6 +301,10 @@ def _automation_prompt(agent: dict[str, Any], row: dict[str, Any]) -> str:
     if skills:
         parts.append("ТВОИ НАВЫКИ (подключены владельцем): "
                      + "; ".join(f"«{s['title']}» — {s['description']}" for s in skills))
+        for s in skills:
+            if s.get("content"):
+                parts.append("ПОЛНЫЙ ТЕКСТ НАВЫКА «" + s["title"] + "» — следуй ему буквально:\n"
+                             + s["content"])
     learned = agent.get("instructions") or []
     if learned:
         parts.append("ТВОИ ЛИЧНЫЕ ИНСТРУКЦИИ (применяй обязательно):\n"

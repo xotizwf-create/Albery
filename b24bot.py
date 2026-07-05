@@ -2107,6 +2107,10 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                 "этом списке, не выдумывай и не применяй сторонние приёмы — скажи, что этим "
                 "занимается Основной агент Албери."
             )
+            for s in selected["skills"]:
+                if s.get("content"):
+                    parts.append("ПОЛНЫЙ ТЕКСТ НАВЫКА «" + s["title"] + "» — следуй ему буквально:\n"
+                                 + s["content"])
     # Personal instructions + self-learning apply to ANY agent that runs on its own
     # connector: subagents AND the universal (main) agent when it is on agent-main. The
     # main bot keeps its general head; here we only add its accumulated skills + the
