@@ -7007,7 +7007,9 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
     method = request.get("method")
     available_tools = _allowed_tools(tool_names)
 
-    if method == "notifications/initialized":
+    # JSON-RPC notifications (initialized, cancelled, progress, ...) are one-way:
+    # answering them with a response object (even an error) violates the protocol.
+    if isinstance(method, str) and method.startswith("notifications/"):
         return None
 
     try:
@@ -7017,6 +7019,12 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             }
+        elif method == "ping":
+            # MCP liveness probe. hermes >=0.17 pings every connector each keepalive
+            # interval (180s) and treats ANY failure as a dead connection with a
+            # finite reconnect budget — an unanswered ping killed every connector
+            # within ~15 minutes (incident 2026-07-06, agents lost all tools).
+            result = {}
         elif method == "tools/list":
             result = {"tools": list_tools(tool_names, core=core)}
         elif method == "tools/call":

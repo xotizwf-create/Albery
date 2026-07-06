@@ -75,6 +75,21 @@ def test_handle_request_initialize(ctx):
     assert resp["result"]["capabilities"]["tools"] == {}
 
 
+def test_handle_request_ping_returns_empty_result(ctx):
+    # hermes >=0.17 pings each connector every keepalive interval and treats any
+    # failure as a dead connection (finite reconnect budget) — ping MUST succeed.
+    resp = ctx.handle_request({"jsonrpc": "2.0", "id": 7, "method": "ping"})
+    assert resp["id"] == 7
+    assert resp["result"] == {}
+    assert "error" not in resp
+
+
+def test_notifications_are_one_way(ctx):
+    # Any notifications/* must never be answered — not even with an error object.
+    assert ctx.handle_request({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+    assert ctx.handle_request({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {}}) is None
+
+
 def test_full_server_lists_all_tools(ctx):
     resp = ctx.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     listed = {t["name"] for t in resp["result"]["tools"]}
