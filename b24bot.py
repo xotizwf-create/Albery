@@ -1977,6 +1977,30 @@ def _b24_recent_history(dialog_id: str, limit: int = 6,
 _HERMES_MAX_CONCURRENCY = max(1, int(os.getenv("B24_HERMES_MAX_CONCURRENCY", "3")))
 _HERMES_QUEUE_WAIT_S = int(os.getenv("B24_HERMES_QUEUE_WAIT_S", "180"))
 _HERMES_RUN_SLOTS = threading.BoundedSemaphore(_HERMES_MAX_CONCURRENCY)
+# Live turn registry for cancellation: «Новая сессия» must STOP a running brain turn of that
+# (agent, dialog) — kill its hermes subprocess — instead of letting it finish into a session
+# the user already reset. Keyed by _b24_scope; the worker sees `cancelled` and drops the turn.
+_LIVE_TURNS_LOCK = threading.Lock()
+_LIVE_TURNS: dict[str, list[dict]] = {}
+
+
+def _b24_cancel_live_turns(scope: str) -> int:
+    """Cancel every running brain turn of this scope: mark + kill the hermes subprocess.
+    Returns how many turns were cancelled (0 = nothing was running)."""
+    cancelled = 0
+    with _LIVE_TURNS_LOCK:
+        for entry in _LIVE_TURNS.get(scope, []):
+            entry["cancelled"] = True
+            proc = entry.get("proc")
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            cancelled += 1
+    return cancelled
+
+
 _OPS_ALERT_COOLDOWN_S = 600
 _ops_alert_last_sent: dict[str, float] = {}
 _ops_alert_lock = threading.Lock()
@@ -2030,10 +2054,11 @@ def _b24_brain_error_message(answer: str) -> str:
 
 
 def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
-                        from_user_id: Any, prompt_chars: int):
+                        from_user_id: Any, prompt_chars: int, scope: str = ""):
     """Run the hermes CLI under the concurrency semaphore, retrying once on a quick failure
     (non-zero rc / empty stdout / an LLM error sentinel printed as the answer). Returns
-    (proc, None), (None, 'busy') or (None, 'timeout')."""
+    (proc, None), (None, 'busy'), (None, 'timeout') or (None, 'cancelled') — the latter when
+    «Новая сессия» killed this turn mid-flight."""
     if not _HERMES_RUN_SLOTS.acquire(timeout=_HERMES_QUEUE_WAIT_S):
         logging.warning("b24 testbot: hermes slot wait exceeded %ss dialog_id=%s tier=%s user_id=%s",
                         _HERMES_QUEUE_WAIT_S, dialog_id, tier, from_user_id)
@@ -2043,15 +2068,28 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
             f"(лимит {_HERMES_MAX_CONCURRENCY} одновременных прогонов).",
         )
         return None, "busy"
+    entry: dict[str, Any] = {"proc": None, "cancelled": False}
+    with _LIVE_TURNS_LOCK:
+        _LIVE_TURNS.setdefault(scope, []).append(entry)
     try:
         proc = None
         for attempt in (1, 2):
-            try:
-                proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=timeout_s,
+            # Spawn under the lock so a concurrent cancel can't slip between check and start.
+            with _LIVE_TURNS_LOCK:
+                if entry["cancelled"]:
+                    return None, "cancelled"
+                child = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                     cwd="/root", env={**os.environ, "HOME": "/root"},
                 )
+                entry["proc"] = child
+            try:
+                out, err = child.communicate(timeout=timeout_s)
             except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                if entry["cancelled"]:
+                    return None, "cancelled"
                 logging.warning(
                     "b24 testbot: hermes timed out after %ss dialog_id=%s tier=%s user_id=%s prompt_chars=%s",
                     timeout_s, dialog_id, tier, from_user_id, prompt_chars,
@@ -2059,6 +2097,9 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
                 _b24_ops_alert("таймаут хода", dialog_id, tier, from_user_id,
                                f"Мозг не ответил за {timeout_s}с; пользователь получил вежливый отказ.")
                 return None, "timeout"
+            if entry["cancelled"]:
+                return None, "cancelled"
+            proc = subprocess.CompletedProcess(cmd, child.returncode, out or "", err or "")
             if (proc.returncode == 0 and (proc.stdout or "").strip()
                     and not _hermes_answer_is_error(proc.stdout.strip())):
                 return proc, None
@@ -2067,11 +2108,17 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
                           (proc.stdout or "")[:120])
         return proc, None  # both attempts bad -> caller reports the empty answer
     finally:
+        with _LIVE_TURNS_LOCK:
+            entries = _LIVE_TURNS.get(scope, [])
+            if entry in entries:
+                entries.remove(entry)
+            if not entries:
+                _LIVE_TURNS.pop(scope, None)
         _HERMES_RUN_SLOTS.release()
 
 
 def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_user_id: Any = "",
-                        agent: dict[str, Any] | None = None) -> str:
+                        agent: dict[str, Any] | None = None) -> str | None:
     """Run one turn through the local Hermes brain. Toolset is chosen by access tier:
     admin → full MCP `albery` (incl. instruction/settings edits + deletes); ops → `albery-ops`
     (operational, no admin tools); everyone else → read-only `albery-faq`. A subagent turn
@@ -2331,7 +2378,11 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         parts.append("Сводка более ранней части разговора: " + seed)
     history = _b24_recent_history(dialog_id, int(os.getenv("B24_TESTBOT_HISTORY_TURNS", "10")), agent_slug)
     if history:
-        convo = "\n".join(f"Пользователь: {q}\nАссистент: {a}" for q, a in history)
+        # Long answers (contracts, tables) would balloon the prompt of every following turn —
+        # clip each history item; the rolling session summary carries the older context anyway.
+        def _clip(text: str, cap: int) -> str:
+            return text if len(text) <= cap else text[:cap] + " …[обрезано]"
+        convo = "\n".join(f"Пользователь: {_clip(q, 500)}\nАссистент: {_clip(a, 1500)}" for q, a in history)
         parts.append("История этого диалога (предыдущие реплики, помни их):\n" + convo)
     parts.append("Текущее сообщение пользователя:\n" + user_text)
     prompt = "\n\n".join(parts)
@@ -2342,7 +2393,10 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
     # pre-0.17 behaviour — while the epoch name stays as a searchable prefix in state.db.
     run_session = f"{session}-r{uuid.uuid4().hex[:8]}"
     cmd = ["hermes", "-z", prompt, "--continue", run_session, "-t", toolset, "--yolo"]
-    proc, run_fail = _hermes_run_guarded(cmd, timeout_s, dialog_id, tier, from_user_id, len(prompt))
+    proc, run_fail = _hermes_run_guarded(cmd, timeout_s, dialog_id, tier, from_user_id, len(prompt),
+                                         scope=_b24_scope(dialog_id, agent_slug))
+    if run_fail == "cancelled":
+        return None  # «Новая сессия» остановила этот ход — reset уже ответил пользователю
     if run_fail == "busy":
         return ("Сейчас я обрабатываю много запросов одновременно 🙏 Подожди минуту-другую и "
                 "отправь сообщение ещё раз — я отвечу.")
@@ -2624,6 +2678,13 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
     finally:
         stop_typing.set()
         _b24_inflight_clear(inflight_id)
+    if answer is None:
+        # Turn cancelled by «Новая сессия»: the reset flow already replied to the user —
+        # drop the progress message, release the 👀 reaction and post nothing.
+        if status_message_id:
+            _b24_status_finish(client_endpoint, access_token, bot_id, status_message_id)
+        _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
+        return
     latency_ms = int((time.monotonic() - started) * 1000)
     answer, escalation_request = _b24_extract_escalation(answer)
     answer, _deliver_name, _deliver_fmt = _b24_extract_deliver(answer)
@@ -2661,12 +2722,17 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
 def _b24_do_reset(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
                   message_id: Any = "", agent_slug: str | None = None) -> None:
     """Reset the dialog's session and confirm — runs WITHOUT calling the model. Scoped per agent
-    so 'New session' only clears THIS agent's conversation, not another bot's in the same chat."""
+    so 'New session' only clears THIS agent's conversation, not another bot's in the same chat.
+    A brain turn still running in this scope is KILLED first: a reset means the user no longer
+    wants that answer, and letting it finish would post into the fresh session."""
+    stopped = _b24_cancel_live_turns(_b24_scope(dialog_id, agent_slug))
     _b24_session_reset(dialog_id, agent_slug)
     if message_id:
         _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
         _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id,
+                   ("⏹ Остановил текущую работу и начал новую сессию — предыдущий контекст очищен. "
+                    "Спрашивайте!") if stopped else
                    "🆕 Начал новую сессию — предыдущий контекст очищен. Спрашивайте!",
                    keyboard=_b24_keyboard())
     _b24_ensure_command_registered(client_endpoint, access_token, bot_id)

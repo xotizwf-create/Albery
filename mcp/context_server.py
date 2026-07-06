@@ -1383,7 +1383,11 @@ def _resolve_active_bitrix_user(bitrix_user_id: Any = None, name: Any = None) ->
                 )
                 row = cur.fetchone()
                 if not row:
-                    raise McpError(-32602, f"Не найден активный сотрудник Bitrix с id {user_id}.")
+                    raise McpError(
+                        -32602,
+                        f"Не найден активный сотрудник Bitrix с id {user_id}. Не перебирай id — "
+                        "уточни у пользователя правильного сотрудника.",
+                    )
                 return dict(row)
 
             if not responsible_name:
@@ -1402,7 +1406,13 @@ def _resolve_active_bitrix_user(bitrix_user_id: Any = None, name: Any = None) ->
     exact = [row for row in rows if str(row.get("full_name") or "").strip().lower() == responsible_name.lower()]
     matches = exact or [row for row in rows if _person_names_match(row.get("full_name"), responsible_name)]
     if not matches:
-        raise McpError(-32602, f"Не удалось найти исполнителя в оргструктуре: {responsible_name}.")
+        raise McpError(
+            -32602,
+            f"Не удалось найти исполнителя в оргструктуре: {responsible_name}. "
+            "НЕ повторяй вызов с этим же именем и НЕ подбирай замену сам: если задач несколько — "
+            "создай остальные, а по этому человеку спроси у пользователя, кто это "
+            "(или попроси точный responsible_bitrix_user_id).",
+        )
     if len(matches) > 1:
         candidates = [
             {
@@ -1487,7 +1497,9 @@ def _resolve_active_bitrix_users(
                     if not matches:
                         raise McpError(
                             -32602,
-                            f"{role_label} не найден в оргструктуре: {name}.",
+                            f"{role_label} не найден в оргструктуре: {name}. "
+                            "НЕ повторяй вызов с этим именем — пропусти этого человека, сделай "
+                            "остальное и уточни у пользователя, кто это.",
                         )
                     if len(matches) > 1:
                         candidates = [
@@ -3909,7 +3921,11 @@ def _resolve_message_recipient(
                 )
                 row = cur.fetchone()
                 if not row:
-                    raise McpError(-32602, f"Не найден активный сотрудник Bitrix с id {user_id}.")
+                    raise McpError(
+                        -32602,
+                        f"Не найден активный сотрудник Bitrix с id {user_id}. Не перебирай id — "
+                        "уточни у пользователя правильного сотрудника.",
+                    )
                 return dict(row)
 
             if not name_clean:
