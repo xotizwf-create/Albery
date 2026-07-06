@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -1984,6 +1985,37 @@ _LIVE_TURNS_LOCK = threading.Lock()
 _LIVE_TURNS: dict[str, list[dict]] = {}
 
 
+def _b24_hermes_popen_kwargs(cmd: list) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "args": cmd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "cwd": "/root",
+        "env": {**os.environ, "HOME": "/root"},
+    }
+    if os.name == "posix":
+        # Hermes can spawn children. Give the turn its own process group so reset/timeout
+        # can kill the whole tree and not hang on inherited stdout/stderr pipes.
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _b24_kill_process_tree(proc: Any) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), getattr(signal, "SIGKILL", signal.SIGTERM))
+        else:
+            proc.kill()
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _b24_cancel_live_turns(scope: str) -> int:
     """Cancel every running brain turn of this scope: mark + kill the hermes subprocess.
     Returns how many turns were cancelled (0 = nothing was running)."""
@@ -1992,11 +2024,7 @@ def _b24_cancel_live_turns(scope: str) -> int:
         for entry in _LIVE_TURNS.get(scope, []):
             entry["cancelled"] = True
             proc = entry.get("proc")
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+            _b24_kill_process_tree(proc)
             cancelled += 1
     return cancelled
 
@@ -2078,15 +2106,12 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
             with _LIVE_TURNS_LOCK:
                 if entry["cancelled"]:
                     return None, "cancelled"
-                child = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                    cwd="/root", env={**os.environ, "HOME": "/root"},
-                )
+                child = subprocess.Popen(**_b24_hermes_popen_kwargs(cmd))
                 entry["proc"] = child
             try:
                 out, err = child.communicate(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                child.kill()
+                _b24_kill_process_tree(child)
                 child.communicate()
                 if entry["cancelled"]:
                     return None, "cancelled"
