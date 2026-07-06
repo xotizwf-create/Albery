@@ -1950,7 +1950,8 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_bl
 def _b24_recent_history(dialog_id: str, limit: int = 6,
                         agent_slug: str | None = None) -> list[tuple[str, str]]:
     """Last successful Q/A pairs for THIS agent in this dialog — we inject them into the prompt
-    because `hermes -z` one-shot calls do NOT persist/resume `--continue` sessions, so the agent
+    because each turn runs in a FRESH hermes session (a unique per-run --continue name; hermes
+    >=0.17 would otherwise resume the named session and double the memory), so the agent
     has no memory of its own. Filtered by agent_slug so an agent only recalls its OWN history
     (the Bitrix dialog_id is shared across bots); the floor comes from this agent's session row."""
     try:
@@ -2334,7 +2335,13 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         parts.append("История этого диалога (предыдущие реплики, помни их):\n" + convo)
     parts.append("Текущее сообщение пользователя:\n" + user_text)
     prompt = "\n\n".join(parts)
-    cmd = ["hermes", "-z", prompt, "--continue", session, "-t", toolset, "--yolo"]
+    # Hermes >=0.17 actually RESUMES a named --continue session (0.14 one-shots never did).
+    # Our only memory channel is the prompt-injected history above; a resumed session would
+    # duplicate it AND replay every past tool result into each turn's context (compression is
+    # disabled on this box). A unique per-run suffix keeps one fresh session per turn — the
+    # pre-0.17 behaviour — while the epoch name stays as a searchable prefix in state.db.
+    run_session = f"{session}-r{uuid.uuid4().hex[:8]}"
+    cmd = ["hermes", "-z", prompt, "--continue", run_session, "-t", toolset, "--yolo"]
     proc, run_fail = _hermes_run_guarded(cmd, timeout_s, dialog_id, tier, from_user_id, len(prompt))
     if run_fail == "busy":
         return ("Сейчас я обрабатываю много запросов одновременно 🙏 Подожди минуту-другую и "
