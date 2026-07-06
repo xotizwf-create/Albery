@@ -1,5 +1,7 @@
 slug: main
-instructions: []
+instructions:
+- Работа в системе / Классификатор запросов
+- Работа в системе / Проблемы за период
 skills:
 - skill:apple/apple-notes
 - skill:apple/apple-reminders

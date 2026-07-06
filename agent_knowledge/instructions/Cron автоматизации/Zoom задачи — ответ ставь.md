@@ -1,6 +1,6 @@
 ---
 name: Zoom задачи — ответ ставь
-scope: universal
+scope: optional
 sort_order: 0
 db_id: f8ebb603-0746-4c09-a8b1-a02ecf15893a
 ---

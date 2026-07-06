@@ -1,6 +1,6 @@
 ---
 name: Выгрузка транскриптов созвонов в Markdown
-scope: universal
+scope: optional
 sort_order: 10
 db_id: 664d5ef1-a1e6-4da0-9ccf-22883d96abcb
 ---
