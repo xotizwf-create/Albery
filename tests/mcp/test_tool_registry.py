@@ -45,6 +45,29 @@ def test_core_tools_present(ctx):
     assert not missing, f"missing core tools: {sorted(missing)}"
 
 
+def test_task_mutation_tools_registered(ctx):
+    required = {
+        "add_bitrix_task_comment",
+        "reopen_bitrix_task",
+        "delete_bitrix_task",
+    }
+    missing = required - set(ctx.TOOLS)
+    assert not missing, f"missing task mutation tools: {sorted(missing)}"
+    assert {"add_bitrix_task_comment", "reopen_bitrix_task"} <= set(ctx.CORE_TOOL_NAMES)
+
+
+def test_ops_core_does_not_list_owner_only_delete(ctx):
+    resp = ctx.handle_request(
+        {"jsonrpc": "2.0", "id": 20, "method": "tools/list"},
+        tool_names=ctx.OPS_TOOL_NAMES,
+        core=True,
+    )
+    listed = {t["name"] for t in resp["result"]["tools"]}
+    assert "add_bitrix_task_comment" in listed
+    assert "reopen_bitrix_task" in listed
+    assert "delete_bitrix_task" not in listed
+
+
 def test_handle_request_initialize(ctx):
     resp = ctx.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
     assert resp["id"] == 1
@@ -87,3 +110,23 @@ def test_faq_cannot_call_a_full_only_tool(ctx):
         tool_names=ctx.FAQ_TOOL_NAMES,
     )
     assert resp["error"]["code"] == -32601
+
+
+def test_agent_scoped_connector_can_call_enabled_owner_tool_when_allowed(ctx):
+    request = {
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": {"name": "delete_bitrix_task", "arguments": {"bitrix_task_id": 1}},
+    }
+
+    public_scoped = ctx.handle_request(request, tool_names={"delete_bitrix_task"})
+    assert public_scoped["error"]["code"] == -32601
+
+    per_agent = ctx.handle_request(
+        request,
+        tool_names={"delete_bitrix_task"},
+        allow_owner_tools=True,
+    )
+    assert per_agent["error"]["code"] == -32602
+    assert "подтверждения" in per_agent["error"]["message"]

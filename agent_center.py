@@ -51,9 +51,9 @@ def agent_center_spa(sub: str = ""):
     from app import index
     return index()
 
-# There is exactly one live agent today: the Bitrix24 bot. Access tiers
-# (admin/ops/faq) are per-employee grants INSIDE it (agent_access), not separate
-# agents. When subagents arrive (own Bitrix app/user each) they become extra rows.
+# The main Bitrix24 bot is the default agent. Legacy tier columns remain in the
+# DB as creation presets / labels, but a personal agent's real capability boundary
+# is its enabled tool whitelist.
 _MAIN_AGENT_META = {
     "id": "main",
     "name": "Основной агент",
@@ -349,9 +349,9 @@ def agent_center_agents():
 
 @app.get("/api/agent-center/tools")
 def agent_center_tools():
-    """The real MCP tool registry with tier availability (admin=/mcp, ops=/mcp-ops,
-    faq=/mcp-faq) and the core-toolset flag (the compact set the chat-bot runs on).
-    Same lazy-import idiom the /mcp* HTTP handlers in app.py use."""
+    """The real MCP tool registry with legacy connector buckets and the core-toolset
+    flag (the compact set the chat-bot runs on). Same lazy-import idiom the /mcp*
+    HTTP handlers in app.py use."""
     try:
         from mcp.context_server import (
             CORE_TOOL_NAMES,
@@ -1588,8 +1588,9 @@ def _library_instructions() -> list[dict[str, Any]]:
 
 @app.get("/api/agent-center/agents/<slug>/config")
 def agent_center_agent_config(slug: str):
-    """The agent's full capability surface for the constructor: every tier tool with its
-    on/off + fixed state, and the whole instruction/skill library with what's selected."""
+    """The agent's full capability surface for the constructor: every registry tool
+    with its on/off + fixed state, and the whole instruction/skill library with
+    what's selected."""
     agent = _agent_by_slug(slug)
     if not agent:
         return jsonify({"error": "Агент не найден."}), 404
@@ -1604,11 +1605,10 @@ def agent_center_agent_config(slug: str):
     except Exception:  # noqa: BLE001
         logging.exception("agent config: context_server import failed")
         return jsonify({"error": "Не удалось загрузить инструменты."}), 500
-    pool = _agent_allowed_pool(agent)          # what this level may hold
+    pool = _agent_allowed_pool(agent)          # what this agent may hold
     enabled = _agent_tool_names(agent)          # effective set the connector serves
     fixed = MANDATORY_AGENT_TOOLS & pool
-    # The whole registry — the level is a preset, not a cap. Tools outside the level's
-    # allowed pool (owner-only for non-developers) are shown but locked (allowed=false).
+    # The whole registry is available to the constructor; legacy tier is a preset, not a cap.
     tools = []
     for name in sorted(TOOLS):
         spec = TOOLS.get(name, {})
@@ -1659,18 +1659,16 @@ def agent_center_agent_config(slug: str):
 
 @app.put("/api/agent-center/agents/<slug>/config")
 def agent_center_agent_config_save(slug: str):
-    """Persist the constructor state: which tier tools are enabled (mandatory ones are
-    always kept), and which library instructions/skills are linked. Values are validated
-    against the real tier set / library so the stored config can never grant something
-    outside the agent's tier."""
+    """Persist the constructor state: which tools are enabled (mandatory ones are
+    always kept), and which library instructions/skills are linked. Values are
+    validated against the real registry / library so stale names are dropped."""
     agent = _agent_by_slug(slug)
     if not agent:
         return jsonify({"error": "Агент не найден."}), 404
     body = request.get_json(silent=True) or {}
     pool = _agent_allowed_pool(agent)
     fixed = MANDATORY_AGENT_TOOLS & pool
-    # Tools: keep only what this level is allowed to hold (owner-only tools are dropped
-    # for non-developers); the mandatory baseline is always included.
+    # Tools: keep only real registry names; the mandatory baseline is always included.
     requested_tools = {str(t) for t in (body.get("tools") or []) if str(t)}
     enabled_tools = sorted((requested_tools & pool) | fixed)
     # Only OPTIONAL instructions are per-agent connections; universal ones are always
@@ -1736,11 +1734,10 @@ def agent_selected_knowledge(agent: dict[str, Any]) -> dict[str, list[dict[str, 
 
 
 # --- Per-agent MCP endpoint (/mcp-agent/<slug>/<token>) with self-learning ------------------
-# The agent's ONLY connector. Tool scope = its tier set (faq → read-only knowledge;
-# ops → operational, no admin tools) ∩ optional per-agent whitelist, PLUS three
+# The agent's ONLY connector. Tool scope = its exact enabled whitelist, PLUS
 # self-learning tools handled RIGHT HERE with the slug from the URL — so an agent
 # can read/write exclusively its own instruction store, never global instructions,
-# never another agent's. Global admin tools are structurally unreachable.
+# never another agent's.
 
 _SELF_TOOL_SPECS: dict[str, dict[str, Any]] = {
     "upsert_my_instruction": {
@@ -1846,7 +1843,7 @@ def _agent_allowed_pool(agent: dict[str, Any]) -> set[str]:
 
 
 def _agent_preset_default(agent: dict[str, Any]) -> set[str]:
-    """Enabled set for an agent that was never customized — seeded from the level preset:
+    """Enabled set for an agent that was never customized — seeded from the legacy preset:
     база знаний → read-only faq set, все функции → operational set, разработчик → everything."""
     from mcp.context_server import FAQ_TOOL_NAMES, OPS_TOOL_NAMES, TOOLS
     tier = agent.get("tier")
@@ -1859,9 +1856,9 @@ def _agent_preset_default(agent: dict[str, Any]) -> set[str]:
 
 def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
     """Tools the agent's connector actually serves. Selection is from the FULL registry
-    (the level is a preset, not a cap), but always intersected with the level's allowed
-    pool so a non-developer agent can never end up holding an owner-only tool, and the
-    mandatory baseline is always forced on. Default (never customized) = the level preset.
+    (legacy tier is only a creation/default preset, not an access gate), intersected with
+    the registry so stale names disappear, and the mandatory baseline is always forced on.
+    Default (never customized) = the preset chosen at creation time.
     This is the hard gate: tools/list over the connector returns exactly this set, so a
     disabled tool is invisible and uncallable regardless of the prompt."""
     pool = _agent_allowed_pool(agent)
@@ -1891,7 +1888,7 @@ def mcp_agent_info(slug: str, path_token: str | None = None):
         "name": f"albery-agent-{slug}",
         "transport": "http-json-rpc",
         "endpoint": f"/mcp-agent/{slug}",
-        "scope": f"tier={agent['tier']} + личное самообучение агента «{agent['name']}»",
+        "scope": f"персональный набор инструментов агента «{agent['name']}» + личное самообучение",
         "methods": ["initialize", "tools/list", "tools/call"],
         "tools": sorted(_agent_tool_names(agent) | set(_SELF_TOOL_SPECS)),
     })
@@ -1937,7 +1934,12 @@ def mcp_agent_http(slug: str, path_token: str | None = None):
     # exactly that set, so an unconnected optional instruction is unreadable here.
     from agent_knowledge import allowed_instruction_paths
     instruction_scope = allowed_instruction_paths(agent["slug"])
-    response = handle_request(payload, tool_names=tool_names, instruction_scope=instruction_scope)
+    response = handle_request(
+        payload,
+        tool_names=tool_names,
+        allow_owner_tools=True,
+        instruction_scope=instruction_scope,
+    )
     if response is None:
         return ("", 202)
     if method == "tools/list" and isinstance(response, dict):

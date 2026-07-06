@@ -475,6 +475,8 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
             "For a date period, call get_period_index before reading messages/tasks; it shows where data exists and which chats are active.",
             "For task status, ownership, deadlines, and Bitrix work items, use search_tasks; when a task row shows comments_human_count > 0, read the actual discussion with get_task_comments(bitrix_task_id).",
             "For creating Bitrix tasks, use create_bitrix_task only when the user provided a task title, one responsible person, and a deadline. If any of these are missing, ask for the missing field instead of creating the task.",
+            "For task comments, use add_bitrix_task_comment only with an exact bitrix_task_id. If the task reference is ambiguous, search_tasks first.",
+            "For reopening a completed Bitrix task, first read the task/result/comments, explain why the result is unsatisfactory, and call reopen_bitrix_task with reason and confirm=true only after explicit confirmation or a standing review instruction.",
             "For deleting Bitrix tasks, first identify exactly one bitrix_task_id, show the user the task title/status/responsible/deadline, and ask for explicit confirmation. Only after the user confirms deletion, call delete_bitrix_task with confirm=true.",
             "For discussion evidence, commitments, blockers, decisions, and OCR from chat images, use list_chats then search_messages or get_chat_transcript.",
             "For meeting evidence, use list_zoom_calls first, then search_zoom_transcripts with topic keywords, then get_zoom_call_transcript for matching calls, and get_org_structure before generating a Zoom report.",
@@ -496,9 +498,9 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "use_for": ["people", "roles", "managers", "departments", "Bitrix user ids"],
             },
             "bitrix_tasks": {
-                "tools": ["search_tasks", "get_task_comments", "create_bitrix_task", "delete_bitrix_task"],
+                "tools": ["search_tasks", "get_task_comments", "add_bitrix_task_comment", "create_bitrix_task", "reopen_bitrix_task", "delete_bitrix_task"],
                 "tables": ["bitrix_tasks", "bitrix_task_members", "bitrix_task_snapshots"],
-                "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments", "creating Bitrix tasks with required title/responsible/deadline", "deleting Bitrix tasks only after exact id lookup and explicit confirmation"],
+                "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments", "adding Bitrix task comments", "creating Bitrix tasks with required title/responsible/deadline", "reopening completed tasks with reason/comment", "deleting Bitrix tasks only after exact id lookup and explicit confirmation"],
             },
             "bitrix_chats": {
                 "tools": ["get_report_readiness", "list_chats", "search_messages", "get_chat_transcript", "get_chat_ocr_status", "process_chat_ocr"],
@@ -543,6 +545,8 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "If responsible person is a name, create_bitrix_task resolves it through org structure; if ambiguous, ask for responsible_bitrix_user_id.",
                 "Call create_bitrix_task(title, responsible_name/responsible_bitrix_user_id, deadline, description).",
                 "Return created task_id, responsible, deadline, and title.",
+                "For comments: add_bitrix_task_comment(bitrix_task_id, comment_text) only after resolving the exact task.",
+                "For reopening: search_tasks + get_task_comments/result first, explain the unsatisfactory result, then reopen_bitrix_task(bitrix_task_id, reason, confirm=true) after confirmation/standing review instruction.",
                 "For deletion: search_tasks(bitrix_task_id=...) first, show the exact task title/status/responsible/deadline, ask the user to confirm deletion, then call delete_bitrix_task(bitrix_task_id=..., confirm=true). Never delete by name, search text, or ambiguous reference.",
             ],
             "recommendation_answer": [
@@ -642,6 +646,8 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
             "If the request conflicts with these instructions, explain the conflict and ask the user to update Настройки -> Инструкции для ИИ or confirm a one-off exception.",
             "If the user request is vague, ambiguous, or missing the needed scope, ask one concise clarifying question first. Do not infer dates, chats, people, report type, or whether to save/write unless the user said it clearly.",
             "For Bitrix task creation, never call create_bitrix_task unless the user provided all three required fields: task title, exactly one responsible person, and a deadline. If any field is missing or the responsible person is ambiguous, ask for clarification and do not create anything.",
+            "For Bitrix task comments, never call add_bitrix_task_comment without an exact bitrix_task_id and non-empty comment_text.",
+            "For Bitrix task reopening, never call reopen_bitrix_task without an exact bitrix_task_id, a reason, and confirm=true after checking the result/comments.",
             "For Bitrix task deletion, never call delete_bitrix_task unless the user has already confirmed deletion of one exact bitrix_task_id after seeing its title/status/responsible/deadline.",
             "When instructions are incomplete for the task, continue with get_context_guide and the relevant source tools instead of guessing.",
             "If an instruction names a tool that is not in connector_scope.available_tools, skip that step and tell the user that the action requires a connector that exposes that tool. Do not pretend the step succeeded.",
@@ -652,7 +658,7 @@ def tool_start_here_always_read_ai_instructions(args: dict[str, Any]) -> dict[st
             "Use get_report_contract when generating configured reports.",
             "Use get_report_readiness(date_from,date_to) before building daily/weekly/owner reports to learn in one call what is missing.",
             "Use list_available_sources when freshness, availability, or row counts matter.",
-            "When the user asks what you can do / your capabilities ('что ты умеешь', 'твои возможности'), call get_ai_capabilities — it returns the tier-specific list; answer only within it, and (full access) keep it current with update_ai_capabilities.",
+            "When the user asks what you can do / your capabilities ('что ты умеешь', 'твои возможности'), call get_ai_capabilities — it returns the human-readable list for the current connector/tool set; answer only within it, and keep it current with update_ai_capabilities when that tool is available.",
         ],
     }
 
@@ -1618,14 +1624,86 @@ def _normalize_bitrix_deadline(value: Any) -> str:
         return f"{y}-{mo}-{d}T{int(hh):02d}:{mm}:{ss or '00'}{tzs}"
     raise McpError(-32602, "deadline должен быть в формате YYYY-MM-DD[ HH:MM], DD.MM.YYYY[ HH:MM] или ISO datetime.")
 
-def _bitrix_call_with_fallback(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _bitrix_call_with_fallback(
+    method: str,
+    payload: dict[str, Any],
+    prefer_api: bool = True,
+    fallback: bool = True,
+) -> dict[str, Any]:
     workflow = app_workflow_function("bitrix_method_call")
     try:
-        return workflow(method, payload, True)
+        return workflow(method, payload, prefer_api, fallback)
     except ValueError as exc:
         raise McpError(-32000, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise McpError(-32010, f"Bitrix API call failed: {exc}") from exc
+
+
+def _positive_bitrix_task_id(value: Any) -> int:
+    if value in (None, ""):
+        raise McpError(-32602, "Нужно указать точный номер задачи: bitrix_task_id.")
+    try:
+        task_id = int(value)
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "bitrix_task_id must be an integer.") from exc
+    if task_id <= 0:
+        raise McpError(-32602, "bitrix_task_id must be a positive integer.")
+    return task_id
+
+
+def _confirmed(args: dict[str, Any]) -> bool:
+    raw = args.get("confirm")
+    return raw is True or str(raw or "").strip().lower() in {"true", "1", "yes", "да"}
+
+
+def _indexed_task_for_action(task_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    t.bitrix_task_id,
+                    t.title,
+                    t.status,
+                    t.status_name,
+                    t.deadline_at,
+                    ru.bitrix_user_id AS responsible_bitrix_user_id,
+                    ru.full_name AS responsible_name
+                FROM bitrix_tasks t
+                LEFT JOIN users ru ON ru.id = t.responsible_id
+                WHERE t.bitrix_task_id = %s
+                LIMIT 1
+                """,
+                (task_id,),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _assert_expected_task_title(task: dict[str, Any] | None, expected_title: Any) -> None:
+    expected = str(expected_title or "").strip()
+    if not expected or not task:
+        return
+    actual = str(task.get("title") or "").strip()
+    if expected.lower() != actual.lower():
+        raise McpError(
+            -32602,
+            "expected_title не совпадает с найденной задачей. Действие остановлено, чтобы не изменить не ту задачу.",
+        )
+
+
+def _task_payload(task: dict[str, Any] | None, task_id: int) -> dict[str, Any]:
+    if not task:
+        return {"bitrix_task_id": task_id}
+    return {
+        "bitrix_task_id": task.get("bitrix_task_id"),
+        "title": task.get("title"),
+        "status": task.get("status"),
+        "status_name": task.get("status_name"),
+        "deadline_at": task.get("deadline_at").isoformat() if hasattr(task.get("deadline_at"), "isoformat") else task.get("deadline_at"),
+        "responsible_bitrix_user_id": task.get("responsible_bitrix_user_id"),
+        "responsible_name": task.get("responsible_name"),
+    }
 
 
 def _deadline_in_past(deadline: str) -> "datetime | None":
@@ -1770,18 +1848,9 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_delete_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
-    raw_task_id = args.get("bitrix_task_id")
-    if raw_task_id in (None, ""):
-        raise McpError(-32602, "Нужно указать точный номер задачи: bitrix_task_id.")
-    try:
-        task_id = int(raw_task_id)
-    except (TypeError, ValueError) as exc:
-        raise McpError(-32602, "bitrix_task_id must be an integer.") from exc
-    if task_id <= 0:
-        raise McpError(-32602, "bitrix_task_id must be a positive integer.")
+    task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
 
-    confirmed = args.get("confirm") is True
-    if not confirmed:
+    if not _confirmed(args):
         raise McpError(
             -32602,
             "Удаление задачи требует явного подтверждения. Сначала покажите пользователю точную задачу "
@@ -1789,56 +1858,99 @@ def tool_delete_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
             "повторите вызов с confirm=true.",
         )
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    t.bitrix_task_id,
-                    t.title,
-                    t.status,
-                    t.status_name,
-                    t.deadline_at,
-                    ru.bitrix_user_id AS responsible_bitrix_user_id,
-                    ru.full_name AS responsible_name
-                FROM bitrix_tasks t
-                LEFT JOIN users ru ON ru.id = t.responsible_id
-                WHERE t.bitrix_task_id = %s
-                LIMIT 1
-                """,
-                (task_id,),
-            )
-            row = cur.fetchone()
-    if not row:
+    task = _indexed_task_for_action(task_id)
+    if not task:
         raise McpError(
             -32602,
             f"Задача Bitrix {task_id} не найдена в локальном индексе. Сначала проверьте номер через search_tasks.",
         )
-    task = dict(row)
 
-    expected_title = str(args.get("expected_title") or "").strip()
-    actual_title = str(task.get("title") or "").strip()
-    if expected_title and expected_title.lower() != actual_title.lower():
-        raise McpError(
-            -32602,
-            "expected_title не совпадает с найденной задачей. Удаление остановлено, чтобы не удалить не ту задачу.",
-        )
+    _assert_expected_task_title(task, args.get("expected_title"))
 
     response = _bitrix_call_with_fallback("tasks.task.delete", {"taskId": task_id})
     return {
         "deleted": True,
-        "task": {
-            "bitrix_task_id": task.get("bitrix_task_id"),
-            "title": task.get("title"),
-            "status": task.get("status"),
-            "status_name": task.get("status_name"),
-            "deadline_at": task.get("deadline_at").isoformat() if hasattr(task.get("deadline_at"), "isoformat") else task.get("deadline_at"),
-            "responsible_bitrix_user_id": task.get("responsible_bitrix_user_id"),
-            "responsible_name": task.get("responsible_name"),
-        },
+        "task": _task_payload(task, task_id),
         "bitrix_response": response.get("result") if isinstance(response, dict) else response,
         "rule": "Deletion requires exact bitrix_task_id and confirm=true after the user has seen the exact task and explicitly confirmed deletion.",
     }
+
+
+def tool_add_bitrix_task_comment(args: dict[str, Any]) -> dict[str, Any]:
+    task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
+    text = str(args.get("comment_text") or args.get("message") or "").strip()
+    if not text:
+        raise McpError(-32602, "Нужно указать текст комментария: comment_text.")
+    if len(text) > 20000:
+        raise McpError(-32602, "comment_text is too long (max 20000 characters).")
+
+    task = _indexed_task_for_action(task_id)
+    _assert_expected_task_title(task, args.get("expected_title"))
+
+    attempts = (
+        ("task.commentitem.add", {"TASKID": task_id, "FIELDS": {"POST_MESSAGE": text}}, False),
+    )
+    last_error: McpError | None = None
+    for method, payload, prefer_api in attempts:
+        try:
+            response = _bitrix_call_with_fallback(method, payload, prefer_api=prefer_api, fallback=False)
+            return {
+                "comment_added": True,
+                "task": _task_payload(task, task_id),
+                "comment_text": text,
+                "method": method,
+                "bitrix_response": response.get("result") if isinstance(response, dict) else response,
+                "rule": "Comments require exact bitrix_task_id. Use search_tasks first when the user references a task ambiguously.",
+            }
+        except McpError as exc:
+            last_error = exc
+            continue
+    raise last_error or McpError(-32010, "Bitrix API call failed: could not add task comment.")
+
+
+def tool_reopen_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
+    task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
+    reason = str(args.get("reason") or args.get("comment_text") or "").strip()
+    if not reason:
+        raise McpError(-32602, "Нужно указать причину возобновления: reason.")
+    if not _confirmed(args):
+        raise McpError(
+            -32602,
+            "Возобновление задачи требует confirm=true. Сначала проверь задачу через search_tasks/get_task_comments, "
+            "объясни пользователю, почему результат неудовлетворительный, и получи подтверждение на возобновление.",
+        )
+
+    task = _indexed_task_for_action(task_id)
+    _assert_expected_task_title(task, args.get("expected_title"))
+
+    comment = "Результат требует доработки: " + reason
+    comment_result = tool_add_bitrix_task_comment({
+        "bitrix_task_id": task_id,
+        "comment_text": comment,
+        "expected_title": args.get("expected_title"),
+    })
+
+    attempts = (
+        ("task.item.renew", {"TASKID": task_id}, False),
+        ("tasks.task.renew", {"taskId": task_id}, False),
+    )
+    last_error: McpError | None = None
+    for method, payload, prefer_api in attempts:
+        try:
+            response = _bitrix_call_with_fallback(method, payload, prefer_api=prefer_api, fallback=False)
+            return {
+                "reopened": True,
+                "task": _task_payload(task, task_id),
+                "reason": reason,
+                "comment": comment_result,
+                "method": method,
+                "bitrix_response": response.get("result") if isinstance(response, dict) else response,
+                "rule": "Reopen requires exact bitrix_task_id, reason, and confirm=true after checking the result/comments.",
+            }
+        except McpError as exc:
+            last_error = exc
+            continue
+    raise last_error or McpError(-32010, "Bitrix API call failed: could not reopen task.")
 
 
 # --- Bitrix task comments -------------------------------------------------
@@ -4856,9 +4968,8 @@ def tool_get_bitrix_bot_chat(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_get_ai_capabilities(args: dict[str, Any]) -> dict[str, Any]:
-    """Return what the assistant can do for the CALLER's access tier (full/faq). The tier is
-    taken from the connector (_connector_id injected by handle_request), so the read-only FAQ
-    assistant never sees owner-only powers."""
+    """Return what the assistant can do for the caller's current connector/tool set.
+    The legacy full/faq key is still used only to select the stored note."""
     connector_id = args.get("_connector_id") or "full"
     tier = "faq" if connector_id == "faq" else "full"
     with connect() as conn:
@@ -4873,17 +4984,18 @@ def tool_get_ai_capabilities(args: dict[str, Any]) -> dict[str, Any]:
         "capabilities": row["content"] if row else "",
         "updated_at": row["updated_at"] if row else None,
         "note": (
-            f"Это твои возможности для текущего уровня доступа ({tier}). Отвечай пользователю "
+            f"Это твои возможности для текущего коннектора/набора инструментов ({tier}). Отвечай пользователю "
             "СТРОГО в рамках этого списка — не обещай того, чего тут нет. "
             + ("Если узнал/получил новую возможность — дополни список через update_ai_capabilities."
-               if can_edit else "Обновлять список на этом уровне доступа нельзя.")
+               if can_edit else "Обновлять список из этого коннектора нельзя.")
         ),
     }
 
 
 def tool_update_ai_capabilities(args: dict[str, Any]) -> dict[str, Any]:
-    """Self-update the capabilities note (FULL access only — not exposed to the FAQ connector).
-    mode 'append' (default) adds a line; 'replace' overwrites. tier 'full' (default) or 'faq'."""
+    """Self-update the capabilities note when this tool is enabled for the connector.
+    mode 'append' (default) adds a line; 'replace' overwrites. Stored note key:
+    legacy 'full' (default) or 'faq'."""
     content = str(args.get("content") or "").strip()
     if not content:
         raise McpError(-32602, "content is required")
@@ -5086,7 +5198,8 @@ TOOLS: dict[str, dict[str, Any]] = {
             "возвращается список кандидатов). Без обоих — вернёт всех, кто отсутствует в период (по умолчанию "
             "сегодня). Для проверки на конкретную дату задай date_from=date_to (например дедлайн задачи). "
             "Возвращает on_vacation и периоды отсутствия. ПРАВИЛО постановки задач: если исполнитель on_vacation "
-            "на дедлайн — задачу не ставить, сообщить владельцу. Только полный доступ (не для FAQ)."
+            "на дедлайн — задачу не ставить, сообщить владельцу. Использовать только если этот инструмент "
+            "включён в текущем наборе агента/коннектора."
         ),
         "inputSchema": {
             "type": "object",
@@ -5399,6 +5512,52 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_delete_bitrix_task,
     },
+    "add_bitrix_task_comment": {
+        "description": (
+            "Add one comment to an existing Bitrix task discussion. Use only with an exact bitrix_task_id; "
+            "if the user points to a task by title/person/text, first resolve it with search_tasks and avoid "
+            "ambiguous matches. This is the normal tool for ведение переписки внутри задачи."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Exact Bitrix task number."},
+                "comment_text": {"type": "string", "description": "Comment text to add to the task discussion."},
+                "expected_title": {
+                    "type": "string",
+                    "description": "Optional safety check: if the task is locally indexed, the title must match before posting.",
+                },
+            },
+            "required": ["bitrix_task_id", "comment_text"],
+            "additionalProperties": False,
+        },
+        "handler": tool_add_bitrix_task_comment,
+    },
+    "reopen_bitrix_task": {
+        "description": (
+            "Reopen/renew one completed Bitrix task and write a comment explaining why. Use after checking "
+            "search_tasks plus task result/comments and deciding the result is unsatisfactory. Requires exact "
+            "bitrix_task_id, reason, and confirm=true after explicit user confirmation or a standing review instruction."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Exact Bitrix task number to reopen."},
+                "reason": {"type": "string", "description": "Why the result is unsatisfactory / what must be fixed."},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true. Means reopening was explicitly approved or follows a standing task-review instruction.",
+                },
+                "expected_title": {
+                    "type": "string",
+                    "description": "Optional safety check: if the task is locally indexed, the title must match before reopening.",
+                },
+            },
+            "required": ["bitrix_task_id", "reason", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_reopen_bitrix_task,
+    },
     "list_chats": {
         "description": "List active non-excluded chats, optionally with message counts for a period.",
         "inputSchema": {
@@ -5462,18 +5621,18 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_get_bitrix_bot_chat,
     },
     "get_ai_capabilities": {
-        "description": "Return what YOU (this AI assistant) can do, scoped to the caller's access level. Call this whenever the user asks 'что ты умеешь', 'твои возможности', 'what can you do', or before promising an action — and answer strictly within the returned list (it differs for owners vs employees). Your exact tool set is in start_here.available_tools; this is the human-readable, owner-maintained description.",
+        "description": "Return what YOU (this AI assistant) can do for the current connector/tool set. Call this whenever the user asks 'что ты умеешь', 'твои возможности', 'what can you do', or before promising an action — and answer strictly within the returned list. Your exact tool set is in start_here.available_tools; this is the human-readable, owner-maintained description.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "handler": tool_get_ai_capabilities,
     },
     "update_ai_capabilities": {
-        "description": "Record/update the assistant's capabilities note (FULL access only). Use when you gain or are told about a new capability so future sessions know it. mode 'append' (default) adds, 'replace' overwrites; tier 'full' (default) or 'faq'. Keep it concise and truthful.",
+        "description": "Record/update the assistant's capabilities note when this tool is enabled. Use when you gain or are told about a new capability so future sessions know it. mode 'append' (default) adds, 'replace' overwrites; stored note key 'full' (default) or 'faq'. Keep it concise and truthful.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "description": "Text to append or the full replacement."},
                 "mode": {"type": "string", "enum": ["append", "replace"], "description": "Default 'append'."},
-                "tier": {"type": "string", "enum": ["full", "faq"], "description": "Which audience's list. Default 'full'."},
+                "tier": {"type": "string", "enum": ["full", "faq"], "description": "Legacy stored note key. Default 'full'."},
             },
             "required": ["content"],
             "additionalProperties": False,
@@ -6477,10 +6636,10 @@ FAQ_TOOL_NAMES: set[str] = {
 }
 
 
-# Tools that change the agent's own configuration or destroy data. Reserved for the admin
-# connector only (the full /mcp endpoint, tool_names=None). The ops connector (/mcp-ops) gets
-# everything else; FAQ gets the read-only subset. This is capability-based access control:
-# non-admin connectors never receive these tools, so they cannot be called regardless of prompt.
+# Tools that change global configuration or destroy data. Public scoped connectors (/mcp-ops,
+# /mcp-faq, core variants) never receive these. Per-agent connectors are different: the agent's
+# own whitelist is the capability boundary, so an owner/destructive tool can be exposed there
+# only when it is explicitly enabled for that particular agent.
 OWNER_ONLY_TOOL_NAMES: set[str] = {
     "upsert_ai_instruction",
     "update_ai_capabilities",
@@ -6514,7 +6673,10 @@ CORE_TOOL_NAMES: set[str] = {
     # tasks
     "search_tasks",
     "get_task_comments",
+    "add_bitrix_task_comment",
     "create_bitrix_task",
+    "reopen_bitrix_task",
+    "delete_bitrix_task",
     # zoom
     "list_zoom_calls",
     "get_zoom_call_transcript",
@@ -6839,6 +7001,7 @@ def list_tools(tool_names: set[str] | None = None, core: bool = False) -> list[d
 
 def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
                    core: bool = False,
+                   allow_owner_tools: bool = False,
                    instruction_scope: set[str] | list[str] | None = None) -> dict[str, Any] | None:
     request_id = request.get("id")
     method = request.get("method")
@@ -6876,10 +7039,10 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
                 if core:
                     raise McpError(-32601, f"Unknown or unavailable tool: {name}. Найди точное имя через find_tool.")
                 raise McpError(-32601, f"Unknown or unavailable tool: {name}")
-            # Defense-in-depth: admin-only tools are reachable ONLY via the full/admin connector
-            # (tool_names is None). Even if a future config mistakenly added them to a scoped
-            # connector's tool set, refuse here.
-            if name in OWNER_ONLY_TOOL_NAMES and tool_names is not None:
+            # Public scoped connectors (/mcp-ops, /mcp-faq, core variants) must never expose
+            # owner/destructive tools. Per-agent connectors pass allow_owner_tools=True: their
+            # security boundary is the exact agent whitelist from _agent_tool_names().
+            if name in OWNER_ONLY_TOOL_NAMES and tool_names is not None and not allow_owner_tools:
                 raise McpError(-32601, f"Unknown or unavailable tool: {name}")
             if core:
                 record_core_tool_call(name)
@@ -6899,7 +7062,7 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
                     )
             # Per-agent instruction scope: when this connector is bound to an agent,
             # start_here / get_ai_instructions return ONLY the agent's allowed paths
-            # (universal + connected). None = no scoping (admin/tier connectors).
+            # (universal + connected). None = no scoping (legacy public/admin connectors).
             if instruction_scope is not None and name in (
                 "start_here_always_read_ai_instructions", "get_ai_instructions"
             ):

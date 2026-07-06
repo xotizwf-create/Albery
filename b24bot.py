@@ -2550,7 +2550,9 @@ _B24_STATUS_GREETING = [
 _B24_TOOL_STATUS = {
     "search_tasks": "🔍 Ищу по задачам в Bitrix...",
     "get_task_comments": "💬 Читаю комментарии к задаче...",
+    "add_bitrix_task_comment": "💬 Пишу комментарий в задаче...",
     "create_bitrix_task": "🎯 Ставлю задачу в Bitrix...",
+    "reopen_bitrix_task": "🔁 Возобновляю задачу...",
     "delete_bitrix_task": "🗑 Удаляю задачу...",
     "search_company_knowledge": "📚 Ищу в базе знаний компании...",
     "list_company_files": "🗂 Просматриваю документы компании...",

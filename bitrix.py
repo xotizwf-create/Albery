@@ -567,8 +567,11 @@ def bitrix_method_call(
     method: str,
     payload: dict[str, Any] | None = None,
     prefer_api: bool = True,
+    fallback: bool = True,
 ) -> dict[str, Any]:
     client = bitrix_webhook_client()
+    if not fallback:
+        return client.call(method, payload or {}, use_api=prefer_api)
     return client.call_with_fallback(method, payload or {}, prefer_api=prefer_api)
 def bitrix_storage_id_for_reports(client: BitrixClient) -> int:
     env_value = to_int(os.getenv("BITRIX_REPORTS_STORAGE_ID", ""))
