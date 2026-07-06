@@ -2392,7 +2392,13 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
     # disabled on this box). A unique per-run suffix keeps one fresh session per turn — the
     # pre-0.17 behaviour — while the epoch name stays as a searchable prefix in state.db.
     run_session = f"{session}-r{uuid.uuid4().hex[:8]}"
-    cmd = ["hermes", "-z", prompt, "--continue", run_session, "-t", toolset, "--yolo"]
+    # Every agent gets the internet by default: hermes's built-in `web` toolset (search + page
+    # fetch) rides along with the agent's own MCP connector. `-t` REPLACES the toolset list, so
+    # without this agents are cut off from the web entirely. Terminal/file/exec stay OFF —
+    # the isolation model is unchanged.
+    extra_toolsets = os.getenv("B24_EXTRA_TOOLSETS", "web").strip().strip(",")
+    toolset_arg = f"{toolset},{extra_toolsets}" if extra_toolsets else toolset
+    cmd = ["hermes", "-z", prompt, "--continue", run_session, "-t", toolset_arg, "--yolo"]
     proc, run_fail = _hermes_run_guarded(cmd, timeout_s, dialog_id, tier, from_user_id, len(prompt),
                                          scope=_b24_scope(dialog_id, agent_slug))
     if run_fail == "cancelled":

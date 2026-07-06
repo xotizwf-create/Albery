@@ -366,7 +366,11 @@ def _run_automation(row: dict[str, Any], attempt: int = 1) -> None:
             raise RuntimeError("агент выключен")
         prompt = _automation_prompt(agent, row)
         from b24bot import _hermes_answer_is_error
-        cmd = ["hermes", "-z", prompt, "-t", f"agent-{agent['slug']}", "--yolo"]
+        # Same default as live b24bot turns: the built-in `web` toolset rides along so
+        # automations can reach the internet too (terminal/file/exec stay off).
+        extra = os.getenv("B24_EXTRA_TOOLSETS", "web").strip().strip(",")
+        toolsets = f"agent-{agent['slug']},{extra}" if extra else f"agent-{agent['slug']}"
+        cmd = ["hermes", "-z", prompt, "-t", toolsets, "--yolo"]
         proc, run_fail = _hermes_oneshot(cmd, _AUTOMATION_TIMEOUT_S, f"{row['id']}/{row['name']}")
         if run_fail == "timeout":
             raise RuntimeError(f"таймаут {_AUTOMATION_TIMEOUT_S} с")
