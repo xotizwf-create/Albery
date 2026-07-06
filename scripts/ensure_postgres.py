@@ -61,6 +61,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "040_agent_position.sql",
     # Idempotent: per-agent scheduled automations + seed of the legacy Hermes crons.
     "041_agent_automations.sql",
+    # Idempotent: agent_slug on bitrix_error_reports (per-agent monitoring feed).
+    "042_error_report_agent.sql",
 ]
 
 

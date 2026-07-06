@@ -2633,7 +2633,8 @@ def _b24_user_name(client_endpoint: str, access_token: str, user_id: Any) -> str
 
 
 def _b24_log_error_report(dialog_id: str, from_user_id: Any, reporter_name: str,
-                          report_text: str, delivered: bool, delivery_error: str | None) -> None:
+                          report_text: str, delivered: bool, delivery_error: str | None,
+                          agent_slug: str | None = None) -> None:
     try:
         with pg_connect() as conn:
             with conn.transaction():
@@ -2641,11 +2642,11 @@ def _b24_log_error_report(dialog_id: str, from_user_id: Any, reporter_name: str,
                     cur.execute(
                         """
                         INSERT INTO bitrix_error_reports
-                          (dialog_id, bitrix_user_id, reporter_name, report_text, delivered, delivery_error)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                          (dialog_id, bitrix_user_id, reporter_name, report_text, delivered, delivery_error, agent_slug)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         """,
                         (str(dialog_id), to_int(from_user_id), reporter_name or None,
-                         report_text, bool(delivered), delivery_error),
+                         report_text, bool(delivered), delivery_error, agent_slug),
                     )
     except Exception:  # noqa: BLE001
         logging.exception("b24 testbot: error-report log failed")
@@ -2676,7 +2677,14 @@ def _b24_handle_error_report(client_endpoint: str, access_token: str, bot_id: An
     name = (reporter_name or "").strip() or "Сотрудник"
     tg_text = f"⚠️ {name} отправил отчёт об ошибке, текст: {report_text}. Я уже иду разбираться дальше."
     ok, err = _albery_tg_notify(tg_text)
-    _b24_log_error_report(dialog_id, from_user_id, name, report_text, ok, err)
+    report_agent_slug = None  # NULL = the main bot, same convention as interactions
+    try:
+        from agent_center import agent_for_bot_id
+        report_agent = agent_for_bot_id(bot_id)
+        report_agent_slug = report_agent.get("slug") if report_agent else None
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 testbot: error-report agent resolve failed", exc_info=True)
+    _b24_log_error_report(dialog_id, from_user_id, name, report_text, ok, err, report_agent_slug)
     # Mirror to the Bitrix24 notifications chat AS THE BOT (best-effort; never blocks the TG path).
     # We are inside a live event, so pass its fresh token — no refresh needed here.
     b24_ok, b24_err = _albery_bitrix_notify(

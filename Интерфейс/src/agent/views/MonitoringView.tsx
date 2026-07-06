@@ -9,6 +9,7 @@ import {
   BookOpen,
   Crown,
   Package,
+  LayoutGrid,
 } from "lucide-react";
 import {
   LineChart,
@@ -31,9 +32,11 @@ const CARD_TONE: Record<string, string> = {
 
 const REFRESH_MS = 30000;
 
+const ALL_AGENTS_ID = "all";
+
 export function MonitoringView() {
   const [agents, setAgents] = useState<AgentConfig[]>([]);
-  const [activeAgentId, setActiveAgentId] = useState("");
+  const [activeAgentId, setActiveAgentId] = useState(ALL_AGENTS_ID);
   const [data, setData] = useState<MonitoringData | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [chartDays, setChartDays] = useState(1);
@@ -41,23 +44,25 @@ export function MonitoringView() {
 
   useEffect(() => {
     fetchAgents()
-      .then((loaded) => {
-        setAgents(loaded);
-        if (loaded.length > 0) setActiveAgentId(loaded[0].id);
-      })
+      .then(setAgents)
       .catch(() => {});
   }, []);
 
   const load = useCallback(() => {
     setRefreshing(true);
-    fetchMonitoring(chartDays)
+    fetchMonitoring(chartDays, activeAgentId)
       .then((d) => {
         setData(d);
         setError("");
       })
       .catch((e: Error) => setError(e.message))
       .finally(() => setRefreshing(false));
-  }, [chartDays]);
+  }, [chartDays, activeAgentId]);
+
+  // Switching the agent must never show the previous agent's numbers, even for a moment.
+  useEffect(() => {
+    setData(null);
+  }, [activeAgentId]);
 
   useEffect(() => {
     load();
@@ -65,7 +70,8 @@ export function MonitoringView() {
     return () => window.clearInterval(timer);
   }, [load]);
 
-  const activeAgent = agents.find((a) => a.id === activeAgentId) || agents[0];
+  const isAll = activeAgentId === ALL_AGENTS_ID;
+  const activeAgent = isAll ? undefined : agents.find((a) => a.id === activeAgentId);
   const online = !!data && !error;
 
   return (
@@ -79,6 +85,27 @@ export function MonitoringView() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-3 space-y-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+          <div
+            onClick={() => setActiveAgentId(ALL_AGENTS_ID)}
+            className={cn(
+              "p-4 rounded-2xl cursor-pointer transition-all group relative",
+              isAll ? "bg-gray-50" : "bg-transparent hover:bg-gray-50/50",
+            )}
+          >
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 shadow-sm bg-indigo-100 text-indigo-500">
+                <LayoutGrid className="w-5 h-5" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <h3 className="font-bold text-gray-900 text-[15px] truncate mb-0.5">
+                  Все агенты
+                </h3>
+                <p className="text-[12.5px] text-gray-500 font-medium truncate">
+                  сводка по всем ботам вместе
+                </p>
+              </div>
+            </div>
+          </div>
           {agents
             .filter((a) => a.isActive)
             .map((agent) => {
@@ -145,10 +172,12 @@ export function MonitoringView() {
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-bold text-gray-900 mb-1">
-              Мониторинг: {activeAgent?.name || "Основной агент"}
+              Мониторинг: {isAll ? "Все агенты" : activeAgent?.name || "…"}
             </h1>
             <p className="text-gray-500 text-sm">
-              Доступность агента, ошибки и скорость — живые данные, обновление каждые 30 сек
+              {isAll
+                ? "Сводные показатели всех агентов — живые данные, обновление каждые 30 сек"
+                : "Показатели только этого агента (ходы, скорость, ошибки) — живые данные, обновление каждые 30 сек"}
             </p>
           </div>
           <button
@@ -183,7 +212,7 @@ export function MonitoringView() {
                 ></span>
               </div>
               <span className="font-bold text-gray-900">
-                {online ? "Агент в строю" : "Нет данных"}
+                {online ? (isAll ? "Все агенты в строю" : "Агент в строю") : "Нет данных"}
               </span>
             </div>
             {data && (
@@ -349,6 +378,11 @@ export function MonitoringView() {
             <div className="flex items-center gap-2 mb-6">
               <Zap className="w-4 h-4 text-gray-400" />
               <h3 className="font-semibold text-gray-900">Здоровье систем</h3>
+              {!isAll && (
+                <span className="text-[10.5px] font-bold text-gray-400 bg-gray-50 px-2 py-0.5 rounded-md">
+                  общие для всех
+                </span>
+              )}
             </div>
             <div className="space-y-5 flex-1">
               {(data?.health || []).map((sys, i) => (

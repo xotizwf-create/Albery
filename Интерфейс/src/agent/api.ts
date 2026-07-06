@@ -380,9 +380,9 @@ export interface MonitoringData {
   problems: string[];
 }
 
-export async function fetchMonitoring(chartDays = 1): Promise<MonitoringData> {
+export async function fetchMonitoring(chartDays = 1, agent = "all"): Promise<MonitoringData> {
   return (await fetchJsonSafe(
-    `/api/agent-center/monitoring?chart_days=${chartDays}`,
+    `/api/agent-center/monitoring?chart_days=${chartDays}&agent=${encodeURIComponent(agent)}`,
     undefined,
     30000,
   )) as MonitoringData;

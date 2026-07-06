@@ -491,10 +491,26 @@ def _server_memory() -> tuple[float, float] | None:
         return None
 
 
-def monitoring_payload(chart_days: int = 1) -> dict[str, Any]:
+def _monitoring_agent_filter(agent: str | None) -> tuple[str, dict[str, Any]]:
+    """WHERE-suffix isolating one agent's rows in bitrix_bot_interactions /
+    bitrix_error_reports: 'main' → the universal agent (agent_slug IS NULL — same
+    convention both tables use), a slug → that subagent, ''/'all'/None → no filter."""
+    key = str(agent or "all").strip()
+    if key in ("", "all"):
+        return "", {}
+    if key == MAIN_AGENT_SLUG:
+        return " AND agent_slug IS NULL", {}
+    return " AND agent_slug = %(agent_slug)s", {"agent_slug": key}
+
+
+def monitoring_payload(chart_days: int = 1, agent: str = "all") -> dict[str, Any]:
     """Live monitoring snapshot; shared by the SPA endpoint, the agent's
-    get_agent_monitoring MCP tool and the half-hourly health watchdog."""
+    get_agent_monitoring MCP tool and the half-hourly health watchdog.
+    `agent` scopes turn stats, the speed chart and the events feed to one bot
+    ('all' = every agent together); system health is infrastructure shared by
+    all agents and stays global in every view."""
     chart_days = min(max(int(chart_days or 1), 1), 90)
+    flt, fparams = _monitoring_agent_filter(agent)
     now_msk = msk_now()
     today_start = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
     yday_start = today_start - timedelta(days=1)
@@ -516,31 +532,37 @@ def monitoring_payload(chart_days: int = 1) -> dict[str, Any]:
                 " COUNT(DISTINCT dialog_id) FILTER (WHERE created_at >= %(week_ago)s) AS dialogs_7d,"
                 " MAX(created_at) AS last_turn_at,"
                 " MAX(created_at) FILTER (WHERE status = 'ok') AS last_ok_at"
-                " FROM bitrix_bot_interactions",
+                " FROM bitrix_bot_interactions WHERE TRUE" + flt,
                 {"today": today_start, "yday": yday_start, "yday_same": yday_same_time,
-                 "day_ago": day_ago, "week_ago": week_ago},
+                 "day_ago": day_ago, "week_ago": week_ago, **fparams},
             )
             st = dict(cur.fetchone() or {})
             cur.execute(
                 "SELECT created_at, latency_ms, status FROM bitrix_bot_interactions"
-                " WHERE created_at >= %s ORDER BY created_at",
-                (chart_since,),
+                " WHERE created_at >= %(since)s" + flt + " ORDER BY created_at",
+                {"since": chart_since, **fparams},
             )
             turn_rows = cur.fetchall()
             cur.execute(
                 "SELECT created_at, dialog_id, bitrix_user_id, error, latency_ms, status"
                 " FROM bitrix_bot_interactions"
-                " WHERE created_at >= %s AND (status <> 'ok' OR latency_ms > 300000)"
-                " ORDER BY id DESC LIMIT 12",
-                (week_ago,),
+                " WHERE created_at >= %(since)s AND (status <> 'ok' OR latency_ms > 300000)"
+                + flt + " ORDER BY id DESC LIMIT 12",
+                {"since": week_ago, **fparams},
             )
             notable_rows = cur.fetchall()
             cur.execute(
                 "SELECT created_at, reporter_name, report_text FROM bitrix_error_reports"
-                " WHERE created_at >= %s ORDER BY id DESC LIMIT 8",
-                (week_ago,),
+                " WHERE created_at >= %(since)s" + flt + " ORDER BY id DESC LIMIT 8",
+                {"since": week_ago, **fparams},
             )
             report_rows = cur.fetchall()
+            # Health is infrastructure (shared brain), so its freshness signal must stay
+            # global even when cards/chart are scoped to one agent with few or no turns.
+            global_last_ok = st.get("last_ok_at")
+            if flt:
+                cur.execute("SELECT MAX(created_at) FILTER (WHERE status = 'ok') AS m FROM bitrix_bot_interactions")
+                global_last_ok = (cur.fetchone() or {}).get("m")
             zoom_last_at = drive_last_at = None
             try:
                 cur.execute("SELECT MAX(synced_at) AS m FROM zoom_calls")
@@ -596,7 +618,7 @@ def monitoring_payload(chart_days: int = 1) -> dict[str, Any]:
         health.append({"label": f"MCP-инструменты ({len(TOOLS)})", "status": "зарегистрированы", "type": "ok"})
     except Exception:  # noqa: BLE001
         health.append({"label": "MCP-инструменты", "status": "модуль не загрузился", "type": "warn"})
-    last_ok = st.get("last_ok_at")
+    last_ok = global_last_ok
     ok_fresh = bool(last_ok and (now_msk - last_ok.astimezone(MSK_TZ)) < timedelta(hours=24))
     health.append({
         "label": "Мозг агента (Hermes)",
@@ -651,8 +673,9 @@ def monitoring_payload(chart_days: int = 1) -> dict[str, Any]:
     for r in report_rows:
         text = f"«Сообщить об ошибке» от {r['reporter_name'] or 'сотрудника'}: " + re.sub(r"\s+", " ", r["report_text"]).strip()[:140]
         stamped.append((r["created_at"], {"type": "report", "text": text}))
-    for c in _git_info()["log"]:
-        stamped.append((c["at"], {"type": "deploy", "text": f"Деплой: {c['subject']} ({c['sha']})"}))
+    if not flt:  # deploys are system-wide — they belong to the "all agents" feed only
+        for c in _git_info()["log"]:
+            stamped.append((c["at"], {"type": "deploy", "text": f"Деплой: {c['subject']} ({c['sha']})"}))
     stamped.sort(key=lambda pair: pair[0], reverse=True)
     events = [
         {"time": _event_time_label(at), **payload}
@@ -690,8 +713,9 @@ def agent_center_monitoring():
         chart_days = int(request.args.get("chart_days") or 1)
     except (TypeError, ValueError):
         chart_days = 1
+    agent = str(request.args.get("agent") or "all").strip() or "all"
     try:
-        return jsonify(monitoring_payload(chart_days))
+        return jsonify(monitoring_payload(chart_days, agent))
     except Exception:  # noqa: BLE001
         logging.exception("agent_center monitoring failed")
         return jsonify({"error": "Не удалось загрузить мониторинг."}), 500
