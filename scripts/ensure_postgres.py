@@ -63,6 +63,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "041_agent_automations.sql",
     # Idempotent: agent_slug on bitrix_error_reports (per-agent monitoring feed).
     "042_error_report_agent.sql",
+    # Idempotent: durable in-flight turn registry (restart/crash recovery net).
+    "043_inflight_turns.sql",
 ]
 
 

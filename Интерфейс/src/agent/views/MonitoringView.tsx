@@ -348,7 +348,9 @@ export function MonitoringView() {
                     connectNulls
                     dot={(props: any) => {
                       const { cx, cy, payload, index } = props;
-                      if (payload.error || payload.speed > 120) {
+                      // Red marks ONLY real errors — a slow-but-successful turn is not a problem,
+                      // and flagging the largest value just floods the chart with false alarms.
+                      if (payload.error) {
                         return (
                           <circle
                             key={`dot-${index}`}

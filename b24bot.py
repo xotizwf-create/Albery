@@ -21,6 +21,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+import uuid
 
 from datetime import datetime
 from datetime import timezone
@@ -949,24 +950,116 @@ def _b24_bootstrap_all_commands(client_endpoint: str, access_token: str, main_bo
     threading.Thread(target=_do, daemon=True).start()
 
 
+def _b24_inflight_register(bot_id: Any, dialog_id: str, agent_slug: str | None, from_user_id: Any,
+                           message_id: Any, status_message_id: Any, user_preview: str) -> str | None:
+    """Record that a brain turn is starting. Returns the row id (or None on failure — the turn
+    still runs; this is only a safety net). Cleared by _b24_inflight_clear when the turn finishes.
+    A row that survives = a turn killed mid-flight (restart/OOM/crash), recovered at next boot."""
+    turn_id = str(uuid.uuid4())
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO bitrix_inflight_turns"
+                        " (id, bot_id, dialog_id, agent_slug, from_user_id, message_id, status_message_id, user_preview)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (turn_id, str(bot_id or ""), str(dialog_id), agent_slug, str(from_user_id or ""),
+                         str(message_id or ""), str(status_message_id or ""), (user_preview or "")[:200]),
+                    )
+        return turn_id
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 testbot: inflight register failed", exc_info=True)
+        return None
+
+
+def _b24_inflight_clear(turn_id: str | None) -> None:
+    """Turn finished (ok or handled error) — drop its in-flight row so boot recovery ignores it."""
+    if not turn_id:
+        return
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM bitrix_inflight_turns WHERE id = %s", (turn_id,))
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 testbot: inflight clear failed", exc_info=True)
+
+
+def _b24_recover_inflight_turns(endpoint: str = "", token: str = "") -> int:
+    """At boot, every row left in bitrix_inflight_turns belongs to a turn that was killed
+    mid-flight (deploy restart, OOM, crash) — its worker thread died with the process, so the
+    user got no answer and a stuck 'typing…'. For each, delete the stale progress message and
+    tell that user (as the exact bot they wrote to) to resend, then remove the row. This is the
+    hard guarantee that a killed turn NEVER looks like an eternal hang. Best-effort, never raises."""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id::text AS id, bot_id, dialog_id, status_message_id"
+                    " FROM bitrix_inflight_turns ORDER BY started_at"
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 testbot: inflight recovery read failed", exc_info=True)
+        return 0
+    if not rows:
+        return 0
+    if not (endpoint and token):
+        try:
+            endpoint, token = _b24_app_access_token()
+        except Exception:  # noqa: BLE001
+            endpoint, token = "", ""
+    for r in rows:
+        dlg, bot, smid = r["dialog_id"], r["bot_id"], r["status_message_id"]
+        if endpoint and token and smid:
+            try:
+                _b24_app_call(endpoint, token, "imbot.message.delete",
+                              {"BOT_ID": bot, "MESSAGE_ID": smid, "COMPLETE": "Y"})
+            except Exception:  # noqa: BLE001
+                logging.debug("b24 testbot: inflight recovery status-delete failed", exc_info=True)
+        try:
+            _albery_bitrix_notify(
+                "🙏 Извините — я перезапустился и не успел ответить на ваше прошлое сообщение. "
+                "Пожалуйста, отправьте его ещё раз, и я сразу отвечу.",
+                dialog_id=dlg, client_endpoint=endpoint, access_token=token, bot_id=bot)
+        except Exception:  # noqa: BLE001
+            logging.warning("b24 testbot: inflight recovery notify failed dlg=%s", dlg, exc_info=True)
+    try:
+        ids = [r["id"] for r in rows]
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM bitrix_inflight_turns WHERE id::text = ANY(%s)", (ids,))
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 testbot: inflight recovery cleanup failed", exc_info=True)
+    logging.info("b24 testbot: inflight recovery notified %d interrupted turn(s)", len(rows))
+    return len(rows)
+
+
 def _b24_startup_register_commands() -> None:
     """On process start, register keyboard commands for ALL bots without waiting for an event, so
     buttons are live immediately after a deploy/restart (not only after the first message). Uses the
-    stored app refresh_token to mint a token off-event; best-effort and idempotent (per-bot flags)."""
+    stored app refresh_token to mint a token off-event; best-effort and idempotent (per-bot flags).
+    Also runs the in-flight turn recovery net so any turn cut off by the restart is answered."""
     def _do() -> None:
         time.sleep(15)  # let the app + DB pool settle after startup
         try:
             endpoint, token = _b24_app_access_token()
         except Exception:  # noqa: BLE001
             logging.debug("b24 testbot: startup command registration — token not ready", exc_info=True)
-            return
+            endpoint, token = "", ""
         if endpoint and token:
             _b24_bootstrap_all_commands(endpoint, token, _b24_load_state().get("bot_id"))
+        try:
+            _b24_recover_inflight_turns(endpoint, token)
+        except Exception:  # noqa: BLE001
+            logging.warning("b24 testbot: inflight recovery failed", exc_info=True)
 
     threading.Thread(target=_do, daemon=True).start()
 
 
-# Kick off proactive command registration once, right after import (app startup).
+# Kick off proactive command registration + interrupted-turn recovery once, right after import.
 _b24_startup_register_commands()
 
 
@@ -2089,6 +2182,26 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                 "ставить/закрывать задачи, отправлять сообщения, что-либо менять в системах. "
                 "Отвечай по-русски." + access_rule + fmt + "]")
     parts = [head]
+    # Self-orientation, same for every agent: how to see what it can do and act fast + correctly.
+    # Keeps agents from either faking a capability they lack or refusing one they have. The model
+    # natively sees its enabled tools (the connector serves tools/list) — this tells it to trust
+    # that set as the source of truth and gives a tight operating procedure.
+    parts.append(
+        "КАК ТЫ РАБОТАЕШЬ (ориентируйся по этому, отвечай быстро и точно): "
+        "1) ТВОИ ВОЗМОЖНОСТИ — это РОВНО те инструменты, что доступны тебе в этом ходе (система "
+        "показывает их как доступные функции), плюс перечисленные ниже подключённые навыки и "
+        "инструкции. Это и есть точный список того, что ты умеешь. "
+        "2) ПОРЯДОК: пойми, что нужно человеку → выбери подходящий инструмент из своего набора → "
+        "выполни за МИНИМУМ шагов. Не делай пробных вызовов без обязательных полей и не "
+        "переспрашивай лишний раз: недостающее (исполнитель, срок, критерий и т.п.) собери ОДНИМ "
+        "уточняющим сообщением, затем действуй. "
+        "3) ЕСЛИ НУЖНОГО ИНСТРУМЕНТА ИЛИ НАВЫКА У ТЕБЯ НЕТ — не выдумывай и не имитируй работу: "
+        "коротко и честно скажи, что именно вне твоих возможностей, и направь — профильные вопросы "
+        "не по твоей роли ведёт Основной агент Албери, вопросы доступа/настроек решает Александр "
+        "Никитенко. "
+        "4) Прежде чем сказать «не могу/не помню» — проверь свои инструменты и историю диалога: "
+        "часто нужное уже под рукой."
+    )
     if agent is not None:
         # Skills the owner connected to THIS subagent (manifest). Injecting only the
         # selected ones is what enforces the selection at the prompt level. (Instructions
@@ -2489,6 +2602,10 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
                                    status_message_id, text)
 
     threading.Thread(target=_typing_keepalive, daemon=True).start()
+    # Durable in-flight marker: if this process is killed mid-turn (deploy restart, OOM, crash),
+    # the row survives and boot recovery tells the user to resend — never an eternal 'typing…'.
+    inflight_id = _b24_inflight_register(bot_id, dialog_id, (agent or {}).get("slug"), from_user_id,
+                                         message_id, status_message_id, user_text)
     try:
         answer = hermes_brain_answer(user_text, dialog_id, tier, from_user_id, agent=agent)
     except Exception as exc:  # noqa: BLE001
@@ -2499,6 +2616,7 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
                   "Попробуй повторить запрос через пару минут.")
     finally:
         stop_typing.set()
+        _b24_inflight_clear(inflight_id)
     latency_ms = int((time.monotonic() - started) * 1000)
     answer, escalation_request = _b24_extract_escalation(answer)
     answer, _deliver_name, _deliver_fmt = _b24_extract_deliver(answer)
