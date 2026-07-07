@@ -2008,6 +2008,10 @@ def bitrix_task_event_webhook(secret: str):
 
     payload = flatten_request_payload()
     event_name = normalize_bitrix_event_name(first_non_empty(payload.get("event"), payload.get("EVENT")))
+    if os.getenv("B24_TASK_EVENT_DEBUG", "0") == "1":
+        import logging as _lg
+        _lg.getLogger(__name__).info("task-event debug: name=%r keys=%s",
+                                     event_name, list(payload.keys())[:25])
     # In-task agent: an employee named an agent in a task comment. Fires on EVERY comment company-
     # wide, so ACK immediately and do ALL work (fetch/detect/access/run) in a background thread —
     # the guards + kill-switch live inside _b24_handle_task_comment_event.
