@@ -100,6 +100,31 @@ def extract_bitrix_event_task_id(payload: dict[str, Any]) -> int | None:
         if task_id is not None:
             return task_id
     return None
+def _event_field_after(payload: dict[str, Any], field: str) -> int | None:
+    """Read data[FIELDS_AFTER][<field>] from a flattened Bitrix event payload (dotted or bracketed)."""
+    val = pick(payload, f"data.FIELDS_AFTER.{field}", f"data.FIELDS_BEFORE.{field}")
+    got = to_int(val)
+    if got is not None:
+        return got
+    suffix = f"[fields_after][{field.lower()}]"
+    for key, value in payload.items():
+        if str(key).lower().endswith(suffix):
+            got = to_int(value[0] if isinstance(value, list) and value else value)
+            if got is not None:
+                return got
+    return None
+
+
+def extract_bitrix_comment_event_task_id(payload: dict[str, Any]) -> int | None:
+    """For OnTaskCommentAdd, the TASK id is FIELDS_AFTER.TASK_ID (FIELDS_AFTER.ID is the COMMENT id)."""
+    return _event_field_after(payload, "TASK_ID")
+
+
+def _extract_bitrix_event_comment_id(payload: dict[str, Any]) -> int | None:
+    """The comment id for a task-comment event = data[FIELDS_AFTER][ID]."""
+    return _event_field_after(payload, "ID")
+
+
 def enqueue_bitrix_task_event(event_name: str, task_id: int, payload: dict[str, Any]) -> str:
     ensure_bitrix_task_event_queue_schema()
     with pg_connect() as conn:
@@ -1983,6 +2008,26 @@ def bitrix_task_event_webhook(secret: str):
 
     payload = flatten_request_payload()
     event_name = normalize_bitrix_event_name(first_non_empty(payload.get("event"), payload.get("EVENT")))
+    # In-task agent: an employee named an agent in a task comment. Fires on EVERY comment company-
+    # wide, so ACK immediately and do ALL work (fetch/detect/access/run) in a background thread —
+    # the guards + kill-switch live inside _b24_handle_task_comment_event.
+    if (event_name or "").lower() in {"ontaskcommentadd", "ontaskcommentupdate"}:
+        c_task_id = extract_bitrix_comment_event_task_id(payload)
+        comment_id = _extract_bitrix_event_comment_id(payload)
+        if not c_task_id or not comment_id:
+            return jsonify({"ok": True, "event": event_name, "ignored": True, "reason": "no_ids"}), 200
+
+        def _run_task_comment() -> None:
+            try:
+                import b24bot
+                b24bot._b24_handle_task_comment_event(int(c_task_id), int(comment_id))
+            except Exception:  # noqa: BLE001
+                import logging as _lg
+                _lg.getLogger(__name__).warning("task-comment handler failed", exc_info=True)
+
+        import threading as _threading
+        _threading.Thread(target=_run_task_comment, daemon=True).start()
+        return jsonify({"ok": True, "event": event_name, "accepted": True}), 200
     if event_name not in {"OnTaskAdd", "OnTaskUpdate", "OnTaskDelete"}:
         return jsonify({"ok": True, "event": event_name, "ignored": True, "reason": "unsupported_event"})
     task_id = extract_bitrix_event_task_id(payload)

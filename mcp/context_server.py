@@ -1876,36 +1876,297 @@ def tool_delete_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# --- Attachment forwarding: re-upload a stored inbound file to Bitrix and reference it -------
+# The attachment store (module `attachments`) keeps the raw bytes of every file an employee sent
+# the bot. To put such a file on a task/comment/result it must be a Bitrix disk object; we upload
+# it once to the webhook user's storage and cache the disk id so repeated attaches are cheap.
+
+def _bitrix_upload_bytes(file_name: str, data: bytes) -> int:
+    import base64
+    me = _bitrix_call_with_fallback("user.current", {}, prefer_api=False)
+    uid = (me.get("result") or {}).get("ID") if isinstance(me, dict) else None
+    storages = []
+    if uid is not None:
+        st = _bitrix_call_with_fallback(
+            "disk.storage.getlist", {"filter": {"ENTITY_TYPE": "user", "ENTITY_ID": uid}}, prefer_api=False)
+        storages = st.get("result") or [] if isinstance(st, dict) else []
+    if not storages:
+        st = _bitrix_call_with_fallback("disk.storage.getlist", {}, prefer_api=False)
+        rows = st.get("result") or [] if isinstance(st, dict) else []
+        storages = [r for r in rows if str(r.get("ENTITY_TYPE") or "").lower() == "user"] or rows
+    sid = storages[0].get("ID") if storages else None
+    if not sid:
+        raise McpError(-32010, "Не удалось найти хранилище Диска для загрузки файла в Bitrix.")
+    content = base64.b64encode(data).decode()
+    up = _bitrix_call_with_fallback(
+        "disk.storage.uploadfile",
+        {"id": sid, "data": {"NAME": file_name or "file"},
+         "fileContent": [file_name or "file", content], "generateUniqueName": True},
+        prefer_api=False,
+    )
+    fid = (up.get("result") or {}).get("ID") if isinstance(up, dict) else None
+    if not fid:
+        raise McpError(-32010, "Bitrix отклонил загрузку файла на Диск.")
+    return int(fid)
+
+
+def _attachment_disk_id(token: str) -> int:
+    """Resolve a stored attachment token to a Bitrix disk file id (uploading on first use)."""
+    import attachments as _att
+    row = _att.get_attachment(token)
+    if not row:
+        raise McpError(-32602, f"Вложение {token} не найдено. Проверь attachment_id (его выдаёт "
+                               "система при получении файла от пользователя).")
+    if row.get("bitrix_disk_id"):
+        return int(row["bitrix_disk_id"])
+    blob = _att.attachment_bytes(token)
+    if not blob:
+        raise McpError(-32010, f"Файл вложения {token} больше недоступен для пересылки "
+                               "(истёк срок хранения). Попроси пользователя прислать файл заново.")
+    data, name = blob
+    fid = _bitrix_upload_bytes(row.get("file_name") or name, data)
+    _att.set_disk_id(token, fid)
+    return fid
+
+
+def _resolve_attachment_disk_refs(attachment_ids: Any) -> tuple[list[str], list[dict[str, Any]]]:
+    """Turn a list of attachment tokens into ['n<fid>', ...] disk refs + a human summary."""
+    refs: list[str] = []
+    summary: list[dict[str, Any]] = []
+    if not isinstance(attachment_ids, (list, tuple)):
+        return refs, summary
+    import attachments as _att
+    for tok in attachment_ids:
+        tok = str(tok or "").strip()
+        if not tok:
+            continue
+        fid = _attachment_disk_id(tok)
+        refs.append(f"n{fid}")
+        row = _att.get_attachment(tok) or {}
+        summary.append({"attachment_id": tok, "file_name": row.get("file_name"), "disk_id": fid})
+    return refs, summary
+
+
+def _attach_disk_refs_to_task(task_id: int, refs: list[str]) -> None:
+    """Append disk refs to a task's UF_TASK_WEBDAV_FILES without dropping existing files."""
+    if not refs:
+        return
+    existing: list[str] = []
+    try:
+        cur = _bitrix_call_with_fallback(
+            "tasks.task.get", {"taskId": task_id, "select": ["ID", "UF_TASK_WEBDAV_FILES"]}, prefer_api=False)
+        task = (cur.get("result") or {}).get("task") or {} if isinstance(cur, dict) else {}
+        raw = task.get("ufTaskWebdavFiles") or task.get("UF_TASK_WEBDAV_FILES") or []
+        for item in raw if isinstance(raw, list) else []:
+            s = str(item)
+            existing.append(s if s.startswith("n") else f"n{s}")
+    except Exception:  # noqa: BLE001
+        existing = []
+    merged = list(dict.fromkeys(existing + refs))
+    _bitrix_call_with_fallback(
+        "tasks.task.update", {"taskId": task_id, "fields": {"UF_TASK_WEBDAV_FILES": merged}}, prefer_api=False)
+
+
+def _resolve_task_actor(args: dict[str, Any], id_key: str, name_key: str) -> dict[str, Any] | None:
+    """Resolve the person an action is performed 'on behalf of' (comment author / task closer).
+    Returns the org-structure user dict or None when nothing was passed (Bitrix keeps the webhook user)."""
+    if args.get(id_key) in (None, "") and not args.get(name_key):
+        return None
+    return _resolve_active_bitrix_user(args.get(id_key), args.get(name_key))
+
+
 def tool_add_bitrix_task_comment(args: dict[str, Any]) -> dict[str, Any]:
     task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
     text = str(args.get("comment_text") or args.get("message") or "").strip()
-    if not text:
-        raise McpError(-32602, "Нужно указать текст комментария: comment_text.")
+    as_result = args.get("as_result") is True or str(args.get("as_result") or "").strip().lower() in {"true", "1", "yes", "да"}
+    attachment_ids = args.get("attachment_ids")
+    has_files = isinstance(attachment_ids, (list, tuple)) and any(str(a or "").strip() for a in attachment_ids)
+    if not text and not has_files:
+        raise McpError(-32602, "Нужно указать текст комментария (comment_text) или вложения (attachment_ids).")
     if len(text) > 20000:
         raise McpError(-32602, "comment_text is too long (max 20000 characters).")
 
     task = _indexed_task_for_action(task_id)
     _assert_expected_task_title(task, args.get("expected_title"))
 
-    attempts = (
-        ("task.commentitem.add", {"TASKID": task_id, "FIELDS": {"POST_MESSAGE": text}}, False),
-    )
-    last_error: McpError | None = None
-    for method, payload, prefer_api in attempts:
+    # On behalf of the requesting employee (verified: task.commentitem.add honours AUTHOR_ID on
+    # this portal — the comment shows as authored by that person, not the technical webhook user).
+    author = _resolve_task_actor(args, "author_bitrix_user_id", "author_name")
+
+    post_text = text
+    if as_result:
+        # Native "Результат задачи" (tasks.task.result.addFromComment) does NOT work through the
+        # REST webhook on this portal (comments are IM-chat based, the legacy forum id is rejected
+        # as "Comment not found"). So a result is delivered as an unmistakably-labelled comment
+        # PLUS the file(s) attached to the task — functionally the result, visible to everyone.
+        post_text = ("✅ РЕЗУЛЬТАТ ЗАДАЧИ:\n" + text) if text else "✅ РЕЗУЛЬТАТ ЗАДАЧИ (см. вложение)"
+
+    # Re-upload any forwarded attachments and reference them on the comment.
+    refs, attach_summary = _resolve_attachment_disk_refs(attachment_ids)
+
+    fields: dict[str, Any] = {"POST_MESSAGE": post_text or "(вложение)"}
+    if author:
+        fields["AUTHOR_ID"] = int(author["bitrix_user_id"])
+    if refs:
+        fields["UF_FORUM_MESSAGE_DOC"] = refs
+    response = _bitrix_call_with_fallback(
+        "task.commentitem.add", {"TASKID": task_id, "FIELDS": fields}, prefer_api=False, fallback=False)
+    comment_id = response.get("result") if isinstance(response, dict) else None
+
+    # For a result, also pin the file(s) to the task itself so they show in the task's files.
+    if as_result and refs:
         try:
-            response = _bitrix_call_with_fallback(method, payload, prefer_api=prefer_api, fallback=False)
+            _attach_disk_refs_to_task(task_id, refs)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("as_result task attach failed task=%s: %s", task_id, repr(exc)[:120])
+
+    return {
+        "comment_added": True,
+        "task": _task_payload(task, task_id),
+        "comment_text": post_text,
+        "comment_id": comment_id,
+        "as_result": as_result,
+        "author": ({"bitrix_user_id": author.get("bitrix_user_id"), "full_name": author.get("full_name")}
+                   if author else None),
+        "attachments": attach_summary,
+        "method": "task.commentitem.add",
+        "rule": ("Comments require exact bitrix_task_id. By default author = the current chat user "
+                 "(author_bitrix_user_id). as_result posts a labelled result comment + pins files to the task "
+                 "(the native Bitrix result badge is not settable via REST on this portal)."),
+    }
+
+
+def tool_complete_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
+    """Complete (close) a Bitrix task, optionally on behalf of the current chat user and with a
+    result comment + attached files. The status change is attributed to the person via
+    STATUS_CHANGED_BY (verified settable); CLOSED_BY is computed by Bitrix and stays the webhook user."""
+    task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
+    task = _indexed_task_for_action(task_id)
+    _assert_expected_task_title(task, args.get("expected_title"))
+
+    actor = _resolve_task_actor(args, "on_behalf_bitrix_user_id", "on_behalf_name")
+    result_text = str(args.get("result_text") or args.get("comment_text") or "").strip()
+    attachment_ids = args.get("attachment_ids")
+    has_files = isinstance(attachment_ids, (list, tuple)) and any(str(a or "").strip() for a in attachment_ids)
+
+    # If a result was provided, record it FIRST (as a labelled result comment + files pinned to the
+    # task), so a task with "результат обязателен" has its result visible before completion.
+    result_info = None
+    if result_text or has_files:
+        result_info = tool_add_bitrix_task_comment({
+            "bitrix_task_id": task_id,
+            "comment_text": result_text,
+            "as_result": True,
+            "attachment_ids": attachment_ids,
+            "author_bitrix_user_id": args.get("on_behalf_bitrix_user_id"),
+            "author_name": args.get("on_behalf_name"),
+            "expected_title": args.get("expected_title"),
+        })
+
+    fields: dict[str, Any] = {"STATUS": 5}
+    if actor:
+        fields["STATUS_CHANGED_BY"] = int(actor["bitrix_user_id"])
+    # tasks.task.complete is the canonical close; it also bypasses the "result required" gate for
+    # the webhook admin user. We use update(STATUS=5) so we can attribute STATUS_CHANGED_BY.
+    last_error: McpError | None = None
+    for method, payload in (
+        ("tasks.task.update", {"taskId": task_id, "fields": fields}),
+        ("tasks.task.complete", {"taskId": task_id}),
+    ):
+        try:
+            response = _bitrix_call_with_fallback(method, payload, prefer_api=False, fallback=False)
             return {
-                "comment_added": True,
+                "completed": True,
                 "task": _task_payload(task, task_id),
-                "comment_text": text,
+                "on_behalf": ({"bitrix_user_id": actor.get("bitrix_user_id"), "full_name": actor.get("full_name")}
+                              if actor else None),
+                "result": result_info,
                 "method": method,
-                "bitrix_response": response.get("result") if isinstance(response, dict) else response,
-                "rule": "Comments require exact bitrix_task_id. Use search_tasks first when the user references a task ambiguously.",
+                "rule": ("Completion closes the task. By default the closer = the current chat user "
+                         "(on_behalf_bitrix_user_id → STATUS_CHANGED_BY). Attach the result via result_text/"
+                         "attachment_ids so a result-required task keeps its proof."),
             }
         except McpError as exc:
             last_error = exc
             continue
-    raise last_error or McpError(-32010, "Bitrix API call failed: could not add task comment.")
+    raise last_error or McpError(-32010, "Bitrix API call failed: could not complete task.")
+
+
+def tool_attach_files_to_task(args: dict[str, Any]) -> dict[str, Any]:
+    """Attach one or more stored inbound attachments (screenshots/documents the user sent the bot)
+    to a Bitrix task — either to the task's files, or as a comment/result carrying the files."""
+    task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
+    attachment_ids = args.get("attachment_ids")
+    if not (isinstance(attachment_ids, (list, tuple)) and any(str(a or "").strip() for a in attachment_ids)):
+        raise McpError(-32602, "Нужно указать attachment_ids — токены вложений от пользователя.")
+    task = _indexed_task_for_action(task_id)
+    _assert_expected_task_title(task, args.get("expected_title"))
+
+    as_result = args.get("as_result") is True or str(args.get("as_result") or "").strip().lower() in {"true", "1", "yes", "да"}
+    as_comment = args.get("as_comment") is True or str(args.get("as_comment") or "").strip().lower() in {"true", "1", "yes", "да"}
+    note = str(args.get("note") or "").strip()
+
+    if as_result or as_comment or note:
+        # Deliver as a (result) comment carrying the files.
+        return tool_add_bitrix_task_comment({
+            "bitrix_task_id": task_id,
+            "comment_text": note or ("Файлы приложены" if not as_result else "Результат приложен"),
+            "as_result": as_result,
+            "attachment_ids": attachment_ids,
+            "author_bitrix_user_id": args.get("author_bitrix_user_id"),
+            "author_name": args.get("author_name"),
+            "expected_title": args.get("expected_title"),
+        })
+
+    # Default: pin the files to the task's files section.
+    refs, summary = _resolve_attachment_disk_refs(attachment_ids)
+    _attach_disk_refs_to_task(task_id, refs)
+    return {
+        "attached": True,
+        "task": _task_payload(task, task_id),
+        "attachments": summary,
+        "target": "task_files",
+        "rule": "Files are pinned to the task. Pass as_result=true (labelled result comment + files) "
+                "or as_comment=true (files in a discussion comment) to deliver differently.",
+    }
+
+
+def tool_get_attachment_text(args: dict[str, Any]) -> dict[str, Any]:
+    """Return the FULL extracted text of a stored attachment (chunked). This is how an agent reads a
+    long document (e.g. a contract) end to end — nothing is truncated; the prompt only ever holds a
+    preview, the complete text is served here on demand."""
+    import attachments as _att
+    token = str(args.get("attachment_id") or args.get("token") or "").strip()
+    if not token:
+        raise McpError(-32602, "Нужно указать attachment_id (токен вложения из промпта).")
+    row = _att.get_attachment(token)
+    if not row:
+        raise McpError(-32602, f"Вложение {token} не найдено. Проверь attachment_id.")
+    full = row.get("extracted_text") or ""
+    total = len(full)
+    try:
+        offset = max(0, int(args.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        max_chars = int(args.get("max_chars") or 40000)
+    except (TypeError, ValueError):
+        max_chars = 40000
+    max_chars = max(1000, min(max_chars, 120000))
+    chunk = full[offset:offset + max_chars]
+    next_offset = offset + len(chunk)
+    return {
+        "attachment_id": token,
+        "file_name": row.get("file_name"),
+        "kind": row.get("kind"),
+        "total_chars": total,
+        "offset": offset,
+        "returned_chars": len(chunk),
+        "has_more": next_offset < total,
+        "next_offset": next_offset if next_offset < total else None,
+        "text": chunk,
+        "rule": "Read the whole document by calling again with offset=next_offset until has_more is false.",
+    }
 
 
 def tool_reopen_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
@@ -1923,10 +2184,27 @@ def tool_reopen_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     task = _indexed_task_for_action(task_id)
     _assert_expected_task_title(task, args.get("expected_title"))
 
+    # Optional new deadline when reopening ("возобнови с новым сроком до …").
+    new_deadline = None
+    if args.get("new_deadline"):
+        new_deadline = _normalize_bitrix_deadline(args.get("new_deadline"))
+        confirm_past = args.get("confirm_past_deadline")
+        confirm_past = confirm_past is True or str(confirm_past or "").strip().lower() in {"true", "1", "yes", "да"}
+        if not confirm_past and _deadline_in_past(new_deadline) is not None:
+            raise McpError(
+                -32602,
+                "Новый срок " + str(args.get("new_deadline")) + " уже в прошлом. Уточни у пользователя новый "
+                "срок в будущем, либо, если нужно оставить как есть, повтори с confirm_past_deadline=true.",
+            )
+
     comment = "Результат требует доработки: " + reason
+    if new_deadline:
+        comment += f"\nНовый срок: {new_deadline}."
     comment_result = tool_add_bitrix_task_comment({
         "bitrix_task_id": task_id,
         "comment_text": comment,
+        "author_bitrix_user_id": args.get("on_behalf_bitrix_user_id"),
+        "author_name": args.get("on_behalf_name"),
         "expected_title": args.get("expected_title"),
     })
 
@@ -1935,22 +2213,37 @@ def tool_reopen_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
         ("tasks.task.renew", {"taskId": task_id}, False),
     )
     last_error: McpError | None = None
+    reopened_response = None
+    reopened_method = None
     for method, payload, prefer_api in attempts:
         try:
-            response = _bitrix_call_with_fallback(method, payload, prefer_api=prefer_api, fallback=False)
-            return {
-                "reopened": True,
-                "task": _task_payload(task, task_id),
-                "reason": reason,
-                "comment": comment_result,
-                "method": method,
-                "bitrix_response": response.get("result") if isinstance(response, dict) else response,
-                "rule": "Reopen requires exact bitrix_task_id, reason, and confirm=true after checking the result/comments.",
-            }
+            reopened_response = _bitrix_call_with_fallback(method, payload, prefer_api=prefer_api, fallback=False)
+            reopened_method = method
+            break
         except McpError as exc:
             last_error = exc
             continue
-    raise last_error or McpError(-32010, "Bitrix API call failed: could not reopen task.")
+    if reopened_method is None:
+        raise last_error or McpError(-32010, "Bitrix API call failed: could not reopen task.")
+
+    if new_deadline:
+        try:
+            _bitrix_call_with_fallback(
+                "tasks.task.update", {"taskId": task_id, "fields": {"DEADLINE": new_deadline}}, prefer_api=False)
+        except McpError as exc:
+            logging.warning("reopen: new deadline set failed task=%s: %s", task_id, str(exc)[:120])
+
+    return {
+        "reopened": True,
+        "task": _task_payload(task, task_id),
+        "reason": reason,
+        "new_deadline": new_deadline,
+        "comment": comment_result,
+        "method": reopened_method,
+        "bitrix_response": reopened_response.get("result") if isinstance(reopened_response, dict) else reopened_response,
+        "rule": "Reopen requires exact bitrix_task_id, reason, and confirm=true after checking the result/comments. "
+                "Pass new_deadline to renew with a new due date.",
+    }
 
 
 # --- Bitrix task comments -------------------------------------------------
@@ -5516,28 +5809,106 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Add one comment to an existing Bitrix task discussion. Use only with an exact bitrix_task_id; "
             "if the user points to a task by title/person/text, first resolve it with search_tasks and avoid "
-            "ambiguous matches. This is the normal tool for ведение переписки внутри задачи."
+            "ambiguous matches. This is the normal tool for ведение переписки внутри задачи. BY DEFAULT the "
+            "comment is posted ОТ ЛИЦА the current chat user — pass author_bitrix_user_id = the id of the person "
+            "who asked (the prompt gives it); the comment then shows as authored by them, not the bot. You can "
+            "attach the user's screenshots/documents by passing their attachment_ids. Set as_result=true to mark "
+            "the comment as the task RESULT (posts a «✅ РЕЗУЛЬТАТ» comment and pins the attached file(s) to the "
+            "task — this is how you «прикрепить скрин как результат»)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "bitrix_task_id": {"type": "integer", "description": "Exact Bitrix task number."},
                 "comment_text": {"type": "string", "description": "Comment text to add to the task discussion."},
+                "author_bitrix_user_id": {"type": "integer", "description": "Bitrix user id of the comment AUTHOR. Default: the CURRENT chat user (whoever asked to add the comment) — pass their id so the comment is «от лица» them. Use another id only if explicitly asked to comment on someone else's behalf."},
+                "author_name": {"type": "string", "description": "Full name of the comment author from the org structure, used when the id is unknown. Same default rule as author_bitrix_user_id."},
+                "attachment_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional list of attachment tokens (att_…) the user sent the bot, to attach to this comment. The tokens are given in the prompt when the user sends a file."},
+                "as_result": {"type": "boolean", "description": "If true, post this comment as the task RESULT (labelled «✅ РЕЗУЛЬТАТ» + attached files pinned to the task). Use for «отметить комментарий/скрин как результат»."},
                 "expected_title": {
                     "type": "string",
                     "description": "Optional safety check: if the task is locally indexed, the title must match before posting.",
                 },
             },
-            "required": ["bitrix_task_id", "comment_text"],
+            "required": ["bitrix_task_id"],
             "additionalProperties": False,
         },
         "handler": tool_add_bitrix_task_comment,
+    },
+    "complete_bitrix_task": {
+        "description": (
+            "Complete (close/«завершить») one Bitrix task. BY DEFAULT the closure is attributed to the current "
+            "chat user (on_behalf_bitrix_user_id → the status change is recorded as done by that person). If the "
+            "task requires a result, pass result_text and/or attachment_ids — a «✅ РЕЗУЛЬТАТ» comment is posted "
+            "and the file(s) pinned to the task before closing, so the proof is attached. Resolve the exact task "
+            "with search_tasks first; confirm with the user before closing someone else's task."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Exact Bitrix task number to complete."},
+                "on_behalf_bitrix_user_id": {"type": "integer", "description": "Bitrix user id the completion is on behalf of. Default: the CURRENT chat user (whoever asked to close it)."},
+                "on_behalf_name": {"type": "string", "description": "Full name of the person the completion is on behalf of, used when the id is unknown."},
+                "result_text": {"type": "string", "description": "Optional result text; posted as a «✅ РЕЗУЛЬТАТ» comment before closing (needed for result-required tasks)."},
+                "attachment_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional attachment tokens (att_…) to attach as the result before closing."},
+                "expected_title": {"type": "string", "description": "Optional safety check on the task title."},
+            },
+            "required": ["bitrix_task_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_complete_bitrix_task,
+    },
+    "attach_files_to_task": {
+        "description": (
+            "Attach one or more files the user sent the bot (screenshots, documents — referenced by their "
+            "attachment tokens att_…) to a Bitrix task. Default: pin them to the task's files. Pass as_result=true "
+            "to deliver them as the task RESULT (labelled comment + pinned files), or as_comment=true with a note "
+            "to attach them inside a discussion comment. This is how the agent forwards the user's attachments "
+            "into a task."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Exact Bitrix task number."},
+                "attachment_ids": {"type": "array", "items": {"type": "string"}, "description": "Attachment tokens (att_…) from the prompt to attach."},
+                "as_result": {"type": "boolean", "description": "Deliver as the task RESULT (labelled comment + pinned files)."},
+                "as_comment": {"type": "boolean", "description": "Deliver inside a discussion comment (with note)."},
+                "note": {"type": "string", "description": "Optional text to accompany the files when as_comment/as_result."},
+                "author_bitrix_user_id": {"type": "integer", "description": "When posting a comment/result: the author (default current chat user)."},
+                "author_name": {"type": "string", "description": "Author full name when the id is unknown."},
+                "expected_title": {"type": "string", "description": "Optional safety check on the task title."},
+            },
+            "required": ["bitrix_task_id", "attachment_ids"],
+            "additionalProperties": False,
+        },
+        "handler": tool_attach_files_to_task,
+    },
+    "get_attachment_text": {
+        "description": (
+            "Read the FULL text of a file the user sent the bot (contract, document, screenshot OCR), by its "
+            "attachment token att_… The prompt shows a preview of long documents; call this to read the WHOLE "
+            "thing — nothing is truncated. For a long contract, read it in chunks: call with offset=0, then "
+            "offset=next_offset until has_more is false. Use before drafting/analysing a document the user attached."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "string", "description": "Attachment token att_… from the prompt."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Character offset to start from (default 0)."},
+                "max_chars": {"type": "integer", "description": "Max characters to return (default 40000, cap 120000)."},
+            },
+            "required": ["attachment_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_get_attachment_text,
     },
     "reopen_bitrix_task": {
         "description": (
             "Reopen/renew one completed Bitrix task and write a comment explaining why. Use after checking "
             "search_tasks plus task result/comments and deciding the result is unsatisfactory. Requires exact "
-            "bitrix_task_id, reason, and confirm=true after explicit user confirmation or a standing review instruction."
+            "bitrix_task_id, reason, and confirm=true after explicit user confirmation or a standing review instruction. "
+            "Pass new_deadline to «возобновить с новым сроком». The explanatory comment is posted on behalf of the "
+            "current chat user (on_behalf_bitrix_user_id)."
         ),
         "inputSchema": {
             "type": "object",
@@ -5548,6 +5919,10 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "boolean",
                     "description": "Must be true. Means reopening was explicitly approved or follows a standing task-review instruction.",
                 },
+                "new_deadline": {"type": "string", "description": "Optional new deadline (YYYY-MM-DD, DD.MM.YYYY, or with time) to set when reopening — «возобновить с новым сроком»."},
+                "confirm_past_deadline": {"type": "boolean", "description": "Set true only if the user explicitly wants a new_deadline that is already in the past."},
+                "on_behalf_bitrix_user_id": {"type": "integer", "description": "Bitrix user id the reopen comment is authored by (default current chat user)."},
+                "on_behalf_name": {"type": "string", "description": "Full name of the person the reopen is on behalf of, when the id is unknown."},
                 "expected_title": {
                     "type": "string",
                     "description": "Optional safety check: if the task is locally indexed, the title must match before reopening.",
@@ -6633,6 +7008,8 @@ FAQ_TOOL_NAMES: set[str] = {
     "get_zoom_call_transcript",
     "search_zoom_transcripts",
     "get_ai_capabilities",
+    # Read-only: an agent reads the full text of a file the user sent it (token-gated, unguessable).
+    "get_attachment_text",
 }
 
 
@@ -6675,8 +7052,11 @@ CORE_TOOL_NAMES: set[str] = {
     "get_task_comments",
     "add_bitrix_task_comment",
     "create_bitrix_task",
+    "complete_bitrix_task",
     "reopen_bitrix_task",
     "delete_bitrix_task",
+    "attach_files_to_task",
+    "get_attachment_text",
     # zoom
     "list_zoom_calls",
     "get_zoom_call_transcript",

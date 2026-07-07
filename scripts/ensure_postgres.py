@@ -65,6 +65,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "042_error_report_agent.sql",
     # Idempotent: durable in-flight turn registry (restart/crash recovery net).
     "043_inflight_turns.sql",
+    # Idempotent: attachment store (full-text + re-upload) + task-comment mention dedupe.
+    "044_task_tools_attachments.sql",
 ]
 
 

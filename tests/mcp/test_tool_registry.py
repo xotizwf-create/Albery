@@ -56,6 +56,38 @@ def test_task_mutation_tools_registered(ctx):
     assert {"add_bitrix_task_comment", "reopen_bitrix_task"} <= set(ctx.CORE_TOOL_NAMES)
 
 
+def test_task_management_and_attachment_tools_registered(ctx):
+    # Full task lifecycle + attachment handling for the team rollout (2026-07-07).
+    required = {
+        "complete_bitrix_task",
+        "attach_files_to_task",
+        "get_attachment_text",
+    }
+    missing = required - set(ctx.TOOLS)
+    assert not missing, f"missing task/attachment tools: {sorted(missing)}"
+    # All reachable via the chat bot's core toolset.
+    assert required <= set(ctx.CORE_TOOL_NAMES)
+    # Reading an attachment is read-only -> safe on the FAQ tier (token-gated, unguessable).
+    assert "get_attachment_text" in ctx.FAQ_TOOL_NAMES
+    # Mutating tools must NOT be on the read-only FAQ tier.
+    assert "complete_bitrix_task" not in ctx.FAQ_TOOL_NAMES
+    assert "attach_files_to_task" not in ctx.FAQ_TOOL_NAMES
+
+
+def test_add_comment_supports_author_and_result(ctx):
+    schema = ctx.TOOLS["add_bitrix_task_comment"]["inputSchema"]["properties"]
+    for field in ("author_bitrix_user_id", "author_name", "attachment_ids", "as_result"):
+        assert field in schema, f"add_bitrix_task_comment missing {field}"
+    # comment_text is no longer required (a comment may carry only attachments).
+    assert "comment_text" not in ctx.TOOLS["add_bitrix_task_comment"]["inputSchema"]["required"]
+
+
+def test_reopen_supports_new_deadline(ctx):
+    schema = ctx.TOOLS["reopen_bitrix_task"]["inputSchema"]["properties"]
+    assert "new_deadline" in schema
+    assert "on_behalf_bitrix_user_id" in schema
+
+
 def test_ops_core_does_not_list_owner_only_delete(ctx):
     resp = ctx.handle_request(
         {"jsonrpc": "2.0", "id": 20, "method": "tools/list"},

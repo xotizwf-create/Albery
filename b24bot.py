@@ -1848,17 +1848,27 @@ def _b24_app_download_url(endpoint: str, access_token: str, fid) -> str:
     return ""
 
 
-def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = ""):
+def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "",
+                        agent_slug: str | None = None, dialog_id: str = "", from_user_id: Any = None):
     """Parse images + documents + reply-context straight from the flattened imbot event payload.
     Files come inline as data[PARAMS][FILES][<id>][field]; the inline _esd urls are session-bound, so
     we resolve a REST DOWNLOAD_URL via disk.file.get (needs the webhook 'disk' scope). Images -> Groq
-    vision OCR; documents (pdf/docx/xlsx/md/txt/csv) -> text extraction. Reply text is inline in
-    data[PARAMS][REPLY_MESSAGE][MESSAGE]. Returns (image_texts, reply_text, doc_blocks)."""
+    vision OCR; documents (pdf/docx/xlsx/md/txt/csv) -> text extraction.
+
+    Every successfully downloaded file is ALSO persisted to the attachment store (full text + raw
+    bytes), so (a) the agent can read the WHOLE document later via get_attachment_text — no 12k
+    truncation — and (b) it can re-attach the original file to a task/comment/result. The store
+    token is returned per attachment for prompt injection.
+
+    Reply text is inline in data[PARAMS][REPLY_MESSAGE][MESSAGE].
+    Returns (image_texts, reply_text, doc_blocks, attachments) where doc_blocks items are
+    (name, content, token|None) and attachments is a list of {token,name,kind,char_len}."""
     image_texts: list = []
     reply_text = ""
     doc_blocks: list = []
+    attachments: list = []
     if not isinstance(payload, dict):
-        return image_texts, reply_text, doc_blocks
+        return image_texts, reply_text, doc_blocks, attachments
     for key in ("data[PARAMS][REPLY_MESSAGE][MESSAGE]", "data[params][REPLY_MESSAGE][MESSAGE]"):
         v = payload.get(key)
         if isinstance(v, list):
@@ -1902,29 +1912,59 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
                 doc_blocks.append((name or "документ",
                                    "(\u26a0\ufe0f не удалось скачать файл с сервера Bitrix. Честно скажи "
                                    "пользователю, что не смог открыть этот файл, и попроси прислать его "
-                                   "ещё раз или в виде PDF. НЕ придумывай и не угадывай содержимое.)"))
+                                   "ещё раз или в виде PDF. НЕ придумывай и не угадывай содержимое.)", None))
             else:
                 image_texts.append("(\u26a0\ufe0f не удалось получить изображение. Скажи пользователю, что "
                                    "не смог его открыть, и попроси прислать ещё раз. Не придумывай, что на нём.)")
             continue
+        # Persist the file (raw bytes + extracted text) so the agent can read the WHOLE document
+        # later and re-attach the original to a task. Best-effort — never blocks the reply.
+        def _store(kind: str, full_text: str) -> str | None:
+            try:
+                import attachments as _att
+                return _att.store_attachment(
+                    data=data, file_name=name or ("image" if kind == "image" else "file"),
+                    kind=kind, extracted_text=full_text or "", agent_slug=agent_slug,
+                    dialog_id=str(dialog_id or ""), bitrix_user_id=from_user_id,
+                    mime=str(f.get("type") or "") or None,
+                )
+            except Exception:  # noqa: BLE001
+                logging.warning("b24 extras: attachment store failed name=%s", name)
+                return None
         if is_image:
             txt = _b24_vision_ocr(data, name or "image.png")
+            token = _store("image", txt)
             if txt:
                 image_texts.append(txt)
+            if token:
+                attachments.append({"token": token, "name": name or "image",
+                                    "kind": "image", "char_len": len(txt or "")})
         else:
             txt = _b24_extract_document(data, name or "file")
+            token = _store("document", txt if (txt and txt.strip()) else "")
             if txt and txt.strip():
-                doc_blocks.append((name or "документ", txt.strip()))
+                doc_blocks.append((name or "документ", txt.strip(), token))
             else:
                 doc_blocks.append((name or "документ",
                                    "(не удалось извлечь текст: возможно скан без текстового слоя, "
-                                   "пустой файл или устаревший формат .doc — попросите прислать PDF/DOCX)"))
+                                   "пустой файл или устаревший формат .doc — попросите прислать PDF/DOCX)", token))
+            if token:
+                attachments.append({"token": token, "name": name or "документ",
+                                    "kind": "document", "char_len": len((txt or "").strip())})
     if os.getenv("B24_DEBUG_PAYLOAD", "0") == "1":
-        logging.info("b24 extras: images=%d docs=%d reply=%s", len(image_texts), len(doc_blocks), bool(reply_text))
-    return image_texts, reply_text, doc_blocks
+        logging.info("b24 extras: images=%d docs=%d reply=%s attach=%d",
+                     len(image_texts), len(doc_blocks), bool(reply_text), len(attachments))
+    return image_texts, reply_text, doc_blocks, attachments
 
 
-def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_blocks: list = None) -> str:
+# How many characters of an extracted document to inline into the prompt. Beyond this the agent
+# reads the rest with get_attachment_text(token, offset). Generous by default so short/medium
+# docs (most contracts fit) are fully inline; the tool guarantees the complete text regardless.
+_B24_DOC_INLINE_CHARS = int(os.getenv("B24_DOC_INLINE_CHARS", "30000") or "30000")
+
+
+def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_blocks: list = None,
+                           attachments: list = None) -> str:
     """Fold reply-context, image OCR and extracted document text into the message for the brain."""
     text = (text or "").strip()
     blocks: list = []
@@ -1938,11 +1978,32 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_bl
         label = (f"[Изображение №{i}. Распознанное содержимое:]" if multi
                  else "[Пользователь прислал изображение. Распознанное содержимое:]")
         blocks.append(label + "\n" + ocr[:2500])
-    for name, content in (doc_blocks or []):
-        body = content[:12000]
-        if len(content) > 12000:
-            body += "\n…[документ обрезан, показано начало]"
-        blocks.append(f"[Пользователь прислал документ «{name}». Извлечённое содержимое:]\n" + body)
+    for entry in (doc_blocks or []):
+        # doc_blocks entries are (name, content, token|None). Tolerate the legacy 2-tuple too.
+        name, content = entry[0], entry[1]
+        token = entry[2] if len(entry) > 2 else None
+        cap = _B24_DOC_INLINE_CHARS
+        body = content[:cap]
+        head = f"[Пользователь прислал документ «{name}»"
+        if token:
+            head += f", attachment_id={token}"
+        head += ". Извлечённое содержимое"
+        if len(content) > cap:
+            body += ("\n…[показано начало документа. ПОЛНЫЙ текст читай инструментом "
+                     f"get_attachment_text(attachment_id='{token}', offset=…) — ничего не обрезано, "
+                     "документ доступен целиком.]")
+            head += " (начало; полный текст — get_attachment_text)"
+        blocks.append(head + ":]\n" + body)
+    # Tell the agent it can re-send/attach these exact files (screenshots, documents) to a task,
+    # comment, or result — by passing their attachment_id to the task tools.
+    forwardable = [a for a in (attachments or []) if a.get("token")]
+    if forwardable:
+        listing = "; ".join(f"{a['token']} — «{a['name']}» ({a['kind']})" for a in forwardable)
+        blocks.append(
+            "[ВЛОЖЕНИЯ от пользователя, которые ты можешь переслать/приложить как есть "
+            "(передай attachment_id в create_bitrix_task, add_bitrix_task_comment или "
+            "attach_files_to_task; полный текст документа — get_attachment_text): " + listing + "]"
+        )
     if not text and (image_texts or doc_blocks):
         blocks.append("(Текста в сообщении не было — отвечай по содержимому вложения.)")
     return "\n\n".join(blocks) if blocks else text
@@ -2397,7 +2458,25 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
             "result_criteria, creator_bitrix_user_id. НЕ делай пробных вызовов create_bitrix_task без "
             "обязательных полей (получишь отказ и потеряешь целый ход). НЕ вызывай get_employee_absences "
             "и прочие инструменты при обычной постановке — только если пользователь сам упомянул отпуск/"
-            "занятость. Не переспрашивай и не перепроверяй лишний раз — действуй сразу, одним вызовом."
+            "занятость. Не переспрашивай и не перепроверяй лишний раз — действуй сразу, одним вызовом. "
+            "ВЕДЕНИЕ ЗАДАЧ ОТ ЛИЦА СОБЕСЕДНИКА (важно): по умолчанию всё, что ты делаешь в задаче, — "
+            "ОТ ИМЕНИ текущего собеседника (id=" + str(from_user_id) + "). "
+            "• Комментарий: add_bitrix_task_comment(bitrix_task_id, comment_text, "
+            "author_bitrix_user_id=" + str(from_user_id) + ") — комментарий покажется от его имени. "
+            "Другого автора ставь ТОЛЬКО если он явно просит прокомментировать от другого человека. "
+            "• Завершить задачу: complete_bitrix_task(bitrix_task_id, on_behalf_bitrix_user_id=" + str(from_user_id) + "); "
+            "если у задачи обязателен результат — передай result_text и/или attachment_ids (файл-подтверждение). "
+            "• Отметить результат / приложить скрин как результат: add_bitrix_task_comment(..., as_result=true, "
+            "attachment_ids=[...]) или attach_files_to_task(bitrix_task_id, attachment_ids=[...], as_result=true). "
+            "• Возобновить задачу: reopen_bitrix_task(bitrix_task_id, reason, confirm=true); с новым сроком — "
+            "добавь new_deadline. "
+            "ВЛОЖЕНИЯ (важно): файлы, которые прислал пользователь, приходят тебе с токенами attachment_id "
+            "(att_…) в блоке [ВЛОЖЕНИЯ …]. Чтобы переслать/приложить их — передавай эти attachment_id в "
+            "create_bitrix_task, add_bitrix_task_comment, complete_bitrix_task или attach_files_to_task "
+            "(и скрин, и документ). Чтобы прочитать ДЛИННЫЙ документ целиком (договор и т.п.) — вызывай "
+            "get_attachment_text(attachment_id=..., offset=...) по частям, пока has_more не станет false; "
+            "в промпте показан только предпросмотр, полный текст бери инструментом, ничего не обрезано. "
+            "Правку документа отдавай обратно через export_document (свой HTML → docx)."
         )
     if seed:
         parts.append("Сводка более ранней части разговора: " + seed)
@@ -2926,6 +3005,243 @@ def _b24_handle_error_report(client_endpoint: str, access_token: str, bot_id: An
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, confirm, keyboard=_b24_keyboard())
 
 
+# ================= Agent works INSIDE a task: reply in the comment when called =================
+# When an employee writes a task comment naming an agent ("Албери, ..."), and that employee has
+# access to the agent, the agent replies IN the task comment with the FULL task context and can act
+# on the task (comment / close / result / deadline) through its tools. Delivered via the existing
+# OnTaskCommentAdd outgoing webhook (one manual step: add that event to the tasks webhook).
+#
+# Guards make company-wide comment traffic safe — the webhook fires on EVERY comment on EVERY task:
+#   * dedupe by comment id (bitrix_task_comment_seen) — each comment handled at most once;
+#   * skip comments authored by the technical webhook user or any bot (no self-trigger loops);
+#   * act ONLY when a configured agent trigger phrase is present AND the author has access;
+#   * kill-switch B24_TASK_MENTION_ENABLED=0.
+
+def _b24_task_mention_enabled() -> bool:
+    return os.getenv("B24_TASK_MENTION_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _b24_task_bot_author_ids() -> set[int]:
+    """User ids whose comments must NEVER trigger the agent (its own replies go out as these)."""
+    ids = {to_int(x) for x in os.getenv("B24_TASK_BOT_AUTHOR_IDS", "22").split(",")}
+    return {i for i in ids if i is not None}
+
+
+def _b24_task_targets() -> list[dict[str, Any]]:
+    """Agents that can be summoned in a task comment, each with its trigger phrases.
+    main (the universal agent) + every active subagent with a Bitrix bot. Triggers derive from the
+    agent name; B24_TASK_MENTION_TRIGGERS_<SLUG> / _MAIN can add extras (comma-separated)."""
+    targets: list[dict[str, Any]] = []
+    main_bot = to_int(_b24_load_state().get("bot_id"))
+    main_trigs = {"албери", "агент албери", "@албери", "albery"}
+    main_trigs |= {t.strip().lower() for t in os.getenv("B24_TASK_MENTION_TRIGGERS_MAIN", "").split(",") if t.strip()}
+    targets.append({"slug": None, "bot_id": main_bot, "name": "Агент Албери",
+                    "triggers": main_trigs, "is_main": True})
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT slug, name, bitrix_bot_id FROM agents "
+                            "WHERE is_active AND bitrix_bot_id IS NOT NULL")
+                for row in cur.fetchall():
+                    name = str(row["name"] or "").strip()
+                    trigs = {name.lower()} if name else set()
+                    for w in re.findall(r"[а-яёa-z]{4,}", name.lower()):
+                        if w not in {"агент"}:
+                            trigs.add(w)
+                    env_key = "B24_TASK_MENTION_TRIGGERS_" + str(row["slug"] or "").upper().replace("-", "_")
+                    trigs |= {t.strip().lower() for t in os.getenv(env_key, "").split(",") if t.strip()}
+                    targets.append({"slug": row["slug"], "bot_id": to_int(row["bitrix_bot_id"]),
+                                    "name": name, "triggers": {t for t in trigs if t}, "is_main": False})
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 task-mention: target list failed", exc_info=True)
+    return targets
+
+
+def _b24_task_pick_agent(text: str) -> dict[str, Any] | None:
+    """Return the summoned agent target whose trigger phrase appears in the comment, longest first
+    (so «агент-юрист» wins over the generic «албери»). None if no agent is named."""
+    low = " " + re.sub(r"\s+", " ", (text or "").lower()) + " "
+    best = None
+    best_len = 0
+    for tgt in _b24_task_targets():
+        for trig in tgt["triggers"]:
+            if not trig:
+                continue
+            # word-ish boundary: trigger surrounded by non-letters (handles «Албери,» / «@албери»)
+            if re.search(r"(?<![а-яёa-z])" + re.escape(trig) + r"(?![а-яёa-z])", low):
+                if len(trig) > best_len:
+                    best, best_len = tgt, len(trig)
+    return best
+
+
+def _b24_task_comment_claim(comment_id: int, task_id: int, agent_slug: str | None, author_id: Any) -> bool:
+    """Atomically mark a comment as seen. Returns True only on FIRST sight (safe to process)."""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bitrix_task_comment_seen (comment_id, task_id, agent_slug, author_id) "
+                    "VALUES (%s,%s,%s,%s) ON CONFLICT (comment_id) DO NOTHING RETURNING comment_id",
+                    (int(comment_id), int(task_id), agent_slug, to_int(author_id)))
+                return cur.fetchone() is not None
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 task-mention: claim failed comment=%s", comment_id, exc_info=True)
+        return False
+
+
+def _b24_fetch_task_comment(task_id: int, comment_id: int) -> dict[str, Any] | None:
+    """Read a task comment (author id + text) via the task's IM chat (the modern task card stores
+    comments as chat messages — the legacy forum getlist is empty on this portal)."""
+    wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
+
+    def _wh(method, payload):
+        if not wh:
+            return {}
+        try:
+            r = requests.post(f"{wh}/{method}.json", json=payload, timeout=20)
+            return r.json() if r.content else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    task = _wh("tasks.task.get", {"taskId": task_id, "select": ["ID", "CHAT_ID", "TITLE"]})
+    t = (task.get("result") or {}).get("task") or {} if isinstance(task, dict) else {}
+    chat_id = t.get("chatId") or t.get("CHAT_ID")
+    if not chat_id:
+        return None
+    msgs = _wh("im.dialog.messages.get", {"DIALOG_ID": f"chat{chat_id}", "LIMIT": 30})
+    for m in ((msgs.get("result") or {}).get("messages") or []) if isinstance(msgs, dict) else []:
+        if str(m.get("id")) == str(comment_id):
+            return {"author_id": to_int(m.get("author_id")), "text": str(m.get("text") or ""),
+                    "chat_id": chat_id, "title": t.get("title") or t.get("TITLE")}
+    return None
+
+
+def _b24_task_context_text(task_id: int) -> str:
+    """A compact task context block for the agent: title, status, responsible, deadline, last
+    human comments — so the agent «обязательно видит контекст задачи, в которой его зовут»."""
+    wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
+    lines = [f"Задача №{task_id}."]
+    try:
+        r = requests.post(f"{wh}/tasks.task.get.json",
+                          json={"taskId": task_id,
+                                "select": ["ID", "TITLE", "DESCRIPTION", "STATUS", "DEADLINE",
+                                           "RESPONSIBLE_ID", "CREATED_BY"]}, timeout=20)
+        t = (r.json().get("result") or {}).get("task") or {}
+        if t.get("title"):
+            lines.append("Название: " + str(t.get("title")))
+        if t.get("description"):
+            lines.append("Описание: " + str(t.get("description"))[:1500])
+        if t.get("deadline"):
+            lines.append("Срок: " + str(t.get("deadline")))
+        rid = to_int(t.get("responsibleId") or t.get("RESPONSIBLE_ID"))
+        if rid:
+            who = _b24_portal_user_directory().get(rid, {})
+            lines.append("Ответственный: " + (who.get("name") or str(rid)))
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 task-mention: context fetch failed task=%s", task_id, exc_info=True)
+    return "\n".join(lines)
+
+
+def _b24_post_task_comment(task_id: int, text: str, agent_name: str) -> bool:
+    """Post the agent's reply as a task comment (author = technical webhook user, marked with the
+    agent name so employees see who answered). Loop-safe: our handler skips this author id."""
+    wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
+    if not wh:
+        return False
+    body = f"🤖 {agent_name}: {text}"
+    try:
+        r = requests.post(f"{wh}/task.commentitem.add.json",
+                          json={"TASKID": task_id, "FIELDS": {"POST_MESSAGE": body[:20000]}}, timeout=30)
+        data = r.json() if r.content else {}
+        return bool(data.get("result"))
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 task-mention: reply post failed task=%s", task_id, exc_info=True)
+        return False
+
+
+def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, Any]:
+    """Core of the in-task agent. Returns a small status dict (also used by the smoke test)."""
+    if not _b24_task_mention_enabled():
+        return {"handled": False, "reason": "disabled"}
+    comment = _b24_fetch_task_comment(task_id, comment_id)
+    if not comment:
+        return {"handled": False, "reason": "comment_not_found"}
+    author_id = comment.get("author_id")
+    text = comment.get("text") or ""
+    # Loop guard: never react to the bot's own replies or the technical webhook user.
+    if to_int(author_id) in _b24_task_bot_author_ids() or text.lstrip().startswith("🤖"):
+        return {"handled": False, "reason": "own_comment"}
+    target = _b24_task_pick_agent(text)
+    if not target:
+        return {"handled": False, "reason": "no_agent_named"}
+    # Access gate: the author must have access to THIS agent (same rules as the chat).
+    allowed = _b24_main_allows(author_id) if target["is_main"] else _b24_task_subagent_allows(target["slug"], author_id)
+    if not allowed:
+        return {"handled": False, "reason": "no_access", "agent": target["name"]}
+    # First-sight claim (dedupe) — do this AFTER the cheap filters so we don't burn the id on noise.
+    if not _b24_task_comment_claim(comment_id, task_id, target["slug"], author_id):
+        return {"handled": False, "reason": "already_seen"}
+
+    agent = None
+    if not target["is_main"] and target["slug"]:
+        try:
+            from agent_center import agent_for_bot_id
+            agent = agent_for_bot_id(target["bot_id"])
+        except Exception:  # noqa: BLE001
+            logging.warning("b24 task-mention: agent resolve failed slug=%s", target["slug"], exc_info=True)
+    tier = "ops" if target["is_main"] else str((agent or {}).get("tier") or "faq")
+
+    ctx = _b24_task_context_text(task_id)
+    requester = _b24_portal_user_directory().get(to_int(author_id), {}).get("name") or f"id {author_id}"
+    user_text = (
+        "Тебя позвали ПРЯМО В ЗАДАЧЕ Bitrix (в комментарии). Работай с ЭТОЙ задачей.\n\n"
+        + ctx + "\n\n"
+        + f"Сотрудник {requester} (id={author_id}) написал в комментарии к задаче №{task_id}:\n«"
+        + text.strip() + "»\n\n"
+        "Ответь по существу и, если он просит действие с задачей, выполни его своими инструментами "
+        f"(комментарий — add_bitrix_task_comment(bitrix_task_id={task_id}, author_bitrix_user_id={author_id}); "
+        f"завершить — complete_bitrix_task(bitrix_task_id={task_id}, on_behalf_bitrix_user_id={author_id}); "
+        f"результат/скрин как результат — as_result=true; возобновить — reopen_bitrix_task; "
+        f"новый срок — new_deadline). Пиши кратко: твой ответ уйдёт в этот же комментарий задачи. "
+        "НЕ дублируй постановку — задача уже есть, работай в её контексте."
+    )
+    # Per-task memory so the agent keeps the thread of THIS task, separate from private chat.
+    dialog_id = f"task-{task_id}"
+    answer = hermes_brain_answer(user_text, dialog_id, tier, author_id, agent=agent)
+    if not answer or _hermes_answer_is_error(answer):
+        return {"handled": False, "reason": "brain_error", "agent": target["name"]}
+    posted = _b24_post_task_comment(task_id, answer, target["name"])
+    try:
+        _b24_log_interaction(dialog_id, author_id, tier, user_text, answer, 0,
+                             "ok" if posted else "post_failed", "" if posted else "reply post failed",
+                             agent_slug=target["slug"])
+    except Exception:  # noqa: BLE001
+        pass
+    return {"handled": bool(posted), "agent": target["name"], "task_id": task_id}
+
+
+def _b24_task_subagent_allows(slug: str | None, author_id: Any) -> bool:
+    """Subagent access for the in-task path: explicit member list, empty = open to non-'none'."""
+    if not slug:
+        return _b24_main_allows(author_id)
+    try:
+        from agent_center import agent_for_bot_id  # noqa: F401
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT a.id FROM agents a WHERE a.slug=%s", (slug,))
+                row = cur.fetchone()
+                if not row:
+                    return False
+                cur.execute("SELECT bitrix_user_id FROM agent_members WHERE agent_id=%s", (row["id"],))
+                members = {to_int(r["bitrix_user_id"]) for r in cur.fetchall()}
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 task-mention: subagent access lookup failed slug=%s", slug, exc_info=True)
+        return False
+    if members:
+        return to_int(author_id) in members
+    return _b24_tier_for(author_id) != "none"
+
+
 def _bitrix_imbot_app_event():
     if request.method == "GET":
         return jsonify({"ok": True, "message": "Bitrix imbot app endpoint is ready."})
@@ -3106,9 +3422,11 @@ def _bitrix_imbot_app_event():
             except Exception:  # noqa: BLE001
                 logging.exception("b24 MSGADD debug log failed")
         # The bot must SEE screenshots and understand replies to earlier (possibly reset) messages.
-        image_texts, reply_text, doc_blocks = [], "", []
+        image_texts, reply_text, doc_blocks, msg_attachments = [], "", [], []
         try:
-            image_texts, reply_text, doc_blocks = _b24_message_extras(payload, endpoint, access_token)
+            image_texts, reply_text, doc_blocks, msg_attachments = _b24_message_extras(
+                payload, endpoint, access_token,
+                agent_slug=(agent or {}).get("slug"), dialog_id=dialog_id, from_user_id=from_user_id)
         except Exception:  # noqa: BLE001
             logging.exception("b24 testbot: image/reply/doc extras failed")
         if not dialog_id or (not message_text and not image_texts and not reply_text and not doc_blocks):
@@ -3155,7 +3473,7 @@ def _bitrix_imbot_app_event():
             _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
             _b24_app_process(
                 endpoint, access_token, bot_id, dialog_id,
-                _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks),
+                _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks, msg_attachments),
                 message_id, from_user_id, agent=agent,
             )
 
