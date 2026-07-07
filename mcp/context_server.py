@@ -1911,21 +1911,21 @@ def _bitrix_upload_bytes(file_name: str, data: bytes) -> int:
 
 
 def _attachment_disk_id(token: str) -> int:
-    """Resolve a stored attachment token to a Bitrix disk file id (uploading on first use)."""
+    """Resolve a stored attachment token to a FRESH Bitrix disk file id. A disk object is consumed
+    once attached to an entity (comment/task) — so we upload a new copy per attach target rather
+    than reusing a cached id (reuse yields «Не удалось найти файл»)."""
     import attachments as _att
     row = _att.get_attachment(token)
     if not row:
         raise McpError(-32602, f"Вложение {token} не найдено. Проверь attachment_id (его выдаёт "
                                "система при получении файла от пользователя).")
-    if row.get("bitrix_disk_id"):
-        return int(row["bitrix_disk_id"])
     blob = _att.attachment_bytes(token)
     if not blob:
         raise McpError(-32010, f"Файл вложения {token} больше недоступен для пересылки "
                                "(истёк срок хранения). Попроси пользователя прислать файл заново.")
     data, name = blob
     fid = _bitrix_upload_bytes(row.get("file_name") or name, data)
-    _att.set_disk_id(token, fid)
+    _att.set_disk_id(token, fid)  # last-used id, for reference only (not reused)
     return fid
 
 
@@ -2036,9 +2036,11 @@ def tool_add_bitrix_task_comment(args: dict[str, Any]) -> dict[str, Any]:
     comment_id = response.get("result") if isinstance(response, dict) else None
 
     # For a result, also pin the file(s) to the task itself so they show in the task's files.
-    if as_result and refs:
+    # A disk object is consumed by the comment attach above, so upload FRESH copies for the task.
+    if as_result and has_files:
         try:
-            _attach_disk_refs_to_task(task_id, refs)
+            task_refs, _ = _resolve_attachment_disk_refs(attachment_ids)
+            _attach_disk_refs_to_task(task_id, task_refs)
         except Exception as exc:  # noqa: BLE001
             logging.warning("as_result task attach failed task=%s: %s", task_id, repr(exc)[:120])
 
