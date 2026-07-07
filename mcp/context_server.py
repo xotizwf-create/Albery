@@ -1947,14 +1947,37 @@ def _resolve_attachment_disk_refs(attachment_ids: Any) -> tuple[list[str], list[
     return refs, summary
 
 
+def _webhook_raw(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Call the plain Bitrix incoming webhook (REST v2) directly. Needed for legacy task fields
+    like UF_TASK_WEBDAV_FILES that the v3 TaskDto (used by BitrixClient) rejects."""
+    base = (os.getenv("BITRIX_WEBHOOK_BASE", "") or "").rstrip("/")
+    if not base:
+        raise McpError(-32000, "BITRIX_WEBHOOK_BASE is not configured.")
+    data = json.dumps(payload or {}).encode()
+    req = urllib.request.Request(f"{base}/{method}.json", data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as exc:  # noqa: BLE001
+        body = ""
+        try:
+            body = exc.read().decode()[:300]
+        except Exception:  # noqa: BLE001
+            pass
+        raise McpError(-32010, f"Bitrix webhook {method} failed: HTTP {exc.code} {body}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Bitrix webhook {method} failed: {exc}") from exc
+
+
 def _attach_disk_refs_to_task(task_id: int, refs: list[str]) -> None:
-    """Append disk refs to a task's UF_TASK_WEBDAV_FILES without dropping existing files."""
+    """Append disk refs to a task's UF_TASK_WEBDAV_FILES without dropping existing files.
+    Uses the v2 webhook directly — the v3 TaskDto (BitrixClient) rejects UF_TASK_WEBDAV_FILES."""
     if not refs:
         return
     existing: list[str] = []
     try:
-        cur = _bitrix_call_with_fallback(
-            "tasks.task.get", {"taskId": task_id, "select": ["ID", "UF_TASK_WEBDAV_FILES"]}, prefer_api=False)
+        cur = _webhook_raw("tasks.task.get", {"taskId": task_id, "select": ["ID", "UF_TASK_WEBDAV_FILES"]})
         task = (cur.get("result") or {}).get("task") or {} if isinstance(cur, dict) else {}
         raw = task.get("ufTaskWebdavFiles") or task.get("UF_TASK_WEBDAV_FILES") or []
         for item in raw if isinstance(raw, list) else []:
@@ -1963,8 +1986,7 @@ def _attach_disk_refs_to_task(task_id: int, refs: list[str]) -> None:
     except Exception:  # noqa: BLE001
         existing = []
     merged = list(dict.fromkeys(existing + refs))
-    _bitrix_call_with_fallback(
-        "tasks.task.update", {"taskId": task_id, "fields": {"UF_TASK_WEBDAV_FILES": merged}}, prefer_api=False)
+    _webhook_raw("tasks.task.update", {"taskId": task_id, "fields": {"UF_TASK_WEBDAV_FILES": merged}})
 
 
 def _resolve_task_actor(args: dict[str, Any], id_key: str, name_key: str) -> dict[str, Any] | None:
@@ -2068,13 +2090,16 @@ def tool_complete_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
         fields["STATUS_CHANGED_BY"] = int(actor["bitrix_user_id"])
     # tasks.task.complete is the canonical close; it also bypasses the "result required" gate for
     # the webhook admin user. We use update(STATUS=5) so we can attribute STATUS_CHANGED_BY.
+    # v2 webhook: the v3 TaskDto rejects the uppercase STATUS/STATUS_CHANGED_BY fields.
     last_error: McpError | None = None
     for method, payload in (
         ("tasks.task.update", {"taskId": task_id, "fields": fields}),
         ("tasks.task.complete", {"taskId": task_id}),
     ):
         try:
-            response = _bitrix_call_with_fallback(method, payload, prefer_api=False, fallback=False)
+            response = _webhook_raw(method, payload)
+            if isinstance(response, dict) and response.get("error") and not response.get("result"):
+                raise McpError(-32010, f"Bitrix {method}: {response.get('error_description') or response.get('error')}")
             return {
                 "completed": True,
                 "task": _task_payload(task, task_id),
@@ -2209,15 +2234,17 @@ def tool_reopen_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     })
 
     attempts = (
-        ("task.item.renew", {"TASKID": task_id}, False),
-        ("tasks.task.renew", {"taskId": task_id}, False),
+        ("tasks.task.renew", {"taskId": task_id}),
+        ("task.item.renew", {"TASKID": task_id}),
     )
     last_error: McpError | None = None
     reopened_response = None
     reopened_method = None
-    for method, payload, prefer_api in attempts:
+    for method, payload in attempts:
         try:
-            reopened_response = _bitrix_call_with_fallback(method, payload, prefer_api=prefer_api, fallback=False)
+            reopened_response = _webhook_raw(method, payload)
+            if isinstance(reopened_response, dict) and reopened_response.get("error") and not reopened_response.get("result"):
+                raise McpError(-32010, str(reopened_response.get("error_description") or reopened_response.get("error")))
             reopened_method = method
             break
         except McpError as exc:
@@ -2228,8 +2255,7 @@ def tool_reopen_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
 
     if new_deadline:
         try:
-            _bitrix_call_with_fallback(
-                "tasks.task.update", {"taskId": task_id, "fields": {"DEADLINE": new_deadline}}, prefer_api=False)
+            _webhook_raw("tasks.task.update", {"taskId": task_id, "fields": {"DEADLINE": new_deadline}})
         except McpError as exc:
             logging.warning("reopen: new deadline set failed task=%s: %s", task_id, str(exc)[:120])
 
