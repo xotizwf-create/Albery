@@ -66,13 +66,19 @@ def test_pick_agent_detects_main_trigger(monkeypatch):
 def test_comment_event_id_extraction():
     import bitrix
 
+    # Real portal shape: the chat message id is in MESSAGE_ID; ID is 0/unused.
     payload = {
         "event": "ONTASKCOMMENTADD",
-        "data[FIELDS_AFTER][ID]": "12766",
-        "data[FIELDS_AFTER][TASK_ID]": "1082",
+        "data[FIELDS_AFTER][ID]": "0",
+        "data[FIELDS_AFTER][MESSAGE_ID]": "12928",
+        "data[FIELDS_AFTER][TASK_ID]": "1102",
     }
-    assert bitrix._extract_bitrix_event_comment_id(payload) == 12766
-    assert bitrix.extract_bitrix_comment_event_task_id(payload) == 1082
+    assert bitrix._extract_bitrix_event_comment_id(payload) == 12928
+    assert bitrix.extract_bitrix_comment_event_task_id(payload) == 1102
+    # Fallback to ID when MESSAGE_ID absent.
+    legacy = {"event": "ONTASKCOMMENTADD", "data[FIELDS_AFTER][ID]": "555",
+              "data[FIELDS_AFTER][TASK_ID]": "9"}
+    assert bitrix._extract_bitrix_event_comment_id(legacy) == 555
 
 
 def test_task_bot_author_ids_default():

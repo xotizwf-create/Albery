@@ -121,8 +121,13 @@ def extract_bitrix_comment_event_task_id(payload: dict[str, Any]) -> int | None:
 
 
 def _extract_bitrix_event_comment_id(payload: dict[str, Any]) -> int | None:
-    """The comment id for a task-comment event = data[FIELDS_AFTER][ID]."""
-    return _event_field_after(payload, "ID")
+    """The comment id for a task-comment event. On this portal the chat message id lives in
+    FIELDS_AFTER.MESSAGE_ID (FIELDS_AFTER.ID is 0/unused); prefer MESSAGE_ID, fall back to ID."""
+    mid = _event_field_after(payload, "MESSAGE_ID")
+    if mid:
+        return mid
+    got = _event_field_after(payload, "ID")
+    return got or None
 
 
 def enqueue_bitrix_task_event(event_name: str, task_id: int, payload: dict[str, Any]) -> str:
@@ -2008,12 +2013,6 @@ def bitrix_task_event_webhook(secret: str):
 
     payload = flatten_request_payload()
     event_name = normalize_bitrix_event_name(first_non_empty(payload.get("event"), payload.get("EVENT")))
-    if os.getenv("B24_TASK_EVENT_DEBUG", "0") == "1" and "COMMENT" in (event_name or "").upper():
-        import logging as _lg
-        _lg.getLogger(__name__).info(
-            "task-comment debug: name=%r ID=%s MESSAGE_ID=%s TASK_ID=%s",
-            event_name, _event_field_after(payload, "ID"),
-            _event_field_after(payload, "MESSAGE_ID"), _event_field_after(payload, "TASK_ID"))
     # In-task agent: an employee named an agent in a task comment. Fires on EVERY comment company-
     # wide, so ACK immediately and do ALL work (fetch/detect/access/run) in a background thread —
     # the guards + kill-switch live inside _b24_handle_task_comment_event.
