@@ -85,3 +85,22 @@ def test_task_bot_author_ids_default():
     import b24bot
 
     assert 22 in b24bot._b24_task_bot_author_ids()
+
+
+def test_task_deep_link_builds_clickable_url(monkeypatch):
+    import mcp.context_server as cs
+
+    monkeypatch.setenv("BITRIX_WEBHOOK_BASE", "https://b24-0xrp3s.bitrix24.ru/rest/22/secret/")
+    url = cs._task_deep_link(1076)
+    assert url == "https://b24-0xrp3s.bitrix24.ru/company/personal/user/0/tasks/task/view/1076/"
+    # bad ids -> no link (never a broken URL)
+    assert cs._task_deep_link(None) is None
+    assert cs._task_deep_link("abc") is None
+
+
+def test_task_deep_link_none_without_portal(monkeypatch):
+    import mcp.context_server as cs
+
+    monkeypatch.delenv("BITRIX_WEBHOOK_BASE", raising=False)
+    monkeypatch.delenv("BITRIX_PORTAL_URL", raising=False)
+    assert cs._task_deep_link(1076) is None

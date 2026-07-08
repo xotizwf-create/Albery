@@ -1706,6 +1706,47 @@ def _task_payload(task: dict[str, Any] | None, task_id: int) -> dict[str, Any]:
     }
 
 
+def _portal_base_url() -> str:
+    """The Bitrix portal web host (https://<portal>), derived from the webhook base."""
+    base = (os.getenv("BITRIX_WEBHOOK_BASE", "") or "").strip()
+    if base:
+        p = urlparse(base)
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+    return (os.getenv("BITRIX_PORTAL_URL", "") or "").rstrip("/")
+
+
+def _task_deep_link(task_id: Any) -> str | None:
+    """Clickable Bitrix task deep link — the number a user taps to open the task."""
+    base = _portal_base_url()
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        return None
+    if not base or tid <= 0:
+        return None
+    return f"{base}/company/personal/user/0/tasks/task/view/{tid}/"
+
+
+def _task_deadline_change_count(task_id: Any) -> int | None:
+    """How many times the DEADLINE was changed («перенесена X раз»), via live task history.
+    Best-effort — None on any failure. Uses the v2 webhook directly (history.list works there)."""
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        r = _webhook_raw("tasks.task.history.list", {"taskId": tid})
+    except Exception:  # noqa: BLE001
+        return None
+    res = r.get("result") if isinstance(r, dict) else None
+    lst = res.get("list") if isinstance(res, dict) else res
+    if not isinstance(lst, list):
+        return None
+    return sum(1 for it in lst if isinstance(it, dict)
+               and str(it.get("field") or it.get("FIELD") or "").upper() == "DEADLINE")
+
+
 def _deadline_in_past(deadline: str) -> "datetime | None":
     """Return the parsed deadline (MSK-aware) if it is at/before 'now' in Europe/Moscow, else None.
     Deterministic backstop so an already-overdue task is never created without explicit confirmation."""
@@ -2431,6 +2472,16 @@ def tool_search_tasks(args: dict[str, Any]) -> dict[str, Any]:
                 params,
             )
             rows = cur.fetchall()
+    # Clickable deep link on every task number + how many times its deadline was moved.
+    # The history call is per-task, so only enrich single-task lookups and SHORT lists.
+    hist_max = int(os.getenv("B24_TASK_HISTORY_ENRICH_MAX", "12") or "12")
+    enrich_hist = (bitrix_task_id not in (None, "")) or (0 < len(rows) <= hist_max)
+    for row in rows:
+        row["task_url"] = _task_deep_link(row.get("bitrix_task_id"))
+        if enrich_hist:
+            cnt = _task_deadline_change_count(row.get("bitrix_task_id"))
+            if cnt is not None:
+                row["deadline_change_count"] = cnt
     note = None
     if not include_full_description and any(row.get("description_truncated") for row in rows):
         note = (
@@ -2438,7 +2489,12 @@ def tool_search_tasks(args: dict[str, Any]) -> dict[str, Any]:
             "see description_full_length. To read one task in full use "
             "search_tasks(bitrix_task_id=..., include_full_description=true)."
         )
-    return {"items": rows, "limit": limit, "offset": offset, "note": note}
+    return {
+        "items": rows, "limit": limit, "offset": offset, "note": note,
+        "display_rule": ("Показывай номер задачи как КЛИКАБЕЛЬНУЮ ссылку в Битрикс-формате "
+                         "[URL=<task_url>]<номер>[/URL], рядом дедлайн; если deadline_change_count>0 — "
+                         "добавь «перенесена N раз»."),
+    }
 
 
 def tool_get_task_comments(args: dict[str, Any]) -> dict[str, Any]:
@@ -2512,6 +2568,8 @@ def tool_get_task_comments(args: dict[str, Any]) -> dict[str, Any]:
         "found": True,
         "title": row["title"],
         "status": row["status_name"] or row["status"],
+        "task_url": _task_deep_link(row["bitrix_task_id"]),
+        "deadline_change_count": _task_deadline_change_count(row["bitrix_task_id"]),
         "creator_name": row["creator_name"],
         "responsible_name": row["responsible_name"],
         "chat_id": row["chat_id"],

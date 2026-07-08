@@ -2143,11 +2143,18 @@ def _b24_brain_error_message(answer: str) -> str:
 
 
 def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
-                        from_user_id: Any, prompt_chars: int, scope: str = ""):
+                        from_user_id: Any, prompt_chars: int, scope: str = "",
+                        retry_prompt_suffix: str = ""):
     """Run the hermes CLI under the concurrency semaphore, retrying once on a quick failure
     (non-zero rc / empty stdout / an LLM error sentinel printed as the answer). Returns
     (proc, None), (None, 'busy'), (None, 'timeout') or (None, 'cancelled') — the latter when
-    «Новая сессия» killed this turn mid-flight."""
+    «Новая сессия» killed this turn mid-flight.
+
+    On the retry we (a) pause a short backoff so a transient provider blip (Broken pipe to the
+    single Codex account, which is what kills heavy contract turns) can clear, and (b) optionally
+    append `retry_prompt_suffix` to the -z prompt so the second attempt runs LEANER (fewer web
+    pages, one export call) — heavy multi-step turns are exactly what breaks the connection."""
+    backoff_s = float(os.getenv("B24_HERMES_RETRY_BACKOFF_S", "6") or "6")
     if not _HERMES_RUN_SLOTS.acquire(timeout=_HERMES_QUEUE_WAIT_S):
         logging.warning("b24 testbot: hermes slot wait exceeded %ss dialog_id=%s tier=%s user_id=%s",
                         _HERMES_QUEUE_WAIT_S, dialog_id, tier, from_user_id)
@@ -2163,11 +2170,23 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
     try:
         proc = None
         for attempt in (1, 2):
+            attempt_cmd = cmd
+            if attempt == 2:
+                # Give a transient provider blip time to clear, then rerun LEANER.
+                if backoff_s > 0 and not entry["cancelled"]:
+                    time.sleep(backoff_s)
+                if retry_prompt_suffix:
+                    attempt_cmd = list(cmd)
+                    try:
+                        zi = attempt_cmd.index("-z")
+                        attempt_cmd[zi + 1] = str(attempt_cmd[zi + 1]) + retry_prompt_suffix
+                    except (ValueError, IndexError):
+                        pass
             # Spawn under the lock so a concurrent cancel can't slip between check and start.
             with _LIVE_TURNS_LOCK:
                 if entry["cancelled"]:
                     return None, "cancelled"
-                child = subprocess.Popen(**_b24_hermes_popen_kwargs(cmd))
+                child = subprocess.Popen(**_b24_hermes_popen_kwargs(attempt_cmd))
                 entry["proc"] = child
             try:
                 out, err = child.communicate(timeout=timeout_s)
@@ -2430,6 +2449,22 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
             "переопубликовать именно его (а не плодить новые копии). Проверяя доступность ссылки, бери "
             "АКТУАЛЬНЫЙ web_app_url из своей истории, а не угадывай."
         )
+    # Document + forwarded-message recall — applies to EVERY agent (incl. tier=faq юрист), so the
+    # agent can always reach earlier context, including Word/PDF sent in a past/reset session.
+    if agent is not None or tier in ("admin", "ops"):
+        parts.append(
+            "ПАМЯТЬ О ДОКУМЕНТАХ И ПЕРЕСЛАННЫХ СООБЩЕНИЯХ (важно). Это диалог dialog_id=`"
+            + str(dialog_id) + "`. Ты можешь поднять ВСЁ, что было в этом диалоге раньше — включая "
+            "прошлые и уже сброшенные сессии — инструментом get_bitrix_bot_chat(dialog_id='"
+            + str(dialog_id) + "'). Если пользователь ссылается на прежний документ/сообщение, "
+            "ПЕРЕСЫЛАЕТ или ОТВЕЧАЕТ на старое сообщение (в т.ч. в новой сессии), а ты не видишь его "
+            "полностью — СНАЧАЛА вызови get_bitrix_bot_chat и найди нужный момент. У КАЖДОГО присланного "
+            "ранее файла (Word/PDF/Excel/скан) в истории есть его attachment_id (att_…): прочитай "
+            "документ ЦЕЛИКОМ через get_attachment_text(attachment_id='att_…', offset=…), по частям, "
+            "пока has_more не станет false. Если файл прикреплён к текущему сообщению заново — ты видишь "
+            "его сразу; если он только процитирован/переслан — подними его из истории по attachment_id. "
+            "НИКОГДА не проси прислать заново то, что уже было в этом диалоге."
+        )
     if tier in ("ops", "admin") and str(from_user_id).strip():
         parts.append(
             "ПОСТАНОВЩИК ЗАДАЧ (важно): по умолчанию постановщик создаваемой задачи — "
@@ -2503,8 +2538,19 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
     extra_toolsets = os.getenv("B24_EXTRA_TOOLSETS", "web").strip().strip(",")
     toolset_arg = f"{toolset},{extra_toolsets}" if extra_toolsets else toolset
     cmd = ["hermes", "-z", prompt, "--continue", run_session, "-t", toolset_arg, "--yolo"]
+    # If the first attempt fails (typically a Broken pipe to the single Codex account on a HEAVY
+    # turn — big document HTML + lots of web browsing), the retry runs leaner so it actually
+    # completes: one short web lookup at most, assemble the file in ONE export_document call.
+    retry_lean = (
+        "\n\n[СИСТЕМА: предыдущая попытка оборвалась из-за нагрузки на ИИ (тяжёлый ход). "
+        "Сейчас работай МАКСИМАЛЬНО экономно и надёжно: не открывай много веб-страниц (максимум "
+        "ОДИН короткий поиск, а если данных нет — ставь плейсхолдер [заполнить] и продолжай), "
+        "не делай лишних шагов, и если нужен документ — собери его за ОДИН вызов export_document. "
+        "Цель — довести ответ до конца, а не идеальность.]"
+    )
     proc, run_fail = _hermes_run_guarded(cmd, timeout_s, dialog_id, tier, from_user_id, len(prompt),
-                                         scope=_b24_scope(dialog_id, agent_slug))
+                                         scope=_b24_scope(dialog_id, agent_slug),
+                                         retry_prompt_suffix=retry_lean)
     if run_fail == "cancelled":
         return None  # «Новая сессия» остановила этот ход — reset уже ответил пользователю
     if run_fail == "busy":
