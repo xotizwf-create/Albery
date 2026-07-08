@@ -99,7 +99,7 @@ def find_by_disk_file_id(disk_file_id: Any) -> dict[str, Any] | None:
                 cur.execute(
                     "SELECT token, file_name, ext, kind, char_len, extracted_text "
                     "FROM bitrix_bot_attachments WHERE source_disk_file_id = %s "
-                    "ORDER BY id DESC LIMIT 1",
+                    "ORDER BY created_at DESC LIMIT 1",
                     (fid,),
                 )
                 return cur.fetchone()
