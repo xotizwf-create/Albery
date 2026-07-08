@@ -2254,3 +2254,8 @@ if os.getenv("ENSURE_MAIN_AGENT", "1").strip() != "0":
 import agent_automations as _agent_automations  # noqa: E402
 
 _SELF_TOOL_SPECS.update(_agent_automations.AUTOMATION_SELF_TOOL_SPECS)
+
+# Agent-owned scheduler for recurring Bitrix tasks: starts its minute-tick thread at import (same
+# process as the MCP tools). Recurring tasks are fired by us — the portal has no Bitrix subscription
+# so Bitrix's own recurring-task templates never spawn. Kill-switch: RECURRING_TASKS_SCHEDULER=0.
+import recurring_scheduler as _recurring_scheduler  # noqa: E402,F401

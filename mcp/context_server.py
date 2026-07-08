@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import calendar
 import csv
 import io
 import importlib
@@ -1598,15 +1599,17 @@ def _build_bitrix_regular_parameters(periodic: dict[str, Any]) -> dict[str, Any]
     return params
 
 
-def _normalize_bitrix_deadline(value: Any) -> str:
-    """Accept the natural deadline formats the model produces, not only ISO-with-T.
+def _normalize_bitrix_datetime(value: Any, *, field: str = "deadline",
+                               missing_msg: str | None = None) -> str:
+    """Accept the natural date/datetime formats the model produces, not only ISO-with-T.
     Supported: YYYY-MM-DD and DD.MM.YYYY (date-only -> 19:00 MSK); the same dates
     followed by ' HH:MM[:SS]' (space OR 'T'); and full ISO with optional tz.
     A space-separated date+time (e.g. '2026-06-28 15:00') was previously REJECTED,
-    which made the model loop on format retries and report a phantom tool timeout."""
+    which made the model loop on format retries and report a phantom tool timeout.
+    `field` names the field in error messages so plan dates / deadline read naturally."""
     raw = str(value or "").strip()
     if not raw:
-        raise McpError(-32602, "Нужно указать крайний срок задачи: deadline.")
+        raise McpError(-32602, missing_msg or f"Нужно указать {field}.")
     # DD.MM.YYYY  optionally followed by  (space|T) HH:MM[:SS]
     m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$", raw)
     if m:
@@ -1622,7 +1625,14 @@ def _normalize_bitrix_deadline(value: Any) -> str:
             return f"{y}-{mo}-{d}T19:00:00+03:00"
         tzs = "+03:00" if not tz else ("+00:00" if tz == "Z" else tz)
         return f"{y}-{mo}-{d}T{int(hh):02d}:{mm}:{ss or '00'}{tzs}"
-    raise McpError(-32602, "deadline должен быть в формате YYYY-MM-DD[ HH:MM], DD.MM.YYYY[ HH:MM] или ISO datetime.")
+    raise McpError(-32602, f"{field} должен быть в формате YYYY-MM-DD[ HH:MM], DD.MM.YYYY[ HH:MM] или ISO datetime.")
+
+
+def _normalize_bitrix_deadline(value: Any) -> str:
+    """Task deadline normalizer (see _normalize_bitrix_datetime). Behaviour preserved."""
+    return _normalize_bitrix_datetime(
+        value, field="deadline",
+        missing_msg="Нужно указать крайний срок задачи: deadline.")
 
 def _bitrix_call_with_fallback(
     method: str,
@@ -1766,6 +1776,137 @@ def _deadline_in_past(deadline: str) -> "datetime | None":
     return dt if dt <= now else None
 
 
+# --- Full task field support (соисполнители, план, CRM, пользовательские поля, ...) ----------
+# The Bitrix task editor exposes many field groups (see the "add field" chips). These helpers let
+# the agent set the REST-addable ones on create AND on update. The action-based entities
+# (checklists, time tracking, dependencies, reminders) have their own dedicated tools below.
+
+_UF_KEY_RE = re.compile(r"^UF_[A-Z0-9_]+$")
+_CRM_PREFIX_MAP = {"DEAL": "D", "LEAD": "L", "CONTACT": "C", "COMPANY": "CO"}
+
+
+def _clean_crm_elements(value: Any) -> list[str]:
+    """Normalize CRM bindings for UF_CRM_TASK — accept ['D_12','L_3',...] or long forms
+    (deal/lead/contact/company). Returns ['D_12', ...] or []. Malformed entries are refused."""
+    if value in (None, ""):
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    out: list[str] = []
+    for it in items:
+        s = str(it or "").strip().upper().replace(" ", "")
+        if not s:
+            continue
+        m = re.match(r"^([A-Z]+)_?(\d+)$", s)
+        if not m:
+            raise McpError(-32602, f"crm_elements: '{it}' — ожидается вид 'D_123' (сделка), "
+                                   "'L_' (лид), 'C_' (контакт), 'CO_' (компания).")
+        pref = _CRM_PREFIX_MAP.get(m.group(1), m.group(1))
+        ref = f"{pref}_{m.group(2)}"
+        if ref not in out:
+            out.append(ref)
+    return out
+
+
+def _clean_custom_fields(value: Any) -> dict[str, Any]:
+    """Validate a dict of custom task fields. Keys must be UF_* (task user fields) so the model
+    cannot set arbitrary system fields. Field codes come from list_task_userfields."""
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise McpError(-32602, "custom_fields должен быть объектом вида {\"UF_...\": значение}.")
+    out: dict[str, Any] = {}
+    for k, v in value.items():
+        key = str(k or "").strip().upper()
+        if not _UF_KEY_RE.match(key):
+            raise McpError(-32602, f"custom_fields: ключ '{k}' должен начинаться с UF_ "
+                                   "(пользовательское поле задачи). Коды полей — list_task_userfields.")
+        out[key] = v
+    return out
+
+
+def _resolve_person_ids(args: dict[str, Any], id_field: str, name_field: str, role_label: str) -> list[int]:
+    """Resolve a list of people (ids and/or names) to a de-duplicated list of active user ids."""
+    users = _resolve_active_bitrix_users(
+        args.get(id_field), args.get(name_field),
+        role_label=role_label, id_field=id_field, name_field=name_field)
+    return [int(u["bitrix_user_id"]) for u in users]
+
+
+def _assemble_task_fields(
+    *, title: str, description: str, responsible_id: int, deadline_iso: str,
+    priority: int = 1, auditor_ids: list[int] | None = None,
+    accomplice_ids: list[int] | None = None, creator_id: int | None = None,
+    tags: list[str] | None = None, parent_task_id: int | None = None, group_id: int | None = None,
+    start_plan: str | None = None, end_plan: str | None = None,
+    time_estimate_seconds: int | None = None, crm_elements: list[str] | None = None,
+    custom_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the Bitrix tasks.task.add FIELDS dict from already-resolved values. Shared by the
+    create tool and the recurring scheduler so both produce identical tasks. Only provided optional
+    fields are set; a result is always required (SE_PARAMETER code 3)."""
+    fields: dict[str, Any] = {
+        "TITLE": title,
+        "DESCRIPTION": description,
+        "RESPONSIBLE_ID": int(responsible_id),
+        "DEADLINE": deadline_iso,
+        "PRIORITY": priority,
+        "SE_PARAMETER": [{"CODE": 3, "VALUE": "Y"}],
+    }
+    if auditor_ids:
+        fields["AUDITORS"] = [int(x) for x in auditor_ids]
+    if accomplice_ids:
+        fields["ACCOMPLICES"] = [int(x) for x in accomplice_ids]
+    if creator_id is not None:
+        fields["CREATED_BY"] = int(creator_id)
+    if tags:
+        fields["TAGS"] = list(tags)
+    if parent_task_id:
+        fields["PARENT_ID"] = int(parent_task_id)
+    if group_id:
+        fields["GROUP_ID"] = int(group_id)
+    if start_plan:
+        fields["START_DATE_PLAN"] = start_plan
+    if end_plan:
+        fields["END_DATE_PLAN"] = end_plan
+    if time_estimate_seconds:
+        fields["TIME_ESTIMATE"] = int(time_estimate_seconds)
+    if crm_elements:
+        fields["UF_CRM_TASK"] = list(crm_elements)
+    if custom_fields:
+        for k, v in custom_fields.items():
+            fields[str(k)] = v
+    return fields
+
+
+def _add_checklist_items(task_id: int, items: Any) -> list[dict[str, Any]]:
+    """Add checklist items to a task (task.checklistitem.add, v2 webhook). `items` = list of
+    strings or {title, complete?}. Best-effort per item; a per-item error never aborts the rest."""
+    summary: list[dict[str, Any]] = []
+    if not isinstance(items, (list, tuple)):
+        return summary
+    for it in items:
+        if isinstance(it, dict):
+            title = str(it.get("title") or it.get("text") or "").strip()
+            complete = it.get("complete") is True or str(it.get("complete") or "").strip().lower() in {"true", "1", "yes", "да"}
+        else:
+            title = str(it or "").strip()
+            complete = False
+        if not title:
+            continue
+        try:
+            resp = _webhook_raw("task.checklistitem.add", {"TASKID": task_id, "FIELDS": {"TITLE": title}})
+            item_id = resp.get("result") if isinstance(resp, dict) else None
+            if complete and item_id:
+                try:
+                    _webhook_raw("task.checklistitem.complete", {"TASKID": task_id, "ITEMID": item_id})
+                except Exception:  # noqa: BLE001
+                    pass
+            summary.append({"title": title, "checklist_item_id": item_id, "complete": complete})
+        except Exception as exc:  # noqa: BLE001
+            summary.append({"title": title, "error": str(exc)[:160]})
+    return summary
+
+
 def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     title = str(args.get("title") or "").strip()
     if not title:
@@ -1778,6 +1919,20 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
             "у этой задачи — по чему поймём, что сделано, и чем подтверждается (скрин/ссылка/файл)? "
             "Затем повтори вызов create_bitrix_task с параметром result_criteria=...",
         )
+
+    # Recurring tasks are NOT created here. The old Bitrix REPLICATE template mechanism needs a
+    # paid plan (which this portal does not have) and silently never spawns tasks; recurring tasks
+    # are now driven by the agent's own scheduler. Redirect to the dedicated tool.
+    periodic_arg = args.get("periodic")
+    if isinstance(periodic_arg, dict) and periodic_arg:
+        raise McpError(
+            -32602,
+            "Для ПОВТОРЯЮЩЕЙСЯ (регулярной) задачи используй инструмент create_recurring_task "
+            "(create_bitrix_task делает только разовые). Передай period (daily/weekly/monthly), для "
+            "weekly — weekdays, create_time (во сколько создавать) и срок каждой задачи (deadline_time "
+            "или deadline_after_hours).",
+        )
+
     deadline = _normalize_bitrix_deadline(args.get("deadline"))
     _confirm_past = args.get("confirm_past_deadline")
     _confirm_past = _confirm_past is True or str(_confirm_past or "").strip().lower() in {"true", "1", "yes", "да"}
@@ -1800,56 +1955,46 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     priority = 2 if priority_raw in {"high", "critical", "2", "важно", "высокий"} else 1
 
     auditors = _resolve_active_bitrix_users(
-        args.get("auditor_bitrix_user_ids"),
-        args.get("auditor_names"),
-        role_label="Наблюдатель",
-        id_field="auditor_bitrix_user_ids",
-        name_field="auditor_names",
-    )
+        args.get("auditor_bitrix_user_ids"), args.get("auditor_names"),
+        role_label="Наблюдатель", id_field="auditor_bitrix_user_ids", name_field="auditor_names")
+    accomplices = _resolve_active_bitrix_users(
+        args.get("accomplice_bitrix_user_ids"), args.get("accomplice_names"),
+        role_label="Соисполнитель", id_field="accomplice_bitrix_user_ids", name_field="accomplice_names")
 
-    fields: dict[str, Any] = {
-        "TITLE": title,
-        "DESCRIPTION": description,
-        "RESPONSIBLE_ID": int(responsible["bitrix_user_id"]),
-        "DEADLINE": deadline,
-        "PRIORITY": priority,
-    }
-    if auditors:
-        fields["AUDITORS"] = [int(u["bitrix_user_id"]) for u in auditors]
-
-    # Always require a result before the task can be completed
-    # (SE_PARAMETER code 3 = "do not complete the task without a result").
-    fields["SE_PARAMETER"] = [{"CODE": 3, "VALUE": "Y"}]
-
-    # Постановщик (CREATED_BY): default = the requesting chat user (passed by the agent),
-    # or an explicitly named person. If neither is given, Bitrix keeps the webhook user.
     creator_info = None
     if args.get("creator_bitrix_user_id") not in (None, "") or args.get("creator_name"):
-        creator_info = _resolve_active_bitrix_user(
-            args.get("creator_bitrix_user_id"), args.get("creator_name")
-        )
-        fields["CREATED_BY"] = int(creator_info["bitrix_user_id"])
+        creator_info = _resolve_active_bitrix_user(args.get("creator_bitrix_user_id"), args.get("creator_name"))
 
-    tags = args.get("tags")
-    if isinstance(tags, list):
-        clean_tags = [str(tag).strip() for tag in tags if str(tag or "").strip()]
-        if clean_tags:
-            fields["TAGS"] = clean_tags
+    # Optional scalar fields (all safe to omit; only set when provided).
+    parent_task_id = _positive_bitrix_task_id(args.get("parent_task_id")) if args.get("parent_task_id") not in (None, "") else None
+    group_id = None
+    if args.get("group_id") not in (None, ""):
+        try:
+            group_id = int(args.get("group_id"))
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "group_id (проект/рабочая группа) должен быть числом.") from exc
+    start_plan = _normalize_bitrix_datetime(args.get("start_plan"), field="start_plan") if args.get("start_plan") not in (None, "") else None
+    end_plan = _normalize_bitrix_datetime(args.get("end_plan"), field="end_plan") if args.get("end_plan") not in (None, "") else None
+    time_estimate_seconds = None
+    if args.get("time_estimate_hours") not in (None, ""):
+        try:
+            time_estimate_seconds = int(float(args.get("time_estimate_hours")) * 3600)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "time_estimate_hours должно быть числом (часы).") from exc
+    crm_elements = _clean_crm_elements(args.get("crm_elements"))
+    custom_fields = _clean_custom_fields(args.get("custom_fields"))
+    tags = [str(t).strip() for t in args.get("tags") if str(t or "").strip()] if isinstance(args.get("tags"), list) else None
 
-    # Recurring tasks are NOT created here: the v3 tasks.task.add silently drops IS_REGULAR
-    # (verified — the task comes back isRegular=null). Redirect to the dedicated tool, which uses
-    # the working Bitrix REPLICATE task-template mechanism.
-    periodic_arg = args.get("periodic")
-    is_periodic = False
-    regular_parameters: dict[str, Any] | None = None
-    if isinstance(periodic_arg, dict) and periodic_arg:
-        raise McpError(
-            -32602,
-            "Для ПОВТОРЯЮЩЕЙСЯ (регулярной) задачи используй инструмент create_recurring_task "
-            "(create_bitrix_task делает только разовые). Передай period (daily/weekly/monthly), для "
-            "weekly — weekdays, create_time (во сколько создавать) и срок каждой задачи (deadline_time "
-            "или deadline_after_hours).",
-        )
+    fields = _assemble_task_fields(
+        title=title, description=description, responsible_id=int(responsible["bitrix_user_id"]),
+        deadline_iso=deadline, priority=priority,
+        auditor_ids=[int(u["bitrix_user_id"]) for u in auditors],
+        accomplice_ids=[int(u["bitrix_user_id"]) for u in accomplices],
+        creator_id=int(creator_info["bitrix_user_id"]) if creator_info else None,
+        tags=tags, parent_task_id=parent_task_id, group_id=group_id,
+        start_plan=start_plan, end_plan=end_plan, time_estimate_seconds=time_estimate_seconds,
+        crm_elements=crm_elements or None, custom_fields=custom_fields or None,
+    )
 
     response = _bitrix_call_with_fallback("tasks.task.add", {"fields": fields})
     result = response.get("result") if isinstance(response, dict) else {}
@@ -1859,6 +2004,19 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
         task_id = task.get("id") or result.get("id")
     else:
         task_id = result
+
+    # Post-create actions that need the task id: attach forwarded files + checklist items.
+    attach_summary: list[dict[str, Any]] = []
+    if task_id and isinstance(args.get("attachment_ids"), (list, tuple)) and any(str(a or "").strip() for a in args["attachment_ids"]):
+        try:
+            refs, attach_summary = _resolve_attachment_disk_refs(args.get("attachment_ids"))
+            _attach_disk_refs_to_task(int(task_id), refs)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("create_task attach failed task=%s: %s", task_id, repr(exc)[:120])
+    checklist_summary: list[dict[str, Any]] = []
+    if task_id and args.get("checklist"):
+        checklist_summary = _add_checklist_items(int(task_id), args.get("checklist"))
+
     return {
         "created": True,
         "task_id": task_id,
@@ -1870,27 +2028,27 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
             "full_name": responsible.get("full_name"),
             "work_position": responsible.get("work_position"),
         },
-        "auditors": [
-            {
-                "bitrix_user_id": u.get("bitrix_user_id"),
-                "full_name": u.get("full_name"),
-                "work_position": u.get("work_position"),
-            }
-            for u in auditors
-        ],
+        "auditors": [{"bitrix_user_id": u.get("bitrix_user_id"), "full_name": u.get("full_name")} for u in auditors],
+        "accomplices": [{"bitrix_user_id": u.get("bitrix_user_id"), "full_name": u.get("full_name")} for u in accomplices],
         "creator": (
-            {
-                "bitrix_user_id": creator_info.get("bitrix_user_id"),
-                "full_name": creator_info.get("full_name"),
-            }
-            if creator_info
-            else None
+            {"bitrix_user_id": creator_info.get("bitrix_user_id"), "full_name": creator_info.get("full_name")}
+            if creator_info else None
         ),
+        "parent_task_id": parent_task_id,
+        "group_id": group_id,
+        "planning": {"start_plan": start_plan, "end_plan": end_plan,
+                     "time_estimate_hours": (time_estimate_seconds / 3600) if time_estimate_seconds else None},
+        "crm_elements": crm_elements or None,
+        "custom_fields": custom_fields or None,
+        "attachments": attach_summary or None,
+        "checklist": checklist_summary or None,
         "require_result": True,
-        "is_periodic": is_periodic,
-        "regular_parameters": regular_parameters,
         "bitrix_response": response.get("result") if isinstance(response, dict) else response,
-        "rule": "Task creation requires title, responsible_name/responsible_bitrix_user_id, and deadline. Missing or ambiguous data blocks creation.",
+        "rule": "Task creation requires title, responsible_name/responsible_bitrix_user_id, and deadline. "
+                "Optional: соисполнители (accomplice_*), наблюдатели (auditor_*), теги, родительская задача "
+                "(parent_task_id), проект (group_id), планирование (start_plan/end_plan/time_estimate_hours), "
+                "элементы CRM (crm_elements), пользовательские поля (custom_fields), файлы (attachment_ids), "
+                "чек-лист (checklist). Missing or ambiguous data blocks creation.",
     }
 
 
@@ -2321,13 +2479,231 @@ def tool_reopen_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# --- Recurring (regular) tasks -------------------------------------------------------------
-# Bitrix stores a recurring task as a REPLICATE task TEMPLATE (task.template.add {data:...}); it
-# then spawns real tasks on schedule. Verified on the portal: PERIOD='daily'|'weekly'|'monthly',
-# weekly WEEK_DAYS=[1..7] (Mon=1..Sun=7, e.g. 5=Friday), TIME='HH:MM' = creation time,
-# DEADLINE_AFTER=seconds = deadline offset from creation. The template REST has NO list method, so
-# we mirror every recurring task we create into bitrix_recurring_tasks (migration 045) and list from
-# there (enriched with the live NEXT_EXECUTION_TIME via task.template.get).
+# --- General task editor + action tools (the "add field" chips of the Bitrix task) -----------
+# One editor (update_bitrix_task) covers the field-group chips settable via REST; the action
+# entities (checklists, time tracking, related tasks/Gantt, reminders) get dedicated tools.
+# Everything goes through the v2 webhook (_webhook_raw): the v3 TaskDto rejects legacy fields
+# like ACCOMPLICES/AUDITORS/TAGS/PARENT_ID/UF_* on update.
+
+def _webhook_ok(resp: dict[str, Any], method: str) -> Any:
+    """Return resp['result'] or raise a clear McpError if the webhook reported an error.
+    Never a silent drop (the lesson from the REPLICATE recurring-task failure)."""
+    if isinstance(resp, dict) and resp.get("error") and not resp.get("result"):
+        raise McpError(-32010, f"Bitrix {method}: {resp.get('error_description') or resp.get('error')}")
+    return resp.get("result") if isinstance(resp, dict) else resp
+
+
+def tool_update_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
+    """Edit an existing Bitrix task: any subset of the field-group chips (соисполнители,
+    наблюдатели, теги, родительская задача, проект, планирование сроков, элементы CRM,
+    пользовательские поля, срок, приоритет, ответственный, название/описание)."""
+    task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
+    task = _indexed_task_for_action(task_id)
+    _assert_expected_task_title(task, args.get("expected_title"))
+
+    fields: dict[str, Any] = {}
+    changed: list[str] = []
+
+    if str(args.get("title") or "").strip():
+        fields["TITLE"] = str(args["title"]).strip(); changed.append("название")
+    if args.get("description") not in (None, ""):
+        fields["DESCRIPTION"] = str(args["description"]).strip(); changed.append("описание")
+    if args.get("priority") not in (None, ""):
+        pr = str(args.get("priority")).strip().lower()
+        fields["PRIORITY"] = 2 if pr in {"high", "critical", "2", "важно", "высокий"} else 1
+        changed.append("приоритет")
+    if args.get("deadline") not in (None, ""):
+        dl = _normalize_bitrix_deadline(args.get("deadline"))
+        confirm_past = args.get("confirm_past_deadline") is True or str(args.get("confirm_past_deadline") or "").strip().lower() in {"true", "1", "yes", "да"}
+        if not confirm_past and _deadline_in_past(dl) is not None:
+            raise McpError(-32602, "Новый срок уже в прошлом. Уточни у пользователя срок в будущем, "
+                                   "либо повтори с confirm_past_deadline=true, чтобы оставить как есть.")
+        fields["DEADLINE"] = dl; changed.append("срок")
+    if args.get("responsible_bitrix_user_id") not in (None, "") or args.get("responsible_name"):
+        resp_user = _resolve_active_bitrix_user(args.get("responsible_bitrix_user_id"), args.get("responsible_name"))
+        fields["RESPONSIBLE_ID"] = int(resp_user["bitrix_user_id"]); changed.append("ответственный")
+    if args.get("accomplice_bitrix_user_ids") not in (None, "") or args.get("accomplice_names"):
+        fields["ACCOMPLICES"] = _resolve_person_ids(args, "accomplice_bitrix_user_ids", "accomplice_names", "Соисполнитель")
+        changed.append("соисполнители")
+    if args.get("auditor_bitrix_user_ids") not in (None, "") or args.get("auditor_names"):
+        fields["AUDITORS"] = _resolve_person_ids(args, "auditor_bitrix_user_ids", "auditor_names", "Наблюдатель")
+        changed.append("наблюдатели")
+    if isinstance(args.get("tags"), list):
+        fields["TAGS"] = [str(t).strip() for t in args["tags"] if str(t or "").strip()]; changed.append("теги")
+    if args.get("parent_task_id") not in (None, ""):
+        fields["PARENT_ID"] = _positive_bitrix_task_id(args.get("parent_task_id")); changed.append("родительская задача")
+    if args.get("group_id") not in (None, ""):
+        try:
+            fields["GROUP_ID"] = int(args.get("group_id"))
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "group_id должен быть числом.") from exc
+        changed.append("проект")
+    if args.get("start_plan") not in (None, ""):
+        fields["START_DATE_PLAN"] = _normalize_bitrix_datetime(args.get("start_plan"), field="start_plan"); changed.append("план: старт")
+    if args.get("end_plan") not in (None, ""):
+        fields["END_DATE_PLAN"] = _normalize_bitrix_datetime(args.get("end_plan"), field="end_plan"); changed.append("план: финиш")
+    if args.get("time_estimate_hours") not in (None, ""):
+        try:
+            fields["TIME_ESTIMATE"] = int(float(args.get("time_estimate_hours")) * 3600)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "time_estimate_hours должно быть числом.") from exc
+        changed.append("оценка времени")
+    crm = _clean_crm_elements(args.get("crm_elements"))
+    if crm:
+        fields["UF_CRM_TASK"] = crm; changed.append("элементы CRM")
+    custom = _clean_custom_fields(args.get("custom_fields"))
+    if custom:
+        fields.update(custom); changed.append("пользовательские поля")
+
+    if not fields:
+        raise McpError(-32602, "Нечего менять: передай хотя бы одно поле (напр. accomplice_names, tags, "
+                               "deadline, parent_task_id, group_id, start_plan/end_plan, crm_elements, custom_fields).")
+
+    resp = _webhook_raw("tasks.task.update", {"taskId": task_id, "fields": fields})
+    _webhook_ok(resp, "tasks.task.update")
+    return {
+        "updated": True,
+        "task": _task_payload(task, task_id),
+        "changed": changed,
+        "fields_set": sorted(fields.keys()),
+        "rule": "Правит существующую задачу по точному bitrix_task_id. Списочные поля (соисполнители/"
+                "наблюдатели/теги) ЗАМЕНЯЮТСЯ переданным списком — передавай полный набор. Смену "
+                "ответственного/родительской задачи подтверди у пользователя перед вызовом.",
+    }
+
+
+def tool_add_task_checklist(args: dict[str, Any]) -> dict[str, Any]:
+    """Add checklist items (чек-лист) to an existing task. items = list of strings or
+    {title, complete?}."""
+    task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
+    items = args.get("items") or args.get("checklist")
+    if not (isinstance(items, (list, tuple)) and any(
+            (str((it.get("title") if isinstance(it, dict) else it) or "").strip()) for it in items)):
+        raise McpError(-32602, "Нужно указать items — список пунктов чек-листа (строки или {title, complete}).")
+    task = _indexed_task_for_action(task_id)
+    _assert_expected_task_title(task, args.get("expected_title"))
+    summary = _add_checklist_items(task_id, items)
+    added = [s for s in summary if not s.get("error")]
+    if not added and summary:
+        raise McpError(-32010, "Bitrix не принял пункты чек-листа: " + str(summary[0].get("error") or "")[:180])
+    return {"checklist_added": True, "task": _task_payload(task, task_id), "items": summary,
+            "rule": "Пункты чек-листа добавлены (task.checklistitem.add). complete=true отмечает пункт выполненным."}
+
+
+def tool_log_task_time(args: dict[str, Any]) -> dict[str, Any]:
+    """Log spent time (учёт времени) on a task via task.elapseditem.add. Time from hours/minutes/
+    seconds; optional comment and on-behalf user."""
+    task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
+    total = 0
+    for key, mult in (("hours", 3600), ("minutes", 60), ("seconds", 1)):
+        if args.get(key) not in (None, ""):
+            try:
+                total += int(float(args.get(key)) * mult)
+            except (TypeError, ValueError) as exc:
+                raise McpError(-32602, f"{key} должно быть числом.") from exc
+    if total <= 0:
+        raise McpError(-32602, "Укажи затраченное время: hours и/или minutes (или seconds).")
+    task = _indexed_task_for_action(task_id)
+    _assert_expected_task_title(task, args.get("expected_title"))
+    fields: dict[str, Any] = {"SECONDS": total}
+    comment = str(args.get("comment") or args.get("comment_text") or "").strip()
+    if comment:
+        fields["COMMENT_TEXT"] = comment
+    actor = _resolve_task_actor(args, "on_behalf_bitrix_user_id", "on_behalf_name")
+    if actor:
+        fields["USER_ID"] = int(actor["bitrix_user_id"])
+    resp = _webhook_raw("task.elapseditem.add", {"TASKID": task_id, "FIELDS": fields})
+    item_id = _webhook_ok(resp, "task.elapseditem.add")
+    return {"time_logged": True, "task": _task_payload(task, task_id), "seconds": total,
+            "minutes": round(total / 60, 1), "elapsed_item_id": item_id,
+            "on_behalf": ({"bitrix_user_id": actor.get("bitrix_user_id"), "full_name": actor.get("full_name")} if actor else None),
+            "rule": "Записан учёт времени по задаче (task.elapseditem.add)."}
+
+
+_TASK_LINK_TYPES = {"finish_start": 2, "start_start": 0, "start_finish": 1, "finish_finish": 3}
+
+
+def tool_link_tasks(args: dict[str, Any]) -> dict[str, Any]:
+    """Link two tasks (связанные задачи / зависимость для Ганта) via task.dependence.add.
+    task_id_from depends on task_id_to; link_type finish_start (default) / start_start /
+    start_finish / finish_finish, or an int 0..3."""
+    src = _positive_bitrix_task_id(args.get("task_id_from") or args.get("bitrix_task_id"))
+    dst = _positive_bitrix_task_id(args.get("task_id_to") or args.get("related_task_id"))
+    if src == dst:
+        raise McpError(-32602, "task_id_from и task_id_to должны быть разными задачами.")
+    lt_raw = args.get("link_type")
+    if lt_raw in (None, ""):
+        link_type = 2
+    elif isinstance(lt_raw, int) or str(lt_raw).isdigit():
+        link_type = int(lt_raw)
+        if link_type not in (0, 1, 2, 3):
+            raise McpError(-32602, "link_type (число) должен быть 0..3.")
+    else:
+        key = str(lt_raw).strip().lower()
+        if key not in _TASK_LINK_TYPES:
+            raise McpError(-32602, "link_type: finish_start | start_start | start_finish | finish_finish (или 0..3).")
+        link_type = _TASK_LINK_TYPES[key]
+    resp = _webhook_raw("task.dependence.add", {"taskIdFrom": src, "taskIdTo": dst, "linkType": link_type})
+    result = _webhook_ok(resp, "task.dependence.add")
+    return {"linked": True, "task_id_from": src, "task_id_to": dst, "link_type": link_type,
+            "bitrix_response": result,
+            "rule": "Создана связь/зависимость между задачами (task.dependence.add) — она же строит Гант."}
+
+
+def tool_add_task_reminder(args: dict[str, Any]) -> dict[str, Any]:
+    """Add a reminder (напоминание) for a task at an absolute time. Best-effort: reminders REST
+    varies by portal — on rejection the tool returns a clear error rather than failing silently."""
+    task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
+    if args.get("remind_at") in (None, ""):
+        raise McpError(-32602, "Укажи remind_at — когда напомнить (YYYY-MM-DD HH:MM или DD.MM.YYYY HH:MM).")
+    remind_iso = _normalize_bitrix_datetime(args.get("remind_at"), field="remind_at")
+    # Whom to remind: explicit user, else the responsible person of the indexed task.
+    user = _resolve_task_actor(args, "user_bitrix_user_id", "user_name")
+    uid = int(user["bitrix_user_id"]) if user else None
+    task = _indexed_task_for_action(task_id)
+    if uid is None and task and task.get("responsible_bitrix_user_id"):
+        uid = int(task["responsible_bitrix_user_id"])
+    if uid is None:
+        raise McpError(-32602, "Кому напомнить не определено: передай user_name/user_bitrix_user_id.")
+    resp = _webhook_raw("task.reminder.add", {
+        "taskId": task_id,
+        "userId": uid,
+        "reminder": {"TYPE": "date", "TIME": remind_iso},
+    })
+    result = _webhook_ok(resp, "task.reminder.add")
+    return {"reminder_added": True, "task_id": task_id, "user_bitrix_user_id": uid, "remind_at": remind_iso,
+            "bitrix_response": result, "rule": "Напоминание по задаче добавлено (task.reminder.add)."}
+
+
+def tool_list_task_userfields(args: dict[str, Any]) -> dict[str, Any]:
+    """List the custom task fields (пользовательские поля) defined on the portal, so the agent uses
+    real UF_* codes in create/update instead of guessing. Read-only."""
+    resp = _webhook_raw("task.item.userfield.getlist", {})
+    rows = resp.get("result") if isinstance(resp, dict) else None
+    fields = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        fields.append({
+            "code": r.get("FIELD_NAME") or r.get("USER_TYPE") or r.get("ID"),
+            "label": r.get("EDIT_FORM_LABEL") or r.get("LIST_COLUMN_LABEL") or r.get("FIELD_NAME"),
+            "type": r.get("USER_TYPE_ID"),
+            "multiple": r.get("MULTIPLE"),
+            "mandatory": r.get("MANDATORY"),
+        })
+    return {"count": len(fields), "fields": fields,
+            "rule": "Коды пользовательских полей задач. Их значения передавай в custom_fields "
+                    "инструментов create_bitrix_task / update_bitrix_task."}
+
+
+# --- Recurring (regular) tasks — fired by the agent's OWN scheduler, not Bitrix ---------------
+# The portal has no paid subscription and Bitrix's automatic task replication (task.template.add
+# REPLICATE) is a paid feature: the template is created but never spawns tasks ("не создаётся
+# нормально"). So the recurrence schedule lives in bitrix_recurring_tasks (migrations 045+046) and
+# the Albery app's recurring_scheduler.py creates a plain one-off task on time — plain tasks via
+# REST work without a subscription. This module defines the schedule maths + the create-from-spec
+# path both the tool and the scheduler share; the scheduler thread itself lives in
+# recurring_scheduler.py (started from agent_center.py, same process as these tools).
 
 _WEEKDAY_NUM = {"MO": 1, "TU": 2, "WE": 3, "TH": 4, "FR": 5, "SA": 6, "SU": 7}
 _WEEKDAY_RU = {1: "понедельник", 2: "вторник", 3: "среда", 4: "четверг", 5: "пятница", 6: "суббота", 7: "воскресенье"}
@@ -2359,26 +2735,94 @@ def _recurring_schedule_desc(period: str, interval: int, weekday_nums: list[int]
     return txt
 
 
-def _build_replicate_params(period: str, interval: int, weekday_nums: list[int],
-                            day_of_month: int | None, create_time: str, until: str | None) -> dict[str, Any]:
-    from datetime import date as _date
-    rp: dict[str, Any] = {"TIME": create_time, "START_DATE": _date.today().strftime("%d.%m.%Y")}
+def _recurring_day_matches(period: str, interval: int, weekday_nums: list[int],
+                           day_of_month: int | None, d: "date", anchor: "date") -> bool:
+    """Does calendar day `d` (>= anchor) match the recurrence? interval>1 counts from `anchor`."""
+    if d < anchor:
+        return False
     if period == "daily":
-        rp.update({"PERIOD": "daily", "EVERY_DAY": interval})
-    elif period == "weekly":
-        rp.update({"PERIOD": "weekly", "EVERY_WEEK": interval, "WEEK_DAYS": weekday_nums})
-    else:  # monthly
-        rp.update({"PERIOD": "monthly", "MONTHLY_TYPE": 1, "MONTHLY_DAY_NUM": day_of_month, "MONTHLY_MONTH_NUM_1": interval})
-    if until:
-        rp.update({"END_TYPE": "date", "END_DATE": until, "REPEAT_TILL": "date"})
+        return interval == 1 or ((d - anchor).days % interval == 0)
+    if period == "weekly":
+        if d.isoweekday() not in weekday_nums:  # Mon=1..Sun=7 (== Bitrix WEEK_DAYS)
+            return False
+        if interval == 1:
+            return True
+        a_mon = anchor - timedelta(days=anchor.isoweekday() - 1)
+        d_mon = d - timedelta(days=d.isoweekday() - 1)
+        weeks = (d_mon - a_mon).days // 7
+        return weeks >= 0 and weeks % interval == 0
+    # monthly: fire on day_of_month, clamped to the month's length (31 -> last day of a short month)
+    eff = min(int(day_of_month or 1), calendar.monthrange(d.year, d.month)[1])
+    if d.day != eff:
+        return False
+    if interval == 1:
+        return True
+    months = (d.year - anchor.year) * 12 + (d.month - anchor.month)
+    return months >= 0 and months % interval == 0
+
+
+def _recurring_next_run(period: str, interval: int, weekday_nums: list[int],
+                        day_of_month: int | None, create_time: str, *,
+                        after: "datetime", anchor: "date | None" = None) -> "datetime | None":
+    """Next MSK-aware datetime at create_time on a matching day, strictly AFTER `after`.
+    None if nothing within ~2 years (shouldn't happen for valid schedules)."""
+    hh, mm = (int(x) for x in create_time.split(":"))
+    after = after.astimezone(_MSK_TZ) if after.tzinfo else after.replace(tzinfo=_MSK_TZ)
+    anchor = anchor or after.date()
+    for offset in range(0, 800):
+        d = after.date() + timedelta(days=offset)
+        cand = datetime(d.year, d.month, d.day, hh, mm, tzinfo=_MSK_TZ)
+        if cand <= after:
+            continue
+        if _recurring_day_matches(period, interval, weekday_nums, day_of_month, d, anchor):
+            return cand
+    return None
+
+
+def create_oneoff_task_from_spec(spec: dict[str, Any], deadline_iso: str) -> dict[str, Any]:
+    """Create a plain one-off Bitrix task from a stored recurring spec (used by the scheduler).
+    People are already resolved to ids in the spec. Returns {task_id, checklist}. Raises on failure
+    (the scheduler records last_error and retries)."""
+    title = str(spec.get("title") or "").strip()
+    description = str(spec.get("description") or "").strip() or title
+    responsible_id = int(spec["responsible_bitrix_id"])
+    priority = 2 if str(spec.get("priority") or "").strip().lower() in {"high", "critical", "2", "важно", "высокий"} else 1
+    fields = _assemble_task_fields(
+        title=title, description=description, responsible_id=responsible_id, deadline_iso=deadline_iso,
+        priority=priority,
+        auditor_ids=spec.get("auditor_ids") or None,
+        accomplice_ids=spec.get("accomplice_ids") or None,
+        creator_id=int(spec["creator_bitrix_id"]) if spec.get("creator_bitrix_id") else responsible_id,
+        tags=spec.get("tags") or None, group_id=spec.get("group_id") or None,
+        crm_elements=spec.get("crm_elements") or None, custom_fields=spec.get("custom_fields") or None,
+    )
+    response = _bitrix_call_with_fallback("tasks.task.add", {"fields": fields})
+    result = response.get("result") if isinstance(response, dict) else {}
+    task_id = None
+    if isinstance(result, dict):
+        t = result.get("task") if isinstance(result.get("task"), dict) else {}
+        task_id = t.get("id") or result.get("id")
     else:
-        rp.update({"END_TYPE": "never", "REPEAT_TILL": "endless"})
-    return rp
+        task_id = result
+    if not task_id:
+        raise McpError(-32010, f"Bitrix не создал разовую задачу по расписанию: {response.get('error_description') if isinstance(response, dict) else response}")
+    checklist = _add_checklist_items(int(task_id), spec.get("checklist")) if spec.get("checklist") else None
+    return {"task_id": int(task_id), "checklist": checklist}
+
+
+def _ddmmyyyy_to_date(value: Any) -> "date | None":
+    """Parse a DD.MM.YYYY string (the registry's until format) to a date; None on failure."""
+    try:
+        d, m, y = str(value).split(".")
+        return date(int(y), int(m), int(d))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def tool_create_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
-    """Create a RECURRING (regular) Bitrix task that spawns automatically on a schedule (e.g. every
-    Friday at 10:00, deadline 19:00 the same day). Implemented as a Bitrix REPLICATE task template."""
+    """Create a RECURRING (regular) task that is fired by the agent's OWN scheduler — the app creates
+    a plain one-off Bitrix task on schedule (e.g. every Friday at 10:00, deadline 19:00 the same day).
+    No Bitrix subscription needed (unlike Bitrix's own recurring-task templates)."""
     title = str(args.get("title") or "").strip()
     if not title:
         raise McpError(-32602, "Нужно указать название задачи: title.")
@@ -2462,70 +2906,88 @@ def tool_create_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
     if "Критерий результата" not in description:
         description += "\n\nКритерий результата: " + result_criteria
 
-    replicate = _build_replicate_params(period, interval, weekday_nums, day_of_month, create_time, until)
-    data = {
-        "TITLE": title,
-        "DESCRIPTION": description,
-        "RESPONSIBLE_ID": int(responsible["bitrix_user_id"]),
-        "CREATED_BY": int(creator["bitrix_user_id"]) if creator else int(responsible["bitrix_user_id"]),
-        "DEADLINE_AFTER": deadline_after_seconds,
-        "SE_PARAMETER": [{"CODE": 3, "VALUE": "Y"}],  # результат обязателен
-        "REPLICATE": "Y",
-        "REPLICATE_PARAMS": replicate,
-    }
-    resp = _webhook_raw("task.template.add", {"data": data})
-    res = resp.get("result") if isinstance(resp, dict) else None
-    template_id = res.get("ID") if isinstance(res, dict) else res
-    if not template_id:
-        raise McpError(-32010, f"Bitrix не создал шаблон повторяющейся задачи: {resp.get('error_description') or resp}")
-    template_id = int(template_id)
+    # Optional extra fields carried into every generated instance (same palette as create_bitrix_task).
+    priority_raw = str(args.get("priority") or "normal").strip().lower()
+    priority = "high" if priority_raw in {"high", "critical", "2", "важно", "высокий"} else "normal"
+    auditors = _resolve_active_bitrix_users(
+        args.get("auditor_bitrix_user_ids"), args.get("auditor_names"),
+        role_label="Наблюдатель", id_field="auditor_bitrix_user_ids", name_field="auditor_names")
+    accomplices = _resolve_active_bitrix_users(
+        args.get("accomplice_bitrix_user_ids"), args.get("accomplice_names"),
+        role_label="Соисполнитель", id_field="accomplice_bitrix_user_ids", name_field="accomplice_names")
+    group_id = None
+    if args.get("group_id") not in (None, ""):
+        try:
+            group_id = int(args.get("group_id"))
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "group_id должен быть числом.") from exc
+    tags = [str(t).strip() for t in args.get("tags") if str(t or "").strip()] if isinstance(args.get("tags"), list) else None
+    crm_elements = _clean_crm_elements(args.get("crm_elements")) or None
+    custom_fields = _clean_custom_fields(args.get("custom_fields")) or None
+    checklist = args.get("checklist") if isinstance(args.get("checklist"), list) else None
 
     schedule_desc = _recurring_schedule_desc(period, interval, weekday_nums, day_of_month, create_time, deadline_desc)
-    next_exec = None
-    try:
-        g = _webhook_raw("task.template.get", {"id": template_id})
-        gr = g.get("result") if isinstance(g, dict) else None
-        rp = (gr.get("DATA", {}) if isinstance(gr, dict) else {}).get("REPLICATE_PARAMS", {})
-        next_exec = rp.get("NEXT_EXECUTION_TIME")
-    except Exception:  # noqa: BLE001
-        pass
+    until_date = until  # DD.MM.YYYY or None (normalized above)
 
+    now_msk = datetime.now(_MSK_TZ)
+    next_run = _recurring_next_run(period, interval, weekday_nums, day_of_month, create_time, after=now_msk)
+    until_d = _ddmmyyyy_to_date(until_date) if until_date else None
+    if next_run and until_d and next_run.date() > until_d:
+        next_run = None  # end date already passed — nothing to schedule
+
+    spec = {
+        "title": title,
+        "description": description,
+        "responsible_bitrix_id": int(responsible["bitrix_user_id"]),
+        "creator_bitrix_id": int(creator["bitrix_user_id"]) if creator else None,
+        "auditor_ids": [int(u["bitrix_user_id"]) for u in auditors] or None,
+        "accomplice_ids": [int(u["bitrix_user_id"]) for u in accomplices] or None,
+        "tags": tags, "group_id": group_id, "crm_elements": crm_elements,
+        "custom_fields": custom_fields, "checklist": checklist,
+        "priority": priority, "deadline_after_seconds": deadline_after_seconds,
+    }
+
+    recurring_id = None
     try:
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO bitrix_recurring_tasks (bitrix_template_id, title, description, "
-                    "responsible_bitrix_id, responsible_name, creator_bitrix_id, period, interval_every, "
-                    "weekdays, day_of_month, create_time, deadline_after_seconds, deadline_desc, "
-                    "schedule_desc, until_date) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                    "ON CONFLICT (bitrix_template_id) DO UPDATE SET title=EXCLUDED.title, "
-                    "schedule_desc=EXCLUDED.schedule_desc, updated_at=now(), active=true",
-                    (template_id, title, description, int(responsible["bitrix_user_id"]),
-                     responsible.get("full_name"), (int(creator["bitrix_user_id"]) if creator else None),
-                     period, interval, weekday_nums or None, day_of_month, create_time,
-                     deadline_after_seconds, deadline_desc, schedule_desc, until))
+                    "INSERT INTO bitrix_recurring_tasks (title, description, responsible_bitrix_id, "
+                    "responsible_name, creator_bitrix_id, period, interval_every, weekdays, day_of_month, "
+                    "create_time, deadline_after_seconds, deadline_desc, schedule_desc, until_date, "
+                    "result_criteria, priority, spec, next_run_at, source) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s) RETURNING id",
+                    (title, description, int(responsible["bitrix_user_id"]), responsible.get("full_name"),
+                     (int(creator["bitrix_user_id"]) if creator else None), period, interval,
+                     weekday_nums or None, day_of_month, create_time, deadline_after_seconds, deadline_desc,
+                     schedule_desc, until_date, result_criteria, priority,
+                     json.dumps(spec, ensure_ascii=False), next_run, "agent_scheduler"))
+                row = cur.fetchone()
+                recurring_id = (row or {}).get("id") if isinstance(row, dict) else (row[0] if row else None)
     except Exception as exc:  # noqa: BLE001
-        logging.warning("recurring registry insert failed template=%s: %s", template_id, repr(exc)[:160])
+        logging.warning("recurring registry insert failed: %s", repr(exc)[:200])
+        raise McpError(-32010, "Не удалось сохранить повторяющуюся задачу в реестр. Повтори позже.") from exc
 
     return {
         "created": True,
         "recurring": True,
-        "bitrix_template_id": template_id,
+        "recurring_id": recurring_id,
         "title": title,
         "responsible": {"bitrix_user_id": responsible.get("bitrix_user_id"), "full_name": responsible.get("full_name")},
         "creator": ({"bitrix_user_id": creator.get("bitrix_user_id"), "full_name": creator.get("full_name")} if creator else None),
         "schedule": schedule_desc,
-        "next_execution": next_exec,
+        "next_run": next_run.isoformat() if next_run else None,
         "period": period, "interval": interval, "weekdays": weekday_nums or None, "day_of_month": day_of_month,
-        "create_time": create_time, "deadline": deadline_desc, "until": until,
-        "rule": "Повторяющаяся задача создана как шаблон Bitrix (REPLICATE) — Bitrix сам будет создавать "
-                "задачу по расписанию. Смотреть все повторяющиеся задачи: list_recurring_tasks.",
+        "create_time": create_time, "deadline": deadline_desc, "until": until_date,
+        "rule": "Повторяющаяся задача поставлена в СОБСТВЕННЫЙ планировщик агента (не в Bitrix — там нет "
+                "подписки). Приложение само создаёт обычную разовую задачу в момент next_run по расписанию. "
+                "Смотреть/останавливать: list_recurring_tasks / delete_recurring_task.",
     }
 
 
 def tool_list_recurring_tasks(args: dict[str, Any]) -> dict[str, Any]:
-    """List recurring (regular) Bitrix tasks — all of them or for one person. Reads our registry
-    (Bitrix has no template-list REST) and enriches each with the live next-execution time."""
+    """List recurring (regular) tasks — all of them or for one person. Reads the agent's registry;
+    each row shows the schedule, the next auto-creation time, and the last created instance."""
     filt_user = None
     if args.get("responsible_bitrix_user_id") not in (None, "") or args.get("responsible_name"):
         u = _resolve_active_bitrix_user(args.get("responsible_bitrix_user_id"), args.get("responsible_name"))
@@ -2543,53 +3005,66 @@ def tool_list_recurring_tasks(args: dict[str, Any]) -> dict[str, Any]:
             if not safe_table_exists(cur, "bitrix_recurring_tasks"):
                 return {"items": [], "note": "Таблица реестра ещё не создана."}
             cur.execute(
-                f"SELECT bitrix_template_id, title, responsible_bitrix_id, responsible_name, "
-                f"period, interval_every, weekdays, day_of_month, create_time, deadline_desc, "
-                f"schedule_desc, until_date, active, created_at "
+                f"SELECT id, title, responsible_bitrix_id, responsible_name, period, interval_every, "
+                f"weekdays, day_of_month, create_time, deadline_desc, schedule_desc, until_date, active, "
+                f"next_run_at, last_created_at, last_task_id, last_error, created_at "
                 f"FROM bitrix_recurring_tasks {where_sql} ORDER BY responsible_name NULLS LAST, created_at DESC",
                 params,
             )
             rows = cur.fetchall()
 
     items = []
-    stale: list[int] = []
     for r in rows:
         row = dict(r)
-        tid = row.get("bitrix_template_id")
-        # Enrich with live next-execution + detect templates deleted in Bitrix.
-        try:
-            g = _webhook_raw("task.template.get", {"id": tid})
-            gr = g.get("result") if isinstance(g, dict) else None
-            if isinstance(gr, dict) and gr.get("DATA"):
-                row["next_execution"] = gr["DATA"].get("REPLICATE_PARAMS", {}).get("NEXT_EXECUTION_TIME")
-                row["still_in_bitrix"] = True
-            else:
-                row["still_in_bitrix"] = False
-                stale.append(tid)
-        except Exception:  # noqa: BLE001
-            row["next_execution"] = None
-            row["still_in_bitrix"] = None
-        row["created_at"] = _to_msk(row["created_at"]).isoformat() if hasattr(row.get("created_at"), "isoformat") else row.get("created_at")
+        for col in ("next_run_at", "last_created_at", "created_at"):
+            v = row.get(col)
+            row[col] = _to_msk(v).isoformat() if hasattr(v, "isoformat") else v
         items.append(row)
-
-    # Mark templates that no longer exist in Bitrix as inactive (best-effort).
-    if stale:
-        try:
-            with connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE bitrix_recurring_tasks SET active=false, updated_at=now() "
-                                "WHERE bitrix_template_id = ANY(%s)", (stale,))
-        except Exception:  # noqa: BLE001
-            pass
 
     return {
         "count": len(items),
         "responsible_filter": filt_user,
         "items": items,
-        "note": ("Список повторяющихся (регулярных) задач из реестра агента. Bitrix не отдаёт список "
-                 "шаблонов через REST, поэтому здесь задачи, созданные через агента (create_recurring_task). "
-                 "next_execution — ближайшее авто-создание задачи."),
+        "note": ("Повторяющиеся задачи из реестра агента. Их создаёт СОБСТВЕННЫЙ планировщик приложения "
+                 "(не Bitrix — там нет подписки): next_run_at — ближайшее авто-создание, last_task_id — "
+                 "последняя созданная задача. Остановить: delete_recurring_task."),
     }
+
+
+def tool_delete_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
+    """Stop a recurring task: deactivate it in the registry so the scheduler no longer creates it.
+    Identify it by recurring_id (from list_recurring_tasks). Already-created task instances are not
+    touched. Requires confirm=true."""
+    rec_id = args.get("recurring_id")
+    if rec_id in (None, ""):
+        raise McpError(-32602, "Укажи recurring_id — id повторяющейся задачи из list_recurring_tasks.")
+    try:
+        rec_id = int(rec_id)
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "recurring_id должен быть числом.") from exc
+    if not _confirmed(args):
+        raise McpError(-32602, "Остановка повторяющейся задачи требует confirm=true. Сначала покажи "
+                               "пользователю задачу (list_recurring_tasks) и получи подтверждение.")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, title, schedule_desc, responsible_name, active, bitrix_template_id "
+                        "FROM bitrix_recurring_tasks WHERE id = %s", (rec_id,))
+            row = cur.fetchone()
+            if not row:
+                raise McpError(-32602, f"Повторяющаяся задача {rec_id} не найдена в реестре.")
+            row = dict(row)
+            cur.execute("UPDATE bitrix_recurring_tasks SET active=false, updated_at=now() WHERE id = %s", (rec_id,))
+    # Best-effort: also drop the dead Bitrix template for legacy (pre-scheduler) rows.
+    tpl = row.get("bitrix_template_id")
+    if tpl:
+        try:
+            _webhook_raw("task.template.delete", {"id": int(tpl)})
+        except Exception:  # noqa: BLE001
+            pass
+    return {"stopped": True, "recurring_id": rec_id, "title": row.get("title"),
+            "schedule": row.get("schedule_desc"), "responsible_name": row.get("responsible_name"),
+            "rule": "Повторяющаяся задача остановлена (active=false) — планировщик её больше не создаёт. "
+                    "Уже созданные задачи остаются."}
 
 
 # --- Bitrix task comments -------------------------------------------------
@@ -6322,7 +6797,11 @@ TOOLS: dict[str, dict[str, Any]] = {
             "tool refuses unless confirm_past_deadline=true — ask the user whether to keep it as-is (then "
             "re-call with confirm_past_deadline=true) or give a new future deadline. Every task MUST have "
             "result_criteria (what counts as done + how it is proven); if the user did not specify it, ASK — "
-            "never invent it. The tool refuses to create a task without result_criteria."
+            "never invent it. The tool refuses to create a task without result_criteria. "
+            "Optional task fields (set only when asked): соисполнители (accomplice_names/ids), "
+            "родительская задача/подзадача (parent_task_id), проект (group_id), планирование сроков "
+            "(start_plan/end_plan/time_estimate_hours), элементы CRM (crm_elements), пользовательские поля "
+            "(custom_fields, коды из list_task_userfields), файлы (attachment_ids), чек-лист (checklist)."
         ),
         "inputSchema": {
             "type": "object",
@@ -6347,6 +6826,37 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "array",
                     "items": {"type": "integer"},
                     "description": "Optional list of observer Bitrix user ids. Preferred over auditor_names when known. Merged with names; duplicates are dropped.",
+                },
+                "accomplice_names": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Соисполнители (co-executors) — полные имена из оргструктуры (fuzzy-matched; ambiguity refused).",
+                },
+                "accomplice_bitrix_user_ids": {
+                    "type": "array", "items": {"type": "integer"},
+                    "description": "Соисполнители по Bitrix id (приоритетнее имён).",
+                },
+                "parent_task_id": {"type": "integer", "description": "Родительская задача: id задачи-родителя (эта задача станет подзадачей)."},
+                "group_id": {"type": "integer", "description": "Проект/рабочая группа: id группы Bitrix, к которой привязать задачу."},
+                "start_plan": {"type": "string", "description": "Планирование сроков — плановое начало (YYYY-MM-DD[ HH:MM] / DD.MM.YYYY[ HH:MM] / ISO)."},
+                "end_plan": {"type": "string", "description": "Планирование сроков — плановое завершение (тот же формат)."},
+                "time_estimate_hours": {"type": "number", "description": "Оценка трудозатрат в часах (планирование)."},
+                "crm_elements": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Элементы CRM: привязки вида 'D_123' (сделка), 'L_45' (лид), 'C_7' (контакт), 'CO_9' (компания).",
+                },
+                "custom_fields": {
+                    "type": "object",
+                    "description": "Пользовательские поля задачи: {\"UF_...\": значение}. Коды полей — list_task_userfields.",
+                    "additionalProperties": True,
+                },
+                "attachment_ids": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Файлы к задаче: токены вложений (att_…), присланные пользователем боту; прикрепляются к файлам задачи.",
+                },
+                "checklist": {
+                    "type": "array",
+                    "items": {"type": ["string", "object"]},
+                    "description": "Чек-лист: список пунктов — строки или {title, complete}. Каждый добавляется в чек-лист задачи.",
                 },
                 "periodic": {
                     "type": "object",
@@ -6526,15 +7036,149 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_reopen_bitrix_task,
     },
+    "update_bitrix_task": {
+        "description": (
+            "Изменить существующую задачу Bitrix по точному bitrix_task_id — любой набор полей из "
+            "конструктора задачи: соисполнители (accomplice_*), наблюдатели (auditor_*), теги, "
+            "родительская задача (parent_task_id), проект (group_id), планирование сроков "
+            "(start_plan/end_plan/time_estimate_hours), элементы CRM (crm_elements), пользовательские "
+            "поля (custom_fields), срок (deadline), приоритет, ответственный, название/описание. "
+            "Списочные поля ЗАМЕНЯЮТСЯ переданным списком (передавай полный набор). Смену ответственного "
+            "или родительской задачи сначала подтверди у пользователя. Файлы к задаче — attach_files_to_task; "
+            "чек-лист — add_task_checklist; учёт времени — log_task_time; связи — link_tasks."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Точный номер задачи."},
+                "title": {"type": "string", "description": "Новое название."},
+                "description": {"type": "string", "description": "Новое описание."},
+                "deadline": {"type": "string", "description": "Новый срок (YYYY-MM-DD[ HH:MM] / DD.MM.YYYY[ HH:MM] / ISO)."},
+                "confirm_past_deadline": {"type": "boolean", "description": "true, если новый срок в прошлом и пользователь подтвердил."},
+                "priority": {"type": "string", "enum": ["normal", "high", "critical"]},
+                "responsible_name": {"type": "string", "description": "Новый ответственный по имени (подтверди у пользователя)."},
+                "responsible_bitrix_user_id": {"type": "integer", "description": "Новый ответственный по id."},
+                "accomplice_names": {"type": "array", "items": {"type": "string"}, "description": "Соисполнители по именам (заменяют текущих)."},
+                "accomplice_bitrix_user_ids": {"type": "array", "items": {"type": "integer"}, "description": "Соисполнители по id."},
+                "auditor_names": {"type": "array", "items": {"type": "string"}, "description": "Наблюдатели по именам (заменяют текущих)."},
+                "auditor_bitrix_user_ids": {"type": "array", "items": {"type": "integer"}, "description": "Наблюдатели по id."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Теги (заменяют текущие)."},
+                "parent_task_id": {"type": "integer", "description": "Родительская задача (сделать подзадачей)."},
+                "group_id": {"type": "integer", "description": "Проект/рабочая группа."},
+                "start_plan": {"type": "string", "description": "Плановое начало."},
+                "end_plan": {"type": "string", "description": "Плановое завершение."},
+                "time_estimate_hours": {"type": "number", "description": "Оценка трудозатрат, часы."},
+                "crm_elements": {"type": "array", "items": {"type": "string"}, "description": "Элементы CRM ('D_123','L_45','C_7','CO_9')."},
+                "custom_fields": {"type": "object", "description": "Пользовательские поля {\"UF_...\": значение}.", "additionalProperties": True},
+                "expected_title": {"type": "string", "description": "Опц. проверка: должно совпасть с названием индексированной задачи."},
+            },
+            "required": ["bitrix_task_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_update_bitrix_task,
+    },
+    "add_task_checklist": {
+        "description": (
+            "Добавить пункты ЧЕК-ЛИСТА к задаче Bitrix. items — список строк или объектов {title, "
+            "complete}. complete=true отмечает пункт выполненным."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Точный номер задачи."},
+                "items": {
+                    "type": "array",
+                    "items": {"type": ["string", "object"]},
+                    "description": "Пункты чек-листа: строки или {title, complete}.",
+                },
+                "expected_title": {"type": "string", "description": "Опц. проверка названия задачи."},
+            },
+            "required": ["bitrix_task_id", "items"],
+            "additionalProperties": False,
+        },
+        "handler": tool_add_task_checklist,
+    },
+    "log_task_time": {
+        "description": (
+            "Записать УЧЁТ ВРЕМЕНИ по задаче (затраченное время). Время из hours и/или minutes (или "
+            "seconds). Опц. комментарий и от чьего лица (on_behalf_*)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Точный номер задачи."},
+                "hours": {"type": "number", "description": "Часы (можно вместе с minutes)."},
+                "minutes": {"type": "number", "description": "Минуты."},
+                "seconds": {"type": "number", "description": "Секунды (если нужно точно)."},
+                "comment": {"type": "string", "description": "Комментарий к записи учёта времени."},
+                "on_behalf_bitrix_user_id": {"type": "integer", "description": "От чьего лица записать время (id)."},
+                "on_behalf_name": {"type": "string", "description": "От чьего лица записать время (имя)."},
+                "expected_title": {"type": "string", "description": "Опц. проверка названия задачи."},
+            },
+            "required": ["bitrix_task_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_log_task_time,
+    },
+    "link_tasks": {
+        "description": (
+            "Связать две задачи (СВЯЗАННЫЕ ЗАДАЧИ / зависимость для Ганта). task_id_from зависит от "
+            "task_id_to. link_type: finish_start (по умолчанию) / start_start / start_finish / "
+            "finish_finish, либо число 0..3."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id_from": {"type": "integer", "description": "Задача-источник (зависит от целевой)."},
+                "task_id_to": {"type": "integer", "description": "Целевая задача."},
+                "link_type": {"type": "string", "description": "finish_start | start_start | start_finish | finish_finish (или 0..3)."},
+            },
+            "required": ["task_id_from", "task_id_to"],
+            "additionalProperties": False,
+        },
+        "handler": tool_link_tasks,
+    },
+    "add_task_reminder": {
+        "description": (
+            "Добавить НАПОМИНАНИЕ по задаче на конкретное время. remind_at — когда напомнить. Кому: "
+            "по умолчанию ответственный задачи, либо user_name/user_bitrix_user_id. Best-effort: если "
+            "портал не поддерживает напоминания через REST — вернёт внятную ошибку."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Точный номер задачи."},
+                "remind_at": {"type": "string", "description": "Когда напомнить (YYYY-MM-DD HH:MM / DD.MM.YYYY HH:MM / ISO)."},
+                "user_name": {"type": "string", "description": "Кому напомнить (имя). По умолчанию — ответственный."},
+                "user_bitrix_user_id": {"type": "integer", "description": "Кому напомнить (id)."},
+            },
+            "required": ["bitrix_task_id", "remind_at"],
+            "additionalProperties": False,
+        },
+        "handler": tool_add_task_reminder,
+    },
+    "list_task_userfields": {
+        "description": (
+            "Показать ПОЛЬЗОВАТЕЛЬСКИЕ ПОЛЯ задач (UF_*), заведённые на портале, с кодами и подписями — "
+            "чтобы использовать реальные коды в custom_fields инструментов create_bitrix_task / "
+            "update_bitrix_task, а не угадывать. Только чтение."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "handler": tool_list_task_userfields,
+    },
     "create_recurring_task": {
         "description": (
-            "Создать ПОВТОРЯЮЩУЮСЯ (регулярную) задачу Bitrix — она будет создаваться автоматически по "
-            "расписанию (например, каждую пятницу в 10:00 с дедлайном 19:00 того же дня). Реализовано как "
-            "шаблон Bitrix с репликацией. Укажи period (weekly/daily/monthly), для weekly — weekdays "
+            "Создать ПОВТОРЯЮЩУЮСЯ (регулярную) задачу — она будет создаваться автоматически по "
+            "расписанию (например, каждую пятницу в 10:00 с дедлайном 19:00 того же дня). Расписание "
+            "ведёт СОБСТВЕННЫЙ планировщик агента (в Bitrix нет подписки на регулярные задачи, поэтому "
+            "штатный механизм там не работает) — приложение само создаёт обычную разовую задачу в срок. "
+            "Укажи period (weekly/daily/monthly), для weekly — weekdays "
             "(MO/TU/WE/TH/FR/SA/SU), create_time (во сколько создавать, ЧЧ:ММ) и срок каждой задачи: "
             "deadline_time (ЧЧ:ММ того же дня; если раньше create_time — считается следующий день) ИЛИ "
             "deadline_after_hours. Постановщик (creator) по умолчанию = текущий собеседник. Как и обычная "
-            "задача, требует result_criteria. Просмотр всех повторяющихся задач — list_recurring_tasks."
+            "задача, требует result_criteria. Можно задать соисполнителей/наблюдателей/теги/проект/CRM/"
+            "пользовательские поля/чек-лист — они попадут в каждую созданную задачу. Просмотр — "
+            "list_recurring_tasks, остановка — delete_recurring_task."
         ),
         "inputSchema": {
             "type": "object",
@@ -6554,6 +7198,16 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "creator_name": {"type": "string", "description": "Постановщик по имени (по умолчанию — текущий собеседник)."},
                 "creator_bitrix_user_id": {"type": "integer", "description": "Постановщик по id (по умолчанию — текущий собеседник)."},
                 "until": {"type": "string", "description": "Дата окончания повторов YYYY-MM-DD или DD.MM.YYYY (по умолчанию бессрочно)."},
+                "priority": {"type": "string", "enum": ["normal", "high", "critical"], "description": "Приоритет каждой задачи."},
+                "accomplice_names": {"type": "array", "items": {"type": "string"}, "description": "Соисполнители по именам."},
+                "accomplice_bitrix_user_ids": {"type": "array", "items": {"type": "integer"}, "description": "Соисполнители по id."},
+                "auditor_names": {"type": "array", "items": {"type": "string"}, "description": "Наблюдатели по именам."},
+                "auditor_bitrix_user_ids": {"type": "array", "items": {"type": "integer"}, "description": "Наблюдатели по id."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Теги задачи."},
+                "group_id": {"type": "integer", "description": "Проект/рабочая группа."},
+                "crm_elements": {"type": "array", "items": {"type": "string"}, "description": "Элементы CRM ('D_123','L_45','C_7','CO_9')."},
+                "custom_fields": {"type": "object", "description": "Пользовательские поля {\"UF_...\": значение}.", "additionalProperties": True},
+                "checklist": {"type": "array", "items": {"type": ["string", "object"]}, "description": "Чек-лист: строки или {title, complete}."},
             },
             "required": ["title", "period", "result_criteria"],
             "additionalProperties": False,
@@ -6578,6 +7232,23 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_list_recurring_tasks,
+    },
+    "delete_recurring_task": {
+        "description": (
+            "Остановить ПОВТОРЯЮЩУЮСЯ задачу — планировщик перестанет её создавать. Определи по "
+            "recurring_id из list_recurring_tasks. Уже созданные задачи не трогаются. Требует "
+            "confirm=true после показа задачи пользователю."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recurring_id": {"type": "integer", "description": "id повторяющейся задачи из list_recurring_tasks."},
+                "confirm": {"type": "boolean", "description": "Должно быть true — пользователь подтвердил остановку."},
+            },
+            "required": ["recurring_id", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_delete_recurring_task,
     },
     "list_chats": {
         "description": "List active non-excluded chats, optionally with message counts for a period.",
@@ -7711,8 +8382,13 @@ CORE_TOOL_NAMES: set[str] = {
     "get_task_comments",
     "add_bitrix_task_comment",
     "create_bitrix_task",
+    "update_bitrix_task",
+    "add_task_checklist",
+    "log_task_time",
+    "link_tasks",
     "create_recurring_task",
     "list_recurring_tasks",
+    "delete_recurring_task",
     "complete_bitrix_task",
     "reopen_bitrix_task",
     "delete_bitrix_task",

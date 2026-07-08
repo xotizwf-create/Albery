@@ -69,6 +69,9 @@ ALWAYS_APPLY_MIGRATIONS = [
     "044_task_tools_attachments.sql",
     # Idempotent: registry of recurring (regular) Bitrix tasks created via the agent.
     "045_recurring_tasks.sql",
+    # Idempotent: recurring tasks fired by the agent's own scheduler (not Bitrix REPLICATE) —
+    # adds scheduling state (next_run_at/last_*) + a jsonb spec to reproduce the one-off task.
+    "046_recurring_tasks_scheduler.sql",
 ]
 
 

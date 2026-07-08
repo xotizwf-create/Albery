@@ -203,20 +203,99 @@ def test_recurring_tools_registered(ctx=None):
     assert "create_recurring_task" not in cs.FAQ_TOOL_NAMES
 
 
-def test_replicate_params_weekly_friday():
+def test_full_task_capability_tools_registered():
     import mcp.context_server as cs
 
-    rp = cs._build_replicate_params("weekly", 1, [5], None, "10:00", None)
-    assert rp["PERIOD"] == "weekly" and rp["WEEK_DAYS"] == [5] and rp["TIME"] == "10:00"
-    assert rp["EVERY_WEEK"] == 1 and rp["END_TYPE"] == "never"
+    new_tools = {"update_bitrix_task", "add_task_checklist", "log_task_time", "link_tasks",
+                 "add_task_reminder", "list_task_userfields", "delete_recurring_task"}
+    assert new_tools <= set(cs.TOOLS), f"missing: {sorted(new_tools - set(cs.TOOLS))}"
+    # High-frequency ones reachable via the chat bot core; mutating ones off the read-only FAQ tier.
+    assert {"update_bitrix_task", "add_task_checklist", "log_task_time", "link_tasks",
+            "delete_recurring_task"} <= set(cs.CORE_TOOL_NAMES)
+    assert not (new_tools & set(cs.FAQ_TOOL_NAMES))
+    # create_bitrix_task now exposes the full field palette.
+    props = cs.TOOLS["create_bitrix_task"]["inputSchema"]["properties"]
+    for field in ("accomplice_names", "parent_task_id", "group_id", "start_plan", "crm_elements",
+                  "custom_fields", "attachment_ids", "checklist"):
+        assert field in props, f"create_bitrix_task missing {field}"
 
 
-def test_replicate_params_monthly_and_until():
+def test_recurring_next_run_weekly_friday():
+    import mcp.context_server as cs
+    from datetime import datetime
+
+    after = datetime(2026, 7, 8, 12, 0, tzinfo=cs._MSK_TZ)  # Wednesday noon
+    nxt = cs._recurring_next_run("weekly", 1, [5], None, "10:00", after=after)
+    assert (nxt.year, nxt.month, nxt.day) == (2026, 7, 10)  # next Friday
+    assert (nxt.hour, nxt.minute) == (10, 0)
+    assert nxt.tzinfo is not None
+
+
+def test_recurring_next_run_daily_same_then_next_day():
+    import mcp.context_server as cs
+    from datetime import datetime
+
+    after = datetime(2026, 7, 8, 12, 0, tzinfo=cs._MSK_TZ)
+    same = cs._recurring_next_run("daily", 1, [], None, "15:00", after=after)
+    assert (same.day, same.hour) == (8, 15)  # later today
+    nextday = cs._recurring_next_run("daily", 1, [], None, "09:00", after=after)
+    assert (nextday.day, nextday.hour) == (9, 9)  # 09:00 already passed today -> tomorrow
+
+
+def test_recurring_next_run_monthly_and_interval_skip():
+    import mcp.context_server as cs
+    from datetime import datetime, date
+
+    after = datetime(2026, 7, 8, 12, 0, tzinfo=cs._MSK_TZ)
+    monthly = cs._recurring_next_run("monthly", 1, [], 15, "09:30", after=after)
+    assert (monthly.month, monthly.day, monthly.hour, monthly.minute) == (7, 15, 9, 30)
+
+    # every 2 weeks from Fri 10th -> skip the 17th, fire the 24th
+    biweekly = cs._recurring_next_run("weekly", 2, [5], None, "10:00",
+                                      after=datetime(2026, 7, 10, 12, 0, tzinfo=cs._MSK_TZ),
+                                      anchor=date(2026, 7, 10))
+    assert (biweekly.month, biweekly.day) == (7, 24)
+
+
+def test_recurring_monthly_day31_clamps_to_short_month():
+    import mcp.context_server as cs
+    from datetime import datetime
+
+    after = datetime(2026, 6, 1, 0, 0, tzinfo=cs._MSK_TZ)  # June has 30 days
+    nxt = cs._recurring_next_run("monthly", 1, [], 31, "10:00", after=after)
+    assert (nxt.month, nxt.day) == (6, 30)  # 31 clamped to last day of June
+
+
+def test_assemble_task_fields_full_and_minimal():
     import mcp.context_server as cs
 
-    rp = cs._build_replicate_params("monthly", 2, [], 15, "09:30", "31.12.2026")
-    assert rp["PERIOD"] == "monthly" and rp["MONTHLY_DAY_NUM"] == 15
-    assert rp["MONTHLY_MONTH_NUM_1"] == 2 and rp["END_DATE"] == "31.12.2026"
+    f = cs._assemble_task_fields(
+        title="T", description="D", responsible_id=5, deadline_iso="2026-07-10T19:00:00+03:00",
+        priority=2, auditor_ids=[7], accomplice_ids=[8, 9], creator_id=3, tags=["a"],
+        parent_task_id=100, group_id=12, start_plan="2026-07-10T10:00:00+03:00",
+        end_plan="2026-07-11T10:00:00+03:00", time_estimate_seconds=3600,
+        crm_elements=["D_5"], custom_fields={"UF_X": "v"})
+    assert f["RESPONSIBLE_ID"] == 5 and f["ACCOMPLICES"] == [8, 9] and f["AUDITORS"] == [7]
+    assert f["CREATED_BY"] == 3 and f["PARENT_ID"] == 100 and f["GROUP_ID"] == 12
+    assert f["TIME_ESTIMATE"] == 3600 and f["UF_CRM_TASK"] == ["D_5"] and f["UF_X"] == "v"
+    assert f["SE_PARAMETER"] == [{"CODE": 3, "VALUE": "Y"}]  # result always required
+
+    minimal = cs._assemble_task_fields(title="T", description="D", responsible_id=5,
+                                       deadline_iso="2026-07-10T19:00:00+03:00")
+    for k in ("ACCOMPLICES", "AUDITORS", "PARENT_ID", "GROUP_ID", "UF_CRM_TASK", "TAGS", "CREATED_BY"):
+        assert k not in minimal
+
+
+def test_clean_crm_and_custom_fields():
+    import mcp.context_server as cs
+    import pytest
+
+    assert cs._clean_crm_elements(["D_5", "lead_9", "CO_3"]) == ["D_5", "L_9", "CO_3"]
+    assert cs._clean_custom_fields({"uf_auto_1": "x"}) == {"UF_AUTO_1": "x"}
+    with pytest.raises(cs.McpError):
+        cs._clean_custom_fields({"BADKEY": 1})
+    with pytest.raises(cs.McpError):
+        cs._clean_crm_elements(["nonsense!!"])
 
 
 def test_recurring_schedule_desc_friday_1000_1900():
