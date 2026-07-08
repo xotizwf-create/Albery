@@ -1836,14 +1836,20 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
         if clean_tags:
             fields["TAGS"] = clean_tags
 
+    # Recurring tasks are NOT created here: the v3 tasks.task.add silently drops IS_REGULAR
+    # (verified — the task comes back isRegular=null). Redirect to the dedicated tool, which uses
+    # the working Bitrix REPLICATE task-template mechanism.
     periodic_arg = args.get("periodic")
     is_periodic = False
     regular_parameters: dict[str, Any] | None = None
     if isinstance(periodic_arg, dict) and periodic_arg:
-        regular_parameters = _build_bitrix_regular_parameters(periodic_arg)
-        fields["IS_REGULAR"] = "Y"
-        fields["REGULAR_PARAMETERS"] = regular_parameters
-        is_periodic = True
+        raise McpError(
+            -32602,
+            "Для ПОВТОРЯЮЩЕЙСЯ (регулярной) задачи используй инструмент create_recurring_task "
+            "(create_bitrix_task делает только разовые). Передай period (daily/weekly/monthly), для "
+            "weekly — weekdays, create_time (во сколько создавать) и срок каждой задачи (deadline_time "
+            "или deadline_after_hours).",
+        )
 
     response = _bitrix_call_with_fallback("tasks.task.add", {"fields": fields})
     result = response.get("result") if isinstance(response, dict) else {}
@@ -2312,6 +2318,277 @@ def tool_reopen_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
         "bitrix_response": reopened_response.get("result") if isinstance(reopened_response, dict) else reopened_response,
         "rule": "Reopen requires exact bitrix_task_id, reason, and confirm=true after checking the result/comments. "
                 "Pass new_deadline to renew with a new due date.",
+    }
+
+
+# --- Recurring (regular) tasks -------------------------------------------------------------
+# Bitrix stores a recurring task as a REPLICATE task TEMPLATE (task.template.add {data:...}); it
+# then spawns real tasks on schedule. Verified on the portal: PERIOD='daily'|'weekly'|'monthly',
+# weekly WEEK_DAYS=[1..7] (Mon=1..Sun=7, e.g. 5=Friday), TIME='HH:MM' = creation time,
+# DEADLINE_AFTER=seconds = deadline offset from creation. The template REST has NO list method, so
+# we mirror every recurring task we create into bitrix_recurring_tasks (migration 045) and list from
+# there (enriched with the live NEXT_EXECUTION_TIME via task.template.get).
+
+_WEEKDAY_NUM = {"MO": 1, "TU": 2, "WE": 3, "TH": 4, "FR": 5, "SA": 6, "SU": 7}
+_WEEKDAY_RU = {1: "понедельник", 2: "вторник", 3: "среда", 4: "четверг", 5: "пятница", 6: "суббота", 7: "воскресенье"}
+
+
+def _parse_hhmm(value: Any, field: str, default: str | None = None) -> str:
+    s = str(value or "").strip()
+    if not s and default is not None:
+        return default
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if not m or not (0 <= int(m.group(1)) <= 23) or not (0 <= int(m.group(2)) <= 59):
+        raise McpError(-32602, f"{field} должно быть в формате ЧЧ:ММ (например 10:00).")
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def _recurring_schedule_desc(period: str, interval: int, weekday_nums: list[int],
+                             day_of_month: int | None, create_time: str, deadline_desc: str) -> str:
+    every = "" if interval == 1 else f"каждые {interval} "
+    if period == "daily":
+        base = "каждый день" if interval == 1 else f"каждые {interval} дн."
+    elif period == "weekly":
+        days = ", ".join(_WEEKDAY_RU.get(n, str(n)) for n in weekday_nums)
+        base = f"еженедельно ({days})" if interval == 1 else f"каждые {interval} нед. ({days})"
+    else:
+        base = f"ежемесячно, {day_of_month} числа" if interval == 1 else f"каждые {interval} мес., {day_of_month} числа"
+    txt = f"{base}, создание в {create_time}"
+    if deadline_desc:
+        txt += f", дедлайн {deadline_desc}"
+    return txt
+
+
+def _build_replicate_params(period: str, interval: int, weekday_nums: list[int],
+                            day_of_month: int | None, create_time: str, until: str | None) -> dict[str, Any]:
+    from datetime import date as _date
+    rp: dict[str, Any] = {"TIME": create_time, "START_DATE": _date.today().strftime("%d.%m.%Y")}
+    if period == "daily":
+        rp.update({"PERIOD": "daily", "EVERY_DAY": interval})
+    elif period == "weekly":
+        rp.update({"PERIOD": "weekly", "EVERY_WEEK": interval, "WEEK_DAYS": weekday_nums})
+    else:  # monthly
+        rp.update({"PERIOD": "monthly", "MONTHLY_TYPE": 1, "MONTHLY_DAY_NUM": day_of_month, "MONTHLY_MONTH_NUM_1": interval})
+    if until:
+        rp.update({"END_TYPE": "date", "END_DATE": until, "REPEAT_TILL": "date"})
+    else:
+        rp.update({"END_TYPE": "never", "REPEAT_TILL": "endless"})
+    return rp
+
+
+def tool_create_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
+    """Create a RECURRING (regular) Bitrix task that spawns automatically on a schedule (e.g. every
+    Friday at 10:00, deadline 19:00 the same day). Implemented as a Bitrix REPLICATE task template."""
+    title = str(args.get("title") or "").strip()
+    if not title:
+        raise McpError(-32602, "Нужно указать название задачи: title.")
+    result_criteria = str(args.get("result_criteria") or "").strip()
+    if not result_criteria:
+        raise McpError(-32602, "У повторяющейся задачи ОБЯЗАН быть результат. Спроси пользователя, "
+                               "по чему поймём, что сделано, и передай result_criteria.")
+    period = str(args.get("period") or "").strip().lower()
+    if period not in {"daily", "weekly", "monthly"}:
+        raise McpError(-32602, "period должно быть daily, weekly или monthly.")
+    try:
+        interval = int(args.get("interval") or 1)
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "interval должно быть целым числом ≥ 1.") from exc
+    if interval < 1:
+        raise McpError(-32602, "interval должно быть ≥ 1.")
+
+    weekday_nums: list[int] = []
+    day_of_month: int | None = None
+    if period == "weekly":
+        raw = args.get("weekdays")
+        if not isinstance(raw, list) or not raw:
+            raise McpError(-32602, "Для weekly укажи weekdays — список дней (MO/TU/WE/TH/FR/SA/SU), например ['FR'].")
+        for code in raw:
+            c = str(code or "").strip().upper()
+            if c not in _WEEKDAY_NUM:
+                raise McpError(-32602, f"weekdays: '{code}' — неверный код. Используй MO/TU/WE/TH/FR/SA/SU.")
+            if _WEEKDAY_NUM[c] not in weekday_nums:
+                weekday_nums.append(_WEEKDAY_NUM[c])
+    elif period == "monthly":
+        try:
+            day_of_month = int(args.get("day_of_month"))
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "Для monthly укажи day_of_month (1-31).") from exc
+        if not 1 <= day_of_month <= 31:
+            raise McpError(-32602, "day_of_month должно быть 1-31.")
+
+    create_time = _parse_hhmm(args.get("create_time"), "create_time", default="10:00")
+    # Deadline: either an explicit deadline_time (same day; wraps to next day if earlier than create)
+    # or deadline_after_hours. Default: end of the creation day is not assumed — require one.
+    deadline_after_seconds: int | None = None
+    deadline_desc = ""
+    if args.get("deadline_time") not in (None, ""):
+        dl = _parse_hhmm(args.get("deadline_time"), "deadline_time")
+        ch, cm = (int(x) for x in create_time.split(":"))
+        dh, dm = (int(x) for x in dl.split(":"))
+        diff = (dh * 60 + dm) - (ch * 60 + cm)
+        if diff <= 0:
+            diff += 24 * 60  # deadline on the next day
+            deadline_desc = f"{dl} следующего дня"
+        else:
+            deadline_desc = f"{dl} того же дня"
+        deadline_after_seconds = diff * 60
+    elif args.get("deadline_after_hours") not in (None, ""):
+        try:
+            hrs = float(args.get("deadline_after_hours"))
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "deadline_after_hours должно быть числом.") from exc
+        if hrs <= 0:
+            raise McpError(-32602, "deadline_after_hours должно быть > 0.")
+        deadline_after_seconds = int(hrs * 3600)
+        deadline_desc = f"через {hrs:g} ч после создания"
+    else:
+        raise McpError(-32602, "Укажи срок каждой задачи: deadline_time (ЧЧ:ММ, напр. 19:00) или deadline_after_hours.")
+
+    until = None
+    if args.get("until"):
+        until = str(args.get("until")).strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", until) and not re.match(r"^\d{2}\.\d{2}\.\d{4}$", until):
+            raise McpError(-32602, "until должно быть YYYY-MM-DD или DD.MM.YYYY.")
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", until):
+            y, m, d = until.split("-")
+            until = f"{d}.{m}.{y}"  # Bitrix wants DD.MM.YYYY
+
+    responsible = _resolve_active_bitrix_user(args.get("responsible_bitrix_user_id"), args.get("responsible_name"))
+    creator = None
+    if args.get("creator_bitrix_user_id") not in (None, "") or args.get("creator_name"):
+        creator = _resolve_active_bitrix_user(args.get("creator_bitrix_user_id"), args.get("creator_name"))
+
+    description = str(args.get("description") or "").strip() or title
+    if "Критерий результата" not in description:
+        description += "\n\nКритерий результата: " + result_criteria
+
+    replicate = _build_replicate_params(period, interval, weekday_nums, day_of_month, create_time, until)
+    data = {
+        "TITLE": title,
+        "DESCRIPTION": description,
+        "RESPONSIBLE_ID": int(responsible["bitrix_user_id"]),
+        "CREATED_BY": int(creator["bitrix_user_id"]) if creator else int(responsible["bitrix_user_id"]),
+        "DEADLINE_AFTER": deadline_after_seconds,
+        "SE_PARAMETER": [{"CODE": 3, "VALUE": "Y"}],  # результат обязателен
+        "REPLICATE": "Y",
+        "REPLICATE_PARAMS": replicate,
+    }
+    resp = _webhook_raw("task.template.add", {"data": data})
+    res = resp.get("result") if isinstance(resp, dict) else None
+    template_id = res.get("ID") if isinstance(res, dict) else res
+    if not template_id:
+        raise McpError(-32010, f"Bitrix не создал шаблон повторяющейся задачи: {resp.get('error_description') or resp}")
+    template_id = int(template_id)
+
+    schedule_desc = _recurring_schedule_desc(period, interval, weekday_nums, day_of_month, create_time, deadline_desc)
+    next_exec = None
+    try:
+        g = _webhook_raw("task.template.get", {"id": template_id})
+        gr = g.get("result") if isinstance(g, dict) else None
+        rp = (gr.get("DATA", {}) if isinstance(gr, dict) else {}).get("REPLICATE_PARAMS", {})
+        next_exec = rp.get("NEXT_EXECUTION_TIME")
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bitrix_recurring_tasks (bitrix_template_id, title, description, "
+                    "responsible_bitrix_id, responsible_name, creator_bitrix_id, period, interval_every, "
+                    "weekdays, day_of_month, create_time, deadline_after_seconds, deadline_desc, "
+                    "schedule_desc, until_date) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (bitrix_template_id) DO UPDATE SET title=EXCLUDED.title, "
+                    "schedule_desc=EXCLUDED.schedule_desc, updated_at=now(), active=true",
+                    (template_id, title, description, int(responsible["bitrix_user_id"]),
+                     responsible.get("full_name"), (int(creator["bitrix_user_id"]) if creator else None),
+                     period, interval, weekday_nums or None, day_of_month, create_time,
+                     deadline_after_seconds, deadline_desc, schedule_desc, until))
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("recurring registry insert failed template=%s: %s", template_id, repr(exc)[:160])
+
+    return {
+        "created": True,
+        "recurring": True,
+        "bitrix_template_id": template_id,
+        "title": title,
+        "responsible": {"bitrix_user_id": responsible.get("bitrix_user_id"), "full_name": responsible.get("full_name")},
+        "creator": ({"bitrix_user_id": creator.get("bitrix_user_id"), "full_name": creator.get("full_name")} if creator else None),
+        "schedule": schedule_desc,
+        "next_execution": next_exec,
+        "period": period, "interval": interval, "weekdays": weekday_nums or None, "day_of_month": day_of_month,
+        "create_time": create_time, "deadline": deadline_desc, "until": until,
+        "rule": "Повторяющаяся задача создана как шаблон Bitrix (REPLICATE) — Bitrix сам будет создавать "
+                "задачу по расписанию. Смотреть все повторяющиеся задачи: list_recurring_tasks.",
+    }
+
+
+def tool_list_recurring_tasks(args: dict[str, Any]) -> dict[str, Any]:
+    """List recurring (regular) Bitrix tasks — all of them or for one person. Reads our registry
+    (Bitrix has no template-list REST) and enriches each with the live next-execution time."""
+    filt_user = None
+    if args.get("responsible_bitrix_user_id") not in (None, "") or args.get("responsible_name"):
+        u = _resolve_active_bitrix_user(args.get("responsible_bitrix_user_id"), args.get("responsible_name"))
+        filt_user = int(u["bitrix_user_id"])
+    include_inactive = bool(args.get("include_inactive", False))
+
+    where = [] if include_inactive else ["active"]
+    params: list[Any] = []
+    if filt_user is not None:
+        where.append("responsible_bitrix_id = %s")
+        params.append(filt_user)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if not safe_table_exists(cur, "bitrix_recurring_tasks"):
+                return {"items": [], "note": "Таблица реестра ещё не создана."}
+            cur.execute(
+                f"SELECT bitrix_template_id, title, responsible_bitrix_id, responsible_name, "
+                f"period, interval_every, weekdays, day_of_month, create_time, deadline_desc, "
+                f"schedule_desc, until_date, active, created_at "
+                f"FROM bitrix_recurring_tasks {where_sql} ORDER BY responsible_name NULLS LAST, created_at DESC",
+                params,
+            )
+            rows = cur.fetchall()
+
+    items = []
+    stale: list[int] = []
+    for r in rows:
+        row = dict(r)
+        tid = row.get("bitrix_template_id")
+        # Enrich with live next-execution + detect templates deleted in Bitrix.
+        try:
+            g = _webhook_raw("task.template.get", {"id": tid})
+            gr = g.get("result") if isinstance(g, dict) else None
+            if isinstance(gr, dict) and gr.get("DATA"):
+                row["next_execution"] = gr["DATA"].get("REPLICATE_PARAMS", {}).get("NEXT_EXECUTION_TIME")
+                row["still_in_bitrix"] = True
+            else:
+                row["still_in_bitrix"] = False
+                stale.append(tid)
+        except Exception:  # noqa: BLE001
+            row["next_execution"] = None
+            row["still_in_bitrix"] = None
+        row["created_at"] = _to_msk(row["created_at"]).isoformat() if hasattr(row.get("created_at"), "isoformat") else row.get("created_at")
+        items.append(row)
+
+    # Mark templates that no longer exist in Bitrix as inactive (best-effort).
+    if stale:
+        try:
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE bitrix_recurring_tasks SET active=false, updated_at=now() "
+                                "WHERE bitrix_template_id = ANY(%s)", (stale,))
+        except Exception:  # noqa: BLE001
+            pass
+
+    return {
+        "count": len(items),
+        "responsible_filter": filt_user,
+        "items": items,
+        "note": ("Список повторяющихся (регулярных) задач из реестра агента. Bitrix не отдаёт список "
+                 "шаблонов через REST, поэтому здесь задачи, созданные через агента (create_recurring_task). "
+                 "next_execution — ближайшее авто-создание задачи."),
     }
 
 
@@ -6249,6 +6526,59 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_reopen_bitrix_task,
     },
+    "create_recurring_task": {
+        "description": (
+            "Создать ПОВТОРЯЮЩУЮСЯ (регулярную) задачу Bitrix — она будет создаваться автоматически по "
+            "расписанию (например, каждую пятницу в 10:00 с дедлайном 19:00 того же дня). Реализовано как "
+            "шаблон Bitrix с репликацией. Укажи period (weekly/daily/monthly), для weekly — weekdays "
+            "(MO/TU/WE/TH/FR/SA/SU), create_time (во сколько создавать, ЧЧ:ММ) и срок каждой задачи: "
+            "deadline_time (ЧЧ:ММ того же дня; если раньше create_time — считается следующий день) ИЛИ "
+            "deadline_after_hours. Постановщик (creator) по умолчанию = текущий собеседник. Как и обычная "
+            "задача, требует result_criteria. Просмотр всех повторяющихся задач — list_recurring_tasks."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Название задачи."},
+                "responsible_name": {"type": "string", "description": "Имя ответственного из оргструктуры."},
+                "responsible_bitrix_user_id": {"type": "integer", "description": "Точный Bitrix id ответственного (приоритетнее имени)."},
+                "period": {"type": "string", "enum": ["daily", "weekly", "monthly"], "description": "Тип повтора."},
+                "weekdays": {"type": "array", "items": {"type": "string", "enum": ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]}, "description": "Дни недели для weekly (например ['FR'] = каждую пятницу)."},
+                "day_of_month": {"type": "integer", "minimum": 1, "maximum": 31, "description": "День месяца для monthly."},
+                "interval": {"type": "integer", "minimum": 1, "description": "Каждые N единиц (по умолчанию 1). Напр. interval=2 + weekly = раз в две недели."},
+                "create_time": {"type": "string", "description": "Время создания каждой задачи, ЧЧ:ММ (по умолчанию 10:00)."},
+                "deadline_time": {"type": "string", "description": "Срок каждой задачи, ЧЧ:ММ того же дня (напр. 19:00). Если раньше create_time — срок на следующий день."},
+                "deadline_after_hours": {"type": "number", "description": "Альтернатива deadline_time: срок через N часов после создания."},
+                "result_criteria": {"type": "string", "description": "ОБЯЗАТЕЛЬНО: по чему поймём, что задача выполнена."},
+                "description": {"type": "string", "description": "Описание задачи (необязательно)."},
+                "creator_name": {"type": "string", "description": "Постановщик по имени (по умолчанию — текущий собеседник)."},
+                "creator_bitrix_user_id": {"type": "integer", "description": "Постановщик по id (по умолчанию — текущий собеседник)."},
+                "until": {"type": "string", "description": "Дата окончания повторов YYYY-MM-DD или DD.MM.YYYY (по умолчанию бессрочно)."},
+            },
+            "required": ["title", "period", "result_criteria"],
+            "additionalProperties": False,
+        },
+        "handler": tool_create_recurring_task,
+    },
+    "list_recurring_tasks": {
+        "description": (
+            "Показать ПОВТОРЯЮЩИЕСЯ (регулярные) задачи — все или по одному человеку. Для каждой отдаёт "
+            "расписание (человекочитаемо), ближайшее авто-создание (next_execution), ответственного и "
+            "id шаблона. Используй, когда просят «какие повторяющиеся задачи у <человека>» или «покажи все "
+            "регулярные задачи». Bitrix не отдаёт список шаблонов через REST, поэтому список ведётся в "
+            "реестре агента (задачи, созданные через create_recurring_task)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "responsible_name": {"type": "string", "description": "Показать задачи этого человека (по имени)."},
+                "responsible_bitrix_user_id": {"type": "integer", "description": "Показать задачи этого человека (по id)."},
+                "include_inactive": {"type": "boolean", "description": "Включить неактивные/удалённые из Bitrix (по умолчанию нет)."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_recurring_tasks,
+    },
     "list_chats": {
         "description": "List active non-excluded chats, optionally with message counts for a period.",
         "inputSchema": {
@@ -7381,6 +7711,8 @@ CORE_TOOL_NAMES: set[str] = {
     "get_task_comments",
     "add_bitrix_task_comment",
     "create_bitrix_task",
+    "create_recurring_task",
+    "list_recurring_tasks",
     "complete_bitrix_task",
     "reopen_bitrix_task",
     "delete_bitrix_task",

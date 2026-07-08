@@ -190,3 +190,49 @@ def test_export_document_unknown_token_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "_DOC_DRAFT_DIR", tmp_path / "drafts")
     with pytest.raises(cs.McpError):
         cs.tool_export_document({"doc_token": "doc_nope", "section": "<p>x</p>"})
+
+
+def test_recurring_tools_registered(ctx=None):
+    import mcp.context_server as cs
+
+    for name in ("create_recurring_task", "list_recurring_tasks"):
+        assert name in cs.TOOLS, f"{name} not registered"
+    assert {"create_recurring_task", "list_recurring_tasks"} <= set(cs.CORE_TOOL_NAMES)
+    # viewing is read-only -> ok on FAQ; creating is not
+    # (list is fine to expose broadly; create must not be on FAQ)
+    assert "create_recurring_task" not in cs.FAQ_TOOL_NAMES
+
+
+def test_replicate_params_weekly_friday():
+    import mcp.context_server as cs
+
+    rp = cs._build_replicate_params("weekly", 1, [5], None, "10:00", None)
+    assert rp["PERIOD"] == "weekly" and rp["WEEK_DAYS"] == [5] and rp["TIME"] == "10:00"
+    assert rp["EVERY_WEEK"] == 1 and rp["END_TYPE"] == "never"
+
+
+def test_replicate_params_monthly_and_until():
+    import mcp.context_server as cs
+
+    rp = cs._build_replicate_params("monthly", 2, [], 15, "09:30", "31.12.2026")
+    assert rp["PERIOD"] == "monthly" and rp["MONTHLY_DAY_NUM"] == 15
+    assert rp["MONTHLY_MONTH_NUM_1"] == 2 and rp["END_DATE"] == "31.12.2026"
+
+
+def test_recurring_schedule_desc_friday_1000_1900():
+    import mcp.context_server as cs
+
+    d = cs._recurring_schedule_desc("weekly", 1, [5], None, "10:00", "19:00 того же дня")
+    assert "пятница" in d and "10:00" in d and "19:00" in d
+
+
+def test_parse_hhmm_validation():
+    import mcp.context_server as cs
+    import pytest
+
+    assert cs._parse_hhmm("9:5" if False else "09:00", "t") == "09:00"
+    assert cs._parse_hhmm("", "t", default="10:00") == "10:00"
+    with pytest.raises(cs.McpError):
+        cs._parse_hhmm("25:00", "t")
+    with pytest.raises(cs.McpError):
+        cs._parse_hhmm("abc", "t")

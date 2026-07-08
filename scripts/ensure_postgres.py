@@ -67,6 +67,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "043_inflight_turns.sql",
     # Idempotent: attachment store (full-text + re-upload) + task-comment mention dedupe.
     "044_task_tools_attachments.sql",
+    # Idempotent: registry of recurring (regular) Bitrix tasks created via the agent.
+    "045_recurring_tasks.sql",
 ]
 
 
