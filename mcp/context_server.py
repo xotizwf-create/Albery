@@ -8127,6 +8127,13 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
             raise McpError(-32601, f"Unknown method: {method}")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except McpError as exc:
+        tool_name = ""
+        if method == "tools/call" and isinstance(request.get("params"), dict):
+            tool_name = " tool=" + str(request["params"].get("name") or "")
+        logger.warning(
+            "MCP request rejected: method=%s%s id=%s code=%s message=%s",
+            method, tool_name, request_id, exc.code, exc.message,
+        )
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": exc.code, "message": exc.message}}
     except Exception:
         logger.exception("Unhandled MCP request error: method=%s id=%s", method, request_id)

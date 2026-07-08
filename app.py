@@ -15982,10 +15982,15 @@ def mcp_auth_error():
 
 
 def mcp_status_code(response: dict[str, Any]) -> int:
+    # Streamable-HTTP MCP clients (the official SDK, used by Hermes) only read
+    # the JSON-RPC body of 2xx responses: a tool error shipped as HTTP 4xx/5xx
+    # never reaches the agent and the call hangs until the client-side timeout
+    # (300 s per call). Every response addressed to a request id must therefore
+    # go out as HTTP 200 even when it carries an error; only unaddressable
+    # bodies (id=null, e.g. parse errors) keep a transport-level 400.
     if "error" not in response:
         return 200
-    code = response["error"].get("code")
-    return 400 if code in {-32700, -32600, -32601, -32602} else 500
+    return 200 if response.get("id") is not None else 400
 
 
 def mcp_sse_event(event: str, data: str) -> str:
