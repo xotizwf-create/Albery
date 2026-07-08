@@ -6728,7 +6728,7 @@ def _crm_resolve_category(args: dict[str, Any], required: bool = True) -> dict[s
             cid = int(cid)
         except (TypeError, ValueError) as exc:
             raise McpError(-32602, "category_id must be an integer.") from exc
-        match = next((c for c in cats if int(c.get("id") or -1) == cid), None)
+        match = next((c for c in cats if str(c.get("id")) == str(cid)), None)
         if not match:
             raise McpError(-32602, "Воронка id=%s не найдена. Существуют: %s" % (
                 cid, "; ".join(f"{c['id']} — {c.get('name')}" for c in cats)))
@@ -6878,12 +6878,17 @@ def _crm_add_stage(category_id: int, spec: dict[str, Any]) -> dict[str, Any]:
     status_id = code if int(category_id) == 0 else f"C{int(category_id)}:{code}"
     if any(str(s.get("stage_id") or "").casefold() == status_id.casefold() for s in stages):
         raise McpError(-32602, f"Стадия с кодом {status_id} уже существует — задай другой stage_code.")
+    semantics_failure = str(spec.get("semantics") or "").strip().lower() in ("failure", "fail", "провал")
     sort = spec.get("sort")
     if sort in (None, ""):
         final = [s["sort"] for s in stages if s.get("semantics") in ("success", "failure")]
         process = [s["sort"] for s in stages if s.get("semantics") not in ("success", "failure")]
-        cand = (max(process) + 10) if process else 10
-        sort = cand if not final or cand < min(final) else max(min(final) - 1, 1)
+        if semantics_failure:
+            # Bitrix requires a losing stage to sort AFTER the final stages.
+            sort = (max([s["sort"] for s in stages]) + 10) if stages else 10
+        else:
+            cand = (max(process) + 10) if process else 10
+            sort = cand if not final or cand < min(final) else max(min(final) - 1, 1)
     fields: dict[str, Any] = {
         "ENTITY_ID": _crm_stage_entity(category_id),
         "STATUS_ID": status_id,
@@ -6896,7 +6901,7 @@ def _crm_add_stage(category_id: int, spec: dict[str, Any]) -> dict[str, Any]:
             raise McpError(-32602, "color должен быть в формате #RRGGBB.")
         fields["COLOR"] = color
     semantics = str(spec.get("semantics") or "").strip().lower()
-    if semantics in ("failure", "fail", "провал"):
+    if semantics_failure:
         fields["SEMANTICS"] = "F"  # extra losing stage; success beyond the system WON is not supported
     elif semantics and semantics != "process":
         raise McpError(-32602, "semantics: только 'process' (обычная) или 'failure' (доп. проигрышная).")
