@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.14.0"
+SERVER_VERSION = "0.15.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -6658,6 +6658,693 @@ def tool_get_employee_absences(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# --- CRM: воронки сделок (deal pipelines) -------------------------------------------------------
+# The incoming webhooks have no `crm` scope (probed live 2026-07-08), but the bot local-app OAuth
+# token does — every funnel/deal tool calls Bitrix through b24bot.b24_app_method_call (auto-refresh).
+# CRM lives on the bot portal (b24-0xrp3s): user ids here are bot-portal ids, the same id space
+# _b24_active_users() / get_employee_absences use. userfieldconfig.* is NOT allowed for this token —
+# custom deal fields go through the classic crm.deal.userfield.* API.
+
+DEAL_ENTITY_TYPE_ID = 2
+_CRM_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_CRM_CODE_SANITIZE_RE = re.compile(r"[^A-Z0-9_]+")
+_CRM_DEAL_LIST_SELECT = [
+    "ID", "TITLE", "STAGE_ID", "CATEGORY_ID", "OPPORTUNITY", "CURRENCY_ID", "ASSIGNED_BY_ID",
+    "COMPANY_ID", "CONTACT_ID", "DATE_CREATE", "BEGINDATE", "CLOSEDATE", "CLOSED", "COMMENTS",
+]
+
+
+def _crm_call(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        return app_workflow_function("b24_app_method_call")(method, payload or {})
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32012, f"Bitrix CRM {method}: {str(exc)[:300]}") from exc
+
+
+def _crm_portal_deal_url(deal_id: int) -> str:
+    base = (shared_load_env_value("B24_TESTBOT_WEBHOOK_BASE") or "").strip()
+    host = urlparse(base).netloc if base else ""
+    return f"https://{host}/crm/deal/details/{int(deal_id)}/" if host else ""
+
+
+def _crm_categories() -> list[dict[str, Any]]:
+    res = _crm_call("crm.category.list", {"entityTypeId": DEAL_ENTITY_TYPE_ID}).get("result") or {}
+    cats = (res.get("categories") or []) if isinstance(res, dict) else []
+    return sorted(cats, key=lambda c: (int(c.get("sort") or 0), int(c.get("id") or 0)))
+
+
+def _crm_stage_entity(category_id: int) -> str:
+    return "DEAL_STAGE" if int(category_id) == 0 else f"DEAL_STAGE_{int(category_id)}"
+
+
+def _crm_stages(category_id: int) -> list[dict[str, Any]]:
+    rows = _crm_call(
+        "crm.status.list", {"filter": {"ENTITY_ID": _crm_stage_entity(category_id)}}
+    ).get("result") or []
+    stages = []
+    for r in rows:
+        extra = r.get("EXTRA") or {}
+        stages.append({
+            "id": int(r.get("ID") or 0),
+            "stage_id": r.get("STATUS_ID"),
+            "name": r.get("NAME"),
+            "sort": int(r.get("SORT") or 0),
+            "color": extra.get("COLOR") or r.get("COLOR"),
+            "semantics": extra.get("SEMANTICS") or r.get("SEMANTICS") or "process",
+            "system": str(r.get("SYSTEM") or "") == "Y",
+        })
+    return sorted(stages, key=lambda s: s["sort"])
+
+
+def _crm_resolve_category(args: dict[str, Any], required: bool = True) -> dict[str, Any] | None:
+    """Resolve a pipeline by category_id (exact) or pipeline_name (case-insensitive, then substring).
+    Ambiguity / not found -> readable refusal listing what exists."""
+    cats = _crm_categories()
+    cid = args.get("category_id")
+    if cid not in (None, ""):
+        try:
+            cid = int(cid)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "category_id must be an integer.") from exc
+        match = next((c for c in cats if int(c.get("id") or -1) == cid), None)
+        if not match:
+            raise McpError(-32602, "Воронка id=%s не найдена. Существуют: %s" % (
+                cid, "; ".join(f"{c['id']} — {c.get('name')}" for c in cats)))
+        return match
+    name = str(args.get("pipeline_name") or "").strip()
+    if not name:
+        if required:
+            raise McpError(-32602, "Укажи category_id или pipeline_name (список — list_crm_pipelines).")
+        return None
+    nl = name.casefold()
+    matches = [c for c in cats if str(c.get("name") or "").casefold() == nl]
+    if not matches:
+        matches = [c for c in cats if nl in str(c.get("name") or "").casefold()]
+    if not matches:
+        raise McpError(-32602, "Воронка «%s» не найдена. Существуют: %s" % (
+            name, "; ".join(f"{c['id']} — {c.get('name')}" for c in cats)))
+    if len(matches) > 1:
+        raise McpError(-32602, "Название «%s» неоднозначно: %s. Уточни category_id." % (
+            name, "; ".join(f"{c['id']} — {c.get('name')}" for c in matches)))
+    return matches[0]
+
+
+def _crm_resolve_stage(category_id: int, ref: str) -> dict[str, Any]:
+    """Resolve a stage inside a pipeline by STATUS_ID (full 'C8:NEW' or bare 'NEW') or by name."""
+    ref = str(ref or "").strip()
+    if not ref:
+        raise McpError(-32602, "Стадия не указана.")
+    stages = _crm_stages(category_id)
+    rl = ref.casefold()
+    for s in stages:
+        sid = str(s.get("stage_id") or "")
+        bare = sid.split(":", 1)[1] if ":" in sid else sid
+        if rl in (sid.casefold(), bare.casefold()):
+            return s
+    matches = [s for s in stages if str(s.get("name") or "").casefold() == rl]
+    if not matches:
+        matches = [s for s in stages if rl in str(s.get("name") or "").casefold()]
+    if not matches:
+        raise McpError(-32602, "Стадия «%s» не найдена в воронке %s. Стадии: %s" % (
+            ref, category_id, "; ".join(f"{s['stage_id']} — {s['name']}" for s in stages)))
+    if len(matches) > 1:
+        raise McpError(-32602, "Стадия «%s» неоднозначна: %s" % (
+            ref, "; ".join(f"{s['stage_id']} — {s['name']}" for s in matches)))
+    return matches[0]
+
+
+def _crm_resolve_portal_user(args: dict[str, Any], id_key: str, name_key: str) -> int | None:
+    """Bot-portal user by id or fuzzy name (same id space as get_employee_absences)."""
+    uid = args.get(id_key)
+    if uid not in (None, ""):
+        try:
+            return int(uid)
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, f"{id_key} must be an integer.") from exc
+    name = str(args.get(name_key) or "").strip()
+    if not name:
+        return None
+    actives = _b24_active_users()
+    matches = [u for u in actives if _person_names_match(u["full_name"], name)]
+    if not matches:
+        raise McpError(-32602, "Сотрудник «%s» не найден среди активных на портале. Есть: %s" % (
+            name, ", ".join(u["full_name"] for u in actives if u["full_name"])[:1500]))
+    if len(matches) > 1:
+        raise McpError(-32602, "Имя «%s» неоднозначно: %s" % (
+            name, "; ".join(f"{u['id']} — {u['full_name']}" for u in matches)))
+    return int(matches[0]["id"])
+
+
+def _crm_custom_fields_arg(args: dict[str, Any]) -> dict[str, Any]:
+    custom = args.get("custom_fields")
+    if custom in (None, ""):
+        return {}
+    if not isinstance(custom, dict):
+        raise McpError(-32602, "custom_fields должен быть объектом {\"UF_CRM_...\": значение}.")
+    bad = [k for k in custom if not str(k).upper().startswith("UF_")]
+    if bad:
+        raise McpError(-32602, "custom_fields: коды должны начинаться с UF_ (получены: %s). "
+                               "Реальные коды — list_crm_deal_fields." % ", ".join(map(str, bad)))
+    return {str(k).upper(): v for k, v in custom.items()}
+
+
+def _crm_deal_brief(row: dict[str, Any], names: dict[str, Any] | None = None) -> dict[str, Any]:
+    names = names or {}
+    deal_id = int(row.get("ID") or 0)
+    brief = {
+        "deal_id": deal_id,
+        "title": row.get("TITLE"),
+        "category_id": int(row.get("CATEGORY_ID") or 0),
+        "pipeline_name": names.get("pipeline_name"),
+        "stage_id": row.get("STAGE_ID"),
+        "stage_name": names.get("stage_name"),
+        "amount": row.get("OPPORTUNITY"),
+        "currency": row.get("CURRENCY_ID"),
+        "assigned_by_id": row.get("ASSIGNED_BY_ID"),
+        "assigned_name": names.get("assigned_name"),
+        "closed": str(row.get("CLOSED") or "") == "Y",
+        "date_create": row.get("DATE_CREATE"),
+        "close_date": row.get("CLOSEDATE"),
+        "url": _crm_portal_deal_url(deal_id) if deal_id else "",
+    }
+    return {k: v for k, v in brief.items() if v not in (None, "")}
+
+
+def _crm_deal_enrich_names(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-row {pipeline_name, stage_name, assigned_name} lookups, каждое — best-effort."""
+    cat_names: dict[int, str] = {}
+    stage_names: dict[int, dict[str, str]] = {}
+    try:
+        cat_names = {int(c["id"]): str(c.get("name") or "") for c in _crm_categories()}
+    except McpError:
+        pass
+    users: dict[str, str] = {}
+    try:
+        users = {str(u["id"]): u["full_name"] for u in _b24_active_users()}
+    except Exception:  # noqa: BLE001
+        pass
+    out = []
+    for row in rows:
+        cid = int(row.get("CATEGORY_ID") or 0)
+        if cid not in stage_names:
+            try:
+                stage_names[cid] = {s["stage_id"]: s["name"] for s in _crm_stages(cid)}
+            except McpError:
+                stage_names[cid] = {}
+        out.append({
+            "pipeline_name": cat_names.get(cid),
+            "stage_name": stage_names[cid].get(row.get("STAGE_ID")),
+            "assigned_name": users.get(str(row.get("ASSIGNED_BY_ID") or "")),
+        })
+    return out
+
+
+def _crm_stage_code(spec_code: Any, name: str) -> str:
+    code = _CRM_CODE_SANITIZE_RE.sub("_", str(spec_code or "").strip().upper()).strip("_")
+    if not code:
+        latin = _CRM_CODE_SANITIZE_RE.sub("_", str(name or "").upper()).strip("_")
+        code = latin[:20] if latin else ""
+    return code or f"S{int(time.time()) % 10**8}"
+
+
+def _crm_add_stage(category_id: int, spec: dict[str, Any]) -> dict[str, Any]:
+    name = str(spec.get("name") or "").strip()
+    if not name:
+        raise McpError(-32602, "У каждой стадии обязателен name.")
+    stages = _crm_stages(category_id)
+    code = _crm_stage_code(spec.get("stage_code"), name)
+    status_id = code if int(category_id) == 0 else f"C{int(category_id)}:{code}"
+    if any(str(s.get("stage_id") or "").casefold() == status_id.casefold() for s in stages):
+        raise McpError(-32602, f"Стадия с кодом {status_id} уже существует — задай другой stage_code.")
+    sort = spec.get("sort")
+    if sort in (None, ""):
+        final = [s["sort"] for s in stages if s.get("semantics") in ("success", "failure")]
+        process = [s["sort"] for s in stages if s.get("semantics") not in ("success", "failure")]
+        cand = (max(process) + 10) if process else 10
+        sort = cand if not final or cand < min(final) else max(min(final) - 1, 1)
+    fields: dict[str, Any] = {
+        "ENTITY_ID": _crm_stage_entity(category_id),
+        "STATUS_ID": status_id,
+        "NAME": name,
+        "SORT": int(sort),
+    }
+    color = str(spec.get("color") or "").strip()
+    if color:
+        if not _CRM_COLOR_RE.match(color):
+            raise McpError(-32602, "color должен быть в формате #RRGGBB.")
+        fields["COLOR"] = color
+    semantics = str(spec.get("semantics") or "").strip().lower()
+    if semantics in ("failure", "fail", "провал"):
+        fields["SEMANTICS"] = "F"  # extra losing stage; success beyond the system WON is not supported
+    elif semantics and semantics != "process":
+        raise McpError(-32602, "semantics: только 'process' (обычная) или 'failure' (доп. проигрышная).")
+    row_id = _crm_call("crm.status.add", {"fields": fields}).get("result")
+    return {"id": row_id, "stage_id": status_id, "name": name, "sort": int(sort)}
+
+
+def tool_list_crm_pipelines(args: dict[str, Any]) -> dict[str, Any]:
+    include_stages = args.get("include_stages") is not False
+    include_counts = args.get("include_deal_counts") is not False
+    pipelines = []
+    for c in _crm_categories():
+        cid = int(c.get("id") or 0)
+        item: dict[str, Any] = {
+            "category_id": cid,
+            "name": c.get("name"),
+            "sort": int(c.get("sort") or 0),
+            "is_default": str(c.get("isDefault") or "") == "Y",
+        }
+        if include_stages:
+            item["stages"] = _crm_stages(cid)
+        if include_counts:
+            r = _crm_call("crm.deal.list", {"filter": {"CATEGORY_ID": cid}, "select": ["ID"]})
+            item["deals_total"] = r.get("total", len(r.get("result") or []))
+        pipelines.append(item)
+    return {"portal": "b24-0xrp3s", "count": len(pipelines), "pipelines": pipelines}
+
+
+def tool_create_crm_pipeline(args: dict[str, Any]) -> dict[str, Any]:
+    name = str(args.get("name") or "").strip()
+    if not name:
+        raise McpError(-32602, "name (название воронки) обязателен.")
+    dup = [c for c in _crm_categories() if str(c.get("name") or "").casefold() == name.casefold()]
+    if dup and args.get("allow_duplicate_name") is not True:
+        raise McpError(-32602, "Воронка «%s» уже существует (id=%s). Если дубль нужен намеренно — "
+                               "передай allow_duplicate_name=true." % (name, dup[0].get("id")))
+    fields: dict[str, Any] = {"name": name}
+    if args.get("sort") not in (None, ""):
+        fields["sort"] = int(args["sort"])
+    res = _crm_call("crm.category.add", {"entityTypeId": DEAL_ENTITY_TYPE_ID, "fields": fields})
+    cat = ((res.get("result") or {}).get("category") or {}) if isinstance(res.get("result"), dict) else {}
+    cid = int(cat.get("id") or 0)
+    added, stage_errors = [], []
+    for spec in (args.get("stages") or []):
+        if isinstance(spec, str):
+            spec = {"name": spec}
+        try:
+            added.append(_crm_add_stage(cid, spec))
+        except McpError as exc:
+            stage_errors.append(str(exc))
+    out = {
+        "created": True,
+        "category_id": cid,
+        "name": cat.get("name"),
+        "stages": _crm_stages(cid),
+        "note": "Bitrix автоматически создаёт стандартный набор стадий; лишние можно удалить "
+                "через manage_crm_pipeline_stage (системные «Сделка успешна»/«Сделка провалена» не удаляются).",
+    }
+    if added:
+        out["stages_added"] = added
+    if stage_errors:
+        out["stage_errors"] = stage_errors
+    return out
+
+
+def tool_update_crm_pipeline(args: dict[str, Any]) -> dict[str, Any]:
+    cat = _crm_resolve_category(args)
+    fields: dict[str, Any] = {}
+    if str(args.get("new_name") or "").strip():
+        fields["name"] = str(args["new_name"]).strip()
+    if args.get("sort") not in (None, ""):
+        fields["sort"] = int(args["sort"])
+    if not fields:
+        raise McpError(-32602, "Нечего менять: укажи new_name и/или sort.")
+    res = _crm_call("crm.category.update",
+                    {"entityTypeId": DEAL_ENTITY_TYPE_ID, "id": int(cat["id"]), "fields": fields})
+    updated = ((res.get("result") or {}).get("category") or {}) if isinstance(res.get("result"), dict) else {}
+    return {"updated": True, "category_id": int(cat["id"]),
+            "name": updated.get("name") or fields.get("name") or cat.get("name")}
+
+
+def tool_delete_crm_pipeline(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Удаление воронки требует подтверждения: покажи пользователю точную "
+                               "воронку (id, название, сколько в ней сделок) и вызови с confirm=true.")
+    cat = _crm_resolve_category(args)
+    cid = int(cat["id"])
+    if str(cat.get("isDefault") or "") == "Y" or cid == 0:
+        raise McpError(-32602, "Основную (default) воронку удалять нельзя.")
+    expected = str(args.get("expected_name") or "").strip()
+    if expected and expected.casefold() != str(cat.get("name") or "").casefold():
+        raise McpError(-32602, "expected_name не совпал: воронка id=%s называется «%s». Удаление отменено."
+                       % (cid, cat.get("name")))
+    r = _crm_call("crm.deal.list", {"filter": {"CATEGORY_ID": cid}, "select": ["ID"]})
+    total = r.get("total", len(r.get("result") or []))
+    if total:
+        raise McpError(-32602, "В воронке «%s» осталось сделок: %s. Сначала перенеси их в другую "
+                               "воронку (update_crm_deal) или удали — потом удаляй воронку." % (cat.get("name"), total))
+    _crm_call("crm.category.delete", {"entityTypeId": DEAL_ENTITY_TYPE_ID, "id": cid})
+    return {"deleted": True, "category_id": cid, "name": cat.get("name")}
+
+
+def tool_manage_crm_pipeline_stage(args: dict[str, Any]) -> dict[str, Any]:
+    action = str(args.get("action") or "").strip().lower()
+    if action not in ("add", "update", "delete"):
+        raise McpError(-32602, "action: add | update | delete.")
+    if action == "delete" and args.get("confirm") is not True:
+        raise McpError(-32602, "Удаление стадии требует подтверждения: покажи пользователю стадию "
+                               "и воронку, затем вызови с confirm=true.")
+    cat = _crm_resolve_category(args)
+    cid = int(cat["id"])
+
+    if action == "add":
+        created = _crm_add_stage(cid, {
+            "name": args.get("name"), "stage_code": args.get("stage_code"), "sort": args.get("sort"),
+            "color": args.get("color"), "semantics": args.get("semantics"),
+        })
+        return {"added": created, "pipeline": cat.get("name"), "stages": _crm_stages(cid)}
+
+    stage = _crm_resolve_stage(cid, args.get("stage") or args.get("name"))
+    if action == "delete":
+        if stage.get("system"):
+            raise McpError(-32602, "Стадия «%s» системная — Bitrix не даёт её удалить." % stage.get("name"))
+        r = _crm_call("crm.deal.list", {"filter": {"STAGE_ID": stage["stage_id"], "CATEGORY_ID": cid},
+                                        "select": ["ID"]})
+        total = r.get("total", len(r.get("result") or []))
+        if total:
+            raise McpError(-32602, "На стадии «%s» стоят сделки: %s. Сначала перенеси их "
+                                   "(update_crm_deal), потом удаляй стадию." % (stage.get("name"), total))
+        _crm_call("crm.status.delete", {"id": int(stage["id"])})
+        return {"deleted": True, "stage_id": stage["stage_id"], "name": stage.get("name"),
+                "pipeline": cat.get("name")}
+
+    fields: dict[str, Any] = {}
+    if str(args.get("new_name") or "").strip():
+        fields["NAME"] = str(args["new_name"]).strip()
+    if args.get("sort") not in (None, ""):
+        fields["SORT"] = int(args["sort"])
+    color = str(args.get("color") or "").strip()
+    if color:
+        if not _CRM_COLOR_RE.match(color):
+            raise McpError(-32602, "color должен быть в формате #RRGGBB.")
+        fields["COLOR"] = color
+    if not fields:
+        raise McpError(-32602, "Нечего менять: укажи new_name, sort и/или color.")
+    _crm_call("crm.status.update", {"id": int(stage["id"]), "fields": fields})
+    return {"updated": True, "stage_id": stage["stage_id"], "pipeline": cat.get("name"),
+            "stages": _crm_stages(cid)}
+
+
+def tool_list_crm_deal_fields(args: dict[str, Any]) -> dict[str, Any]:
+    rows = _crm_call("crm.deal.userfield.list", {}).get("result") or []
+    custom = []
+    for r in rows:
+        label = r.get("EDIT_FORM_LABEL")
+        if isinstance(label, dict):
+            label = label.get("ru") or label.get("en") or next(iter(label.values()), "")
+        custom.append({
+            "id": int(r.get("ID") or 0),
+            "field_code": r.get("FIELD_NAME"),
+            "type": r.get("USER_TYPE_ID"),
+            "label": label,
+            "multiple": str(r.get("MULTIPLE") or "") == "Y",
+            "mandatory": str(r.get("MANDATORY") or "") == "Y",
+            "show_in_list": str(r.get("SHOW_IN_LIST") or "") == "Y",
+            "settings": r.get("SETTINGS") or {},
+        })
+    out: dict[str, Any] = {"custom_fields": custom, "custom_count": len(custom)}
+    if args.get("include_standard") is True:
+        std = _crm_call("crm.deal.fields", {}).get("result") or {}
+        out["standard_fields"] = {
+            code: {"type": meta.get("type"), "title": meta.get("formLabel") or meta.get("title") or code}
+            for code, meta in std.items() if isinstance(meta, dict) and not code.startswith("UF_")
+        }
+    else:
+        out["note"] = "Стандартные поля сделки — вызови с include_standard=true."
+    return out
+
+
+_CRM_UF_TYPES = {"string", "integer", "double", "boolean", "date", "datetime", "money", "url",
+                 "enumeration", "employee", "file", "address"}
+
+
+def tool_manage_crm_deal_field(args: dict[str, Any]) -> dict[str, Any]:
+    action = str(args.get("action") or "").strip().lower()
+    if action not in ("add", "update", "delete"):
+        raise McpError(-32602, "action: add | update | delete.")
+    if action == "delete" and args.get("confirm") is not True:
+        raise McpError(-32602, "Удаление поля СТИРАЕТ его значения во всех сделках. Покажи "
+                               "пользователю точное поле и вызови с confirm=true (после подтверждения).")
+
+    def _resolve_existing() -> dict[str, Any]:
+        rows = _crm_call("crm.deal.userfield.list", {}).get("result") or []
+        fid = args.get("field_id")
+        if fid not in (None, ""):
+            match = next((r for r in rows if str(r.get("ID")) == str(fid)), None)
+            if not match:
+                raise McpError(-32602, f"Пользовательское поле id={fid} не найдено.")
+            return match
+        code = str(args.get("field_code") or "").strip().upper()
+        if not code:
+            raise McpError(-32602, "Укажи field_code (UF_CRM_...) или field_id.")
+        if not code.startswith("UF_"):
+            code = "UF_CRM_" + code
+        match = next((r for r in rows if str(r.get("FIELD_NAME") or "").upper() == code), None)
+        if not match:
+            raise McpError(-32602, "Поле %s не найдено. Существуют: %s" % (
+                code, ", ".join(str(r.get("FIELD_NAME")) for r in rows) or "(нет пользовательских полей)"))
+        return match
+
+    if action == "add":
+        label = str(args.get("label") or "").strip()
+        if not label:
+            raise McpError(-32602, "label (человеческое название поля) обязателен.")
+        ftype = str(args.get("type") or "string").strip().lower()
+        if ftype not in _CRM_UF_TYPES:
+            raise McpError(-32602, "type: %s." % ", ".join(sorted(_CRM_UF_TYPES)))
+        code = _CRM_CODE_SANITIZE_RE.sub("_", str(args.get("field_code") or "").strip().upper()).strip("_")
+        if code and not code.startswith("UF_"):
+            code = "UF_CRM_" + code
+        if not code:
+            code = f"UF_CRM_F{int(time.time()) % 10**8}"
+        fields: dict[str, Any] = {
+            "FIELD_NAME": code,
+            "USER_TYPE_ID": ftype,
+            "EDIT_FORM_LABEL": {"ru": label, "en": label},
+            "LIST_COLUMN_LABEL": {"ru": label, "en": label},
+            "LIST_FILTER_LABEL": {"ru": label, "en": label},
+            "MANDATORY": "Y" if args.get("mandatory") is True else "N",
+            "MULTIPLE": "Y" if args.get("multiple") is True else "N",
+            "SHOW_IN_LIST": "N" if args.get("show_in_list") is False else "Y",
+        }
+        items = args.get("list_items")
+        if ftype == "enumeration":
+            if not (isinstance(items, list) and items):
+                raise McpError(-32602, "Для type=enumeration обязателен list_items — список вариантов.")
+            fields["LIST"] = [{"VALUE": str(v), "SORT": (i + 1) * 100} for i, v in enumerate(items)]
+        elif items:
+            raise McpError(-32602, "list_items имеет смысл только при type=enumeration.")
+        uf_id = _crm_call("crm.deal.userfield.add", {"fields": fields}).get("result")
+        return {"added": True, "field_id": uf_id, "field_code": code, "type": ftype, "label": label,
+                "note": "Код поля используй в custom_fields инструментов create_crm_deal/update_crm_deal."}
+
+    existing = _resolve_existing()
+    code = existing.get("FIELD_NAME")
+    if action == "delete":
+        _crm_call("crm.deal.userfield.delete", {"id": int(existing["ID"])})
+        return {"deleted": True, "field_code": code}
+
+    fields = {}
+    label = str(args.get("label") or "").strip()
+    if label:
+        fields["EDIT_FORM_LABEL"] = {"ru": label, "en": label}
+        fields["LIST_COLUMN_LABEL"] = {"ru": label, "en": label}
+        fields["LIST_FILTER_LABEL"] = {"ru": label, "en": label}
+    if args.get("mandatory") in (True, False):
+        fields["MANDATORY"] = "Y" if args["mandatory"] else "N"
+    if args.get("show_in_list") in (True, False):
+        fields["SHOW_IN_LIST"] = "Y" if args["show_in_list"] else "N"
+    items = args.get("list_items")
+    if items:
+        if str(existing.get("USER_TYPE_ID")) != "enumeration":
+            raise McpError(-32602, "list_items можно менять только у поля типа enumeration.")
+        fields["LIST"] = [{"VALUE": str(v), "SORT": (i + 1) * 100} for i, v in enumerate(items)]
+    if not fields:
+        raise McpError(-32602, "Нечего менять: укажи label, mandatory, show_in_list и/или list_items.")
+    _crm_call("crm.deal.userfield.update", {"id": int(existing["ID"]), "fields": fields})
+    return {"updated": True, "field_code": code}
+
+
+def tool_list_crm_deals(args: dict[str, Any]) -> dict[str, Any]:
+    limit = min(int(args.get("limit") or 50), 200)
+    offset = max(int(args.get("offset") or 0), 0)
+    filt: dict[str, Any] = {}
+    cat = _crm_resolve_category(args, required=False)
+    if cat is not None:
+        filt["CATEGORY_ID"] = int(cat["id"])
+    stage_ref = str(args.get("stage") or "").strip()
+    if stage_ref:
+        if cat is not None:
+            filt["STAGE_ID"] = _crm_resolve_stage(int(cat["id"]), stage_ref)["stage_id"]
+        elif ":" in stage_ref or stage_ref.upper() == stage_ref:
+            filt["STAGE_ID"] = stage_ref
+        else:
+            raise McpError(-32602, "Для поиска по названию стадии укажи и воронку "
+                                   "(category_id/pipeline_name), либо передай точный STAGE_ID ('C8:NEW').")
+    if args.get("include_closed") is False:
+        filt["CLOSED"] = "N"
+    assigned = _crm_resolve_portal_user(args, "assigned_bitrix_user_id", "assigned_name")
+    if assigned is not None:
+        filt["ASSIGNED_BY_ID"] = assigned
+    search = str(args.get("search") or "").strip()
+    if search:
+        filt["%TITLE"] = search
+    select = list(_CRM_DEAL_LIST_SELECT) + (["UF_*"] if args.get("include_custom_fields") is True else [])
+
+    rows: list[dict[str, Any]] = []
+    start = offset
+    total = 0
+    while len(rows) < limit:
+        r = _crm_call("crm.deal.list", {"order": {"DATE_CREATE": "DESC"}, "filter": filt,
+                                        "select": select, "start": start})
+        page = r.get("result") or []
+        total = r.get("total", len(page))
+        rows.extend(page)
+        nxt = r.get("next")
+        if not page or nxt in (None, "", start):
+            break
+        start = nxt
+    rows = rows[:limit]
+    names = _crm_deal_enrich_names(rows)
+    deals = []
+    for row, nm in zip(rows, names):
+        item = _crm_deal_brief(row, nm)
+        if args.get("include_custom_fields") is True:
+            uf = {k: v for k, v in row.items() if k.startswith("UF_") and v not in (None, "", [])}
+            if uf:
+                item["custom_fields"] = uf
+        deals.append(item)
+    return {"total": total, "returned": len(deals), "offset": offset, "deals": deals}
+
+
+def tool_get_crm_deal(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        deal_id = int(args.get("deal_id"))
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "deal_id must be an integer.") from exc
+    row = _crm_call("crm.deal.get", {"id": deal_id}).get("result") or {}
+    names = _crm_deal_enrich_names([row])[0]
+    out = _crm_deal_brief(row, names)
+    out["comments"] = row.get("COMMENTS") or ""
+    out["custom_fields"] = {k: v for k, v in row.items() if k.startswith("UF_") and v not in (None, "", [])}
+    out["fields"] = {k: v for k, v in row.items()
+                     if not k.startswith("UF_") and v not in (None, "", []) and k not in
+                     ("TITLE", "STAGE_ID", "CATEGORY_ID", "OPPORTUNITY", "CURRENCY_ID",
+                      "ASSIGNED_BY_ID", "DATE_CREATE", "CLOSEDATE", "CLOSED", "COMMENTS", "ID")}
+    return out
+
+
+def _crm_deal_common_fields(args: dict[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    if args.get("amount") not in (None, ""):
+        fields["OPPORTUNITY"] = float(args["amount"])
+        fields["CURRENCY_ID"] = str(args.get("currency") or "RUB").upper()
+    elif args.get("currency"):
+        fields["CURRENCY_ID"] = str(args["currency"]).upper()
+    assigned = _crm_resolve_portal_user(args, "responsible_bitrix_user_id", "responsible_name")
+    if assigned is not None:
+        fields["ASSIGNED_BY_ID"] = assigned
+    if args.get("comments") not in (None, ""):
+        fields["COMMENTS"] = str(args["comments"])
+    if args.get("begin_date") not in (None, ""):
+        fields["BEGINDATE"] = str(args["begin_date"])
+    if args.get("close_date") not in (None, ""):
+        fields["CLOSEDATE"] = str(args["close_date"])
+    if args.get("contact_id") not in (None, ""):
+        fields["CONTACT_ID"] = int(args["contact_id"])
+    if args.get("company_id") not in (None, ""):
+        fields["COMPANY_ID"] = int(args["company_id"])
+    fields.update(_crm_custom_fields_arg(args))
+    return fields
+
+
+def tool_create_crm_deal(args: dict[str, Any]) -> dict[str, Any]:
+    title = str(args.get("title") or "").strip()
+    if not title:
+        raise McpError(-32602, "title (название сделки) обязателен.")
+    fields: dict[str, Any] = {"TITLE": title}
+    cat = _crm_resolve_category(args, required=False)
+    if cat is not None:
+        fields["CATEGORY_ID"] = int(cat["id"])
+    stage_ref = str(args.get("stage") or "").strip()
+    if stage_ref:
+        cid = int(cat["id"]) if cat is not None else next(
+            (int(c["id"]) for c in _crm_categories() if str(c.get("isDefault") or "") == "Y"), 0)
+        fields["STAGE_ID"] = _crm_resolve_stage(cid, stage_ref)["stage_id"]
+    fields.update(_crm_deal_common_fields(args))
+    deal_id = _crm_call("crm.deal.add", {"fields": fields,
+                                         "params": {"REGISTER_SONET_EVENT": "Y"}}).get("result")
+    row = _crm_call("crm.deal.get", {"id": int(deal_id)}).get("result") or {}
+    return {"created": True, **_crm_deal_brief(row, _crm_deal_enrich_names([row])[0])}
+
+
+def tool_update_crm_deal(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        deal_id = int(args.get("deal_id"))
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "deal_id must be an integer.") from exc
+    current = _crm_call("crm.deal.get", {"id": deal_id}).get("result") or {}
+    expected = str(args.get("expected_title") or "").strip()
+    if expected and expected.casefold() != str(current.get("TITLE") or "").casefold():
+        raise McpError(-32602, "expected_title не совпал: сделка %s называется «%s». Изменение отменено."
+                       % (deal_id, current.get("TITLE")))
+
+    target_cat: int | None = None
+    cat = _crm_resolve_category(args, required=False)
+    if cat is not None and int(cat["id"]) != int(current.get("CATEGORY_ID") or 0):
+        target_cat = int(cat["id"])
+
+    fields: dict[str, Any] = {}
+    if str(args.get("title") or "").strip():
+        fields["TITLE"] = str(args["title"]).strip()
+    stage_ref = str(args.get("stage") or "").strip()
+    if stage_ref:
+        cid = target_cat if target_cat is not None else int(current.get("CATEGORY_ID") or 0)
+        fields["STAGE_ID"] = _crm_resolve_stage(cid, stage_ref)["stage_id"]
+    fields.update(_crm_deal_common_fields(args))
+
+    if target_cat is None and not fields:
+        raise McpError(-32602, "Нечего менять: передай хотя бы одно поле (title/stage/amount/"
+                               "responsible_*/comments/custom_fields/воронку и т.д.).")
+
+    moved = False
+    if target_cat is not None:
+        # Перенос между воронками — только через универсальный crm.item.update
+        # (crm.deal.update молча игнорирует CATEGORY_ID).
+        item_fields: dict[str, Any] = {"categoryId": target_cat}
+        if "STAGE_ID" in fields:
+            item_fields["stageId"] = fields.pop("STAGE_ID")
+        _crm_call("crm.item.update", {"entityTypeId": DEAL_ENTITY_TYPE_ID, "id": deal_id,
+                                      "fields": item_fields})
+        moved = True
+    if fields:
+        _crm_call("crm.deal.update", {"id": deal_id, "fields": fields})
+    row = _crm_call("crm.deal.get", {"id": deal_id}).get("result") or {}
+    out = {"updated": True, **_crm_deal_brief(row, _crm_deal_enrich_names([row])[0])}
+    if moved:
+        out["moved_to_pipeline"] = cat.get("name")
+    return out
+
+
+def tool_delete_crm_deal(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Удаление сделки требует подтверждения: покажи пользователю точную "
+                               "сделку (id, название, воронка, сумма) и вызови с confirm=true.")
+    try:
+        deal_id = int(args.get("deal_id"))
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "deal_id must be an integer.") from exc
+    row = _crm_call("crm.deal.get", {"id": deal_id}).get("result") or {}
+    expected = str(args.get("expected_title") or "").strip()
+    if expected and expected.casefold() != str(row.get("TITLE") or "").casefold():
+        raise McpError(-32602, "expected_title не совпал: сделка %s называется «%s». Удаление отменено."
+                       % (deal_id, row.get("TITLE")))
+    _crm_call("crm.deal.delete", {"id": deal_id})
+    return {"deleted": True, "deal_id": deal_id, "title": row.get("TITLE")}
+
+
 TOOLS: dict[str, dict[str, Any]] = {
     "get_agent_monitoring": {
         "description": (
@@ -8446,6 +9133,262 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_get_compact_export,
     },
+    "list_crm_pipelines": {
+        "description": (
+            "ВОРОНКИ CRM (сделки Bitrix): показать все воронки с их стадиями и количеством сделок. "
+            "Первый шаг любой работы с воронками/сделками — отсюда берутся category_id и коды стадий."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_stages": {"type": "boolean", "description": "Включить стадии каждой воронки (по умолчанию true)."},
+                "include_deal_counts": {"type": "boolean", "description": "Посчитать сделки в каждой воронке (по умолчанию true)."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_crm_pipelines,
+    },
+    "create_crm_pipeline": {
+        "description": (
+            "Создать НОВУЮ ВОРОНКУ CRM (направление сделок). Bitrix сам создаст стандартные стадии; "
+            "дополнительные можно передать сразу (stages) или добавить потом через "
+            "manage_crm_pipeline_stage. Перед созданием покажи пользователю название и план стадий."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Название воронки."},
+                "sort": {"type": "integer", "description": "Порядок сортировки среди воронок."},
+                "stages": {
+                    "type": "array",
+                    "items": {"type": ["string", "object"]},
+                    "description": "Доп. стадии: строки-названия или {name, stage_code?, sort?, color?, semantics?}.",
+                },
+                "allow_duplicate_name": {"type": "boolean", "description": "true — создать, даже если воронка с таким названием уже есть."},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+        "handler": tool_create_crm_pipeline,
+    },
+    "update_crm_pipeline": {
+        "description": "Переименовать воронку CRM или поменять её порядок (sort). Воронка — по category_id или pipeline_name.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category_id": {"type": "integer", "description": "id воронки (из list_crm_pipelines)."},
+                "pipeline_name": {"type": "string", "description": "Название воронки (если id неизвестен)."},
+                "new_name": {"type": "string", "description": "Новое название."},
+                "sort": {"type": "integer", "description": "Новый порядок сортировки."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_update_crm_pipeline,
+    },
+    "delete_crm_pipeline": {
+        "description": (
+            "УДАЛИТЬ воронку CRM. Жёсткое правило: сначала list_crm_pipelines, показать пользователю "
+            "точную воронку и число сделок в ней, дождаться явного подтверждения — и только затем "
+            "вызвать с confirm=true. Воронка с сделками не удаляется (сначала перенести их)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category_id": {"type": "integer", "description": "id воронки."},
+                "pipeline_name": {"type": "string", "description": "Название воронки (если id неизвестен)."},
+                "expected_name": {"type": "string", "description": "Safety-check: должно совпасть с названием воронки."},
+                "confirm": {"type": "boolean", "description": "Обязательно true после явного подтверждения пользователя."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_delete_crm_pipeline,
+    },
+    "manage_crm_pipeline_stage": {
+        "description": (
+            "СТАДИИ воронки CRM: add — добавить стадию (name; опц. stage_code/sort/color/"
+            "semantics='failure' для доп. проигрышной), update — переименовать/пересортировать/"
+            "перекрасить (stage + new_name/sort/color), delete — удалить пустую несистемную стадию "
+            "(confirm=true после подтверждения). Стадия задаётся кодом ('C8:NEW') или названием."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "update", "delete"]},
+                "category_id": {"type": "integer", "description": "id воронки."},
+                "pipeline_name": {"type": "string", "description": "Название воронки (если id неизвестен)."},
+                "stage": {"type": "string", "description": "Для update/delete: код стадии ('C8:NEW') или её название."},
+                "name": {"type": "string", "description": "Для add: название новой стадии."},
+                "new_name": {"type": "string", "description": "Для update: новое название."},
+                "stage_code": {"type": "string", "description": "Для add: латинский код стадии (A-Z, 0-9, _). По умолчанию генерируется."},
+                "sort": {"type": "integer", "description": "Порядок стадии (меньше — левее на канбане)."},
+                "color": {"type": "string", "description": "Цвет #RRGGBB."},
+                "semantics": {"type": "string", "enum": ["process", "failure"], "description": "Для add: failure — дополнительная проигрышная стадия."},
+                "confirm": {"type": "boolean", "description": "Для delete: обязательно true после подтверждения."},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        "handler": tool_manage_crm_pipeline_stage,
+    },
+    "list_crm_deal_fields": {
+        "description": (
+            "ПОЛЯ СДЕЛОК CRM: пользовательские поля (UF_CRM_*) с кодами/типами/подписями — реальные "
+            "коды для custom_fields в create_crm_deal/update_crm_deal. include_standard=true добавит "
+            "стандартные поля сделки."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_standard": {"type": "boolean", "description": "Включить стандартные поля сделки (по умолчанию false)."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_crm_deal_fields,
+    },
+    "manage_crm_deal_field": {
+        "description": (
+            "СОБСТВЕННЫЕ ПОЛЯ СДЕЛОК (UF_CRM_*): add — создать поле (label; type: string/integer/"
+            "double/boolean/date/datetime/money/url/enumeration/employee/file/address; для "
+            "enumeration обязателен list_items), update — поменять подпись/обязательность/варианты "
+            "списка, delete — удалить поле (СТИРАЕТ значения во всех сделках — только с confirm=true "
+            "после явного подтверждения). Поле задаётся field_code или field_id."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "update", "delete"]},
+                "label": {"type": "string", "description": "Человеческое название поля."},
+                "field_code": {"type": "string", "description": "Код поля UF_CRM_... (для add — опционально, сгенерируется)."},
+                "field_id": {"type": "integer", "description": "id поля (альтернатива field_code для update/delete)."},
+                "type": {"type": "string", "description": "Тип поля для add (по умолчанию string)."},
+                "list_items": {"type": "array", "items": {"type": "string"}, "description": "Варианты для type=enumeration (при update — полный новый список ДОБАВЛЯЕМЫХ вариантов)."},
+                "mandatory": {"type": "boolean", "description": "Обязательное поле."},
+                "multiple": {"type": "boolean", "description": "Множественное значение (только при add)."},
+                "show_in_list": {"type": "boolean", "description": "Показывать в списке сделок (по умолчанию true)."},
+                "confirm": {"type": "boolean", "description": "Для delete: обязательно true после подтверждения."},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        "handler": tool_manage_crm_deal_field,
+    },
+    "list_crm_deals": {
+        "description": (
+            "СДЕЛКИ CRM: список с фильтрами по воронке (category_id/pipeline_name), стадии (stage — "
+            "код или название), ответственному (assigned_name/assigned_bitrix_user_id), тексту в "
+            "названии (search). include_closed=false скроет закрытые; include_custom_fields=true "
+            "добавит UF_CRM_* поля. Сортировка — новые сверху."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category_id": {"type": "integer", "description": "id воронки."},
+                "pipeline_name": {"type": "string", "description": "Название воронки."},
+                "stage": {"type": "string", "description": "Стадия: код ('C8:NEW') или название (тогда нужна и воронка)."},
+                "assigned_name": {"type": "string", "description": "Ответственный по имени."},
+                "assigned_bitrix_user_id": {"type": "integer", "description": "Ответственный по id."},
+                "search": {"type": "string", "description": "Подстрока в названии сделки."},
+                "include_closed": {"type": "boolean", "description": "false — только открытые сделки (по умолчанию true, показываются все)."},
+                "include_custom_fields": {"type": "boolean", "description": "Вернуть и пользовательские поля UF_CRM_* (по умолчанию false)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Максимум сделок (по умолчанию 50)."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Смещение для пагинации."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_crm_deals,
+    },
+    "get_crm_deal": {
+        "description": "Одна СДЕЛКА CRM целиком: все заполненные поля, воронка/стадия по-человечески, пользовательские поля, ссылка на портал.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "deal_id": {"type": "integer", "description": "Точный id сделки."},
+            },
+            "required": ["deal_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_get_crm_deal,
+    },
+    "create_crm_deal": {
+        "description": (
+            "Создать СДЕЛКУ CRM. Обязателен title; воронка — category_id/pipeline_name (без неё — "
+            "основная), стадия — stage (без неё — первая), сумма amount (+currency, по умолчанию RUB), "
+            "ответственный responsible_name/responsible_bitrix_user_id, комментарий comments, "
+            "пользовательские поля custom_fields {UF_CRM_...: значение} (коды — list_crm_deal_fields). "
+            "Перед созданием покажи пользователю, что именно будет создано."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Название сделки."},
+                "category_id": {"type": "integer", "description": "id воронки."},
+                "pipeline_name": {"type": "string", "description": "Название воронки."},
+                "stage": {"type": "string", "description": "Стадия: код или название."},
+                "amount": {"type": "number", "description": "Сумма сделки."},
+                "currency": {"type": "string", "description": "Валюта (по умолчанию RUB)."},
+                "responsible_name": {"type": "string", "description": "Ответственный по имени."},
+                "responsible_bitrix_user_id": {"type": "integer", "description": "Ответственный по id."},
+                "comments": {"type": "string", "description": "Комментарий к сделке."},
+                "begin_date": {"type": "string", "description": "Дата начала (YYYY-MM-DD)."},
+                "close_date": {"type": "string", "description": "Плановая дата закрытия (YYYY-MM-DD)."},
+                "contact_id": {"type": "integer", "description": "id контакта CRM."},
+                "company_id": {"type": "integer", "description": "id компании CRM."},
+                "custom_fields": {"type": "object", "description": "Пользовательские поля {\"UF_CRM_...\": значение}.", "additionalProperties": True},
+            },
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+        "handler": tool_create_crm_deal,
+    },
+    "update_crm_deal": {
+        "description": (
+            "Изменить СДЕЛКУ CRM: название, стадию (stage — движение по воронке), сумму, "
+            "ответственного, комментарий, пользовательские поля; перенос в ДРУГУЮ воронку — "
+            "category_id/pipeline_name (+опц. stage целевой воронки). Указывай только то, что меняется."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "deal_id": {"type": "integer", "description": "Точный id сделки."},
+                "title": {"type": "string", "description": "Новое название."},
+                "stage": {"type": "string", "description": "Новая стадия: код или название."},
+                "category_id": {"type": "integer", "description": "Перенести в воронку с этим id."},
+                "pipeline_name": {"type": "string", "description": "Перенести в воронку с этим названием."},
+                "amount": {"type": "number", "description": "Новая сумма."},
+                "currency": {"type": "string", "description": "Валюта."},
+                "responsible_name": {"type": "string", "description": "Новый ответственный по имени."},
+                "responsible_bitrix_user_id": {"type": "integer", "description": "Новый ответственный по id."},
+                "comments": {"type": "string", "description": "Новый комментарий (заменяет прежний)."},
+                "begin_date": {"type": "string", "description": "Дата начала."},
+                "close_date": {"type": "string", "description": "Плановая дата закрытия."},
+                "contact_id": {"type": "integer", "description": "id контакта CRM."},
+                "company_id": {"type": "integer", "description": "id компании CRM."},
+                "custom_fields": {"type": "object", "description": "Пользовательские поля {\"UF_CRM_...\": значение}.", "additionalProperties": True},
+                "expected_title": {"type": "string", "description": "Safety-check: должно совпасть с текущим названием сделки."},
+            },
+            "required": ["deal_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_update_crm_deal,
+    },
+    "delete_crm_deal": {
+        "description": (
+            "УДАЛИТЬ сделку CRM. Жёсткое правило: сначала get_crm_deal, показать пользователю точную "
+            "сделку (id, название, воронка, сумма), дождаться явного подтверждения — и только затем "
+            "вызвать с confirm=true. expected_title — защита от удаления не той сделки."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "deal_id": {"type": "integer", "description": "Точный id сделки."},
+                "expected_title": {"type": "string", "description": "Safety-check: должно совпасть с названием сделки."},
+                "confirm": {"type": "boolean", "description": "Обязательно true после явного подтверждения пользователя."},
+            },
+            "required": ["deal_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_delete_crm_deal,
+    },
 }
 
 
@@ -8489,6 +9432,9 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
     "delete_zoom_call_report",
     # Per-employee usage/monitoring is management data — admin connector only.
     "get_agent_monitoring",
+    # CRM: deleting a whole funnel or a deal destroys business data — admin / explicitly-enabled only.
+    "delete_crm_pipeline",
+    "delete_crm_deal",
 }
 
 # Operational-full connector: every registered tool EXCEPT the admin-only ones above.
@@ -8536,6 +9482,12 @@ CORE_TOOL_NAMES: set[str] = {
     # dialog memory
     "get_bitrix_bot_chat",
     "list_bitrix_bot_sessions",
+    # crm funnels & deals
+    "list_crm_pipelines",
+    "list_crm_deals",
+    "get_crm_deal",
+    "create_crm_deal",
+    "update_crm_deal",
     # messaging / web
     "send_bitrix_message",
     "fetch_url",

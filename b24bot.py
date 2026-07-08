@@ -558,6 +558,17 @@ def _b24_app_access_token() -> tuple[str, str]:
     return tok.get("client_endpoint") or endpoint, new_access
 
 
+def b24_app_method_call(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Bitrix REST call with the local-app OAuth token (auto-refreshing). The app token carries the
+    `crm` scope the incoming webhooks lack, so CRM tools (funnels/deals) must go through here."""
+    client_endpoint, access_token = _b24_app_access_token()
+    if not access_token:
+        raise RuntimeError(
+            "Bitrix app OAuth token is unavailable (the bot has not stored app_tokens yet — "
+            "it needs to receive at least one portal event first).")
+    return _b24_app_call(client_endpoint, access_token, method, payload)
+
+
 def _b24_app_register_bot(client_endpoint: str, access_token: str) -> Any:
     payload = {
         "CODE": "hermes_agent",

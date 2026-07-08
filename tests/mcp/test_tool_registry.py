@@ -74,6 +74,50 @@ def test_task_management_and_attachment_tools_registered(ctx):
     assert "attach_files_to_task" not in ctx.FAQ_TOOL_NAMES
 
 
+def test_crm_funnel_tools_registered(ctx):
+    # Full funnel management for the team rollout (2026-07-08).
+    required = {
+        "list_crm_pipelines",
+        "create_crm_pipeline",
+        "update_crm_pipeline",
+        "delete_crm_pipeline",
+        "manage_crm_pipeline_stage",
+        "list_crm_deal_fields",
+        "manage_crm_deal_field",
+        "list_crm_deals",
+        "get_crm_deal",
+        "create_crm_deal",
+        "update_crm_deal",
+        "delete_crm_deal",
+    }
+    missing = required - set(ctx.TOOLS)
+    assert not missing, f"missing CRM funnel tools: {sorted(missing)}"
+    # Everyday funnel work is reachable from the chat bot's core toolset.
+    assert {"list_crm_pipelines", "list_crm_deals", "get_crm_deal",
+            "create_crm_deal", "update_crm_deal"} <= set(ctx.CORE_TOOL_NAMES)
+    # Destroying a funnel or a deal is admin-class.
+    assert {"delete_crm_pipeline", "delete_crm_deal"} <= set(ctx.OWNER_ONLY_TOOL_NAMES)
+    # CRM is private business data — never on the FAQ tier.
+    assert not (required & set(ctx.FAQ_TOOL_NAMES))
+
+
+def test_crm_delete_tools_require_confirm(ctx):
+    for tool, arguments in (
+        ("delete_crm_pipeline", {"category_id": 1}),
+        ("delete_crm_deal", {"deal_id": 1}),
+        ("manage_crm_pipeline_stage", {"action": "delete", "category_id": 1, "stage": "X"}),
+        ("manage_crm_deal_field", {"action": "delete", "field_code": "UF_CRM_X"}),
+    ):
+        resp = ctx.handle_request(
+            {"jsonrpc": "2.0", "id": 30, "method": "tools/call",
+             "params": {"name": tool, "arguments": arguments}},
+            tool_names={tool},
+            allow_owner_tools=True,
+        )
+        assert resp["error"]["code"] == -32602, f"{tool} must refuse without confirm=true"
+        assert "подтвержд" in resp["error"]["message"], f"{tool} refusal must explain the confirm gate"
+
+
 def test_add_comment_supports_author_and_result(ctx):
     schema = ctx.TOOLS["add_bitrix_task_comment"]["inputSchema"]["properties"]
     for field in ("author_bitrix_user_id", "author_name", "attachment_ids", "as_result"):
