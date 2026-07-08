@@ -2542,11 +2542,10 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
     # turn — big document HTML + lots of web browsing), the retry runs leaner so it actually
     # completes: one short web lookup at most, assemble the file in ONE export_document call.
     retry_lean = (
-        "\n\n[СИСТЕМА: предыдущая попытка оборвалась из-за нагрузки на ИИ (тяжёлый ход). "
-        "Сейчас работай МАКСИМАЛЬНО экономно и надёжно: не открывай много веб-страниц (максимум "
-        "ОДИН короткий поиск, а если данных нет — ставь плейсхолдер [заполнить] и продолжай), "
-        "не делай лишних шагов, и если нужен документ — собери его за ОДИН вызов export_document. "
-        "Цель — довести ответ до конца, а не идеальность.]"
+        "\n\n[СИСТЕМА: предыдущая попытка не завершилась. Доведи ответ до конца надёжно. Если "
+        "готовишь документ Word — собирай его ИНКРЕМЕНТАЛЬНО по частям (export_document с "
+        "section/doc_token/finalize), НЕ одним огромным вызовом: один большой вывод обрывает связь. "
+        "Каждая секция небольшая. Качество и полнота остаются прежними.]"
     )
     proc, run_fail = _hermes_run_guarded(cmd, timeout_s, dialog_id, tier, from_user_id, len(prompt),
                                          scope=_b24_scope(dialog_id, agent_slug),
