@@ -2665,35 +2665,46 @@ def tool_add_task_reminder(args: dict[str, Any]) -> dict[str, Any]:
         uid = int(task["responsible_bitrix_user_id"])
     if uid is None:
         raise McpError(-32602, "Кому напомнить не определено: передай user_name/user_bitrix_user_id.")
-    resp = _webhook_raw("task.reminder.add", {
-        "taskId": task_id,
-        "userId": uid,
-        "reminder": {"TYPE": "date", "TIME": remind_iso},
-    })
-    result = _webhook_ok(resp, "task.reminder.add")
+    # task.reminder.add wants ONE `data` object with TASK_ID/USER_ID/TYPE + DATE in Bitrix format
+    # (DD.MM.YYYY HH:MM:SS). Some portals block this action for the integration webhook user
+    # (ACTION_FAILED) — degrade to a clear, actionable message instead of a raw error.
+    bx_date = datetime.fromisoformat(remind_iso).strftime("%d.%m.%Y %H:%M:%S")
+    try:
+        resp = _webhook_raw("task.reminder.add", {
+            "data": {"TASK_ID": task_id, "USER_ID": uid, "TYPE": "date", "DATE": bx_date}})
+        result = _webhook_ok(resp, "task.reminder.add")
+    except McpError as exc:
+        raise McpError(
+            -32010,
+            "Этот портал Bitrix не разрешает ставить напоминания через REST (task.reminder.add). "
+            "Надёжные альтернативы: у задачи есть срок — Bitrix сам напомнит о дедлайне; для отдельного "
+            "напоминания в нужное время используй schedule_my_automation (агентское напоминание). "
+            "Тех.детали: " + str(exc.message)[:150]) from exc
     return {"reminder_added": True, "task_id": task_id, "user_bitrix_user_id": uid, "remind_at": remind_iso,
             "bitrix_response": result, "rule": "Напоминание по задаче добавлено (task.reminder.add)."}
 
 
 def tool_list_task_userfields(args: dict[str, Any]) -> dict[str, Any]:
-    """List the custom task fields (пользовательские поля) defined on the portal, so the agent uses
-    real UF_* codes in create/update instead of guessing. Read-only."""
-    resp = _webhook_raw("task.item.userfield.getlist", {})
-    rows = resp.get("result") if isinstance(resp, dict) else None
+    """List the custom task fields (пользовательские поля, UF_*) defined on the portal, so the agent
+    uses real UF_* codes in create/update instead of guessing. Read-only. Uses tasks.task.getFields
+    (task.item.userfield.getlist is blocked for the integration webhook on this portal)."""
+    resp = _webhook_raw("tasks.task.getFields", {})
+    result = resp.get("result") if isinstance(resp, dict) else None
+    fmap = result.get("fields") if isinstance(result, dict) and isinstance(result.get("fields"), dict) else result
     fields = []
-    for r in rows if isinstance(rows, list) else []:
-        if not isinstance(r, dict):
-            continue
-        fields.append({
-            "code": r.get("FIELD_NAME") or r.get("USER_TYPE") or r.get("ID"),
-            "label": r.get("EDIT_FORM_LABEL") or r.get("LIST_COLUMN_LABEL") or r.get("FIELD_NAME"),
-            "type": r.get("USER_TYPE_ID"),
-            "multiple": r.get("MULTIPLE"),
-            "mandatory": r.get("MANDATORY"),
-        })
+    if isinstance(fmap, dict):
+        for code, meta in fmap.items():
+            if not str(code).upper().startswith("UF_"):
+                continue
+            label, ftype = code, None
+            if isinstance(meta, dict):
+                label = meta.get("title") or meta.get("TITLE") or meta.get("EDIT_FORM_LABEL") or code
+                ftype = meta.get("type") or meta.get("TYPE")
+            fields.append({"code": code, "label": label, "type": ftype})
     return {"count": len(fields), "fields": fields,
-            "rule": "Коды пользовательских полей задач. Их значения передавай в custom_fields "
-                    "инструментов create_bitrix_task / update_bitrix_task."}
+            "rule": "Коды пользовательских полей задач (UF_*). Их значения передавай в custom_fields "
+                    "инструментов create_bitrix_task / update_bitrix_task. Пусто = на портале нет своих "
+                    "полей задач (кроме системных)."}
 
 
 # --- Recurring (regular) tasks — fired by the agent's OWN scheduler, not Bitrix ---------------
