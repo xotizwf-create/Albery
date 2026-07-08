@@ -104,3 +104,48 @@ def test_task_deep_link_none_without_portal(monkeypatch):
     monkeypatch.delenv("BITRIX_WEBHOOK_BASE", raising=False)
     monkeypatch.delenv("BITRIX_PORTAL_URL", raising=False)
     assert cs._task_deep_link(1076) is None
+
+
+def test_fetch_url_binary_doc_detection():
+    import mcp.context_server as cs
+
+    assert cs._binary_doc_ext("https://x.ru/f/report.docx", "") == "docx"
+    assert cs._binary_doc_ext("https://x.ru/f/%D0%94%D0%BE%D0%B3%D0%BE%D0%B2%D0%BE%D1%80.docx", "") == "docx"
+    assert cs._binary_doc_ext("https://x.ru/a", "application/pdf") == "pdf"
+    assert cs._binary_doc_ext("https://x.ru/a.html", "text/html; charset=utf-8") is None
+
+
+def test_reader_never_sees_private_hosts(monkeypatch):
+    import mcp.context_server as cs
+
+    monkeypatch.delenv("FETCH_URL_READER", raising=False)
+    monkeypatch.delenv("FETCH_URL_READER_EXCLUDE", raising=False)
+    # token-bearing export links and the Bitrix portal must never leak to the external reader
+    assert cs._reader_allowed_for("https://mcp.m4s.ru/zoom-export/123/tok/file.docx") is False
+    assert cs._reader_allowed_for("https://b24-0xrp3s.bitrix24.ru/company/personal/user/0/tasks/task/view/1/") is False
+    assert cs._reader_allowed_for("http://127.0.0.1:5002/x") is False
+    # public pages are allowed
+    assert cs._reader_allowed_for("https://dzen.ru/a/abc") is True
+    # kill-switch
+    monkeypatch.setenv("FETCH_URL_READER", "0")
+    assert cs._reader_allowed_for("https://dzen.ru/a/abc") is False
+
+
+def test_auth_wall_detection():
+    import mcp.context_server as cs
+
+    assert cs._looks_like_auth_wall("https://sso.passport.yandex.ru/push?x=1", "x" * 5000) is True
+    assert cs._looks_like_auth_wall("https://dzen.ru/a/abc", "короткий огрызок") is True
+    assert cs._looks_like_auth_wall("https://dzen.ru/a/abc", "т" * 1000) is False
+
+
+def test_extract_binary_document_docx_roundtrip(tmp_path):
+    import mcp.context_server as cs
+    from docx import Document
+
+    p = tmp_path / "t.docx"
+    d = Document()
+    d.add_paragraph("Договор оказания услуг — тестовый абзац.")
+    d.save(str(p))
+    text = cs._extract_binary_document(p.read_bytes(), "docx")
+    assert "Договор оказания услуг" in text

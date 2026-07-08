@@ -5110,6 +5110,116 @@ def _strip_html_to_text(html: str) -> str:
     return text.strip()
 
 
+# --- Deep link reading (parity with the Hermes Brain read-links flow) -------------------------
+# Three historical gaps vs the brain's fetch_url.py: a bot-looking UA (anti-bot sites like Dzen
+# redirect to auth), no JS rendering, and no binary-document extraction. Fixed below:
+# real browser headers; pdf/docx/xlsx by URL are extracted to text locally; and when a public
+# page comes back as an auth-wall/JS-shell, we retry through a reader proxy that renders the
+# page and returns clean text. Private/internal hosts NEVER go to the external reader.
+
+_FETCH_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
+}
+
+_BINARY_DOC_EXTS = {"pdf", "docx", "xlsx", "xlsm"}
+_BINARY_DOC_CTYPES = {
+    "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+}
+_FETCH_DOC_MAX_BYTES = int(os.getenv("FETCH_URL_DOC_MAX_BYTES", str(12 * 1024 * 1024)) or str(12 * 1024 * 1024))
+
+
+def _binary_doc_ext(url: str, content_type: str) -> str | None:
+    """'pdf'/'docx'/'xlsx' when the URL/Content-Type points at a binary document, else None."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct in _BINARY_DOC_CTYPES:
+        return _BINARY_DOC_CTYPES[ct]
+    path = urlparse(url).path
+    from urllib.parse import unquote
+    ext = unquote(path).rsplit(".", 1)[-1].lower() if "." in path else ""
+    return ext if ext in _BINARY_DOC_EXTS else None
+
+
+def _extract_binary_document(data: bytes, ext: str) -> str:
+    """Extract readable text from pdf/docx/xlsx bytes (same pure-python extractors the chat
+    bot uses for inbound attachments). Returns '' when nothing extractable."""
+    import io as _io
+    try:
+        if ext == "pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(_io.BytesIO(data))
+            return "\n".join((pg.extract_text() or "") for pg in reader.pages).strip()
+        if ext == "docx":
+            from docx import Document
+            doc = Document(_io.BytesIO(data))
+            parts = [p.text for p in doc.paragraphs]
+            for tbl in doc.tables:
+                for row in tbl.rows:
+                    parts.append(" | ".join(cell.text for cell in row.cells))
+            return "\n".join(parts).strip()
+        if ext in ("xlsx", "xlsm"):
+            from openpyxl import load_workbook
+            wb = load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
+            out = []
+            for ws in wb.worksheets:
+                out.append("# Лист: " + str(ws.title))
+                for row in ws.iter_rows(values_only=True):
+                    cells = ["" if v is None else str(v) for v in row]
+                    if any(c.strip() for c in cells):
+                        out.append(" | ".join(cells))
+            return "\n".join(out).strip()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("fetch_url: binary extract failed (%s): %s", ext, repr(exc)[:160])
+    return ""
+
+
+def _reader_allowed_for(url: str) -> bool:
+    """Whether the external reader proxy may see this URL. Internal hosts and links that carry
+    access tokens (our export links, the Bitrix portal, local addresses) must never leak out."""
+    if os.getenv("FETCH_URL_READER", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    host = (urlparse(url).netloc or "").lower()
+    if not host:
+        return False
+    private = os.getenv("FETCH_URL_READER_EXCLUDE",
+                        "mcp.m4s.ru,m4s.ru,.bitrix24.ru,localhost,127.,10.,192.168.")
+    for pat in (p.strip().lower() for p in private.split(",") if p.strip()):
+        if host == pat or host.endswith(pat) or host.startswith(pat):
+            return False
+    return True
+
+
+def _looks_like_auth_wall(final_url: str, text: str) -> bool:
+    """A 200 that is actually a login/consent page or an empty JS shell."""
+    host = (urlparse(final_url or "").netloc or "").lower()
+    if any(m in host for m in ("passport.", "sso.", "login.", "auth.")):
+        return True
+    return len((text or "").strip()) < 500
+
+
+def _fetch_via_reader(url: str, max_chars: int) -> dict[str, Any] | None:
+    """Read a JS-heavy / anti-bot page through the reader proxy (renders the page, returns
+    markdown text). Best-effort: None on any failure so the caller keeps the direct result."""
+    base = os.getenv("FETCH_URL_READER_BASE", "https://r.jina.ai/").strip()
+    if not base:
+        return None
+    try:
+        req = urllib.request.Request(base.rstrip("/") + "/" + url, headers=_FETCH_BROWSER_HEADERS)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read(max_chars * 6 + 4096)
+        text = raw.decode("utf-8", "replace").strip()
+        if len(text) < 200:
+            return None
+        return {"text": text, "status": 200, "content_type": "text/markdown", "kind": "reader"}
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("fetch_url: reader fallback failed: %s", repr(exc)[:160])
+        return None
+
+
 def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
     url = str(args.get("url") or "").strip()
     if not url:
@@ -5137,25 +5247,32 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
         final_url = str(google_result.get("final_url") or url)
         kind = str(google_result.get("kind") or kind)
     else:
-        request = urllib.request.Request(
-            fetched_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; AlberyMCP/0.7 fetch_url)",
-                "Accept": "text/csv,text/plain,text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
-            },
-            method="GET",
-        )
+        request = urllib.request.Request(fetched_url, headers=dict(_FETCH_BROWSER_HEADERS), method="GET")
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 status = response.status
                 content_type = response.headers.get("Content-Type", "") or ""
-                raw_bytes = response.read(max_chars * 6 + 4096)
+                doc_ext = _binary_doc_ext(fetched_url, content_type)
+                # Binary documents need the whole file for extraction; text needs only a slice.
+                raw_bytes = response.read(_FETCH_DOC_MAX_BYTES if doc_ext else max_chars * 6 + 4096)
                 final_url = response.geturl() or fetched_url
         except urllib.error.HTTPError as exc:
             try:
                 body_preview = exc.read().decode("utf-8", "replace")[:500]
             except Exception:  # noqa: BLE001
                 body_preview = ""
+            # A hard 4xx/5xx on a public page is often anti-bot — the reader proxy still works.
+            if _reader_allowed_for(url):
+                reader = _fetch_via_reader(url, max_chars)
+                if reader:
+                    text = reader["text"][:max_chars]
+                    return {
+                        "ok": True, "original_url": url, "fetched_url": fetched_url,
+                        "final_url": url, "kind": "reader", "status": 200,
+                        "content_type": reader["content_type"], "char_count": len(text),
+                        "truncated": len(reader["text"]) > max_chars, "text": text,
+                        "note": f"Прямой запрос вернул HTTP {exc.code}; содержимое получено через reader-прокси.",
+                    }
             return {
                 "ok": False,
                 "original_url": url,
@@ -5169,6 +5286,26 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             raise McpError(-32010, f"Fetch failed: {exc}") from exc
 
+        # Binary document (Word/PDF/Excel by URL) -> extract full text locally.
+        doc_ext = _binary_doc_ext(final_url or fetched_url, content_type)
+        if doc_ext:
+            doc_text = _extract_binary_document(raw_bytes, doc_ext)
+            if doc_text:
+                truncated = len(doc_text) > max_chars
+                return {
+                    "ok": True, "original_url": url, "fetched_url": fetched_url,
+                    "final_url": final_url, "kind": f"document-{doc_ext}", "status": status,
+                    "content_type": content_type, "char_count": min(len(doc_text), max_chars),
+                    "truncated": truncated, "text": doc_text[:max_chars],
+                    "note": ("Это бинарный документ; извлечён его текст."
+                             + (" Показано начало — вызови ещё раз с большим max_chars." if truncated else "")),
+                }
+            return {
+                "ok": False, "original_url": url, "fetched_url": fetched_url, "kind": f"document-{doc_ext}",
+                "status": status, "error": "binary document without extractable text",
+                "hint": "Файл скачан, но текст извлечь не удалось (возможно скан без текстового слоя).",
+            }
+
         charset_match = re.search(r"charset=([a-zA-Z0-9_\-]+)", content_type)
         charset = charset_match.group(1) if charset_match else "utf-8"
         try:
@@ -5179,6 +5316,16 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
     looks_html = ("html" in content_type.lower()) or text.lstrip().lower().startswith(("<!doctype", "<html"))
     if strip_html_flag and looks_html and kind == "raw":
         text = _strip_html_to_text(text)
+
+    # Auth-wall / empty JS shell on a PUBLIC page -> render it through the reader proxy.
+    if kind == "raw" and _looks_like_auth_wall(final_url, text) and _reader_allowed_for(url):
+        reader = _fetch_via_reader(url, max_chars)
+        if reader:
+            text = reader["text"]
+            kind = "reader"
+            content_type = reader["content_type"]
+            status = 200
+            final_url = url
 
     truncated = len(text) > max_chars
     if truncated:
@@ -7004,14 +7151,17 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "fetch_url": {
         "description": (
-            "Fetch the contents of a web URL the user sent in chat (article, Google Sheet, Google Doc, "
-            "raw text file, etc.) and return it as plain text. Use this when the user shares a link and asks you to "
-            "read, summarize, or extract data from it. Special handling: Google Sheets and Google Docs are read with the agent authorized Google account; "
-            "private files shared with that account can be read without public link access. HTML pages are stripped to text by default. Size is hard-"
-            "capped (default 50000 chars, max 200000) to protect the context window. On 403/404 from Google docs, "
-            "the file is not accessible to the agent Google account; do not describe that as public CSV export failure. Do NOT use "
-            "this for company knowledge that already lives in Albery — prefer search_company_knowledge, "
-            "list_company_files, get_company_file, search_messages, get_zoom_call_transcript for that."
+            "Fetch the contents of a web URL the user sent in chat and return it as readable text. THE tool for "
+            "«вот ссылка — о чём страница / прочитай / вытащи данные». Reads: articles and normal pages (HTML "
+            "stripped to text); JS-heavy or anti-bot pages (Дзен, новостные сайты, SPA) — automatically re-read "
+            "through a rendering reader proxy, so a login-redirect or an empty shell still yields the article text; "
+            "Word/PDF/Excel files by URL — the document text is extracted (use for «прочитай договор по ссылке»); "
+            "Google Sheets and Google Docs are read with the agent's authorized Google account (private files shared "
+            "with that account work without public access). Size is hard-capped (default 50000 chars, max 200000). "
+            "If the result has kind='reader', the text is a rendered markdown of the page. On 403/404 from Google "
+            "docs, the file is not accessible to the agent Google account. Do NOT use this for company knowledge "
+            "that already lives in Albery — prefer search_company_knowledge, list_company_files, get_company_file, "
+            "search_messages, get_zoom_call_transcript for that."
         ),
         "inputSchema": {
             "type": "object",
