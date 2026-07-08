@@ -1939,6 +1939,7 @@ def mcp_agent_http(slug: str, path_token: str | None = None):
         tool_names=tool_names,
         allow_owner_tools=True,
         instruction_scope=instruction_scope,
+        agent_slug=agent["slug"],
     )
     if response is None:
         return ("", 202)

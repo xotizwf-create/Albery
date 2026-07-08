@@ -1848,6 +1848,79 @@ def _b24_app_download_url(endpoint: str, access_token: str, fid) -> str:
     return ""
 
 
+def task_comment_files(file_ids: list, task_id: int, max_files: int = 5) -> list[dict]:
+    """Read files attached to TASK COMMENTS (params.FILE_ID of the task-chat message): download,
+    recognize (images → Groq vision OCR, documents → text extraction), persist to the attachment
+    store and return [{attachment_id, name, kind, text}]. Used by mcp get_task_comments and the
+    in-task mention flow, so agents can actually see screenshots/documents in comments (Sofia's
+    case: a comment that is only a screenshot looked «empty» to the agent).
+
+    Results are cached by the Bitrix disk file id (source_disk_file_id, migration 047): a repeated
+    get_task_comments over the same task reuses stored text instead of re-downloading/re-OCRing.
+    Download: app OAuth token first (same as chat files), inbound webhook as fallback — both were
+    proven to reach task-chat files on this portal. Best-effort per file: a failure yields an
+    honest «не удалось прочитать» entry instead of a silent drop."""
+    import attachments as _att
+    out: list[dict] = []
+    wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
+    ep = tok = ""
+    for fid in list(file_ids or [])[:max_files]:
+        fid_i = to_int(fid)
+        if fid_i is None:
+            continue
+        cached = _att.find_by_disk_file_id(fid_i)
+        if cached and (cached.get("extracted_text") or "").strip():
+            out.append({"attachment_id": cached["token"], "name": cached.get("file_name") or "файл",
+                        "kind": cached.get("kind") or "document",
+                        "text": cached.get("extracted_text") or ""})
+            continue
+        # File metadata (NAME) + download URL via the webhook; app-token URL as the second road.
+        name, durl = "", ""
+        if wh:
+            try:
+                r = requests.post(f"{wh}/disk.file.get.json", json={"id": fid_i}, timeout=20)
+                res = (r.json() or {}).get("result") or {}
+                if isinstance(res, dict):
+                    name = str(res.get("NAME") or "")
+                    for key in ("DOWNLOAD_URL", "DOWNLOAD_URL_EXTERNAL", "SHOW_URL"):
+                        if isinstance(res.get(key), str) and res[key].strip():
+                            durl = absolute_bitrix_url(res[key], wh) or ""
+                            break
+            except Exception:  # noqa: BLE001
+                logging.warning("b24 task files: webhook disk.file.get failed fid=%s", fid_i)
+        data = _b24_fetch_bytes(durl, "") if durl else b""
+        if not data:
+            if not (ep and tok):
+                try:
+                    ep, tok = _b24_app_access_token()
+                except Exception:  # noqa: BLE001
+                    ep = tok = ""
+            aurl = _b24_app_download_url(ep, tok, fid_i) if ep and tok else ""
+            data = _b24_fetch_bytes(aurl, tok) if aurl else b""
+        if not data:
+            logging.warning("b24 task files: could not download fid=%s name=%s", fid_i, name)
+            out.append({"attachment_id": None, "name": name or f"файл {fid_i}", "kind": "unknown",
+                        "text": "(⚠️ не удалось скачать это вложение из комментария — честно скажи "
+                                "об этом и попроси прислать файл в чат. НЕ придумывай содержимое.)"})
+            continue
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        is_image = ext in _B24_IMG_EXTS or (not ext and data[:3] in (b"\xff\xd8\xff", b"\x89PN", b"GIF"))
+        if is_image:
+            kind, text = "image", _b24_vision_ocr(data, name or "image.png")
+        else:
+            kind, text = "document", _b24_extract_document(data, name or "file")
+        token = _att.store_attachment(
+            data=data, file_name=name or ("image.png" if kind == "image" else "file"),
+            kind=kind, extracted_text=text or "", agent_slug=None,
+            dialog_id=f"task-{task_id}", source_disk_file_id=fid_i,
+        )
+        out.append({"attachment_id": token, "name": name or ("скрин" if kind == "image" else "файл"),
+                    "kind": kind,
+                    "text": (text or "").strip() or "(не удалось извлечь текст из вложения — "
+                            "возможно скан без текстового слоя; попроси прислать PDF/DOCX)"})
+    return out
+
+
 def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "",
                         agent_slug: str | None = None, dialog_id: str = "", from_user_id: Any = None):
     """Parse images + documents + reply-context straight from the flattened imbot event payload.
@@ -3156,8 +3229,11 @@ def _b24_fetch_task_comment(task_id: int, comment_id: int) -> dict[str, Any] | N
     msgs = _wh("im.dialog.messages.get", {"DIALOG_ID": f"chat{chat_id}", "LIMIT": 30})
     for m in ((msgs.get("result") or {}).get("messages") or []) if isinstance(msgs, dict) else []:
         if str(m.get("id")) == str(comment_id):
+            params = m.get("params") if isinstance(m.get("params"), dict) else {}
+            file_ids = params.get("FILE_ID") if isinstance(params.get("FILE_ID"), list) else []
             return {"author_id": to_int(m.get("author_id")), "text": str(m.get("text") or ""),
-                    "chat_id": chat_id, "title": t.get("title") or t.get("TITLE")}
+                    "chat_id": chat_id, "title": t.get("title") or t.get("TITLE"),
+                    "file_ids": file_ids}
     return None
 
 
@@ -3238,11 +3314,30 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
 
     ctx = _b24_task_context_text(task_id)
     requester = _b24_portal_user_directory().get(to_int(author_id), {}).get("name") or f"id {author_id}"
+    # Files attached to the triggering comment (screenshots/documents): recognize and inject,
+    # so «Албери, посмотри скрин» inside a task actually sees the screenshot.
+    files_block = ""
+    if comment.get("file_ids"):
+        try:
+            parts = []
+            for f in task_comment_files(comment["file_ids"], task_id):
+                head = f"[Вложение в комментарии: «{f['name']}» ({'скрин/изображение' if f['kind'] == 'image' else 'документ'}"
+                if f.get("attachment_id"):
+                    head += f", attachment_id={f['attachment_id']}"
+                head += "). Распознанное/извлечённое содержимое:]"
+                parts.append(head + "\n" + (f["text"] or "")[:4000])
+            if parts:
+                files_block = "\n\n" + "\n\n".join(parts) + (
+                    "\n\n(Полный текст вложения — get_attachment_text(attachment_id=…); "
+                    "переслать файл в задачу/комментарий — attachment_ids.)")
+        except Exception:  # noqa: BLE001
+            logging.warning("b24 task-mention: comment files read failed task=%s", task_id, exc_info=True)
     user_text = (
         "Тебя позвали ПРЯМО В ЗАДАЧЕ Bitrix (в комментарии). Работай с ЭТОЙ задачей.\n\n"
         + ctx + "\n\n"
         + f"Сотрудник {requester} (id={author_id}) написал в комментарии к задаче №{task_id}:\n«"
-        + text.strip() + "»\n\n"
+        + text.strip() + "»"
+        + files_block + "\n\n"
         "Ответь по существу и, если он просит действие с задачей, выполни его своими инструментами "
         f"(комментарий — add_bitrix_task_comment(bitrix_task_id={task_id}, author_bitrix_user_id={author_id}); "
         f"завершить — complete_bitrix_task(bitrix_task_id={task_id}, on_behalf_bitrix_user_id={author_id}); "

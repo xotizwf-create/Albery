@@ -2958,6 +2958,10 @@ def tool_create_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
         "priority": priority, "deadline_after_seconds": deadline_after_seconds,
     }
 
+    # Which agent's «Автоматизации» tab shows this row: the per-agent MCP connector injects
+    # its slug as _agent_slug (see handle_request); legacy connectors fall back to 'main'.
+    agent_slug = str(args.get("_agent_slug") or "").strip() or "main"
+
     recurring_id = None
     try:
         with connect() as conn:
@@ -2966,13 +2970,13 @@ def tool_create_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
                     "INSERT INTO bitrix_recurring_tasks (title, description, responsible_bitrix_id, "
                     "responsible_name, creator_bitrix_id, period, interval_every, weekdays, day_of_month, "
                     "create_time, deadline_after_seconds, deadline_desc, schedule_desc, until_date, "
-                    "result_criteria, priority, spec, next_run_at, source) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s) RETURNING id",
+                    "result_criteria, priority, spec, next_run_at, source, agent_slug) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s) RETURNING id",
                     (title, description, int(responsible["bitrix_user_id"]), responsible.get("full_name"),
                      (int(creator["bitrix_user_id"]) if creator else None), period, interval,
                      weekday_nums or None, day_of_month, create_time, deadline_after_seconds, deadline_desc,
                      schedule_desc, until_date, result_criteria, priority,
-                     json.dumps(spec, ensure_ascii=False), next_run, "agent_scheduler"))
+                     json.dumps(spec, ensure_ascii=False), next_run, "agent_scheduler", agent_slug))
                 row = cur.fetchone()
                 recurring_id = (row or {}).get("id") if isinstance(row, dict) else (row[0] if row else None)
     except Exception as exc:  # noqa: BLE001
@@ -2992,7 +2996,9 @@ def tool_create_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
         "create_time": create_time, "deadline": deadline_desc, "until": until_date,
         "rule": "Повторяющаяся задача поставлена в СОБСТВЕННЫЙ планировщик агента (не в Bitrix — там нет "
                 "подписки). Приложение само создаёт обычную разовую задачу в момент next_run по расписанию. "
-                "Смотреть/останавливать: list_recurring_tasks / delete_recurring_task.",
+                "Скажи пользователю: запись видна в Центре Агента → Агенты → вкладка «Автоматизации» "
+                "(чип «регулярная задача»), там же её можно выключить/удалить. "
+                "Смотреть/останавливать из чата: list_recurring_tasks / delete_recurring_task.",
     }
 
 
@@ -3085,7 +3091,7 @@ def tool_delete_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
 
 _BB_BR_RE = re.compile(r"\[BR\]", re.IGNORECASE)
 _BB_USER_RE = re.compile(r"\[USER=\d+\]\s*(.*?)\s*\[/USER\]", re.IGNORECASE | re.DOTALL)
-_BB_URL_NAMED_RE = re.compile(r"\[URL=[^\]]+\](.*?)\[/URL\]", re.IGNORECASE | re.DOTALL)
+_BB_URL_NAMED_RE = re.compile(r"\[URL=([^\]]+)\](.*?)\[/URL\]", re.IGNORECASE | re.DOTALL)
 _BB_URL_PLAIN_RE = re.compile(r"\[URL\](.*?)\[/URL\]", re.IGNORECASE | re.DOTALL)
 _BB_TIMESTAMP_RE = re.compile(r"\[TIMESTAMP=[^\]]+\]", re.IGNORECASE)
 _BB_DISK_RE = re.compile(r"\[DISK\s+FILE\s+ID=[^\]]+\]", re.IGNORECASE)
@@ -3108,7 +3114,16 @@ def clean_bitrix_text(text: Any) -> str:
     s = str(text)
     s = _BB_BR_RE.sub("\n", s)
     s = _BB_USER_RE.sub(lambda m: m.group(1) or "", s)
-    s = _BB_URL_NAMED_RE.sub(lambda m: m.group(1) or "", s)
+
+    def _named_url(m: "re.Match[str]") -> str:
+        # Keep ABSOLUTE hrefs next to the label so the agent can actually open the link
+        # (fetch_url); portal-relative service links stay label-only to avoid noise.
+        href, label = (m.group(1) or "").strip(), (m.group(2) or "").strip()
+        if href.lower().startswith(("http://", "https://")) and label and label != href:
+            return f"{label} ({href})"
+        return label or href
+
+    s = _BB_URL_NAMED_RE.sub(_named_url, s)
     s = _BB_URL_PLAIN_RE.sub(lambda m: m.group(1) or "", s)
     s = _BB_TIMESTAMP_RE.sub("", s)
     s = _BB_DISK_RE.sub("", s)
@@ -3141,6 +3156,25 @@ def is_service_task_comment(item: dict[str, Any]) -> bool:
     return False
 
 
+def comment_file_ids(item: dict[str, Any]) -> list[int]:
+    """Bitrix disk file ids attached to a task comment (params.FILE_ID of the IM message).
+    A comment that is ONLY a screenshot has empty text + FILE_ID — without this the agent
+    sees it as «пустой комментарий»."""
+    params = item.get("params")
+    if not isinstance(params, dict):
+        return []
+    raw = params.get("FILE_ID") or params.get("FILES")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for v in raw:
+        try:
+            out.append(int(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def normalize_task_comment(item: dict[str, Any], names_by_id: dict[int, str]) -> dict[str, Any]:
     author_id = comment_author_id(item)
     raw_text = item.get("text") or item.get("MESSAGE") or item.get("POST_MESSAGE") or ""
@@ -3151,6 +3185,7 @@ def normalize_task_comment(item: dict[str, Any], names_by_id: dict[int, str]) ->
         "created_at": item.get("date") or item.get("POST_DATE"),
         "is_service": is_service_task_comment(item),
         "text": clean_bitrix_text(raw_text),
+        "file_ids": comment_file_ids(item),
     }
 
 
@@ -3326,6 +3361,40 @@ def tool_get_task_comments(args: dict[str, Any]) -> dict[str, Any]:
     pool.sort(key=lambda c: c.get("created_at") or "", reverse=(order == "desc"))
     page = pool[offset : offset + limit]
 
+    # Read the files attached to the returned comments (screenshots → OCR, documents → text) so
+    # a screenshot-only comment is no longer «пустой». Cached by disk file id, so only the first
+    # read of a file downloads/recognizes it; the per-call budget bounds worst-case latency.
+    attachments_note = None
+    files_budget = int(os.getenv("B24_COMMENT_FILES_PER_CALL", "8") or "8")
+    for c in page:
+        fids = c.pop("file_ids", []) or []
+        if not fids:
+            continue
+        if files_budget <= 0:
+            c["attachments_skipped"] = ("во вложениях ещё файлы — лимит чтения за один вызов исчерпан; "
+                                        "повтори get_task_comments с offset на этот комментарий")
+            continue
+        take = fids[:files_budget]
+        files_budget -= len(take)
+        try:
+            from b24bot import task_comment_files
+            enriched = task_comment_files(take, task_id)
+        except Exception:  # noqa: BLE001
+            logging.warning("get_task_comments: files read failed task=%s", task_id, exc_info=True)
+            enriched = [{"attachment_id": None, "name": f"файл {f}", "kind": "unknown",
+                         "text": "(не удалось прочитать вложение)"} for f in take]
+        c["attachments"] = [
+            {"attachment_id": f.get("attachment_id"), "name": f.get("name"), "kind": f.get("kind"),
+             "content": (f.get("text") or "")[:1500]
+             + ("… [полный текст: get_attachment_text(attachment_id)]" if len(f.get("text") or "") > 1500 else "")}
+            for f in enriched
+        ]
+        attachments_note = (
+            "В комментариях есть вложения: поле attachments — распознанные скрины/извлечённые документы. "
+            "Полный текст — get_attachment_text(attachment_id); переслать файл — attachment_ids в тулах задач. "
+            "Ссылки из комментариев открывай через fetch_url."
+        )
+
     return {
         "bitrix_task_id": row["bitrix_task_id"],
         "found": True,
@@ -3345,6 +3414,7 @@ def tool_get_task_comments(args: dict[str, Any]) -> dict[str, Any]:
         "offset": offset,
         "returned": len(page),
         "items": page,
+        "attachments_note": attachments_note,
     }
 
 
@@ -6767,6 +6837,9 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Read the discussion/comments of one Bitrix task by bitrix_task_id (from search_tasks). "
             "Returns human comments with author name, timestamp, and BB-code-cleaned text. "
+            "ВЛОЖЕНИЯ КОММЕНТАРИЕВ ЧИТАЮТСЯ: скрины распознаются (OCR), документы извлекаются — поле "
+            "attachments у комментария, полный текст через get_attachment_text(attachment_id). Комментарий "
+            "без текста, но со скрином — НЕ пустой. Ссылки из комментариев открывай fetch_url. "
             "Auto-generated notifications (overdue reminders, status cards, completion notices) are "
             "excluded by default; set include_service=true to include them. Use this to find what "
             "people asked, decided, committed, or blocked on a task — search_tasks alone does not show it."
@@ -7182,7 +7255,11 @@ TOOLS: dict[str, dict[str, Any]] = {
             "Создать ПОВТОРЯЮЩУЮСЯ (регулярную) задачу — она будет создаваться автоматически по "
             "расписанию (например, каждую пятницу в 10:00 с дедлайном 19:00 того же дня). Расписание "
             "ведёт СОБСТВЕННЫЙ планировщик агента (в Bitrix нет подписки на регулярные задачи, поэтому "
-            "штатный механизм там не работает) — приложение само создаёт обычную разовую задачу в срок. "
+            "НИКОГДА не создавай шаблон регулярной задачи в Bitrix — он не будет спавнить задачи) — "
+            "приложение само создаёт обычную разовую задачу в срок БЕЗ хода LLM. Запись сразу видна "
+            "владельцу в Центре Агента → Агенты → вкладка «Автоматизации» (чип «регулярная задача»). "
+            "Это правильный инструмент для «ставь задачу каждый день/неделю/месяц»; schedule_my_automation "
+            "для этого НЕ использовать (та — для регулярных ОТЧЁТОВ/действий и жжёт полноценный ход). "
             "Укажи period (weekly/daily/monthly), для weekly — weekdays "
             "(MO/TU/WE/TH/FR/SA/SU), create_time (во сколько создавать, ЧЧ:ММ) и срок каждой задачи: "
             "deadline_time (ЧЧ:ММ того же дня; если раньше create_time — считается следующий день) ИЛИ "
@@ -7231,7 +7308,8 @@ TOOLS: dict[str, dict[str, Any]] = {
             "расписание (человекочитаемо), ближайшее авто-создание (next_execution), ответственного и "
             "id шаблона. Используй, когда просят «какие повторяющиеся задачи у <человека>» или «покажи все "
             "регулярные задачи». Bitrix не отдаёт список шаблонов через REST, поэтому список ведётся в "
-            "реестре агента (задачи, созданные через create_recurring_task)."
+            "реестре агента (задачи, созданные через create_recurring_task). Эти же записи владелец "
+            "видит в Центре Агента → Агенты → «Автоматизации»."
         ),
         "inputSchema": {
             "type": "object",
@@ -8730,7 +8808,8 @@ def list_tools(tool_names: set[str] | None = None, core: bool = False) -> list[d
 def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
                    core: bool = False,
                    allow_owner_tools: bool = False,
-                   instruction_scope: set[str] | list[str] | None = None) -> dict[str, Any] | None:
+                   instruction_scope: set[str] | list[str] | None = None,
+                   agent_slug: str | None = None) -> dict[str, Any] | None:
     request_id = request.get("id")
     method = request.get("method")
     available_tools = _allowed_tools(tool_names)
@@ -8803,6 +8882,10 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
                 "start_here_always_read_ai_instructions", "get_ai_instructions"
             ):
                 args = {**args, "_allowed_instruction_paths": list(instruction_scope)}
+            # Recurring tasks are attributed to the agent whose connector created them,
+            # so the row lands in THAT agent's «Автоматизации» tab.
+            if agent_slug and name == "create_recurring_task":
+                args = {**args, "_agent_slug": agent_slug}
             started = time.perf_counter()
             result_payload = available_tools[name]["handler"](args)
             duration_ms = round((time.perf_counter() - started) * 1000, 1)

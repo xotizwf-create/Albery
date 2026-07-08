@@ -53,6 +53,7 @@ def store_attachment(
     dialog_id: str,
     bitrix_user_id: Any = None,
     mime: str | None = None,
+    source_disk_file_id: Any = None,
 ) -> str | None:
     """Persist one incoming file (bytes + extracted text) and return its token, or None on failure.
     Best-effort: any error is logged and swallowed so it never breaks the chat reply."""
@@ -74,15 +75,36 @@ def store_attachment(
                 cur.execute(
                     "INSERT INTO bitrix_bot_attachments "
                     "(token, agent_slug, dialog_id, bitrix_user_id, file_name, ext, kind, mime, "
-                    " byte_size, char_len, extracted_text, file_path) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    " byte_size, char_len, extracted_text, file_path, source_disk_file_id) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (token, agent_slug, str(dialog_id), _to_int(bitrix_user_id),
                      file_name or "file", ext, kind, mime, len(data) if data else 0,
-                     len(text), text, file_path or None),
+                     len(text), text, file_path or None, _to_int(source_disk_file_id)),
                 )
         return token
     except Exception as exc:  # noqa: BLE001
         logging.warning("attachments.store failed (%s): %s", file_name, repr(exc)[:160])
+        return None
+
+
+def find_by_disk_file_id(disk_file_id: Any) -> dict[str, Any] | None:
+    """The freshest stored attachment for a Bitrix disk file id — lets task-comment reads reuse
+    the already-downloaded/recognized text instead of re-downloading and re-OCRing every call."""
+    fid = _to_int(disk_file_id)
+    if fid is None:
+        return None
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT token, file_name, ext, kind, char_len, extracted_text "
+                    "FROM bitrix_bot_attachments WHERE source_disk_file_id = %s "
+                    "ORDER BY id DESC LIMIT 1",
+                    (fid,),
+                )
+                return cur.fetchone()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("attachments.find_by_disk_file_id failed (%s): %s", fid, repr(exc)[:120])
         return None
 
 

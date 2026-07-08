@@ -135,6 +135,74 @@ def _automation_json(r: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# --- Recurring Bitrix tasks shown as kind='task' rows -----------------------------------------
+# The owner asked that a recurring TASK requested in chat is visible in the same «Автоматизации»
+# tab. The rows live in bitrix_recurring_tasks and are fired by recurring_scheduler.py
+# DETERMINISTICALLY (a plain tasks.task.add, no LLM turn — so they cost nothing per fire and
+# don't count against the automation frequency caps). Here we only render/manage them.
+
+def _recurring_json(r: dict[str, Any]) -> dict[str, Any]:
+    spec = r.get("spec")
+    if isinstance(spec, str):
+        try:
+            import json as _json
+            spec = _json.loads(spec)
+        except Exception:  # noqa: BLE001
+            spec = {}
+    spec = spec if isinstance(spec, dict) else {}
+    parts = [f"Создаёт задачу в Bitrix: «{r['title']}»"]
+    if r.get("responsible_name"):
+        parts.append("исполнитель — " + str(r["responsible_name"]))
+    if r.get("deadline_desc"):
+        parts.append("дедлайн " + str(r["deadline_desc"]))
+    if r.get("result_criteria"):
+        parts.append("результат: " + str(r["result_criteria"]))
+    if spec.get("checklist"):
+        parts.append(f"чек-лист из {len(spec['checklist'])} пунктов")
+    status, result = "", ""
+    if r.get("last_error"):
+        status = "error"
+    elif r.get("last_task_id"):
+        status, result = "ok", f"Создана задача №{r['last_task_id']}"
+    return {
+        # Negative id keeps React keys/busy-tracking unique next to real automations;
+        # the API identifier for recurring endpoints is recurring_id.
+        "id": -int(r["id"]),
+        "recurring_id": int(r["id"]),
+        "agent_slug": r.get("agent_slug") or "main",
+        "name": r["title"],
+        "description": "",
+        "schedule": "",
+        "schedule_label": r.get("schedule_desc") or "",
+        "prompt": ", ".join(parts),
+        "deliver_to": "",
+        "kind": "task",
+        "created_by": "self",
+        "creator_label": "агент (из чата)",
+        "is_active": bool(r.get("active")),
+        "next_run": _when(r.get("next_run_at")),
+        "last_run": _when(r.get("last_created_at")),
+        "last_status": status,
+        "last_result": result,
+        "last_error": r.get("last_error") or "",
+    }
+
+
+_RECURRING_COLS = ("id, title, responsible_name, schedule_desc, deadline_desc, result_criteria, "
+                   "active, next_run_at, last_created_at, last_task_id, last_error, spec, agent_slug")
+
+
+def _recurring_rows(where: str, args: tuple) -> list[dict[str, Any]]:
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT {_RECURRING_COLS} FROM bitrix_recurring_tasks {where} ORDER BY id", args)
+                return list(cur.fetchall())
+    except Exception:  # noqa: BLE001
+        logging.exception("recurring tasks load failed")
+        return []
+
+
 def _validate(name: str, schedule: str, prompt: str, max_per_day: int) -> str | None:
     """Returns a user-facing error string, or None when the automation is valid."""
     if not name:
@@ -162,10 +230,105 @@ def _validate(name: str, schedule: str, prompt: str, max_per_day: int) -> str | 
 def agent_automations_list(slug: str):
     try:
         rows = _load_rows("WHERE agent_slug = %s", (slug,))
-        return jsonify({"automations": [_automation_json(r) for r in rows]})
+        payload = [_automation_json(r) for r in rows]
+        # Recurring Bitrix tasks of this agent ride along as kind='task' rows.
+        payload += [_recurring_json(r)
+                    for r in _recurring_rows("WHERE COALESCE(agent_slug, 'main') = %s", (slug,))]
+        return jsonify({"automations": payload})
     except Exception:  # noqa: BLE001
         logging.exception("agent automations list failed: %s", slug)
         return jsonify({"error": "Не удалось загрузить автоматизации."}), 500
+
+
+# --- Recurring-task rows management (the kind='task' rows of the same tab) -------------------
+
+@app.patch("/api/agent-center/recurring-tasks/<int:rec_id>")
+def recurring_task_update(rec_id: int):
+    body = request.get_json(silent=True) or {}
+    if body.get("is_active") is None:
+        return jsonify({"error": "Поддерживается только включение/выключение (is_active)."}), 400
+    is_active = bool(body.get("is_active"))
+    try:
+        rows = _recurring_rows("WHERE id = %s", (rec_id,))
+        if not rows:
+            return jsonify({"error": "Регулярная задача не найдена."}), 404
+        next_run = None
+        if is_active:
+            # Re-enabling: recompute the next fire so a long-disabled row doesn't fire instantly
+            # on a stale next_run_at from the past.
+            import recurring_scheduler
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id, period, interval_every, weekdays, day_of_month, "
+                                "create_time, until_date, created_at FROM bitrix_recurring_tasks "
+                                "WHERE id = %s", (rec_id,))
+                    full = dict(cur.fetchone())
+            next_run = recurring_scheduler._compute_next(full, msk_now())
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    if is_active:
+                        cur.execute("UPDATE bitrix_recurring_tasks SET active = TRUE, next_run_at = %s, "
+                                    "last_error = NULL, updated_at = now() WHERE id = %s", (next_run, rec_id))
+                    else:
+                        cur.execute("UPDATE bitrix_recurring_tasks SET active = FALSE, updated_at = now() "
+                                    "WHERE id = %s", (rec_id,))
+        return jsonify({"ok": True})
+    except Exception:  # noqa: BLE001
+        logging.exception("recurring task update failed: %s", rec_id)
+        return jsonify({"error": "Не удалось сохранить."}), 500
+
+
+@app.delete("/api/agent-center/recurring-tasks/<int:rec_id>")
+def recurring_task_delete(rec_id: int):
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM bitrix_recurring_tasks WHERE id = %s RETURNING id", (rec_id,))
+                    if cur.fetchone() is None:
+                        return jsonify({"error": "Регулярная задача не найдена."}), 404
+        return jsonify({"ok": True})
+    except Exception:  # noqa: BLE001
+        logging.exception("recurring task delete failed: %s", rec_id)
+        return jsonify({"error": "Не удалось удалить."}), 500
+
+
+@app.post("/api/agent-center/recurring-tasks/<int:rec_id>/run")
+def recurring_task_run_now(rec_id: int):
+    """Create one task instance right now (verification button). Deterministic — no LLM turn;
+    next_run_at is left untouched, so the regular schedule is unaffected."""
+    try:
+        from datetime import timedelta
+
+        import recurring_scheduler
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, title, description, responsible_bitrix_id, creator_bitrix_id, "
+                            "period, interval_every, weekdays, day_of_month, create_time, "
+                            "deadline_after_seconds, until_date, spec, created_at "
+                            "FROM bitrix_recurring_tasks WHERE id = %s", (rec_id,))
+                row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "Регулярная задача не найдена."}), 404
+        row = dict(row)
+        spec = recurring_scheduler._row_spec(row)
+        if not spec.get("responsible_bitrix_id"):
+            return jsonify({"error": "В записи нет исполнителя — создать задачу нельзя."}), 400
+        now = msk_now()
+        dl_secs = int(spec.get("deadline_after_seconds") or row.get("deadline_after_seconds") or 0)
+        deadline_iso = (now + timedelta(seconds=dl_secs if dl_secs > 0 else 24 * 3600)).isoformat()
+        from mcp import context_server as cs
+        res = cs.create_oneoff_task_from_spec(spec, deadline_iso)
+        task_id = res.get("task_id")
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE bitrix_recurring_tasks SET last_created_at = now(), last_task_id = %s, "
+                            "last_error = NULL, updated_at = now() WHERE id = %s", (task_id, rec_id))
+        return jsonify({"ok": True, "task_id": task_id})
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("recurring task run-now failed: %s", rec_id)
+        return jsonify({"error": f"Не удалось создать задачу: {str(exc)[:200]}"}), 502
 
 
 @app.post("/api/agent-center/agents/<slug>/automations")
@@ -468,12 +631,15 @@ if os.getenv("AGENT_AUTOMATIONS", "1").strip() != "0":
 AUTOMATION_SELF_TOOL_SPECS: dict[str, dict[str, Any]] = {
     "schedule_my_automation": {
         "description": (
-            "АВТОМАТИЗАЦИИ: поставь СЕБЕ регулярную задачу по расписанию (cron, время МСК). "
-            "Каждый запуск — твой полноценный ход: ты выполнишь task своими инструментами, и результат "
-            "уйдёт сообщением в Битрикс. ПЕРЕД созданием честно проверь, что твоих ИНСТРУМЕНТОВ хватает "
-            "для задачи; если нет — НЕ создавай автоматизацию, а скажи пользователю, чего именно не "
-            "хватает. schedule — 5 полей cron: «0 9 * * 1-5» = будни в 9:00, «30 18 * * 5» = пт в 18:30; "
-            "чаще раза в час нельзя. deliver_to — dialog_id, куда слать результат (обычно текущий диалог)."
+            "АВТОМАТИЗАЦИИ: поставь СЕБЕ регулярное ДЕЙСТВИЕ по расписанию (cron, время МСК) — отчёт, "
+            "сводку, мониторинг. Каждый запуск — твой полноценный ход: ты выполнишь task своими "
+            "инструментами, и результат уйдёт сообщением в Битрикс. ⚠️ НЕ для регулярных ЗАДАЧ Bitrix: "
+            "если просят «создавай задачу каждый день/неделю» — используй create_recurring_task (он "
+            "создаёт задачи без хода агента и тоже виден во вкладке «Автоматизации»). ПЕРЕД созданием "
+            "честно проверь, что твоих ИНСТРУМЕНТОВ хватает для задачи; если нет — НЕ создавай "
+            "автоматизацию, а скажи пользователю, чего именно не хватает. schedule — 5 полей cron: "
+            "«0 9 * * 1-5» = будни в 9:00, «30 18 * * 5» = пт в 18:30; чаще раза в час нельзя. "
+            "deliver_to — dialog_id, куда слать результат (обычно текущий диалог)."
         ),
         "inputSchema": {
             "type": "object",

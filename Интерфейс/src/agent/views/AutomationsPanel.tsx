@@ -4,9 +4,12 @@ import {
   AgentAutomation,
   createAgentAutomation,
   deleteAgentAutomation,
+  deleteRecurringTask,
   fetchAgentAutomations,
   runAgentAutomation,
+  runRecurringTask,
   updateAgentAutomation,
+  updateRecurringTask,
 } from "../api";
 import { cn } from "../../lib/utils";
 
@@ -34,6 +37,7 @@ const statusChip = (a: AgentAutomation): { text: string; cls: string } => {
 
 const sourceChip = (a: AgentAutomation): { text: string; cls: string } => {
   if (a.kind === "system") return { text: "системная · Hermes", cls: "bg-violet-50 text-violet-600 border-violet-100" };
+  if (a.kind === "task") return { text: "регулярная задача 📋", cls: "bg-sky-50 text-sky-600 border-sky-100" };
   if (a.created_by === "self") return { text: "сам поставил 🤖", cls: "bg-emerald-50 text-emerald-600 border-emerald-100" };
   return { text: "владелец", cls: "bg-indigo-50 text-indigo-600 border-indigo-100" };
 };
@@ -86,8 +90,9 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
     <div className="p-6 md:p-8 space-y-4">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <p className="text-[13px] font-medium text-gray-500 max-w-2xl">
-          Регулярные задачи этого агента: он выполняет их по расписанию своими инструментами и
-          присылает результат в Битрикс. Агент может ставить их себе сам — попросите его в чате.
+          Всё регулярное у этого агента: автоматизации (агент выполняет по расписанию своими
+          инструментами и присылает результат в Битрикс) и регулярные задачи 📋 (приложение само
+          создаёт задачу в Bitrix точно в срок). Агент ставит и то и другое из чата — просто попросите.
         </p>
         <button
           onClick={() => setShowForm((v) => !v)}
@@ -205,15 +210,25 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                 {!system && (
                   <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
                     <button
-                      onClick={() => void act(a.id, () => runAgentAutomation(a.id))}
+                      onClick={() =>
+                        void act(a.id, () =>
+                          a.kind === "task" ? runRecurringTask(a.recurring_id!) : runAgentAutomation(a.id),
+                        )
+                      }
                       disabled={busyId !== null || a.last_status === "running"}
-                      title="Запустить сейчас (проверка)"
+                      title={a.kind === "task" ? "Создать задачу сейчас (проверка)" : "Запустить сейчас (проверка)"}
                       className="p-1.5 text-gray-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors disabled:opacity-40"
                     >
                       <Play className="w-4 h-4" />
                     </button>
                     <button
-                      onClick={() => void act(a.id, () => updateAgentAutomation(a.id, { is_active: !a.is_active }))}
+                      onClick={() =>
+                        void act(a.id, () =>
+                          a.kind === "task"
+                            ? updateRecurringTask(a.recurring_id!, { is_active: !a.is_active })
+                            : updateAgentAutomation(a.id, { is_active: !a.is_active }),
+                        )
+                      }
                       disabled={busyId !== null}
                       title={a.is_active ? "Выключить" : "Включить"}
                       className={cn(
@@ -227,8 +242,11 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                     </button>
                     <button
                       onClick={() => {
-                        if (window.confirm(`Удалить автоматизацию «${a.name}»?`)) {
-                          void act(a.id, () => deleteAgentAutomation(a.id));
+                        const label = a.kind === "task" ? "регулярную задачу" : "автоматизацию";
+                        if (window.confirm(`Удалить ${label} «${a.name}»?`)) {
+                          void act(a.id, () =>
+                            a.kind === "task" ? deleteRecurringTask(a.recurring_id!) : deleteAgentAutomation(a.id),
+                          );
                         }
                       }}
                       disabled={busyId !== null}
@@ -254,10 +272,17 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                           <span className="font-bold text-gray-800">Задача:</span> {a.prompt}
                         </p>
                       )}
+                      {a.kind === "task" ? (
+                        <p>
+                          Задачу в Bitrix создаёт планировщик приложения точно по расписанию — без хода
+                          агента (не тратит лимиты).
+                        </p>
+                      ) : (
                       <p>
                         <span className="font-bold text-gray-800">Доставка:</span>{" "}
                         {a.deliver_to || "чат уведомлений Albery"}
                       </p>
+                      )}
                       {a.last_error && <p className="text-rose-600">Последняя ошибка: {a.last_error}</p>}
                       {a.last_result && (
                         <p className="whitespace-pre-wrap bg-slate-50 border border-gray-100 rounded-xl p-3 text-gray-600">

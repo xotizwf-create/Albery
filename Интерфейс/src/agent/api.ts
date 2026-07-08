@@ -266,10 +266,13 @@ export async function setInstructionScope(path: string, scope: "universal" | "op
 
 // --- Per-agent scheduled automations (Агенты → Автоматизации) ---
 // kind='system' rows mirror the legacy Hermes cron jobs on the box (read-only showcase);
-// kind='agent' rows are executed by the app itself on the agent's own connector.
+// kind='agent' rows are executed by the app itself on the agent's own connector;
+// kind='task' rows are recurring Bitrix tasks (bitrix_recurring_tasks): the app creates a
+// plain task on schedule WITHOUT an LLM turn; managed via the recurring-tasks endpoints.
 
 export interface AgentAutomation {
   id: number;
+  recurring_id?: number; // set on kind='task' rows only
   agent_slug: string;
   name: string;
   description: string;
@@ -277,7 +280,7 @@ export interface AgentAutomation {
   schedule_label: string;
   prompt: string;
   deliver_to: string;
-  kind: "agent" | "system";
+  kind: "agent" | "system" | "task";
   created_by: "owner" | "self";
   creator_label: string;
   is_active: boolean;
@@ -321,6 +324,24 @@ export async function deleteAgentAutomation(id: number): Promise<void> {
 
 export async function runAgentAutomation(id: number): Promise<void> {
   await fetchJsonSafe(`/api/agent-center/automations/${id}/run`, { method: "POST" }, 30000);
+}
+
+// kind='task' rows (recurring Bitrix tasks) live in their own registry with their own endpoints.
+
+export async function updateRecurringTask(recurringId: number, body: { is_active: boolean }): Promise<void> {
+  await fetchJsonSafe(
+    `/api/agent-center/recurring-tasks/${recurringId}`,
+    { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    30000,
+  );
+}
+
+export async function deleteRecurringTask(recurringId: number): Promise<void> {
+  await fetchJsonSafe(`/api/agent-center/recurring-tasks/${recurringId}`, { method: "DELETE" }, 30000);
+}
+
+export async function runRecurringTask(recurringId: number): Promise<void> {
+  await fetchJsonSafe(`/api/agent-center/recurring-tasks/${recurringId}/run`, { method: "POST" }, 60000);
 }
 
 export async function fetchAgentDialogs(params: { channel: string; q?: string; agent?: string }): Promise<{

@@ -72,6 +72,9 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Idempotent: recurring tasks fired by the agent's own scheduler (not Bitrix REPLICATE) —
     # adds scheduling state (next_run_at/last_*) + a jsonb spec to reproduce the one-off task.
     "046_recurring_tasks_scheduler.sql",
+    # Idempotent: agent_slug on recurring tasks (shown in the agent's «Автоматизации» tab)
+    # + source_disk_file_id cache key on the attachment store (task-comment files).
+    "047_recurring_agent_slug_attachment_source.sql",
 ]
 
 
