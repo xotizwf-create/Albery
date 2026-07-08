@@ -3295,6 +3295,28 @@ def tool_search_tasks(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _live_task_comments(task_id: int, chat_id: Any = None) -> list[dict[str, Any]] | None:
+    """Read the task's comments LIVE from Bitrix (comments = messages of the task's IM chat).
+    The bitrix_tasks.raw_json snapshot goes stale between syncs — the agent was seeing 1 of 5
+    screenshots in task 962 because 4 comments were newer than the snapshot. None on failure
+    (the caller falls back to the snapshot)."""
+    try:
+        if not chat_id:
+            resp = _webhook_raw("tasks.task.get", {"taskId": int(task_id),
+                                                   "select": ["ID", "CHAT_ID"]})
+            t = (resp.get("result") or {}).get("task") or {}
+            chat_id = t.get("chatId") or t.get("CHAT_ID")
+        if not chat_id:
+            return None
+        msgs = _webhook_raw("im.dialog.messages.get",
+                            {"DIALOG_ID": f"chat{chat_id}", "LIMIT": 200})
+        messages = (msgs.get("result") or {}).get("messages")
+        return messages if isinstance(messages, list) else None
+    except Exception:  # noqa: BLE001
+        logging.warning("get_task_comments: live fetch failed task=%s", task_id, exc_info=True)
+        return None
+
+
 def tool_get_task_comments(args: dict[str, Any]) -> dict[str, Any]:
     raw_task_id = args.get("bitrix_task_id")
     if raw_task_id in (None, ""):
@@ -3329,24 +3351,47 @@ def tool_get_task_comments(args: dict[str, Any]) -> dict[str, Any]:
                 (task_id,),
             )
             row = cur.fetchone()
-            if not row:
-                return {
-                    "bitrix_task_id": task_id,
-                    "found": False,
-                    "items": [],
-                    "note": "Task not found in bitrix_tasks. Sync it first or check the id.",
-                }
 
-            items = row["items"] if isinstance(row["items"], list) else []
-            author_ids: set[int] = set()
-            for it in items:
-                if isinstance(it, dict):
-                    aid = comment_author_id(it)
-                    if aid:
-                        author_ids.add(aid)
+    # Live-first: the synced snapshot lags behind (new comments/screenshots are invisible in it).
+    live_items = _live_task_comments(task_id, (row or {}).get("chat_id"))
+    source = "live"
+    if live_items is not None:
+        items = live_items
+    elif row and isinstance(row["items"], list):
+        items, source = row["items"], "snapshot"
+    else:
+        items = []
+    if not row and live_items is None:
+        return {
+            "bitrix_task_id": task_id,
+            "found": False,
+            "items": [],
+            "note": "Task not found (neither synced nor reachable live). Check the id.",
+        }
+    if not row:
+        # Task exists live but was never synced: fetch the header fields live too.
+        try:
+            resp = _webhook_raw("tasks.task.get", {"taskId": task_id,
+                                                   "select": ["ID", "TITLE", "STATUS", "CHAT_ID"]})
+            t = (resp.get("result") or {}).get("task") or {}
+            row = {"bitrix_task_id": task_id, "title": t.get("title"),
+                   "status": t.get("status"), "status_name": None,
+                   "chat_id": t.get("chatId"), "creator_name": None, "responsible_name": None}
+        except Exception:  # noqa: BLE001
+            row = {"bitrix_task_id": task_id, "title": None, "status": None, "status_name": None,
+                   "chat_id": None, "creator_name": None, "responsible_name": None}
 
-            names_by_id: dict[int, str] = {}
-            if author_ids:
+    author_ids: set[int] = set()
+    for it in items:
+        if isinstance(it, dict):
+            aid = comment_author_id(it)
+            if aid:
+                author_ids.add(aid)
+
+    names_by_id: dict[int, str] = {}
+    if author_ids:
+        with connect() as conn:
+            with conn.cursor() as cur:
                 cur.execute(
                     "SELECT bitrix_user_id, full_name FROM users WHERE bitrix_user_id = ANY(%s)",
                     (list(author_ids),),
@@ -3365,7 +3410,7 @@ def tool_get_task_comments(args: dict[str, Any]) -> dict[str, Any]:
     # a screenshot-only comment is no longer «пустой». Cached by disk file id, so only the first
     # read of a file downloads/recognizes it; the per-call budget bounds worst-case latency.
     attachments_note = None
-    files_budget = int(os.getenv("B24_COMMENT_FILES_PER_CALL", "8") or "8")
+    files_budget = int(os.getenv("B24_COMMENT_FILES_PER_CALL", "12") or "12")
     for c in page:
         fids = c.pop("file_ids", []) or []
         if not fids:
@@ -3414,6 +3459,7 @@ def tool_get_task_comments(args: dict[str, Any]) -> dict[str, Any]:
         "offset": offset,
         "returned": len(page),
         "items": page,
+        "comments_source": source,
         "attachments_note": attachments_note,
     }
 
