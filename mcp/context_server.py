@@ -4617,25 +4617,108 @@ def tool_get_webapp_template(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"get_webapp_template failed: {exc}") from exc
 
 
+# Incremental document drafts — the model assembles a LONG document (contract) in small sections
+# so no single tool-call output is huge. The Codex backend drops the stream connection when the
+# model has to emit one very large tool argument (a full contract HTML ~ 15k+ output tokens); that
+# is the real reason big contracts failed. Small sections (~5-8k chars each) never trigger that.
+_DOC_DRAFT_DIR = Path(os.getenv("EXPORT_DRAFT_DIR", "/var/www/albery/.doc_drafts"))
+_DOC_HTML_MAX = 400_000
+
+
+def _doc_draft_path(token: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "", str(token or ""))
+    return _DOC_DRAFT_DIR / f"{safe}.json"
+
+
+def _render_and_save_doc(title: str, html: str, args: dict[str, Any]) -> str:
+    from docformat import html_to_docx
+    data = html_to_docx(
+        html,
+        font_size_pt=float(args.get("font_size_pt") or 12),
+        line_spacing=float(args.get("line_spacing") or 1.15),
+    )
+    from b24bot import _b24_save_export
+    return _b24_save_export(data, title, "docx")
+
+
 def tool_export_document(args: dict[str, Any]) -> dict[str, Any]:
+    import json as _json
+    import secrets as _secrets
     title = str(args.get("title") or "").strip() or "Документ"
     fmt = str(args.get("format") or "docx").strip().lower()
-    html = str(args.get("html") or "")
     if fmt != "docx":
         raise McpError(-32602, "Пока поддерживается только format='docx'.")
+
+    html = str(args.get("html") or "")
+    section = str(args.get("section") or "")
+    doc_token = str(args.get("doc_token") or "").strip()
+    finalize = args.get("finalize") is True or str(args.get("finalize") or "").strip().lower() in {"true", "1", "yes", "да"}
+
+    # --- Incremental mode: doc_token / section / finalize are present -------------------------
+    if doc_token or section or finalize:
+        try:
+            _DOC_DRAFT_DIR.mkdir(parents=True, exist_ok=True)
+            if not doc_token:
+                # First section — open a new draft.
+                doc_token = "doc_" + _secrets.token_urlsafe(8)
+                draft = {"title": title, "html": "",
+                         "font_size_pt": args.get("font_size_pt"), "line_spacing": args.get("line_spacing")}
+            else:
+                p = _doc_draft_path(doc_token)
+                if not p.is_file():
+                    raise McpError(-32602, f"Черновик {doc_token} не найден (истёк или не начат). Начни заново: "
+                                           "export_document(title=..., section=...) без doc_token.")
+                draft = _json.loads(p.read_text(encoding="utf-8"))
+                if title and title != "Документ":
+                    draft["title"] = title
+            if section:
+                draft["html"] += section
+            if len(draft["html"]) > _DOC_HTML_MAX:
+                raise McpError(-32602, "Документ превысил лимит 400 тыс. символов.")
+            # Preserve settings from the opening call.
+            for k in ("font_size_pt", "line_spacing"):
+                if args.get(k) is not None:
+                    draft[k] = args.get(k)
+
+            if finalize:
+                if not draft["html"].strip():
+                    raise McpError(-32602, "Черновик пуст — добавь секции перед finalize.")
+                url = _render_and_save_doc(
+                    draft.get("title") or title,
+                    draft["html"],
+                    {"font_size_pt": draft.get("font_size_pt"), "line_spacing": draft.get("line_spacing")},
+                )
+                try:
+                    _doc_draft_path(doc_token).unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                return {"url": url, "format": "docx", "doc_token": doc_token,
+                        "chars_total": len(draft["html"]),
+                        "note": "Готово: документ собран из всех секций. Пришли пользователю эту ссылку."}
+            _doc_draft_path(doc_token).write_text(_json.dumps(draft, ensure_ascii=False), encoding="utf-8")
+            return {
+                "doc_token": doc_token,
+                "chars_total": len(draft["html"]),
+                "finalized": False,
+                "note": (f"Секция принята (всего {len(draft['html'])} символов). Добавь следующую часть: "
+                         f"export_document(doc_token='{doc_token}', section='<HTML следующей части>'). "
+                         f"Когда документ готов — export_document(doc_token='{doc_token}', finalize=true). "
+                         "Держи каждую секцию небольшой (примерно до 6000 символов)."),
+            }
+        except McpError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise McpError(-32010, f"export_document (incremental) failed: {exc}") from exc
+
+    # --- One-shot mode (small documents) ------------------------------------------------------
     if not html.strip():
-        raise McpError(-32602, "Передайте html — полное содержимое документа.")
-    if len(html) > 400_000:
+        raise McpError(-32602, "Передайте html — полное содержимое документа. Для ДЛИННОГО документа "
+                               "(договор) собирай его по частям: export_document(title=..., section=...) → "
+                               "export_document(doc_token=..., section=...) → export_document(doc_token=..., finalize=true).")
+    if len(html) > _DOC_HTML_MAX:
         raise McpError(-32602, "HTML слишком большой (лимит 400 тыс. символов) — сократите документ.")
     try:
-        from docformat import html_to_docx
-        data = html_to_docx(
-            html,
-            font_size_pt=float(args.get("font_size_pt") or 12),
-            line_spacing=float(args.get("line_spacing") or 1.15),
-        )
-        from b24bot import _b24_save_export
-        url = _b24_save_export(data, title, "docx")
+        url = _render_and_save_doc(title, html, args)
     except McpError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -6998,18 +7081,28 @@ TOOLS: dict[str, dict[str, Any]] = {
             "А4. Эмодзи вырезаются автоматически — НЕ используй их и BB-коды [b] в html. Нумерацию "
             "разделов/пунктов (1., 1.1., 5.2.1.) пиши ЯВНО в тексте — так надёжнее списков. "
             "В html клади ТОЛЬКО сам документ: без комментариев, рекомендаций и пояснений — их пиши "
-            "отдельно в чате."
+            "отдельно в чате.\n\n"
+            "⚠️ ДЛИННЫЙ ДОКУМЕНТ (договор, соглашение с приложениями) СОБИРАЙ ПО ЧАСТЯМ — это ОБЯЗАТЕЛЬНО, "
+            "иначе один огромный вызов обрывает связь с ИИ и документ НЕ создаётся. Схема: "
+            "(1) первый вызов export_document(title=..., section='<HTML шапки + преамбула + раздел 1>') — "
+            "вернётся doc_token; (2) следующие вызовы export_document(doc_token='<тот же>', section='<HTML "
+            "следующих 1-2 разделов>') — по очереди; (3) финал export_document(doc_token='<тот же>', "
+            "finalize=true) — вернётся ссылка url. Держи КАЖДУЮ section небольшой (примерно до 6000 "
+            "символов). Одним вызовом html=... шли ТОЛЬКО короткие документы (справка, простое письмо)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "Имя файла (без расширения), например «Договор поставки ткани»."},
-                "html": {"type": "string", "description": "Полный HTML документа (только содержимое документа)."},
+                "title": {"type": "string", "description": "Имя файла (без расширения), например «Договор поставки ткани». Указывай в ПЕРВОМ вызове."},
+                "html": {"type": "string", "description": "Полный HTML КОРОТКОГО документа за один вызов. Для длинного документа НЕ используй — собирай через section/doc_token/finalize."},
+                "section": {"type": "string", "description": "Очередная ЧАСТЬ HTML длинного документа (до ~6000 символов). Первый вызов с section и без doc_token открывает черновик и возвращает doc_token."},
+                "doc_token": {"type": "string", "description": "Идентификатор черновика (возвращается первым вызовом). Передавай во все последующие section-вызовы и в finalize."},
+                "finalize": {"type": "boolean", "description": "true в ПОСЛЕДНЕМ вызове — собрать docx из всех накопленных секций и вернуть ссылку url."},
                 "format": {"type": "string", "enum": ["docx"], "description": "Формат файла (пока docx)."},
-                "font_size_pt": {"type": "number", "description": "Базовый размер шрифта, pt (по умолчанию 12)."},
-                "line_spacing": {"type": "number", "description": "Межстрочный интервал (по умолчанию 1.15; для договоров обычно 1.5)."},
+                "font_size_pt": {"type": "number", "description": "Базовый размер шрифта, pt (по умолчанию 12). Указывай в первом вызове."},
+                "line_spacing": {"type": "number", "description": "Межстрочный интервал (по умолчанию 1.15; для договоров обычно 1.5). Указывай в первом вызове."},
             },
-            "required": ["title", "html"],
+            "required": ["title"],
             "additionalProperties": False,
         },
         "handler": tool_export_document,

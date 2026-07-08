@@ -29,5 +29,6 @@ dist/
 *.predeploy.*
 .b24_testbot_state.json
 .b24_attachments/
+.doc_drafts/
 .error_digest_state.json
 tmp_*.py

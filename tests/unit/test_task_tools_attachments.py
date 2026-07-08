@@ -149,3 +149,44 @@ def test_extract_binary_document_docx_roundtrip(tmp_path):
     d.save(str(p))
     text = cs._extract_binary_document(p.read_bytes(), "docx")
     assert "Договор оказания услуг" in text
+
+
+def test_export_document_incremental_assembly(tmp_path, monkeypatch):
+    """Long docs are built in small sections so no single tool output is huge (the real cause of
+    the contract failures). Each section call returns a token; finalize renders the whole thing."""
+    import mcp.context_server as cs
+
+    monkeypatch.setattr(cs, "_DOC_DRAFT_DIR", tmp_path / "drafts")
+    rendered = {}
+    monkeypatch.setattr(cs, "_render_and_save_doc",
+                        lambda title, html, a: rendered.update(title=title, html=html) or "https://x/doc.docx")
+
+    r1 = cs.tool_export_document({"title": "Договор", "section": "<h1>ДОГОВОР</h1><p>Часть 1.</p>"})
+    assert r1["doc_token"].startswith("doc_") and r1["finalized"] is False
+    tok = r1["doc_token"]
+
+    r2 = cs.tool_export_document({"doc_token": tok, "section": "<p>Часть 2 — предмет.</p>"})
+    assert r2["chars_total"] > r1["chars_total"]
+
+    r3 = cs.tool_export_document({"doc_token": tok, "finalize": True})
+    assert r3["url"] == "https://x/doc.docx"
+    assert "Часть 1" in rendered["html"] and "Часть 2" in rendered["html"]
+    # draft cleaned up after finalize
+    assert not cs._doc_draft_path(tok).exists()
+
+
+def test_export_document_oneshot_still_works(tmp_path, monkeypatch):
+    import mcp.context_server as cs
+
+    monkeypatch.setattr(cs, "_render_and_save_doc", lambda title, html, a: "https://x/one.docx")
+    r = cs.tool_export_document({"title": "Справка", "html": "<p>Короткий документ.</p>"})
+    assert r["url"] == "https://x/one.docx"
+
+
+def test_export_document_unknown_token_rejected(tmp_path, monkeypatch):
+    import mcp.context_server as cs
+    import pytest
+
+    monkeypatch.setattr(cs, "_DOC_DRAFT_DIR", tmp_path / "drafts")
+    with pytest.raises(cs.McpError):
+        cs.tool_export_document({"doc_token": "doc_nope", "section": "<p>x</p>"})
