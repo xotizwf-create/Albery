@@ -2202,6 +2202,35 @@ def _resolve_task_actor(args: dict[str, Any], id_key: str, name_key: str) -> dic
     return _resolve_active_bitrix_user(args.get(id_key), args.get(name_key))
 
 
+def _preclaim_task_comment(comment_id: Any, task_id: int, author_id: Any = None) -> None:
+    """A comment created by OUR OWN tools must never trigger the in-task mention handler — the
+    OnTaskCommentAdd event fires for it too. Pre-claiming the id in the dedupe table makes the
+    handler see it as already handled. This precise guard is what allows LIVE humans writing
+    through the technical webhook user (author 22 — наш веб-интерфейс) to summon the agent:
+    the old blanket «skip author 22» rule silently ate their mentions (2026-07-09, «Рекомендации
+    09.07»)."""
+    try:
+        cid = int(comment_id)
+    except (TypeError, ValueError):
+        return
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bitrix_task_comment_seen (comment_id, task_id, agent_slug, author_id, handled) "
+                    "VALUES (%s, %s, 'self-tool', %s, TRUE) ON CONFLICT (comment_id) DO NOTHING",
+                    (cid, int(task_id), _int_or_none(author_id)))
+    except Exception:  # noqa: BLE001
+        logging.warning("task-comment preclaim failed comment=%s", comment_id, exc_info=True)
+
+
+def _int_or_none(value: Any):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def tool_add_bitrix_task_comment(args: dict[str, Any]) -> dict[str, Any]:
     task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
     text = str(args.get("comment_text") or args.get("message") or "").strip()
@@ -2239,6 +2268,7 @@ def tool_add_bitrix_task_comment(args: dict[str, Any]) -> dict[str, Any]:
     response = _bitrix_call_with_fallback(
         "task.commentitem.add", {"TASKID": task_id, "FIELDS": fields}, prefer_api=False, fallback=False)
     comment_id = response.get("result") if isinstance(response, dict) else None
+    _preclaim_task_comment(comment_id, task_id, (author or {}).get("bitrix_user_id"))
 
     # For a result, also pin the file(s) to the task itself so they show in the task's files.
     # A disk object is consumed by the comment attach above, so upload FRESH copies for the task.

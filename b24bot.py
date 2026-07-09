@@ -3204,8 +3204,13 @@ def _b24_ensure_task_comment_event_bound(client_endpoint: str, access_token: str
 
 
 def _b24_task_bot_author_ids() -> set[int]:
-    """User ids whose comments must NEVER trigger the agent (its own replies go out as these)."""
-    ids = {to_int(x) for x in os.getenv("B24_TASK_BOT_AUTHOR_IDS", "22").split(",")}
+    """EXTRA user ids whose comments never trigger the agent (env B24_TASK_BOT_AUTHOR_IDS).
+    Default is now EMPTY: the technical webhook user (22) is how LIVE humans post through the
+    Albery web UI, and the old blanket skip silently ate their mentions («Рекомендации 09.07»,
+    2026-07-09). Loop safety is precise instead: agent replies are authored by the BOTS (guarded
+    via _b24_task_targets), fallback replies carry the «🤖» prefix, and every comment our own
+    tools create is PRE-CLAIMED in bitrix_task_comment_seen at creation time."""
+    ids = {to_int(x) for x in os.getenv("B24_TASK_BOT_AUTHOR_IDS", "").split(",") if x.strip()}
     return {i for i in ids if i is not None}
 
 
@@ -3380,17 +3385,28 @@ def _b24_post_task_comment(task_id: int, text: str, agent_name: str, author_bot_
     if not wh:
         return False
 
-    def _post(fields: dict[str, Any]) -> bool:
+    def _post(fields: dict[str, Any]) -> Any:
         r = requests.post(f"{wh}/task.commentitem.add.json",
                           json={"TASKID": task_id, "FIELDS": fields}, timeout=30)
         data = r.json() if r.content else {}
-        return bool(data.get("result"))
+        return data.get("result")
+
+    def _claim_own(created_id: Any) -> None:
+        # Our own reply also raises OnTaskCommentAdd — pre-claim it so it can never re-trigger.
+        if to_int(created_id):
+            _b24_task_comment_claim(to_int(created_id), task_id, "self-reply", author_bot_id)
 
     bot_id = to_int(author_bot_id)
     try:
-        if bot_id and _post({"POST_MESSAGE": text[:20000], "AUTHOR_ID": bot_id}):
-            return True
-        return _post({"POST_MESSAGE": f"🤖 {agent_name}: {text}"[:20000]})
+        if bot_id:
+            created = _post({"POST_MESSAGE": text[:20000], "AUTHOR_ID": bot_id})
+            if created:
+                _claim_own(created)
+                return True
+        created = _post({"POST_MESSAGE": f"🤖 {agent_name}: {text}"[:20000]})
+        if created:
+            _claim_own(created)
+        return bool(created)
     except Exception:  # noqa: BLE001
         logging.warning("b24 task-mention: reply post failed task=%s", task_id, exc_info=True)
         return False

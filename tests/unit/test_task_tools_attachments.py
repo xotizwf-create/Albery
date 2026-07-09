@@ -81,10 +81,44 @@ def test_comment_event_id_extraction():
     assert bitrix._extract_bitrix_event_comment_id(legacy) == 555
 
 
-def test_task_bot_author_ids_default():
+def test_task_bot_author_ids_default_empty(monkeypatch):
+    # The blanket «skip author 22» rule silently ate mentions posted by live humans through the
+    # web UI (2026-07-09, «Рекомендации 09.07») — the default extra-skip list is now empty;
+    # loop safety is precise (bot authors + 🤖 prefix + pre-claimed own comments).
     import b24bot
 
-    assert 22 in b24bot._b24_task_bot_author_ids()
+    monkeypatch.delenv("B24_TASK_BOT_AUTHOR_IDS", raising=False)
+    assert b24bot._b24_task_bot_author_ids() == set()
+    monkeypatch.setenv("B24_TASK_BOT_AUTHOR_IDS", "22, 99")
+    assert b24bot._b24_task_bot_author_ids() == {22, 99}
+
+
+def test_webhook_user_mention_now_triggers(monkeypatch):
+    # A mention authored by the technical webhook user (22 — how the web UI posts) must reach
+    # the agent and produce a reply.
+    import b24bot
+
+    monkeypatch.delenv("B24_TASK_BOT_AUTHOR_IDS", raising=False)
+    monkeypatch.setattr(b24bot, "_b24_fetch_task_comment",
+                        lambda t, c: {"author_id": 22, "text": "Албери, собери сводку",
+                                      "chat_id": 1, "file_ids": []})
+    monkeypatch.setattr(b24bot, "_b24_task_targets", lambda: [
+        {"slug": None, "bot_id": 24, "name": "Агент Албери", "triggers": {"албери"}, "is_main": True},
+    ])
+    monkeypatch.setattr(b24bot, "_b24_main_allows", lambda uid: True)
+    monkeypatch.setattr(b24bot, "_b24_task_comment_claim", lambda *a: True)
+    monkeypatch.setattr(b24bot, "_b24_task_context_text", lambda t: "Задача №9.")
+    monkeypatch.setattr(b24bot, "_b24_portal_user_directory", lambda: {22: {"name": "ИИ Агент"}})
+    monkeypatch.setattr(b24bot, "hermes_brain_answer", lambda *a, **k: "Готово, сводка ниже.")
+    monkeypatch.setattr(b24bot, "_hermes_answer_is_error", lambda a: False)
+    sent = []
+    monkeypatch.setattr(b24bot, "_b24_post_task_comment",
+                        lambda *a, **k: sent.append(a) or True)
+    monkeypatch.setattr(b24bot, "_b24_task_comment_mark_handled", lambda c: None)
+    monkeypatch.setattr(b24bot, "_b24_log_interaction", lambda *a, **k: None)
+    res = b24bot._b24_handle_task_comment_event(9, 200)
+    assert res.get("handled") is True
+    assert sent, "the reply must be posted"
 
 
 def test_error_suggestion_button_label():
