@@ -8053,7 +8053,7 @@ export default function App() {
       </aside>
 
       {/* MAIN LAYOUT */}
-      <div className="flex-1 ml-[260px] flex flex-col min-h-screen">
+      <div className="flex-1 min-w-0 ml-[260px] flex flex-col min-h-screen">
         {/* HEADER */}
         <header className="flex items-center justify-between px-10 py-5 bg-[#F4F5F8] border-b border-transparent z-20">
           <div className="flex flex-wrap items-center gap-6">
@@ -8100,7 +8100,7 @@ export default function App() {
         </header>
 
         {/* CONTENT AREA */}
-        <main className="flex-1 px-10 pb-10 flex flex-col relative z-10">
+        <main className="flex-1 min-w-0 px-10 pb-10 flex flex-col relative z-10">
           {/* PAGE HEADER */}
           <div className="flex items-end justify-between mb-8 pb-2 shrink-0">
             <div>
@@ -8163,7 +8163,7 @@ export default function App() {
           </div>
 
           {/* DYNAMIC CONTENT */}
-          <div className="flex-1">{renderContent()}</div>
+          <div className="flex-1 min-w-0">{renderContent()}</div>
         </main>
       </div>
 

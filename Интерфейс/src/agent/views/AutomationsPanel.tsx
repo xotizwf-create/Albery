@@ -182,7 +182,7 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
           const open = openId === a.id;
           const system = a.kind === "system";
           return (
-            <div key={a.id} className={cn("bg-white border border-gray-200/70 rounded-2xl shadow-sm", !a.is_active && "opacity-60")}>
+            <div key={a.id} className={cn("bg-white border border-gray-200/70 rounded-2xl shadow-sm overflow-hidden", !a.is_active && "opacity-60")}>
               <div className="p-4 flex items-center gap-3 cursor-pointer" onClick={() => setOpenId(open ? null : a.id)}>
                 <div className="w-9 h-9 rounded-xl bg-indigo-50 border border-indigo-100 text-indigo-500 flex items-center justify-center shrink-0">
                   <Clock className="w-5 h-5" />
@@ -268,7 +268,7 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                   ) : (
                     <>
                       {a.prompt && (
-                        <p className="whitespace-pre-wrap">
+                        <p className="whitespace-pre-wrap break-words">
                           <span className="font-bold text-gray-800">Задача:</span> {a.prompt}
                         </p>
                       )}
@@ -283,9 +283,9 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                         {a.deliver_to || "чат уведомлений Albery"}
                       </p>
                       )}
-                      {a.last_error && <p className="text-rose-600">Последняя ошибка: {a.last_error}</p>}
+                      {a.last_error && <p className="text-rose-600 break-words">Последняя ошибка: {a.last_error}</p>}
                       {a.last_result && (
-                        <p className="whitespace-pre-wrap bg-slate-50 border border-gray-100 rounded-xl p-3 text-gray-600">
+                        <p className="whitespace-pre-wrap break-words bg-slate-50 border border-gray-100 rounded-xl p-3 text-gray-600">
                           {a.last_result}
                         </p>
                       )}
