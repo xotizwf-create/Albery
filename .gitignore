@@ -32,3 +32,5 @@ dist/
 .doc_drafts/
 .error_digest_state.json
 tmp_*.py
+.tg_agent_state.json
+.tg_business_log.jsonl
