@@ -16,7 +16,6 @@ import time
 
 from datetime import date
 from datetime import datetime
-from datetime import time as dt_time
 from datetime import timedelta
 from flask import abort
 from flask import jsonify
@@ -30,7 +29,6 @@ import requests
 from config import (
     EXPORT_DIR,
     MSK_TZ,
-    msk_today,
 )
 
 from utils import (
@@ -943,12 +941,13 @@ def zoom_call_operational_tasks(call: dict[str, Any]) -> list[dict[str, Any]]:
     section = extract_zoom_operational_tasks_section(call.get("analytical_note") or "")
     return normalize_zoom_operational_tasks(section=section, analysis=analysis, existing_tasks=existing)
 def zoom_dispatch_deadline(call: dict[str, Any]) -> tuple[str | None, str]:
-    call_date = safe_parse_date(call.get("date"))
-    if call_date is None:
-        start = parse_datetime(call.get("start_time_msk"))
-        call_date = start.astimezone(MSK_TZ).date() if start else msk_today()
-    deadline_at = datetime.combine(call_date, dt_time(19, 0), tzinfo=MSK_TZ)
-    return deadline_at.isoformat(), f"{call_date.strftime('%d.%m.%Y')} 19:00 МСК"
+    """Lead-card deadline from DISPATCH time (owner rule 2026-07-09): today 18:00 МСК, but if
+    fewer than 3 hours remain before 18:00 (or it is evening/a day off) — next working day 11:00.
+    The call date is intentionally ignored: an old call dispatched today must still get a
+    deadline the lead can realistically meet."""
+    import business_hours
+    deadline_at = business_hours.zoom_lead_deadline_at()
+    return deadline_at.isoformat(), business_hours.format_deadline_msk(deadline_at)
 def _zoom_ai_analysis(call: dict[str, Any]) -> dict[str, Any]:
     """Return the saved zoom_processing JSON (raw_json.ai_report.analysis)."""
     raw_json = call.get("raw_json") if isinstance(call.get("raw_json"), dict) else {}

@@ -12408,7 +12408,8 @@ def normalize_bitrix_recipient_ids(recipient_ids: list[Any]) -> list[int]:
 
 # Owner recommendations are delivered as a single Bitrix task per recipient (titled
 # "Рекомендации DD.MM"), not as personal IM messages. The task is created in the
-# evening (~18:00) and its deadline is 10:00 the next day (MSK) and must not be movable.
+# evening (~18:00); its deadline is 12:00 of the next WORKING day (MSK, owner rule
+# 2026-07-09 — a Friday report is due Monday 12:00) and must not be movable.
 RECOMMENDATION_TASK_REACTION_HEADER = (
     "Ознакомьтесь со списком рекомендаций и дайте на них реакцию:\n"
     "- неактуально\n"
@@ -12430,10 +12431,10 @@ def owner_recommendations_task_title(report: dict[str, Any], report_kind: str) -
 
 
 def owner_recommendations_task_deadline(report: dict[str, Any], report_kind: str) -> tuple[str, str]:
+    import business_hours
     anchor = owner_recommendations_report_anchor_date(report, report_kind)
-    due_date = anchor + timedelta(days=1)
-    deadline_at = datetime.combine(due_date, dt_time(10, 0), tzinfo=MSK_TZ)
-    return deadline_at.isoformat(), f"{due_date.strftime('%d.%m.%Y')} 10:00 МСК"
+    deadline_at = business_hours.recommendations_deadline_at(anchor)
+    return deadline_at.isoformat(), business_hours.format_deadline_msk(deadline_at)
 
 
 def build_owner_recommendation_task_description(body_text: str) -> str:

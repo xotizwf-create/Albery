@@ -8525,7 +8525,8 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Preview the aggregated 'Итоги созвона' Bitrix tasks that would be created for one Zoom call WITHOUT sending. "
             "Returns title (e.g. 'Итоги созвона 09:28'), per-recipient cards (one card = one aggregated task per "
-            "responsible person, grouping all of their operational_tasks from the call), deadline (call_date 19:00 МСК), "
+            "responsible person, grouping all of their operational_tasks from the call), deadline (18:00 МСК сегодня; "
+            "если до 18:00 меньше 3 часов или выходной — следующий рабочий день 11:00), "
             "and the standard description '"
             "Ознакомьтесь со списком выделенных из созвона задач и поставьте себе самые важные в Битрикс...'. "
             "Do not call this if you only need to send — just call dispatch_zoom_operational_tasks directly."
@@ -8543,7 +8544,8 @@ TOOLS: dict[str, dict[str, Any]] = {
     "dispatch_zoom_operational_tasks": {
         "description": (
             "Create aggregated 'Итоги созвона <ЧЧ:ММ>' Bitrix tasks for ONE Zoom call: one task per responsible person, "
-            "deadline = call_date 19:00 МСК, description = standard 'Ознакомьтесь со списком...' header plus the list of "
+            "deadline = 18:00 МСК того же дня (если до 18:00 меньше 3 часов или выходной — следующий рабочий день "
+            "11:00), description = standard 'Ознакомьтесь со списком...' header plus the list of "
             "this person's operational_tasks from the call. Behaves EXACTLY like Albery UI button 'Отправка задач'. "
             "STRICT CONFIRMATION RULE: do not call unless the owner has just explicitly approved sending (replied "
             "'ставь' / 'создавай' / 'да' to the zoom-to-tasks Telegram summary). confirm=true is mandatory. "
@@ -8666,7 +8668,8 @@ TOOLS: dict[str, dict[str, Any]] = {
             "(owner) — one task per recipient, NOT personal messages. Each task is titled 'Рекомендации DD.MM', the "
             "recipient is the responsible person, the description asks them to react (неактуально / взял в работу / "
             "уже в работе / уже есть результат / уже есть рабочий файл — «ссылка») and then lists their recommendations. "
-            "The deadline is fixed at 10:00 the next day (Europe/Moscow) and the assignee cannot move it "
+            "The deadline is fixed at 12:00 of the next WORKING day (Europe/Moscow; a Friday report is due "
+            "Monday 12:00) and the assignee cannot move it "
             "(ALLOW_CHANGE_DEADLINE=N). STRICT RULE: do not call this tool unless the owner has just approved the exact "
             "recommendation texts. Confirm=true is mandatory. Each entry in recipient_recommendations is the final "
             "recommendation body for that Bitrix user id (a clean numbered list, no greeting) and becomes the task "
