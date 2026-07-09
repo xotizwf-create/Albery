@@ -62,7 +62,7 @@ _MAIN_AGENT_META = {
     "icon_bg": "bg-orange-100 text-orange-500",
 }
 
-_B24_MARKUP_RE = re.compile(r"\[/?(?:b|i|u|s|code|quote|url(?:=[^\]]*)?)\]", re.IGNORECASE)
+_B24_MARKUP_RE = re.compile(r"\[/?(?:b|i|u|s|code|quote|url(?:=[^\]]*)?|user(?:=[^\]]*)?)\]", re.IGNORECASE)
 
 
 def _strip_b24_markup(text: str) -> str:
