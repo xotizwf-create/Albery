@@ -41,6 +41,12 @@ export function DialogsView() {
   const [turns, setTurns] = useState<DialogTurn[]>([]);
   const [channel, setChannel] = useState<"Bitrix" | "Telegram">("Bitrix");
   const [channelNote, setChannelNote] = useState("");
+  // Bitrix has two separate streams: ordinary private chats ("chat") and in-task mention
+  // threads ("task", dialog_id "task-<id>"). Kept apart so they never mix. Deep links to a
+  // task thread (dialog segment "task-…") restore the task tab.
+  const [scope, setScope] = useState<"chat" | "task">(
+    () => (agentSubSegments(DIALOGS_BASE)[1]?.startsWith("task-") ? "task" : "chat"),
+  );
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterId>("all");
   // Initial selection comes from the URL (/agent-dialogs/<agent>/<dialog>) so a refresh
@@ -92,6 +98,15 @@ export function DialogsView() {
     setChats([]);
   };
 
+  // Switching stream (chats ↔ in-task): drop the open thread + stale list so one stream's
+  // conversation never lingers under the other.
+  const selectScope = (s: "chat" | "task") => {
+    if (s === scope) return;
+    setScope(s);
+    setActiveChatId(null);
+    setChats([]);
+  };
+
   // Reflect the current selection in the URL (replaceState — survives refresh & is
   // shareable, without spamming history): /agent-dialogs[/<agent>[/<dialog>]].
   useEffect(() => {
@@ -109,6 +124,7 @@ export function DialogsView() {
       const seg = agentSubSegments(DIALOGS_BASE);
       setActiveAgentId(seg[0] || "all");
       setActiveChatId(seg[0] && seg[1] ? `${seg[0]}:${seg[1]}` : null);
+      setScope(seg[1]?.startsWith("task-") ? "task" : "chat");
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
@@ -119,7 +135,7 @@ export function DialogsView() {
     const timer = window.setTimeout(() => {
       setChatsLoading(true);
       setError("");
-      fetchAgentDialogs({ channel, q: query, agent: activeAgentId })
+      fetchAgentDialogs({ channel, q: query, agent: activeAgentId, kind: channel === "Bitrix" ? scope : undefined })
         .then(({ chats: loaded, note }) => {
           if (cancelled) return;
           setChats(loaded);
@@ -136,7 +152,7 @@ export function DialogsView() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [channel, query, activeAgentId]);
+  }, [channel, query, activeAgentId, scope]);
 
   // The agents pane narrows the list to one bot server-side (each bot has its own
   // dialog history — never pooled); here only the tag chips narrow it further.
@@ -205,12 +221,12 @@ export function DialogsView() {
   // Live refresh of the dialog list (new dialogs / previews / error tags).
   useEffect(() => {
     const timer = window.setInterval(() => {
-      fetchAgentDialogs({ channel, q: query, agent: activeAgentId })
+      fetchAgentDialogs({ channel, q: query, agent: activeAgentId, kind: channel === "Bitrix" ? scope : undefined })
         .then(({ chats: loaded }) => setChats(loaded))
         .catch(() => {});
     }, 20000);
     return () => window.clearInterval(timer);
-  }, [channel, query, activeAgentId]);
+  }, [channel, query, activeAgentId, scope]);
 
   const agentIcon = (iconType: AgentConfig["iconType"]) =>
     iconType === "zap" ? Zap : iconType === "book" ? BookOpen : iconType === "crown" ? Crown : Package;
@@ -302,6 +318,30 @@ export function DialogsView() {
               </button>
             ))}
           </div>
+          {channel === "Bitrix" && (
+            <div className="flex gap-1 p-1 bg-gray-100/70 rounded-xl">
+              {(
+                [
+                  { id: "chat", label: "Чаты" },
+                  { id: "task", label: "В задачах" },
+                ] as const
+              ).map((s) => (
+                <button
+                  key={s.id}
+                  onClick={() => selectScope(s.id)}
+                  className={cn(
+                    "flex-1 px-3 py-1.5 text-[12.5px] font-bold rounded-lg transition-colors flex items-center justify-center gap-1.5",
+                    scope === s.id ? "bg-white text-indigo-700 shadow-sm" : "text-gray-500 hover:text-gray-700",
+                  )}
+                >
+                  {s.label}
+                  {scope === s.id && (
+                    <span className="text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded-md text-[11px]">{chats.length}</span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="relative">
             <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
             <input
@@ -341,7 +381,12 @@ export function DialogsView() {
           )}
           {!chatsLoading && !error && visibleChats.length === 0 && (
             <div className="py-10 px-6 text-center text-gray-400 text-[13px] font-medium">
-              {channelNote || (query ? `По запросу «${query}» ничего не найдено` : "Диалогов пока нет")}
+              {channelNote ||
+                (query
+                  ? `По запросу «${query}» ничего не найдено`
+                  : scope === "task"
+                    ? "Обращений к агентам в задачах пока нет"
+                    : "Диалогов пока нет")}
             </div>
           )}
           {!chatsLoading &&
@@ -417,7 +462,7 @@ export function DialogsView() {
                 </div>
               </div>
               <div className="flex items-center gap-2 px-4 py-2 text-[13px] font-bold text-gray-400 bg-white border border-gray-100 rounded-xl">
-                диалог {activeChat.dialogId}
+                {activeChat.taskId ? `в задаче #${activeChat.taskId}` : `диалог ${activeChat.dialogId}`}
                 <ExternalLink className="w-4 h-4" />
               </div>
             </div>

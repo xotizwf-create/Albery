@@ -137,6 +137,17 @@ def agent_center_dialogs():
         else:
             agent_filter = " AND agent_slug = %s"
             agent_params = [agent]
+    # In-task mentions ("Тебя позвали ПРЯМО В ЗАДАЧЕ …") are logged with dialog_id="task-<id>"
+    # by b24bot; regular private chats use the numeric user id. Keep the two streams apart so
+    # in-task threads never mix into the ordinary dialog list. kind=chat (default) = only private
+    # chats; kind=task = only in-task threads; kind=all = both. (% is doubled for psycopg.)
+    kind = (request.args.get("kind") or "chat").strip().lower()
+    if kind == "task":
+        kind_filter = " AND dialog_id LIKE 'task-%%'"
+    elif kind == "all":
+        kind_filter = ""
+    else:
+        kind_filter = " AND dialog_id NOT LIKE 'task-%%'"
     limit = _limit_arg(_DIALOGS_LIMIT_DEFAULT, 500)
     # A "dialog" belongs to a specific bot. In Bitrix a private bot chat is keyed by the
     # USER (dialog_id = user id), so the SAME dialog_id is reused by every bot that user
@@ -147,7 +158,7 @@ def agent_center_dialogs():
             SELECT DISTINCT ON (agent_slug, dialog_id)
                    dialog_id, agent_slug, bitrix_user_id, tier, question, status, created_at
             FROM bitrix_bot_interactions
-            WHERE dialog_id IS NOT NULL{agent_filter}
+            WHERE dialog_id IS NOT NULL{agent_filter}{kind_filter}
             ORDER BY agent_slug, dialog_id, id DESC
         ),
         agg AS (
@@ -156,7 +167,7 @@ def agent_center_dialogs():
                    COUNT(*) FILTER (WHERE status <> 'ok') AS errors,
                    MAX(created_at) AS last_at
             FROM bitrix_bot_interactions
-            WHERE dialog_id IS NOT NULL{agent_filter}
+            WHERE dialog_id IS NOT NULL{agent_filter}{kind_filter}
             GROUP BY dialog_id, agent_slug
         )
         SELECT l.dialog_id, l.agent_slug, l.bitrix_user_id, l.tier, l.question, l.status,
@@ -169,7 +180,7 @@ def agent_center_dialogs():
     if q:
         sql += (
             " WHERE l.dialog_id IN (SELECT DISTINCT dialog_id FROM bitrix_bot_interactions"
-            f" WHERE (question ILIKE %s OR answer ILIKE %s){agent_filter})"
+            f" WHERE (question ILIKE %s OR answer ILIKE %s){agent_filter}{kind_filter})"
         )
         like = f"%{q}%"
         params.extend([like, like])
@@ -184,13 +195,27 @@ def agent_center_dialogs():
                 rows = cur.fetchall()
         names = _user_names()
         for r in rows:
+            did = r["dialog_id"] or ""
             uid = int(r["bitrix_user_id"]) if r["bitrix_user_id"] is not None else None
             info = names.get(uid or -1, {})
-            preview = _strip_b24_markup(r["question"] or "")
+            raw_q = r["question"] or ""
+            task_id = None
+            if did.startswith("task-"):
+                try:
+                    task_id = int(did[len("task-"):])
+                except ValueError:
+                    task_id = None
+                # The stored question is the agent-facing wrapper; surface the employee's actual
+                # comment as the preview instead of the boilerplate "Тебя позвали …" prefix.
+                m = re.search(r"написал[а]? в комментарии к задаче №\d+:\s*«(.+?)»", raw_q, re.S)
+                if m:
+                    raw_q = m.group(1)
+            preview = _strip_b24_markup(raw_q)
             if len(preview) > 100:
                 preview = preview[:100].rstrip() + "…"
             dialogs.append({
-                "dialog_id": r["dialog_id"],
+                "dialog_id": did,
+                "task_id": task_id,
                 "bitrix_user_id": uid,
                 "user_name": info.get("name") or (f"Сотрудник #{uid}" if uid else "Сотрудник"),
                 "user_position": info.get("position") or "",

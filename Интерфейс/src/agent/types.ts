@@ -2,7 +2,8 @@ export type TabType = 'analytics' | 'wb' | 'zoom' | 'team' | 'dialogs' | 'agents
 
 export interface Chat {
   id: string; // composite key `${agentId}:${dialogId}` — unique per bot+user (a dialog_id is shared across bots)
-  dialogId: string; // raw Bitrix dialog_id (the user), for fetching the thread
+  dialogId: string; // raw Bitrix dialog_id (the user, or "task-<id>" for in-task mentions)
+  taskId?: number; // set only for in-task mention threads (dialog_id "task-<id>")
   agentId: string; // which bot this dialog belongs to ('main' or a subagent slug)
   userName: string;
   userRole: string;

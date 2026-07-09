@@ -20,6 +20,7 @@ export interface DialogTurn {
 
 interface RawDialog {
   dialog_id: string;
+  task_id?: number | null;
   bitrix_user_id: number | null;
   user_name: string;
   user_position: string;
@@ -78,9 +79,10 @@ const avatarColor = (key: string) => {
 const toChat = (d: RawDialog): Chat => ({
   id: `${d.agent_slug || "main"}:${d.dialog_id}`,
   dialogId: d.dialog_id,
+  taskId: d.task_id ?? undefined,
   agentId: d.agent_slug || "main",
   userName: d.user_name,
-  userRole: d.user_position || `диалог ${d.dialog_id}`,
+  userRole: d.user_position || (d.task_id ? `задача #${d.task_id}` : `диалог ${d.dialog_id}`),
   avatarInitials: initials(d.user_name),
   avatarColor: avatarColor(d.dialog_id),
   time: d.time,
@@ -344,7 +346,12 @@ export async function runRecurringTask(recurringId: number): Promise<void> {
   await fetchJsonSafe(`/api/agent-center/recurring-tasks/${recurringId}/run`, { method: "POST" }, 60000);
 }
 
-export async function fetchAgentDialogs(params: { channel: string; q?: string; agent?: string }): Promise<{
+export async function fetchAgentDialogs(params: {
+  channel: string;
+  q?: string;
+  agent?: string;
+  kind?: string;
+}): Promise<{
   chats: Chat[];
   note?: string;
 }> {
@@ -352,6 +359,8 @@ export async function fetchAgentDialogs(params: { channel: string; q?: string; a
   if (params.q) search.set("q", params.q);
   // Per-agent isolation: "all" = every bot; otherwise only the selected bot's dialogs.
   if (params.agent && params.agent !== "all") search.set("agent", params.agent);
+  // kind=chat (default) = private chats only; kind=task = in-task mention threads only.
+  if (params.kind) search.set("kind", params.kind);
   const data = await fetchJsonSafe(`/api/agent-center/dialogs?${search}`, undefined, 30000);
   return { chats: ((data.dialogs || []) as RawDialog[]).map(toChat), note: data.note };
 }
