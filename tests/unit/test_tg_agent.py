@@ -19,10 +19,23 @@ def test_normalize_channel_rejects_junk():
         assert tg_agent.normalize_channel(raw) is None, raw
 
 
-def test_owner_gate(monkeypatch):
+def test_owner_gate_by_id(monkeypatch):
     monkeypatch.setenv("TG_AGENT_OWNER_IDS", "111, 222")
+    monkeypatch.setenv("TG_AGENT_OWNER_USERNAMES", "")
     assert tg_agent.is_owner(111) and tg_agent.is_owner("222")
     assert not tg_agent.is_owner(333) and not tg_agent.is_owner(None)
+
+
+def test_owner_gate_by_username(monkeypatch):
+    # Owner rule 2026-07-09: only @AlberyAIManager; the Bot API cannot resolve usernames to
+    # ids up front, so the gate must accept the update's from.username (case-insensitive).
+    monkeypatch.setenv("TG_AGENT_OWNER_IDS", "")
+    monkeypatch.setenv("TG_AGENT_OWNER_USERNAMES", "AlberyAIManager")
+    assert tg_agent.is_owner({"id": 999, "username": "alberyaimanager"})
+    assert tg_agent.is_owner({"id": 999, "username": "AlberyAIManager"})
+    assert not tg_agent.is_owner({"id": 999, "username": "someone_else"})
+    assert not tg_agent.is_owner({"id": 999})
+    assert not tg_agent.is_owner(999)
 
 
 _FIXTURE = """

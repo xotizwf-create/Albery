@@ -98,8 +98,10 @@ DIGEST_PROMPT_HEAD = (
 def run_digest(notify_chat=None) -> str:
     tg_agent._load_env_file()
     names = tg_agent.channels()
-    owners = sorted(tg_agent.owner_ids())
-    targets = [notify_chat] if notify_chat else owners
+    targets = [notify_chat] if notify_chat else tg_agent.delivery_targets()
+    if not targets:
+        log.warning("digest: no delivery targets yet (owner has not written to the bot)")
+        return "no targets"
     if not names:
         for chat in targets:
             tg_agent.send_text(chat, "Еженедельный обзор: список каналов пуст — добавьте их "

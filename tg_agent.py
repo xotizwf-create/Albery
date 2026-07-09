@@ -62,7 +62,7 @@ def bot_token() -> str:
 
 
 def owner_ids() -> set[int]:
-    raw = os.getenv("TG_AGENT_OWNER_IDS", "1451982360")
+    raw = os.getenv("TG_AGENT_OWNER_IDS", "")
     out = set()
     for part in raw.replace(";", ",").split(","):
         part = part.strip()
@@ -71,11 +71,51 @@ def owner_ids() -> set[int]:
     return out
 
 
-def is_owner(user_id) -> bool:
+def owner_usernames() -> set[str]:
+    """Whitelist by @username — the Bot API cannot resolve a username to an id up front, but
+    every incoming update carries from.username, so this is how the owner account is granted
+    access before it ever wrote to the bot. Owner rule 2026-07-09: ONLY @AlberyAIManager."""
+    raw = os.getenv("TG_AGENT_OWNER_USERNAMES", "AlberyAIManager")
+    return {u.strip().lstrip("@").lower() for u in raw.replace(";", ",").split(",") if u.strip()}
+
+
+def is_owner(user) -> bool:
+    """`user` is the update's `from` dict (id + username) or a bare id."""
+    if isinstance(user, dict):
+        if to_int_safe(user.get("id")) in owner_ids():
+            return True
+        return str(user.get("username") or "").lower() in owner_usernames()
     try:
-        return int(user_id) in owner_ids()
+        return int(user) in owner_ids()
     except (TypeError, ValueError):
         return False
+
+
+def to_int_safe(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _remember_owner_chat(user: dict) -> None:
+    """Persist the owner's numeric id once they write — digests and notifications need a chat id,
+    and a username alone cannot receive messages."""
+    uid = to_int_safe(user.get("id"))
+    if not uid:
+        return
+    with _state_lock:
+        state = load_state()
+        seen = set(state.get("owner_chat_ids") or [])
+        if uid not in seen:
+            seen.add(uid)
+            state["owner_chat_ids"] = sorted(seen)
+            save_state(state)
+
+
+def delivery_targets() -> list[int]:
+    """Chats that receive digests/notifications: explicit env ids + owners seen via username."""
+    return sorted(owner_ids() | set(load_state().get("owner_chat_ids") or []))
 
 
 def load_state() -> dict:
@@ -271,14 +311,15 @@ def handle_message(msg: dict) -> None:
     if chat.get("type") != "private":
         return  # phase 1: the bot works in private chats only
     chat_id = chat.get("id")
-    from_id = (msg.get("from") or {}).get("id")
+    sender = msg.get("from") or {}
     text = (msg.get("text") or "").strip()
     if not text:
         return
-    if not is_owner(from_id):
+    if not is_owner(sender):
         send_text(chat_id, "Я — внутренний агент компании Albery и работаю только с владельцем. "
                            "Если вам нужен доступ — напишите Евгению.")
         return
+    _remember_owner_chat(sender)
     if handle_command(chat_id, text):
         return
     try:
@@ -305,7 +346,7 @@ def handle_business_connection(conn: dict) -> None:
             "at": datetime.now(timezone.utc).isoformat(),
         }
         save_state(state)
-    for oid in owner_ids():
+    for oid in delivery_targets():
         try:
             state_word = "подключён к вашему аккаунту" if conn.get("is_enabled", True) else "отключён"
             send_text(oid, f"🔗 Бизнес-режим: бот {state_word}. Я вижу личные чаты и веду журнал; "
@@ -334,7 +375,8 @@ def handle_business_message(msg: dict) -> None:
 
 
 def poll_forever() -> None:
-    log.info("tg agent starting; owners=%s", sorted(owner_ids()))
+    log.info("tg agent starting; owner ids=%s usernames=%s",
+             sorted(owner_ids()), sorted(owner_usernames()))
     me = api("getMe")
     log.info("bot: @%s (id %s)", me.get("username"), me.get("id"))
     offset = int(load_state().get("offset") or 0)
