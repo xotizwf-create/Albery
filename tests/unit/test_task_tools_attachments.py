@@ -165,6 +165,75 @@ def test_strip_task_bbcode():
     assert cleaned == "Агент Албери привет жирный"
 
 
+def test_post_task_comment_as_the_mentioned_bot(monkeypatch):
+    # The reply must be authored by the summoned bot itself (owner, 2026-07-09); the
+    # technical-webhook-user + «🤖 prefix» form is only the fallback.
+    import b24bot
+
+    monkeypatch.setenv("B24_TESTBOT_WEBHOOK_BASE", "https://portal/rest/22/tok")
+    posts = []
+
+    class _Resp:
+        content = b"{}"
+
+        def json(self):
+            return {"result": 1}
+
+    def fake_post(url, json=None, timeout=None):
+        posts.append(json["FIELDS"])
+        return _Resp()
+
+    monkeypatch.setattr(b24bot.requests, "post", fake_post)
+    assert b24bot._b24_post_task_comment(5, "привет", "Агент Албери", 24) is True
+    assert posts[0]["AUTHOR_ID"] == 24
+    assert posts[0]["POST_MESSAGE"] == "привет"  # no prefix when the author IS the bot
+    posts.clear()
+    assert b24bot._b24_post_task_comment(5, "привет", "Агент Албери", None) is True
+    assert "AUTHOR_ID" not in posts[0]
+    assert posts[0]["POST_MESSAGE"].startswith("🤖 Агент Албери:")
+
+
+def test_no_access_mention_gets_bot_refusal(monkeypatch):
+    # Summoning an agent you cannot use must produce a polite refusal FROM THAT BOT,
+    # not silence (owner, 2026-07-09).
+    import b24bot
+
+    monkeypatch.setattr(b24bot, "_b24_fetch_task_comment",
+                        lambda t, c: {"author_id": 28, "text": "Агент-юрист, помоги с договором",
+                                      "chat_id": 1, "file_ids": []})
+    monkeypatch.setattr(b24bot, "_b24_task_targets", lambda: [
+        {"slug": None, "bot_id": 24, "name": "Агент Албери", "triggers": {"албери"}, "is_main": True},
+        {"slug": "agent-sklad", "bot_id": 70, "name": "Агент-юрист",
+         "triggers": {"агент-юрист", "юрист"}, "is_main": False},
+    ])
+    monkeypatch.setattr(b24bot, "_b24_task_subagent_allows", lambda slug, uid: False)
+    monkeypatch.setattr(b24bot, "_b24_task_comment_claim", lambda *a: True)
+    monkeypatch.setattr(b24bot, "_b24_task_comment_mark_handled", lambda c: None)
+    sent = []
+    monkeypatch.setattr(
+        b24bot, "_b24_post_task_comment",
+        lambda task_id, text, name, bot_id=None: sent.append((task_id, text, name, bot_id)) or True)
+    res = b24bot._b24_handle_task_comment_event(9, 100)
+    assert res["reason"] == "no_access_refused" and res["handled"] is True
+    assert sent[0][3] == 70  # the refusal comes from the summoned bot itself
+    assert "нет доступа" in sent[0][1]
+
+
+def test_bot_authored_comment_never_retriggers(monkeypatch):
+    # A reply authored by ANY agent bot (not only the webhook user) must not loop.
+    import b24bot
+
+    monkeypatch.setattr(b24bot, "_b24_fetch_task_comment",
+                        lambda t, c: {"author_id": 70, "text": "Албери, посмотри",
+                                      "chat_id": 1, "file_ids": []})
+    monkeypatch.setattr(b24bot, "_b24_task_targets", lambda: [
+        {"slug": None, "bot_id": 24, "name": "Агент Албери", "triggers": {"албери"}, "is_main": True},
+        {"slug": "agent-sklad", "bot_id": 70, "name": "Агент-юрист", "triggers": {"юрист"}, "is_main": False},
+    ])
+    res = b24bot._b24_handle_task_comment_event(9, 101)
+    assert res == {"handled": False, "reason": "own_comment"}
+
+
 def test_task_deep_link_builds_clickable_url(monkeypatch):
     import mcp.context_server as cs
 

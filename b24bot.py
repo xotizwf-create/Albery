@@ -3236,13 +3236,13 @@ def _b24_task_targets() -> list[dict[str, Any]]:
     return targets
 
 
-def _b24_task_pick_agent(text: str) -> dict[str, Any] | None:
+def _b24_task_pick_agent(text: str, targets: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     """Return the summoned agent target whose trigger phrase appears in the comment, longest first
     (so «агент-юрист» wins over the generic «албери»). None if no agent is named."""
     low = " " + re.sub(r"\s+", " ", (text or "").lower()) + " "
     best = None
     best_len = 0
-    for tgt in _b24_task_targets():
+    for tgt in (targets if targets is not None else _b24_task_targets()):
         for trig in tgt["triggers"]:
             if not trig:
                 continue
@@ -3368,21 +3368,40 @@ def _b24_task_context_text(task_id: int) -> str:
     return "\n".join(lines)
 
 
-def _b24_post_task_comment(task_id: int, text: str, agent_name: str) -> bool:
-    """Post the agent's reply as a task comment (author = technical webhook user, marked with the
-    agent name so employees see who answered). Loop-safe: our handler skips this author id."""
+def _b24_post_task_comment(task_id: int, text: str, agent_name: str, author_bot_id: Any = None) -> bool:
+    """Post the agent's reply as a task comment AS THE MENTIONED BOT (AUTHOR_ID = the bot's user
+    id — probed live 2026-07-09: the comment really sticks as «Агент Албери»/«Агент-юрист»).
+    Fallback when the bot id is unknown or rejected: the technical webhook user with a
+    «🤖 <Имя>:» prefix. Loop-safe either way: the handler skips bot/webhook authors."""
     wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
     if not wh:
         return False
-    body = f"🤖 {agent_name}: {text}"
-    try:
+
+    def _post(fields: dict[str, Any]) -> bool:
         r = requests.post(f"{wh}/task.commentitem.add.json",
-                          json={"TASKID": task_id, "FIELDS": {"POST_MESSAGE": body[:20000]}}, timeout=30)
+                          json={"TASKID": task_id, "FIELDS": fields}, timeout=30)
         data = r.json() if r.content else {}
         return bool(data.get("result"))
+
+    bot_id = to_int(author_bot_id)
+    try:
+        if bot_id and _post({"POST_MESSAGE": text[:20000], "AUTHOR_ID": bot_id}):
+            return True
+        return _post({"POST_MESSAGE": f"🤖 {agent_name}: {text}"[:20000]})
     except Exception:  # noqa: BLE001
         logging.warning("b24 task-mention: reply post failed task=%s", task_id, exc_info=True)
         return False
+
+
+def _b24_task_comment_mark_handled(comment_id: int) -> None:
+    """Flip the dedupe row to handled=TRUE once a reply was actually posted (observability)."""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE bitrix_task_comment_seen SET handled = TRUE WHERE comment_id = %s",
+                            (int(comment_id),))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, Any]:
@@ -3394,16 +3413,26 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
         return {"handled": False, "reason": "comment_not_found"}
     author_id = comment.get("author_id")
     text = comment.get("text") or ""
-    # Loop guard: never react to the bot's own replies or the technical webhook user.
-    if to_int(author_id) in _b24_task_bot_author_ids() or text.lstrip().startswith("🤖"):
+    targets = _b24_task_targets()
+    # Loop guard: never react to any agent bot's own replies or the technical webhook user.
+    bot_authors = _b24_task_bot_author_ids() | {to_int(t["bot_id"]) for t in targets if t.get("bot_id")}
+    if to_int(author_id) in bot_authors or text.lstrip().startswith("🤖"):
         return {"handled": False, "reason": "own_comment"}
-    target = _b24_task_pick_agent(text)
+    target = _b24_task_pick_agent(text, targets)
     if not target:
         return {"handled": False, "reason": "no_agent_named"}
     # Access gate: the author must have access to THIS agent (same rules as the chat).
+    # No access -> the SUMMONED BOT itself politely refuses (a silent agent «нарушает логику»).
     allowed = _b24_main_allows(author_id) if target["is_main"] else _b24_task_subagent_allows(target["slug"], author_id)
     if not allowed:
-        return {"handled": False, "reason": "no_access", "agent": target["name"]}
+        if not _b24_task_comment_claim(comment_id, task_id, target["slug"], author_id):
+            return {"handled": False, "reason": "already_seen"}
+        refusal = ("У вас нет доступа ко мне( Попросите администратора открыть вам доступ — "
+                   "и я помогу прямо в задаче.")
+        posted = _b24_post_task_comment(task_id, refusal, target["name"], target.get("bot_id"))
+        if posted:
+            _b24_task_comment_mark_handled(comment_id)
+        return {"handled": bool(posted), "reason": "no_access_refused", "agent": target["name"]}
     # First-sight claim (dedupe) — do this AFTER the cheap filters so we don't burn the id on noise.
     if not _b24_task_comment_claim(comment_id, task_id, target["slug"], author_id):
         return {"handled": False, "reason": "already_seen"}
@@ -3457,15 +3486,9 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
     answer = hermes_brain_answer(user_text, dialog_id, tier, author_id, agent=agent)
     if not answer or _hermes_answer_is_error(answer):
         return {"handled": False, "reason": "brain_error", "agent": target["name"]}
-    posted = _b24_post_task_comment(task_id, answer, target["name"])
+    posted = _b24_post_task_comment(task_id, answer, target["name"], target.get("bot_id"))
     if posted:
-        try:
-            with pg_connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE bitrix_task_comment_seen SET handled = TRUE "
-                                "WHERE comment_id = %s", (int(comment_id),))
-        except Exception:  # noqa: BLE001
-            pass
+        _b24_task_comment_mark_handled(comment_id)
     try:
         _b24_log_interaction(dialog_id, author_id, tier, user_text, answer, 0,
                              "ok" if posted else "post_failed", "" if posted else "reply post failed",
