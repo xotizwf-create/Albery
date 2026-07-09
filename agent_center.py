@@ -671,7 +671,7 @@ def monitoring_payload(chart_days: int = 1, agent: str = "all") -> dict[str, Any
             etype = "info"
         stamped.append((r["created_at"], {"type": etype, "text": text}))
     for r in report_rows:
-        text = f"«Сообщить об ошибке» от {r['reporter_name'] or 'сотрудника'}: " + re.sub(r"\s+", " ", r["report_text"]).strip()[:140]
+        text = f"«Ошибка/Предложение» от {r['reporter_name'] or 'сотрудника'}: " + re.sub(r"\s+", " ", r["report_text"]).strip()[:140]
         stamped.append((r["created_at"], {"type": "report", "text": text}))
     if not flt:  # deploys are system-wide — they belong to the "all agents" feed only
         for c in _git_info()["log"]:

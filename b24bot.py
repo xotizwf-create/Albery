@@ -592,7 +592,7 @@ def _b24_disclaimer() -> str:
 
 def _b24_keyboard() -> list[dict[str, Any]]:
     """Buttons under the bot's latest reply: '🆕 Новая сессия' (resets via `new`), '⚠️ Сообщить об
-    ошибке' (error-report flow via `report_error`) and '❓ Как пользоваться' (re-shows the onboarding
+    Предложение' (error/suggestion flow via `report_error`) and '❓ Как пользоваться' (re-shows the onboarding
     guide via `help`). Only the most recent bot message carries these — _b24_app_reply strips the
     keyboard off the previous one (see _b24_strip_keyboard). Typed '/new' / 'новая сессия' still
     resets via the _b24_is_reset_command keyword detector."""
@@ -607,7 +607,7 @@ def _b24_keyboard() -> list[dict[str, Any]]:
             "BLOCK": "N",
         },
         {
-            "TEXT": "⚠️ Сообщить об ошибке",
+            "TEXT": "⚠️ Ошибка/Предложение",
             "COMMAND": "report_error",
             "COMMAND_PARAMS": "/report_error",
             "DISPLAY": "LINE",
@@ -869,7 +869,7 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
 
 _B24_COMMANDS = [
     {"COMMAND": "new", "ru": "Новая сессия", "en": "New session"},
-    {"COMMAND": "report_error", "ru": "Сообщить об ошибке", "en": "Report an error"},
+    {"COMMAND": "report_error", "ru": "Ошибка/Предложение", "en": "Error / Suggestion"},
     {"COMMAND": "help", "ru": "Как пользоваться", "en": "How to use"},
     {"COMMAND": "onb_next", "ru": "Далее", "en": "Next"},
 ]
@@ -2983,7 +2983,8 @@ def _b24_do_reset(client_endpoint: str, access_token: str, bot_id: Any, dialog_i
     _b24_ensure_command_registered(client_endpoint, access_token, bot_id)
 
 
-# --- "Сообщить об ошибке": ask → capture next message → forward to Telegram + log -----------
+# --- "Ошибка/Предложение" (бывш. «Сообщить об ошибке»): ask → capture next message → forward to
+# --- Telegram + log. Since 2026-07-09 the button carries both error reports and improvement ideas.
 # The notifications group is a Telegram group ("Albery_Уведомления"); generic Bitrix REST is the
 # wrong channel anyway. We deliver via the Telegram Bot API using @albery_ai_bot's token and log
 # every report to bitrix_error_reports (delivered flag + any delivery error) for an audit trail.
@@ -3090,16 +3091,17 @@ def _b24_log_error_report(dialog_id: str, from_user_id: Any, reporter_name: str,
 
 def _b24_start_error_report(client_endpoint: str, access_token: str, bot_id: Any,
                             dialog_id: str, message_id: Any = "") -> None:
-    """User pressed '⚠️ Сообщить об ошибке' — ask for the description and arm capture of their
-    next message (handled in ONIMBOTMESSAGEADD via _b24_pop_awaiting_error). Armed per (bot, dialog)
-    so pressing it on one bot never captures a message the user later sends to a DIFFERENT bot."""
+    """User pressed '⚠️ Ошибка/Предложение' — ask for the description (an error OR an improvement
+    idea) and arm capture of their next message (handled in ONIMBOTMESSAGEADD via
+    _b24_pop_awaiting_error). Armed per (bot, dialog) so pressing it on one bot never captures a
+    message the user later sends to a DIFFERENT bot."""
     _b24_set_awaiting_error(bot_id, dialog_id)
     if message_id:
         _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
         _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
     _b24_app_reply(
         client_endpoint, access_token, bot_id, dialog_id,
-        "Объясните, пожалуйста, в чём заключается ошибка? Опишите одним сообщением — "
+        "Опишите, пожалуйста, вашу ошибку или предложение одним сообщением — "
         "я сразу передам Александру.",
         keyboard=_b24_keyboard(),
     )
@@ -3109,9 +3111,10 @@ def _b24_start_error_report(client_endpoint: str, access_token: str, bot_id: Any
 def _b24_handle_error_report(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
                              report_text: str, from_user_id: Any, reporter_name: str,
                              message_id: Any = "") -> None:
-    """Forward a user's error description to the Albery notifications Telegram group and log it."""
+    """Forward a user's error report or improvement suggestion to the Albery notifications
+    Telegram group and log it (one shared channel — the reader triages by the text itself)."""
     name = (reporter_name or "").strip() or "Сотрудник"
-    tg_text = f"⚠️ {name} отправил отчёт об ошибке, текст: {report_text}. Я уже иду разбираться дальше."
+    tg_text = f"⚠️ {name} отправил ошибку/предложение: {report_text}"
     ok, err = _albery_tg_notify(tg_text)
     report_agent_slug = None  # NULL = the main bot, same convention as interactions
     try:
@@ -3131,10 +3134,10 @@ def _b24_handle_error_report(client_endpoint: str, access_token: str, bot_id: An
         _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
         _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
     if ok:
-        confirm = "Спасибо! Передал ваше сообщение Александру — уже разбираемся."
+        confirm = "Спасибо! Передал ваше сообщение Александру."
     else:
         logging.error("b24 testbot: error report TG delivery failed: %s", err)
-        confirm = "Спасибо! Записал вашу ошибку и передам Александру."
+        confirm = "Спасибо! Записал ваше сообщение и передам Александру."
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id, confirm, keyboard=_b24_keyboard())
 
 
@@ -3666,7 +3669,7 @@ def _bitrix_imbot_app_event():
                 })
             except Exception:  # noqa: BLE001
                 logging.exception("b24 testbot: no-access notice (command) failed")
-        elif cmd_dialog and command in ("report_error", "error", "ошибка"):
+        elif cmd_dialog and command in ("report_error", "error", "ошибка", "предложение", "suggestion"):
             _b24_start_error_report(endpoint, access_token, bot_id, cmd_dialog, message_id)
         elif cmd_dialog and command in ("help", "обучение", "onboarding", "помощь"):
             _b24_send_onboarding(endpoint, access_token, bot_id, cmd_dialog, 1,

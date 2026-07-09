@@ -87,6 +87,16 @@ def test_task_bot_author_ids_default():
     assert 22 in b24bot._b24_task_bot_author_ids()
 
 
+def test_error_suggestion_button_label():
+    # Renamed 2026-07-09 (task 1150): the button accepts both errors and suggestions.
+    import b24bot
+
+    button = next(b for b in b24bot._b24_keyboard() if b["COMMAND"] == "report_error")
+    assert button["TEXT"] == "⚠️ Ошибка/Предложение"
+    # The command id must stay `report_error` — existing per-bot registrations keep resolving.
+    assert button["COMMAND_PARAMS"] == "/report_error"
+
+
 def test_task_comment_event_binding_self_heal(monkeypatch):
     # The manual portal step was never done (event.get was empty) — the binding must be
     # created programmatically and be idempotent (2026-07-09, task 1152).
