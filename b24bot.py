@@ -3443,12 +3443,14 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
         + f"Сотрудник {requester} (id={author_id}) написал в комментарии к задаче №{task_id}:\n«"
         + text.strip() + "»"
         + files_block + "\n\n"
-        "Ответь по существу и, если он просит действие с задачей, выполни его своими инструментами "
-        f"(комментарий — add_bitrix_task_comment(bitrix_task_id={task_id}, author_bitrix_user_id={author_id}); "
-        f"завершить — complete_bitrix_task(bitrix_task_id={task_id}, on_behalf_bitrix_user_id={author_id}); "
-        f"результат/скрин как результат — as_result=true; возобновить — reopen_bitrix_task; "
-        f"новый срок — new_deadline). Пиши кратко: твой ответ уйдёт в этот же комментарий задачи. "
-        "НЕ дублируй постановку — задача уже есть, работай в её контексте."
+        "КАК ОТВЕЧАТЬ: просто напиши текст ответа — он АВТОМАТИЧЕСКИ уйдёт комментарием в эту "
+        "задачу. НИКОГДА не публикуй свой ответ через add_bitrix_task_comment — получится дубль. "
+        "Инструменты используй ТОЛЬКО для действий, которые сотрудник явно попросил: "
+        f"добавить комментарий ОТ ЕГО имени — add_bitrix_task_comment(bitrix_task_id={task_id}, "
+        f"author_bitrix_user_id={author_id}); завершить задачу — complete_bitrix_task("
+        f"bitrix_task_id={task_id}, on_behalf_bitrix_user_id={author_id}); результат/скрин как "
+        "результат — as_result=true; возобновить — reopen_bitrix_task; новый срок — new_deadline. "
+        "Пиши кратко и по существу. НЕ дублируй постановку — задача уже есть, работай в её контексте."
     )
     # Per-task memory so the agent keeps the thread of THIS task, separate from private chat.
     dialog_id = f"task-{task_id}"
@@ -3456,6 +3458,14 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
     if not answer or _hermes_answer_is_error(answer):
         return {"handled": False, "reason": "brain_error", "agent": target["name"]}
     posted = _b24_post_task_comment(task_id, answer, target["name"])
+    if posted:
+        try:
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE bitrix_task_comment_seen SET handled = TRUE "
+                                "WHERE comment_id = %s", (int(comment_id),))
+        except Exception:  # noqa: BLE001
+            pass
     try:
         _b24_log_interaction(dialog_id, author_id, tier, user_text, answer, 0,
                              "ok" if posted else "post_failed", "" if posted else "reply post failed",
