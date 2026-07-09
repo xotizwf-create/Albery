@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly Albery TG channels digest (Mon 10:00, box TZ = Europe/Moscow)
+
+[Timer]
+OnCalendar=Mon *-*-* 10:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

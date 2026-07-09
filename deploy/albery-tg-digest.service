@@ -1,0 +1,8 @@
+[Unit]
+Description=Albery TG weekly channels digest (one shot)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/www/albery
+EnvironmentFile=/var/www/albery/.env
+ExecStart=/var/www/albery/.venv/bin/python /var/www/albery/tg_digest.py

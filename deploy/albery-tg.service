@@ -1,0 +1,15 @@
+[Unit]
+Description=Albery Telegram AI agent (standalone; never touches albery.service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/albery
+EnvironmentFile=/var/www/albery/.env
+ExecStart=/var/www/albery/.venv/bin/python /var/www/albery/tg_agent.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
