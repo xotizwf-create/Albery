@@ -4155,11 +4155,26 @@ export default function App() {
     return `${number}. ${task.task_text.replace(/\.$/, "")}.${criteria} Дедлайн - ${task.deadline_text.replace(/\.$/, "")}.`;
   };
 
-  const zoomCallDispatchDeadline = (call: ZoomCall) => {
-    const dateIso = call.date || call.start_time_msk.slice(0, 10) || isoFromDate(moscowNow());
-    const [year, month, day] = dateIso.split("-").map(Number);
-    const label = `${String(day).padStart(2, "0")}.${String(month).padStart(2, "0")}.${year} 19:00 МСК`;
-    return { deadline: `${dateIso}T19:00:00+03:00`, deadline_text: label };
+  const zoomCallDispatchDeadline = (_call: ZoomCall) => {
+    // Mirrors backend business_hours.zoom_lead_deadline_at (owner rule 2026-07-09):
+    // 18:00 МСК today; if fewer than 3 hours remain before 18:00 or it is a day off —
+    // next working day 11:00. Computed from dispatch time, not the call date.
+    const now = moscowNow();
+    const isWorkday = (d: Date) => d.getDay() >= 1 && d.getDay() <= 5;
+    const minutesNow = now.getHours() * 60 + now.getMinutes();
+    const fitsToday = isWorkday(now) && minutesNow <= 15 * 60; // >= 3 hours before 18:00
+    const target = new Date(now);
+    let hour = 18;
+    if (!fitsToday) {
+      do {
+        target.setDate(target.getDate() + 1);
+      } while (!isWorkday(target));
+      hour = 11;
+    }
+    const pad = (value: number) => String(value).padStart(2, "0");
+    const dateIso = `${target.getFullYear()}-${pad(target.getMonth() + 1)}-${pad(target.getDate())}`;
+    const label = `${pad(target.getDate())}.${pad(target.getMonth() + 1)}.${target.getFullYear()} ${pad(hour)}:00 МСК`;
+    return { deadline: `${dateIso}T${pad(hour)}:00:00+03:00`, deadline_text: label };
   };
 
   const personNamesMatch = (left?: string | null, right?: string | null) => {
