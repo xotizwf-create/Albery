@@ -87,6 +87,84 @@ def test_task_bot_author_ids_default():
     assert 22 in b24bot._b24_task_bot_author_ids()
 
 
+def test_task_comment_event_binding_self_heal(monkeypatch):
+    # The manual portal step was never done (event.get was empty) — the binding must be
+    # created programmatically and be idempotent (2026-07-09, task 1152).
+    import b24bot
+
+    monkeypatch.setenv("BITRIX_EVENT_SECRET", "sec123")
+    monkeypatch.setattr(b24bot, "_B24_TASK_EVENT_BIND_CHECKED", False)
+    calls = []
+
+    def fake_call(endpoint, token, method, payload=None):
+        calls.append((method, payload))
+        if method == "event.get":
+            return {"result": []}
+        return {"result": True}
+
+    monkeypatch.setattr(b24bot, "_b24_app_call", fake_call)
+    b24bot._b24_ensure_task_comment_event_bound("https://portal/rest/", "tok")
+    binds = [p for m, p in calls if m == "event.bind"]
+    assert [p["event"] for p in binds] == ["ONTASKCOMMENTADD", "ONTASKCOMMENTUPDATE"]
+    assert all(p["handler"] == "https://mcp.m4s.ru/bitrix/events/tasks/sec123" for p in binds)
+    # once-per-process guard: the second call must not touch the API at all
+    calls.clear()
+    b24bot._b24_ensure_task_comment_event_bound("https://portal/rest/", "tok")
+    assert calls == []
+
+
+def test_task_comment_event_binding_skips_when_already_bound(monkeypatch):
+    import b24bot
+
+    monkeypatch.setenv("BITRIX_EVENT_SECRET", "sec123")
+    monkeypatch.setattr(b24bot, "_B24_TASK_EVENT_BIND_CHECKED", False)
+    handler = "https://mcp.m4s.ru/bitrix/events/tasks/sec123"
+    seen = []
+
+    def fake_call(endpoint, token, method, payload=None):
+        seen.append(method)
+        if method == "event.get":
+            return {"result": [{"event": "ONTASKCOMMENTADD", "handler": handler},
+                               {"event": "ONTASKCOMMENTUPDATE", "handler": handler}]}
+        raise AssertionError("event.bind must not be called when already bound")
+
+    monkeypatch.setattr(b24bot, "_b24_app_call", fake_call)
+    b24bot._b24_ensure_task_comment_event_bound("https://portal/rest/", "tok")
+    assert seen == ["event.get"]
+
+
+def test_task_comment_event_binding_requires_secret(monkeypatch):
+    import b24bot
+
+    monkeypatch.delenv("BITRIX_EVENT_SECRET", raising=False)
+    monkeypatch.setattr(b24bot, "_B24_TASK_EVENT_BIND_CHECKED", False)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("no API calls without the endpoint secret")
+
+    monkeypatch.setattr(b24bot, "_b24_app_call", boom)
+    b24bot._b24_ensure_task_comment_event_bound("https://portal/rest/", "tok")  # silent no-op
+
+
+def test_native_bitrix_mention_triggers_agent(monkeypatch):
+    # The task-card «упомянуть» button inserts [USER=<bot>]Имя[/USER] — must trigger.
+    import b24bot
+
+    monkeypatch.setattr(b24bot, "_b24_task_targets", lambda: [
+        {"slug": None, "bot_id": 24, "name": "Агент Албери",
+         "triggers": {"албери", "агент албери"}, "is_main": True},
+    ])
+    picked = b24bot._b24_task_pick_agent("[USER=24]Агент Албери[/USER] О чем эта задача?")
+    assert picked is not None and picked["is_main"] is True
+
+
+def test_strip_task_bbcode():
+    import b24bot
+
+    cleaned = b24bot._b24_strip_task_bbcode("[USER=24]Агент Албери[/USER] привет [B]жирный[/B]")
+    assert cleaned == "Агент Албери привет жирный"
+
+
 def test_task_deep_link_builds_clickable_url(monkeypatch):
     import mcp.context_server as cs
 

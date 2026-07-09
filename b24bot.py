@@ -1063,6 +1063,10 @@ def _b24_startup_register_commands() -> None:
             endpoint, token = "", ""
         if endpoint and token:
             _b24_bootstrap_all_commands(endpoint, token, _b24_load_state().get("bot_id"))
+            try:
+                _b24_ensure_task_comment_event_bound(endpoint, token)
+            except Exception:  # noqa: BLE001
+                logging.warning("b24 testbot: task-comment event bind on startup failed", exc_info=True)
         try:
             _b24_recover_inflight_turns(endpoint, token)
         except Exception:  # noqa: BLE001
@@ -3138,9 +3142,13 @@ def _b24_handle_error_report(client_endpoint: str, access_token: str, bot_id: An
 # When an employee writes a task comment naming an agent ("Албери, ..."), and that employee has
 # access to the agent, the agent replies IN the task comment with the FULL task context and can act
 # on the task (comment / close / result / deadline) through its tools. Delivered via the existing
-# OnTaskCommentAdd outgoing webhook (one manual step: add that event to the tasks webhook).
+# OnTaskCommentAdd events are bound PROGRAMMATICALLY via the app OAuth token (event.bind) — the
+# original design relied on a manual portal step that was never done, so event.get stayed empty and
+# mentions silently never fired (found 2026-07-09). _b24_ensure_task_comment_event_bound() is
+# self-healing: it runs on process start and on live events, checks event.get and binds only what
+# is missing, so the binding survives app reinstalls/token rotations without manual steps.
 #
-# Guards make company-wide comment traffic safe — the webhook fires on EVERY comment on EVERY task:
+# Guards make company-wide comment traffic safe — the event fires on EVERY comment on EVERY task:
 #   * dedupe by comment id (bitrix_task_comment_seen) — each comment handled at most once;
 #   * skip comments authored by the technical webhook user or any bot (no self-trigger loops);
 #   * act ONLY when a configured agent trigger phrase is present AND the author has access;
@@ -3148,6 +3156,48 @@ def _b24_handle_error_report(client_endpoint: str, access_token: str, bot_id: An
 
 def _b24_task_mention_enabled() -> bool:
     return os.getenv("B24_TASK_MENTION_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+_B24_TASK_EVENT_BIND_CHECKED = False
+
+
+def _b24_task_events_handler_url() -> str:
+    secret = os.getenv("BITRIX_EVENT_SECRET", "").strip()
+    return f"https://mcp.m4s.ru/bitrix/events/tasks/{secret}" if secret else ""
+
+
+def _b24_ensure_task_comment_event_bound(client_endpoint: str, access_token: str) -> None:
+    """Bind ONTASKCOMMENTADD/ONTASKCOMMENTUPDATE to our tasks-events endpoint via the app token.
+    Idempotent and cheap: once per process; reads event.get and binds only the missing events.
+    A duplicate delivery is harmless anyway — the comment claim is atomic (first sight wins)."""
+    global _B24_TASK_EVENT_BIND_CHECKED
+    if _B24_TASK_EVENT_BIND_CHECKED or not _b24_task_mention_enabled():
+        return
+    handler = _b24_task_events_handler_url()
+    if not (handler and client_endpoint and access_token):
+        return
+    try:
+        existing = _b24_app_call(client_endpoint, access_token, "event.get", {})
+        bound = {
+            str(e.get("event") or "").strip().upper()
+            for e in (existing.get("result") or [])
+            if isinstance(e, dict) and str(e.get("handler") or "").strip() == handler
+        }
+        for event_name in ("ONTASKCOMMENTADD", "ONTASKCOMMENTUPDATE"):
+            if event_name in bound:
+                continue
+            try:
+                _b24_app_call(client_endpoint, access_token, "event.bind",
+                              {"event": event_name, "handler": handler})
+                logging.info("b24 task-mention: bound %s -> tasks events endpoint", event_name)
+            except Exception as exc:  # noqa: BLE001
+                # "Handler already binded" is fine — someone raced us; anything else is loud.
+                if "already" in str(exc).lower():
+                    continue
+                raise
+        _B24_TASK_EVENT_BIND_CHECKED = True
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 task-mention: event bind failed (will retry on next event)", exc_info=True)
 
 
 def _b24_task_bot_author_ids() -> set[int]:
@@ -3248,29 +3298,73 @@ def _b24_fetch_task_comment(task_id: int, comment_id: int) -> dict[str, Any] | N
     return None
 
 
+_B24_TASK_STATUS_LABELS = {
+    1: "новая", 2: "ждёт выполнения", 3: "выполняется", 4: "ждёт контроля",
+    5: "завершена", 6: "отложена", 7: "отклонена",
+}
+
+
+def _b24_strip_task_bbcode(text: str) -> str:
+    """Readable comment text: [USER=24]Имя[/USER] -> Имя, other short BB tags dropped."""
+    out = re.sub(r"\[USER=\d+\]([^\[]*)\[/USER\]", r"\1", str(text or ""), flags=re.IGNORECASE)
+    out = re.sub(r"\[/?[A-Za-z][^\]]{0,60}\]", "", out)
+    return re.sub(r"\s+", " ", out).strip()
+
+
 def _b24_task_context_text(task_id: int) -> str:
-    """A compact task context block for the agent: title, status, responsible, deadline, last
-    human comments — so the agent «обязательно видит контекст задачи, в которой его зовут»."""
+    """The FULL task context block for the agent: title, description, status, deadline,
+    responsible, creator and the recent comment thread — so the agent «обязательно видит
+    контекст задачи, в которой его зовут» (требование задачи 1152)."""
     wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
     lines = [f"Задача №{task_id}."]
+    chat_id = None
     try:
         r = requests.post(f"{wh}/tasks.task.get.json",
                           json={"taskId": task_id,
                                 "select": ["ID", "TITLE", "DESCRIPTION", "STATUS", "DEADLINE",
-                                           "RESPONSIBLE_ID", "CREATED_BY"]}, timeout=20)
+                                           "RESPONSIBLE_ID", "CREATED_BY", "CHAT_ID"]}, timeout=20)
         t = (r.json().get("result") or {}).get("task") or {}
+        chat_id = t.get("chatId") or t.get("CHAT_ID")
         if t.get("title"):
             lines.append("Название: " + str(t.get("title")))
+        status = to_int(t.get("status") or t.get("STATUS"))
+        if status in _B24_TASK_STATUS_LABELS:
+            lines.append("Статус: " + _B24_TASK_STATUS_LABELS[status])
         if t.get("description"):
-            lines.append("Описание: " + str(t.get("description"))[:1500])
+            lines.append("Описание: " + str(t.get("description"))[:3000])
         if t.get("deadline"):
             lines.append("Срок: " + str(t.get("deadline")))
+        directory = _b24_portal_user_directory()
         rid = to_int(t.get("responsibleId") or t.get("RESPONSIBLE_ID"))
         if rid:
-            who = _b24_portal_user_directory().get(rid, {})
-            lines.append("Ответственный: " + (who.get("name") or str(rid)))
+            lines.append("Ответственный: " + (directory.get(rid, {}).get("name") or str(rid)))
+        cid = to_int(t.get("createdBy") or t.get("CREATED_BY"))
+        if cid:
+            lines.append("Постановщик: " + (directory.get(cid, {}).get("name") or str(cid)))
     except Exception:  # noqa: BLE001
         logging.warning("b24 task-mention: context fetch failed task=%s", task_id, exc_info=True)
+
+    # Recent comment thread (the modern task card keeps comments in the task IM chat).
+    if chat_id:
+        try:
+            r = requests.post(f"{wh}/im.dialog.messages.get.json",
+                              json={"DIALOG_ID": f"chat{chat_id}", "LIMIT": 20}, timeout=20)
+            msgs = (r.json().get("result") or {}).get("messages") or []
+            directory = _b24_portal_user_directory()
+            thread = []
+            for m in sorted(msgs, key=lambda x: to_int(x.get("id")) or 0):
+                author = to_int(m.get("author_id"))
+                if not author:  # system notices (task created/status changed) — noise
+                    continue
+                text = _b24_strip_task_bbcode(m.get("text"))
+                if not text:
+                    continue
+                name = directory.get(author, {}).get("name") or f"id {author}"
+                thread.append(f"- {name}: {text[:400]}")
+            if thread:
+                lines.append("Последние комментарии (старые выше):\n" + "\n".join(thread[-10:]))
+        except Exception:  # noqa: BLE001
+            logging.warning("b24 task-mention: comments fetch failed task=%s", task_id, exc_info=True)
     return "\n".join(lines)
 
 
@@ -3485,6 +3579,7 @@ def _bitrix_imbot_app_event():
     if access_token and bot_id and endpoint and event_name in ("ONIMBOTMESSAGEADD", "ONIMCOMMANDADD"):
         _b24_ensure_command_registered(endpoint, access_token, bot_id)
         _b24_bootstrap_all_commands(endpoint, access_token, state.get("bot_id"))
+        _b24_ensure_task_comment_event_bound(endpoint, access_token)
 
     if event_name == "ONIMBOTJOINCHAT":
         if dialog_id:
