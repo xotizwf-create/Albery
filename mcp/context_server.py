@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.15.0"
+SERVER_VERSION = "0.16.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -7380,6 +7380,75 @@ def tool_delete_crm_deal(args: dict[str, Any]) -> dict[str, Any]:
     return {"deleted": True, "deal_id": deal_id, "title": row.get("TITLE")}
 
 
+# --- Telegram news watchlist (отраслевые каналы WB/маркетплейсов) ------------------------------
+# The TG bot's watchlist (.tg_agent_state.json, managed via /add_channel) is read here so a
+# Bitrix agent («Новостной агент») can see fresh posts of ALL watched channels in one fast call.
+# Fetching goes through tg_digest's public-preview scraper in parallel; per-(channel,days)
+# results are cached 30 minutes, so repeated tool calls within one turn/session are instant.
+
+def _tg_watchlist() -> list[str]:
+    try:
+        state = json.loads((ROOT / ".tg_agent_state.json").read_text(encoding="utf-8"))
+        return [str(c) for c in (state.get("channels") or [])]
+    except (OSError, ValueError):
+        return []
+
+
+def tool_get_tg_news(args: dict[str, Any]) -> dict[str, Any]:
+    import tg_digest  # lazy: standalone module, no Flask/циркулярок
+
+    days = max(1, min(int(args.get("days") or 7), 30))
+    only = [str(c).strip().lstrip("@") for c in (args.get("channels") or []) if str(c).strip()]
+    names = only or _tg_watchlist()
+    if not names:
+        raise McpError(-32000, "Список отслеживаемых каналов пуст (владелец наполняет его через "
+                               "TG-бота командой /add_channel).")
+    max_posts = max(1, min(int(args.get("max_posts_per_channel") or 12), 50))
+    post_chars = max(200, min(int(args.get("post_chars") or 700), 2000))
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    def _one(name: str) -> tuple[str, list[str], str | None]:
+        cached = ttl_cache_get(("tg_news", name, days))
+        if cached is not None:
+            return name, cached[0], cached[1]
+        posts, err = tg_digest.fetch_channel_posts(name, since)
+        ttl_cache_set(("tg_news", name, days), (posts, err), 1800)
+        return name, posts, err
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(pool.map(_one, names))
+
+    channels_out, empty, problems = [], [], []
+    total_posts, budget = 0, 90000
+    for name, posts, err in results:
+        if err:
+            problems.append(f"t.me/{name} — {err}")
+            continue
+        if not posts:
+            empty.append(name)
+            continue
+        fresh = [p[:post_chars] for p in posts[-max_posts:]]
+        piece_len = sum(len(p) for p in fresh)
+        if budget - piece_len < 0:
+            problems.append(f"t.me/{name} — не влез в лимит ответа (запроси его отдельно через channels=[...])")
+            continue
+        budget -= piece_len
+        total_posts += len(fresh)
+        channels_out.append({"channel": name, "url": f"https://t.me/{name}",
+                             "posts_count": len(fresh), "posts": fresh})
+    return {
+        "period_days": days,
+        "channels_with_posts": len(channels_out),
+        "total_posts": total_posts,
+        "channels": channels_out,
+        "empty_channels": empty,
+        "problems": problems,
+        "note": ("Посты за период по каждому каналу (старые выше). Нужен полный текст постов "
+                 "конкретного канала — вызови ещё раз с channels=['имя'] и большим post_chars."),
+    }
+
+
 TOOLS: dict[str, dict[str, Any]] = {
     "get_agent_monitoring": {
         "description": (
@@ -9170,6 +9239,25 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_compact_export,
+    },
+    "get_tg_news": {
+        "description": (
+            "СВЕЖИЕ ПОСТЫ отраслевых Telegram-каналов (список ведёт владелец: WB/маркетплейсы, "
+            "оргпрактики, ИИ). Один вызов = все отслеживаемые каналы за period_days (по умолчанию 7), "
+            "результат кэшируется 30 минут. channels=['имя'] — только выбранные и подробнее. "
+            "Источник — публичные веб-превью t.me/s/."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "minimum": 1, "maximum": 30, "description": "За сколько дней собрать посты (по умолчанию 7)."},
+                "channels": {"type": "array", "items": {"type": "string"}, "description": "Только эти каналы (@имя или имя). Пусто = весь список владельца."},
+                "max_posts_per_channel": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Максимум постов на канал (по умолчанию 12, самые свежие)."},
+                "post_chars": {"type": "integer", "minimum": 200, "maximum": 2000, "description": "Обрезка текста поста (по умолчанию 700 символов)."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_get_tg_news,
     },
     "list_crm_pipelines": {
         "description": (
