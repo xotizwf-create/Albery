@@ -102,23 +102,42 @@ def run_digest(notify_chat=None) -> str:
     if not targets:
         log.warning("digest: no delivery targets yet (owner has not written to the bot)")
         return "no targets"
-    if not names:
-        for chat in targets:
-            tg_agent.send_text(chat, "Еженедельный обзор: список каналов пуст — добавьте их "
-                                     "командой /add_channel @канал.")
-        return "no channels"
     days = int(os.getenv("TG_DIGEST_DAYS", "7"))
     since = datetime.now(timezone.utc) - timedelta(days=days)
     sections, problems = [], []
-    for name in names:
-        posts, err = fetch_channel_posts(name, since)
-        if err:
-            problems.append(f"t.me/{name} — {err}")
-            continue
-        if posts:
-            sections.append(f"=== Канал t.me/{name} ({len(posts)} постов) ===\n" + "\n\n".join(posts))
-        else:
-            problems.append(f"t.me/{name} — за {days} дн. новых постов нет")
+
+    # Primary source: the manager account's own MTProto session (tg_userbot) — sees EVERYTHING
+    # the account is subscribed to, private channels included. Watchlist (/add_channel)
+    # non-empty -> only those; empty -> ALL subscribed channels. Fallback: public t.me/s/.
+    import tg_userbot
+    use_userbot = tg_userbot.session_ready() and \
+        os.getenv("TG_DIGEST_USERBOT", "1").strip().lower() not in {"0", "false", "no", "off"}
+    if use_userbot:
+        try:
+            chats, ub_problems = tg_userbot.fetch_posts(since_days=days, only_names=names)
+            problems.extend(ub_problems)
+            for label, posts in chats:
+                sections.append(f"=== {label} ({len(posts)} постов) ===\n" + "\n\n".join(posts))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("digest: userbot source failed — falling back to public previews")
+            problems.append(f"сессия аккаунта недоступна ({str(exc)[:100]}) — читаю публичные превью")
+            use_userbot = False
+    if not use_userbot:
+        if not names:
+            for chat in targets:
+                tg_agent.send_text(chat, "Еженедельный обзор: сессия менеджер-аккаунта не подключена "
+                                         "и список каналов пуст — добавьте каналы (/add_channel) "
+                                         "или подключите сессию.")
+            return "no channels"
+        for name in names:
+            posts, err = fetch_channel_posts(name, since)
+            if err:
+                problems.append(f"t.me/{name} — {err}")
+                continue
+            if posts:
+                sections.append(f"=== Канал t.me/{name} ({len(posts)} постов) ===\n" + "\n\n".join(posts))
+            else:
+                problems.append(f"t.me/{name} — за {days} дн. новых постов нет")
     if not sections:
         text = "Еженедельный обзор: свежих постов нет.\n" + "\n".join(problems)
         for chat in targets:

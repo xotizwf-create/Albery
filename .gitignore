@@ -34,3 +34,5 @@ dist/
 tmp_*.py
 .tg_agent_state.json
 .tg_business_log.jsonl
+.tg_userbot*
+.tg_userbot_login.json

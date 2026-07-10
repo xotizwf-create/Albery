@@ -237,14 +237,15 @@ HELP_TEXT = (
     "Я — ИИ-агент Албери в Telegram.\n\n"
     "Команды:\n"
     "/channels — список каналов еженедельного обзора\n"
-    "/add_channel <@канал или ссылка, можно несколько> — добавить\n"
-    "/del_channel <канал> — убрать\n"
-    "/digest — собрать обзор каналов прямо сейчас\n"
+    "/add_channel <@канал или ссылка, можно несколько> — следить только за этими\n"
+    "/del_channel <канал> — убрать из списка\n"
+    "/chats — что видит подключённая сессия аккаунта (каналы/группы/чаты)\n"
+    "/digest — собрать обзор прямо сейчас\n"
     "/new — начать новую сессию (забыть историю)\n\n"
     "Любое другое сообщение — вопрос к агенту (инструменты компании + веб).\n\n"
-    "Чтобы я видел ваши личные чаты (поставщики) и мог отвечать от вашего имени: "
-    "нужен Telegram Premium → Настройки → Telegram для бизнеса → Чат-боты → выбрать меня. "
-    "Пока автоответы выключены — я только читаю и веду журнал."
+    "Обзор каналов: если подключена сессия менеджер-аккаунта, я читаю ВСЕ каналы, на которые "
+    "подписан аккаунт (список /add_channel тогда работает как фильтр; пустой список = все). "
+    "Без сессии — только публичные каналы из списка."
 )
 
 
@@ -280,6 +281,26 @@ def handle_command(chat_id, text: str) -> bool:
             send_text(chat_id, f"Убрал t.me/{name}.")
         else:
             send_text(chat_id, "Такого канала нет в списке (/channels).")
+    elif cmd == "/chats":
+        try:
+            import tg_userbot
+            if not tg_userbot.session_ready():
+                send_text(chat_id, "Сессия менеджер-аккаунта ещё не подключена — попросите "
+                                   "разработчика выполнить подключение (нужен код из Telegram).")
+            else:
+                dialogs = tg_userbot.list_dialogs()
+                kinds = {"channel": [], "group": [], "private": []}
+                for d in dialogs:
+                    kinds.get(d["type"], kinds["private"]).append(d)
+                lines = [f"Сессия видит {len(dialogs)} диалогов: "
+                         f"{len(kinds['channel'])} каналов, {len(kinds['group'])} групп, "
+                         f"{len(kinds['private'])} личных чатов.", "", "Каналы:"]
+                lines += [f"• {d['name']}" + (f" (t.me/{d['username']})" if d.get("username") else "")
+                          for d in kinds["channel"][:60]]
+                send_text(chat_id, "\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("chats command failed")
+            send_text(chat_id, f"Не смог прочитать список чатов: {str(exc)[:150]}")
     elif cmd == "/digest":
         send_text(chat_id, "Собираю обзор каналов — пришлю сюда (обычно 2–5 минут)…")
 
