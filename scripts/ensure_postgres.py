@@ -75,6 +75,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Idempotent: agent_slug on recurring tasks (shown in the agent's «Автоматизации» tab)
     # + source_disk_file_id cache key on the attachment store (task-comment files).
     "047_recurring_agent_slug_attachment_source.sql",
+    # Idempotent: stored weekly TG news digests (news agent reuses the latest for ad-hoc questions).
+    "048_tg_news_digests.sql",
 ]
 
 

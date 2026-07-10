@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.16.0"
+SERVER_VERSION = "0.17.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -7449,6 +7449,48 @@ def tool_get_tg_news(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_save_news_digest(args: dict[str, Any]) -> dict[str, Any]:
+    """Store a weekly news digest so ad-hoc questions reuse it instead of rebuilding."""
+    summary = str(args.get("summary") or "").strip()
+    if not summary:
+        raise McpError(-32602, "summary (текст сводки) обязателен.")
+    period_days = max(1, min(int(args.get("period_days") or 7), 30))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO tg_news_digests (period_days, summary, meta) VALUES (%s, %s, %s) "
+                "RETURNING id, created_at",
+                (period_days, summary[:20000], Jsonb(args.get("meta") or {})))
+            row = cur.fetchone()
+    return {"saved": True, "id": row["id"], "created_at": _to_msk(row["created_at"]).isoformat()}
+
+
+def tool_get_latest_news_digest(args: dict[str, Any]) -> dict[str, Any]:
+    """The most recent stored digest + its age. Use it to answer questions about the news
+    WITHOUT rebuilding — rebuild (get_tg_news) only if it is missing or older than max_age_days."""
+    max_age = int(args.get("max_age_days") or 7)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, created_at, period_days, summary FROM tg_news_digests "
+                        "ORDER BY created_at DESC LIMIT 1")
+            row = cur.fetchone()
+    if not row:
+        return {"found": False, "note": "Сохранённых сводок ещё нет — собери свежую через get_tg_news."}
+    created = _to_msk(row["created_at"])
+    age_days = (datetime.now(_MSK_TZ) - created).total_seconds() / 86400
+    return {
+        "found": True,
+        "id": row["id"],
+        "created_at": created.isoformat(),
+        "age_days": round(age_days, 1),
+        "is_fresh": age_days <= max_age,
+        "period_days": row["period_days"],
+        "summary": row["summary"],
+        "note": ("Свежая — отвечай на её основе, НЕ пересобирай." if age_days <= max_age
+                 else f"Устарела ({round(age_days,1)} дн) — можно пересобрать через get_tg_news."),
+    }
+
+
 TOOLS: dict[str, dict[str, Any]] = {
     "get_agent_monitoring": {
         "description": (
@@ -9258,6 +9300,38 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_tg_news,
+    },
+    "save_news_digest": {
+        "description": (
+            "Сохранить недельную новостную сводку, чтобы на повторные вопросы отвечать из неё, "
+            "а не пересобирать. Вызывай в конце еженедельной автоматизации, summary = финальный "
+            "текст сводки."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "Финальный текст сводки."},
+                "period_days": {"type": "integer", "minimum": 1, "maximum": 30, "description": "За сколько дней (по умолчанию 7)."},
+            },
+            "required": ["summary"],
+            "additionalProperties": False,
+        },
+        "handler": tool_save_news_digest,
+    },
+    "get_latest_news_digest": {
+        "description": (
+            "Последняя сохранённая новостная сводка + её возраст. Отвечая на вопрос о новостях, "
+            "СНАЧАЛА вызови это: если is_fresh=true — отвечай на её основе, НЕ пересобирай через "
+            "get_tg_news (экономия). Пересобирай только если сводки нет или устарела."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_age_days": {"type": "integer", "description": "Свежей считать сводку не старше стольких дней (по умолчанию 7)."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_get_latest_news_digest,
     },
     "list_crm_pipelines": {
         "description": (
