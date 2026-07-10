@@ -483,10 +483,24 @@ def _is_silent(answer: str) -> bool:
 
 
 def _deliver(agent: dict[str, Any], row: dict[str, Any], text: str) -> tuple[bool, str | None]:
+    """deliver_to supports SEVERAL comma-separated targets (user ids and/or chatNNN) — the owner
+    wants some digests both in Никитенко's private dialog and to the «ИИ Агент» account. Success
+    when at least one target got the message; failures are reported per target."""
     from b24bot import _albery_bitrix_notify
-    target = (row["deliver_to"] or "").strip() or os.getenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat728")
-    return _albery_bitrix_notify("[b]⏰ " + row["name"] + "[/b]\n" + text,
-                                 dialog_id=target, bot_id=agent.get("bitrix_bot_id"))
+    raw = (row["deliver_to"] or "").strip() or os.getenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat728")
+    targets = [t.strip() for t in raw.replace(";", ",").split(",") if t.strip()]
+    message = "[b]⏰ " + row["name"] + "[/b]\n" + text
+    errors: list[str] = []
+    delivered_any = False
+    for target in targets:
+        ok, err = _albery_bitrix_notify(message, dialog_id=target, bot_id=agent.get("bitrix_bot_id"))
+        if ok:
+            delivered_any = True
+        else:
+            errors.append(f"{target}: {err}")
+    if errors and delivered_any:  # partial failure must not fail the run, but must be visible
+        logging.warning("agent automation %s: partial delivery failure: %s", row["id"], "; ".join(errors))
+    return delivered_any, ("; ".join(errors) if errors else None)
 
 
 def _hermes_oneshot(cmd: list, timeout_s: int, tag: str) -> tuple[Any, str | None]:
