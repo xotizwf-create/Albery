@@ -2084,13 +2084,52 @@ def tool_delete_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
 
     _assert_expected_task_title(task, args.get("expected_title"))
 
-    response = _bitrix_call_with_fallback("tasks.task.delete", {"taskId": task_id})
+    try:
+        response = _bitrix_call_with_fallback("tasks.task.delete", {"taskId": task_id})
+    except McpError:
+        # Bitrix answers «Нет доступа к удалению задачи» (1048582) for tasks that DON'T EXIST —
+        # our local index keeps rows for tasks deleted earlier, so the agent sees a ghost,
+        # tries to delete it and gets a misleading permission error (live incident 11.07:
+        # 7 of 8 «неудаляемых» задач просто не существовали). Probe live before failing.
+        if _task_exists_live(task_id):
+            raise  # the task is real — this IS a genuine error/permission problem
+        _purge_task_from_index(task_id)
+        return {
+            "deleted": True,
+            "already_gone": True,
+            "task": _task_payload(task, task_id),
+            "note": "Задачи уже не было в Bitrix (устаревший локальный индекс) — запись вычищена "
+                    "из индекса, в списках она больше не появится.",
+        }
+    _purge_task_from_index(task_id)
     return {
         "deleted": True,
         "task": _task_payload(task, task_id),
         "bitrix_response": response.get("result") if isinstance(response, dict) else response,
         "rule": "Deletion requires exact bitrix_task_id and confirm=true after the user has seen the exact task and explicitly confirmed deletion.",
     }
+
+
+def _task_exists_live(task_id: int) -> bool:
+    """Does the task exist in Bitrix RIGHT NOW (not in the local snapshot)? Best-effort:
+    unknown (call failed) counts as existing so a delete error is never masked by a probe error."""
+    try:
+        r = _webhook_raw("tasks.task.list", {"filter": {"ID": int(task_id)}, "select": ["ID"]})
+        tasks = (r.get("result") or {}).get("tasks")
+        return bool(tasks)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _purge_task_from_index(task_id: int) -> None:
+    """Drop the task's row from the local bitrix_tasks index after deletion, so ghosts don't
+    linger in search_tasks lists (the sync never removes deleted tasks)."""
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM bitrix_tasks WHERE bitrix_task_id = %s", (int(task_id),))
+    except Exception:  # noqa: BLE001
+        logging.warning("task index purge failed for %s", task_id, exc_info=True)
 
 
 # --- Attachment forwarding: re-upload a stored inbound file to Bitrix and reference it -------
