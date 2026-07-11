@@ -1,8 +1,8 @@
-﻿-- 049: Offers on agent-created tasks (Р·Р°РґР°С‡Р° 1300 + РІР»Р°РґРµР»РµС† 2026-07-11): right after the agent
+-- 049: Offers on agent-created tasks (задача 1300 + владелец 2026-07-11): right after the agent
 -- creates a task, the most suitable agent posts an offer-to-help comment; the responsible replies
--- in the comments WITHOUT naming the agent вЂ” the mention handler falls back to the open offer of
+-- in the comments WITHOUT naming the agent — the mention handler falls back to the open offer of
 -- that task and routes the reply to the offering agent. One offer row per task; state:
--- 'open' (dialog continues) | 'declined' (a short В«РЅРµС‚В» reply closes it, no more auto-routing).
+-- 'open' (dialog continues) | 'declined' (a short «нет» reply closes it, no more auto-routing).
 -- Idempotent (IF NOT EXISTS). Registered in ALWAYS_APPLY_MIGRATIONS.
 
 CREATE TABLE IF NOT EXISTS bitrix_task_agent_offers (
