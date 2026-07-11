@@ -26,8 +26,11 @@ import re
 import threading
 from typing import Any
 
-_OFFER_MODEL = os.getenv("B24_OFFER_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+# llama-3.3-70b writes clean Russian; scout (the OCR model) leaked CJK glyphs into offer texts.
+_OFFER_MODEL = os.getenv("B24_OFFER_MODEL", "llama-3.3-70b-versatile")
 _OFFER_MAX_CHARS = 900
+# Any CJK leakage means the generation went off the rails — use the honest fallback instead.
+_CJK_RE = re.compile(r"[一-鿿぀-ヿ가-힯]")
 # A short pure-«нет» reply closes the offer without an LLM turn.
 _DECLINE_RE = re.compile(r"^(нет|не надо|не нужно|не стоит|сам[аи]?|спасибо,? не надо|нет,? спасибо)[.!)\s]*$",
                          re.IGNORECASE)
@@ -141,7 +144,7 @@ def compose_offer(task: dict[str, Any], candidates: list[dict[str, Any]],
         msg = str(data.get("message") or "").strip()[:_OFFER_MAX_CHARS]
         slug = str(data.get("agent") or "main").strip()
         agent = next((c for c in candidates if (c["slug"] or "main") == slug), fallback_agent)
-        if msg:
+        if msg and not _CJK_RE.search(msg):
             return agent, msg
     except Exception as exc:  # noqa: BLE001
         logging.warning("task offers: groq compose failed: %s", repr(exc)[:160])
