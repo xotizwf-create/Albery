@@ -66,8 +66,17 @@ def test_classifier_parsing_tolerates_junk(monkeypatch):
     assert any(v["id"] == 2 and v["help"] is False for v in out)
     assert len(out) == 2  # the junk row is dropped
 
+    # Both engines down -> post nothing. Backoff patched to 0 so the test is fast.
+    monkeypatch.setenv("B24_CHECKIN_CLASSIFY_BACKOFF_S", "0")
     monkeypatch.setattr(to, "_groq_chat", lambda p: (_ for _ in ()).throw(RuntimeError("down")))
-    assert tc.classify_tasks([_t(1, "Анализ")]) == []  # engine down -> post nothing
+    monkeypatch.setattr(to, "_codex_chat", lambda p: (_ for _ in ()).throw(RuntimeError("down")))
+    assert tc.classify_tasks([_t(1, "Анализ")]) == []
+
+    # Groq down but Codex answers -> classification still works (the daily run is not lost).
+    monkeypatch.setattr(to, "_codex_chat",
+                        lambda p: '{"tasks":[{"id":1,"help":true,"reason":"соберу"}]}')
+    out2 = tc.classify_tasks([_t(1, "Анализ")])
+    assert out2 == [{"id": 1, "help": True, "reason": "соберу"}]
 
 
 def test_run_checkin_dry_run_posts_nothing(monkeypatch):

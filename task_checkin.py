@@ -148,30 +148,37 @@ def classify_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "\"reason\": \"<по-русски, одна строка: что именно агент сделает>\"}]}. Отбирай строго: "
         "сомневаешься — help=false. Лучше 3 точных попадания, чем 10 натяжек."
     )
-    from task_offers import _extract_json
-    # The classifier is ONE call a day, but Groq's free tier can 429 transiently — a couple of
-    # spaced retries so a momentary rate-limit doesn't cost the whole run (returning [] here
-    # means «post nothing», which is safe but skips a real day of offers).
+    from task_offers import _codex_chat, _extract_json
+
+    def _parse(raw: str) -> list[dict[str, Any]]:
+        data = _extract_json(raw)
+        rows = data.get("tasks") if isinstance(data.get("tasks"), list) else []
+        out = []
+        for r in rows:
+            try:
+                out.append({"id": int(r.get("id")), "help": bool(r.get("help")),
+                            "reason": str(r.get("reason") or "")[:300]})
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    # Engine chain like the offer composer: Groq (free, one batch call a day) with a couple of
+    # spaced retries for a transient 429, then Codex once (reliable) if Groq is exhausted. Only
+    # a total failure of both returns [] («post nothing» — safe but skips the day).
     last_exc = None
     for attempt in range(3):
         try:
-            raw = _groq_chat(prompt)
-            data = _extract_json(raw)
-            rows = data.get("tasks") if isinstance(data.get("tasks"), list) else []
-            out = []
-            for r in rows:
-                try:
-                    out.append({"id": int(r.get("id")), "help": bool(r.get("help")),
-                                "reason": str(r.get("reason") or "")[:300]})
-                except (TypeError, ValueError):
-                    continue
-            return out
+            return _parse(_groq_chat(prompt))
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < 2:
                 time.sleep(int(os.getenv("B24_CHECKIN_CLASSIFY_BACKOFF_S", "25")))
-    logging.warning("task checkin: classification failed after retries: %s", repr(last_exc)[:160])
-    return []
+    logging.warning("task checkin: Groq classify failed (%s), trying Codex", repr(last_exc)[:120])
+    try:
+        return _parse(_codex_chat(prompt))
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("task checkin: classification failed on both engines: %s", repr(exc)[:160])
+        return []
 
 
 # --- dossier ------------------------------------------------------------------------------------
