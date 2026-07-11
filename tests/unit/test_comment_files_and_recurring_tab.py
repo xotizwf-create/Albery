@@ -65,6 +65,46 @@ def test_recurring_json_maps_registry_row_to_task_automation():
     assert j["last_status"] == ""  # never fired yet
 
 
+def test_normalize_weekday_list_accepts_codes_ints_and_dedupes():
+    from mcp import context_server as cs
+
+    assert cs._normalize_weekday_list(["MO", "TU", 5, "5", 7]) == [1, 2, 5, 7]
+    assert cs._normalize_weekday_list(["mo", "we", "fr"]) == [1, 3, 5]
+    for bad in ([], "MO", [0], [8], ["XX"]):
+        try:
+            cs._normalize_weekday_list(bad)
+            raise AssertionError(f"accepted invalid weekdays: {bad!r}")
+        except cs.McpError:
+            pass
+
+
+def test_deadline_desc_regex_matches_stored_formats():
+    from mcp import context_server as cs
+
+    assert cs._DL_DESC_RE.match("18:00 того же дня").group(1) == "18:00"
+    assert cs._DL_DESC_RE.match("9:30 следующего дня").group(1) == "9:30"
+    assert cs._DL_DESC_RE.match("через 3 ч после создания") is None
+
+
+def test_recurring_json_exposes_machine_readable_schedule():
+    import app  # noqa: F401
+
+    import agent_automations as aa
+
+    base = {
+        "id": 5, "title": "Т", "responsible_name": None, "schedule_desc": "", "deadline_desc": "",
+        "result_criteria": "", "active": True, "next_run_at": None, "last_created_at": None,
+        "last_task_id": None, "last_error": None, "spec": None, "agent_slug": "main",
+        "create_time": "09:00",
+    }
+    daily = aa._recurring_json({**base, "period": "daily", "weekdays": None, "day_of_month": None})
+    assert daily["period"] == "daily" and daily["weekdays"] == [1, 2, 3, 4, 5, 6, 7]
+    weekly = aa._recurring_json({**base, "period": "weekly", "weekdays": [1, 3, 5], "day_of_month": None})
+    assert weekly["weekdays"] == [1, 3, 5] and weekly["create_time"] == "09:00"
+    monthly = aa._recurring_json({**base, "period": "monthly", "weekdays": None, "day_of_month": 15})
+    assert monthly["period"] == "monthly" and monthly["weekdays"] == []
+
+
 def test_recurring_json_status_reflects_last_fire():
     import app  # noqa: F401
 

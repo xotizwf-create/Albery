@@ -3114,6 +3114,189 @@ def tool_delete_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
                     "Уже созданные задачи остаются."}
 
 
+_DL_DESC_RE = re.compile(r"^(\d{1,2}:\d{2}) (того же|следующего) дня$")
+
+
+def _normalize_weekday_list(raw: Any) -> list[int]:
+    """Accepts MO..SU codes and/or ints 1..7 (Mon=1); returns a sorted unique int list."""
+    if not isinstance(raw, list) or not raw:
+        raise McpError(-32602, "weekdays должен быть непустым списком дней: MO/TU/WE/TH/FR/SA/SU или числа 1-7 (Пн=1).")
+    out: list[int] = []
+    for v in raw:
+        if isinstance(v, str) and v.strip().upper() in _WEEKDAY_NUM:
+            n = _WEEKDAY_NUM[v.strip().upper()]
+        else:
+            try:
+                n = int(v)
+            except (TypeError, ValueError) as exc:
+                raise McpError(-32602, f"weekdays: '{v}' — не день недели (MO..SU или 1-7).") from exc
+        if not 1 <= n <= 7:
+            raise McpError(-32602, f"weekdays: {n} вне диапазона 1-7 (Пн=1..Вс=7).")
+        if n not in out:
+            out.append(n)
+    return sorted(out)
+
+
+def apply_recurring_update(rec_id: int, changes: dict[str, Any]) -> dict[str, Any]:
+    """Update a recurring-task registry row: schedule (weekdays / create_time / deadline_time /
+    day_of_month / until) and/or content (title / description / checklist / result_criteria /
+    priority). Recomputes deadline offset, human schedule text and next_run_at, and keeps the
+    jsonb spec in sync so the next created instance reflects the edit. Shared by the
+    «Автоматизации» tab editor (PATCH endpoint) and the update_recurring_task MCP tool.
+
+    Weekday semantics: a weekdays list of all 7 days == period 'daily'; any subset == 'weekly'
+    with those days (so «каждый день, но не в выходные» is weekdays=[1..5]). day_of_month
+    switches the row to 'monthly'."""
+    try:
+        rec_id = int(rec_id)
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "recurring_id должен быть числом.") from exc
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM bitrix_recurring_tasks WHERE id = %s", (rec_id,))
+            row = cur.fetchone()
+    if not row:
+        raise McpError(-32602, f"Повторяющаяся задача {rec_id} не найдена (list_recurring_tasks покажет id).")
+    row = dict(row)
+
+    period = row.get("period") or "daily"
+    interval = int(row.get("interval_every") or 1)
+    weekday_nums = list(row.get("weekdays") or [])
+    day_of_month = row.get("day_of_month")
+    create_time = row.get("create_time") or "10:00"
+    dl_secs = row.get("deadline_after_seconds")
+    deadline_desc = row.get("deadline_desc") or ""
+
+    if changes.get("weekdays") is not None:
+        wd = _normalize_weekday_list(changes["weekdays"])
+        if len(wd) == 7:
+            period, weekday_nums, day_of_month = "daily", [], None
+        else:
+            period, weekday_nums, day_of_month = "weekly", wd, None
+        interval = 1  # a day-of-week edit always means "every listed day"
+    if changes.get("day_of_month") is not None:
+        try:
+            dom = int(changes["day_of_month"])
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "day_of_month должно быть числом 1-31.") from exc
+        if not 1 <= dom <= 31:
+            raise McpError(-32602, "day_of_month должно быть 1-31.")
+        period, weekday_nums, day_of_month, interval = "monthly", [], dom, 1
+    if period == "weekly" and not weekday_nums:
+        raise McpError(-32602, "Для weekly-расписания нужен непустой список weekdays.")
+
+    old_create_time = create_time
+    if changes.get("create_time") not in (None, ""):
+        create_time = _parse_hhmm(changes["create_time"], "create_time")
+
+    # Deadline: explicit edit wins; otherwise, when the creation time moved and the old deadline
+    # was anchored to a clock time («18:00 того же дня»), keep that clock time by recomputing the
+    # offset — moving creation 09:00→10:00 must not silently move the deadline 18:00→19:00.
+    def _offset_from(dl_hhmm: str) -> tuple[int, str]:
+        ch, cm = (int(x) for x in create_time.split(":"))
+        dh, dm = (int(x) for x in dl_hhmm.split(":"))
+        diff = (dh * 60 + dm) - (ch * 60 + cm)
+        if diff <= 0:
+            return (diff + 24 * 60) * 60, f"{dl_hhmm} следующего дня"
+        return diff * 60, f"{dl_hhmm} того же дня"
+
+    if changes.get("deadline_time") not in (None, ""):
+        dl_secs, deadline_desc = _offset_from(_parse_hhmm(changes["deadline_time"], "deadline_time"))
+    elif changes.get("deadline_after_hours") not in (None, ""):
+        try:
+            hrs = float(changes["deadline_after_hours"])
+        except (TypeError, ValueError) as exc:
+            raise McpError(-32602, "deadline_after_hours должно быть числом.") from exc
+        if hrs <= 0:
+            raise McpError(-32602, "deadline_after_hours должно быть > 0.")
+        dl_secs, deadline_desc = int(hrs * 3600), f"через {hrs:g} ч после создания"
+    elif create_time != old_create_time:
+        m = _DL_DESC_RE.match(deadline_desc.strip())
+        if m:
+            dl_secs, deadline_desc = _offset_from(_parse_hhmm(m.group(1), "deadline_time"))
+
+    until_date = row.get("until_date")
+    if changes.get("until") not in (None, ""):
+        until = str(changes["until"]).strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", until):
+            y, mth, d = until.split("-")
+            until = f"{d}.{mth}.{y}"
+        elif not re.match(r"^\d{2}\.\d{2}\.\d{4}$", until):
+            raise McpError(-32602, "until должно быть YYYY-MM-DD или DD.MM.YYYY.")
+        until_date = until
+
+    # Content edits land both in the flat columns and in the spec the scheduler creates from.
+    from recurring_scheduler import _row_spec
+    spec = _row_spec(row)
+    title = str(changes.get("title") or row.get("title") or "").strip()
+    result_criteria = str(changes.get("result_criteria") if changes.get("result_criteria") is not None
+                          else row.get("result_criteria") or "").strip()
+    description = str(changes.get("description") if changes.get("description") is not None
+                      else row.get("description") or "").strip() or title
+    if result_criteria and "Критерий результата" not in description:
+        description += "\n\nКритерий результата: " + result_criteria
+    if changes.get("checklist") is not None:
+        if not isinstance(changes["checklist"], list):
+            raise McpError(-32602, "checklist должен быть списком пунктов.")
+        spec["checklist"] = changes["checklist"] or None
+    if changes.get("priority") is not None:
+        spec["priority"] = "high" if str(changes["priority"]).strip().lower() in {"high", "critical", "2", "важно", "высокий"} else "normal"
+    spec.update({"title": title, "description": description})
+    spec["deadline_after_seconds"] = dl_secs
+
+    schedule_desc = _recurring_schedule_desc(period, interval, weekday_nums, day_of_month,
+                                             create_time, deadline_desc)
+    now_msk = datetime.now(_MSK_TZ)
+    anchor = None
+    if row.get("created_at") is not None and hasattr(row["created_at"], "astimezone"):
+        anchor = row["created_at"].astimezone(_MSK_TZ).date()
+    next_run = _recurring_next_run(period, interval, weekday_nums, day_of_month, create_time,
+                                   after=now_msk, anchor=anchor)
+    until_d = _ddmmyyyy_to_date(until_date) if until_date else None
+    if next_run and until_d and next_run.date() > until_d:
+        next_run = None
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE bitrix_recurring_tasks SET title=%s, description=%s, period=%s, "
+                "interval_every=%s, weekdays=%s, day_of_month=%s, create_time=%s, "
+                "deadline_after_seconds=%s, deadline_desc=%s, schedule_desc=%s, until_date=%s, "
+                "result_criteria=%s, spec=%s::jsonb, next_run_at=%s, updated_at=now() WHERE id=%s",
+                (title, description, period, interval, weekday_nums or None, day_of_month,
+                 create_time, dl_secs, deadline_desc, schedule_desc, until_date, result_criteria,
+                 json.dumps(spec, ensure_ascii=False), next_run, rec_id))
+
+    return {
+        "updated": True,
+        "recurring_id": rec_id,
+        "title": title,
+        "schedule": schedule_desc,
+        "next_run": next_run.isoformat() if next_run else None,
+        "active": bool(row.get("active")),
+        "checklist_items": len(spec.get("checklist") or []),
+        "result_criteria": result_criteria or None,
+    }
+
+
+def tool_update_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
+    """MCP: edit an existing recurring task — days of week / time / deadline / content."""
+    rec_id = args.get("recurring_id")
+    if rec_id in (None, ""):
+        raise McpError(-32602, "Укажи recurring_id — id повторяющейся задачи из list_recurring_tasks.")
+    changes = {k: args.get(k) for k in ("weekdays", "day_of_month", "create_time", "deadline_time",
+                                        "deadline_after_hours", "until", "title", "description",
+                                        "checklist", "result_criteria", "priority")
+               if args.get(k) is not None}
+    if not changes:
+        raise McpError(-32602, "Нечего менять: передай хотя бы одно поле (weekdays, create_time, "
+                               "deadline_time, title, description, checklist, result_criteria…).")
+    res = apply_recurring_update(rec_id, changes)
+    res["rule"] = ("Расписание обновлено; запись видна в Центре Агента → Агенты → «Автоматизации». "
+                   "Скажи пользователю новое расписание и ближайшее создание (next_run).")
+    return res
+
+
 # --- Bitrix task comments -------------------------------------------------
 # Task comments are stored inside bitrix_tasks.raw_json -> 'comments' -> 'items'
 # as Bitrix IM messages. Human comments have a real author_id (> 0) and empty
@@ -8201,6 +8384,36 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_list_recurring_tasks,
     },
+    "update_recurring_task": {
+        "description": (
+            "Изменить ПОВТОРЯЮЩУЮСЯ (регулярную) задачу: дни недели, время создания, дедлайн, "
+            "название/описание/чек-лист/критерий результата. recurring_id бери из list_recurring_tasks. "
+            "Дни недели: weekdays=['MO','TU','WE','TH','FR'] = по будням (просьба «не присылай в "
+            "выходные» решается именно так); все 7 дней = ежедневно. Время: create_time (ЧЧ:ММ МСК); "
+            "если дедлайн был «до 18:00», он сохранится автоматически. Расписание пересчитывается "
+            "сразу (next_run в ответе); запись видна во вкладке «Автоматизации»."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recurring_id": {"type": "integer", "description": "id повторяющейся задачи из list_recurring_tasks."},
+                "weekdays": {"type": "array", "items": {"type": ["string", "integer"]}, "description": "Новые дни: MO/TU/WE/TH/FR/SA/SU или 1-7 (Пн=1). Все 7 = ежедневно."},
+                "day_of_month": {"type": "integer", "minimum": 1, "maximum": 31, "description": "Перевести на ежемесячный повтор в этот день месяца."},
+                "create_time": {"type": "string", "description": "Новое время создания, ЧЧ:ММ МСК."},
+                "deadline_time": {"type": "string", "description": "Новый срок каждой задачи, ЧЧ:ММ того же дня."},
+                "deadline_after_hours": {"type": "number", "description": "Альтернатива deadline_time: срок через N часов после создания."},
+                "until": {"type": "string", "description": "Дата окончания повторов YYYY-MM-DD или DD.MM.YYYY."},
+                "title": {"type": "string", "description": "Новое название задачи."},
+                "description": {"type": "string", "description": "Новое описание задачи."},
+                "checklist": {"type": "array", "items": {"type": ["string", "object"]}, "description": "Новый чек-лист (полностью заменяет старый)."},
+                "result_criteria": {"type": "string", "description": "Новый критерий результата."},
+                "priority": {"type": "string", "enum": ["normal", "high", "critical"], "description": "Приоритет создаваемых задач."},
+            },
+            "required": ["recurring_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_update_recurring_task,
+    },
     "delete_recurring_task": {
         "description": (
             "Остановить ПОВТОРЯЮЩУЮСЯ задачу — планировщик перестанет её создавать. Определи по "
@@ -9669,6 +9882,7 @@ CORE_TOOL_NAMES: set[str] = {
     "link_tasks",
     "create_recurring_task",
     "list_recurring_tasks",
+    "update_recurring_task",
     "delete_recurring_task",
     "complete_bitrix_task",
     "reopen_bitrix_task",

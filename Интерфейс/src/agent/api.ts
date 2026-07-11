@@ -283,6 +283,10 @@ export interface AgentAutomation {
   prompt: string;
   deliver_to: string;
   kind: "agent" | "system" | "task";
+  // kind='task' only — machine-readable schedule for the tab's day/time editor.
+  period?: "daily" | "weekly" | "monthly";
+  weekdays?: number[]; // Mon=1..Sun=7; daily rows report all 7
+  create_time?: string; // "HH:MM" MSK
   created_by: "owner" | "self";
   creator_label: string;
   is_active: boolean;
@@ -330,7 +334,10 @@ export async function runAgentAutomation(id: number): Promise<void> {
 
 // kind='task' rows (recurring Bitrix tasks) live in their own registry with their own endpoints.
 
-export async function updateRecurringTask(recurringId: number, body: { is_active: boolean }): Promise<void> {
+export async function updateRecurringTask(
+  recurringId: number,
+  body: { is_active?: boolean; weekdays?: number[]; create_time?: string },
+): Promise<void> {
   await fetchJsonSafe(
     `/api/agent-center/recurring-tasks/${recurringId}`,
     { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },

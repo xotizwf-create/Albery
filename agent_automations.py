@@ -185,11 +185,18 @@ def _recurring_json(r: dict[str, Any]) -> dict[str, Any]:
         "last_status": status,
         "last_result": result,
         "last_error": r.get("last_error") or "",
+        # Machine-readable schedule for the tab's day/time editor. daily = all 7 days;
+        # monthly rows get no weekday list (the editor offers only the time there).
+        "period": r.get("period") or "daily",
+        "weekdays": (list(r.get("weekdays") or []) if (r.get("period") or "daily") == "weekly"
+                     else ([1, 2, 3, 4, 5, 6, 7] if (r.get("period") or "daily") == "daily" else [])),
+        "create_time": r.get("create_time") or "",
     }
 
 
 _RECURRING_COLS = ("id, title, responsible_name, schedule_desc, deadline_desc, result_criteria, "
-                   "active, next_run_at, last_created_at, last_task_id, last_error, spec, agent_slug")
+                   "active, next_run_at, last_created_at, last_task_id, last_error, spec, agent_slug, "
+                   "period, weekdays, day_of_month, create_time")
 
 
 def _recurring_rows(where: str, args: tuple) -> list[dict[str, Any]]:
@@ -245,8 +252,23 @@ def agent_automations_list(slug: str):
 @app.patch("/api/agent-center/recurring-tasks/<int:rec_id>")
 def recurring_task_update(rec_id: int):
     body = request.get_json(silent=True) or {}
+    # Schedule edit (day-of-week chips + time in the tab editor) — shared helper with the
+    # update_recurring_task MCP tool; recomputes deadline offset, human text and next_run_at.
+    schedule_changes = {k: body.get(k) for k in ("weekdays", "create_time", "deadline_time")
+                        if body.get(k) is not None}
+    if schedule_changes:
+        try:
+            from mcp.context_server import McpError, apply_recurring_update
+            apply_recurring_update(rec_id, schedule_changes)
+        except McpError as exc:
+            return jsonify({"error": exc.message}), 400
+        except Exception:  # noqa: BLE001
+            logging.exception("recurring task schedule edit failed: %s", rec_id)
+            return jsonify({"error": "Не удалось изменить расписание."}), 500
+        if body.get("is_active") is None:
+            return jsonify({"ok": True})
     if body.get("is_active") is None:
-        return jsonify({"error": "Поддерживается только включение/выключение (is_active)."}), 400
+        return jsonify({"error": "Нечего менять: передайте weekdays/create_time или is_active."}), 400
     is_active = bool(body.get("is_active"))
     try:
         rows = _recurring_rows("WHERE id = %s", (rec_id,))

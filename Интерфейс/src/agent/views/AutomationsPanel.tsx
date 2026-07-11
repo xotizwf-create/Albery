@@ -35,6 +35,131 @@ const statusChip = (a: AgentAutomation): { text: string; cls: string } => {
   return { text: `ок · ${a.last_run}`, cls: "bg-emerald-50 text-emerald-600 border-emerald-100" };
 };
 
+// --- Day/time schedule editor (any non-system row) ------------------------------------------
+// task rows edit weekdays/create_time in the recurring registry; agent rows edit the cron —
+// parseable "M H * * DOW" crons get the same chips, anything fancier falls back to raw cron.
+
+const DAY_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]; // index+1 = Mon=1..Sun=7
+
+const parseSimpleCron = (cron: string): { time: string; days: number[] } | null => {
+  const f = (cron || "").trim().split(/\s+/);
+  if (f.length !== 5 || f[2] !== "*" || f[3] !== "*") return null;
+  if (!/^\d{1,2}$/.test(f[0]) || !/^\d{1,2}$/.test(f[1])) return null;
+  const mm = Number(f[0]);
+  const hh = Number(f[1]);
+  if (mm > 59 || hh > 23) return null;
+  let days: number[];
+  if (f[4] === "*") {
+    days = [1, 2, 3, 4, 5, 6, 7];
+  } else {
+    days = [];
+    for (const part of f[4].split(",")) {
+      const m = part.match(/^(\d)(?:-(\d))?$/);
+      if (!m) return null;
+      const a = Number(m[1]);
+      const b = m[2] !== undefined ? Number(m[2]) : a;
+      if (a > 7 || b > 7 || a > b) return null;
+      for (let d = a; d <= b; d++) {
+        const day = d === 0 ? 7 : d; // vixie: 0 and 7 are both Sunday
+        if (!days.includes(day)) days.push(day);
+      }
+    }
+    days.sort((x, y) => x - y);
+  }
+  return { time: `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`, days };
+};
+
+const buildCron = (time: string, days: number[]): string => {
+  const [hh, mm] = time.split(":").map(Number);
+  const dow = days.length === 7 ? "*" : days.map((d) => (d === 7 ? 0 : d)).sort((a, b) => a - b).join(",");
+  return `${mm} ${hh} * * ${dow}`;
+};
+
+const ScheduleEditor: React.FC<{
+  row: AgentAutomation;
+  disabled: boolean;
+  onSave: (payload: { weekdays?: number[]; create_time?: string; schedule?: string }) => void;
+}> = ({ row, disabled, onSave }) => {
+  const isTask = row.kind === "task";
+  const monthly = isTask && row.period === "monthly";
+  const parsed = isTask ? null : parseSimpleCron(row.schedule);
+  const cronOnly = !isTask && !parsed; // fancy cron (*/5 etc.) — raw editing only
+  const [days, setDays] = useState<number[]>(isTask ? row.weekdays || [] : parsed?.days || []);
+  const [time, setTime] = useState<string>(isTask ? row.create_time || "09:00" : parsed?.time || "09:00");
+  const [rawCron, setRawCron] = useState<string>(row.schedule);
+
+  const toggleDay = (d: number) =>
+    setDays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort((a, b) => a - b)));
+
+  const timeOk = /^\d{1,2}:\d{2}$/.test(time) && Number(time.split(":")[0]) < 24 && Number(time.split(":")[1]) < 60;
+  const canSave = cronOnly ? rawCron.trim().split(/\s+/).length === 5 : timeOk && (monthly || days.length > 0);
+
+  const save = () => {
+    if (cronOnly) return onSave({ schedule: rawCron.trim() });
+    if (isTask) return onSave(monthly ? { create_time: time } : { weekdays: days, create_time: time });
+    return onSave({ schedule: buildCron(time, days) });
+  };
+
+  return (
+    <div className="bg-slate-50/70 border border-gray-100 rounded-xl p-3 space-y-2">
+      <p className="text-[11px] font-bold uppercase text-gray-400">Изменить расписание</p>
+      {cronOnly ? (
+        <div className="flex items-center gap-2 flex-wrap">
+          <input
+            type="text"
+            value={rawCron}
+            onChange={(e) => setRawCron(e.target.value)}
+            title="5 полей cron (мин час день месяц день-недели), время МСК"
+            className="w-44 px-3 py-2 bg-white border border-gray-200/80 rounded-lg text-[12.5px] font-mono font-bold outline-none focus:border-indigo-500"
+          />
+          <span className="text-[11.5px] text-gray-400">это расписание сложнее, чем «дни + время» — правится как cron</span>
+        </div>
+      ) : (
+        <div className="flex items-center gap-3 flex-wrap">
+          {!monthly && (
+            <div className="flex items-center gap-1">
+              {DAY_LABELS.map((label, i) => {
+                const d = i + 1;
+                const on = days.includes(d);
+                return (
+                  <button
+                    key={d}
+                    onClick={() => toggleDay(d)}
+                    className={cn(
+                      "px-2 py-1.5 rounded-lg text-[11.5px] font-bold border transition-colors",
+                      on
+                        ? "bg-indigo-600 border-indigo-600 text-white"
+                        : "bg-white border-gray-200 text-gray-400 hover:border-indigo-300 hover:text-indigo-500",
+                      d >= 6 && !on && "text-rose-300",
+                    )}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {monthly && <span className="text-[11.5px] text-gray-400">ежемесячный повтор — меняется только время</span>}
+          <input
+            type="time"
+            value={time}
+            onChange={(e) => setTime(e.target.value)}
+            className="px-2.5 py-1.5 bg-white border border-gray-200/80 rounded-lg text-[12.5px] font-bold outline-none focus:border-indigo-500"
+          />
+          <span className="text-[11.5px] text-gray-400">МСК</span>
+        </div>
+      )}
+      <button
+        onClick={save}
+        disabled={disabled || !canSave}
+        className="px-4 py-1.5 bg-indigo-600 text-white rounded-lg text-[12px] font-bold hover:bg-indigo-700 transition-all disabled:opacity-40"
+      >
+        Сохранить расписание
+      </button>
+    </div>
+  );
+};
+
 const sourceChip = (a: AgentAutomation): { text: string; cls: string } => {
   if (a.kind === "system") return { text: "системная · Hermes", cls: "bg-violet-50 text-violet-600 border-violet-100" };
   if (a.kind === "task") return { text: "регулярная задача 📋", cls: "bg-sky-50 text-sky-600 border-sky-100" };
@@ -283,6 +408,18 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                         {a.deliver_to || "чат уведомлений Albery"}
                       </p>
                       )}
+                      <ScheduleEditor
+                        key={`${a.id}:${a.schedule}:${a.create_time}:${(a.weekdays || []).join("")}`}
+                        row={a}
+                        disabled={busyId !== null}
+                        onSave={(payload) =>
+                          void act(a.id, () =>
+                            a.kind === "task"
+                              ? updateRecurringTask(a.recurring_id!, payload)
+                              : updateAgentAutomation(a.id, { schedule: payload.schedule! }),
+                          )
+                        }
+                      />
                       {a.last_error && <p className="text-rose-600 break-words">Последняя ошибка: {a.last_error}</p>}
                       {a.last_result && (
                         <p className="whitespace-pre-wrap break-words bg-slate-50 border border-gray-100 rounded-xl p-3 text-gray-600">
