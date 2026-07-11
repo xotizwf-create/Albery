@@ -55,6 +55,14 @@ def checkin_enabled() -> bool:
     return os.getenv("B24_TASK_CHECKIN", "1").strip() != "0"
 
 
+def is_working_day(dt=None) -> bool:
+    """Mon-Fri. The agent must NOT message employees on weekends (owner rule 2026-07-12) —
+    the scheduled check-in only fires on working days. A manual/forced run (owner asked
+    explicitly) is not gated by this."""
+    dt = dt or msk_now()
+    return dt.isoweekday() <= 5
+
+
 # --- stage 0: deterministic filters ------------------------------------------------------------
 
 def _live_open_tasks() -> list[dict[str, Any]]:
@@ -360,7 +368,8 @@ def _loop() -> None:
     while True:
         try:
             now = msk_now()
-            if checkin_enabled() and now.hour == _CHECKIN_HOUR and now.minute < 5:
+            if (checkin_enabled() and is_working_day(now)
+                    and now.hour == _CHECKIN_HOUR and now.minute < 5):
                 run_checkin()
         except Exception:  # noqa: BLE001
             logging.exception("task checkin: loop tick failed")

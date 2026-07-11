@@ -40,6 +40,18 @@ def test_filters_drop_noise_keep_value():
     assert stats["stop_word"] >= 4
 
 
+def test_is_working_day_excludes_weekend():
+    import datetime
+
+    import app  # noqa: F401
+
+    import task_checkin as tc
+
+    # 2026-07-13 is a Monday ... 2026-07-19 is a Sunday.
+    assert [tc.is_working_day(datetime.datetime(2026, 7, d)) for d in range(13, 20)] == \
+        [True, True, True, True, True, False, False]
+
+
 def test_classifier_parsing_tolerates_junk(monkeypatch):
     import app  # noqa: F401
 
