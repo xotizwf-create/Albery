@@ -3339,6 +3339,67 @@ def apply_recurring_update(rec_id: int, changes: dict[str, Any]) -> dict[str, An
     }
 
 
+def tool_get_employee_dossier(args: dict[str, Any]) -> dict[str, Any]:
+    """The agent's working memory about employees: who uses the agent, who ignores it, which
+    of their tasks are automatable. Filled by the daily task check-in; notes via update tool."""
+    who = None
+    if args.get("bitrix_user_id") not in (None, "") or args.get("name"):
+        who = _resolve_active_bitrix_user(args.get("bitrix_user_id"), args.get("name"))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if not safe_table_exists(cur, "employee_agent_dossier"):
+                return {"items": [], "note": "Досье ещё не создано (таблица появится после деплоя чекина)."}
+            if who:
+                cur.execute("SELECT * FROM employee_agent_dossier WHERE bitrix_user_id=%s",
+                            (int(who["bitrix_user_id"]),))
+            else:
+                cur.execute("SELECT * FROM employee_agent_dossier "
+                            "ORDER BY turns_30d DESC NULLS LAST, full_name")
+            rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        for col in ("last_agent_use", "last_offer_at", "first_dm_at", "last_dm_at", "updated_at"):
+            v = r.get(col)
+            r[col] = _to_msk(v).isoformat() if hasattr(v, "isoformat") else v
+    return {
+        "count": len(rows), "items": rows,
+        "note": ("Досье обновляется ежедневным обходом задач (12:00 МСК): turns_30d — ходы с агентом "
+                 "за 30 дней (task_turns_30d — из них в задачах), offers_* — предложения помощи и "
+                 "реакция, automatable — какие задачи человека агент может ускорить. Свои наблюдения "
+                 "добавляй через update_employee_dossier. ЭТО ВНУТРЕННЯЯ ИНФОРМАЦИЯ для владельца и "
+                 "администратора — не показывай досье рядовым сотрудникам."),
+    }
+
+
+def tool_update_employee_dossier(args: dict[str, Any]) -> dict[str, Any]:
+    """Append or replace the agent's own observations in an employee's dossier."""
+    who = _resolve_active_bitrix_user(args.get("bitrix_user_id"), args.get("name"))
+    uid = int(who["bitrix_user_id"])
+    note = str(args.get("note") or "").strip()
+    if not note:
+        raise McpError(-32602, "Передай note — наблюдение, которое надо записать в досье.")
+    if len(note) > 1000:
+        raise McpError(-32602, "note длиннее 1000 символов — сократи до сути.")
+    replace = args.get("replace") is True
+    stamped = f"{datetime.now(_MSK_TZ).strftime('%d.%m.%Y')}: {note}"
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if replace:
+                cur.execute(
+                    "INSERT INTO employee_agent_dossier (bitrix_user_id, full_name, notes, updated_at) "
+                    "VALUES (%s,%s,%s,now()) ON CONFLICT (bitrix_user_id) DO UPDATE SET "
+                    "notes=EXCLUDED.notes, updated_at=now()",
+                    (uid, who.get("full_name"), stamped))
+            else:
+                cur.execute(
+                    "INSERT INTO employee_agent_dossier (bitrix_user_id, full_name, notes, updated_at) "
+                    "VALUES (%s,%s,%s,now()) ON CONFLICT (bitrix_user_id) DO UPDATE SET "
+                    "notes = left(coalesce(employee_agent_dossier.notes || chr(10), '') || EXCLUDED.notes, 4000), "
+                    "updated_at=now()",
+                    (uid, who.get("full_name"), stamped))
+    return {"updated": True, "bitrix_user_id": uid, "full_name": who.get("full_name"),
+            "mode": "replace" if replace else "append"}
+
+
 def tool_update_recurring_task(args: dict[str, Any]) -> dict[str, Any]:
     """MCP: edit an existing recurring task — days of week / time / deadline / content."""
     rec_id = args.get("recurring_id")
@@ -8474,6 +8535,43 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_update_recurring_task,
     },
+    "get_employee_dossier": {
+        "description": (
+            "ДОСЬЕ по сотрудникам (внутреннее, для владельца/админа — рядовым не показывать): кто "
+            "реально работает с агентом (ходы за 30 дней, из них в задачах), реакция на предложения "
+            "помощи (offers_made/engaged/declined), какие задачи человека агент может ускорить "
+            "(automatable), заметки. Обновляется ежедневным обходом задач. Без аргументов — все; "
+            "name/bitrix_user_id — один человек."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Сотрудник по имени."},
+                "bitrix_user_id": {"type": "integer", "description": "Сотрудник по id."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_get_employee_dossier,
+    },
+    "update_employee_dossier": {
+        "description": (
+            "Записать наблюдение в ДОСЬЕ сотрудника (внутреннее): паттерны его задач, что удалось/не "
+            "удалось автоматизировать, как человек взаимодействует с агентом. По умолчанию note "
+            "ДОПИСЫВАЕТСЯ с датой; replace=true — заменить заметки целиком."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Сотрудник по имени."},
+                "bitrix_user_id": {"type": "integer", "description": "Сотрудник по id."},
+                "note": {"type": "string", "description": "Наблюдение (до 1000 символов)."},
+                "replace": {"type": "boolean", "description": "true = заменить все заметки этой."},
+            },
+            "required": ["note"],
+            "additionalProperties": False,
+        },
+        "handler": tool_update_employee_dossier,
+    },
     "delete_recurring_task": {
         "description": (
             "Остановить ПОВТОРЯЮЩУЮСЯ задачу — планировщик перестанет её создавать. Определи по "
@@ -9905,6 +10003,9 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
     "delete_zoom_call_report",
     # Per-employee usage/monitoring is management data — admin connector only.
     "get_agent_monitoring",
+    # Employee dossiers are internal management data — never on the public scoped connectors.
+    "get_employee_dossier",
+    "update_employee_dossier",
     # CRM: deleting a whole funnel or a deal destroys business data — admin / explicitly-enabled only.
     "delete_crm_pipeline",
     "delete_crm_deal",

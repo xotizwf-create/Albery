@@ -79,6 +79,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "048_tg_news_digests.sql",
     # Idempotent: offer-to-help comments on agent-created tasks (reply routing without mentions).
     "049_task_agent_offers.sql",
+    # Idempotent: daily task check-in (12:00) + per-employee agent dossier.
+    "050_task_checkin_dossier.sql",
 ]
 
 

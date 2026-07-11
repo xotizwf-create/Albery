@@ -2285,3 +2285,4 @@ _SELF_TOOL_SPECS.update(_agent_automations.AUTOMATION_SELF_TOOL_SPECS)
 # process as the MCP tools). Recurring tasks are fired by us — the portal has no Bitrix subscription
 # so Bitrix's own recurring-task templates never spawn. Kill-switch: RECURRING_TASKS_SCHEDULER=0.
 import recurring_scheduler as _recurring_scheduler  # noqa: E402,F401
+import task_checkin as _task_checkin  # noqa: E402,F401  (daily 12:00 offers + dossiers)
