@@ -15,11 +15,27 @@ def test_is_decline_short_no_only():
         assert not to.is_decline(no), no
 
 
+def _raise(*a, **k):
+    raise RuntimeError("engine down")
+
+
+def test_extract_json_handles_fences_and_prose():
+    import app  # noqa: F401
+
+    import task_offers as to
+
+    assert to._extract_json('```json\n{"agent": "main", "message": "ok"}\n```') == {"agent": "main", "message": "ok"}
+    assert to._extract_json('Вот ответ: {"agent": "main", "message": "ok"}') == {"agent": "main", "message": "ok"}
+    assert to._extract_json("никакого json") == {}
+    assert to._extract_json("") == {}
+
+
 def test_compose_offer_falls_back_without_groq(monkeypatch):
     import app  # noqa: F401
 
     import task_offers as to
 
+    monkeypatch.setattr(to, "_codex_chat", _raise)
     monkeypatch.setattr(to, "_groq_chat", lambda prompt: "")
     candidates = [
         {"slug": None, "name": "Агент Албери", "bot_id": 24, "role": "универсальный", "is_main": True},
@@ -33,13 +49,14 @@ def test_compose_offer_falls_back_without_groq(monkeypatch):
     assert "могу помочь выполнить и закрыть" in msg
 
 
-def test_compose_offer_uses_groq_choice(monkeypatch):
+def test_compose_offer_uses_groq_when_codex_down(monkeypatch):
     import json
 
     import app  # noqa: F401
 
     import task_offers as to
 
+    monkeypatch.setattr(to, "_codex_chat", _raise)
     monkeypatch.setattr(to, "_groq_chat", lambda prompt: json.dumps(
         {"agent": "agent-sklad", "message": "Артур, могу помочь выполнить и закрыть вам эту задачу. "
                                             "Могу подготовить договор — начать? Ответьте прямо здесь — я увижу ваше сообщение."},

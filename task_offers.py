@@ -26,11 +26,19 @@ import re
 import threading
 from typing import Any
 
+# Engine: 'codex' = a light hermes -z turn (gpt-5.5 — the owner wants real, practical
+# recommendations with proper formatting), 'groq' = the free fallback model. The chain is
+# codex → groq → fixed text, so an offer is always posted even when both LLMs are down.
+_OFFER_ENGINE = os.getenv("B24_OFFER_ENGINE", "codex").strip().lower()
+_CODEX_TIMEOUT_S = int(os.getenv("B24_OFFER_CODEX_TIMEOUT_S", "150"))
 # llama-3.3-70b writes clean Russian; scout (the OCR model) leaked CJK glyphs into offer texts.
 _OFFER_MODEL = os.getenv("B24_OFFER_MODEL", "llama-3.3-70b-versatile")
-_OFFER_MAX_CHARS = 900
+_OFFER_MAX_CHARS = 1100
 # Any CJK leakage means the generation went off the rails — use the honest fallback instead.
 _CJK_RE = re.compile(r"[一-鿿぀-ヿ가-힯]")
+# Offers are background niceties: never run two hermes subprocesses for them at once
+# (2 GB box; Monday 09:00 can create several recurring instances back to back).
+_CODEX_GATE = threading.Semaphore(1)
 # A short pure-«нет» reply closes the offer without an LLM turn.
 _DECLINE_RE = re.compile(r"^(нет|не надо|не нужно|не стоит|сам[аи]?|спасибо,? не надо|нет,? спасибо)[.!)\s]*$",
                          re.IGNORECASE)
@@ -105,10 +113,77 @@ def _groq_chat(prompt: str) -> str:
     return ((d.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "").strip()
 
 
+def _codex_chat(prompt: str) -> str:
+    """One light hermes -z turn (gpt-5.5): the prompt is self-contained, only the tiny built-in
+    web toolset rides along so the turn stays cheap. Serialized by a semaphore (2 GB box)."""
+    import subprocess
+    from b24bot import _hermes_answer_is_error
+    with _CODEX_GATE:
+        proc = subprocess.run(
+            ["hermes", "-z", prompt, "-t", "web", "--yolo"],
+            capture_output=True, text=True, timeout=_CODEX_TIMEOUT_S,
+            cwd="/root", env={**os.environ, "HOME": "/root"},
+        )
+    answer = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not answer or _hermes_answer_is_error(answer):
+        raise RuntimeError(f"hermes rc={proc.returncode} answer={answer[:120]}")
+    return answer
+
+
+def _extract_json(raw: str) -> dict[str, Any]:
+    """The model may wrap the JSON in a code fence or prepend a sentence — cut the outer braces."""
+    s = (raw or "").strip()
+    start, end = s.find("{"), s.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        data = json.loads(s[start:end + 1])
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _offer_prompt(task: dict[str, Any], candidates: list[dict[str, Any]],
+                  responsible_name: str, first_name: str) -> str:
+    agents_desc = "\n".join(
+        f"- {c['slug'] or 'main'}: «{c['name']}» — {c['role'] or 'универсальный'}" for c in candidates)
+    checklist = task.get("checklist") or []
+    cl_txt = "\n".join(f"{i}. {str(it.get('title') if isinstance(it, dict) else it)}"
+                       for i, it in enumerate(checklist[:15], 1))
+    return (
+        "Ты подбираешь ИИ-агента и пишешь ПЕРВЫЙ комментарий-предложение помощи в новой задаче "
+        "Bitrix24. Ничего не ищи и не вызывай инструменты — просто напиши текст. Ответь СТРОГО "
+        "одним JSON-объектом без пояснений: {\"agent\": \"<slug или main>\", \"message\": \"<текст>\"}.\n\n"
+        "Доступные агенты (выбери самого профильного под тему задачи; сомневаешься — main):\n"
+        + agents_desc + "\n\n"
+        "Задача:\nНазвание: " + str(task.get("title") or "") + "\n"
+        "Описание: " + str(task.get("description") or "")[:1500] + "\n"
+        + (("Чек-лист:\n" + cl_txt + "\n") if cl_txt else "")
+        + "Ответственный: " + (responsible_name or "сотрудник") + "\n\n"
+        "Требования к message (по-русски, до 900 символов):\n"
+        "1) Обратись по имени: «" + (first_name or "Коллега") + ", могу помочь выполнить и закрыть "
+        "вам эту задачу.»\n"
+        "2) Дальше — ПРАКТИЧЕСКАЯ польза по сути ЭТОЙ задачи, не общие слова: что КОНКРЕТНО агент "
+        "сделает реальными возможностями (поставить/обновить задачи в Bitrix, собрать отчёт или "
+        "сводку по задачам/созвонам, подготовить документ Word или Google-таблицу, найти в базе "
+        "знаний компании, проанализировать комментарии и вложения задачи, найти информацию в "
+        "интернете). Простая операционная задача — один конкретный вопрос-предложение (например "
+        "«скажите, могу ли я поставить задачи исполнителям?»). Сложная — план из 3-5 шагов, что "
+        "сделаем вместе, и вопрос, с какого шага начать. Если реально помочь нечем — короткое "
+        "скромное предложение без выдумок.\n"
+        "3) ОФОРМЛЕНИЕ (Bitrix BB-код, НЕ Markdown): ключевые действия выдели [b]жирным[/b]; "
+        "шаги/пункты — отдельными строками, каждая начинается с «— »; между обращением, сутью и "
+        "финальной строкой — пустая строка. Никаких #, *, ` и таблиц.\n"
+        "4) Закончи строкой: «Ответьте прямо здесь — я увижу ваше сообщение.»\n"
+        "Не выдумывай данных, которых нет в задаче; не обещай того, чего агент сделать не может."
+    )
+
+
 def compose_offer(task: dict[str, Any], candidates: list[dict[str, Any]],
                   responsible_name: str) -> tuple[dict[str, Any], str]:
     """Pick the best-suited agent and write the offer text. Returns (agent, message).
-    Groq does both in one call; any failure degrades to (main-or-first, fixed text)."""
+    Engine chain: codex (real practical recommendations, proper BB formatting — owner's call
+    2026-07-11) → groq → fixed fallback, so an offer is always posted even with both LLMs down."""
     first_name = (responsible_name or "").split()[0] if responsible_name else ""
     fallback_agent = next((c for c in candidates if c.get("is_main")), candidates[0])
     fallback_msg = ((first_name + ", ") if first_name else "") + (
@@ -116,38 +191,20 @@ def compose_offer(task: dict[str, Any], candidates: list[dict[str, Any]],
         "или просто «да» — и я возьмусь. Я вижу контекст задачи.")
     if len(candidates) == 1 and not (task.get("title") or task.get("description")):
         return fallback_agent, fallback_msg
-    agents_desc = "\n".join(
-        f"- {c['slug'] or 'main'}: «{c['name']}» — {c['role'] or 'универсальный'}" for c in candidates)
-    checklist = task.get("checklist") or []
-    cl_txt = "\n".join(f"{i}. {str(it.get('title') if isinstance(it, dict) else it)}"
-                       for i, it in enumerate(checklist[:15], 1))
-    prompt = (
-        "Ты подбираешь ИИ-агента и пишешь ПЕРВЫЙ комментарий-предложение помощи в новой задаче "
-        "Bitrix24. Верни СТРОГО JSON: {\"agent\": \"<slug или main>\", \"message\": \"<текст>\"}.\n\n"
-        "Доступные агенты (выбери самого профильного; сомневаешься — main):\n" + agents_desc + "\n\n"
-        "Задача:\nНазвание: " + str(task.get("title") or "") + "\n"
-        "Описание: " + str(task.get("description") or "")[:1500] + "\n"
-        + (("Чек-лист:\n" + cl_txt + "\n") if cl_txt else "")
-        + "Ответственный: " + (responsible_name or "сотрудник") + "\n\n"
-        "Требования к message (по-русски, БЕЗ Markdown; жирный только [b]...[/b]; до 700 символов):\n"
-        "1) Обратись по имени: «" + (first_name or "Коллега") + ", могу помочь выполнить и закрыть "
-        "вам эту задачу.»\n"
-        "2) Дальше — ПО СУТИ задачи: если она простая/операционная — задай один конкретный вопрос-"
-        "предложение (например «скажите, могу ли я поставить задачи исполнителям?»); если сложная — "
-        "предложи короткий план в 3-5 шагов, что сделаем вместе, и спроси, с какого шага начать.\n"
-        "3) Закончи фразой: «Ответьте прямо здесь — я увижу ваше сообщение.»\n"
-        "Не выдумывай данных, которых нет в задаче; не обещай того, что не следует из её текста."
-    )
-    try:
-        raw = _groq_chat(prompt)
-        data = json.loads(raw) if raw else {}
-        msg = str(data.get("message") or "").strip()[:_OFFER_MAX_CHARS]
-        slug = str(data.get("agent") or "main").strip()
-        agent = next((c for c in candidates if (c["slug"] or "main") == slug), fallback_agent)
-        if msg and not _CJK_RE.search(msg):
-            return agent, msg
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("task offers: groq compose failed: %s", repr(exc)[:160])
+    prompt = _offer_prompt(task, candidates, responsible_name, first_name)
+    engines = ("codex", "groq") if _OFFER_ENGINE != "groq" else ("groq",)
+    for engine in engines:
+        try:
+            raw = _codex_chat(prompt) if engine == "codex" else _groq_chat(prompt)
+            data = _extract_json(raw)
+            msg = str(data.get("message") or "").strip()[:_OFFER_MAX_CHARS]
+            slug = str(data.get("agent") or "main").strip()
+            agent = next((c for c in candidates if (c["slug"] or "main") == slug), fallback_agent)
+            if msg and not _CJK_RE.search(msg):
+                return agent, msg
+            logging.warning("task offers: %s compose returned unusable text", engine)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("task offers: %s compose failed: %s", engine, repr(exc)[:160])
     return fallback_agent, fallback_msg
 
 
