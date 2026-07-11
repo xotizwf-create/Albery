@@ -77,6 +77,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "047_recurring_agent_slug_attachment_source.sql",
     # Idempotent: stored weekly TG news digests (news agent reuses the latest for ad-hoc questions).
     "048_tg_news_digests.sql",
+    # Idempotent: offer-to-help comments on agent-created tasks (reply routing without mentions).
+    "049_task_agent_offers.sql",
 ]
 
 

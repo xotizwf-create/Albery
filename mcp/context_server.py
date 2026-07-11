@@ -2017,6 +2017,18 @@ def tool_create_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     if task_id and args.get("checklist"):
         checklist_summary = _add_checklist_items(int(task_id), args.get("checklist"))
 
+    # Agent-created task → offer-to-help comment from the most suitable agent (задача 1300).
+    # Fire-and-forget background thread; can never fail or delay the creation itself.
+    if task_id:
+        try:
+            from task_offers import schedule_offer
+            schedule_offer(task_id, title=title, description=description,
+                           checklist=args.get("checklist"),
+                           responsible_id=responsible.get("bitrix_user_id"),
+                           creator_id=(creator_info or {}).get("bitrix_user_id"))
+        except Exception:  # noqa: BLE001
+            logging.warning("create_task: offer scheduling failed task=%s", task_id, exc_info=True)
+
     return {
         "created": True,
         "task_id": task_id,
@@ -2848,6 +2860,15 @@ def create_oneoff_task_from_spec(spec: dict[str, Any], deadline_iso: str) -> dic
     if not task_id:
         raise McpError(-32010, f"Bitrix не создал разовую задачу по расписанию: {response.get('error_description') if isinstance(response, dict) else response}")
     checklist = _add_checklist_items(int(task_id), spec.get("checklist")) if spec.get("checklist") else None
+    # Scheduler-created instances get the same offer-to-help comment as one-off agent tasks.
+    try:
+        from task_offers import schedule_offer
+        schedule_offer(task_id, title=title, description=description,
+                       checklist=spec.get("checklist"),
+                       responsible_id=responsible_id,
+                       creator_id=spec.get("creator_bitrix_id"))
+    except Exception:  # noqa: BLE001
+        logging.warning("recurring instance: offer scheduling failed task=%s", task_id, exc_info=True)
     return {"task_id": int(task_id), "checklist": checklist}
 
 
