@@ -21,7 +21,6 @@ from __future__ import annotations
 import logging
 import os
 import queue
-import re
 import subprocess
 import threading
 import time
@@ -505,19 +504,11 @@ def _is_silent(answer: str) -> bool:
     return answer.strip().strip("«»\"'.").upper() == "SILENT"
 
 
-# The model is told to answer in Bitrix BB only, but a long answer occasionally slips into
-# Markdown — Bitrix renders that as an unformatted wall of ** and # (владелец 12.07: «сводка
-# пришла абсолютно не оформленная»). Deterministic safety net before delivery.
-_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
-_MD_HEADER_RE = re.compile(r"(?m)^\s*#{1,6}\s+(.*)$")
-_MD_FENCE_RE = re.compile(r"```[a-z]*\n?")
-
-
 def _bb_sanitize(text: str) -> str:
-    t = _MD_BOLD_RE.sub(r"[b]\1[/b]", text or "")
-    t = _MD_HEADER_RE.sub(lambda m: "[b]" + m.group(1).strip() + "[/b]", t)
-    t = _MD_FENCE_RE.sub("", t)
-    return t
+    """Единый санитайзер Markdown→BB живёт в b24bot (там же его применяют все ответы бота):
+    таблицы, жирный, заголовки, ссылки, код, списки. Здесь — та же сетка перед доставкой."""
+    from b24bot import bb_sanitize
+    return bb_sanitize(text)
 
 
 def _deliver(agent: dict[str, Any], row: dict[str, Any], text: str) -> tuple[bool, str | None]:

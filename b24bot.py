@@ -818,6 +818,78 @@ def _b24_strip_keyboard(client_endpoint: str, access_token: str, bot_id: Any,
         logging.debug("b24 testbot: strip-keyboard update failed", exc_info=True)
 
 
+# --- Markdown -> Bitrix BB: deterministic safety net on EVERY message we send ------------------
+# Bitrix renders no Markdown: `**жирный**` arrives as literal asterisks and a Markdown TABLE
+# arrives as a wall of pipes («палки», owner 2026-07-13). The model is instructed to use BB only,
+# but instructions can be ignored — code cannot. Everything the bot sends (chat replies, in-task
+# comments, automation deliveries) goes through bb_sanitize().
+_MD_FENCE_RE = re.compile(r"```[A-Za-z0-9_+-]*\n?")
+_MD_HEADER_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$")
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+_MD_BOLD_UNDER_RE = re.compile(r"(?<!\w)__(.+?)__(?!\w)", re.S)
+_MD_STRIKE_RE = re.compile(r"~~(.+?)~~", re.S)
+_MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)")
+_MD_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_BULLET_RE = re.compile(r"(?m)^(\s*)[*+]\s+")
+_MD_HR_RE = re.compile(r"(?m)^\s*([-*_])\1{2,}\s*$")
+_MD_ITALIC_RE = re.compile(r"(?<![\w*\[])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])")
+_MD_TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]*-{2,}[\s:|-]*\|?\s*$")
+
+
+def _md_cells(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _md_tables_to_lines(text: str) -> str:
+    """Markdown table -> readable «- значение — значение» lines (Bitrix has no tables)."""
+    lines = (text or "").splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        is_row = line.strip().startswith("|") and line.count("|") >= 2
+        sep_next = i + 1 < len(lines) and _MD_TABLE_SEP_RE.match(lines[i + 1] or "")
+        if not (is_row and sep_next):
+            out.append(line)
+            i += 1
+            continue
+        headers = _md_cells(line)
+        i += 2  # skip header + separator
+        while i < len(lines) and lines[i].strip().startswith("|") and lines[i].count("|") >= 2:
+            cells = _md_cells(lines[i])
+            i += 1
+            values = [c for c in cells if c and not set(c) <= {"-", ":"}]
+            if not values:
+                continue
+            if len(values) <= 2:
+                out.append("- " + " — ".join(values))
+            else:
+                head = values[0]
+                rest = []
+                for idx, val in enumerate(values[1:], start=1):
+                    label = headers[idx] if idx < len(headers) and headers[idx] else ""
+                    rest.append(f"{label}: {val}" if label else val)
+                out.append("- " + head + " — " + "; ".join(rest))
+        out.append("")  # air after the block
+    return "\n".join(out)
+
+
+def bb_sanitize(text: str) -> str:
+    """Strip/convert every Markdown artefact so Bitrix shows a clean, readable message."""
+    t = _md_tables_to_lines(text or "")
+    t = _MD_FENCE_RE.sub("", t)
+    t = _MD_HEADER_RE.sub(lambda m: "[b]" + m.group(1).strip() + "[/b]", t)
+    t = _MD_LINK_RE.sub(lambda m: f"[URL={m.group(2)}]{m.group(1)}[/URL]", t)
+    t = _MD_BOLD_RE.sub(r"[b]\1[/b]", t)
+    t = _MD_BOLD_UNDER_RE.sub(r"[b]\1[/b]", t)
+    t = _MD_STRIKE_RE.sub(r"\1", t)
+    t = _MD_CODE_RE.sub(r"\1", t)
+    t = _MD_HR_RE.sub("", t)
+    t = _MD_BULLET_RE.sub(r"\1- ", t)
+    t = _MD_ITALIC_RE.sub(r"\1", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
 def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
                    text: str, keyboard: list[dict[str, Any]] | None = None) -> Any:
     """Send a bot message; returns the new message id (or None). When a keyboard is attached, the
@@ -828,6 +900,7 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
     format, we retry with an INLINE italic footnote so the answer is always delivered."""
     if not (client_endpoint and access_token and bot_id and dialog_id):
         return None
+    text = bb_sanitize(text)
     disclaimer = _b24_disclaimer()
     base: dict[str, Any] = {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text}
     if keyboard:
@@ -3384,6 +3457,7 @@ def _b24_post_task_comment(task_id: int, text: str, agent_name: str, author_bot_
     wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
     if not wh:
         return False
+    text = bb_sanitize(text)
 
     def _post(fields: dict[str, Any]) -> Any:
         r = requests.post(f"{wh}/task.commentitem.add.json",
