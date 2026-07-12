@@ -7759,6 +7759,14 @@ def tool_get_tg_news(args: dict[str, Any]) -> dict[str, Any]:
 # по умолчанию 14=Евгений Палей, 22=ИИ Агент) — агент обязан передать id того, кто попросил, и
 # получить явное подтверждение (confirm=true). Любое изменение пишется в журнал.
 
+# Разведано вживую 2026-07-13: Bitrix САМ добавляет назначенного руководителя в этот отдел
+# (UF_DEPARTMENT пополняется). Значит «пустых» отделов с руководителем не бывает — предупреждаем
+# человека, иначе он удивится, что руководитель «переехал», и не сможет удалить отдел.
+_ORG_HEAD_AUTOJOIN_NOTE = ("Bitrix автоматически включил руководителя в состав этого отдела. "
+                           "Сообщи это человеку. Чтобы удалить отдел, сначала переведи из него "
+                           "ВСЕХ, включая руководителя.")
+
+
 def _org_admin_ids() -> set[int]:
     raw = os.getenv("ORG_STRUCTURE_ADMINS", "14,22")
     return {int(x) for x in re.findall(r"\d+", raw)}
@@ -7857,9 +7865,12 @@ def tool_manage_bitrix_department(args: dict[str, Any]) -> dict[str, Any]:
             fields["UF_HEAD"] = head
         dep_id = _org_webhook("department.add", fields)
         logging.info("org: user %s created department %s «%s»", requester, dep_id, name)
-        return {"created": True, "department_id": _int_or_none(dep_id), "name": name,
-                "parent_id": fields["PARENT"], "head_bitrix_user_id": head,
-                "sync": _org_resync_team()}
+        out = {"created": True, "department_id": _int_or_none(dep_id), "name": name,
+               "parent_id": fields["PARENT"], "head_bitrix_user_id": head,
+               "sync": _org_resync_team()}
+        if head:
+            out["note"] = _ORG_HEAD_AUTOJOIN_NOTE
+        return out
 
     dep_id = _int_or_none(args.get("department_id"))
     if not dep_id:
@@ -7897,12 +7908,15 @@ def tool_manage_bitrix_department(args: dict[str, Any]) -> dict[str, Any]:
     _org_webhook("department.update", fields)
     after = (_org_webhook("department.get", {"ID": dep_id}) or [{}])[0]
     logging.info("org: user %s updated department %s: %s", requester, dep_id, fields)
-    return {"updated": True, "department_id": dep_id,
-            "was": {"name": current.get("NAME"), "parent_id": _int_or_none(current.get("PARENT")),
-                    "head_bitrix_user_id": _int_or_none(current.get("UF_HEAD"))},
-            "now": {"name": after.get("NAME"), "parent_id": _int_or_none(after.get("PARENT")),
-                    "head_bitrix_user_id": _int_or_none(after.get("UF_HEAD"))},
-            "sync": _org_resync_team()}
+    out = {"updated": True, "department_id": dep_id,
+           "was": {"name": current.get("NAME"), "parent_id": _int_or_none(current.get("PARENT")),
+                   "head_bitrix_user_id": _int_or_none(current.get("UF_HEAD"))},
+           "now": {"name": after.get("NAME"), "parent_id": _int_or_none(after.get("PARENT")),
+                   "head_bitrix_user_id": _int_or_none(after.get("UF_HEAD"))},
+           "sync": _org_resync_team()}
+    if "UF_HEAD" in fields:
+        out["note"] = _ORG_HEAD_AUTOJOIN_NOTE
+    return out
 
 
 def tool_assign_employee_department(args: dict[str, Any]) -> dict[str, Any]:
