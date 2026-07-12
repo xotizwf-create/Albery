@@ -108,6 +108,7 @@ def main() -> int:
     load_dotenv(ROOT / ".env")
 
     import app  # noqa: PLC0415
+    import gdrive  # noqa: PLC0415  # drive-синки вынесены из app.py в июле-2026
 
     webhook_base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
     today = app.msk_today()
@@ -145,10 +146,10 @@ def main() -> int:
     steps.extend([
         ("zoom_recording_events", lambda: app.process_zoom_recording_event_queue(limit=100)),
         ("zoom_api_calls", lambda: app.sync_zoom_calls(zoom_from, zoom_to)),
-        ("google_drive_company_instructions", app.sync_google_drive_company_documents),
+        ("google_drive_company_instructions", gdrive.sync_google_drive_company_documents),
     ])
     if env_bool("AUTO_SYNC_GOOGLE_DRIVE_ZOOM_TRANSCRIPTS", True):
-        steps.append(("google_drive_zoom_transcripts", app.sync_google_drive_call_transcripts))
+        steps.append(("google_drive_zoom_transcripts", gdrive.sync_google_drive_call_transcripts))
 
     success = True
     for name, func in steps:
