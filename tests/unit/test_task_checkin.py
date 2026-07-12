@@ -52,6 +52,19 @@ def test_is_working_day_excludes_weekend():
         [True, True, True, True, True, False, False]
 
 
+def test_bb_sanitize_converts_stray_markdown():
+    import app  # noqa: F401
+
+    import agent_automations as aa
+
+    src = "## Итоги недели\nWB поднял **комиссии на 9%**.\n```\ncode\n```\n[b]уже бб[/b]"
+    out = aa._bb_sanitize(src)
+    assert "[b]Итоги недели[/b]" in out
+    assert "[b]комиссии на 9%[/b]" in out
+    assert "```" not in out and "##" not in out
+    assert "[b]уже бб[/b]" in out  # existing BB untouched
+
+
 def test_classifier_parsing_tolerates_junk(monkeypatch):
     import app  # noqa: F401
 

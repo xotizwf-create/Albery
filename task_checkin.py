@@ -260,12 +260,25 @@ _FIRST_DM = (
 )
 _NEXT_DM = ("{name}, я снова посмотрел ваши задачи и написал в них, чем могу ускорить "
             "работу:\n\n{tasks}\n\nОтветьте прямо в задаче — и я возьмусь.")
+# Nudge for people with access who simply don't use the agent (no offers today, no turns in 30d).
+# Owner: «тем кто просто не работает с агентом — другой текст, типо давайте работать уже»,
+# not every day — at most once in 3 days, and only when there is a reason.
+_NUDGE_DM = (
+    "{name}, я корпоративный ИИ-агент Албери — вижу, мы с вами ещё не работали вместе. "
+    "Давайте уже попробуем!\n\n"
+    "Напишите мне прямо здесь любой рабочий вопрос или поручите рутину: собрать данные или "
+    "таблицу, сделать отчёт или анализ, найти информацию, поставить задачи, разобрать документ "
+    "или скрин. Также меня можно позвать в любой задаче — напишите «Албери» в комментарии, "
+    "я вижу контекст задачи и помогу прямо там."
+)
+_NUDGE_EVERY_H = int(os.getenv("B24_CHECKIN_NUDGE_HOURS", "72"))  # раз в 3 дня
 
 
-def _send_dms(offers_by_user: dict[int, list[dict[str, Any]]], main_bot_id: Any) -> int:
+def _send_dms(offers_by_user: dict[int, list[dict[str, Any]]], main_bot_id: Any) -> list[str]:
+    """Offer-DMs; returns the recipients' names (for the owner's report)."""
     import b24bot
     directory = b24bot._b24_portal_user_directory()
-    sent = 0
+    sent: list[str] = []
     for uid, tasks in offers_by_user.items():
         try:
             with pg_connect() as conn:
@@ -283,7 +296,7 @@ def _send_dms(offers_by_user: dict[int, list[dict[str, Any]]], main_bot_id: Any)
             ok, err = b24bot._albery_bitrix_notify(tpl.format(name=name, tasks=listing),
                                                    dialog_id=str(uid), bot_id=main_bot_id)
             if ok:
-                sent += 1
+                sent.append(directory.get(uid, {}).get("name") or str(uid))
                 with pg_connect() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -296,6 +309,80 @@ def _send_dms(offers_by_user: dict[int, list[dict[str, Any]]], main_bot_id: Any)
         except Exception:  # noqa: BLE001
             logging.warning("task checkin: DM flow failed uid=%s", uid, exc_info=True)
     return sent
+
+
+def _send_nudges(exclude_uids: set[int], main_bot_id: Any) -> list[str]:
+    """DM the people who have agent access but DON'T use the agent at all (turns_30d = 0):
+    «давайте уже работать». At most once per _NUDGE_EVERY_H (72h = раз в 3 дня), never on the
+    same day as an offer-DM, never to bots/the owner account. Returns nudged names."""
+    import b24bot
+    nudged: list[str] = []
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT bitrix_user_id, full_name FROM employee_agent_dossier "
+                    "WHERE agent_access AND coalesce(turns_30d, 0) = 0 "
+                    "AND (last_dm_at IS NULL OR last_dm_at < now() - %s * interval '1 hour')",
+                    (_NUDGE_EVERY_H,))
+                rows = [dict(r) for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        logging.warning("task checkin: nudge candidates load failed", exc_info=True)
+        return nudged
+    bot_uids = {b24bot.to_int(t.get("bot_id")) for t in b24bot._b24_task_targets()}
+    for r in rows:
+        uid = int(r["bitrix_user_id"])
+        if uid in exclude_uids or uid in bot_uids or uid in b24bot._b24_task_bot_author_ids():
+            continue
+        name = (r.get("full_name") or "").split()[0] or "Коллега"
+        ok, err = b24bot._albery_bitrix_notify(_NUDGE_DM.format(name=name),
+                                               dialog_id=str(uid), bot_id=main_bot_id)
+        if ok:
+            nudged.append(r.get("full_name") or str(uid))
+            try:
+                with pg_connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE employee_agent_dossier SET last_dm_at = now(), "
+                            "first_dm_at = coalesce(first_dm_at, now()), updated_at = now() "
+                            "WHERE bitrix_user_id = %s", (uid,))
+            except Exception:  # noqa: BLE001
+                logging.warning("task checkin: nudge stamp failed uid=%s", uid, exc_info=True)
+        else:
+            logging.warning("task checkin: nudge to %s failed: %s", uid, err)
+    return nudged
+
+
+def _report_to_owner(report: dict[str, Any], offers_by_user: dict[int, list[dict[str, Any]]],
+                     dm_names: list[str], nudged: list[str], main_bot_id: Any) -> bool:
+    """The owner's DM after every live run: which tasks got recommendations, who was DMed —
+    the log the owner asked for («и всё это у нас должно логироваться»)."""
+    import b24bot
+    from mcp.context_server import _task_deep_link
+    target = os.getenv("B24_CHECKIN_REPORT_TO", "22").strip()
+    if not target:
+        return False
+    lines = ["[b]🤖 Ежедневный обход задач — отчёт[/b]"]
+    if offers_by_user:
+        lines.append("Рекомендации отправлены в задачах:")
+        for uid, tasks in offers_by_user.items():
+            for t in tasks:
+                lines.append(f"— [URL={_task_deep_link(t['id'])}]{t['title'][:70]}[/URL]")
+    else:
+        lines.append("Подходящих задач для рекомендаций сегодня не нашлось.")
+    if dm_names:
+        lines.append("Отписался в ЛС: " + ", ".join(dm_names))
+    if nudged:
+        lines.append("Напомнил о себе (пока не работают с агентом): " + ", ".join(nudged))
+    st = report.get("filter_stats") or {}
+    lines.append(f"Статистика: задач {report.get('scanned', 0)}, прошли фильтры "
+                 f"{report.get('passed_filters', 0)}, отобрано {report.get('offers_posted', 0)}; "
+                 f"отсеяно: без доступа {st.get('no_access', 0)}, стоп-слова {st.get('stop_word', 0)}, "
+                 f"массовые {st.get('mass', 0)}, с оффером {st.get('offered', 0)}.")
+    ok, err = b24bot._albery_bitrix_notify("\n".join(lines), dialog_id=target, bot_id=main_bot_id)
+    if not ok:
+        logging.warning("task checkin: owner report failed: %s", err)
+    return ok
 
 
 # --- the run ------------------------------------------------------------------------------------
@@ -358,7 +445,15 @@ def run_checkin(*, dry_run: bool = False, only_users: set[int] | None = None,
                 logging.warning("task checkin: offer failed task=%s", t["id"], exc_info=True)
         refresh_dossiers()
         main_bot = b24bot.to_int(b24bot._b24_load_state().get("bot_id"))
-        report["dms_sent"] = _send_dms(offers_by_user, main_bot)
+        dm_names = _send_dms(offers_by_user, main_bot)
+        report["dms_sent"] = len(dm_names)
+        report["dm_names"] = dm_names
+        # «Давайте уже работать» for access-holders who don't use the agent (≤ раз в 3 дня).
+        nudged = _send_nudges(set(offers_by_user), main_bot)
+        report["nudged"] = nudged
+        # Owner's log-DM: which tasks got recommendations, who was written to.
+        report["owner_report_sent"] = _report_to_owner(
+            {**report, "offers_posted": offers_posted}, offers_by_user, dm_names, nudged, main_bot)
     report["offers_posted"] = offers_posted
 
     if not dry_run and not force:

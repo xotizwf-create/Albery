@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -504,6 +505,21 @@ def _is_silent(answer: str) -> bool:
     return answer.strip().strip("«»\"'.").upper() == "SILENT"
 
 
+# The model is told to answer in Bitrix BB only, but a long answer occasionally slips into
+# Markdown — Bitrix renders that as an unformatted wall of ** and # (владелец 12.07: «сводка
+# пришла абсолютно не оформленная»). Deterministic safety net before delivery.
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+_MD_HEADER_RE = re.compile(r"(?m)^\s*#{1,6}\s+(.*)$")
+_MD_FENCE_RE = re.compile(r"```[a-z]*\n?")
+
+
+def _bb_sanitize(text: str) -> str:
+    t = _MD_BOLD_RE.sub(r"[b]\1[/b]", text or "")
+    t = _MD_HEADER_RE.sub(lambda m: "[b]" + m.group(1).strip() + "[/b]", t)
+    t = _MD_FENCE_RE.sub("", t)
+    return t
+
+
 def _deliver(agent: dict[str, Any], row: dict[str, Any], text: str) -> tuple[bool, str | None]:
     """deliver_to supports SEVERAL comma-separated targets (user ids and/or chatNNN) — the owner
     wants some digests both in Никитенко's private dialog and to the «ИИ Агент» account. Success
@@ -511,7 +527,7 @@ def _deliver(agent: dict[str, Any], row: dict[str, Any], text: str) -> tuple[boo
     from b24bot import _albery_bitrix_notify
     raw = (row["deliver_to"] or "").strip() or os.getenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat728")
     targets = [t.strip() for t in raw.replace(";", ",").split(",") if t.strip()]
-    message = "[b]⏰ " + row["name"] + "[/b]\n" + text
+    message = "[b]⏰ " + row["name"] + "[/b]\n" + _bb_sanitize(text)
     errors: list[str] = []
     delivered_any = False
     for target in targets:
