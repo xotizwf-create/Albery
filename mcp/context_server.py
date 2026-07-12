@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SERVER_NAME = "employee-analytics-context"
-SERVER_VERSION = "0.17.0"
+SERVER_VERSION = "0.18.0"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LIMIT = 500
 ZOOM_TRANSCRIPT_MAX_LIMIT = 2000
@@ -7753,6 +7753,199 @@ def tool_get_tg_news(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# --- Оргструктура Bitrix (отделы + принадлежность людей) ----------------------------------------
+# Правит ТОЛЬКО вебхук: scope `department` есть у входящего вебхука и НЕТ у app-токена (разведано
+# 2026-07-13). Менять оргструктуру разрешено строго ограниченному кругу (ORG_STRUCTURE_ADMINS,
+# по умолчанию 14=Евгений Палей, 22=ИИ Агент) — агент обязан передать id того, кто попросил, и
+# получить явное подтверждение (confirm=true). Любое изменение пишется в журнал.
+
+def _org_admin_ids() -> set[int]:
+    raw = os.getenv("ORG_STRUCTURE_ADMINS", "14,22")
+    return {int(x) for x in re.findall(r"\d+", raw)}
+
+
+def _org_assert_allowed(args: dict[str, Any], action: str) -> int:
+    """Кто просит? Разрешено только Евгению (14) и ИИ Агенту (22)."""
+    uid = _int_or_none(args.get("requested_by_bitrix_user_id"))
+    if uid is None:
+        raise McpError(-32602, "Укажи requested_by_bitrix_user_id — id того, КТО просит изменить "
+                               "оргструктуру (менять её могут только Евгений Палей и ИИ Агент).")
+    allowed = _org_admin_ids()
+    if uid not in allowed:
+        who = _resolve_active_bitrix_user(uid, None) if uid else None
+        name = (who or {}).get("full_name") or f"id {uid}"
+        raise McpError(-32602, f"У {name} нет прав менять оргструктуру. Это могут делать только "
+                               f"Евгений Палей и ИИ Агент. Скажи это человеку прямо и не выполняй "
+                               f"изменение.")
+    if args.get("confirm") is not True:
+        raise McpError(-32602, f"Оргструктура — чувствительные данные. Сначала покажи человеку "
+                               f"ТОЧНЫЙ план ({action}: что и с какими id изменится), дождись явного "
+                               f"«да» и вызови повторно с confirm=true.")
+    return uid
+
+
+def _org_webhook(method: str, payload: dict[str, Any] | None = None) -> Any:
+    data = _webhook_raw(method, payload or {})
+    return data.get("result") if isinstance(data, dict) else data
+
+
+def _org_resync_team() -> str:
+    """После правки оргструктуры пересинхронизировать наш справочник (users), иначе
+    get_org_structure будет отдавать старое."""
+    try:
+        base = os.getenv("BITRIX_WEBHOOK_BASE", "").strip()
+        if base:
+            res = app_workflow_function("sync_bitrix_team")(base)
+            return f"справочник обновлён (сотрудников: {res.get('saved', '?')})"
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("org: team resync failed: %s", repr(exc)[:150])
+    return "справочник обновится ближайшей синхронизацией"
+
+
+def tool_get_bitrix_departments(args: dict[str, Any]) -> dict[str, Any]:
+    """Живая оргструктура портала: отделы (id, название, родитель, руководитель) + кто в каждом."""
+    deps = _org_webhook("department.get") or []
+    users = _org_webhook("user.get", {"ACTIVE": "true"}) or []
+    by_dep: dict[str, list[dict[str, Any]]] = {}
+    for u in users:
+        name = " ".join(x for x in (u.get("NAME"), u.get("LAST_NAME")) if x).strip()
+        for dep_id in (u.get("UF_DEPARTMENT") or []):
+            by_dep.setdefault(str(dep_id), []).append({
+                "bitrix_user_id": _int_or_none(u.get("ID")),
+                "full_name": name or f"id {u.get('ID')}",
+                "position": u.get("WORK_POSITION") or "",
+            })
+    heads = {str(d.get("ID")): _int_or_none(d.get("UF_HEAD")) for d in deps}
+    names = {str(_int_or_none(u.get("ID"))): " ".join(x for x in (u.get("NAME"), u.get("LAST_NAME")) if x).strip()
+             for u in users}
+    out = []
+    for d in deps:
+        did = str(d.get("ID"))
+        head_id = heads.get(did)
+        out.append({
+            "department_id": _int_or_none(d.get("ID")),
+            "name": d.get("NAME"),
+            "parent_id": _int_or_none(d.get("PARENT")),
+            "head_bitrix_user_id": head_id,
+            "head_name": names.get(str(head_id)) if head_id else None,
+            "employees": sorted(by_dep.get(did, []), key=lambda e: e["full_name"]),
+        })
+    return {
+        "portal": "b24-0xrp3s",
+        "departments": sorted(out, key=lambda d: (d["parent_id"] or 0, d["department_id"] or 0)),
+        "count": len(out),
+        "note": ("Это ЖИВАЯ структура портала. Менять её могут только Евгений Палей и ИИ Агент "
+                 "(manage_bitrix_department / assign_employee_department) — после показа плана и "
+                 "явного подтверждения."),
+    }
+
+
+def tool_manage_bitrix_department(args: dict[str, Any]) -> dict[str, Any]:
+    """Создать / переименовать / переподчинить / назначить руководителя / удалить отдел."""
+    action = str(args.get("action") or "").strip().lower()
+    if action not in ("create", "update", "delete"):
+        raise McpError(-32602, "action: create | update | delete.")
+    requester = _org_assert_allowed(args, f"отдел: {action}")
+
+    if action == "create":
+        name = str(args.get("name") or "").strip()
+        if not name:
+            raise McpError(-32602, "Для create нужен name (название отдела).")
+        fields: dict[str, Any] = {"NAME": name, "PARENT": _int_or_none(args.get("parent_id")) or 1}
+        head = _int_or_none(args.get("head_bitrix_user_id"))
+        if head:
+            fields["UF_HEAD"] = head
+        dep_id = _org_webhook("department.add", fields)
+        logging.info("org: user %s created department %s «%s»", requester, dep_id, name)
+        return {"created": True, "department_id": _int_or_none(dep_id), "name": name,
+                "parent_id": fields["PARENT"], "head_bitrix_user_id": head,
+                "sync": _org_resync_team()}
+
+    dep_id = _int_or_none(args.get("department_id"))
+    if not dep_id:
+        raise McpError(-32602, "Укажи department_id (см. get_bitrix_departments).")
+    current = (_org_webhook("department.get", {"ID": dep_id}) or [{}])[0]
+    if not current:
+        raise McpError(-32602, f"Отдел id={dep_id} не найден.")
+    if dep_id == 1:
+        raise McpError(-32602, "Корневой отдел портала менять/удалять нельзя.")
+
+    if action == "delete":
+        members = [u for u in (_org_webhook("user.get", {"ACTIVE": "true"}) or [])
+                   if dep_id in [_int_or_none(x) for x in (u.get("UF_DEPARTMENT") or [])]]
+        if members:
+            names = ", ".join(" ".join(x for x in (u.get("NAME"), u.get("LAST_NAME")) if x) for u in members[:10])
+            raise McpError(-32602, f"В отделе «{current.get('NAME')}» ещё есть сотрудники: {names}. "
+                                   f"Сначала переведи их (assign_employee_department), потом удаляй отдел.")
+        _org_webhook("department.delete", {"ID": dep_id})
+        logging.info("org: user %s deleted department %s «%s»", requester, dep_id, current.get("NAME"))
+        return {"deleted": True, "department_id": dep_id, "name": current.get("NAME"),
+                "sync": _org_resync_team()}
+
+    fields = {"ID": dep_id}
+    if str(args.get("name") or "").strip():
+        fields["NAME"] = str(args["name"]).strip()
+    if args.get("parent_id") not in (None, ""):
+        fields["PARENT"] = _int_or_none(args["parent_id"])
+    if args.get("head_bitrix_user_id") not in (None, ""):
+        head = _int_or_none(args["head_bitrix_user_id"])
+        if head and not _resolve_active_bitrix_user(head, None):
+            raise McpError(-32602, f"Сотрудник id={head} не найден среди активных — руководителя не назначил.")
+        fields["UF_HEAD"] = head
+    if len(fields) == 1:
+        raise McpError(-32602, "Нечего менять: передай name, parent_id и/или head_bitrix_user_id.")
+    _org_webhook("department.update", fields)
+    after = (_org_webhook("department.get", {"ID": dep_id}) or [{}])[0]
+    logging.info("org: user %s updated department %s: %s", requester, dep_id, fields)
+    return {"updated": True, "department_id": dep_id,
+            "was": {"name": current.get("NAME"), "parent_id": _int_or_none(current.get("PARENT")),
+                    "head_bitrix_user_id": _int_or_none(current.get("UF_HEAD"))},
+            "now": {"name": after.get("NAME"), "parent_id": _int_or_none(after.get("PARENT")),
+                    "head_bitrix_user_id": _int_or_none(after.get("UF_HEAD"))},
+            "sync": _org_resync_team()}
+
+
+def tool_assign_employee_department(args: dict[str, Any]) -> dict[str, Any]:
+    """Перевести сотрудника(ов) в отдел и/или задать должность."""
+    requester = _org_assert_allowed(args, "перевод сотрудника")
+    dep_ids = [_int_or_none(d) for d in (args.get("department_ids") or [])]
+    dep_ids = [d for d in dep_ids if d]
+    position = args.get("position")
+    if not dep_ids and position is None:
+        raise McpError(-32602, "Нечего менять: передай department_ids и/или position.")
+
+    known = {_int_or_none(d.get("ID")) for d in (_org_webhook("department.get") or [])}
+    bad = [d for d in dep_ids if d not in known]
+    if bad:
+        raise McpError(-32602, f"Отделов с id {bad} нет. Актуальные — get_bitrix_departments.")
+
+    targets: list[dict[str, Any]] = []
+    for item in (args.get("employees") or []):
+        user = _resolve_active_bitrix_user(item if str(item).isdigit() else None,
+                                           None if str(item).isdigit() else str(item))
+        if not user:
+            raise McpError(-32602, f"Сотрудник «{item}» не найден среди активных. Сверься с "
+                                   f"get_org_structure и передай точный id.")
+        targets.append(user)
+    if not targets:
+        raise McpError(-32602, "Укажи employees — список id или ФИО сотрудников.")
+
+    results = []
+    for user in targets:
+        uid = int(user["bitrix_user_id"])
+        payload: dict[str, Any] = {"ID": uid}
+        if dep_ids:
+            payload["UF_DEPARTMENT"] = dep_ids
+        if position is not None:
+            payload["WORK_POSITION"] = str(position)
+        _org_webhook("user.update", payload)
+        results.append({"bitrix_user_id": uid, "full_name": user.get("full_name"),
+                        "department_ids": dep_ids or "не менял",
+                        "position": position if position is not None else "не менял"})
+        logging.info("org: user %s moved employee %s -> deps=%s pos=%s", requester, uid, dep_ids, position)
+    return {"updated": True, "employees": results, "sync": _org_resync_team()}
+
+
 def tool_save_news_digest(args: dict[str, Any]) -> dict[str, Any]:
     """Store a weekly news digest so ad-hoc questions reuse it instead of rebuilding."""
     summary = str(args.get("summary") or "").strip()
@@ -9672,6 +9865,62 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_get_tg_news,
     },
+    "get_bitrix_departments": {
+        "description": (
+            "ЖИВАЯ оргструктура портала: отделы (id, название, родитель, руководитель) и кто в "
+            "каждом отделе (с id и должностями). Всегда начинай работу с оргструктурой отсюда — "
+            "здесь точные id, которые нужны остальным инструментам. Только чтение."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "handler": tool_get_bitrix_departments,
+    },
+    "manage_bitrix_department": {
+        "description": (
+            "ОТДЕЛЫ оргструктуры: create (name, опц. parent_id, head_bitrix_user_id), update "
+            "(department_id + name/parent_id/head_bitrix_user_id — переименовать, переподчинить, "
+            "назначить руководителя), delete (только пустой отдел). МЕНЯТЬ ОРГСТРУКТУРУ МОГУТ "
+            "ТОЛЬКО Евгений Палей и ИИ Агент — обязателен requested_by_bitrix_user_id (id того, кто "
+            "просит); остальным инструмент откажет. Порядок: get_bitrix_departments → показать "
+            "человеку ТОЧНЫЙ план с id → дождаться «да» → вызвать с confirm=true."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["create", "update", "delete"]},
+                "department_id": {"type": "integer", "description": "id отдела для update/delete."},
+                "name": {"type": "string", "description": "Название отдела (create / переименование)."},
+                "parent_id": {"type": "integer", "description": "Родительский отдел (по умолчанию корневой 1)."},
+                "head_bitrix_user_id": {"type": "integer", "description": "id руководителя отдела."},
+                "requested_by_bitrix_user_id": {"type": "integer", "description": "id того, КТО просит изменение (только Евгений Палей / ИИ Агент)."},
+                "confirm": {"type": "boolean", "description": "true — после показа плана и явного подтверждения человека."},
+            },
+            "required": ["action", "requested_by_bitrix_user_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_manage_bitrix_department,
+    },
+    "assign_employee_department": {
+        "description": (
+            "Перевести сотрудника(ов) в отдел и/или задать должность. employees — список id или ФИО "
+            "(резолвится по активным сотрудникам), department_ids — id отделов (человек может быть "
+            "в нескольких), position — должность. МЕНЯТЬ МОГУТ ТОЛЬКО Евгений Палей и ИИ Агент "
+            "(requested_by_bitrix_user_id). Сначала get_bitrix_departments + показать план с id, "
+            "затем confirm=true."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "employees": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "id или ФИО сотрудников."},
+                "department_ids": {"type": "array", "items": {"type": "integer"}, "description": "id отделов, куда перевести."},
+                "position": {"type": "string", "description": "Должность (WORK_POSITION)."},
+                "requested_by_bitrix_user_id": {"type": "integer", "description": "id того, КТО просит (только Евгений Палей / ИИ Агент)."},
+                "confirm": {"type": "boolean", "description": "true — после показа плана и явного подтверждения."},
+            },
+            "required": ["employees", "requested_by_bitrix_user_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_assign_employee_department,
+    },
     "save_news_digest": {
         "description": (
             "Сохранить недельную новостную сводку, чтобы на повторные вопросы отвечать из неё, "
@@ -10010,6 +10259,11 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
     "delete_crm_pipeline",
     "delete_crm_deal",
 }
+
+# Оргструктура: читать может любой тир кроме FAQ; ПРАВИТЬ — только Евгений(14)/ИИ Агент(22),
+# и это проверяется В САМИХ инструментах (requested_by_bitrix_user_id + confirm), потому что
+# тиры Bitrix-доступа не совпадают с этим списком (у Александра admin, но менять оргструктуру
+# ему не разрешено).
 
 # Operational-full connector: every registered tool EXCEPT the admin-only ones above.
 OPS_TOOL_NAMES: set[str] = set(TOOLS) - OWNER_ONLY_TOOL_NAMES
