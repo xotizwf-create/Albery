@@ -7842,7 +7842,9 @@ def tool_get_bitrix_departments(args: dict[str, Any]) -> dict[str, Any]:
         "portal": "b24-0xrp3s",
         "departments": sorted(out, key=lambda d: (d["parent_id"] or 0, d["department_id"] or 0)),
         "count": len(out),
-        "note": ("Это ЖИВАЯ структура портала. Менять её могут только Евгений Палей и ИИ Агент "
+        "note": ("Это ЖИВАЯ структура портала и ЕДИНСТВЕННЫЙ источник правды об отделах: схемы из "
+                 "документов базы знаний могут описывать старую/задуманную структуру — не выдавай "
+                 "их за факт. Менять структуру могут только Евгений Палей и ИИ Агент "
                  "(manage_bitrix_department / assign_employee_department) — после показа плана и "
                  "явного подтверждения."),
     }
