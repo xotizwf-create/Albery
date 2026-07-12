@@ -335,8 +335,17 @@ def _learned_file(slug: str, name: str) -> Path:
     return _learned_dir(slug) / f"{_safe_component(name)[:80]}.md"
 
 
+# Windows forbids / \ : * ? " < > | in filenames. The agent names its own learned instructions
+# freely (e.g. «Новостные сводки: искать последнюю»), and a colon made every Windows clone of the
+# repo unusable ("invalid path", checkout aborts). Map every forbidden char to a lookalike so the
+# name stays readable and the file stays cross-platform.
+_FILENAME_SAFE = str.maketrans({
+    "/": "∕", "\\": "∖", ":": "∶", "*": "∗", "?": "？", '"': "＂", "<": "‹", ">": "›", "|": "∣",
+})
+
+
 def _safe_component(name: str) -> str:
-    cleaned = (name or "").replace("/", "∕").replace("\\", "∖").strip().strip(".")
+    cleaned = (name or "").translate(_FILENAME_SAFE).strip().strip(".")
     return cleaned or "unnamed"
 
 
