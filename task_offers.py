@@ -211,7 +211,8 @@ def _offer_prompt(task: dict[str, Any], candidates: list[dict[str, Any]],
         "внешним системам (старый портал, чужой аккаунт) — их у агента может не быть; вместо этого "
         "проси описать или скинуть скринами (например воронку: «опишите стадии или скиньте скрин "
         "воронки — соберу такую же в Bitrix»).\n"
-        "4) Заверши строкой: «Ответьте прямо здесь — я увижу ваше сообщение.»\n"
+        "4) НЕ зови отвечать «прямо здесь» и не проси писать тебе в комментариях: финальную "
+        "строку о том, как тебя позвать через @, система добавит сама.\n"
         "Если по сути задачи агент реально ничем помочь не может — верни пустой message (\"\"), "
         "не выдумывай пользу. Ничего не обещай, чего агент сделать не может."
     )
@@ -225,8 +226,7 @@ def compose_offer(task: dict[str, Any], candidates: list[dict[str, Any]],
     first_name = (responsible_name or "").split()[0] if responsible_name else ""
     fallback_agent = next((c for c in candidates if c.get("is_main")), candidates[0])
     fallback_msg = ((first_name + ", ") if first_name else "") + (
-        "могу помочь выполнить и закрыть вам эту задачу. Напишите прямо здесь, с чего начать, "
-        "или просто «да» — и я возьмусь. Я вижу контекст задачи.")
+        "могу помочь выполнить и закрыть вам эту задачу — я вижу её контекст.")
     if len(candidates) == 1 and not (task.get("title") or task.get("description")):
         return fallback_agent, fallback_msg
     prompt = _offer_prompt(task, candidates, responsible_name, first_name)
@@ -298,6 +298,20 @@ def mark_declined(task_id: int) -> None:
 
 # --- entry point (fired after the agent created a task) ---------------------------------------
 
+def _summon_tail(agent: dict[str, Any]) -> str:
+    """Fixed closing line of every offer: HOW to summon the agent. Appended in code — not by
+    the LLM — so the «отвечаю только когда позвали через @» rule reads the same in every task.
+    Agents no longer react to unaddressed comments (owner's decision 2026-07-13)."""
+    name = str(agent.get("name") or "Агент Албери").strip()
+    short = "Албери" if agent.get("is_main") or not agent.get("slug") else name
+    return (
+        "\n\n[b]Нужна помощь — позовите меня через @.[/b] В комментарии введите символ @, начните "
+        "печатать «" + name + "» и выберите меня в подсказке (можно и просто написать «" + short +
+        "»), затем добавьте, что сделать. Пример: «@" + name + " возьми это на себя». "
+        "Пока меня не позвали по имени — я в вашу переписку не вмешиваюсь."
+    )
+
+
 def _post_offer(task_id: int, title: str, description: str, checklist: Any,
                 responsible_id: int, creator_id: int | None) -> None:
     import b24bot
@@ -311,6 +325,7 @@ def _post_offer(task_id: int, title: str, description: str, checklist: Any,
     agent, message = compose_offer(
         {"title": title, "description": description, "checklist": checklist},
         candidates, responsible_name)
+    message = message.rstrip() + _summon_tail(agent)
     posted = b24bot._b24_post_task_comment(int(task_id), message, agent["name"], agent.get("bot_id"))
     if posted:
         _save_offer(task_id, agent, responsible_id, creator_id)

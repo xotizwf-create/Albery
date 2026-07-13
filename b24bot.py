@@ -3514,34 +3514,13 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
     if to_int(author_id) in bot_authors or text.lstrip().startswith("🤖"):
         return {"handled": False, "reason": "own_comment"}
     target = _b24_task_pick_agent(text, targets)
-    offer_followup = False
     if not target:
-        # No agent named — but if this task carries an OPEN offer («могу помочь выполнить…»)
-        # addressed to this author, the reply belongs to the offering agent: «да»/questions
-        # continue the dialog without a mention; a plain «нет» politely closes the offer.
-        offer = None
-        try:
-            from task_offers import is_decline, mark_declined, open_offer_for
-            offer = open_offer_for(task_id, to_int(author_id))
-        except Exception:  # noqa: BLE001
-            logging.warning("b24 task-offer: lookup failed task=%s", task_id, exc_info=True)
-        if not offer:
-            return {"handled": False, "reason": "no_agent_named"}
-        target = next((t for t in targets if (t.get("slug") or None) == (offer.get("agent_slug") or None)), None)
-        if not target:
-            return {"handled": False, "reason": "offer_agent_gone"}
-        offer_followup = True
-        if is_decline(text):
-            if not _b24_task_comment_claim(comment_id, task_id, target["slug"], author_id):
-                return {"handled": False, "reason": "already_seen"}
-            mark_declined(task_id)
-            posted = _b24_post_task_comment(
-                task_id, "Принято, не вмешиваюсь. Если понадоблюсь — позовите меня по имени "
-                         "прямо в комментарии, я вижу контекст задачи.",
-                target["name"], target.get("bot_id"))
-            if posted:
-                _b24_task_comment_mark_handled(comment_id)
-            return {"handled": bool(posted), "reason": "offer_declined", "agent": target["name"]}
+        # Agents speak in tasks ONLY when summoned by name/@ (owner's decision 2026-07-13).
+        # The old open-offer fallback routed EVERY comment of the responsible to the agent
+        # until an explicit «нет»: an employee posting routine progress notes got six agent
+        # replies in three minutes — inside an already-completed task. The offer text itself
+        # now teaches how to summon the agent (see task_offers._summon_tail).
+        return {"handled": False, "reason": "no_agent_named"}
     # Access gate: the author must have access to THIS agent (same rules as the chat).
     # No access -> the SUMMONED BOT itself politely refuses (a silent agent «нарушает логику»).
     allowed = _b24_main_allows(author_id) if target["is_main"] else _b24_task_subagent_allows(target["slug"], author_id)
@@ -3587,11 +3566,7 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
                     "переслать файл в задачу/комментарий — attachment_ids.)")
         except Exception:  # noqa: BLE001
             logging.warning("b24 task-mention: comment files read failed task=%s", task_id, exc_info=True)
-    intro = ("Сотрудник ОТВЕЧАЕТ на твоё предложение помощи в задаче Bitrix (твой комментарий-оффер "
-             "виден в ленте ниже). Продолжай этот диалог: согласие («да») = приступай к тому, что "
-             "предлагал; вопрос = ответь и двигай задачу дальше."
-             if offer_followup else
-             "Тебя позвали ПРЯМО В ЗАДАЧЕ Bitrix (в комментарии). Работай с ЭТОЙ задачей.")
+    intro = "Тебя позвали ПРЯМО В ЗАДАЧЕ Bitrix (в комментарии). Работай с ЭТОЙ задачей."
     user_text = (
         intro + "\n\n"
         + ctx + "\n\n"
