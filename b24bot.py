@@ -1095,6 +1095,7 @@ def _b24_recover_inflight_turns(endpoint: str = "", token: str = "") -> int:
             endpoint, token = _b24_app_access_token()
         except Exception:  # noqa: BLE001
             endpoint, token = "", ""
+    apologized: set = set()
     for r in rows:
         dlg, bot, smid = r["dialog_id"], r["bot_id"], r["status_message_id"]
         if endpoint and token and smid:
@@ -1103,6 +1104,10 @@ def _b24_recover_inflight_turns(endpoint: str = "", token: str = "") -> int:
                               {"BOT_ID": bot, "MESSAGE_ID": smid, "COMPLETE": "Y"})
             except Exception:  # noqa: BLE001
                 logging.debug("b24 testbot: inflight recovery status-delete failed", exc_info=True)
+        key = (str(bot), str(dlg))
+        if key in apologized:
+            continue  # one apology per dialog even if several turns were interrupted
+        apologized.add(key)
         try:
             _albery_bitrix_notify(
                 "🙏 Извините — я перезапустился и не успел ответить на ваше прошлое сообщение. "
@@ -3351,6 +3356,27 @@ def _b24_task_comment_claim(comment_id: int, task_id: int, agent_slug: str | Non
         return False
 
 
+def _b24_message_claim(message_id: Any, bot_id: Any, dialog_id: Any, from_user_id: Any) -> bool:
+    """Atomic first-sight for an inbound chat message. True only on the FIRST delivery (safe to
+    process). Bitrix delivers imbot webhooks at-least-once; without this a re-delivered message is
+    answered twice (seen 2026-07-13: Alexander got a duplicate reply). Fail-open on any error so a
+    real message is never dropped."""
+    mid = to_int(message_id)
+    if mid is None:
+        return True  # no id -> cannot dedup, let it through
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bitrix_bot_message_seen (message_id, bot_id, dialog_id, from_user_id) "
+                    "VALUES (%s,%s,%s,%s) ON CONFLICT (message_id) DO NOTHING RETURNING message_id",
+                    (mid, to_int(bot_id), str(dialog_id or ""), to_int(from_user_id)))
+                return cur.fetchone() is not None
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 testbot: message claim failed mid=%s", message_id, exc_info=True)
+        return True
+
+
 def _b24_fetch_task_comment(task_id: int, comment_id: int) -> dict[str, Any] | None:
     """Read a task comment (author id + text) via the task's IM chat (the modern task card stores
     comments as chat messages — the legacy forum getlist is empty on this portal)."""
@@ -3793,6 +3819,10 @@ def _bitrix_imbot_app_event():
         message_text = str(_imbot_event_param(payload, "MESSAGE") or "").strip()
         message_id = _imbot_event_param(payload, "MESSAGE_ID") or ""
         from_user_id = _imbot_event_param(payload, "FROM_USER_ID") or ""
+        # Dedup a re-delivered event BEFORE any side effect (reaction, reset, model call) so a
+        # Bitrix retry can never double-answer the user. Task comments have the same guard.
+        if message_id and not _b24_message_claim(message_id, bot_id, dialog_id, from_user_id):
+            return jsonify({"ok": True, "event": event_name, "duplicate": True}), 200
         if os.getenv("B24_DEBUG_PAYLOAD", "0") == "1":
             try:
                 _red = {k: ("<redacted>" if re.search(r"TOKEN|AUTH|SECRET|REFRESH", k, re.I) else v)

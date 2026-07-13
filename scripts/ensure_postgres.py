@@ -81,6 +81,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "049_task_agent_offers.sql",
     # Idempotent: daily task check-in (12:00) + per-employee agent dossier.
     "050_task_checkin_dossier.sql",
+    # Idempotent: dedup table for inbound imbot chat messages (at-least-once delivery).
+    "051_bitrix_bot_message_seen.sql",
 ]
 
 
