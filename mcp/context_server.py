@@ -2482,6 +2482,82 @@ def tool_get_attachment_text(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_edit_attachment_document(args: dict[str, Any]) -> dict[str, Any]:
+    """Targeted in-place edits to a user-sent document. Changes ONLY the requested fragments;
+    the rest of the original file (tables, links, formatting) survives untouched. Exists because
+    regenerating a file from the model's retelling silently loses everything it didn't retell."""
+    import attachments as _att
+    token = str(args.get("attachment_id") or args.get("token") or "").strip()
+    if not token:
+        raise McpError(-32602, "Нужно указать attachment_id (токен вложения att_… из промпта).")
+    edits_raw = args.get("edits")
+    if not isinstance(edits_raw, list) or not edits_raw:
+        raise McpError(-32602, "edits обязателен: список правок [{find: 'точный текст', replace: 'новый'}].")
+    if len(edits_raw) > 50:
+        raise McpError(-32602, "Слишком много правок за один вызов — максимум 50.")
+    edits: list[tuple[str, str]] = []
+    for item in edits_raw:
+        find = str((item or {}).get("find") or "") if isinstance(item, dict) else ""
+        if not find:
+            raise McpError(-32602, "Каждая правка — объект {find, replace}; find пустым быть не может.")
+        replace = item.get("replace")
+        edits.append((find, "" if replace is None else str(replace)))
+    row = _att.get_attachment(token)
+    if not row:
+        raise McpError(-32602, f"Вложение {token} не найдено. Проверь attachment_id.")
+    blob = _att.attachment_bytes(token)
+    if not blob:
+        raise McpError(-32010, "Байты этого вложения не сохранились — попроси пользователя прислать файл ещё раз.")
+    data, file_name = blob
+    import docedit
+    try:
+        new_data, counts, warnings = docedit.apply_edits(
+            data, file_name, edits, sheet=str(args.get("sheet") or "").strip() or None)
+    except docedit.UnsupportedFormat as exc:
+        raise McpError(-32602, str(exc)) from exc
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Не удалось применить правки к «{file_name}»: {exc}") from exc
+    applied = [{"find": find[:120], "count": count} for (find, _), count in zip(edits, counts)]
+    if not any(counts):
+        raise McpError(-32602,
+                       "Ни одна правка не совпала с текстом документа. find должен БУКВАЛЬНО совпадать "
+                       "с текстом файла — возьми точную строку из get_attachment_text и повтори.")
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    if ext in ("xlsx", "xlsm"):
+        import webread
+        new_text = webread.extract_xlsx(new_data)
+    elif ext == "docx":
+        new_text = _extract_binary_document(new_data, "docx")
+    else:
+        new_text = new_data.decode("utf-8", "ignore")
+    new_token = _att.store_attachment(
+        data=new_data, file_name=file_name, kind="document", extracted_text=new_text,
+        agent_slug=row.get("agent_slug"), dialog_id=str(row.get("dialog_id") or ""),
+        bitrix_user_id=row.get("bitrix_user_id"), mime=row.get("mime"),
+    )
+    from b24bot import _b24_save_export
+    url = _b24_save_export(new_data, file_name, ext or "bin")
+    missed = [entry["find"] for entry in applied if not entry["count"]]
+    result = {
+        "ok": True,
+        "attachment_id": new_token,
+        "file_name": file_name,
+        "download_url": url,
+        "url_note": "Ссылка временная (~30 минут) — отправь её пользователю в этом же ответе.",
+        "replacements": applied,
+        "note": ("Файл изменён точечно, всё остальное сохранено из оригинала (исходное вложение не тронуто). "
+                 "Приложить обновлённый файл к задаче — attach_files_to_task с новым attachment_id."),
+    }
+    if missed:
+        result["missed_edits"] = missed
+        result["note"] += " Часть правок не совпала (missed_edits) — сверь их с get_attachment_text."
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
 def tool_reopen_bitrix_task(args: dict[str, Any]) -> dict[str, Any]:
     task_id = _positive_bitrix_task_id(args.get("bitrix_task_id"))
     reason = str(args.get("reason") or args.get("comment_text") or "").strip()
@@ -8523,6 +8599,41 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_get_attachment_text,
     },
+    "edit_attachment_document": {
+        "description": (
+            "Внести ТОЧЕЧНЫЕ правки в присланный пользователем файл (xlsx/docx/txt/csv/md) по его attachment_id: "
+            "заменяет только указанные фрагменты текста, всё остальное — структура, таблицы, ссылки, оформление — "
+            "сохраняется из оригинала. Используй, когда просят изменить/исправить/дополнить присланный документ; "
+            "пересобирать файл с нуля в этом случае нельзя. find должен буквально совпадать с текстом файла "
+            "(возьми из get_attachment_text). Возвращает ссылку на обновлённый файл (отправь пользователю) и "
+            "новый attachment_id (для attach_files_to_task)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "string", "description": "Токен att_… исходного вложения."},
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "find": {"type": "string", "description": "Точный текст, как он написан в документе."},
+                            "replace": {"type": "string", "description": "Новый текст (пустая строка = удалить)."},
+                        },
+                        "required": ["find"],
+                        "additionalProperties": False,
+                    },
+                    "description": "Список замен; каждая применяется ко ВСЕМ вхождениям find.",
+                },
+                "sheet": {"type": "string", "description": "Только для Excel: ограничить правку одним листом (точное имя листа)."},
+            },
+            "required": ["attachment_id", "edits"],
+            "additionalProperties": False,
+        },
+        "handler": tool_edit_attachment_document,
+    },
     "reopen_bitrix_task": {
         "description": (
             "Reopen/renew one completed Bitrix task and write a comment explaining why. Use after checking "
@@ -10365,6 +10476,7 @@ CORE_TOOL_NAMES: set[str] = {
     "delete_bitrix_task",
     "attach_files_to_task",
     "get_attachment_text",
+    "edit_attachment_document",
     # zoom
     "list_zoom_calls",
     "get_zoom_call_transcript",
