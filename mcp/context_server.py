@@ -6458,16 +6458,10 @@ def _extract_binary_document(data: bytes, ext: str) -> str:
                     parts.append(" | ".join(cell.text for cell in row.cells))
             return "\n".join(parts).strip()
         if ext in ("xlsx", "xlsm"):
-            from openpyxl import load_workbook
-            wb = load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
-            out = []
-            for ws in wb.worksheets:
-                out.append("# Лист: " + str(ws.title))
-                for row in ws.iter_rows(values_only=True):
-                    cells = ["" if v is None else str(v) for v in row]
-                    if any(c.strip() for c in cells):
-                        out.append(" | ".join(cells))
-            return "\n".join(out).strip()
+            # WB/1C-style exports omit row indexes, so openpyxl's read_only pass sees only
+            # the first row of every sheet; webread falls back to a streaming XML parse.
+            import webread
+            return webread.extract_xlsx(data)
     except Exception as exc:  # noqa: BLE001
         logging.warning("fetch_url: binary extract failed (%s): %s", ext, repr(exc)[:160])
     return ""
@@ -6534,6 +6528,19 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
             raise McpError(-32602, "max_chars must be between 100 and 200000.")
     strip_html_flag = bool(args.get("strip_html", True))
 
+    via_note = ""
+    # Wildberries card pages sit behind an ASN-level antibot (HTTP 498 from both egress
+    # routes, reader proxy included), while WB's static basket CDN serves the same card as
+    # JSON with no antibot — answer card links from the CDN.
+    try:
+        import webread
+        wb_result = webread.wb_card_result(url, max_chars)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("fetch_url: wb card handler failed: %s", repr(exc)[:160])
+        wb_result = None
+    if wb_result is not None:
+        return wb_result
+
     fetched_url, kind = _rewrite_url_for_export(url)
     google_result = _fetch_google_url_with_oauth(url, max_chars)
     if google_result is not None:
@@ -6557,28 +6564,41 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
                 body_preview = exc.read().decode("utf-8", "replace")[:500]
             except Exception:  # noqa: BLE001
                 body_preview = ""
-            # A hard 4xx/5xx on a public page is often anti-bot — the reader proxy still works.
-            if _reader_allowed_for(url):
-                reader = _fetch_via_reader(url, max_chars)
-                if reader:
-                    text = reader["text"][:max_chars]
-                    return {
-                        "ok": True, "original_url": url, "fetched_url": fetched_url,
-                        "final_url": url, "kind": "reader", "status": 200,
-                        "content_type": reader["content_type"], "char_count": len(text),
-                        "truncated": len(reader["text"]) > max_chars, "text": text,
-                        "note": f"Прямой запрос вернул HTTP {exc.code}; содержимое получено через reader-прокси.",
-                    }
-            return {
-                "ok": False,
-                "original_url": url,
-                "fetched_url": fetched_url,
-                "kind": kind,
-                "status": exc.code,
-                "error": f"HTTP {exc.code}",
-                "body_preview": body_preview,
-                "hint": "",
-            }
+            # Blocked on the VPN egress? Russian sites often reject the Estonian IP — retry
+            # once from the direct RU interface before handing the URL to the reader proxy.
+            direct = None
+            if exc.code in (401, 403, 406, 409, 412, 429, 451, 498):
+                import webread
+                direct = webread.direct_fetch(fetched_url, dict(_FETCH_BROWSER_HEADERS),
+                                              doc_limit=_FETCH_DOC_MAX_BYTES,
+                                              text_limit=max_chars * 6 + 4096)
+            if direct is not None and (direct[2] or b"").strip():
+                status, content_type, raw_bytes, final_url = direct
+                via_note = (f"VPN-выход получил HTTP {exc.code}; страница получена напрямую "
+                            "с российского IP сервера.")
+            else:
+                # A hard 4xx/5xx on a public page is often anti-bot — the reader proxy still works.
+                if _reader_allowed_for(url):
+                    reader = _fetch_via_reader(url, max_chars)
+                    if reader:
+                        text = reader["text"][:max_chars]
+                        return {
+                            "ok": True, "original_url": url, "fetched_url": fetched_url,
+                            "final_url": url, "kind": "reader", "status": 200,
+                            "content_type": reader["content_type"], "char_count": len(text),
+                            "truncated": len(reader["text"]) > max_chars, "text": text,
+                            "note": f"Прямой запрос вернул HTTP {exc.code}; содержимое получено через reader-прокси.",
+                        }
+                return {
+                    "ok": False,
+                    "original_url": url,
+                    "fetched_url": fetched_url,
+                    "kind": kind,
+                    "status": exc.code,
+                    "error": f"HTTP {exc.code}",
+                    "body_preview": body_preview,
+                    "hint": "",
+                }
         except Exception as exc:  # noqa: BLE001
             raise McpError(-32010, f"Fetch failed: {exc}") from exc
 
@@ -6613,7 +6633,26 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
     if strip_html_flag and looks_html and kind == "raw":
         text = _strip_html_to_text(text)
 
-    # Auth-wall / empty JS shell on a PUBLIC page -> render it through the reader proxy.
+    # Auth-wall / geo-stub / empty JS shell on a PUBLIC page: first retry from the direct
+    # Russian interface (covers geo-blocks), then render through the reader proxy (JS shells).
+    if kind == "raw" and _looks_like_auth_wall(final_url, text) and not via_note:
+        import webread
+        direct = webread.direct_fetch(fetched_url, dict(_FETCH_BROWSER_HEADERS),
+                                      doc_limit=_FETCH_DOC_MAX_BYTES,
+                                      text_limit=max_chars * 6 + 4096)
+        if direct is not None and (direct[2] or b"").strip():
+            d_status, d_ct, d_raw, d_final = direct
+            charset_match = re.search(r"charset=([a-zA-Z0-9_\-]+)", d_ct)
+            try:
+                d_text = d_raw.decode(charset_match.group(1) if charset_match else "utf-8", errors="replace")
+            except LookupError:
+                d_text = d_raw.decode("utf-8", errors="replace")
+            if strip_html_flag and (("html" in d_ct.lower())
+                                    or d_text.lstrip().lower().startswith(("<!doctype", "<html"))):
+                d_text = _strip_html_to_text(d_text)
+            if not _looks_like_auth_wall(d_final, d_text):
+                text, status, content_type, final_url = d_text, d_status, d_ct, d_final
+                via_note = "VPN-выход отдал заглушку; страница получена напрямую с российского IP сервера."
     if kind == "raw" and _looks_like_auth_wall(final_url, text) and _reader_allowed_for(url):
         reader = _fetch_via_reader(url, max_chars)
         if reader:
@@ -6627,7 +6666,7 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
     if truncated:
         text = text[:max_chars]
 
-    return {
+    result = {
         "ok": True,
         "original_url": url,
         "fetched_url": fetched_url,
@@ -6639,6 +6678,9 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
         "truncated": truncated,
         "text": text,
     }
+    if via_note:
+        result["note"] = via_note
+    return result
 
 
 def _b24_bot_user_names(user_ids: Any) -> dict[Any, str]:

@@ -1525,16 +1525,10 @@ def _b24_extract_document(data: bytes, name: str) -> str:
                     parts.append(" | ".join(cell.text for cell in row.cells))
             return "\n".join(parts).strip()
         if ext in ("xlsx", "xlsm"):
-            from openpyxl import load_workbook
-            wb = load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
-            out = []
-            for ws in wb.worksheets:
-                out.append("# Лист: " + str(ws.title))
-                for row in ws.iter_rows(values_only=True):
-                    cells = ["" if v is None else str(v) for v in row]
-                    if any(c.strip() for c in cells):
-                        out.append(" | ".join(cells))
-            return "\n".join(out).strip()
+            # WB/1C-style exports omit row indexes, so openpyxl's read_only pass sees only
+            # the first row of every sheet; webread falls back to a streaming XML parse.
+            import webread
+            return webread.extract_xlsx(data)
         if ext == "doc":
             return ""  # legacy binary .doc — unsupported without libreoffice/antiword
         return data.decode("utf-8", "ignore")
