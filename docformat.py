@@ -118,10 +118,10 @@ class _DocBuilder(HTMLParser):
         return p
 
     def _run_size(self) -> float:
-        if self.block_tag in self._HEAD_SIZES:
-            base = float(self._HEAD_SIZES[self.block_tag])
-        else:
-            base = self.base_size
+        # Headings keep the BASE size (bold is what distinguishes them) — official RU documents
+        # are one type size throughout («в договоре всё должно быть 12 шрифтом», owner 2026-07-14).
+        # An explicit font-size style still overrides below.
+        base = self.base_size
         override = self.block_style.get("font-size") or ""
         if override.endswith("pt"):
             try:
