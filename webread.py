@@ -261,6 +261,49 @@ def _wb_probe_order(vol: int) -> list[int]:
 _WB_MISS_TTL_S = 600.0
 _wb_card_miss: dict[int, float] = {}    # nm -> monotonic expiry (card not on CDN)
 _wb_price_miss: dict[int, float] = {}   # nm -> monotonic expiry (no live price in search)
+_WB_HIT_TTL_S = float(os.getenv("WB_PRICE_HIT_TTL_S", "2700") or "2700")  # 45 min
+_wb_price_hit: dict[int, dict] = {}     # nm -> {min,max,sizes_priced,rating,feedbacks,exp}
+_wb_route_toggle = [0]
+_wb_absent: set = set()   # nm confirmed NOT returned by search on any query (out of stock / hidden)
+
+
+def _wb_price_from_product(p: dict) -> dict:
+    prices = []
+    for s in (p.get("sizes") or []):
+        pr = ((s.get("price") or {}).get("product") or (s.get("price") or {}).get("total") or 0)
+        if pr:
+            prices.append(round(pr / 100))
+    return {
+        "min": min(prices) if prices else None,
+        "max": max(prices) if prices else None,
+        "sizes_priced": len(prices),
+        "rating": p.get("reviewRating") or p.get("nmReviewRating") or p.get("rating"),
+        "feedbacks": p.get("feedbacks") or p.get("nmFeedbacks"),
+    }
+
+
+def _wb_cache_products(products: list) -> None:
+    """Cache the price of EVERY product a search returned (a search = a catalog page). Sofya's
+    list is dominated by siblings that co-appear, so one search prices many requested articles."""
+    now = time.monotonic()
+    for p in products or []:
+        try:
+            nm = int(p.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not nm:
+            continue
+        info = _wb_price_from_product(p)
+        if info["min"] or info["rating"]:
+            info["exp"] = now + _WB_HIT_TTL_S
+            _wb_price_hit[nm] = info
+
+
+def _wb_cached_price(nm: int):
+    info = _wb_price_hit.get(int(nm))
+    if info and info.get("exp", 0) > time.monotonic() and info.get("min"):
+        return {k: info[k] for k in ("min", "max", "sizes_priced", "rating", "feedbacks")}
+    return None
 
 
 def _wb_fetch_card(nm: int, deadline: float | None = None):
@@ -313,41 +356,39 @@ def _wb_search_direct_json(url: str, timeout: int):
 
 
 def _wb_search_paced(url: str, timeout: int = 10, deadline: float | None = None):
-    """search.wb.ru rate-limits bursts per IP (429). Pace calls; go DIRECT-RU first, VPN as
-    fallback; sustained 429 arms a global cooldown so bulk lookups fail fast and honestly.
-    ``deadline`` (time.monotonic) bounds the WHOLE dance for one element."""
-    if wb_search_throttled():
-        raise TimeoutError("wb search: throttled (cooldown)")
-    for attempt in range(2):
+    """search.wb.ru rate-limits per IP (429). We ALTERNATE both egress IPs (direct-RU + VPN =
+    two independent 429 buckets) and back off briefly on 429 — WITHOUT any global cooldown, so a
+    hot moment never nukes the rest of the batch. ``deadline`` bounds the dance for one element."""
+    for attempt in range(4):
         wait = _wb_last_search_ts[0] + _WB_SEARCH_MIN_INTERVAL_S - time.time()
         if deadline is not None and time.monotonic() + max(wait, 0) > deadline:
             raise TimeoutError("wb search: element deadline")
         if wait > 0:
             time.sleep(wait)
         _wb_last_search_ts[0] = time.time()
+        t = timeout
         if deadline is not None:
-            timeout = max(2, min(timeout, int(deadline - time.monotonic())))
-        j = _wb_search_direct_json(url, timeout)
-        if j is not None:
-            return j
-        try:
-            return _wb_get_json(url, timeout)
-        except urllib.error.HTTPError as exc:
-            if exc.code != 429:
-                raise
-            if attempt == 0:
-                backoff = 5.0
-                if deadline is not None and time.monotonic() + backoff > deadline:
-                    _wb_search_throttled_until[0] = time.monotonic() + float(
-                        os.getenv("WB_SEARCH_COOLDOWN_S", "120") or "120")
-                    raise TimeoutError("wb search: element deadline (429)") from exc
-                time.sleep(backoff)
-                continue
-            # both routes throttled twice — arm the global cooldown
-            _wb_search_throttled_until[0] = time.monotonic() + float(
-                os.getenv("WB_SEARCH_COOLDOWN_S", "120") or "120")
-            raise TimeoutError("wb search: throttled") from exc
-    raise RuntimeError("unreachable")
+            t = max(2, min(timeout, int(deadline - time.monotonic())))
+        order = ("direct", "vpn") if _wb_route_toggle[0] % 2 == 0 else ("vpn", "direct")
+        _wb_route_toggle[0] += 1
+        for route in order:
+            try:
+                if route == "direct":
+                    j = _wb_search_direct_json(url, t)
+                    if j is not None:
+                        return j
+                else:
+                    return _wb_get_json(url, t)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 429:
+                    raise
+            except Exception:  # noqa: BLE001
+                pass
+        backoff = min(2.5 * (attempt + 1), 8.0)
+        if deadline is not None and time.monotonic() + backoff > deadline:
+            raise TimeoutError("wb search: element deadline (429)")
+        time.sleep(backoff)
+    raise TimeoutError("wb search: exhausted")
 
 
 def _wb_current_prices(nm: int, card: dict, deadline: float | None = None):
@@ -364,6 +405,9 @@ def _wb_current_prices(nm: int, card: dict, deadline: float | None = None):
     # A card with no stock in the default region (Москва) is HIDDEN from its search results
     # while other regions still return it — try a second dest before giving up.
     dests = [d.strip() for d in os.getenv("WB_SEARCH_DESTS", "-1257786,-2162196").split(",") if d.strip()]
+    cached = _wb_cached_price(nm)
+    if cached:
+        return cached
     exp = _wb_price_miss.get(nm)
     if exp and exp > time.monotonic():
         return None  # known miss — don't repeat the whole failing dance
@@ -386,6 +430,7 @@ def _wb_current_prices(nm: int, card: dict, deadline: float | None = None):
         except Exception:  # noqa: BLE001
             continue
         products = j.get("products") or (j.get("data") or {}).get("products") or []
+        _wb_cache_products(products)  # price siblings for free — persists across calls/turns
         hit = next((p for p in products if int(p.get("id") or 0) == int(nm)), None)
         if not hit:
             continue
@@ -403,14 +448,16 @@ def _wb_current_prices(nm: int, card: dict, deadline: float | None = None):
             "feedbacks": hit.get("feedbacks") or hit.get("nmFeedbacks"),
         }
         if out["min"] or out["rating"]:
+            _wb_absent.discard(int(nm))
             return out
     if deadline_hit:
         # ran out of the element budget — remember it briefly so an immediate retry (same task,
         # same list) answers instantly instead of chewing the same slow article again
         _wb_price_miss[nm] = time.monotonic() + float(os.getenv("WB_SLOW_MISS_TTL_S", "180") or "180")
     else:
-        # every combo genuinely answered «нет такой карточки» — cache the miss for longer
+        # every combo genuinely answered «нет такой карточки в выдаче» — confirmed absent
         _wb_price_miss[nm] = time.monotonic() + _WB_MISS_TTL_S
+        _wb_absent.add(int(nm))
     return None
 
 
@@ -420,8 +467,8 @@ def wb_bulk_prices(articles: list[int], call_budget_s: float | None = None,
     One unreachable article can no longer eat the turn: each item gets its own deadline, known
     misses answer from cache, and when the call budget runs out the REST is returned in
     ``skipped`` so the caller just calls again with them. Never raises."""
-    call_budget_s = call_budget_s or float(os.getenv("WB_BULK_CALL_BUDGET_S", "45") or "45")
-    per_item_budget_s = per_item_budget_s or float(os.getenv("WB_BULK_ITEM_BUDGET_S", "12") or "12")
+    call_budget_s = call_budget_s or float(os.getenv("WB_BULK_CALL_BUDGET_S", "150") or "150")
+    per_item_budget_s = per_item_budget_s or float(os.getenv("WB_BULK_ITEM_BUDGET_S", "22") or "22")
     t0 = time.monotonic()
     rows, skipped = [], []
     for nm in articles:
@@ -429,6 +476,11 @@ def wb_bulk_prices(articles: list[int], call_budget_s: float | None = None,
             nm = int(nm)
         except (TypeError, ValueError):
             rows.append({"article": nm, "status": "bad_article"})
+            continue
+        cached = _wb_cached_price(nm)  # free hit: this run already fetched it or a sibling search did
+        if cached and cached.get("min"):
+            rows.append({"article": nm, "status": "ok", "price_min": cached["min"],
+                         "price_max": cached["max"], "sizes_priced": cached.get("sizes_priced")})
             continue
         if time.monotonic() - t0 > call_budget_s:
             skipped.append(nm)
@@ -445,8 +497,8 @@ def wb_bulk_prices(articles: list[int], call_budget_s: float | None = None,
                 if live and live.get("min"):
                     row.update(status="ok", price_min=live["min"], price_max=live["max"],
                                sizes_priced=live.get("sizes_priced"))
-                elif wb_search_throttled():
-                    row["status"] = "wb_throttled"
+                elif int(nm) in _wb_absent:
+                    row["status"] = "card_hidden"  # WB doesn't return it in search — genuinely no price
         except Exception as exc:  # noqa: BLE001
             log.warning("wb_bulk_prices: nm=%s failed: %s", nm, repr(exc)[:120])
             row["status"] = "error"
@@ -455,11 +507,12 @@ def wb_bulk_prices(articles: list[int], call_budget_s: float | None = None,
         "rows": rows,
         "skipped_by_budget": skipped,
         "ok": sum(1 for r in rows if r.get("status") == "ok"),
-        "note": ("status=ok — цена сейчас на витрине (без скидки WB-кошелька); card_hidden/no_price — "
-                 "WB не отдаёт карточку или скрыл её из выдачи, честно скажи об этом и НЕ повторяй их; "
-                 "wb_throttled — WB временно ограничил частоту запросов с сервера: внеси то, что есть, "
-                 "и скажи пользователю повторить по этим позициям через 3-5 минут; "
-                 "skipped_by_budget — не успели в бюджет вызова: вызови инструмент ещё раз ТОЛЬКО с ними."),
+        "note": ("status=ok — цена сейчас на витрине (без скидки WB-кошелька); внеси сразу. "
+                 "card_hidden — WB скрыл карточку из выдачи (нет в наличии), это единственный случай, "
+                 "когда цены реально нет — так и скажи по этим артикулам. no_price/error/"
+                 "skipped_by_budget — НЕ финал: WB просто ограничил частоту, вызови get_wb_prices ещё "
+                 "раз с ЭТИМИ же артикулами (успешные уже в кэше, ответит быстро) — так добери все. "
+                 "Повторяй, пока не останутся только card_hidden. Частичный результат вноси сразу."),
     }
 
 
