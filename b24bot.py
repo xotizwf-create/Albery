@@ -2196,6 +2196,64 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
 _B24_DOC_INLINE_CHARS = int(os.getenv("B24_DOC_INLINE_CHARS", "30000") or "30000")
 
 
+_ZOOM_LINK_RE = re.compile(r"/zoom-export/[^/\s]+/[^/\s]+/([^/\s\]\)]+\.(?:docx|pdf|xlsx))", re.I)
+
+
+def _b24_capture_generated_doc(dialog_id: str, agent_slug: str | None, from_user_id: Any,
+                               answer: str) -> None:
+    """After a turn, store the FULL text of any document the agent just generated (its export link
+    is in the answer), so the next turn can edit THAT document instead of rebuilding it from a
+    clipped chat and losing filled-in fields (contract number, dates, requisites). Best-effort."""
+    try:
+        import urllib.parse
+        seen = set()
+        for m in _ZOOM_LINK_RE.finditer(answer or ""):
+            fname = urllib.parse.unquote(m.group(1))
+            if fname in seen:
+                continue
+            seen.add(fname)
+            path = ZOOM_EXPORT_DIR / fname
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+            ext = fname.rsplit(".", 1)[-1].lower()
+            if ext == "xlsx":
+                import webread
+                text = webread.extract_xlsx(data)
+            else:
+                text = _b24_extract_document(data, fname)
+            if not (text or "").strip():
+                continue
+            import attachments as _att
+            _att.store_attachment(
+                data=b"", file_name=fname, kind="agent_doc", extracted_text=text[:60000],
+                agent_slug=agent_slug, dialog_id=str(dialog_id or ""), bitrix_user_id=from_user_id)
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 testbot: generated-doc capture failed dlg=%s", dialog_id, exc_info=True)
+
+
+def _b24_recent_generated_doc(dialog_id: str, agent_slug: str | None, hours: int | None = None):
+    """The freshest document THIS agent generated in this dialog (full text), for re-injection."""
+    if hours is None:
+        hours = int(os.getenv("B24_GENERATED_DOC_HOURS", "12") or "12")
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT file_name, extracted_text, char_len, "
+                    "       to_char(created_at at time zone 'Europe/Moscow', 'DD.MM HH24:MI') AS at_msk "
+                    "FROM bitrix_bot_attachments "
+                    "WHERE dialog_id = %s AND agent_slug IS NOT DISTINCT FROM %s::text "
+                    "  AND kind = 'agent_doc' AND created_at >= now() - make_interval(hours => %s) "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (str(dialog_id or ""), agent_slug, hours))
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 testbot: generated-doc recall failed dlg=%s", dialog_id, exc_info=True)
+        return None
+
+
 def _b24_recent_dialog_attachments(dialog_id: str, agent_slug: str | None,
                                    hours: int | None = None, limit: int = 5) -> list[dict]:
     """Fresh attachments the user sent EARLIER in this dialog. Injected into a text-only turn so
@@ -2222,7 +2280,8 @@ def _b24_recent_dialog_attachments(dialog_id: str, agent_slug: str | None,
 
 
 def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_blocks: list = None,
-                           attachments: list = None, recent_attachments: list = None) -> str:
+                           attachments: list = None, recent_attachments: list = None,
+                           recent_doc: dict = None) -> str:
     """Fold reply-context, image OCR and extracted document text into the message for the brain."""
     text = (text or "").strip()
     blocks: list = []
@@ -2275,6 +2334,17 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_bl
             "точечная правка — edit_attachment_document. НЕ отвечай «вложение не отобразилось» и НЕ проси "
             "прислать файл заново.]"
         )
+    if recent_doc and (recent_doc.get("extracted_text") or "").strip() and not (doc_blocks or image_texts):
+        blocks.append(
+            "[ТВОЙ ПОСЛЕДНИЙ СОЗДАННЫЙ В ЭТОМ ДИАЛОГЕ ДОКУМЕНТ «" + str(recent_doc.get("file_name") or "")
+            + "» (создан " + str(recent_doc.get("at_msk") or "") + "). Ты сам собрал его через "
+            "export_document. Если пользователь просит ИСПРАВИТЬ, ДОПОЛНИТЬ или ПЕРЕДЕЛАТЬ этот "
+            "документ — СОБЕРИ export_document ЗАНОВО, взяв за основу ПОЛНЫЙ ТЕКСТ НИЖЕ и поменяв "
+            "ТОЛЬКО то, что он просит. Это твой собственный документ: НЕ ищи вложение, НЕ проси "
+            "прислать файл и НЕ применяй edit_attachment_document — исходник это текст ниже, его "
+            "достаточно. НЕ теряй уже заполненные поля (номер договора, дату, сроки, реквизиты "
+            "сторон, суммы, перечень услуг, все пункты) — переноси их дословно, кроме тех, что "
+            "правишь. Полный текст документа:\n" + str(recent_doc.get("extracted_text") or "")[:40000] + "]")
     if not text and (image_texts or doc_blocks):
         blocks.append("(Текста в сообщении не было — отвечай по содержимому вложения.)")
     return "\n\n".join(blocks) if blocks else text
@@ -2800,7 +2870,9 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         # clip each history item; the rolling session summary carries the older context anyway.
         def _clip(text: str, cap: int) -> str:
             return text if len(text) <= cap else text[:cap] + " …[обрезано]"
-        convo = "\n".join(f"Пользователь: {_clip(q, 500)}\nАссистент: {_clip(a, 1500)}" for q, a in history)
+        # Users paste requisites / services / sums into one message; clipping the question to
+        # 500 chars dropped everything past it on the next «исправь» turn (owner 2026-07-15).
+        convo = "\n".join(f"Пользователь: {_clip(q, 6000)}\nАссистент: {_clip(a, 3000)}" for q, a in history)
         parts.append("История этого диалога (предыдущие реплики, помни их):\n" + convo)
     parts.append("Текущее сообщение пользователя:\n" + user_text)
     prompt = "\n\n".join(parts)
@@ -2867,6 +2939,7 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                       dialog_id, tier, answer[:200])
         _b24_ops_alert("ошибка LLM в ходе", dialog_id, tier, from_user_id, answer[:300])
         return _b24_brain_error_message(answer)
+    _b24_capture_generated_doc(dialog_id, agent_slug, from_user_id, answer)
     return answer
 
 
@@ -4008,13 +4081,15 @@ def _bitrix_imbot_app_event():
         def _process_message_async() -> None:
             _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
             _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
-            recent_atts = []
+            recent_atts, recent_doc = [], None
             if not (msg_attachments or doc_blocks or image_texts):
                 recent_atts = _b24_recent_dialog_attachments(dialog_id, (agent or {}).get("slug"))
+                recent_doc = _b24_recent_generated_doc(dialog_id, (agent or {}).get("slug"))
             _b24_app_process(
                 endpoint, access_token, bot_id, dialog_id,
                 _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks,
-                                       msg_attachments, recent_attachments=recent_atts),
+                                       msg_attachments, recent_attachments=recent_atts,
+                                       recent_doc=recent_doc),
                 message_id, from_user_id, agent=agent,
             )
 
