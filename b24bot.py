@@ -2123,8 +2123,33 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
 _B24_DOC_INLINE_CHARS = int(os.getenv("B24_DOC_INLINE_CHARS", "30000") or "30000")
 
 
+def _b24_recent_dialog_attachments(dialog_id: str, agent_slug: str | None,
+                                   hours: int | None = None, limit: int = 5) -> list[dict]:
+    """Fresh attachments the user sent EARLIER in this dialog. Injected into a text-only turn so
+    «во вложении…» after a separate file message resolves to the real stored file instead of a
+    «пришлите ещё раз» (2026-07-14: файл в 11:14, вопрос в 11:15, бот заявил, что вложения нет).
+    Scoped by agent_slug — the Bitrix dialog_id is shared across bots."""
+    if hours is None:
+        hours = int(os.getenv("B24_RECENT_ATTACH_HOURS", "8") or "8")
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT token, file_name, kind, char_len, "
+                    "       to_char(created_at at time zone 'Europe/Moscow', 'HH24:MI') AS at_msk "
+                    "FROM bitrix_bot_attachments "
+                    "WHERE dialog_id = %s AND agent_slug IS NOT DISTINCT FROM %s::text "
+                    "  AND created_at >= now() - make_interval(hours => %s) "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (str(dialog_id or ""), agent_slug, hours, limit))
+                return [dict(r) for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 testbot: recent attachments lookup failed dlg=%s", dialog_id, exc_info=True)
+        return []
+
+
 def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_blocks: list = None,
-                           attachments: list = None) -> str:
+                           attachments: list = None, recent_attachments: list = None) -> str:
     """Fold reply-context, image OCR and extracted document text into the message for the brain."""
     text = (text or "").strip()
     blocks: list = []
@@ -2164,6 +2189,18 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_bl
             "(передай attachment_id в create_bitrix_task, add_bitrix_task_comment или "
             "attach_files_to_task; полный текст документа — get_attachment_text; внести правку в "
             "документ, сохранив всё остальное, — edit_attachment_document): " + listing + "]"
+        )
+    if recent_attachments and not (doc_blocks or image_texts):
+        listing = "; ".join(
+            f"{a['token']} — «{a['file_name']}» ({'скрин' if a.get('kind') == 'image' else 'документ'}, "
+            f"{a.get('char_len') or 0} симв., прислан в {a.get('at_msk')} МСК)"
+            for a in recent_attachments)
+        blocks.append(
+            "[К ЭТОМУ сообщению файлов не приложено, но РАНЕЕ в этом диалоге пользователь присылал "
+            "файлы (свежие, уже распознаны): " + listing + ". Если он пишет «во вложении…», «в файле…», "
+            "«этот документ/договор» — речь именно о них: читай get_attachment_text(attachment_id='att_…'), "
+            "точечная правка — edit_attachment_document. НЕ отвечай «вложение не отобразилось» и НЕ проси "
+            "прислать файл заново.]"
         )
     if not text and (image_texts or doc_blocks):
         blocks.append("(Текста в сообщении не было — отвечай по содержимому вложения.)")
@@ -3881,9 +3918,13 @@ def _bitrix_imbot_app_event():
         def _process_message_async() -> None:
             _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
             _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
+            recent_atts = []
+            if not (msg_attachments or doc_blocks or image_texts):
+                recent_atts = _b24_recent_dialog_attachments(dialog_id, (agent or {}).get("slug"))
             _b24_app_process(
                 endpoint, access_token, bot_id, dialog_id,
-                _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks, msg_attachments),
+                _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks,
+                                       msg_attachments, recent_attachments=recent_atts),
                 message_id, from_user_id, agent=agent,
             )
 
