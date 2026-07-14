@@ -169,13 +169,102 @@ _AGENT_CAPABILITIES = (
 )
 
 
+def _task_context(task_id: Any) -> dict[str, Any]:
+    """What the task ALREADY contains: checklist, comments and attachments. Read from the indexed
+    task JSON (comments arrive there via OnTaskCommentAdd) — free, no OCR. Without this the offer
+    asks for material that is already attached, which destroys trust in the agent."""
+    ctx: dict[str, Any] = {"checklist": [], "comments": [], "attach_count": 0, "task_files": 0}
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        return ctx
+    import b24bot
+    from app import pg_connect
+    names = {}
+    try:
+        names = b24bot._b24_portal_user_directory()
+    except Exception:  # noqa: BLE001
+        pass
+    bot_ids = set()
+    try:
+        bot_ids = {b24bot.to_int(x) for x in (b24bot._b24_task_bot_author_ids() or set())}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT raw_json->'comments'->'items' AS items, raw_json->'files' AS files"
+                    " FROM bitrix_tasks WHERE bitrix_task_id = %s", (tid,))
+                row = cur.fetchone()
+    except Exception:  # noqa: BLE001
+        logging.warning("task offers: context read failed task=%s", tid, exc_info=True)
+        return ctx
+    if not row:
+        return ctx
+    files = row.get("files") or []
+    ctx["task_files"] = len(files) if isinstance(files, list) else 0
+    for item in (row.get("items") or []):
+        if not isinstance(item, dict):
+            continue
+        author = b24bot.to_int(item.get("author_id"))
+        if author in bot_ids:
+            continue  # our own offer / replies are not "what the employee already provided"
+        params = item.get("params") or {}
+        has_file = bool(params.get("FILE_ID") or params.get("FILE_ID[]"))
+        text = re.sub(r"\[[^\]]{1,40}\]", " ", str(item.get("text") or "")).strip()
+        if has_file:
+            ctx["attach_count"] += 1
+        if not text and not has_file:
+            continue
+        ctx["comments"].append({
+            "author": names.get(author, {}).get("name") or f"id {author}",
+            "text": text[:300],
+            "has_file": has_file,
+        })
+    try:
+        from mcp.context_server import _webhook_raw
+        r = _webhook_raw("task.checklistitem.getlist", {"taskId": tid})
+        for it in (r.get("result") or []):
+            t = str((it.get("TITLE") if isinstance(it, dict) else "") or "").strip()
+            if t:
+                ctx["checklist"].append(t)
+    except Exception:  # noqa: BLE001
+        logging.debug("task offers: checklist read failed task=%s", tid, exc_info=True)
+    return ctx
+
+
+def _context_block(task: dict[str, Any]) -> str:
+    """Render «что УЖЕ есть в задаче» for the offer prompt."""
+    lines = []
+    desc = str(task.get("description") or "").strip()
+    if desc:
+        lines.append("ОПИСАНИЕ ЗАДАЧИ (читай целиком, там уже могут быть все данные):\n" + desc[:4000])
+    cl = task.get("checklist") or []
+    if cl:
+        lines.append("ЧЕК-ЛИСТ:\n" + "\n".join(
+            f"{i}. {str(c.get('title') if isinstance(c, dict) else c)}" for i, c in enumerate(cl[:20], 1)))
+    comments = task.get("comments") or []
+    attach = int(task.get("attach_count") or 0)
+    if comments or attach:
+        head = f"КОММЕНТАРИИ В ЗАДАЧЕ: {len(comments)}"
+        if attach:
+            head += f", из них С ВЛОЖЕНИЯМИ (скрины/файлы): {attach}"
+        rows = []
+        for c in comments[:12]:
+            body = c.get("text") or ""
+            tag = " 📎[вложение приложено]" if c.get("has_file") else ""
+            rows.append(f"— {c.get('author')}:{tag} {body}".rstrip())
+        lines.append(head + "\n" + "\n".join(rows))
+    if int(task.get("task_files") or 0):
+        lines.append(f"ФАЙЛЫ, ПРИКРЕПЛЁННЫЕ К САМОЙ ЗАДАЧЕ: {task['task_files']}")
+    return "\n\n".join(lines) if lines else "(в задаче только название)"
+
+
 def _offer_prompt(task: dict[str, Any], candidates: list[dict[str, Any]],
                   responsible_name: str, first_name: str) -> str:
     agents_desc = "\n".join(
         f"- {c['slug'] or 'main'}: «{c['name']}» — {c['role'] or 'универсальный'}" for c in candidates)
-    checklist = task.get("checklist") or []
-    cl_txt = "\n".join(f"{i}. {str(it.get('title') if isinstance(it, dict) else it)}"
-                       for i, it in enumerate(checklist[:15], 1))
     return (
         "Ты — корпоративный ИИ-агент. Пишешь ПЕРВЫЙ комментарий в задаче Bitrix24: коротко и "
         "конкретно предлагаешь СДЕЛАТЬ САМУЮ ТЯЖЁЛУЮ, СОДЕРЖАТЕЛЬНУЮ часть этой задачи за человека — "
@@ -184,10 +273,17 @@ def _offer_prompt(task: dict[str, Any], candidates: list[dict[str, Any]],
         "{\"agent\": \"<slug или main>\", \"message\": \"<текст>\"}.\n\n"
         "Агенты (выбери профильного под тему; сомневаешься — main):\n" + agents_desc + "\n\n"
         + _AGENT_CAPABILITIES + "\n\n"
-        "Задача:\nНазвание: " + str(task.get("title") or "") + "\n"
-        "Описание: " + str(task.get("description") or "")[:1500] + "\n"
-        + (("Чек-лист:\n" + cl_txt + "\n") if cl_txt else "")
-        + "Ответственный: " + (responsible_name or "сотрудник") + "\n\n"
+        "ЗАДАЧА №" + str(task.get("id") or "") + "\nНазвание: " + str(task.get("title") or "") + "\n"
+        "Ответственный: " + (responsible_name or "сотрудник") + "\n\n"
+        "=== ЧТО УЖЕ ЕСТЬ В ЗАДАЧЕ ===\n" + _context_block(task) + "\n"
+        "=== КОНЕЦ СОДЕРЖИМОГО ЗАДАЧИ ===\n\n"
+        "🚫 ГЛАВНЫЙ ЗАПРЕТ — НЕ ПРОСИ ТО, ЧТО УЖЕ ЕСТЬ. Сначала ВНИМАТЕЛЬНО прочитай описание, "
+        "чек-лист и комментарии выше. Если данные/файлы/скрины уже приложены или уже написаны в "
+        "описании — НЕЛЬЗЯ просить прислать их снова: это выглядит глупо и подрывает доверие. "
+        "Вместо запроса — сразу предложи СДЕЛАТЬ РАБОТУ по тому, что уже есть, и назови это "
+        "конкретно («вижу 12 приложенных скринов отзывов — разберу все и дам сводку претензий», "
+        "«в описании уже есть полный свод по руководителям — подготовлю по нему адресные "
+        "рекомендации»). Просить материалы можно ТОЛЬКО если в задаче их действительно нет.\n\n"
         "ГЛАВНОЕ ПРАВИЛО: предлагай РЕЗУЛЬТАТ, а не «навести порядок». Найди в задаче самое "
         "трудоёмкое действие, которое агент РЕАЛЬНО умеет из списка выше, и предложи выполнить "
         "именно его. СВЕРЬСЯ со списком возможностей ПЕРЕД тем, как что-то обещать: если действие "
@@ -206,11 +302,11 @@ def _offer_prompt(task: dict[str, Any], candidates: list[dict[str, Any]],
         "1) «" + (first_name or "Коллега") + ", ...» — по имени, по-человечески.\n"
         "2) 1-2 предложения или 2-3 пункта «— » с КОНКРЕТНЫМ действием и его эффектом; ключевое "
         "[b]жирным[/b].\n"
-        "3) Один точный вопрос-запрос того, что тебе нужно, чтобы взяться. Проси то, что человеку "
-        "легко дать: СКРИНЫ, ОПИСАНИЕ словами, ссылку на файл/запись. НЕ проси доступ к чужим или "
-        "внешним системам (старый портал, чужой аккаунт) — их у агента может не быть; вместо этого "
-        "проси описать или скинуть скринами (например воронку: «опишите стадии или скиньте скрин "
-        "воронки — соберу такую же в Bitrix»).\n"
+        "3) Если материалов ДОСТАТОЧНО (они уже в описании/чек-листе/комментариях/вложениях) — "
+        "НЕ задавай вопросов вообще: просто скажи, что готов взяться и что именно сделаешь по "
+        "имеющимся данным. Вопрос задавай ТОЛЬКО когда для работы реально не хватает входных "
+        "данных, и проси то, что человеку легко дать (скрин, описание словами, ссылку). НЕ проси "
+        "доступ к чужим/внешним системам.\n"
         "4) НЕ зови отвечать «прямо здесь» и не проси писать тебе в комментариях: финальную "
         "строку о том, как тебя позвать через @, система добавит сама.\n"
         "Если по сути задачи агент реально ничем помочь не может — верни пустой message (\"\"), "
@@ -322,9 +418,20 @@ def _post_offer(task_id: int, title: str, description: str, checklist: Any,
         return
     directory = b24bot._b24_portal_user_directory()
     responsible_name = directory.get(int(responsible_id), {}).get("name") or ""
-    agent, message = compose_offer(
-        {"title": title, "description": description, "checklist": checklist},
-        candidates, responsible_name)
+    # The offer must be written against the WHOLE task — description, checklist, comments and the
+    # attachments already there. Without this it asks for material the employee already provided
+    # (2026-07-14: task 962 had 12 screenshots attached and the offer still asked for screenshots).
+    ctx = _task_context(task_id)
+    task_ctx = {
+        "id": task_id,
+        "title": title,
+        "description": description,
+        "checklist": checklist or ctx["checklist"],
+        "comments": ctx["comments"],
+        "attach_count": ctx["attach_count"],
+        "task_files": ctx["task_files"],
+    }
+    agent, message = compose_offer(task_ctx, candidates, responsible_name)
     message = message.rstrip() + _summon_tail(agent)
     posted = b24bot._b24_post_task_comment(int(task_id), message, agent["name"], agent.get("bot_id"))
     if posted:

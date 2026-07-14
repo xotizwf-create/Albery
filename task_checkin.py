@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import os
 import threading
 import time
@@ -150,8 +151,28 @@ def classify_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not tasks:
         return []
     from task_offers import _groq_chat
-    listing = "\n".join(
-        f"- id={t['id']} | {t['title'][:120]} | {t['description'][:200]}" for t in tasks[:_CLASSIFY_CAP])
+    def _line(t: dict[str, Any]) -> str:
+        # Judging on the title alone made the classifier blind: give it a real slice of the
+        # description plus what is already attached to the task.
+        extra = ""
+        try:
+            from task_offers import _task_context
+            c = _task_context(t["id"])
+            bits = []
+            if c["comments"]:
+                bits.append(f"комментариев {len(c['comments'])}")
+            if c["attach_count"]:
+                bits.append(f"вложений {c['attach_count']}")
+            if c["checklist"]:
+                bits.append(f"пунктов чек-листа {len(c['checklist'])}")
+            if bits:
+                extra = " | В ЗАДАЧЕ УЖЕ ЕСТЬ: " + ", ".join(bits)
+        except Exception:  # noqa: BLE001
+            logging.debug("task checkin: context for classifier failed id=%s", t.get("id"), exc_info=True)
+        desc = re.sub(r"\s+", " ", str(t.get("description") or ""))[:700]
+        return f"- id={t['id']} | {t['title'][:120]} | {desc}{extra}"
+
+    listing = "\n".join(_line(t) for t in tasks[:_CLASSIFY_CAP])
     prompt = (
         "Ты отбираешь задачи Bitrix24, в которых корпоративный ИИ-агент может РЕАЛЬНО ускорить "
         "работу, взяв на себя существенную часть. Его реальные возможности: собрать/сверить/"
