@@ -35,17 +35,30 @@ from typing import Any
 from app import MSK_TZ, msk_now, pg_connect
 
 _CHECKIN_HOUR = int(os.getenv("B24_TASK_CHECKIN_HOUR", "12"))
-_OFFER_CAP = int(os.getenv("B24_TASK_CHECKIN_OFFER_CAP", "8"))
+_OFFER_CAP = int(os.getenv("B24_TASK_CHECKIN_OFFER_CAP", "15"))
 _CLASSIFY_CAP = 40   # tasks per Groq batch — plenty for this portal's volume
 
-# Stop-words: the agent cannot pay bills, measure goods, drive trucks or make the boss's
-# decisions. Matched against title+description, lowercased.
-_STOP_WORDS = (
+# Tasks the agent itself produced (its own digests / recommendation lists). Never offer help on
+# our own output — matched anywhere in the text.
+_SELF_GENERATED = ("итоги созвона", "рекомендации", "заполнить профиль", "анонс обучения")
+
+# Core actions the agent physically cannot perform. Matched against the TITLE ONLY: the title
+# states what the task IS. The same words inside a DESCRIPTION are almost always incidental
+# context («фондовая политика согласована с Евгением», «какие налоги уже были оплачены») and used
+# to kill perfectly good data tasks — on 2026-07-13 that wrongly dropped 19 of 43 open tasks.
+_HARD_STOP_TITLE = (
     "оплат", "пополн", "выплат", "платеж", "платёж",
     "замер", "отгруз", "погруз", "упаков", "привезти", "забор груза", "приемк", "приёмк",
     "позвонить", "переговор", "созвонит",
-    "ознаком", "согласова", "подтверд",
-    "итоги созвона", "рекомендации", "заполнить профиль", "анонс обучения",
+)
+
+# Real data work in the task (tables, comparisons, analytics, exports). Owner's rule: wherever
+# there are tables/comparisons — offer help. A data signal OVERRIDES a hard stop-word; the
+# classifier then judges whether the agent can actually do a useful part of it.
+_DATA_SIGNALS = (
+    "таблиц", "[table]", "docs.google", "spreadsheet", "выгрузк", "отчёт", "отчет", "сводк",
+    "анализ", "проанализ", "сравн", "реестр", "спецификац", "динамик", "статистик",
+    "мониторинг", "дашборд", "конверси", "воронк", "остатк", "карточк",
 )
 _TEST_MARKERS = ("🧪", "probe", "[e2e", "удалится", "(del)", "тест ")
 _OPEN_STATUSES = {"1", "2", "3"}  # new / pending / in progress
@@ -116,7 +129,12 @@ def filter_tasks(tasks: list[dict[str, Any]], offered_ids: set[int],
         if title_counts.get(t["title"].strip().lower(), 0) >= 3:
             stats["mass"] += 1
             continue
-        if any(w in blob for w in _STOP_WORDS):
+        if any(w in blob for w in _SELF_GENERATED):
+            stats["stop_word"] += 1
+            continue
+        title = t["title"].lower()
+        if (any(w in title for w in _HARD_STOP_TITLE)
+                and not any(s in blob for s in _DATA_SIGNALS)):
             stats["stop_word"] += 1
             continue
         survivors.append(t)
@@ -136,7 +154,7 @@ def classify_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         f"- id={t['id']} | {t['title'][:120]} | {t['description'][:200]}" for t in tasks[:_CLASSIFY_CAP])
     prompt = (
         "Ты отбираешь задачи Bitrix24, в которых корпоративный ИИ-агент может РЕАЛЬНО ускорить "
-        "работу, выполнив не меньше половины её сам. Его реальные возможности: собрать/сверить/"
+        "работу, взяв на себя существенную часть. Его реальные возможности: собрать/сверить/"
         "актуализировать данные и Google-таблицы; подготовить анализ, отчёт, сводку, список, "
         "спецификацию; работать с CRM-воронками, сделками и задачами Bitrix; написать/"
         "отредактировать тексты (отзывы, шаблоны, письма, анонсы); подготовить документ Word; "
@@ -147,8 +165,21 @@ def classify_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "системы без доступа; принимать решения за руководителя.\n\n"
         "Задачи:\n" + listing + "\n\n"
         "Ответь СТРОГО JSON: {\"tasks\": [{\"id\": <id>, \"help\": true|false, "
-        "\"reason\": \"<по-русски, одна строка: что именно агент сделает>\"}]}. Отбирай строго: "
-        "сомневаешься — help=false. Лучше 3 точных попадания, чем 10 натяжек."
+        "\"reason\": \"<по-русски, одна строка: что именно агент сделает>\"}]}.\n\n"
+        "КАК ОТБИРАТЬ (правило владельца): не занижай — раньше отбор был слишком жёстким. Если в "
+        "задаче есть ТАБЛИЦА, выгрузка, сравнение, анализ, отчёт, сводка, реестр, спецификация, ТЗ, "
+        "подготовка текста или документа, поиск информации, работа с карточками товаров или CRM — "
+        "ставь help=true, даже если часть работы человек всё равно сделает сам: агенту достаточно "
+        "взять на себя ОДИН ощутимый кусок.\n"
+        "ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА перед help=true: в reason ты должен назвать КОНКРЕТНОЕ действие "
+        "агента — «свести данные в таблицу», «сравнить карточки по цене и конверсии», «подготовить "
+        "черновик документа», «найти информацию», «проанализировать отзывы». Если конкретное "
+        "действие назвать не получается и reason выходит пересказом названия задачи — это НЕ "
+        "попадание, ставь help=false.\n"
+        "help=false ОБЯЗАТЕЛЕН, когда работа: физическая (собрать, скомплектовать, упаковать, "
+        "отгрузить, принять, измерить, привезти товар), денежная операция (провести оплату, выдать "
+        "премию), живой разговор (позвонить, договориться лично), согласование отпуска или "
+        "отсутствия, личное управленческое решение руководителя."
     )
     from task_offers import _codex_chat, _extract_json
 
