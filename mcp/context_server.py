@@ -2482,6 +2482,33 @@ def tool_get_attachment_text(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_get_wb_prices(args: dict[str, Any]) -> dict[str, Any]:
+    """Batch current-price lookup for Wildberries articles. Exists so a price-table task is a
+    handful of tool calls, not one model round-trip per article — and so one unreachable article
+    can never stall the turn (per-item deadline + honest skip list inside webread)."""
+    raw = args.get("articles")
+    if not isinstance(raw, list) or not raw:
+        raise McpError(-32602, "articles обязателен: список артикулов или ссылок wildberries.ru (до 15 за вызов).")
+    if len(raw) > 15:
+        raise McpError(-32602, "Не больше 15 артикулов за вызов — разбей список и вызывай несколько раз подряд.")
+    articles: list[Any] = []
+    for item in raw:
+        s = str(item or "").strip()
+        m = re.search(r"/catalog/(\d{5,12})", s)
+        if m:
+            articles.append(int(m.group(1)))
+        elif s.isdigit():
+            articles.append(int(s))
+        else:
+            articles.append(s)  # webread marks it bad_article
+    import webread
+    result = webread.wb_bulk_prices(articles)
+    result["ok_note"] = ("Сразу вноси полученные цены и продолжай работу. Недоступные (card_hidden/"
+                         "no_price) перечисли пользователю честно одной строкой — WB скрывает эти "
+                         "карточки из выдачи; НЕ пытайся тянуть их повторно другими способами.")
+    return result
+
+
 def tool_edit_attachment_document(args: dict[str, Any]) -> dict[str, Any]:
     """Targeted in-place edits to a user-sent document. Changes ONLY the requested fragments;
     the rest of the original file (tables, links, formatting) survives untouched. Exists because
@@ -8599,6 +8626,30 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_get_attachment_text,
     },
+    "get_wb_prices": {
+        "description": (
+            "Текущие витринные цены Wildberries для СПИСКА артикулов/ссылок (до 15 за вызов) — "
+            "используй для заполнения таблиц цен и любых списков, НЕ дергай fetch_url по одному "
+            "артикулу. Возвращает по каждому: price_min/price_max (по размерам, ₽, без скидки "
+            "WB-кошелька) и status; недоступные артикулы помечаются card_hidden/no_price — пропусти "
+            "их и честно скажи пользователю; skipped_by_budget — вызови ещё раз только с ними."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "articles": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 15,
+                    "items": {"type": "string"},
+                    "description": "Артикулы WB (числа) или ссылки wildberries.ru/catalog/…",
+                },
+            },
+            "required": ["articles"],
+            "additionalProperties": False,
+        },
+        "handler": tool_get_wb_prices,
+    },
     "edit_attachment_document": {
         "description": (
             "Внести ТОЧЕЧНЫЕ правки в присланный пользователем файл (xlsx/docx/txt/csv/md) по его attachment_id: "
@@ -10410,6 +10461,8 @@ FAQ_TOOL_NAMES: set[str] = {
     "get_ai_capabilities",
     # Read-only: an agent reads the full text of a file the user sent it (token-gated, unguessable).
     "get_attachment_text",
+    # Read-only public marketplace data.
+    "get_wb_prices",
 }
 
 
@@ -10477,6 +10530,7 @@ CORE_TOOL_NAMES: set[str] = {
     "attach_files_to_task",
     "get_attachment_text",
     "edit_attachment_document",
+    "get_wb_prices",
     # zoom
     "list_zoom_calls",
     "get_zoom_call_transcript",

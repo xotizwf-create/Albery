@@ -258,9 +258,19 @@ def _wb_probe_order(vol: int) -> list[int]:
     return order
 
 
-def _wb_fetch_card(nm: int):
+_WB_MISS_TTL_S = 600.0
+_wb_card_miss: dict[int, float] = {}    # nm -> monotonic expiry (card not on CDN)
+_wb_price_miss: dict[int, float] = {}   # nm -> monotonic expiry (no live price in search)
+
+
+def _wb_fetch_card(nm: int, deadline: float | None = None):
+    exp = _wb_card_miss.get(nm)
+    if exp and exp > time.monotonic():
+        return None, None  # known miss — answer instantly instead of re-sweeping hosts
     vol, part = nm // 100_000, nm // 1_000
     for b in _wb_probe_order(vol)[:_WB_MAX_PROBES]:
+        if deadline is not None and time.monotonic() > deadline:
+            return None, None  # deadline, NOT a confirmed miss — do not poison the cache
         host = "basket-%02d.wbbasket.ru" % b
         try:
             card = _wb_get_json(f"https://{host}/vol{vol}/part{part}/{nm}/info/ru/card.json", 4)
@@ -268,6 +278,7 @@ def _wb_fetch_card(nm: int):
             continue
         _wb_basket_cache[vol] = b
         return host, card
+    _wb_card_miss[nm] = time.monotonic() + _WB_MISS_TTL_S
     return None, None
 
 
@@ -275,25 +286,71 @@ _WB_SEARCH_MIN_INTERVAL_S = float(os.getenv("WB_SEARCH_MIN_INTERVAL_S", "2.0") o
 _wb_last_search_ts = [0.0]
 
 
-def _wb_search_paced(url: str, timeout: int = 10):
-    """search.wb.ru rate-limits bursts (429 after a handful of rapid calls — bulk price lookups
-    for article lists died on it). Pace calls and back off on 429."""
-    for attempt in range(3):
+_wb_search_throttled_until = [0.0]
+
+
+def wb_search_throttled() -> bool:
+    """True while search.wb.ru is rate-limiting us — callers report an honest «WB тротлит,
+    повторите через пару минут» instead of silently returning «цены нет»."""
+    return time.monotonic() < _wb_search_throttled_until[0]
+
+
+def _wb_search_direct_json(url: str, timeout: int):
+    """Search via the DIRECT Russian interface: its 429-quota is separate from the VPN egress
+    (which every other outbound request shares and burns), and a RU IP is the natural client
+    for a RU marketplace. Returns parsed json or None (any failure -> caller falls back to VPN)."""
+    d = direct_fetch(url, {"User-Agent": _UA, "Accept": "*/*"}, timeout=timeout,
+                     text_limit=3 * 1024 * 1024)
+    if not d:
+        return None
+    body = d[2]
+    if body[:2] == b"\x1f\x8b":
+        body = gzip.decompress(body)
+    try:
+        return json.loads(body)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _wb_search_paced(url: str, timeout: int = 10, deadline: float | None = None):
+    """search.wb.ru rate-limits bursts per IP (429). Pace calls; go DIRECT-RU first, VPN as
+    fallback; sustained 429 arms a global cooldown so bulk lookups fail fast and honestly.
+    ``deadline`` (time.monotonic) bounds the WHOLE dance for one element."""
+    if wb_search_throttled():
+        raise TimeoutError("wb search: throttled (cooldown)")
+    for attempt in range(2):
         wait = _wb_last_search_ts[0] + _WB_SEARCH_MIN_INTERVAL_S - time.time()
+        if deadline is not None and time.monotonic() + max(wait, 0) > deadline:
+            raise TimeoutError("wb search: element deadline")
         if wait > 0:
             time.sleep(wait)
         _wb_last_search_ts[0] = time.time()
+        if deadline is not None:
+            timeout = max(2, min(timeout, int(deadline - time.monotonic())))
+        j = _wb_search_direct_json(url, timeout)
+        if j is not None:
+            return j
         try:
             return _wb_get_json(url, timeout)
         except urllib.error.HTTPError as exc:
-            if exc.code == 429 and attempt < 2:
-                time.sleep(4.0 * (attempt + 1))
+            if exc.code != 429:
+                raise
+            if attempt == 0:
+                backoff = 5.0
+                if deadline is not None and time.monotonic() + backoff > deadline:
+                    _wb_search_throttled_until[0] = time.monotonic() + float(
+                        os.getenv("WB_SEARCH_COOLDOWN_S", "120") or "120")
+                    raise TimeoutError("wb search: element deadline (429)") from exc
+                time.sleep(backoff)
                 continue
-            raise
+            # both routes throttled twice — arm the global cooldown
+            _wb_search_throttled_until[0] = time.monotonic() + float(
+                os.getenv("WB_SEARCH_COOLDOWN_S", "120") or "120")
+            raise TimeoutError("wb search: throttled") from exc
     raise RuntimeError("unreachable")
 
 
-def _wb_current_prices(nm: int, card: dict):
+def _wb_current_prices(nm: int, card: dict, deadline: float | None = None):
     """Live storefront prices for a card via search.wb.ru (NOT antibot-blocked, unlike
     card.wb.ru): search by brand+name / vendor code, match the nm in results, read
     sizes[].price.product. Returns dict {min, max, sizes_priced, rating, feedbacks} in RUB
@@ -301,17 +358,31 @@ def _wb_current_prices(nm: int, card: dict):
     name = str(card.get("imt_name") or "").strip()
     brand = str((card.get("selling") or {}).get("brand_name") or "").strip()
     vendor = str(card.get("vendor_code") or "").strip()
-    queries = [q for q in (f"{brand} {name}".strip(), name, vendor) if q]
+    # brand+name + vendor_code are enough; the name-only query was noise that made confirming
+    # a genuine miss too slow to ever fit the per-item budget (so misses never got cached).
+    queries = [q for q in (f"{brand} {name}".strip(), vendor) if q]
     # A card with no stock in the default region (Москва) is HIDDEN from its search results
     # while other regions still return it — try a second dest before giving up.
     dests = [d.strip() for d in os.getenv("WB_SEARCH_DESTS", "-1257786,-2162196").split(",") if d.strip()]
+    exp = _wb_price_miss.get(nm)
+    if exp and exp > time.monotonic():
+        return None  # known miss — don't repeat the whole failing dance
+    if deadline is None:
+        deadline = time.monotonic() + float(os.getenv("WB_CARD_ELEMENT_BUDGET_S", "25") or "25")
     combos = [(q, d) for q in queries for d in dests]
+    deadline_hit = False
     for query, dest in combos:
+        if time.monotonic() > deadline:
+            deadline_hit = True
+            break
         try:
             url = ("https://search.wb.ru/exactmatch/ru/common/v5/search?appType=1&curr=rub"
                    f"&dest={dest}&resultset=catalog&suppressSpellcheck=false&query="
                    + urllib.parse.quote(query))
-            j = _wb_search_paced(url)
+            j = _wb_search_paced(url, deadline=deadline)
+        except TimeoutError:
+            deadline_hit = True
+            break
         except Exception:  # noqa: BLE001
             continue
         products = j.get("products") or (j.get("data") or {}).get("products") or []
@@ -333,7 +404,63 @@ def _wb_current_prices(nm: int, card: dict):
         }
         if out["min"] or out["rating"]:
             return out
+    if deadline_hit:
+        # ran out of the element budget — remember it briefly so an immediate retry (same task,
+        # same list) answers instantly instead of chewing the same slow article again
+        _wb_price_miss[nm] = time.monotonic() + float(os.getenv("WB_SLOW_MISS_TTL_S", "180") or "180")
+    else:
+        # every combo genuinely answered «нет такой карточки» — cache the miss for longer
+        _wb_price_miss[nm] = time.monotonic() + _WB_MISS_TTL_S
     return None
+
+
+def wb_bulk_prices(articles: list[int], call_budget_s: float | None = None,
+                   per_item_budget_s: float | None = None) -> dict:
+    """Current storefront prices for a LIST of nm ids — the fast path for «заполни таблицу цен».
+    One unreachable article can no longer eat the turn: each item gets its own deadline, known
+    misses answer from cache, and when the call budget runs out the REST is returned in
+    ``skipped`` so the caller just calls again with them. Never raises."""
+    call_budget_s = call_budget_s or float(os.getenv("WB_BULK_CALL_BUDGET_S", "45") or "45")
+    per_item_budget_s = per_item_budget_s or float(os.getenv("WB_BULK_ITEM_BUDGET_S", "12") or "12")
+    t0 = time.monotonic()
+    rows, skipped = [], []
+    for nm in articles:
+        try:
+            nm = int(nm)
+        except (TypeError, ValueError):
+            rows.append({"article": nm, "status": "bad_article"})
+            continue
+        if time.monotonic() - t0 > call_budget_s:
+            skipped.append(nm)
+            continue
+        deadline = min(time.monotonic() + per_item_budget_s, t0 + call_budget_s + 5)
+        row = {"article": nm, "status": "no_price", "price_min": None, "price_max": None}
+        try:
+            host, card = _wb_fetch_card(nm, deadline=deadline)
+            if not card:
+                row["status"] = "card_hidden"
+            else:
+                row["name"] = str(card.get("imt_name") or "")[:80]
+                live = _wb_current_prices(nm, card, deadline=deadline)
+                if live and live.get("min"):
+                    row.update(status="ok", price_min=live["min"], price_max=live["max"],
+                               sizes_priced=live.get("sizes_priced"))
+                elif wb_search_throttled():
+                    row["status"] = "wb_throttled"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("wb_bulk_prices: nm=%s failed: %s", nm, repr(exc)[:120])
+            row["status"] = "error"
+        rows.append(row)
+    return {
+        "rows": rows,
+        "skipped_by_budget": skipped,
+        "ok": sum(1 for r in rows if r.get("status") == "ok"),
+        "note": ("status=ok — цена сейчас на витрине (без скидки WB-кошелька); card_hidden/no_price — "
+                 "WB не отдаёт карточку или скрыл её из выдачи, честно скажи об этом и НЕ повторяй их; "
+                 "wb_throttled — WB временно ограничил частоту запросов с сервера: внеси то, что есть, "
+                 "и скажи пользователю повторить по этим позициям через 3-5 минут; "
+                 "skipped_by_budget — не успели в бюджет вызова: вызови инструмент ещё раз ТОЛЬКО с ними."),
+    }
 
 
 def wb_card_result(url: str, max_chars: int = 50_000):
