@@ -5951,7 +5951,7 @@ def _render_and_save_doc(title: str, html: str, args: dict[str, Any]) -> str:
     data = html_to_docx(
         html,
         font_size_pt=float(args.get("font_size_pt") or 12),
-        line_spacing=float(args.get("line_spacing") or 1.15),
+        line_spacing=float(args.get("line_spacing") or 1.5),  # GOST default for official docs
     )
     from b24bot import _b24_save_export
     return _b24_save_export(data, title, "docx")

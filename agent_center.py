@@ -837,7 +837,9 @@ if os.getenv("AGENT_HEALTH_WATCHDOG", "1").strip() != "0":
 _HERMES_CONFIG = Path(os.getenv("HERMES_CONFIG", "/root/.hermes/config.yaml"))
 _AGENT_MCP_PUBLIC_BASE = os.getenv("AGENT_MCP_PUBLIC_BASE", "https://mcp.m4s.ru")
 _AGENT_SELF_INSTRUCTIONS_MAX = int(os.getenv("AGENT_SELF_INSTRUCTIONS_MAX", "30"))
-_AGENT_INSTRUCTION_CHARS_MAX = 8000
+# 24k: the legal-contract skill alone is ~10k, and a silent cut here disabled the
+# lawyer's whole formatting guide (2026-07-14). Truncation must never be silent.
+_AGENT_INSTRUCTION_CHARS_MAX = 24000
 _AGENT_CACHE: dict[str, Any] = {"at": 0.0, "by_bot": {}, "by_slug": {}}
 _AGENT_COLORS = ("GREEN", "MINT", "PINK", "ORANGE", "PURPLE", "AQUA", "LIGHT_BLUE", "GRAY")
 
@@ -1780,6 +1782,10 @@ def agent_selected_knowledge(agent: dict[str, Any]) -> dict[str, list[dict[str, 
                 if s.get("custom"):
                     content = load_skill_content(s["id"])
                     if content:
+                        if len(content) > _AGENT_INSTRUCTION_CHARS_MAX:
+                            logging.warning(
+                                "agent skill %s is %d chars — TRUNCATED to %d, the tail is invisible "
+                                "to the agent", s["id"], len(content), _AGENT_INSTRUCTION_CHARS_MAX)
                         entry["content"] = content[:_AGENT_INSTRUCTION_CHARS_MAX]
                 skills.append(entry)
     return {"instructions": instructions, "skills": skills}

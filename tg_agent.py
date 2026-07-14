@@ -144,9 +144,21 @@ def api(method: str, http_timeout: int = 35, **params):
     return data.get("result")
 
 
+_MARKUP_RE = re.compile(r"\[/?(?:b|i|u|s|url(?:=[^\]]*)?)\]|</?(?:b|i|u|s|strong|em)>", re.IGNORECASE)
+
+
+def _strip_markup(text: str) -> str:
+    """The model mixes Bitrix BB-codes ([b]…[/b]) and HTML (<b>…</b>) into its answers; this bot
+    sends PLAIN text (no parse_mode), so those tags reached people literally («какие-то символы
+    <b>» — владелец, 2026-07-14). Strip them; bold emphasis is lost, garbage is worse."""
+    text = _MARKUP_RE.sub("", text or "")
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.S)
+    return text
+
+
 def send_text(chat_id, text: str) -> None:
     """Plain-text send with chunking (TG hard limit 4096)."""
-    text = (text or "").strip() or "(пустой ответ)"
+    text = _strip_markup((text or "").strip()) or "(пустой ответ)"
     for i in range(0, len(text), 4000):
         api("sendMessage", chat_id=chat_id, text=text[i:i + 4000],
             disable_web_page_preview=True)

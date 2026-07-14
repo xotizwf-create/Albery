@@ -100,6 +100,11 @@ class _DocBuilder(HTMLParser):
         align = (style.get("text-align") or attrs.get("align") or "").strip().lower()
         if tag in self._HEAD_SIZES and not align:
             align = "center" if tag == "h1" else "left"
+        # GOST default for official documents: plain paragraphs are justified unless the
+        # HTML says otherwise. The model no longer has to remember this on every <p> —
+        # explicit text-align always wins, lists/headers/tables keep their own defaults.
+        if not align and tag in ("p", "div") and not self.list_stack:
+            align = "justify"
         if align in _ALIGN:
             p.alignment = {0: WD_ALIGN_PARAGRAPH.LEFT, 1: WD_ALIGN_PARAGRAPH.CENTER,
                            2: WD_ALIGN_PARAGRAPH.RIGHT, 3: WD_ALIGN_PARAGRAPH.JUSTIFY}[_ALIGN[align]]
@@ -276,7 +281,7 @@ class _DocBuilder(HTMLParser):
         self._add_text(text)
 
 
-def html_to_docx(html: str, *, font_size_pt: float = 12.0, line_spacing: float = 1.15) -> bytes:
+def html_to_docx(html: str, *, font_size_pt: float = 12.0, line_spacing: float = 1.5) -> bytes:
     """Render the supported HTML subset into a .docx (A4, GOST-ish margins: left 3 cm,
     right 1.5 cm, top/bottom 2 cm; Times New Roman throughout)."""
     from docx import Document
