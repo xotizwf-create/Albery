@@ -26,6 +26,8 @@ import logging
 import os
 import re
 import socket
+import time
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -269,6 +271,71 @@ def _wb_fetch_card(nm: int):
     return None, None
 
 
+_WB_SEARCH_MIN_INTERVAL_S = float(os.getenv("WB_SEARCH_MIN_INTERVAL_S", "2.0") or "2.0")
+_wb_last_search_ts = [0.0]
+
+
+def _wb_search_paced(url: str, timeout: int = 10):
+    """search.wb.ru rate-limits bursts (429 after a handful of rapid calls — bulk price lookups
+    for article lists died on it). Pace calls and back off on 429."""
+    for attempt in range(3):
+        wait = _wb_last_search_ts[0] + _WB_SEARCH_MIN_INTERVAL_S - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _wb_last_search_ts[0] = time.time()
+        try:
+            return _wb_get_json(url, timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < 2:
+                time.sleep(4.0 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError("unreachable")
+
+
+def _wb_current_prices(nm: int, card: dict):
+    """Live storefront prices for a card via search.wb.ru (NOT antibot-blocked, unlike
+    card.wb.ru): search by brand+name / vendor code, match the nm in results, read
+    sizes[].price.product. Returns dict {min, max, sizes_priced, rating, feedbacks} in RUB
+    or None. This is the price the customer sees BEFORE the personal WB-wallet discount."""
+    name = str(card.get("imt_name") or "").strip()
+    brand = str((card.get("selling") or {}).get("brand_name") or "").strip()
+    vendor = str(card.get("vendor_code") or "").strip()
+    queries = [q for q in (f"{brand} {name}".strip(), name, vendor) if q]
+    # A card with no stock in the default region (Москва) is HIDDEN from its search results
+    # while other regions still return it — try a second dest before giving up.
+    dests = [d.strip() for d in os.getenv("WB_SEARCH_DESTS", "-1257786,-2162196").split(",") if d.strip()]
+    combos = [(q, d) for q in queries for d in dests]
+    for query, dest in combos:
+        try:
+            url = ("https://search.wb.ru/exactmatch/ru/common/v5/search?appType=1&curr=rub"
+                   f"&dest={dest}&resultset=catalog&suppressSpellcheck=false&query="
+                   + urllib.parse.quote(query))
+            j = _wb_search_paced(url)
+        except Exception:  # noqa: BLE001
+            continue
+        products = j.get("products") or (j.get("data") or {}).get("products") or []
+        hit = next((p for p in products if int(p.get("id") or 0) == int(nm)), None)
+        if not hit:
+            continue
+        prices = []
+        for s in (hit.get("sizes") or []):
+            p = ((s.get("price") or {}).get("product")
+                 or (s.get("price") or {}).get("total") or 0)
+            if p:
+                prices.append(round(p / 100))
+        out = {
+            "min": min(prices) if prices else None,
+            "max": max(prices) if prices else None,
+            "sizes_priced": len(prices),
+            "rating": hit.get("reviewRating") or hit.get("nmReviewRating") or hit.get("rating"),
+            "feedbacks": hit.get("feedbacks") or hit.get("nmFeedbacks"),
+        }
+        if out["min"] or out["rating"]:
+            return out
+    return None
+
+
 def wb_card_result(url: str, max_chars: int = 50_000):
     """fetch_url-shaped result for a wildberries.ru card link, built from the basket CDN
     (card.json + price-history.json + feedbacks). None when the URL is not a WB card or the
@@ -292,6 +359,20 @@ def wb_card_result(url: str, max_chars: int = 50_000):
         selling.get("brand_name") or "?", card.get("subj_root_name") or "?",
         card.get("subj_name") or "?", card.get("vendor_code") or "?"))
 
+    live = None
+    try:
+        live = _wb_current_prices(nm, card)
+    except Exception:  # noqa: BLE001
+        log.warning("wb card: live price lookup failed nm=%s", nm, exc_info=True)
+    if live and live.get("min"):
+        if live["min"] == live["max"]:
+            lines.append(f"ЦЕНА СЕЙЧАС: {live['min']} ₽ — одинакова для всех размеров в наличии "
+                         f"({live['sizes_priced']} шт). Это витринная цена без персональной скидки WB-кошелька.")
+        else:
+            lines.append(f"ЦЕНА СЕЙЧАС: от {live['min']} до {live['max']} ₽ в зависимости от размера "
+                         f"({live['sizes_priced']} размеров в наличии). Витринная цена без скидки WB-кошелька.")
+    if live and live.get("rating"):
+        lines.append(f"Рейтинг: {live['rating']}/5, отзывов: {live.get('feedbacks') or '?'} (живые данные выдачи)")
     try:
         ph = _wb_get_json(f"https://{host}/vol{vol}/part{part}/{nm}/info/price-history.json", 5)
     except Exception:  # noqa: BLE001
@@ -302,14 +383,17 @@ def wb_card_result(url: str, max_chars: int = 50_000):
         last = ph[-1]
         when = _dt.datetime.utcfromtimestamp(int(last.get("dt") or 0)).strftime("%d.%m.%Y")
         lines.append(
-            f"Цена: {prices[-1]:g} ₽ (последнее изменение {when}; витрина может показывать чуть меньше "
-            f"за счёт скидки WB-кошелька). История цен, {len(ph)} точек: мин {min(prices):g} ₽, "
-            f"макс {max(prices):g} ₽.")
-    else:
-        lines.append("Цена: получить из CDN не удалось — попроси скриншот карточки, если цена критична.")
+            f"Динамика цены во времени (история изменений, {len(ph)} точек, последняя {when}): "
+            f"от {min(prices):g} до {max(prices):g} ₽. ⚠️ Это изменения цены ПО ДАТАМ — "
+            f"НЕ разброс «цена от/до» по размерам, для таблиц цен используй ЦЕНУ СЕЙЧАС выше.")
+    if not (live and live.get("min")) and not ph:
+        lines.append("Цена: получить не удалось — попроси скриншот карточки, если цена критична.")
+    elif not (live and live.get("min")):
+        lines.append("⚠️ Актуальную витринную цену получить не удалось. НЕ выдавай исторические "
+                     "мин/макс за «цену от/до» — честно скажи, что текущей цены нет.")
 
     imt = card.get("imt_id")
-    if imt:
+    if imt and not (live and live.get("rating")):
         fb = None
         for fh in ("feedbacks1.wb.ru", "feedbacks2.wb.ru"):
             try:
