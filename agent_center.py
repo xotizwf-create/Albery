@@ -153,25 +153,28 @@ def agent_center_dialogs():
     # USER (dialog_id = user id), so the SAME dialog_id is reused by every bot that user
     # messages. Key by (agent_slug, dialog_id) and scope every aggregate to that bot, so
     # one bot's turns never leak into another's list entry, preview or counts.
+    # Source of truth = the FULL message journal: it also holds messages that never had a
+    # question (proactive DMs from the daily check-in, task offers, notification posts, digests)
+    # and inbound messages that have not been answered yet.
     sql = f"""
         WITH last AS (
             SELECT DISTINCT ON (agent_slug, dialog_id)
-                   dialog_id, agent_slug, bitrix_user_id, tier, question, status, created_at
-            FROM bitrix_bot_interactions
+                   dialog_id, agent_slug, bitrix_user_id, direction, kind, text, created_at
+            FROM bitrix_bot_messages
             WHERE dialog_id IS NOT NULL{agent_filter}{kind_filter}
             ORDER BY agent_slug, dialog_id, id DESC
         ),
         agg AS (
             SELECT dialog_id, agent_slug,
                    COUNT(*) AS turns,
-                   COUNT(*) FILTER (WHERE status <> 'ok') AS errors,
-                   MAX(created_at) AS last_at
-            FROM bitrix_bot_interactions
+                   MAX(created_at) AS last_at,
+                   MAX(bitrix_user_id) AS any_uid
+            FROM bitrix_bot_messages
             WHERE dialog_id IS NOT NULL{agent_filter}{kind_filter}
             GROUP BY dialog_id, agent_slug
         )
-        SELECT l.dialog_id, l.agent_slug, l.bitrix_user_id, l.tier, l.question, l.status,
-               a.turns, a.errors, a.last_at
+        SELECT l.dialog_id, l.agent_slug, COALESCE(l.bitrix_user_id, a.any_uid) AS bitrix_user_id,
+               l.direction, l.kind, l.text, a.turns, a.last_at
         FROM last l
         JOIN agg a ON a.dialog_id = l.dialog_id
                   AND a.agent_slug IS NOT DISTINCT FROM l.agent_slug
@@ -179,11 +182,10 @@ def agent_center_dialogs():
     params: list[Any] = list(agent_params) + list(agent_params)  # last CTE + agg CTE
     if q:
         sql += (
-            " WHERE l.dialog_id IN (SELECT DISTINCT dialog_id FROM bitrix_bot_interactions"
-            f" WHERE (question ILIKE %s OR answer ILIKE %s){agent_filter}{kind_filter})"
+            " WHERE l.dialog_id IN (SELECT DISTINCT dialog_id FROM bitrix_bot_messages"
+            f" WHERE text ILIKE %s{agent_filter}{kind_filter})"
         )
-        like = f"%{q}%"
-        params.extend([like, like])
+        params.append(f"%{q}%")
         params.extend(agent_params)  # keep search within the selected bot too
     sql += " ORDER BY a.last_at DESC LIMIT %s"
     params.append(limit)
@@ -194,43 +196,64 @@ def agent_center_dialogs():
                 cur.execute(sql, params)
                 rows = cur.fetchall()
         names = _user_names()
+        errs = _dialog_error_counts()
         for r in rows:
             did = r["dialog_id"] or ""
             uid = int(r["bitrix_user_id"]) if r["bitrix_user_id"] is not None else None
             info = names.get(uid or -1, {})
-            raw_q = r["question"] or ""
             task_id = None
             if did.startswith("task-"):
                 try:
                     task_id = int(did[len("task-"):])
                 except ValueError:
                     task_id = None
-                # The stored question is the agent-facing wrapper; surface the employee's actual
-                # comment as the preview instead of the boilerplate "Тебя позвали …" prefix.
-                m = re.search(r"написал[а]? в комментарии к задаче №\d+:\s*«(.+?)»", raw_q, re.S)
-                if m:
-                    raw_q = m.group(1)
-            preview = _strip_b24_markup(raw_q)
+            preview = _strip_b24_markup(r["text"] or "")
+            if r["direction"] == "out":
+                preview = "Агент: " + preview
             if len(preview) > 100:
                 preview = preview[:100].rstrip() + "…"
+            slug = r["agent_slug"] or MAIN_AGENT_SLUG
+            if did.lower().startswith("chat"):
+                title = "📢 Канал уведомлений"
+            elif task_id:
+                title = f"Задача №{task_id}"
+            else:
+                title = info.get("name") or (f"Сотрудник #{uid}" if uid else "Сотрудник")
             dialogs.append({
                 "dialog_id": did,
                 "task_id": task_id,
                 "bitrix_user_id": uid,
-                "user_name": info.get("name") or (f"Сотрудник #{uid}" if uid else "Сотрудник"),
+                "user_name": title,
                 "user_position": info.get("position") or "",
-                "tier": r["tier"] or "faq",
-                "agent_slug": r["agent_slug"] or MAIN_AGENT_SLUG,
+                "tier": "ops",
+                "agent_slug": slug,
                 "last_message": preview,
-                "last_status": r["status"],
+                "last_status": "ok",
                 "turns": int(r["turns"]),
-                "errors": int(r["errors"]),
+                "errors": int(errs.get((slug, did), 0)),
                 "time": _when_label(r["last_at"]),
             })
     except Exception:  # noqa: BLE001
         logging.exception("agent_center dialogs failed")
         return jsonify({"error": "Не удалось загрузить диалоги."}), 500
     return jsonify({"dialogs": dialogs})
+
+
+def _dialog_error_counts() -> dict:
+    """Failed turns per (agent, dialog) — the message journal stores what was actually sent, while
+    the turn log keeps the error status, so the error badge keeps working."""
+    out: dict = {}
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT dialog_id, agent_slug, COUNT(*) AS n FROM bitrix_bot_interactions"
+                    " WHERE status <> 'ok' GROUP BY dialog_id, agent_slug")
+                for r in cur.fetchall():
+                    out[(r["agent_slug"] or MAIN_AGENT_SLUG, r["dialog_id"])] = int(r["n"])
+    except Exception:  # noqa: BLE001
+        logging.debug("agent_center: error counts failed", exc_info=True)
+    return out
 
 
 @app.get("/api/agent-center/dialog-messages")
@@ -255,24 +278,28 @@ def agent_center_dialog_messages():
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, created_at, question, answer, status, error, latency_ms, tier, session_name"
-                    f" FROM bitrix_bot_interactions WHERE dialog_id = %s{agent_filter} ORDER BY id DESC LIMIT %s",
+                    "SELECT id, created_at, direction, kind, text"
+                    f" FROM bitrix_bot_messages WHERE dialog_id = %s{agent_filter} ORDER BY id DESC LIMIT %s",
                     [dialog_id, *agent_params, limit],
                 )
                 rows = cur.fetchall()
+        _KIND_LABEL = {"notification": "уведомление", "task_comment": "комментарий в задаче",
+                       "system": "система"}
         for r in reversed(rows):
             local = r["created_at"].astimezone(MSK_TZ) if r["created_at"] else None
+            text = (r["text"] or "").strip()
+            inbound = r["direction"] == "in"
             turns.append({
                 "id": int(r["id"]),
                 "date": local.strftime("%d.%m.%Y") if local else "",
                 "time": local.strftime("%H:%M") if local else "",
-                "question": (r["question"] or "").strip(),
-                "answer": _strip_b24_markup(r["answer"] or ""),
-                "status": r["status"],
-                "error": (r["error"] or "").strip(),
-                "latency_ms": r["latency_ms"],
-                "tier": r["tier"] or "faq",
-                "session_name": r["session_name"] or "",
+                "question": text if inbound else "",
+                "answer": "" if inbound else _strip_b24_markup(text),
+                "status": "ok",
+                "error": None,
+                "latency_ms": None,
+                "tier": "ops",
+                "session_name": _KIND_LABEL.get(r["kind"] or "", ""),
             })
     except Exception:  # noqa: BLE001
         logging.exception("agent_center dialog messages failed")

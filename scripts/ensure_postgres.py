@@ -83,6 +83,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "050_task_checkin_dossier.sql",
     # Idempotent: dedup table for inbound imbot chat messages (at-least-once delivery).
     "051_bitrix_bot_message_seen.sql",
+    # Idempotent: full agent<->human message journal (what the owner sees in the UI).
+    "052_bitrix_bot_messages.sql",
 ]
 
 

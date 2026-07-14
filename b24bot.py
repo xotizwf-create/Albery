@@ -462,7 +462,73 @@ def _imbot_auth(payload: dict[str, Any], name: str) -> str:
     return ""
 
 
-def _b24_app_call(client_endpoint: str, access_token: str, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+_B24_BOT_AGENT_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
+
+
+def _b24_agent_slug_for_bot(bot_id: Any) -> str | None:
+    """bot_id -> agent slug (None = the main agent). Cached 60s; the outbound hook has only the
+    BOT_ID, but the UI needs to attribute every message to the right bot."""
+    bid = to_int(bot_id)
+    if bid is None:
+        return None
+    now = time.time()
+    if now - float(_B24_BOT_AGENT_CACHE["at"] or 0) > 60:
+        mapping: dict[int, str] = {}
+        try:
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT slug, bitrix_bot_id FROM agents WHERE bitrix_bot_id IS NOT NULL")
+                    for r in cur.fetchall():
+                        b = to_int(r["bitrix_bot_id"])
+                        if b:
+                            mapping[b] = r["slug"]
+        except Exception:  # noqa: BLE001
+            logging.debug("b24 msglog: bot->agent map failed", exc_info=True)
+        _B24_BOT_AGENT_CACHE["map"] = mapping
+        _B24_BOT_AGENT_CACHE["at"] = now
+    return _B24_BOT_AGENT_CACHE["map"].get(bid)  # main bot isn't in `agents` -> None
+
+
+def log_bot_message(*, direction: str, dialog_id: Any, text: str, bot_id: Any = None,
+                    agent_slug: Any = "auto", bitrix_user_id: Any = None, kind: str = "",
+                    bitrix_message_id: Any = None, meta: Any = None) -> None:
+    """Record ONE message (in or out) in the full journal the owner's UI reads. Covers what the
+    turn log (bitrix_bot_interactions) structurally cannot: proactive DMs, offers, notifications,
+    digests — and inbound messages BEFORE the answer exists. Fail-open: never breaks a send."""
+    try:
+        did = str(dialog_id or "").strip()
+        if not did:
+            return
+        body = (text or "").strip()
+        if not body:
+            return
+        if agent_slug == "auto":
+            agent_slug = _b24_agent_slug_for_bot(bot_id)
+        if not kind:
+            if did.startswith("task-"):
+                kind = "task_comment"
+            elif did.lower().startswith("chat"):
+                kind = "notification"
+            else:
+                kind = "chat"
+        uid = to_int(bitrix_user_id)
+        if uid is None and did.isdigit():
+            uid = int(did)  # a private bot chat is keyed by the user id
+        import json as _json
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bitrix_bot_messages (agent_slug, bot_id, dialog_id, bitrix_user_id,"
+                    " direction, kind, text, bitrix_message_id, meta)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (agent_slug, to_int(bot_id), did, uid, direction, kind, body[:20000],
+                     to_int(bitrix_message_id), _json.dumps(meta) if meta else None))
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 msglog: log failed dlg=%s dir=%s", dialog_id, direction, exc_info=True)
+
+
+def _b24_app_call(client_endpoint: str, access_token: str, method: str, payload: dict[str, Any] | None = None,
+                  *, _log: bool = True) -> dict[str, Any]:
     base = (client_endpoint or "").strip().rstrip("/")
     if not base or not access_token:
         raise ValueError("client_endpoint/access_token пусты")
@@ -472,7 +538,14 @@ def _b24_app_call(client_endpoint: str, access_token: str, method: str, payload:
     data = resp.json()
     if isinstance(data, dict) and "error" in data:
         raise RuntimeError(f"{method}: {data.get('error')} ({data.get('error_description')})")
-    return data if isinstance(data, dict) else {"result": data}
+    result = data if isinstance(data, dict) else {"result": data}
+    # THE choke point: every message the bot sends to a human — replies, proactive DMs from the
+    # daily check-in, notification-channel posts, digests, owner reports — is an imbot.message.add.
+    if _log and method == "imbot.message.add" and isinstance(payload, dict):
+        log_bot_message(direction="out", dialog_id=payload.get("DIALOG_ID"),
+                        text=str(payload.get("MESSAGE") or ""), bot_id=payload.get("BOT_ID"),
+                        bitrix_message_id=result.get("result"))
+    return result
 
 
 def _b24_capture_tokens(payload: dict[str, Any], state: dict[str, Any]) -> None:
@@ -2953,7 +3026,7 @@ def _b24_status_send(client_endpoint: str, access_token: str, bot_id: Any, dialo
     try:
         res = _b24_app_call(client_endpoint, access_token, "imbot.message.add", {
             "BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": _b24_status_text(0),
-        })
+        }, _log=False)  # transient progress bubble (deleted afterwards) — not part of the history
         return res.get("result")
     except Exception:  # noqa: BLE001
         logging.debug("b24 testbot: status message send failed", exc_info=True)
@@ -3536,15 +3609,23 @@ def _b24_post_task_comment(task_id: int, text: str, agent_name: str, author_bot_
             _b24_task_comment_claim(to_int(created_id), task_id, "self-reply", author_bot_id)
 
     bot_id = to_int(author_bot_id)
+
+    def _journal(created_id: Any) -> None:
+        log_bot_message(direction="out", dialog_id=f"task-{task_id}", text=text,
+                        bot_id=bot_id, kind="task_comment", bitrix_message_id=created_id,
+                        meta={"task_id": int(task_id), "agent_name": agent_name})
+
     try:
         if bot_id:
             created = _post({"POST_MESSAGE": text[:20000], "AUTHOR_ID": bot_id})
             if created:
                 _claim_own(created)
+                _journal(created)
                 return True
         created = _post({"POST_MESSAGE": f"🤖 {agent_name}: {text}"[:20000]})
         if created:
             _claim_own(created)
+            _journal(created)
         return bool(created)
     except Exception:  # noqa: BLE001
         logging.warning("b24 task-mention: reply post failed task=%s", task_id, exc_info=True)
@@ -3599,6 +3680,10 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
     # First-sight claim (dedupe) — do this AFTER the cheap filters so we don't burn the id on noise.
     if not _b24_task_comment_claim(comment_id, task_id, target["slug"], author_id):
         return {"handled": False, "reason": "already_seen"}
+    log_bot_message(direction="in", dialog_id=f"task-{task_id}",
+                    text=_b24_strip_task_bbcode(text), bot_id=target.get("bot_id"),
+                    agent_slug=target.get("slug"), bitrix_user_id=author_id, kind="task_comment",
+                    bitrix_message_id=comment_id, meta={"task_id": int(task_id)})
 
     agent = None
     if not target["is_main"] and target["slug"]:
@@ -3860,6 +3945,11 @@ def _bitrix_imbot_app_event():
         # Bitrix retry can never double-answer the user. Task comments have the same guard.
         if message_id and not _b24_message_claim(message_id, bot_id, dialog_id, from_user_id):
             return jsonify({"ok": True, "event": event_name, "duplicate": True}), 200
+        # Journal the employee's message IMMEDIATELY — the owner must see it in the UI right away,
+        # not only once the agent has finished answering (the turn log is written after the answer).
+        log_bot_message(direction="in", dialog_id=dialog_id,
+                        text=message_text or "📎 (вложение)", bot_id=bot_id,
+                        bitrix_user_id=from_user_id, bitrix_message_id=message_id)
         if os.getenv("B24_DEBUG_PAYLOAD", "0") == "1":
             try:
                 _red = {k: ("<redacted>" if re.search(r"TOKEN|AUTH|SECRET|REFRESH", k, re.I) else v)
