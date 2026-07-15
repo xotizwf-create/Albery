@@ -197,6 +197,7 @@ def agent_center_dialogs():
                 rows = cur.fetchall()
         names = _user_names()
         errs = _dialog_error_counts()
+        laststat = _dialog_last_status()
         for r in rows:
             did = r["dialog_id"] or ""
             uid = int(r["bitrix_user_id"]) if r["bitrix_user_id"] is not None else None
@@ -228,7 +229,7 @@ def agent_center_dialogs():
                 "tier": "ops",
                 "agent_slug": slug,
                 "last_message": preview,
-                "last_status": "ok",
+                "last_status": laststat.get((slug, did), "ok"),
                 "turns": int(r["turns"]),
                 "errors": int(errs.get((slug, did), 0)),
                 "time": _when_label(r["last_at"]),
@@ -253,6 +254,24 @@ def _dialog_error_counts() -> dict:
                     out[(r["agent_slug"] or MAIN_AGENT_SLUG, r["dialog_id"])] = int(r["n"])
     except Exception:  # noqa: BLE001
         logging.debug("agent_center: error counts failed", exc_info=True)
+    return out
+
+
+def _dialog_last_status() -> dict:
+    """Status of the MOST RECENT turn per (agent, dialog) from the turn log, so the dialog list
+    shows a real last_status (timeout/error/busy) instead of a hardcoded 'ok'. Dialogs with only
+    proactive messages (no turn) default to 'ok'."""
+    out: dict = {}
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT ON (agent_slug, dialog_id) dialog_id, agent_slug, status"
+                    " FROM bitrix_bot_interactions ORDER BY agent_slug, dialog_id, id DESC")
+                for r in cur.fetchall():
+                    out[(r["agent_slug"] or MAIN_AGENT_SLUG, r["dialog_id"])] = r["status"] or "ok"
+    except Exception:  # noqa: BLE001
+        logging.debug("agent_center: last status failed", exc_info=True)
     return out
 
 
@@ -283,20 +302,32 @@ def agent_center_dialog_messages():
                     [dialog_id, *agent_params, limit],
                 )
                 rows = cur.fetchall()
+                cur.execute(
+                    "SELECT created_at, status, error FROM bitrix_bot_interactions"
+                    f" WHERE dialog_id = %s{agent_filter} AND status <> 'ok' ORDER BY created_at",
+                    [dialog_id, *agent_params],
+                )
+                fails = [(fr["created_at"], fr["status"], fr["error"]) for fr in cur.fetchall()]
         _KIND_LABEL = {"notification": "уведомление", "task_comment": "комментарий в задаче",
                        "system": "система"}
         for r in reversed(rows):
             local = r["created_at"].astimezone(MSK_TZ) if r["created_at"] else None
             text = (r["text"] or "").strip()
             inbound = r["direction"] == "in"
+            mstatus, merror = "ok", None
+            if not inbound and fails and r["created_at"]:
+                for fc, fs, fe in fails:
+                    if fc and abs((fc - r["created_at"]).total_seconds()) <= 120:
+                        mstatus, merror = fs, fe
+                        break
             turns.append({
                 "id": int(r["id"]),
                 "date": local.strftime("%d.%m.%Y") if local else "",
                 "time": local.strftime("%H:%M") if local else "",
                 "question": text if inbound else "",
                 "answer": "" if inbound else _strip_b24_markup(text),
-                "status": "ok",
-                "error": None,
+                "status": mstatus,
+                "error": merror,
                 "latency_ms": None,
                 "tier": "ops",
                 "session_name": _KIND_LABEL.get(r["kind"] or "", ""),

@@ -2606,6 +2606,27 @@ def _b24_core_instructions() -> str:
     return text
 
 
+# --- Honest turn status: a model turn can succeed, time out, hit the busy cap, or come back as an
+# error sentinel. hermes_brain_answer returns a user-facing string in EVERY case, so the caller
+# cannot tell a real answer from a polite fallback. This thread-local carries the REAL execution
+# outcome so the interaction log records timeout/busy/error (not a false 'ok') and the monitoring
+# and Agent Center stop showing green on failed turns. Each turn runs in its own thread, so a
+# thread-local is race-free.
+_TURN_OUTCOME = threading.local()
+
+
+def _turn_outcome_reset() -> None:
+    _TURN_OUTCOME.status, _TURN_OUTCOME.error = "ok", None
+
+
+def _turn_outcome_set(status: str, error: str | None = None) -> None:
+    _TURN_OUTCOME.status, _TURN_OUTCOME.error = status, error
+
+
+def _turn_outcome_get() -> tuple:
+    return getattr(_TURN_OUTCOME, "status", "ok"), getattr(_TURN_OUTCOME, "error", None)
+
+
 def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_user_id: Any = "",
                         agent: dict[str, Any] | None = None) -> str | None:
     """Run one turn through the local Hermes brain. Toolset is chosen by access tier:
@@ -2616,6 +2637,7 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
     Session lifecycle (idle reset + cap rotation + carried summary) is handled by
     _b24_session_prepare. All session/history keying is scoped to this agent (agent_slug)."""
     agent_slug = (agent or {}).get("slug")
+    _turn_outcome_reset()
     session, seed = _b24_session_prepare(dialog_id, agent_slug)
     toolset = {"admin": "albery", "ops": "albery-ops"}.get(tier, "albery-faq")
     core_toolset = tier in ("admin", "ops") and os.getenv("B24_CORE_TOOLSET", "").strip() == "1"
@@ -2953,11 +2975,14 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                                          scope=_b24_scope(dialog_id, agent_slug),
                                          retry_prompt_suffix=retry_lean)
     if run_fail == "cancelled":
+        _turn_outcome_set("cancelled")
         return None  # «Новая сессия» остановила этот ход — reset уже ответил пользователю
     if run_fail == "busy":
+        _turn_outcome_set("busy")
         return ("Сейчас я обрабатываю много запросов одновременно 🙏 Подожди минуту-другую и "
                 "отправь сообщение ещё раз — я отвечу.")
     if run_fail == "timeout":
+        _turn_outcome_set("timeout", "hard timeout %ss" % timeout_s)
         sheets_like = re.search(
             "(google|гугл|таблиц|spreadsheet|sheet|лист|артикул|баркод|barcode|размер|остатк|заказ)",
             user_text or "",
@@ -2982,6 +3007,7 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                       proc.returncode, (proc.stderr or "")[:300])
         _b24_ops_alert("пустой ответ мозга", dialog_id, tier, from_user_id,
                        f"Два прогона подряд без ответа (rc={proc.returncode}).")
+        _turn_outcome_set("error", "empty brain output rc=%s" % proc.returncode)
         return "Мозг временно недоступен, попробуй ещё раз чуть позже."
     if _hermes_answer_is_error(answer):
         # Both attempts came back as the CLI's own LLM-failure notice (transient network / Broken
@@ -2989,6 +3015,7 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         logging.error("hermes brain LLM error sentinel dialog_id=%s tier=%s: %s",
                       dialog_id, tier, answer[:200])
         _b24_ops_alert("ошибка LLM в ходе", dialog_id, tier, from_user_id, answer[:300])
+        _turn_outcome_set("error", answer[:300])
         return _b24_brain_error_message(answer)
     _b24_capture_generated_doc(dialog_id, agent_slug, from_user_id, answer)
     return answer
@@ -3228,6 +3255,7 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
                                          message_id, status_message_id, user_text)
     try:
         answer = hermes_brain_answer(user_text, dialog_id, tier, from_user_id, agent=agent)
+        status, error = _turn_outcome_get()
     except Exception as exc:  # noqa: BLE001
         logging.exception("b24 testbot: hermes brain failed")
         status, error = "error", str(exc)[:500]
@@ -3857,6 +3885,7 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
     # Per-task memory so the agent keeps the thread of THIS task, separate from private chat.
     dialog_id = f"task-{task_id}"
     answer = hermes_brain_answer(user_text, dialog_id, tier, author_id, agent=agent)
+    _turn_status, _turn_error = _turn_outcome_get()
     if not answer or _hermes_answer_is_error(answer):
         return {"handled": False, "reason": "brain_error", "agent": target["name"]}
     posted = _b24_post_task_comment(task_id, answer, target["name"], target.get("bot_id"))
@@ -3864,7 +3893,8 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
         _b24_task_comment_mark_handled(comment_id)
     try:
         _b24_log_interaction(dialog_id, author_id, tier, user_text, answer, 0,
-                             "ok" if posted else "post_failed", "" if posted else "reply post failed",
+                             (_turn_status if _turn_status != "ok" else ("ok" if posted else "post_failed")),
+                             (_turn_error or ("" if posted else "reply post failed")),
                              agent_slug=target["slug"])
     except Exception:  # noqa: BLE001
         pass
