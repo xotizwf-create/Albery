@@ -2949,6 +2949,14 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                 "ставить/закрывать задачи, отправлять сообщения, что-либо менять в системах. "
                 "Отвечай по-русски." + access_rule + fmt + "]")
     parts = [head]
+    # Who is asking — available to EVERY tier/agent (the detailed ops/admin block below adds
+    # task-authoring hints on top). get_agent_link needs this id to check the asker's access.
+    if str(from_user_id).strip():
+        parts.append(
+            "ТЕКУЩИЙ СОБЕСЕДНИК (кто пишет тебе сейчас): " + _b24_requester_name(from_user_id)
+            + ", его Bitrix id=" + str(from_user_id) + ". Когда нужно проверить доступ ИМЕННО "
+            "этого человека к чему-либо (например, дать ссылку на профильного агента через "
+            "get_agent_link) — передавай requester_bitrix_user_id=" + str(from_user_id) + ".")
     # Self-orientation, same for every agent: how to see what it can do and act fast + correctly.
     # Keeps agents from either faking a capability they lack or refusing one they have. The model
     # natively sees its enabled tools (the connector serves tools/list) — this tells it to trust

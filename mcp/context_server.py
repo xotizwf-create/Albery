@@ -10530,7 +10530,15 @@ if os.getenv("ALBERY_ALLOW_SHEET_WRITE", "").strip().lower() not in {"1", "true"
     TOOLS.pop("write_company_sheet", None)
 
 
+# get_agent_link: hand out a chat link to a specialised agent + tell the asker whether THEY
+# have access. Read-only and safe (the chat link is not a secret — the target bot enforces
+# access on every message), so it belongs on every tier incl. FAQ. Lives in its own module.
+from agent_links import tool_get_agent_link, GET_AGENT_LINK_SPEC  # noqa: E402
+TOOLS["get_agent_link"] = {**GET_AGENT_LINK_SPEC, "handler": tool_get_agent_link}
+
+
 FAQ_TOOL_NAMES: set[str] = {
+    "get_agent_link",
     "start_here_always_read_ai_instructions",
     "health",
     "get_runtime_status",
@@ -10592,6 +10600,8 @@ CORE_TOOL_NAMES: set[str] = {
     "get_ai_instructions",
     "get_ai_capabilities",
     "get_context_guide",
+    # links to the company's specialised agents (+ access check for the asker)
+    "get_agent_link",
     # company knowledge
     "search_company_knowledge",
     "list_company_files",
