@@ -3801,20 +3801,52 @@ def _b24_task_targets() -> list[dict[str, Any]]:
     return targets
 
 
+def _b24_trigger_addresses(low: str, trig: str) -> bool:
+    """Does the trigger phrase ADDRESS the agent (a summon), rather than just occur in the text?
+
+    A bare single-word trigger («албери», «юрист») is ambiguous — «Албери» is also the COMPANY
+    name, so «Наталья, ключ нужен от кабинета Албери)» must NOT summon the agent. So a weak
+    single-word trigger only counts when it is a direct address: at the very start of the comment,
+    prefixed with «@», or immediately followed by addressing punctuation («Албери,» / «юрист:»).
+    Strong triggers — multi-word / hyphenated / @-forms («агент албери», «агент-юрист», «@албери»)
+    — are unambiguous and match anywhere. `low` is ' <text> ' lowercased with collapsed spaces."""
+    t = re.escape(trig)
+    if " " in trig or "-" in trig or "@" in trig:  # strong, explicit address form
+        return re.search(r"(?<![а-яёa-z])" + t + r"(?![а-яёa-z])", low) is not None
+    # weak single word — require a direct-address context
+    if re.match(r"^ " + t + r"(?![а-яёa-z])", low):            # start of comment: «Албери …»
+        return True
+    if re.search(r"@" + t + r"(?![а-яёa-z])", low):            # «@албери»
+        return True
+    if re.search(r"(?<![а-яёa-z])" + t + r"\s*[,:!?]", low):   # «Албери,» / «юрист:»
+        return True
+    return False
+
+
 def _b24_task_pick_agent(text: str, targets: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
-    """Return the summoned agent target whose trigger phrase appears in the comment, longest first
-    (so «агент-юрист» wins over the generic «албери»). None if no agent is named."""
-    low = " " + re.sub(r"\s+", " ", (text or "").lower()) + " "
+    """Return the summoned agent target, or None if no agent is actually addressed.
+
+    Priority: (1) an explicit Bitrix @-mention [USER=<bot_id>] of a target bot — the canonical,
+    unambiguous summon; (2) otherwise a name trigger that ADDRESSES the agent (see
+    _b24_trigger_addresses), longest trigger first so «агент-юрист» wins over «албери». A colleague
+    tag ([USER=30]Наталья) or a bare company-name mention («кабинета Албери») never summons."""
+    raw = text or ""
+    low = " " + re.sub(r"\s+", " ", raw.lower()) + " "
+    targets = targets if targets is not None else _b24_task_targets()
+    # 1) explicit @-mention of a specific bot wins outright.
+    for tgt in targets:
+        bid = to_int(tgt.get("bot_id"))
+        if bid and re.search(r"\[user=" + str(bid) + r"\]", raw, re.I):
+            return tgt
+    # 2) addressing-form name trigger.
     best = None
     best_len = 0
-    for tgt in (targets if targets is not None else _b24_task_targets()):
+    for tgt in targets:
         for trig in tgt["triggers"]:
             if not trig:
                 continue
-            # word-ish boundary: trigger surrounded by non-letters (handles «Албери,» / «@албери»)
-            if re.search(r"(?<![а-яёa-z])" + re.escape(trig) + r"(?![а-яёa-z])", low):
-                if len(trig) > best_len:
-                    best, best_len = tgt, len(trig)
+            if _b24_trigger_addresses(low, trig) and len(trig) > best_len:
+                best, best_len = tgt, len(trig)
     return best
 
 
