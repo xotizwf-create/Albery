@@ -256,6 +256,80 @@ def create_drive_folder(name: str, parent_folder: str, reuse_existing: bool = Tr
     meta = drive.files().create(body={"name": clean_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}, fields="id,name,mimeType,parents,webViewLink", supportsAllDrives=True).execute()
     _share_drive_anyone(drive, meta.get("id"))
     return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": True, "reused": False, "access": "anyone_with_link_editor"}
+def company_drive_root_folder_id() -> str:
+    """Google Drive folder id the company documents live under (the Apps Script sync root).
+    From env GOOGLE_DRIVE_COMPANY_ROOT_FOLDER_ID; falls back to the live sync payload's folder_id."""
+    fid = (os.getenv("GOOGLE_DRIVE_COMPANY_ROOT_FOLDER_ID", "") or "").strip()
+    if fid:
+        return fid
+    payload = fetch_google_drive_company_payload()
+    fid = str(payload.get("folder_id") or "").strip()
+    if not fid:
+        raise RuntimeError("Не удалось определить корневую папку Google Drive компании "
+                           "(задай GOOGLE_DRIVE_COMPANY_ROOT_FOLDER_ID)")
+    return fid
+
+
+def list_company_drive_folders() -> dict[str, Any]:
+    """Top-level folders under the company Drive root — the places a file can be uploaded to."""
+    root = company_drive_root_folder_id()
+    listing = list_drive_folder_items(root)
+    folders = [it for it in listing.get("items", []) if it.get("is_folder")]
+    return {
+        "root_folder_id": root,
+        "root_name": (listing.get("folder") or {}).get("name"),
+        "count": len(folders),
+        "folders": [{"id": f.get("id"), "name": f.get("name"), "url": f.get("web_view_link")} for f in folders],
+    }
+
+
+def resolve_company_folder(folder: str) -> dict[str, Any] | None:
+    """Resolve a folder argument to a concrete company Drive folder. Accepts a Drive id/URL, or a
+    NAME matched case-insensitively among the root's top-level folders. Returns
+    {'id','name','matched_by'} or None when a name was given but not found (then ask the user)."""
+    import re as _re
+    s = str(folder or "").strip()
+    if not s:
+        return None
+    is_url = bool(_re.search(r"drive\.google\.com|/folders/|/d/|[?&]id=", s))
+    is_bare_id = bool(_re.fullmatch(r"[A-Za-z0-9_-]{20,}", s))
+    if is_url or is_bare_id:
+        fid = _extract_drive_folder_id(s)
+        if fid:
+            return {"id": fid, "name": None, "matched_by": "id"}
+    for f in list_company_drive_folders().get("folders", []):
+        if str(f.get("name") or "").strip().lower() == s.lower():
+            return {"id": f.get("id"), "name": f.get("name"), "matched_by": "name"}
+    return None
+
+
+def upload_file_to_drive(data: bytes, file_name: str, folder: str,
+                         mime_type: str | None = None, share_everyone: bool = False) -> dict[str, Any]:
+    """Upload raw bytes as a NEW file into a Google Drive folder. Returns the file's id/name/link.
+    Files inherit the folder's sharing by default (safe for company documents); set
+    share_everyone=True to also grant anyone-with-the-link viewing."""
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+    import io as _io, mimetypes as _mt
+    fid = _extract_drive_folder_id(folder)
+    if not fid:
+        raise ValueError("folder is required (Drive folder id or URL)")
+    if not data:
+        raise ValueError("empty file data")
+    name = str(file_name or "").strip() or "file"
+    if not mime_type:
+        mime_type = _mt.guess_type(name)[0] or "application/octet-stream"
+    drive = build("drive", "v3", credentials=_google_user_credentials(), cache_discovery=False)
+    media = MediaIoBaseUpload(_io.BytesIO(data), mimetype=mime_type, resumable=False)
+    meta = drive.files().create(
+        body={"name": name, "parents": [fid]}, media_body=media,
+        fields="id,name,mimeType,parents,webViewLink,size", supportsAllDrives=True,
+    ).execute()
+    granted = _share_drive_anyone(drive, meta.get("id"), "reader") if share_everyone else ""
+    return {**_drive_public_meta(meta), "folder_id": fid, "size": meta.get("size"),
+            "uploaded": True, "access": ("anyone_with_link_viewer" if granted else "inherits_folder")}
+
+
 _DRIVE_DEFAULT_CATEGORIES = ["Регламенты", "Мотивация сотрудников", "ИИ / Автоматизация", "Финансы", "Обучение", "Отчёты", "Маркетинг / Продажи", "Операционка", "Архив / Разобрать вручную"]
 _DRIVE_CATEGORY_KEYWORDS = {
     "Регламенты": ["регламент", "инструкц", "правил", "порядок", "политик", "стандарт", "соп", "sop"],

@@ -6120,6 +6120,70 @@ def tool_create_drive_folder(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"create_drive_folder failed: {exc}") from exc
 
 
+def tool_list_drive_folders(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return app_workflow_function("list_company_drive_folders")()
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"list_drive_folders failed: {exc}") from exc
+
+
+def tool_upload_file_to_drive(args: dict[str, Any]) -> dict[str, Any]:
+    ids = args.get("attachment_ids")
+    if not ids:
+        one = args.get("attachment_id")
+        ids = [one] if one else []
+    ids = [str(a).strip() for a in (ids or []) if str(a or "").strip()]
+    if not ids:
+        raise McpError(-32602, "Нужен attachment_id присланного файла (формат att_...). Попроси "
+                       "пользователя прислать файл, затем передай его attachment_id.")
+    folder_arg = str(args.get("folder") or args.get("folder_name") or "").strip()
+    target = None
+    if folder_arg:
+        try:
+            target = app_workflow_function("resolve_company_folder")(folder_arg)
+        except McpError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise McpError(-32010, f"folder resolve failed: {exc}") from exc
+    if not target:
+        try:
+            folders = app_workflow_function("list_company_drive_folders")()
+        except Exception as exc:  # noqa: BLE001
+            raise McpError(-32010, f"list folders failed: {exc}") from exc
+        return {
+            "need_folder": True,
+            "message": ("Папка для загрузки не указана (или название не найдено). ПОКАЖИ "
+                        "пользователю список папок ниже и СПРОСИ, в какую загрузить. После ответа "
+                        "снова вызови upload_file_to_drive с folder = названием или id выбранной "
+                        "папки. Не загружай без явного выбора пользователя."),
+            "requested_folder": folder_arg or None,
+            "root_folder_id": folders.get("root_folder_id"),
+            "available_folders": folders.get("folders"),
+        }
+    import attachments as _att
+    up = app_workflow_function("upload_file_to_drive")
+    share = bool(args.get("share_everyone", False))
+    results = []
+    for tok in ids:
+        got = _att.attachment_bytes(tok)
+        if not got:
+            results.append({"attachment_id": tok, "uploaded": False,
+                            "error": "не найдены байты вложения — файл мог устареть; попроси прислать заново"})
+            continue
+        data, fname = got
+        name = str(args.get("file_name") or "").strip() or fname
+        try:
+            r = up(data, name, target["id"], None, share)
+        except Exception as exc:  # noqa: BLE001
+            results.append({"attachment_id": tok, "uploaded": False, "error": str(exc)[:300]})
+            continue
+        results.append({"attachment_id": tok, **r})
+    return {"folder": target, "uploaded_count": sum(1 for r in results if r.get("uploaded")),
+            "results": results}
+
+
 def tool_organize_drive_folder(args: dict[str, Any]) -> dict[str, Any]:
     folder = str(args.get("folder") or "").strip()
     if not folder:
@@ -9939,6 +10003,29 @@ TOOLS: dict[str, dict[str, Any]] = {
         "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "New subfolder name"}, "parent_folder": {"type": "string", "description": "Parent Drive folder id or URL"}, "folder": {"type": "string", "description": "Alias for parent_folder"}, "reuse_existing": {"type": "boolean", "default": True}, "confirm": {"type": "boolean"}}, "required": ["name", "confirm"], "additionalProperties": False},
         "handler": tool_create_drive_folder,
     },
+    "list_drive_folders": {
+        "description": "List the company Google Drive folders a file can be uploaded to (top-level folders under the company root, e.g. «Новинки»). Use this to show the user available folders before uploading.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "handler": tool_list_drive_folders,
+    },
+    "upload_file_to_drive": {
+        "description": (
+            "Upload a file the user SENT (by its attachment_id, format att_...) into a company Google "
+            "Drive folder. folder = a folder NAME (e.g. «Новинки») or a Drive id/URL. ВАЖНО: если "
+            "пользователь НЕ указал папку — НЕ угадывай: вызови без folder (или с неизвестным именем), "
+            "инструмент вернёт need_folder + available_folders; ПОКАЖИ этот список и СПРОСИ, в какую "
+            "папку загрузить, затем вызови снова с выбранной folder. Файл наследует доступ папки; "
+            "share_everyone=true — дополнительно открыть по ссылке всем на просмотр."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "attachment_id": {"type": "string", "description": "att_... токен присланного файла"},
+            "attachment_ids": {"type": "array", "items": {"type": "string"}, "description": "несколько att_... токенов"},
+            "folder": {"type": "string", "description": "папка-получатель: НАЗВАНИЕ (например Новинки) или Drive id/URL"},
+            "file_name": {"type": "string", "description": "необязательно: переопределить имя файла"},
+            "share_everyone": {"type": "boolean", "default": False},
+        }, "additionalProperties": False},
+        "handler": tool_upload_file_to_drive,
+    },
     "organize_drive_folder": {
         "description": "Smartly organize a Google Drive folder: create/reuse category subfolders and move files AND folders into categories. Use dry_run=true first; after approval use dry_run=false and confirm=true.",
         "inputSchema": {"type": "object", "properties": {"folder": {"type": "string", "description": "Drive folder id or URL to organize"}, "categories": {"type": "array", "items": {"type": "string"}}, "dry_run": {"type": "boolean", "default": True}, "confirm": {"type": "boolean"}}, "required": ["folder"], "additionalProperties": False},
@@ -10555,6 +10642,9 @@ CORE_TOOL_NAMES: set[str] = {
     "get_webapp_template",
     "make_sheet_applet",
     "manage_apps_script",
+    # Google Drive uploads (task 1502): upload sent files into company folders + list folders.
+    "upload_file_to_drive",
+    "list_drive_folders",
 }
 
 
