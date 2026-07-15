@@ -2008,6 +2008,48 @@ def _b24_app_download_url(endpoint: str, access_token: str, fid) -> str:
     return ""
 
 
+def _b24_webhook_user_id() -> int | None:
+    """The Bitrix user id the incoming webhook acts as (…/rest/<uid>/<code>/). Downloads and
+    task updates run as this user; task/comment files are ACL-guarded by task membership."""
+    wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "")
+    m = re.search(r"/rest/(\d+)/", wh)
+    return to_int(m.group(1)) if m else None
+
+
+def _b24_ensure_task_auditor(task_id: int) -> bool:
+    """Make the webhook user an AUDITOR (observer) of the task so it gains disk access to the
+    task's files and comment attachments. Bitrix 403s disk.file.get for non-participants — this
+    is exactly what blocked Наталья's birthday list on task 594 until the agent became an
+    observer. Idempotent: no write (and no notification) if the user already participates."""
+    wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
+    uid = _b24_webhook_user_id()
+    if not wh or not uid:
+        return False
+    try:
+        r = requests.post(f"{wh}/tasks.task.get.json",
+                          json={"taskId": task_id,
+                                "select": ["ID", "RESPONSIBLE_ID", "CREATED_BY", "ACCOMPLICES", "AUDITORS"]},
+                          timeout=20)
+        t = (r.json().get("result") or {}).get("task") or {}
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 task-access: task.get failed task=%s", task_id, exc_info=True)
+        return False
+    auditors = [to_int(x) for x in (t.get("auditors") or []) if to_int(x)]
+    members = set(auditors) | {to_int(x) for x in (t.get("accomplices") or []) if to_int(x)}
+    members |= {to_int(t.get("responsibleId") or t.get("RESPONSIBLE_ID")),
+                to_int(t.get("createdBy") or t.get("CREATED_BY"))}
+    if uid in members:
+        return True
+    try:
+        requests.post(f"{wh}/tasks.task.update.json",
+                      json={"taskId": task_id, "fields": {"AUDITORS": auditors + [uid]}}, timeout=20)
+        logging.info("b24 task-access: added webhook user %s as auditor of task %s", uid, task_id)
+        return True
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 task-access: could not add auditor task=%s", task_id, exc_info=True)
+        return False
+
+
 def task_comment_files(file_ids: list, task_id: int, max_files: int = 5) -> list[dict]:
     """Read files attached to TASK COMMENTS (params.FILE_ID of the task-chat message): download,
     recognize (images → Groq vision OCR, documents → text extraction), persist to the attachment
@@ -2024,17 +2066,11 @@ def task_comment_files(file_ids: list, task_id: int, max_files: int = 5) -> list
     out: list[dict] = []
     wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
     ep = tok = ""
-    for fid in list(file_ids or [])[:max_files]:
-        fid_i = to_int(fid)
-        if fid_i is None:
-            continue
-        cached = _att.find_by_disk_file_id(fid_i)
-        if cached and (cached.get("extracted_text") or "").strip():
-            out.append({"attachment_id": cached["token"], "name": cached.get("file_name") or "файл",
-                        "kind": cached.get("kind") or "document",
-                        "text": cached.get("extracted_text") or ""})
-            continue
-        # File metadata (NAME) + download URL via the webhook; app-token URL as the second road.
+    ensured = [False]  # add the webhook user as task observer at most once per call, on first 403
+
+    def _download(fid_i: int) -> tuple[str, bytes]:
+        """Resolve NAME + bytes for one disk file: webhook DOWNLOAD_URL first, app-token second."""
+        nonlocal ep, tok
         name, durl = "", ""
         if wh:
             try:
@@ -2057,10 +2093,32 @@ def task_comment_files(file_ids: list, task_id: int, max_files: int = 5) -> list
                     ep = tok = ""
             aurl = _b24_app_download_url(ep, tok, fid_i) if ep and tok else ""
             data = _b24_fetch_bytes(aurl, tok) if aurl else b""
+        return name, data
+
+    for fid in list(file_ids or [])[:max_files]:
+        fid_i = to_int(fid)
+        if fid_i is None:
+            continue
+        cached = _att.find_by_disk_file_id(fid_i)
+        if cached and (cached.get("extracted_text") or "").strip():
+            out.append({"attachment_id": cached["token"], "name": cached.get("file_name") or "файл",
+                        "kind": cached.get("kind") or "document",
+                        "text": cached.get("extracted_text") or ""})
+            continue
+        name, data = _download(fid_i)
+        if not data and not ensured[0]:
+            # Bitrix guards task/comment files by task membership: the webhook user 403s on
+            # disk.file.get until it observes the task. Become an auditor and retry — this is
+            # what unblocked task 594 (Наталья's birthday list). At most once per call.
+            ensured[0] = True
+            if _b24_ensure_task_auditor(task_id):
+                name2, data = _download(fid_i)
+                if name2:
+                    name = name2
         if not data:
             logging.warning("b24 task files: could not download fid=%s name=%s", fid_i, name)
             out.append({"attachment_id": None, "name": name or f"файл {fid_i}", "kind": "unknown",
-                        "text": "(⚠️ не удалось скачать это вложение из комментария — честно скажи "
+                        "text": "(⚠️ не удалось скачать это вложение — честно скажи "
                                 "об этом и попроси прислать файл в чат. НЕ придумывай содержимое.)"})
             continue
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
@@ -3795,6 +3853,53 @@ def _b24_task_comment_mark_handled(comment_id: int) -> None:
         pass
 
 
+def _b24_task_all_file_ids(task_id: int, extra_file_ids=None) -> list[int]:
+    """Every disk file id attached ANYWHERE in the task: the task's own files
+    (UF_TASK_WEBDAV_FILES) + files posted in ANY comment (params.FILE_ID of the task chat).
+    Order: the triggering comment's files first, then task-body files, then the rest — deduped.
+    So an agent summoned in a task sees attachments from any source, not only the comment that
+    mentioned it."""
+    wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
+    ordered: list[int] = []
+    seen: set[int] = set()
+
+    def _add(v):
+        i = to_int(v)
+        if i and i not in seen:
+            seen.add(i)
+            ordered.append(i)
+
+    for f in (extra_file_ids or []):
+        _add(f)
+    if not wh:
+        return ordered
+    chat_id = None
+    try:
+        r = requests.post(f"{wh}/tasks.task.get.json",
+                          json={"taskId": task_id, "select": ["ID", "CHAT_ID", "UF_TASK_WEBDAV_FILES"]},
+                          timeout=20)
+        t = (r.json().get("result") or {}).get("task") or {}
+        chat_id = t.get("chatId") or t.get("CHAT_ID")
+        for item in (t.get("ufTaskWebdavFiles") or t.get("UF_TASK_WEBDAV_FILES") or []):
+            s = str(item)
+            _add(s[1:] if s.startswith("n") else s)
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 task files: webdav list failed task=%s", task_id, exc_info=True)
+    if chat_id:
+        try:
+            r = requests.post(f"{wh}/im.dialog.messages.get.json",
+                              json={"DIALOG_ID": f"chat{chat_id}", "LIMIT": 50}, timeout=20)
+            for m in ((r.json().get("result") or {}).get("messages") or []):
+                params = m.get("params") if isinstance(m.get("params"), dict) else {}
+                fid = params.get("FILE_ID")
+                if isinstance(fid, list):
+                    for x in fid:
+                        _add(x)
+        except Exception:  # noqa: BLE001
+            logging.warning("b24 task files: chat files list failed task=%s", task_id, exc_info=True)
+    return ordered
+
+
 def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, Any]:
     """Core of the in-task agent. Returns a small status dict (also used by the smoke test)."""
     if not _b24_task_mention_enabled():
@@ -3851,21 +3956,27 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
     # Files attached to the triggering comment (screenshots/documents): recognize and inject,
     # so «Албери, посмотри скрин» inside a task actually sees the screenshot.
     files_block = ""
-    if comment.get("file_ids"):
+    # ANY source: the task's own files + files in ANY comment, not only the mentioning one.
+    all_file_ids = _b24_task_all_file_ids(task_id, comment.get("file_ids"))
+    if all_file_ids:
         try:
             parts = []
-            for f in task_comment_files(comment["file_ids"], task_id):
-                head = f"[Вложение в комментарии: «{f['name']}» ({'скрин/изображение' if f['kind'] == 'image' else 'документ'}"
+            for f in task_comment_files(all_file_ids, task_id, max_files=6):
+                head = f"[Вложение задачи: «{f['name']}» ({'скрин/изображение' if f['kind'] == 'image' else 'документ'}"
                 if f.get("attachment_id"):
                     head += f", attachment_id={f['attachment_id']}"
                 head += "). Распознанное/извлечённое содержимое:]"
                 parts.append(head + "\n" + (f["text"] or "")[:4000])
             if parts:
+                extra = ""
+                if len(all_file_ids) > 6:
+                    extra = ("\n\n(Во вложениях задачи ещё %d файл(ов) — уточни, какой нужен.)"
+                             % (len(all_file_ids) - 6))
                 files_block = "\n\n" + "\n\n".join(parts) + (
                     "\n\n(Полный текст вложения — get_attachment_text(attachment_id=…); "
-                    "переслать файл в задачу/комментарий — attachment_ids.)")
+                    "переслать файл в задачу/комментарий — attachment_ids.)" + extra)
         except Exception:  # noqa: BLE001
-            logging.warning("b24 task-mention: comment files read failed task=%s", task_id, exc_info=True)
+            logging.warning("b24 task-mention: task files read failed task=%s", task_id, exc_info=True)
     intro = "Тебя позвали ПРЯМО В ЗАДАЧЕ Bitrix (в комментарии). Работай с ЭТОЙ задачей."
     user_text = (
         intro + "\n\n"
