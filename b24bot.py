@@ -1550,6 +1550,33 @@ def _b24_vision_ocr(image_bytes: bytes, name: str = "") -> str:
         return ""
 
 
+def _b24_transcribe_audio(audio_bytes: bytes, name: str = "") -> str:
+    """Speech-to-text for voice messages / audio files via Groq Whisper (same key as vision
+    OCR). Language is auto-detected. Browser UA — api.groq.com blocks the default python
+    agents with Cloudflare 1010 (same gotcha as vision). Failure -> "" and the caller tells
+    the user honestly instead of inventing what was said."""
+    key = _b24_groq_api_key()
+    if not key or not audio_bytes:
+        return ""
+    safe_name = (name or "audio.ogg").rsplit("/", 1)[-1]
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer " + key,
+                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            files={"file": (safe_name, audio_bytes)},
+            data={"model": os.getenv("B24_STT_MODEL", "whisper-large-v3"),
+                  "response_format": "json", "temperature": "0"},
+            timeout=180)
+        if r.status_code != 200:
+            logging.warning("b24 stt failed (%s): HTTP %s %s", name, r.status_code, r.text[:200])
+            return ""
+        return ((r.json() or {}).get("text") or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("b24 stt failed (%s): %s", name, repr(exc)[:200])
+        return ""
+
+
 def _b24_fetch_bytes(url: str, access_token: str, max_bytes: int = 20 * 1024 * 1024) -> bytes:
     """Download a Bitrix file. Tries the URL as-is, then with ?auth=<token> (REST file URLs need it)."""
     if not url:
@@ -1575,9 +1602,14 @@ def _b24_fetch_bytes(url: str, access_token: str, max_bytes: int = 20 * 1024 * 1
     return b""
 
 
-_B24_DOC_EXTS = ("pdf", "docx", "doc", "xlsx", "xlsm", "md", "markdown", "txt",
-                 "csv", "tsv", "json", "rtf", "htm", "html", "log", "yaml", "yml")
+_B24_DOC_EXTS = ("pdf", "docx", "doc", "xlsx", "xlsm", "xls", "md", "markdown", "txt",
+                 "csv", "tsv", "json", "rtf", "htm", "html", "log", "yaml", "yml",
+                 "pptx", "ppt", "mht", "mhtml", "odt", "ods", "odp", "zip", "xml")
 _B24_IMG_EXTS = ("png", "jpg", "jpeg", "gif", "webp", "bmp", "heic")
+# Groq Whisper accepts flac/mp3/mp4/mpeg/mpga/m4a/ogg/opus/wav/webm; the rest (e.g. .amr)
+# will fail the API call -> "" and the agent reports honestly instead of guessing.
+_B24_STT_EXTS = ("mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "webm", "flac",
+                 "mp4", "mpga", "mpeg", "amr")
 _B24_DELIVER_RE = re.compile(r"\[\[DELIVER_(PDF|XLSX|EXCEL|DOCX|WORD):\s*([^\]]*)\]\]", re.I)
 _B24_DELIVER_FMT = {"pdf": "pdf", "xlsx": "xlsx", "excel": "xlsx", "docx": "docx", "word": "docx"}
 
@@ -1593,12 +1625,13 @@ def _b24_clean_text(s: str) -> str:
 
 
 def _b24_extract_document(data: bytes, name: str) -> str:
-    """Extract readable text from a user-sent document. Pure-python extractors (pypdf / python-docx /
-    openpyxl) + native text for md/txt/csv. Legacy binary .doc isn't supported (no libreoffice)."""
+    """Extract readable text from a user-sent document. Primary formats (pdf/docx/xlsx/plain
+    text) are handled here; the long tail (xls/pptx/ppt/doc/mht/odf/rtf/zip/html) lives in
+    docextract.py so agents can read ANY document format users actually send."""
     import io as _io
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     try:
-        if ext in ("md", "markdown", "txt", "csv", "tsv", "json", "log", "yaml", "yml", "htm", "html"):
+        if ext in ("md", "markdown", "txt", "csv", "tsv", "json", "log", "yaml", "yml"):
             return data.decode("utf-8", "ignore")
         if ext == "pdf":
             from pypdf import PdfReader
@@ -1617,8 +1650,9 @@ def _b24_extract_document(data: bytes, name: str) -> str:
             # the first row of every sheet; webread falls back to a streaming XML parse.
             import webread
             return webread.extract_xlsx(data)
-        if ext == "doc":
-            return ""  # legacy binary .doc — unsupported without libreoffice/antiword
+        import docextract
+        if ext in docextract.EXTS:
+            return docextract.extract(data, name, inner=_b24_extract_document)
         return data.decode("utf-8", "ignore")
     except Exception as exc:  # noqa: BLE001
         logging.warning("b24 doc extract failed (%s): %s", name, repr(exc)[:160])
@@ -2135,8 +2169,16 @@ def task_comment_files(file_ids: list, task_id: int, max_files: int = 5) -> list
         is_image = ext in _B24_IMG_EXTS or (not ext and data[:3] in (b"\xff\xd8\xff", b"\x89PN", b"GIF"))
         if is_image:
             kind, text = "image", _b24_vision_ocr(data, name or "image.png")
+        elif ext in _B24_STT_EXTS:
+            kind, text = "audio", _b24_clean_text(_b24_transcribe_audio(data, name or "voice.ogg"))
+            if text:
+                text = "(голосовое/аудио, расшифровка) " + text
+        elif ext in _B24_DOC_EXTS:
+            # Only real documents are text-extracted; decoding an unknown binary as text
+            # smuggles NUL bytes that crash the PG store and the model call (33635db).
+            kind, text = "document", _b24_clean_text(_b24_extract_document(data, name or "file"))
         else:
-            kind, text = "document", _b24_extract_document(data, name or "file")
+            kind, text = "document", ""
         token = _att.store_attachment(
             data=data, file_name=name or ("image.png" if kind == "image" else "file"),
             kind=kind, extracted_text=text or "", agent_slug=None,
@@ -2144,8 +2186,11 @@ def task_comment_files(file_ids: list, task_id: int, max_files: int = 5) -> list
         )
         out.append({"attachment_id": token, "name": name or ("скрин" if kind == "image" else "файл"),
                     "kind": kind,
-                    "text": (text or "").strip() or "(не удалось извлечь текст из вложения — "
-                            "возможно скан без текстового слоя; попроси прислать PDF/DOCX)"})
+                    "text": (text or "").strip() or (
+                        "(не удалось расшифровать аудио — скажи об этом честно и попроси "
+                        "продублировать текстом)" if kind == "audio" else
+                        "(не удалось извлечь текст из вложения — возможно скан без текстового "
+                        "слоя или нечитаемый формат; попроси прислать PDF/DOCX)")})
     return out
 
 
@@ -2204,14 +2249,16 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
     token is returned per attachment for prompt injection.
 
     Reply text is inline in data[PARAMS][REPLY_MESSAGE][MESSAGE].
-    Returns (image_texts, reply_text, doc_blocks, attachments) where doc_blocks items are
-    (name, content, token|None) and attachments is a list of {token,name,kind,char_len}."""
+    Returns (image_texts, reply_text, doc_blocks, attachments, voice_texts) where doc_blocks
+    items are (name, content, token|None), attachments is a list of {token,name,kind,char_len}
+    and voice_texts items are (name, transcript) — voice/audio transcribed via Groq Whisper."""
     image_texts: list = []
     reply_text = ""
     doc_blocks: list = []
     attachments: list = []
+    voice_texts: list = []
     if not isinstance(payload, dict):
-        return image_texts, reply_text, doc_blocks, attachments
+        return image_texts, reply_text, doc_blocks, attachments, voice_texts
     for key in ("data[PARAMS][REPLY_MESSAGE][MESSAGE]", "data[params][REPLY_MESSAGE][MESSAGE]"):
         v = payload.get(key)
         if isinstance(v, list):
@@ -2245,11 +2292,12 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
             ftype = ftype or (_ft or "").lower()
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         is_image = ftype == "image" or ext in _B24_IMG_EXTS
-        is_doc = ext in _B24_DOC_EXTS
-        # Respond to EVERYTHING, but do NOT text-extract binaries (audio/.xls/archives): decoding
-        # them as text yields NUL bytes that crash the DB store and the model call. Unknown types
+        is_audio = not is_image and (ftype == "audio" or ext in _B24_STT_EXTS)
+        is_doc = not is_audio and ext in _B24_DOC_EXTS
+        # Respond to EVERYTHING, but do NOT text-extract unknown binaries: decoding them as
+        # text yields NUL bytes that crash the DB store and the model call. Unknown types
         # are downloaded, stored and acknowledged (uploadable/forwardable), just not parsed.
-        is_other = not is_image and not is_doc
+        is_other = not is_image and not is_audio and not is_doc
         if not name and not ext:
             continue
         # Download the chat file. The BOT is a member of this dialog, so it can read the
@@ -2299,6 +2347,20 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
             if token:
                 attachments.append({"token": token, "name": name or "image",
                                     "kind": "image", "char_len": len(txt or "")})
+        elif is_audio:
+            txt = _b24_clean_text(_b24_transcribe_audio(data, name or "voice.ogg"))
+            token = _store("audio", txt)
+            if txt:
+                voice_texts.append((name or "голосовое", txt))
+            else:
+                doc_blocks.append((name or "аудио",
+                                   "(Это голосовое/аудио сообщение, но расшифровать его не удалось. "
+                                   "Честно скажи об этом пользователю и попроси продублировать текстом "
+                                   "или прислать в формате mp3/m4a/ogg/wav. НЕ придумывай содержимое.)",
+                                   token))
+            if token:
+                attachments.append({"token": token, "name": name or "аудио",
+                                    "kind": "audio", "char_len": len(txt or "")})
         else:
             txt = _b24_clean_text(_b24_extract_document(data, name or "file")) if is_doc else ""
             token = _store("document", txt if (txt and txt.strip()) else "")
@@ -2310,17 +2372,18 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
                                    "файл или устаревший формат .doc/.xls — попросите прислать PDF/DOCX/XLSX)", token))
             else:
                 doc_blocks.append((name or "файл",
-                                   "(Файл получен и сохранён — это не документ и не картинка (например "
-                                   "аудио, .xls или архив), поэтому текст я не извлекаю. Его можно ЗАГРУЗИТЬ "
-                                   "на Google Диск или переслать по attachment_id. Чтобы я прочитал "
-                                   "содержимое — пришлите его в PDF/DOCX/XLSX. НЕ придумывай содержимое.)", token))
+                                   "(Файл получен и сохранён, но его формат я не умею читать как текст "
+                                   "(неизвестный/бинарный тип). Его можно ЗАГРУЗИТЬ на Google Диск или "
+                                   "переслать по attachment_id. Чтобы я прочитал содержимое — попроси "
+                                   "прислать его в PDF/DOCX/XLSX. НЕ придумывай содержимое.)", token))
             if token:
                 attachments.append({"token": token, "name": name or "документ",
                                     "kind": "document", "char_len": len((txt or "").strip())})
     if os.getenv("B24_DEBUG_PAYLOAD", "0") == "1":
-        logging.info("b24 extras: images=%d docs=%d reply=%s attach=%d",
-                     len(image_texts), len(doc_blocks), bool(reply_text), len(attachments))
-    return image_texts, reply_text, doc_blocks, attachments
+        logging.info("b24 extras: images=%d docs=%d voice=%d reply=%s attach=%d",
+                     len(image_texts), len(doc_blocks), len(voice_texts), bool(reply_text),
+                     len(attachments))
+    return image_texts, reply_text, doc_blocks, attachments, voice_texts
 
 
 # How many characters of an extracted document to inline into the prompt. Beyond this the agent
@@ -2414,8 +2477,9 @@ def _b24_recent_dialog_attachments(dialog_id: str, agent_slug: str | None,
 
 def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_blocks: list = None,
                            attachments: list = None, recent_attachments: list = None,
-                           recent_doc: dict = None) -> str:
-    """Fold reply-context, image OCR and extracted document text into the message for the brain."""
+                           recent_doc: dict = None, voice_texts: list = None) -> str:
+    """Fold reply-context, voice transcripts, image OCR and extracted document text into the
+    message for the brain."""
     text = (text or "").strip()
     blocks: list = []
     if reply_text:
@@ -2423,6 +2487,14 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_bl
                       "сессии) — учитывай его как контекст]:\n«" + reply_text[:1500] + "»")
     if text:
         blocks.append(text)
+    for entry in (voice_texts or []):
+        vname, vtext = entry[0], entry[1]
+        blocks.append(
+            f"[Пользователь прислал ГОЛОСОВОЕ сообщение («{vname}»). Расшифровка:]\n«"
+            + vtext[:8000] + "»\n"
+            "[Отнесись к расшифровке как к обычному текстовому сообщению пользователя: ВЫПОЛНИ "
+            "то, о чём в нём просят, как если бы это было написано текстом. Явные ошибки "
+            "распознавания речи исправляй по смыслу; если смысл ключевой фразы неясен — переспроси.]")
     multi = len(image_texts) > 1
     for i, ocr in enumerate(image_texts, 1):
         label = (f"[Изображение №{i}. Распознанное содержимое:]" if multi
@@ -2456,8 +2528,9 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_bl
             "документ, сохранив всё остальное, — edit_attachment_document): " + listing + "]"
         )
     if recent_attachments and not (doc_blocks or image_texts):
+        _kl = {"image": "скрин", "audio": "голосовое"}
         listing = "; ".join(
-            f"{a['token']} — «{a['file_name']}» ({'скрин' if a.get('kind') == 'image' else 'документ'}, "
+            f"{a['token']} — «{a['file_name']}» ({_kl.get(a.get('kind'), 'документ')}, "
             f"{a.get('char_len') or 0} симв., прислан в {a.get('at_msk')} МСК)"
             for a in recent_attachments)
         blocks.append(
@@ -4038,7 +4111,8 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
         try:
             parts = []
             for f in task_comment_files(all_file_ids, task_id, max_files=6):
-                head = f"[Вложение задачи: «{f['name']}» ({'скрин/изображение' if f['kind'] == 'image' else 'документ'}"
+                _flabel = {"image": "скрин/изображение", "audio": "голосовое/аудио"}.get(f["kind"], "документ")
+                head = f"[Вложение задачи: «{f['name']}» ({_flabel}"
                 if f.get("attachment_id"):
                     head += f", attachment_id={f['attachment_id']}"
                 head += "). Распознанное/извлечённое содержимое:]"
@@ -4300,14 +4374,15 @@ def _bitrix_imbot_app_event():
             except Exception:  # noqa: BLE001
                 logging.exception("b24 MSGADD debug log failed")
         # The bot must SEE screenshots and understand replies to earlier (possibly reset) messages.
-        image_texts, reply_text, doc_blocks, msg_attachments = [], "", [], []
+        image_texts, reply_text, doc_blocks, msg_attachments, voice_texts = [], "", [], [], []
         try:
-            image_texts, reply_text, doc_blocks, msg_attachments = _b24_message_extras(
+            image_texts, reply_text, doc_blocks, msg_attachments, voice_texts = _b24_message_extras(
                 payload, endpoint, access_token,
                 agent_slug=(agent or {}).get("slug"), dialog_id=dialog_id, from_user_id=from_user_id)
         except Exception:  # noqa: BLE001
             logging.exception("b24 testbot: image/reply/doc extras failed")
-        if not dialog_id or (not message_text and not image_texts and not reply_text and not doc_blocks):
+        if not dialog_id or (not message_text and not image_texts and not reply_text
+                             and not doc_blocks and not voice_texts):
             return jsonify({"ok": True, "ignored": True, "reason": "empty"}), 200
         # Access gate: the universal (main) agent answers ONLY its team (allowlist =
         # non-'none' agent_access grants); a subagent answers only its member list. Everyone
@@ -4350,14 +4425,14 @@ def _bitrix_imbot_app_event():
             _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
             _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
             recent_atts, recent_doc = [], None
-            if not (msg_attachments or doc_blocks or image_texts):
+            if not (msg_attachments or doc_blocks or image_texts or voice_texts):
                 recent_atts = _b24_recent_dialog_attachments(dialog_id, (agent or {}).get("slug"))
                 recent_doc = _b24_recent_generated_doc(dialog_id, (agent or {}).get("slug"))
             _b24_app_process(
                 endpoint, access_token, bot_id, dialog_id,
                 _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks,
                                        msg_attachments, recent_attachments=recent_atts,
-                                       recent_doc=recent_doc),
+                                       recent_doc=recent_doc, voice_texts=voice_texts),
                 message_id, from_user_id, agent=agent,
             )
 
