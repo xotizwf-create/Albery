@@ -16,6 +16,8 @@ _FIELD_NAMES = ("минуты", "часы", "день месяца", "месяц
 _DOW_SHORT = ("вс", "пн", "вт", "ср", "чт", "пт", "сб")  # cron order: 0=Sunday
 _DOW_PLURAL = ("по воскресеньям", "по понедельникам", "по вторникам", "по средам",
                "по четвергам", "по пятницам", "по субботам")
+_MONTH_GEN = ("", "января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря")  # 1-based
 
 
 def _parse_field(spec: str, lo: int, hi: int) -> set[int] | None:
@@ -131,9 +133,13 @@ def describe(expr: str) -> str:
     except ValueError:
         return expr
     minute, hour, dom, month, dow = sets
-    if month is not None:
-        return expr
     at = _time_label(sets)
+    if month is not None:
+        # Annual schedule (e.g. a birthday reminder «0 9 12 3 *»): render «ежегодно 12 марта в 9:00»
+        # when it's a single month + single day at one time; otherwise fall back to the raw expr.
+        if (at and dom is not None and len(dom) == 1 and len(month) == 1 and dow is None):
+            return f"ежегодно {next(iter(dom))} {_MONTH_GEN[next(iter(month))]} в {at}"
+        return expr
 
     # sub-daily frequencies: */n minutes / every hour at :mm
     if at is None:

@@ -36,7 +36,13 @@ _AUTOMATION_TIMEOUT_S = int(os.getenv("AGENT_AUTOMATION_TIMEOUT_S", "300"))
 # A 'running' row older than timeout+retry window+slack means the process restarted
 # mid-run — treat it as interrupted (self-heals: display + run-now unblock).
 _RUNNING_STALE_S = _AUTOMATION_TIMEOUT_S * 2 + 900
-_SELF_AUTOMATIONS_MAX = int(os.getenv("AGENT_SELF_AUTOMATIONS_MAX", "10"))
+# Count ceiling per agent. This is NOT the overload guard — the worker pool below is (every
+# fire is queued and executed at most _AUTOMATION_WORKERS at a time, so N automations never
+# spawn N parallel LLM turns). So the count only needs to be a generous anti-runaway ceiling,
+# not a functional limit: raising it from the old 10 lets real fleets (e.g. one annual
+# birthday reminder per employee, task 594) coexist. Per-automation frequency stays capped
+# separately (_SELF_MAX_FIRES_PER_DAY). Override with AGENT_SELF_AUTOMATIONS_MAX.
+_SELF_AUTOMATIONS_MAX = int(os.getenv("AGENT_SELF_AUTOMATIONS_MAX", "100"))
 # Every run is a full LLM turn — frequency is capped hard. The owner (UI) may go down
 # to every 15 minutes; an agent scheduling itself from chat — at most hourly.
 _OWNER_MAX_FIRES_PER_DAY = 96
@@ -760,7 +766,9 @@ def automation_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, 
             raise ValueError(problem)
         own = _load_rows("WHERE agent_slug = %s AND created_by = 'self'", (slug,))
         if len(own) >= _SELF_AUTOMATIONS_MAX and auto_name not in {r["name"] for r in own}:
-            raise ValueError(f"Лимит {_SELF_AUTOMATIONS_MAX} автоматизаций: удали неактуальную (delete_my_automation).")
+            raise ValueError(f"Достигнут потолок {_SELF_AUTOMATIONS_MAX} автоматизаций у этого агента "
+                             "(защита от бесконтрольного роста). Удали неактуальную "
+                             "(delete_my_automation) или объедини несколько в одну.")
         label = f"агент «{agent.get('name') or slug}» (сам)"
         requester = _requester_name(str(args.get("requested_by") or ""), str(args.get("deliver_to") or ""))
         if requester:
