@@ -69,7 +69,7 @@ def store_attachment(
             dest = ATTACH_DIR / f"{token}__{_safe_name(file_name)}"
             dest.write_bytes(data)
             file_path = str(dest)
-        text = extracted_text or ""
+        text = (extracted_text or "").replace("\x00", "")  # NUL (0x00) is illegal in PG text
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(

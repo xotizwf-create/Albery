@@ -1582,6 +1582,16 @@ _B24_DELIVER_RE = re.compile(r"\[\[DELIVER_(PDF|XLSX|EXCEL|DOCX|WORD):\s*([^\]]*
 _B24_DELIVER_FMT = {"pdf": "pdf", "xlsx": "xlsx", "excel": "xlsx", "docx": "docx", "word": "docx"}
 
 
+_B24_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _b24_clean_text(s: str) -> str:
+    """Strip NUL and other C0 control bytes (keep tab/newline/cr). PostgreSQL text and
+    subprocess args cannot contain NUL (0x00); a binary file decoded as text smuggles it in
+    and crashes the whole turn (DataError / 'embedded null byte')."""
+    return _B24_CTRL_RE.sub("", s) if s else s
+
+
 def _b24_extract_document(data: bytes, name: str) -> str:
     """Extract readable text from a user-sent document. Pure-python extractors (pypdf / python-docx /
     openpyxl) + native text for md/txt/csv. Legacy binary .doc isn't supported (no libreoffice)."""
@@ -2235,9 +2245,11 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
             ftype = ftype or (_ft or "").lower()
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         is_image = ftype == "image" or ext in _B24_IMG_EXTS
-        # Respond to EVERYTHING: any non-image file is handled as a document (downloaded, stored,
-        # acknowledged, uploadable/forwardable) — never silently skipped by extension.
-        is_doc = not is_image
+        is_doc = ext in _B24_DOC_EXTS
+        # Respond to EVERYTHING, but do NOT text-extract binaries (audio/.xls/archives): decoding
+        # them as text yields NUL bytes that crash the DB store and the model call. Unknown types
+        # are downloaded, stored and acknowledged (uploadable/forwardable), just not parsed.
+        is_other = not is_image and not is_doc
         if not name and not ext:
             continue
         # Download the chat file. The BOT is a member of this dialog, so it can read the
@@ -2256,7 +2268,7 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
             # Never drop a file silently: tell the brain a file arrived but could not be
             # read, so it asks for a resend / PDF instead of inventing the contents.
             logging.warning("b24 extras: could not download fid=%s name=%s (app may need 'disk' scope)", fid, name)
-            if is_doc:
+            if not is_image:
                 doc_blocks.append((name or "документ",
                                    "(\u26a0\ufe0f не удалось скачать файл с сервера Bitrix. Честно скажи "
                                    "пользователю, что не смог открыть этот файл, и попроси прислать его "
@@ -2288,14 +2300,20 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
                 attachments.append({"token": token, "name": name or "image",
                                     "kind": "image", "char_len": len(txt or "")})
         else:
-            txt = _b24_extract_document(data, name or "file")
+            txt = _b24_clean_text(_b24_extract_document(data, name or "file")) if is_doc else ""
             token = _store("document", txt if (txt and txt.strip()) else "")
             if txt and txt.strip():
                 doc_blocks.append((name or "документ", txt.strip(), token))
-            else:
+            elif is_doc:
                 doc_blocks.append((name or "документ",
-                                   "(не удалось извлечь текст: возможно скан без текстового слоя, "
-                                   "пустой файл или устаревший формат .doc — попросите прислать PDF/DOCX)", token))
+                                   "(не удалось извлечь текст: возможно скан без текстового слоя, пустой "
+                                   "файл или устаревший формат .doc/.xls — попросите прислать PDF/DOCX/XLSX)", token))
+            else:
+                doc_blocks.append((name or "файл",
+                                   "(Файл получен и сохранён — это не документ и не картинка (например "
+                                   "аудио, .xls или архив), поэтому текст я не извлекаю. Его можно ЗАГРУЗИТЬ "
+                                   "на Google Диск или переслать по attachment_id. Чтобы я прочитал "
+                                   "содержимое — пришлите его в PDF/DOCX/XLSX. НЕ придумывай содержимое.)", token))
             if token:
                 attachments.append({"token": token, "name": name or "документ",
                                     "kind": "document", "char_len": len((txt or "").strip())})
@@ -2462,7 +2480,7 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_bl
             "правишь. Полный текст документа:\n" + str(recent_doc.get("extracted_text") or "")[:40000] + "]")
     if not text and (image_texts or doc_blocks):
         blocks.append("(Текста в сообщении не было — отвечай по содержимому вложения.)")
-    return "\n\n".join(blocks) if blocks else text
+    return _b24_clean_text("\n\n".join(blocks) if blocks else text)
 
 
 def _b24_recent_history(dialog_id: str, limit: int = 6,
@@ -3076,6 +3094,7 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
     # the isolation model is unchanged.
     extra_toolsets = os.getenv("B24_EXTRA_TOOLSETS", "web").strip().strip(",")
     toolset_arg = f"{toolset},{extra_toolsets}" if extra_toolsets else toolset
+    prompt = _b24_clean_text(prompt)  # NUL/control bytes crash Popen ('embedded null byte')
     cmd = ["hermes", "-z", prompt, "--continue", run_session, "-t", toolset_arg, "--yolo"]
     # If the first attempt fails (typically a Broken pipe to the single Codex account on a HEAVY
     # turn — big document HTML + lots of web browsing), the retry runs leaner so it actually
