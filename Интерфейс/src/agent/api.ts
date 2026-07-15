@@ -289,6 +289,7 @@ export interface AgentAutomation {
   create_time?: string; // "HH:MM" MSK
   created_by: "owner" | "self";
   creator_label: string;
+  creator: string; // clean «who created» label for the creator filter (Bitrix id resolved to name)
   is_active: boolean;
   next_run: string;
   last_run: string;

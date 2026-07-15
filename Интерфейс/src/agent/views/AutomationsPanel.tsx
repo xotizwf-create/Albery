@@ -174,6 +174,8 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
   const [busyId, setBusyId] = useState<number | 0 | null>(null);
   const [openId, setOpenId] = useState<number | null>(null);
   const [showForm, setShowForm] = useState(false);
+  // Filter the list by WHO created each automation (owner / an employee who asked / Hermes).
+  const [creatorFilter, setCreatorFilter] = useState<string>("all");
   const [fName, setFName] = useState("");
   const [fSchedule, setFSchedule] = useState("0 9 * * 1-5");
   const [fPrompt, setFPrompt] = useState("");
@@ -210,6 +212,15 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
       setBusyId(null);
     }
   };
+
+  // Distinct creators present, for the filter dropdown; «Все» keeps the full list.
+  const creators = Array.from(new Set<string>(rows.map((a) => a.creator).filter(Boolean))).sort(
+    (a, b) => a.localeCompare(b, "ru"),
+  );
+  const filteredRows =
+    creatorFilter === "all" ? rows : rows.filter((a) => a.creator === creatorFilter);
+  const nTasks = filteredRows.filter((a) => a.kind === "task").length;
+  const nAutos = filteredRows.length - nTasks;
 
   return (
     <div className="p-6 md:p-8 space-y-4">
@@ -300,8 +311,44 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
 
       {error && <div className="text-[13px] font-bold text-rose-500">{error}</div>}
 
+      {loaded && creators.length > 0 && (
+        <div className="flex items-center gap-3 flex-wrap bg-white border border-gray-200/70 rounded-xl px-3.5 py-2.5 shadow-sm">
+          <span className="text-[12px] font-bold text-gray-500">Создатель / для кого:</span>
+          <select
+            value={creatorFilter}
+            onChange={(e) => {
+              setCreatorFilter(e.target.value);
+              setOpenId(null);
+            }}
+            className="px-3 py-1.5 bg-white border border-gray-200/80 rounded-lg text-[12.5px] font-bold text-gray-700 outline-none focus:border-indigo-500 shadow-sm"
+          >
+            <option value="all">Все ({rows.length})</option>
+            {creators.map((c) => (
+              <option key={c} value={c}>
+                {c} ({rows.filter((a) => a.creator === c).length})
+              </option>
+            ))}
+          </select>
+          <span className="text-[11.5px] font-medium text-gray-400">
+            {creatorFilter === "all" ? "показаны все автоматизации" : `автоматизации: ${creatorFilter}`}
+            {" · "}
+            <span className="text-indigo-500 font-bold">{nAutos}</span> автоматизаций
+            {" · "}
+            <span className="text-sky-500 font-bold">{nTasks}</span> регулярных задач 📋
+          </span>
+          {creatorFilter !== "all" && (
+            <button
+              onClick={() => setCreatorFilter("all")}
+              className="ml-auto text-[11.5px] font-bold text-gray-400 hover:text-indigo-600 transition-colors"
+            >
+              сбросить фильтр ✕
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="space-y-2.5">
-        {rows.map((a) => {
+        {filteredRows.map((a) => {
           const st = statusChip(a);
           const src = sourceChip(a);
           const open = openId === a.id;
@@ -325,7 +372,12 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                   <p className="text-[12px] font-medium text-gray-500 truncate mt-0.5">
                     <span title={a.schedule} className="font-bold text-gray-700">{a.schedule_label}</span>
                     {a.next_run && a.is_active && <> · следующий: {a.next_run}</>}
-                    {a.creator_label && <> · поставил: {a.creator_label}</>}
+                    {a.creator && (
+                      <>
+                        {a.kind === "task" ? " · для: " : " · создал: "}
+                        <span className="font-bold text-gray-700" title={a.creator_label}>{a.creator}</span>
+                      </>
+                    )}
                     {(a.description || a.prompt) && <> · {a.description || a.prompt}</>}
                   </p>
                 </div>
@@ -437,6 +489,14 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
           <div className="text-center text-gray-400 text-[13px] font-medium py-10">
             У этого агента пока нет автоматизаций — добавьте здесь или попросите агента в чате
             («присылай мне каждый день в 9:00 сводку…»).
+          </div>
+        )}
+        {loaded && rows.length > 0 && filteredRows.length === 0 && (
+          <div className="text-center text-gray-400 text-[13px] font-medium py-10">
+            У «{creatorFilter}» нет автоматизаций у этого агента.{" "}
+            <button onClick={() => setCreatorFilter("all")} className="text-indigo-500 font-bold hover:underline">
+              Показать все
+            </button>
           </div>
         )}
         {!loaded && !error && (

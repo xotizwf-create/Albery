@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -115,7 +116,55 @@ def _running_is_stale(r: dict[str, Any]) -> bool:
         return False
 
 
-def _automation_json(r: dict[str, Any]) -> dict[str, Any]:
+# --- «Кто создал» for the tab's creator filter --------------------------------------------
+# creator_label is free text ("владелец (панель)", "Hermes cron · owner-daily",
+# "агент «X» (сам) · по просьбе: пользователь Bitrix24 id=30"). Derive a CLEAN person/creator
+# label for grouping, resolving a Bitrix id to the employee's name. The raw label stays as tooltip.
+_USER_NAMES_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
+_BITRIX_ID_RE = re.compile(r"id\s*=?\s*(\d+)")
+_REQUESTED_BY_RE = re.compile(r"по\s+просьбе:\s*(.+)$", re.IGNORECASE)
+
+
+def _user_names() -> dict[int, str]:
+    """bitrix_user_id → ФИО, 60s cache."""
+    now = time.time()
+    if now - float(_USER_NAMES_CACHE["at"] or 0) < 60 and _USER_NAMES_CACHE["map"]:
+        return _USER_NAMES_CACHE["map"]
+    names: dict[int, str] = {}
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT bitrix_user_id, full_name FROM users "
+                            "WHERE bitrix_user_id IS NOT NULL AND COALESCE(full_name,'') <> ''")
+                names = {int(r["bitrix_user_id"]): r["full_name"] for r in cur.fetchall()}
+    except Exception:  # noqa: BLE001
+        logging.exception("automations: user-names load failed")
+    _USER_NAMES_CACHE.update(at=now, map=names)
+    return names
+
+
+def _creator_display(created_by: str, creator_label: str, kind: str, names: dict[int, str]) -> str:
+    """Clean «кто создал» label used by the tab's creator filter."""
+    cl = (creator_label or "").strip()
+    low = cl.lower()
+    if kind == "system" or low.startswith("hermes cron") or "системн" in low:
+        return "Hermes (система)"
+    m = _REQUESTED_BY_RE.search(cl)
+    if m:
+        who = m.group(1).strip()
+        wid = _BITRIX_ID_RE.search(who)
+        if wid and int(wid.group(1)) in names:
+            return names[int(wid.group(1))]
+        return "Владелец" if who.lower() == "владелец" else who
+    if created_by == "owner":
+        return "Владелец"
+    if kind == "task":
+        return "Из чата"
+    return cl or "—"
+
+
+def _automation_json(r: dict[str, Any], names: dict[int, str] | None = None) -> dict[str, Any]:
+    names = names if names is not None else _user_names()
     nxt = cron_schedule.next_run(r["schedule"], msk_now()) if r["is_active"] else None
     status = r["last_status"] or ""
     if _running_is_stale(r):
@@ -132,6 +181,7 @@ def _automation_json(r: dict[str, Any]) -> dict[str, Any]:
         "kind": r["kind"],
         "created_by": r["created_by"],
         "creator_label": r["creator_label"] or "",
+        "creator": _creator_display(r["created_by"], r["creator_label"] or "", r["kind"], names),
         "is_active": bool(r["is_active"]),
         "next_run": _when(nxt),
         "last_run": _when(r["last_run_at"]),
@@ -147,7 +197,8 @@ def _automation_json(r: dict[str, Any]) -> dict[str, Any]:
 # DETERMINISTICALLY (a plain tasks.task.add, no LLM turn — so they cost nothing per fire and
 # don't count against the automation frequency caps). Here we only render/manage them.
 
-def _recurring_json(r: dict[str, Any]) -> dict[str, Any]:
+def _recurring_json(r: dict[str, Any], names: dict[int, str] | None = None) -> dict[str, Any]:
+    names = names if names is not None else _user_names()
     spec = r.get("spec")
     if isinstance(spec, str):
         try:
@@ -185,6 +236,10 @@ def _recurring_json(r: dict[str, Any]) -> dict[str, Any]:
         "kind": "task",
         "created_by": "self",
         "creator_label": "агент (из чата)",
+        # A recurring task is set up by the agent from chat FOR a responsible person — group it
+        # under that person so the «по человеку» filter is useful (task 1556: «относятся к
+        # выбранному человеку»). Falls back to «Из чата» when no responsible is recorded.
+        "creator": (r.get("responsible_name") or "").strip() or "Из чата",
         "is_active": bool(r.get("active")),
         "next_run": _when(r.get("next_run_at")),
         "last_run": _when(r.get("last_created_at")),
@@ -242,10 +297,11 @@ def _validate(name: str, schedule: str, prompt: str, max_per_day: int) -> str | 
 @app.get("/api/agent-center/agents/<slug>/automations")
 def agent_automations_list(slug: str):
     try:
+        names = _user_names()
         rows = _load_rows("WHERE agent_slug = %s", (slug,))
-        payload = [_automation_json(r) for r in rows]
+        payload = [_automation_json(r, names) for r in rows]
         # Recurring Bitrix tasks of this agent ride along as kind='task' rows.
-        payload += [_recurring_json(r)
+        payload += [_recurring_json(r, names)
                     for r in _recurring_rows("WHERE COALESCE(agent_slug, 'main') = %s", (slug,))]
         return jsonify({"automations": payload})
     except Exception:  # noqa: BLE001
