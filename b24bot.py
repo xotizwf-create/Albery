@@ -2139,6 +2139,48 @@ def task_comment_files(file_ids: list, task_id: int, max_files: int = 5) -> list
     return out
 
 
+def _b24_message_file_ids(endpoint: str, access_token: str, dialog_id, message_id,
+                          limit: int = 15) -> list:
+    """Disk file ids attached to THIS chat message (params.FILE_ID), read from the dialog.
+    Bitrix delivers the inline FILES block inconsistently, so we ALSO recover files by reference
+    — this is what makes an uncaptioned or a follow-up file reliably visible to the agent."""
+    if not (endpoint and access_token and dialog_id and message_id):
+        return []
+    try:
+        r = _b24_app_call(endpoint, access_token, "im.dialog.messages.get",
+                          {"DIALOG_ID": str(dialog_id), "LIMIT": int(limit)}, _log=False)
+        for m in ((r or {}).get("result") or {}).get("messages") or []:
+            if str(m.get("id")) == str(message_id):
+                params = m.get("params") if isinstance(m.get("params"), dict) else {}
+                fid = params.get("FILE_ID")
+                return [str(x) for x in fid] if isinstance(fid, list) else []
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 extras: file-id recovery failed dlg=%s msg=%s", dialog_id, message_id)
+    return []
+
+
+def _b24_disk_file_meta(endpoint: str, access_token: str, wh: str, fid) -> tuple:
+    """File name for a disk file id — bot/app token disk.file.get first, webhook fallback."""
+    name = ""
+    try:
+        if endpoint and access_token:
+            r = _b24_app_call(endpoint, access_token, "disk.file.get", {"id": fid}, _log=False)
+            res = (r or {}).get("result") or {}
+            if isinstance(res, dict):
+                name = str(res.get("NAME") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    if not name and wh:
+        try:
+            rr = requests.post(f"{wh}/disk.file.get.json", json={"id": fid}, timeout=20)
+            res = (rr.json() or {}).get("result") or {}
+            if isinstance(res, dict):
+                name = str(res.get("NAME") or "")
+        except Exception:  # noqa: BLE001
+            pass
+    return name, ""
+
+
 def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "",
                         agent_slug: str | None = None, dialog_id: str = "", from_user_id: Any = None):
     """Parse images + documents + reply-context straight from the flattened imbot event payload.
@@ -2176,12 +2218,27 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
         val = v[0] if isinstance(v, list) and v else v
         files.setdefault(m.group(1), {})[m.group(2)] = val
     wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
-    for fid, f in list(files.items())[:5]:
+    # Recover files referenced by THIS message (inline FILES is delivered inconsistently by
+    # Bitrix; an uncaptioned or follow-up file often has no inline block) and merge by disk id.
+    message_id = _imbot_event_param(payload, "MESSAGE_ID") or ""
+    try:
+        for _rfid in _b24_message_file_ids(endpoint, access_token, dialog_id, message_id):
+            files.setdefault(str(_rfid), {})
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 extras: file-id recovery failed", exc_info=True)
+    for fid, f in list(files.items())[:10]:
         name = str(f.get("name") or "")
+        ftype = str(f.get("type") or "").lower()
+        if not name:
+            # Recovered by id (no inline metadata): resolve its real name via disk.file.get.
+            name, _ft = _b24_disk_file_meta(endpoint, access_token, wh, fid)
+            ftype = ftype or (_ft or "").lower()
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-        is_image = str(f.get("type") or "").lower() == "image" or ext in _B24_IMG_EXTS
-        is_doc = ext in _B24_DOC_EXTS
-        if not (is_image or is_doc):
+        is_image = ftype == "image" or ext in _B24_IMG_EXTS
+        # Respond to EVERYTHING: any non-image file is handled as a document (downloaded, stored,
+        # acknowledged, uploadable/forwardable) — never silently skipped by extension.
+        is_doc = not is_image
+        if not name and not ext:
             continue
         # Download the chat file. The BOT is a member of this dialog, so it can read the
         # file via its own OAuth token once the local app has the 'disk' scope; the static
