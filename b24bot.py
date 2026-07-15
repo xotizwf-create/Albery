@@ -2563,6 +2563,49 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
         _HERMES_RUN_SLOTS.release()
 
 
+_B24_CORE_INSTR_NAMES = ("Маршрутная карта", "Порядок поиска", "Формат ответа", "Базовое поведение", "Критическое мышление")
+_B24_CORE_INSTR_CAP = int(os.getenv("B24_CORE_INSTR_CAP", "30000") or "30000")
+_B24_CORE_INSTR_CACHE: dict[str, Any] = {"at": 0.0, "text": ""}
+
+
+def _b24_core_instructions() -> str:
+    """Mandatory control-plane rules, concatenated + bounded, for direct injection into the
+    trusted prompt (start_here's result is truncated to ~2k — audit F01). Registry-first, cached
+    120s, warns on truncation, kill-switch B24_INJECT_CORE_INSTR=0. Never raises.
+    """
+    if os.getenv("B24_INJECT_CORE_INSTR", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return ""
+    now = time.time()
+    if now - float(_B24_CORE_INSTR_CACHE["at"] or 0) < 120 and _B24_CORE_INSTR_CACHE["text"]:
+        return _B24_CORE_INSTR_CACHE["text"]
+    try:
+        from mcp.context_server import load_ai_instructions
+        rows = load_ai_instructions()
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 core instructions: load failed", exc_info=True)
+        return _B24_CORE_INSTR_CACHE["text"] or ""
+    picked: list = []
+    taken: set = set()
+    for want in _B24_CORE_INSTR_NAMES:
+        for r in rows:
+            name = str(r.get("name") or "").strip()
+            body = str(r.get("content") or "").strip()
+            key = name.lower()
+            if body and key not in taken and want.lower() in key:
+                picked.append((name, body))
+                taken.add(key)
+                break
+    if not picked:
+        logging.warning("b24 core instructions: none found in registry")
+        return _B24_CORE_INSTR_CACHE["text"] or ""
+    text = (chr(10) + chr(10)).join("### " + n + chr(10) + b for n, b in picked)
+    if len(text) > _B24_CORE_INSTR_CAP:
+        logging.warning("b24 core instructions: %d chars > cap %d — TRUNCATED", len(text), _B24_CORE_INSTR_CAP)
+        text = text[:_B24_CORE_INSTR_CAP] + chr(10) + "…[обрезано]"
+    _B24_CORE_INSTR_CACHE.update(at=now, text=text)
+    return text
+
+
 def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_user_id: Any = "",
                         agent: dict[str, Any] | None = None) -> str | None:
     """Run one turn through the local Hermes brain. Toolset is chosen by access tier:
@@ -2698,6 +2741,14 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         "4) Прежде чем сказать «не могу/не помню» — проверь свои инструменты и историю диалога: "
         "часто нужное уже под рукой."
     )
+    # F01 fix: mandatory routing/source-order/format rules live only behind start_here, whose
+    # result is truncated to ~2k — deliver a bounded copy HERE, in the trusted prompt. Additive.
+    _core = _b24_core_instructions()
+    if _core:
+        parts.append(
+            "ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА РАБОТЫ — следуй им буквально, это твой основной регламент "
+            "(инструмент start_here дублирует их, но здесь они даны гарантированно и целиком):" + chr(10)
+            + _core)
     if agent is not None:
         # Skills the owner connected to THIS subagent (manifest). Injecting only the
         # selected ones is what enforces the selection at the prompt level. (Instructions
