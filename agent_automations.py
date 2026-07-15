@@ -143,23 +143,31 @@ def _user_names() -> dict[int, str]:
     return names
 
 
+def _owner_name(names: dict[int, str]) -> str:
+    """The owner's real name (first configured owner id, default 16 = Александр Никитенко)."""
+    for i in re.findall(r"\d+", os.getenv("B24_TESTBOT_OWNER_USER_IDS", "16")):
+        if int(i) in names:
+            return names[int(i)]
+    return "Владелец"
+
+
 def _creator_display(created_by: str, creator_label: str, kind: str, names: dict[int, str]) -> str:
-    """Clean «кто создал» label used by the tab's creator filter."""
+    """Clean «кто ФАКТИЧЕСКИ создал» label for the creator filter — a real person's name
+    (owner → Александр Никитенко; an employee who asked the agent → that employee), or
+    «Hermes (система)» for the built-in server crons. Never the participant/responsible."""
     cl = (creator_label or "").strip()
     low = cl.lower()
     if kind == "system" or low.startswith("hermes cron") or "системн" in low:
         return "Hermes (система)"
-    m = _REQUESTED_BY_RE.search(cl)
+    m = _REQUESTED_BY_RE.search(cl)  # self-created: «… · по просьбе: <кто>»
     if m:
         who = m.group(1).strip()
         wid = _BITRIX_ID_RE.search(who)
         if wid and int(wid.group(1)) in names:
             return names[int(wid.group(1))]
-        return "Владелец" if who.lower() == "владелец" else who
+        return _owner_name(names) if who.lower() == "владелец" else who
     if created_by == "owner":
-        return "Владелец"
-    if kind == "task":
-        return "Из чата"
+        return _owner_name(names)
     return cl or "—"
 
 
@@ -236,10 +244,11 @@ def _recurring_json(r: dict[str, Any], names: dict[int, str] | None = None) -> d
         "kind": "task",
         "created_by": "self",
         "creator_label": "агент (из чата)",
-        # A recurring task is set up by the agent from chat FOR a responsible person — group it
-        # under that person so the «по человеку» filter is useful (task 1556: «относятся к
-        # выбранному человеку»). Falls back to «Из чата» when no responsible is recorded.
-        "creator": (r.get("responsible_name") or "").strip() or "Из чата",
+        # The person who actually CREATED/requested this recurring task (creator_bitrix_id),
+        # resolved to a name — NOT the responsible/participant. Task 1556: filter by who created it.
+        "creator": (names.get(int(r["creator_bitrix_id"]))
+                    if r.get("creator_bitrix_id") and int(r["creator_bitrix_id"]) in names
+                    else "Из чата"),
         "is_active": bool(r.get("active")),
         "next_run": _when(r.get("next_run_at")),
         "last_run": _when(r.get("last_created_at")),
@@ -255,9 +264,9 @@ def _recurring_json(r: dict[str, Any], names: dict[int, str] | None = None) -> d
     }
 
 
-_RECURRING_COLS = ("id, title, responsible_name, schedule_desc, deadline_desc, result_criteria, "
-                   "active, next_run_at, last_created_at, last_task_id, last_error, spec, agent_slug, "
-                   "period, weekdays, day_of_month, create_time")
+_RECURRING_COLS = ("id, title, responsible_name, creator_bitrix_id, schedule_desc, deadline_desc, "
+                   "result_criteria, active, next_run_at, last_created_at, last_task_id, last_error, "
+                   "spec, agent_slug, period, weekdays, day_of_month, create_time")
 
 
 def _recurring_rows(where: str, args: tuple) -> list[dict[str, Any]]:

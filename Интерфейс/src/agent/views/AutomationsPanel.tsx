@@ -160,11 +160,12 @@ const ScheduleEditor: React.FC<{
   );
 };
 
+// Exactly three types, nothing else: a recurring Bitrix task, a cron automation (agent run on
+// schedule — whether the owner or the agent set it up), or a built-in system automation (Hermes cron).
 const sourceChip = (a: AgentAutomation): { text: string; cls: string } => {
-  if (a.kind === "system") return { text: "системная · Hermes", cls: "bg-violet-50 text-violet-600 border-violet-100" };
-  if (a.kind === "task") return { text: "регулярная задача 📋", cls: "bg-sky-50 text-sky-600 border-sky-100" };
-  if (a.created_by === "self") return { text: "сам поставил 🤖", cls: "bg-emerald-50 text-emerald-600 border-emerald-100" };
-  return { text: "владелец", cls: "bg-indigo-50 text-indigo-600 border-indigo-100" };
+  if (a.kind === "task") return { text: "регулярная задача", cls: "bg-sky-50 text-sky-600 border-sky-100" };
+  if (a.kind === "system") return { text: "системная автоматизация", cls: "bg-violet-50 text-violet-600 border-violet-100" };
+  return { text: "крон автоматизация", cls: "bg-indigo-50 text-indigo-600 border-indigo-100" };
 };
 
 export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
@@ -220,7 +221,8 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
   const filteredRows =
     creatorFilter === "all" ? rows : rows.filter((a) => a.creator === creatorFilter);
   const nTasks = filteredRows.filter((a) => a.kind === "task").length;
-  const nAutos = filteredRows.length - nTasks;
+  const nSystem = filteredRows.filter((a) => a.kind === "system").length;
+  const nCron = filteredRows.length - nTasks - nSystem;
 
   return (
     <div className="p-6 md:p-8 space-y-4">
@@ -313,7 +315,7 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
 
       {loaded && creators.length > 0 && (
         <div className="flex items-center gap-3 flex-wrap bg-white border border-gray-200/70 rounded-xl px-3.5 py-2.5 shadow-sm">
-          <span className="text-[12px] font-bold text-gray-500">Создатель / для кого:</span>
+          <span className="text-[12px] font-bold text-gray-500">Создатель:</span>
           <select
             value={creatorFilter}
             onChange={(e) => {
@@ -330,11 +332,16 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
             ))}
           </select>
           <span className="text-[11.5px] font-medium text-gray-400">
-            {creatorFilter === "all" ? "показаны все автоматизации" : `автоматизации: ${creatorFilter}`}
+            {creatorFilter === "all" ? "показаны все · " : `создал ${creatorFilter} · `}
+            <span className="text-indigo-500 font-bold">{nCron}</span> крон-автоматизаций
             {" · "}
-            <span className="text-indigo-500 font-bold">{nAutos}</span> автоматизаций
-            {" · "}
-            <span className="text-sky-500 font-bold">{nTasks}</span> регулярных задач 📋
+            <span className="text-sky-500 font-bold">{nTasks}</span> регулярных задач
+            {nSystem > 0 && (
+              <>
+                {" · "}
+                <span className="text-violet-500 font-bold">{nSystem}</span> системных
+              </>
+            )}
           </span>
           {creatorFilter !== "all" && (
             <button
@@ -374,7 +381,7 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                     {a.next_run && a.is_active && <> · следующий: {a.next_run}</>}
                     {a.creator && (
                       <>
-                        {a.kind === "task" ? " · для: " : " · создал: "}
+                        {" · создал: "}
                         <span className="font-bold text-gray-700" title={a.creator_label}>{a.creator}</span>
                       </>
                     )}
