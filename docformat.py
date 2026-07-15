@@ -8,8 +8,8 @@ should look. That is the whole point: when a user asks «приложения с
 
 Supported subset (documented in the tool description; unknown tags are ignored, their
 text flows through):
-  blocks:  h1..h4, p, div, li (ul/ol), table/tr/th/td, br, hr
-  inline:  b/strong, i/em, u, s
+  blocks:  h1..h4, p, div, li (ul/ol), table/tr/th/td, br, hr  (headings default to centre)
+  inline:  b/strong, i/em, u, s  (stray [b]…[/b] BB-codes and **markdown** are normalised to these)
   styles:  text-align: left|center|right|justify (or align="...")
            page-break-before: always  (or class="page-break" on any block/hr)
            font-size: NNpt · text-indent: N.NNcm · line-height: N.N
@@ -30,6 +30,24 @@ _EMOJI_RE = re.compile(
 )
 
 _ALIGN = {"left": 0, "center": 1, "right": 2, "justify": 3}  # WD_ALIGN_PARAGRAPH values
+
+# The agent is heavily trained on Bitrix chat markup ([b]…[/b]) and Markdown (**bold**), so it
+# sometimes emits those INSTEAD of HTML inside a document. This parser only understands HTML
+# tags, so a stray [b] / ** would otherwise print LITERALLY in the finished Word file (the
+# «необработанные теги» bug). Normalise the known chat/markdown emphasis forms to HTML first.
+_BB_TAGS = {"b": "b", "i": "i", "u": "u", "s": "s", "strike": "s"}
+_BB_RE = re.compile(r"\[(/?)(b|i|u|s|strike)\]", re.IGNORECASE)
+_MD_BOLD_RE = re.compile(r"\*\*(\S.*?\S|\S)\*\*")  # **bold**, within a line, no stray spans
+
+
+def _normalize_markup(html: str) -> str:
+    """Convert stray Bitrix BB-codes and **markdown bold** into the HTML tags this renderer
+    understands, so emphasis becomes real formatting instead of leaking as literal text."""
+    def _bb(m: "re.Match[str]") -> str:
+        return f"<{m.group(1)}{_BB_TAGS[m.group(2).lower()]}>"
+    html = _BB_RE.sub(_bb, html)
+    html = _MD_BOLD_RE.sub(r"<b>\1</b>", html)
+    return html
 
 
 def _style_dict(attrs: dict[str, str]) -> dict[str, str]:
@@ -99,7 +117,10 @@ class _DocBuilder(HTMLParser):
                 pass
         align = (style.get("text-align") or attrs.get("align") or "").strip().lower()
         if tag in self._HEAD_SIZES and not align:
-            align = "center" if tag == "h1" else "left"
+            # GOST default for official documents (contracts): ALL section headings are centred,
+            # not only the title. The owner's «заголовки договоров по центру» is thus guaranteed by
+            # code — the model no longer has to remember it. Explicit text-align still wins.
+            align = "center"
         # GOST default for official documents: plain paragraphs are justified unless the
         # HTML says otherwise. The model no longer has to remember this on every <p> —
         # explicit text-align always wins, lists/headers/tables keep their own defaults.
@@ -297,7 +318,7 @@ def html_to_docx(html: str, *, font_size_pt: float = 12.0, line_spacing: float =
     section.bottom_margin = Cm(2.0)
     # the default empty first paragraph would push content down — reuse it as a no-op
     builder = _DocBuilder(doc, base_size=float(font_size_pt), base_line=float(line_spacing))
-    builder.feed(str(html or ""))
+    builder.feed(_normalize_markup(str(html or "")))
     builder.close()
     if builder.table_rows is not None:  # unclosed <table> at EOF
         builder._flush_table()
