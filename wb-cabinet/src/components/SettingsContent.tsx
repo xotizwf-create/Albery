@@ -34,45 +34,52 @@ export function SettingsContent() {
   };
 
   return (
-    <div className="flex-1 flex flex-col min-w-0 bg-slate-50 p-4 md:p-8 overflow-y-auto">
-      <div className="max-w-[1400px] mx-auto w-full flex flex-col gap-6 md:gap-8">
-        <div>
-          <h1 className="text-3xl font-black text-slate-900 tracking-tight">Настройка</h1>
-          <p className="text-sm text-slate-500 mt-2 font-medium">Управление базовыми параметрами, каталогом и финансовыми планами</p>
-        </div>
-
-        <div className="flex flex-col lg:flex-row gap-6 lg:gap-8 items-start">
-          <div className="w-full lg:w-72 shrink-0 flex flex-col gap-2">
-            {SETTINGS_TABS.map((tab) => {
-              const Icon = tab.icon;
-              const isActive = activeTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={cn(
-                    "w-full flex items-start gap-4 p-4 rounded-2xl text-left transition-all border border-transparent",
-                    isActive ? "bg-white shadow-sm shadow-slate-200/50" : "bg-transparent hover:bg-slate-200/50"
-                  )}
-                >
-                  <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center shrink-0 transition-colors", isActive ? "bg-brand-50 text-brand-600" : "bg-slate-200/50 text-slate-500")}>
-                    <Icon className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <div className={cn("font-bold text-sm mb-1", isActive ? "text-slate-900" : "text-slate-700")}>{tab.label}</div>
-                    <div className="text-xs text-slate-500 font-medium leading-relaxed">{tab.description}</div>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="flex-1 w-full min-w-0">
-            <div className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
-              {activeTab === 'articles' && <ArticlesSettings articles={articles} loading={loading} toggleExclude={toggleExclude} />}
-              {activeTab === 'sales_plan' && <SalesPlanSettings articles={articles.filter((a) => !a.excluded)} loading={loading} />}
+    <div className="w-full min-w-0">
+      <div className="flex w-full flex-col gap-5 md:gap-6">
+        <section className="overflow-hidden rounded-3xl border border-slate-200 bg-gradient-to-br from-white via-white to-brand-50/60 p-5 shadow-sm md:p-7">
+          <div className="flex flex-col gap-5 2xl:flex-row 2xl:items-end 2xl:justify-between">
+            <div className="max-w-2xl">
+              <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-brand-100 bg-brand-50 px-3 py-1 text-[11px] font-bold uppercase tracking-[0.14em] text-brand-600">
+                Управление WB-кабинетом
+              </div>
+              <h1 className="text-3xl font-black tracking-tight text-slate-900 md:text-4xl">Настройка</h1>
+              <p className="mt-2 text-sm font-medium leading-6 text-slate-500 md:text-base">
+                Управляйте каталогом, себестоимостью и планами продаж в одном рабочем пространстве.
+              </p>
             </div>
+
+            <nav className="grid w-full grid-cols-1 gap-3 sm:grid-cols-2 2xl:w-auto" aria-label="Разделы настройки">
+              {SETTINGS_TABS.map((tab) => {
+                const Icon = tab.icon;
+                const isActive = activeTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    className={cn(
+                      "group flex min-h-20 w-full items-center gap-3 rounded-2xl border p-3.5 text-left transition-all 2xl:min-w-72",
+                      isActive
+                        ? "border-brand-200 bg-white text-slate-900 shadow-md shadow-brand-500/10"
+                        : "border-white/70 bg-white/60 text-slate-700 hover:border-slate-200 hover:bg-white hover:shadow-sm"
+                    )}
+                  >
+                    <div className={cn("flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-colors", isActive ? "bg-brand-600 text-white shadow-sm shadow-brand-500/30" : "bg-slate-100 text-slate-500 group-hover:bg-brand-50 group-hover:text-brand-600")}>
+                      <Icon className="w-5 h-5" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="mb-1 text-sm font-bold">{tab.label}</div>
+                      <div className="text-xs font-medium leading-relaxed text-slate-500">{tab.description}</div>
+                    </div>
+                  </button>
+                );
+              })}
+            </nav>
           </div>
+        </section>
+
+        <div className="w-full min-w-0 overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_24px_70px_-42px_rgba(15,23,42,0.45)]">
+          {activeTab === 'articles' && <ArticlesSettings articles={articles} loading={loading} toggleExclude={toggleExclude} />}
+          {activeTab === 'sales_plan' && <SalesPlanSettings articles={articles.filter((a) => !a.excluded)} loading={loading} />}
         </div>
       </div>
     </div>
@@ -114,7 +121,7 @@ function LoadingBlock() {
 function ArticlesSettings({ articles, loading, toggleExclude }: { articles: Card[]; loading: boolean; toggleExclude: (nm: number) => void }) {
   const activeCount = articles.filter((a) => !a.excluded).length;
   return (
-    <div className="p-6 md:p-8 flex flex-col gap-6 animate-in fade-in zoom-in-95 duration-300">
+    <div className="flex flex-col gap-6 p-5 animate-in fade-in zoom-in-95 duration-300 md:p-7">
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-xl font-bold text-slate-900">Артикулы и себестоимость</h2>
@@ -131,9 +138,9 @@ function ArticlesSettings({ articles, loading, toggleExclude }: { articles: Card
       {loading ? <LoadingBlock /> : articles.length === 0 ? (
         <div className="py-12 text-center text-sm font-bold text-slate-400">Каталог пуст — товары появятся после синхронизации с WB.</div>
       ) : (
-        <div className="border border-slate-200 rounded-2xl overflow-hidden mt-2 shadow-sm">
-          <div className="overflow-x-auto max-h-[70vh]">
-            <table className="w-full text-left whitespace-nowrap">
+        <div className="mt-1 overflow-hidden rounded-2xl border border-slate-200 shadow-sm">
+          <div className="max-h-[70vh] overflow-auto">
+            <table className="min-w-[980px] w-full text-left whitespace-nowrap">
               <thead className="bg-white border-b border-slate-200 shadow-sm sticky top-0 z-20">
                 <tr>
                   <th className="px-5 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-wider sticky left-0 bg-white z-10 w-64 border-r border-slate-100 shadow-[1px_0_0_0_#f1f5f9]">Артикул</th>
@@ -263,7 +270,7 @@ function SalesPlanSettings({ articles, loading }: { articles: Card[], loading: b
   const months = getMonthsInRange(periodStart, periodEnd);
 
   return (
-    <div className="p-6 md:p-8 flex flex-col gap-6 animate-in fade-in zoom-in-95 duration-300">
+    <div className="flex flex-col gap-6 p-5 animate-in fade-in zoom-in-95 duration-300 md:p-7">
       <div className="flex flex-col xl:flex-row items-start xl:items-center justify-between gap-6">
         <div>
           <h2 className="text-xl font-bold text-slate-900">План продаж</h2>
@@ -293,9 +300,9 @@ function SalesPlanSettings({ articles, loading }: { articles: Card[], loading: b
       ) : articles.length === 0 ? (
         <div className="py-12 text-center text-sm font-bold text-slate-400">Нет активных товаров — все исключены или каталог ещё пуст.</div>
       ) : (
-        <div className="border border-slate-200 rounded-2xl overflow-hidden mt-2 shadow-sm">
-          <div className="overflow-x-auto max-h-[70vh]">
-            <table className="w-full text-left whitespace-nowrap">
+        <div className="mt-1 overflow-hidden rounded-2xl border border-slate-200 shadow-sm">
+          <div className="max-h-[70vh] overflow-auto">
+            <table className="min-w-max w-full text-left whitespace-nowrap">
               <thead className="bg-white sticky top-0 z-20">
                 <tr>
                   <th colSpan={2} className="px-5 py-4 text-[10px] font-bold text-slate-500 uppercase tracking-wider sticky left-0 bg-white z-20 border-r border-slate-100">Товар</th>
