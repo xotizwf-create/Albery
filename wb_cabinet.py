@@ -906,6 +906,13 @@ def _brand_where(brand: str | None, col: str = "brand") -> tuple[str, list]:
     return "", []
 
 
+def _range_complete(source_from: str | None, source_to: str | None,
+                    requested_from: str, requested_to: str, sync_done: Any) -> bool:
+    """A historical flag is insufficient: coverage must include the selected dates."""
+    return bool(sync_done and source_from and source_to
+                and source_from <= requested_from and source_to >= requested_to)
+
+
 def q_brands() -> list[str]:
     with pg_connect() as conn:
         with conn.cursor() as cur:
@@ -974,9 +981,13 @@ def q_summary(d_from: str, d_to: str, brand: str | None) -> dict[str, Any]:
         "top_articles": top,
         "quality": {
             "orders": {"from": coverage.get("orders_min"), "to": coverage.get("orders_max"),
-                       "complete": bool(coverage.get("orders_done"))},
+                       "complete": _range_complete(
+                           coverage.get("orders_min"), coverage.get("orders_max"), d_from, d_to,
+                           coverage.get("orders_done"))},
             "sales_operational": {"from": coverage.get("sales_min"), "to": coverage.get("sales_max"),
-                                  "complete": bool(coverage.get("sales_done"))},
+                                  "complete": _range_complete(
+                                      coverage.get("sales_min"), coverage.get("sales_max"), d_from, d_to,
+                                      coverage.get("sales_done"))},
         },
     }
 

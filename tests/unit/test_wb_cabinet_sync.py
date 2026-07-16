@@ -11,6 +11,7 @@ from wb_cabinet import (
     _jwt_claims,
     _num,
     _paid_storage_row,
+    _range_complete,
     _stock_report_rows,
     q_rnp,
     q_tax,
@@ -135,6 +136,12 @@ def test_token_metadata_and_history_page_completion_are_explicit():
     assert _jwt_claims("not-a-jwt") == {}
     assert _history_page_complete([{}] * 79999) is True
     assert _history_page_complete([{}] * 80000) is False
+
+
+def test_coverage_is_complete_only_when_it_contains_selected_period():
+    assert _range_complete("2026-01-17", "2026-07-17", "2026-01-17", "2026-07-17", True)
+    assert not _range_complete("2026-01-18", "2026-02-18", "2026-01-17", "2026-07-17", True)
+    assert not _range_complete("2026-01-17", "2026-07-17", "2026-01-17", "2026-07-17", False)
 
 
 def test_finance_backfill_uses_one_full_range_and_persists_rrd_cursor(monkeypatch, fake_pg):
