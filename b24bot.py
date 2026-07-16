@@ -1341,12 +1341,12 @@ def _b24_main_allows(from_user_id: Any) -> bool:
 # genuinely fresh epoch (history floor raised + no carried summary, like the manual «Новая
 # сессия» button); after a turn cap we rotate to a new epoch seeded with a short summary of
 # the previous one (conversation-summary-buffer) so long threads never blow the window.
-B24_IDLE_RESET_SECONDS = int(os.getenv("B24_TESTBOT_IDLE_RESET_SECONDS", "1800"))
-# Hard reset (full history-floor raise) only after THIS much idle. Between the soft and hard
-# thresholds the epoch rotates but the last Q/A stay visible — full amnesia after 30 minutes
-# was the owner's top complaint (2026-07-16: an hour later the agent knew nothing of the
-# morning's work in the same dialog).
-B24_IDLE_HARD_RESET_SECONDS = int(os.getenv("B24_IDLE_HARD_RESET_SECONDS", "86400"))
+# Idle reset (owner decision 2026-07-16): after 3 hours of silence the next message starts a
+# GENUINELY fresh session — history floor raised, no carried summary, no digests. The reset is
+# NEVER silent: the user gets a «Начата новая сессия…» notice in the same dialog from the same
+# agent's bot (_b24_notify_session_reset); quote-replying an old message restores its context
+# (the quoted text is injected into the prompt by the reply handler).
+B24_IDLE_RESET_SECONDS = int(os.getenv("B24_TESTBOT_IDLE_RESET_SECONDS", "10800"))
 B24_TURN_CAP = int(os.getenv("B24_TESTBOT_TURN_CAP", "16"))
 
 
@@ -1385,35 +1385,35 @@ def _b24_summarize_segment(dialog_id: str, agent_slug: str | None = None) -> str
         return None
 
 
-def _b24_digest_segment(dialog_id: str, agent_slug: str | None = None, rows_limit: int = 8) -> str | None:
-    """Deterministic, model-free digest of this agent's dialog tail — carries context across a
-    HARD idle reset (>24h) without a slow model call on the turn's critical path (the cap-rotation
-    summarizer runs a whole hermes turn; that is unacceptable before answering a user)."""
-    from datetime import timedelta as _td, timezone as _tz
+def _b24_notify_session_reset(dialog_id: str, agent_slug: str | None = None) -> None:
+    """A session reset must never be silent (owner 2026-07-16): when the idle gap starts a fresh
+    session, tell the user in the SAME dialog, from the SAME agent's bot, how to bring old context
+    back. Best-effort in a daemon thread — a notify failure must never affect the turn itself."""
     try:
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT created_at, question, answer FROM bitrix_bot_interactions "
-                    "WHERE dialog_id=%s AND agent_slug IS NOT DISTINCT FROM %s::text AND status='ok' "
-                    "AND question <> '' ORDER BY id DESC LIMIT %s",
-                    (str(dialog_id), agent_slug, int(rows_limit)),
-                )
-                rows = cur.fetchall()
-        if not rows:
-            return None
-        def _clip(text: str, cap: int) -> str:
-            text = re.sub(r"\s+", " ", str(text or "")).strip()
-            return text if len(text) <= cap else text[:cap] + "…"
-        msk = _tz(_td(hours=3))
-        lines = []
-        for r in reversed(rows):
-            when = r["created_at"].astimezone(msk).strftime("%d.%m %H:%M") if r.get("created_at") else ""
-            lines.append(f"[{when}] {_clip(r['question'], 220)} → {_clip(r['answer'], 320)}")
-        return "\n".join(lines)[:4000] or None
+        d = str(dialog_id or "").strip()
+        if not re.fullmatch(r"(chat)?\d+", d):
+            return  # task threads and other non-IM ids have no bot chat to notify
+        bot_id = None
+        if agent_slug:
+            try:
+                from agent_center import _agent_by_slug
+                bot_id = (_agent_by_slug(agent_slug) or {}).get("bitrix_bot_id")
+            except Exception:  # noqa: BLE001
+                bot_id = None
+        if not bot_id:
+            bot_id = _b24_load_state().get("bot_id")
+        client_endpoint, access_token = _b24_app_access_token()
+        if not (client_endpoint and access_token and bot_id):
+            return
+        hours = max(1, B24_IDLE_RESET_SECONDS // 3600)
+        _b24_app_call(client_endpoint, access_token, "imbot.message.add", {
+            "BOT_ID": bot_id, "DIALOG_ID": d,
+            "MESSAGE": ("🔄 Начата новая сессия: с последнего сообщения прошло больше "
+                        f"{hours} ч, контекст прошлого разговора очищен. Чтобы вернуться к "
+                        "старому контексту, найдите нужное сообщение и нажмите «Ответить»."),
+        })
     except Exception:  # noqa: BLE001
-        logging.exception("b24 testbot: digest failed")
-        return None
+        logging.warning("b24: session reset notify failed dialog=%s", dialog_id, exc_info=True)
 
 
 def _b24_session_prepare(dialog_id: str, agent_slug: str | None = None) -> tuple[str, str | None]:
@@ -1443,19 +1443,11 @@ def _b24_session_prepare(dialog_id: str, agent_slug: str | None = None) -> tuple
                     idle = (now - last_at).total_seconds() if last_at else 1e12
                     seed: str | None = None
                     idle_reset = False
-                    if idle > B24_IDLE_HARD_RESET_SECONDS:
-                        # Very long gap (>24h): raise the floor, but seed a deterministic digest of
-                        # the tail so «вчера мы делали…» still works instead of total amnesia.
-                        summary = _b24_digest_segment(dialog_id, agent_slug)
-                        seed = summary
-                        epoch, turns, idle_reset = epoch + 1, 0, True
-                    elif idle > B24_IDLE_RESET_SECONDS:
-                        # SOFT reset: new epoch (fresh physical run as always), but the history
-                        # floor stays put — the last Q/A keep flowing into the prompt and the
-                        # rolling summary is carried. Full amnesia after 30 min was the top
-                        # owner complaint (2026-07-16).
-                        seed = summary
-                        epoch, turns = epoch + 1, 0
+                    if idle > B24_IDLE_RESET_SECONDS:
+                        # Idle gap >3h → genuinely fresh session: drop the carried summary AND
+                        # raise the history floor. Never silent — the user is notified below and
+                        # can quote-reply an old message to bring its context back.
+                        epoch, turns, summary, idle_reset = epoch + 1, 0, None, True
                     elif turns >= B24_TURN_CAP:
                         seed = _b24_summarize_segment(dialog_id, agent_slug) or summary
                         epoch, turns, summary = epoch + 1, 0, seed
@@ -1473,6 +1465,9 @@ def _b24_session_prepare(dialog_id: str, agent_slug: str | None = None) -> tuple
                             "history_floor_id=%s WHERE dialog_id=%s",
                             (epoch, turns, summary, now, floor, scope),
                         )
+                        # Notify off the critical path (never blocks/breaks the turn itself).
+                        threading.Thread(target=_b24_notify_session_reset,
+                                         args=(str(dialog_id), agent_slug), daemon=True).start()
                     else:
                         cur.execute(
                             "UPDATE bitrix_bot_sessions SET epoch=%s, turns=%s, summary=%s, last_at=%s WHERE dialog_id=%s",
