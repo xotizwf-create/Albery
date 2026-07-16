@@ -1342,6 +1342,11 @@ def _b24_main_allows(from_user_id: Any) -> bool:
 # сессия» button); after a turn cap we rotate to a new epoch seeded with a short summary of
 # the previous one (conversation-summary-buffer) so long threads never blow the window.
 B24_IDLE_RESET_SECONDS = int(os.getenv("B24_TESTBOT_IDLE_RESET_SECONDS", "1800"))
+# Hard reset (full history-floor raise) only after THIS much idle. Between the soft and hard
+# thresholds the epoch rotates but the last Q/A stay visible — full amnesia after 30 minutes
+# was the owner's top complaint (2026-07-16: an hour later the agent knew nothing of the
+# morning's work in the same dialog).
+B24_IDLE_HARD_RESET_SECONDS = int(os.getenv("B24_IDLE_HARD_RESET_SECONDS", "86400"))
 B24_TURN_CAP = int(os.getenv("B24_TESTBOT_TURN_CAP", "16"))
 
 
@@ -1380,6 +1385,37 @@ def _b24_summarize_segment(dialog_id: str, agent_slug: str | None = None) -> str
         return None
 
 
+def _b24_digest_segment(dialog_id: str, agent_slug: str | None = None, rows_limit: int = 8) -> str | None:
+    """Deterministic, model-free digest of this agent's dialog tail — carries context across a
+    HARD idle reset (>24h) without a slow model call on the turn's critical path (the cap-rotation
+    summarizer runs a whole hermes turn; that is unacceptable before answering a user)."""
+    from datetime import timedelta as _td, timezone as _tz
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT created_at, question, answer FROM bitrix_bot_interactions "
+                    "WHERE dialog_id=%s AND agent_slug IS NOT DISTINCT FROM %s::text AND status='ok' "
+                    "AND question <> '' ORDER BY id DESC LIMIT %s",
+                    (str(dialog_id), agent_slug, int(rows_limit)),
+                )
+                rows = cur.fetchall()
+        if not rows:
+            return None
+        def _clip(text: str, cap: int) -> str:
+            text = re.sub(r"\s+", " ", str(text or "")).strip()
+            return text if len(text) <= cap else text[:cap] + "…"
+        msk = _tz(_td(hours=3))
+        lines = []
+        for r in reversed(rows):
+            when = r["created_at"].astimezone(msk).strftime("%d.%m %H:%M") if r.get("created_at") else ""
+            lines.append(f"[{when}] {_clip(r['question'], 220)} → {_clip(r['answer'], 320)}")
+        return "\n".join(lines)[:4000] or None
+    except Exception:  # noqa: BLE001
+        logging.exception("b24 testbot: digest failed")
+        return None
+
+
 def _b24_session_prepare(dialog_id: str, agent_slug: str | None = None) -> tuple[str, str | None]:
     """Return (session_name, seed_summary_for_this_turn) applying idle reset / cap rotation.
     Scoped per agent: the lifecycle row and the hermes session name are keyed by
@@ -1407,10 +1443,19 @@ def _b24_session_prepare(dialog_id: str, agent_slug: str | None = None) -> tuple
                     idle = (now - last_at).total_seconds() if last_at else 1e12
                     seed: str | None = None
                     idle_reset = False
-                    if idle > B24_IDLE_RESET_SECONDS:
-                        # Idle gap → genuinely fresh session: drop carried summary AND raise the
-                        # history floor so prior Q/A is no longer injected into the prompt.
-                        epoch, turns, summary, idle_reset = epoch + 1, 0, None, True
+                    if idle > B24_IDLE_HARD_RESET_SECONDS:
+                        # Very long gap (>24h): raise the floor, but seed a deterministic digest of
+                        # the tail so «вчера мы делали…» still works instead of total amnesia.
+                        summary = _b24_digest_segment(dialog_id, agent_slug)
+                        seed = summary
+                        epoch, turns, idle_reset = epoch + 1, 0, True
+                    elif idle > B24_IDLE_RESET_SECONDS:
+                        # SOFT reset: new epoch (fresh physical run as always), but the history
+                        # floor stays put — the last Q/A keep flowing into the prompt and the
+                        # rolling summary is carried. Full amnesia after 30 min was the top
+                        # owner complaint (2026-07-16).
+                        seed = summary
+                        epoch, turns = epoch + 1, 0
                     elif turns >= B24_TURN_CAP:
                         seed = _b24_summarize_segment(dialog_id, agent_slug) or summary
                         epoch, turns, summary = epoch + 1, 0, seed

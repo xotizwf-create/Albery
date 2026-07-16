@@ -949,7 +949,26 @@ def manage_apps_script(
     if not script_id:
         raise ValueError("script_id is required for action " + act)
     if act == "get":
-        return svc.projects().getContent(scriptId=str(script_id)).execute()
+        content = svc.projects().getContent(scriptId=str(script_id)).execute()
+        meta: dict[str, Any] = {}
+        try:
+            meta = svc.projects().get(scriptId=str(script_id)).execute() or {}
+        except Exception:  # noqa: BLE001 — binding info is best-effort, files still returned
+            pass
+        bound_parent = meta.get("parentId")
+        return {
+            "script_id": str(script_id),
+            "title": meta.get("title"),
+            "parent_id": bound_parent,
+            "bound": bool(bound_parent),
+            "binding_note": (
+                "Скрипт ПРИВЯЗАН к файлу parent_id — его меню/кнопки (onOpen/onEdit) работают в этом файле."
+                if bound_parent else
+                "Скрипт НЕ привязан ни к какому файлу (standalone): его onOpen/onEdit НИКОГДА не сработают "
+                "в таблице. Для кнопки в таблице создай новый скрипт action=create с parent_id."),
+            "editor_url": _editor_url(script_id),
+            "files": content.get("files"),
+        }
     if act == "update":
         if not isinstance(files, list) or not files:
             raise ValueError("files (list) is required for update")
