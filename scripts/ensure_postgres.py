@@ -43,6 +43,10 @@ REQUIRED_FUNCTION_MIGRATIONS = {
 }
 
 ALWAYS_APPLY_MIGRATIONS = [
+    # Idempotent WB resumable sync state. 055 also covers catalogue columns
+    # that older, already-created WB schemas could otherwise silently miss.
+    "054_wb_sync_state_v2.sql",
+    "055_wb_async_reports.sql",
     "022_chats_personal_dialog_types.sql",
     "024_chat_report_hot_path_indexes.sql",
     "025_mcp_search_indexes.sql",
