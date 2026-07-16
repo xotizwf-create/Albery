@@ -1,0 +1,8 @@
+{
+  "name": "Alberi Workspace",
+  "description": "Modern analytics dashboard for WB-кабинет",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

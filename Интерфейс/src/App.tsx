@@ -8016,7 +8016,7 @@ export default function App() {
                   return (
                     <button
                       key={item.label}
-                      onClick={() => setActiveTab(item.label)}
+                      onClick={() => item.label === "WB-кабинет" ? (window.location.href = "/analytics") : setActiveTab(item.label)}
                       className={cn(
                         "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-[14px] font-bold transition-all duration-200 group",
                         isActive
@@ -8076,7 +8076,7 @@ export default function App() {
               {["Бухгалтерия", "Склад", "WB-кабинет"].filter((item) => !HIDDEN_HEADER_LINKS.has(item)).map((item) => (
                 <span
                   key={item}
-                  onClick={() => setActiveTab(item)}
+                  onClick={() => item === "WB-кабинет" ? (window.location.href = "/analytics") : setActiveTab(item)}
                   className={cn(
                     "cursor-pointer transition-colors flex-shrink-0",
                     activeTab === item
