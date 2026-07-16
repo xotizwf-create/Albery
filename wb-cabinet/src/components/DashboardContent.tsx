@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AreaChart, Area, ResponsiveContainer } from 'recharts';
 import { Info, LayoutDashboard } from "lucide-react";
 import { cn } from "../lib/utils";
@@ -8,6 +8,23 @@ import { SettingsContent } from "./SettingsContent";
 import { api, qs, money, pct } from "../lib/api";
 
 const TABS = ["Общий дашборд", "РНП", "ОПиУ", "ДДС", "По артикулам", "Налоговый калькулятор", "Настройка"];
+
+const MOSCOW_DATE = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Europe/Moscow', year: 'numeric', month: '2-digit', day: '2-digit',
+});
+
+function moscowToday() {
+  const parts = Object.fromEntries(MOSCOW_DATE.formatToParts(new Date()).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function monthsBefore(value: string, months: number) {
+  const [year, month, day] = value.split('-').map(Number);
+  const firstOfTarget = new Date(Date.UTC(year, month - 1 - months, 1, 12));
+  const lastDay = new Date(Date.UTC(firstOfTarget.getUTCFullYear(), firstOfTarget.getUTCMonth() + 1, 0, 12)).getUTCDate();
+  const date = new Date(Date.UTC(firstOfTarget.getUTCFullYear(), firstOfTarget.getUTCMonth(), Math.min(day, lastDay), 12));
+  return date.toISOString().slice(0, 10);
+}
 
 function Sparkline({ data, color }: { data: { v: number }[], color: string }) {
   const gradientId = `color-${color.replace('#', '')}`;
@@ -43,8 +60,10 @@ function Row({ color, name, value, share, ring }: { color: string, name: string,
 }
 
 export function DashboardContent() {
-  const [startDate, setStartDate] = useState(() => { const d = new Date(); d.setDate(d.getDate() - 29); return d.toISOString().slice(0, 10); });
-  const [endDate, setEndDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const initialToday = useRef(moscowToday());
+  const autoDateRange = useRef(true);
+  const [startDate, setStartDate] = useState(() => monthsBefore(initialToday.current, 6));
+  const [endDate, setEndDate] = useState(() => initialToday.current);
   const [brand, setBrand] = useState('Все');
   const [activeTab, setActiveTab] = useState('Общий дашборд');
   const [brands, setBrands] = useState<string[]>(['Все']);
@@ -54,6 +73,29 @@ export function DashboardContent() {
   useEffect(() => {
     api<{ brands: string[] }>("/api/wb-cab/brands").then((d) => setBrands(["Все", ...(d.brands || [])])).catch(() => {});
   }, []);
+
+  // Keep the default six-month window aligned with the Moscow calendar after midnight.
+  // Once the user changes either boundary manually, their chosen range is preserved.
+  useEffect(() => {
+    const refreshToday = () => {
+      const today = moscowToday();
+      if (today === initialToday.current) return;
+      initialToday.current = today;
+      if (autoDateRange.current) {
+        setEndDate(today);
+        setStartDate(monthsBefore(today, 6));
+      }
+    };
+    const timer = window.setInterval(refreshToday, 60_000);
+    window.addEventListener('focus', refreshToday);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refreshToday);
+    };
+  }, []);
+
+  const changeStartDate = (value: string) => { autoDateRange.current = false; setStartDate(value); };
+  const changeEndDate = (value: string) => { autoDateRange.current = false; setEndDate(value); };
 
   useEffect(() => {
     const q = qs({ from: startDate, to: endDate, brand: brand === 'Все' ? undefined : brand });
@@ -82,9 +124,9 @@ export function DashboardContent() {
         <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4 sm:gap-6 bg-white p-4 rounded-2xl shadow-sm self-start w-full sm:w-auto">
           <div className="flex flex-wrap sm:flex-nowrap items-center gap-3">
             <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider hidden sm:block">Период</span>
-            <DatePicker value={startDate} onChange={setStartDate} />
+            <DatePicker value={startDate} onChange={changeStartDate} />
             <span className="text-slate-300 hidden sm:block">—</span>
-            <DatePicker value={endDate} onChange={setEndDate} />
+            <DatePicker value={endDate} onChange={changeEndDate} />
           </div>
           <div className="hidden sm:block w-px h-6 bg-slate-200"></div>
           <div className="flex items-center gap-3 w-full sm:w-auto">
