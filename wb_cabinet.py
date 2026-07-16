@@ -1372,7 +1372,7 @@ def wbcab_tax_settings():
 @app.route("/api/wb-cab/cards")
 def wbcab_cards():
     """Our real catalogue (wb_cards) for the RNP picker AND the Настройка tabs.
-    Params: q (vendor_code/title/nm_id ILIKE), brand, limit (default 100, max 5000),
+    Params: q (nm_id/vendor_code/title/subject_name ILIKE), brand, limit (default 100, max 5000),
     include_excluded (default 1; the План продаж tab passes 0 to hide excluded)."""
     from flask import jsonify, request
     q = (request.args.get("q") or "").strip()
@@ -1385,8 +1385,8 @@ def wbcab_cards():
     where = ["1=1"]
     params: list = []
     if q:
-        where.append("(vendor_code ILIKE %s OR title ILIKE %s OR nm_id::text ILIKE %s)")
-        params += [f"%{q}%", f"%{q}%", f"%{q}%"]
+        where.append("(nm_id::text ILIKE %s OR vendor_code ILIKE %s OR title ILIKE %s OR subject_name ILIKE %s)")
+        params += [f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%"]
     if brand and brand.lower() not in ("", "все"):
         where.append("brand = %s")
         params.append(brand)
