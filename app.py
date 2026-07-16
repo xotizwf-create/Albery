@@ -16485,6 +16485,29 @@ def frontend_assets(filename: str):
     return send_from_directory(FRONTEND_DIST / "assets", filename)
 
 
+# --- Standalone WB-cabinet page served at /Analytics (own Vite bundle, base=/analytics/).
+# Behind the same admin auth as the rest of the UI (before_request gate). ---
+WB_CABINET_DIST = FRONTEND_DIST.parent.parent / "wb-cabinet" / "dist"
+
+
+@app.get("/analytics")
+@app.get("/Analytics")
+def wb_analytics_index():
+    idx = WB_CABINET_DIST / "index.html"
+    if idx.exists():
+        return send_from_directory(WB_CABINET_DIST, "index.html")
+    return jsonify({"error": "WB cabinet build not found. Build wb-cabinet/ and deploy its dist."}), 503
+
+
+@app.get("/analytics/<path:filename>")
+def wb_analytics_assets(filename: str):
+    target = (WB_CABINET_DIST / filename)
+    if not target.exists():
+        # SPA fallback: unknown sub-path -> index.html
+        return send_from_directory(WB_CABINET_DIST, "index.html")
+    return send_from_directory(WB_CABINET_DIST, filename)
+
+
 @app.get("/favicon.ico")
 @app.get("/favicon.svg")
 @app.get("/favicon-16x16.png")

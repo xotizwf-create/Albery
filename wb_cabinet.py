@@ -1047,4 +1047,30 @@ def wbcab_tax_settings():
                     "vat_modes": list(VAT_MODES.keys())})
 
 
+@app.route("/api/wb-cab/cards")
+def wbcab_cards():
+    """Lightweight catalogue for the RNP article picker: our real WB cards (nm_id, vendor_code,
+    title, brand, photo). Optional q (vendor_code/title/nm_id ILIKE) and brand filters."""
+    from flask import jsonify, request
+    q = (request.args.get("q") or "").strip()
+    brand = (request.args.get("brand") or "").strip()
+    where = ["1=1"]
+    params: list = []
+    if q:
+        where.append("(vendor_code ILIKE %s OR title ILIKE %s OR nm_id::text ILIKE %s)")
+        params += [f"%{q}%", f"%{q}%", f"%{q}%"]
+    if brand and brand.lower() not in ("", "все"):
+        where.append("brand = %s")
+        params.append(brand)
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT nm_id, vendor_code, title, brand, subject_name, photo_url "
+                "FROM wb_cards WHERE " + " AND ".join(where) +
+                " ORDER BY vendor_code NULLS LAST, nm_id LIMIT 100",
+                params)
+            rows = [dict(r) for r in cur.fetchall()]
+    return jsonify({"cards": rows, "total": len(rows)})
+
+
 log.info("wb_cabinet loaded: /api/wb-cab/* routes registered")
