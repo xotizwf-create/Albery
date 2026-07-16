@@ -1033,30 +1033,61 @@ def q_cashflow(d_from: str, d_to: str, brand: str | None) -> list[dict[str, Any]
     return rows
 
 
-def q_rnp(d_from: str, d_to: str, brand: str | None) -> list[dict[str, Any]]:
-    """РНП «Рука на пульсе»: день к дню. Расширяемо: добавляй колонки в этот запрос."""
-    bw, bp = _brand_where(brand)
+def q_rnp(d_from: str, d_to: str, brand: str | None,
+          nm_id: int | None = None) -> list[dict[str, Any]]:
+    """РНП «Рука на пульсе»: непрерывный дневной ряд, в том числе для пустых дней.
+
+    Если выбран артикул, факты фильтруются по нему. Расходы РК пока нельзя честно
+    разнести по nm_id: WB отдаёт их на уровне кампании, а текущая таблица не хранит
+    состав кампании. Поэтому для карточки они остаются нулевыми, а не подмешивают
+    расходы всего кабинета в отчёт одного товара.
+    """
+    def item_filter(brand_col: str, nm_col: str) -> tuple[str, list[Any]]:
+        where, params = _brand_where(brand, brand_col)
+        if nm_id is not None:
+            where += f" AND {nm_col} = %s"
+            params.append(nm_id)
+        return where, params
+
+    orders_where, orders_params = item_filter("brand", "nm_id")
+    sales_where, sales_params = item_filter("s.brand", "s.nm_id")
+    stocks_where, stocks_params = item_filter("brand", "nm_id")
+    if nm_id is None:
+        adv_cte = """a AS (SELECT date_trunc('day', upd_time)::date AS day,
+                                   COALESCE(sum(upd_sum),0) AS adv
+                            FROM wb_adv_costs
+                            WHERE upd_time >= %s AND upd_time < (%s::date+1)
+                            GROUP BY 1)"""
+        adv_params: list[Any] = [d_from, d_to]
+    else:
+        adv_cte = "a AS (SELECT NULL::date AS day, 0::numeric AS adv WHERE FALSE)"
+        adv_params = []
     with pg_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 WITH o AS (SELECT date_trunc('day', date)::date AS day, count(*) AS cnt,
                                   COALESCE(sum(price_with_disc),0) AS rub
-                           FROM wb_orders WHERE NOT is_cancel AND date >= %s AND date < (%s::date+1) {bw} GROUP BY 1),
-                     s AS (SELECT date_trunc('day', date)::date AS day,
+                           FROM wb_orders WHERE NOT is_cancel AND date >= %s AND date < (%s::date+1) {orders_where} GROUP BY 1),
+                     s AS (SELECT date_trunc('day', s.date)::date AS day,
                                   count(*) FILTER (WHERE NOT is_return) AS cnt,
                                   COALESCE(sum(price_with_disc) FILTER (WHERE NOT is_return),0) AS rub,
-                                  count(*) FILTER (WHERE is_return) AS ret_cnt
-                           FROM wb_sales WHERE date >= %s AND date < (%s::date+1) {bw} GROUP BY 1),
+                                  count(*) FILTER (WHERE is_return) AS ret_cnt,
+                                  COALESCE(sum(for_pay) FILTER (WHERE NOT is_return),0) AS for_pay,
+                                  COALESCE(sum(cp.cost) FILTER (WHERE NOT is_return),0) AS cogs
+                           FROM wb_sales s LEFT JOIN wb_cost_prices cp ON cp.barcode = s.barcode
+                           WHERE s.date >= %s AND s.date < (%s::date+1)
+                           {sales_where}
+                           GROUP BY 1),
                      st AS (SELECT snapshot_date AS day, sum(quantity) AS qty
                             FROM wb_stocks_daily WHERE snapshot_date >= %s::date AND snapshot_date <= %s::date
-                            {bw} GROUP BY 1),
-                     a AS (SELECT date_trunc('day', upd_time)::date AS day, COALESCE(sum(upd_sum),0) AS adv
-                           FROM wb_adv_costs WHERE upd_time >= %s AND upd_time < (%s::date+1) GROUP BY 1)
+                            {stocks_where} GROUP BY 1),
+                     {adv_cte}
                 SELECT d.day::date AS day,
                        COALESCE(o.cnt,0) AS orders_cnt, COALESCE(o.rub,0) AS orders_rub,
                        COALESCE(s.cnt,0) AS sales_cnt, COALESCE(s.rub,0) AS sales_rub,
                        COALESCE(s.ret_cnt,0) AS returns_cnt,
+                       COALESCE(s.for_pay,0) AS for_pay_rub, COALESCE(s.cogs,0) AS cogs_rub,
                        COALESCE(st.qty,0) AS stock_qty, COALESCE(a.adv,0) AS adv_rub,
                        CASE WHEN COALESCE(o.rub,0) > 0 THEN round(100*COALESCE(a.adv,0)/o.rub, 1) ELSE 0 END AS drr_pct
                 FROM (SELECT generate_series(%s::date, %s::date, '1 day')::date AS day) d
@@ -1064,7 +1095,10 @@ def q_rnp(d_from: str, d_to: str, brand: str | None) -> list[dict[str, Any]]:
                 LEFT JOIN st ON st.day = d.day LEFT JOIN a ON a.day = d.day
                 ORDER BY d.day
                 """,
-                [d_from, d_to, *bp, d_from, d_to, *bp, d_from, d_to, *bp, d_from, d_to, d_from, d_to])
+                [d_from, d_to, *orders_params,
+                 d_from, d_to, *sales_params,
+                 d_from, d_to, *stocks_params,
+                 *adv_params, d_from, d_to])
             rows = [dict(r) for r in cur.fetchall()]
     for r in rows:
         r["day"] = r["day"].isoformat()
@@ -1194,9 +1228,15 @@ def wbcab_cashflow():
 
 @app.route("/api/wb-cab/rnp")
 def wbcab_rnp():
-    from flask import jsonify
+    from flask import jsonify, request
     d_from, d_to, brand = _args()
-    return jsonify({"from": d_from, "to": d_to, "brand": brand, "days": q_rnp(d_from, d_to, brand)})
+    raw_nm_id = (request.args.get("nm_id") or "").strip()
+    try:
+        nm_id = int(raw_nm_id) if raw_nm_id else None
+    except ValueError:
+        return jsonify({"error": "nm_id must be an integer"}), 400
+    return jsonify({"from": d_from, "to": d_to, "brand": brand, "nm_id": nm_id,
+                    "days": q_rnp(d_from, d_to, brand, nm_id)})
 
 
 @app.route("/api/wb-cab/tax")

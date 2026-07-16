@@ -1,3 +1,4 @@
+import datetime as dt
 from decimal import Decimal
 
 from scripts import ensure_postgres
@@ -8,6 +9,7 @@ from wb_cabinet import (
     _num,
     _paid_storage_row,
     _stock_report_rows,
+    q_rnp,
     sync_stocks,
 )
 
@@ -131,3 +133,44 @@ def test_stock_sync_queues_resumable_report(monkeypatch):
     assert writes[0][1]["task_id"] == "task-1"
     assert writes[0][1]["status"] == "queued"
     assert logs
+
+
+def test_rnp_selected_article_keeps_calendar_row_and_never_mixes_cabinet_ad_spend(fake_pg):
+    def responder(sql, params):
+        if "generate_series" not in sql:
+            return []
+        return [{
+            "day": dt.date(2026, 7, 16),
+            "orders_cnt": 2,
+            "orders_rub": Decimal("1200.50"),
+            "sales_cnt": 1,
+            "sales_rub": Decimal("650.25"),
+            "returns_cnt": 0,
+            "for_pay_rub": Decimal("500.10"),
+            "cogs_rub": Decimal("200.00"),
+            "stock_qty": 7,
+            "adv_rub": Decimal("0"),
+            "drr_pct": Decimal("0"),
+        }]
+
+    cursor = fake_pg(wb_cabinet, responder)
+    rows = q_rnp("2026-07-16", "2026-07-16", "Allberi", 12345)
+
+    sql, params = cursor.executed[-1]
+    assert "s.nm_id = %s" in sql
+    assert "SELECT NULL::date AS day, 0::numeric AS adv WHERE FALSE" in sql
+    assert "FROM wb_adv_costs" not in sql
+    assert params.count(12345) == 3
+    assert rows == [{
+        "day": "2026-07-16",
+        "orders_cnt": 2,
+        "orders_rub": 1200.5,
+        "sales_cnt": 1,
+        "sales_rub": 650.25,
+        "returns_cnt": 0,
+        "for_pay_rub": 500.1,
+        "cogs_rub": 200.0,
+        "stock_qty": 7,
+        "adv_rub": 0.0,
+        "drr_pct": 0.0,
+    }]
