@@ -2319,6 +2319,11 @@ def tool_add_bitrix_task_comment(args: dict[str, Any]) -> dict[str, Any]:
     response = _bitrix_call_with_fallback(
         "task.commentitem.add", {"TASKID": task_id, "FIELDS": fields}, prefer_api=False, fallback=False)
     comment_id = response.get("result") if isinstance(response, dict) else None
+    if not comment_id:
+        # No id = the portal did NOT accept the comment. Never report success without proof
+        # (2026-07-16: a result comment silently failed and the tool still said comment_added=True).
+        err = (response or {}).get("error_description") or (response or {}).get("error") if isinstance(response, dict) else None
+        raise McpError(-32010, f"Bitrix не принял комментарий (task.commentitem.add вернул без id): {err or response!r}"[:400])
     _preclaim_task_comment(comment_id, task_id, (author or {}).get("bitrix_user_id"))
 
     # For a result, also pin the file(s) to the task itself so they show in the task's files.
