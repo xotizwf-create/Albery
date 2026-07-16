@@ -42,13 +42,26 @@ class WBClient:
             raise RuntimeError("WB_ANALYTICS_TOKEN is not configured in .env")
         self._last_call = 0.0
 
+    # Documented WB limits: statistics-api methods = 1 request/min per method (v1 orders/
+    # sales/stocks answer 429 with a "deprecated" hint when exceeded). Pace BEFORE calling,
+    # per (host, path) — cheaper than burning attempts on 429s.
+    _PACE_PER_METHOD = 62.0
+    _PACED_HOSTS = ("statistics-api.wildberries.ru",)
+
     def call(self, url: str, params: dict | None = None, body: Any = None,
              method: str | None = None, min_gap: float = 1.6, tries: int = 6) -> Any:
         if params:
             url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+        base = url.split("?")[0]
+        if any(h in base for h in self._PACED_HOSTS):
+            min_gap = max(min_gap, self._PACE_PER_METHOD)
+        if not hasattr(self, "_last_by_method"):
+            self._last_by_method = {}
         delay = 65.0
         for attempt in range(1, tries + 1):
-            gap = self._last_call + min_gap - time.monotonic()
+            # global gap + per-method gap
+            gap = max(self._last_call + 1.6 - time.monotonic(),
+                      self._last_by_method.get(base, 0.0) + min_gap - time.monotonic())
             if gap > 0:
                 time.sleep(gap)
             req = urllib.request.Request(url, method=method or ("POST" if body is not None else "GET"))
@@ -58,6 +71,7 @@ class WBClient:
                 data = json.dumps(body).encode()
                 req.add_header("Content-Type", "application/json")
             self._last_call = time.monotonic()
+            self._last_by_method[base] = self._last_call
             try:
                 with urllib.request.urlopen(req, data, timeout=120) as r:
                     raw = r.read()
@@ -69,11 +83,17 @@ class WBClient:
                 except Exception:  # noqa: BLE001
                     pass
                 if e.code in (429, 500, 502, 503, 504) and attempt < tries:
-                    log.info("wb %s -> %s, backoff %.0fs (try %d)", url.split("?")[0], e.code, delay, attempt)
-                    time.sleep(delay)
+                    retry_after = 0.0
+                    try:
+                        retry_after = float(e.headers.get("Retry-After") or e.headers.get("X-Ratelimit-Retry") or 0)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    wait = max(retry_after + 2.0, delay if e.code != 429 or not retry_after else 0)
+                    log.info("wb %s -> %s, wait %.0fs (retry-after=%s, try %d)", base, e.code, wait, retry_after, attempt)
+                    time.sleep(wait)
                     delay = min(delay * 1.7, 600)
                     continue
-                raise RuntimeError(f"WB API {e.code}: {detail[:180]} url={url.split('?')[0]}") from e
+                raise RuntimeError(f"WB API {e.code}: {detail[:180]} url={base}") from e
             except Exception as e:  # noqa: BLE001 — network blip
                 if attempt < tries:
                     time.sleep(min(20 * attempt, 60))
@@ -940,12 +960,30 @@ def wbcab_sync_status():
                                   (SELECT count(*) FROM wb_finance_details) AS finance,
                                   (SELECT count(*) FROM wb_cards) AS cards,
                                   (SELECT count(*) FROM wb_stocks_daily) AS stocks,
-                                  (SELECT count(*) FROM wb_adv_costs) AS adv""")
+                                  (SELECT count(*) FROM wb_adv_costs) AS adv,
+                                  (SELECT count(*) FROM wb_prices_current) AS prices""")
             counts = dict(cur.fetchone())
+            cur.execute("""SELECT 'orders' AS src, min(date)::date::text AS d_min, max(date)::date::text AS d_max FROM wb_orders
+                           UNION ALL SELECT 'sales', min(date)::date::text, max(date)::date::text FROM wb_sales
+                           UNION ALL SELECT 'finance', min(rr_dt)::text, max(rr_dt)::text FROM wb_finance_details
+                           UNION ALL SELECT 'stocks', min(snapshot_date)::text, max(snapshot_date)::text FROM wb_stocks_daily
+                           UNION ALL SELECT 'adv', min(upd_time)::date::text, max(upd_time)::date::text FROM wb_adv_costs""")
+            ranges = {r["src"]: {"min": r["d_min"], "max": r["d_max"]} for r in cur.fetchall()}
+            cur.execute("""SELECT endpoint, started_at, finished_at, rows_upserted, ok, left(coalesce(error,''), 160) AS error
+                           FROM wb_sync_log ORDER BY id DESC LIMIT 12""")
+            recent = [dict(r) for r in cur.fetchall()]
+            # pg_try_advisory_lock(bigint): classid = high 32 bits (0 here), objid = low 32 bits
+            cur.execute("SELECT count(*) > 0 AS running FROM pg_locks "
+                        "WHERE locktype='advisory' AND classid = 0 AND objid = 984312077")
+            running = bool(cur.fetchone()["running"])
     for s in state:
         if s.get("last_run_at"):
             s["last_run_at"] = s["last_run_at"].isoformat()
-    return jsonify({"counts": counts, "state": state})
+    for r in recent:
+        for k in ("started_at", "finished_at"):
+            if r.get(k):
+                r[k] = r[k].isoformat()
+    return jsonify({"counts": counts, "ranges": ranges, "recent_runs": recent, "sync_running": running})
 
 
 @app.route("/api/wb-cab/cost-prices", methods=["GET", "POST"])
