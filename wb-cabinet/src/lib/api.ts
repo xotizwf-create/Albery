@@ -7,6 +7,17 @@ export async function api<T = any>(path: string): Promise<T> {
   return (await r.json()) as T;
 }
 
+export async function apiPost<T = any>(path: string, body: any): Promise<T> {
+  const r = await fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()) as T;
+}
+
 export function qs(params: Record<string, string | undefined>): string {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) if (v) p.set(k, v);
