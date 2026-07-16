@@ -6202,6 +6202,20 @@ def tool_organize_drive_folder(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"organize_drive_folder failed: {exc}") from exc
 
 
+def tool_read_google_sheet_values(args: dict[str, Any]) -> dict[str, Any]:
+    sid = str(args.get("spreadsheet_id") or "").strip()
+    rng = str(args.get("range") or "").strip()
+    if not sid or not rng:
+        raise McpError(-32602, "spreadsheet_id and range are required.")
+    render = str(args.get("value_render_option") or "FORMATTED_VALUE")
+    try:
+        return app_workflow_function("read_google_sheet_values")(sid, rng, render)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"read_google_sheet_values failed: {exc}") from exc
+
+
 def tool_manage_apps_script(args: dict[str, Any]) -> dict[str, Any]:
     if args.get("confirm") is not True:
         raise McpError(-32602, "Set confirm=true to run an Apps Script action.")
@@ -6212,6 +6226,7 @@ def tool_manage_apps_script(args: dict[str, Any]) -> dict[str, Any]:
         return app_workflow_function("manage_apps_script")(
             action,
             script_id=str(args.get("script_id") or "") or None,
+            parent_id=str(args.get("parent_id") or "") or None,
             title=str(args.get("title") or "") or None,
             files=args.get("files"),
             function_name=str(args.get("function_name") or "") or None,
@@ -9802,6 +9817,28 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_get_google_sheet_meta,
     },
+    "read_google_sheet_values": {
+        "description": (
+            "Read a 2D array of cell values from an A1 range of a Google Sheet (value_render_option: "
+            "FORMATTED_VALUE default | UNFORMATTED_VALUE raw numbers | FORMULA to inspect formulas). "
+            "Use it to STUDY a sheet's real layout (headers, first data rows) before building on it, and to "
+            "VERIFY BY READBACK what you just wrote: never report a sheet change or computation as done "
+            "without reading the affected cells back. If the user gave a reference example (\"for X the "
+            "result must be Y\"), read exactly that row and show the got/expected comparison. Read-only. "
+            "Keep ranges narrow — output is capped, whole-sheet reads get truncated."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": {"type": "string"},
+                "range": {"type": "string", "description": "A1 range incl. tab, e.g. \"'свод'!A6:L24\""},
+                "value_render_option": {"type": "string", "enum": ["FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"]},
+            },
+            "required": ["spreadsheet_id", "range"],
+            "additionalProperties": False,
+        },
+        "handler": tool_read_google_sheet_values,
+    },
     "write_google_sheet_values": {
         "description": (
             "Write a 2D array of values/formulas into an A1 range of a Google Sheet (USER_ENTERED, "
@@ -10037,9 +10074,14 @@ TOOLS: dict[str, dict[str, Any]] = {
             "action=publish_web_app with files=[{name,type:HTML|SERVER_JS,source}] (the code needs a "
             "doGet/doPost) -> returns a ready web_app_url (https://script.google.com/macros/s/.../exec) "
             "open by link to everyone (access ANYONE_ANONYMOUS, executeAs USER_DEPLOYING). Other actions: "
-            "create (new project) | get (files) | update (overwrite files=[{name,type:SERVER_JS|JSON|HTML,"
+            "create (new project; pass parent_id=<spreadsheet_id> to create a BOUND script — the ONLY way "
+            "sheet menus/buttons (onOpen/onEdit simple triggers) work; they activate after the user reloads "
+            "the sheet) | get (files) | update (overwrite files=[{name,type:SERVER_JS|JSON|HTML,"
             "source}], manifest preserved) | deploy (version+deploy, web app by default -> web_app_url) | "
-            "run (run function_name). advanced_services=['drive','sheets','calendar','gmail','docs',...] "
+            "run (DO NOT use for regular/bound scripts: Google answers 404 unless the script shares a GCP "
+            "project with the OAuth client — a platform limit, never retry; instead compute yourself via "
+            "read/write_google_sheet_values and let the sheet button call the script client-side). "
+            "advanced_services=['drive','sheets','calendar','gmail','docs',...] "
             "enables Apps Script advanced services in the manifest; oauth_scopes adds runtime scopes. "
             "share=true (default) makes the project editable by link. ALWAYS give the owner the web_app_url, "
             "not the editor_url. Requires confirm=true. If the API is disabled, ask the owner to enable the "
@@ -10050,6 +10092,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "action": {"type": "string", "enum": ["create", "get", "update", "deploy", "run", "publish_web_app"]},
                 "script_id": {"type": "string"},
+                "parent_id": {"type": "string", "description": "create: spreadsheet/doc id to BIND the script to (required for sheet menus/checkbox buttons)"},
                 "title": {"type": "string"},
                 "files": {"type": "array", "items": {"type": "object"}, "description": "[{name,type:SERVER_JS|HTML|JSON,source}]"},
                 "function_name": {"type": "string"},
@@ -10647,6 +10690,7 @@ CORE_TOOL_NAMES: set[str] = {
     # google workflow the bot prompt teaches
     "create_google_sheet",
     "get_google_sheet_meta",
+    "read_google_sheet_values",
     "write_google_sheet_values",
     "share_drive_item_for_everyone",
     "get_webapp_template",

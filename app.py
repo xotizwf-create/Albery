@@ -605,6 +605,40 @@ def get_google_sheet_meta(spreadsheet_id: str) -> dict[str, Any]:
     }
 
 
+def read_google_sheet_values(
+    spreadsheet_id: str, cell_range: str, value_render_option: str = "FORMATTED_VALUE",
+) -> dict[str, Any]:
+    """Read a 2D array of values from an A1 range. The verification counterpart of
+    write_google_sheet_values: study a sheet's real layout before building on it and read back
+    what was just written before reporting success. Output is bounded (~40k chars) so one call
+    cannot flood the model — narrow the range instead."""
+    from googleapiclient.discovery import build
+    creds = _google_user_credentials()
+    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    opt = value_render_option if value_render_option in (
+        "FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA") else "FORMATTED_VALUE"
+    got = sheets.spreadsheets().values().get(
+        spreadsheetId=str(spreadsheet_id), range=str(cell_range), valueRenderOption=opt,
+    ).execute()
+    values = got.get("values", [])
+    total_rows = len(values)
+    out_rows, used, truncated = [], 0, False
+    for row in values:
+        row_len = sum(len(str(c)) + 4 for c in row) + 8
+        if used + row_len > 40000:
+            truncated = True
+            break
+        out_rows.append(row)
+        used += row_len
+    result = {"range": got.get("range"), "value_render_option": opt,
+              "row_count": total_rows, "values": out_rows}
+    if truncated:
+        result["truncated"] = True
+        result["note"] = (f"Показаны первые {len(out_rows)} из {total_rows} строк (лимит вывода). "
+                          "Сузь диапазон (конкретные строки/столбцы) и прочитай остальное отдельным вызовом.")
+    return result
+
+
 def write_google_sheet_values(
     spreadsheet_id: str, cell_range: str, values: list, value_input_option: str = "USER_ENTERED",
 ) -> dict[str, Any]:
@@ -789,6 +823,7 @@ def _apps_script_build_manifest(existing, *, web_app, access, execute_as, advanc
 
 def manage_apps_script(
     action: str, script_id: str | None = None, title: str | None = None,
+    parent_id: str | None = None,
     files: list | None = None, function_name: str | None = None,
     parameters: list | None = None, description: str | None = None,
     web_app: bool = True, access: str | None = None, execute_as: str | None = None,
@@ -802,7 +837,13 @@ def manage_apps_script(
     files + a webapp manifest (access default ANYONE_ANONYMOUS = open by link to everyone, executeAs
     USER_DEPLOYING) + deploy + share, returning the live web_app_url
     (https://script.google.com/macros/s/.../exec). advanced_services (e.g. ['drive','sheets']) enable
-    Apps Script advanced services; oauth_scopes add runtime scopes."""
+    Apps Script advanced services; oauth_scopes add runtime scopes.
+
+    action=create with parent_id=<spreadsheet/doc id> creates a CONTAINER-BOUND script — the only
+    kind whose simple triggers (onOpen menu, onEdit checkbox-button) run for users inside that
+    file. action=run works ONLY when the script shares a GCP project with the OAuth client AND has
+    an API-executable deployment; for a regular/bound script Google answers 404 — a platform
+    limit, not an outage, so retrying is pointless (2026-07-16 incident: the agent looped on it)."""
     import json as _json
     from googleapiclient.discovery import build
     creds = _google_user_credentials()
@@ -869,10 +910,22 @@ def manage_apps_script(
         return out
 
     if act == "create":
-        proj = svc.projects().create(body={"title": title or "Albery Script"}).execute()
+        body = {"title": title or "Albery Script"}
+        if parent_id:
+            body["parentId"] = str(parent_id)
+        proj = svc.projects().create(body=body).execute()
         sid = proj.get("scriptId")
         out = {"script_id": sid, "editor_url": _editor_url(sid), "title": proj.get("title")}
-        if share:
+        if parent_id:
+            out["bound_to"] = str(parent_id)
+            out["note"] = ("Скрипт ПРИВЯЗАН к файлу (container-bound): после action=update с кодом "
+                           "простые триггеры onOpen (меню) и onEdit (чекбокс-кнопка) заработают у "
+                           "пользователя после перезагрузки таблицы; первый запуск попросит разовое "
+                           "разрешение Google. Запускать функции через action=run не нужно и не "
+                           "получится (404) — расчёты выполняй сам через read/write_google_sheet_values. "
+                           "Доступ к скрипту наследуется от файла-родителя.")
+        elif share:
+            # bound scripts are not standalone Drive files — share only standalone ones
             out["shared"] = _apps_script_share_anyone(creds, sid) or "no"
         return out
 
@@ -919,10 +972,23 @@ def manage_apps_script(
     if act == "deploy":
         return _deploy(script_id, bool(web_app))
     if act == "run":
-        resp = svc.scripts().run(
-            scriptId=str(script_id),
-            body={"function": function_name, "parameters": parameters or [], "devMode": True},
-        ).execute()
+        try:
+            resp = svc.scripts().run(
+                scriptId=str(script_id),
+                body={"function": function_name, "parameters": parameters or [], "devMode": True},
+            ).execute()
+        except Exception as exc:  # noqa: BLE001 — surface the platform limit, stop blind retries
+            raise ValueError(
+                "scripts.run НЕДОСТУПЕН для этого скрипта (обычно HTTP 404): Google выполняет "
+                "функции через API только если скрипт и OAuth-клиент делят один Google Cloud "
+                "проект и есть API-executable деплой. Это ограничение платформы, НЕ временный "
+                "сбой — НЕ повторяй вызов. Для кнопки/автоматизации в таблице: создай скрипт "
+                "привязанным (action=create, parent_id=<spreadsheet_id>) с простыми триггерами "
+                "onOpen (меню) и onEdit (чекбокс) — они работают у пользователя сами; расчёт и "
+                "первичное заполнение выполни СВОИМ ходом через read_google_sheet_values + "
+                "write_google_sheet_values и проверь чтением назад. Исходная ошибка Google: "
+                f"{exc}"
+            ) from exc
         if "error" in resp:
             return {"error": resp["error"]}
         return {"result": resp.get("response", {}).get("result")}
