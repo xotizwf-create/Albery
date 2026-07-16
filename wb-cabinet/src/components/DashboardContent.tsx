@@ -43,8 +43,8 @@ function Row({ color, name, value, share, ring }: { color: string, name: string,
 }
 
 export function DashboardContent() {
-  const [startDate, setStartDate] = useState('2026-03-01');
-  const [endDate, setEndDate] = useState('2026-03-08');
+  const [startDate, setStartDate] = useState(() => { const d = new Date(); d.setDate(d.getDate() - 29); return d.toISOString().slice(0, 10); });
+  const [endDate, setEndDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [brand, setBrand] = useState('Все');
   const [activeTab, setActiveTab] = useState('Общий дашборд');
   const [brands, setBrands] = useState<string[]>(['Все']);
