@@ -131,6 +131,7 @@ const MAIN_ROWS: MetricRow[] = [
   { label: 'ДРР РК, %', value: (p) => p.drr_pct, summary: (p) => ratio(sum(p, 'adv_rub'), sum(p, 'orders_rub')), format: 'percent' },
   { label: 'ДРР ко всем заказам, %', value: (p) => ratio(p.adv_rub, p.orders_rub), summary: (p) => ratio(sum(p, 'adv_rub'), sum(p, 'orders_rub')), format: 'percent' },
   { label: 'ДРР к продажам, %', value: (p) => ratio(p.adv_rub, p.sales_rub), summary: (p) => ratio(sum(p, 'adv_rub'), sum(p, 'sales_rub')), format: 'percent' },
+  { label: 'Остаток WB, шт', value: (p) => p.stock_qty, summary: (p) => p.at(-1)?.stock_qty || 0, tone: 'green' },
   { label: 'Оборачиваемость склада, дн.', value: (p) => p.turnoverDays, summary: (p) => average(p.map((item) => item.turnoverDays)), format: 'days', tone: 'green' },
   { label: 'Остаток закончится WB', value: (p) => p.depletionDate, summary: (p) => p.at(-1)?.depletionDate || '—', format: 'date', tone: 'muted' },
   { label: 'К перечислению на р/сч, руб (прогнозное)', value: (p) => p.for_pay_rub, summary: (p) => sum(p, 'for_pay_rub'), format: 'money' },
@@ -211,18 +212,13 @@ export function RnpTab({ brand, startDate, endDate }: { brand?: string; startDat
   }, []);
 
   useEffect(() => {
-    if (!selected) {
-      setDays([]);
-      setMetricsError(false);
-      return;
-    }
     setMetricsLoading(true);
     setMetricsError(false);
     api<{ days: RnpDay[] }>(`/api/wb-cab/rnp${qs({
       from: startDate,
       to: endDate,
       brand: brand === 'Все' ? undefined : brand,
-      nm_id: String(selected.nm_id),
+      nm_id: selected ? String(selected.nm_id) : undefined,
     })}`)
       .then((data) => setDays(data.days || []))
       .catch(() => { setDays([]); setMetricsError(true); })
@@ -337,14 +333,14 @@ export function RnpTab({ brand, startDate, endDate }: { brand?: string; startDat
           </div>
         ) : (
           <div className="rounded-xl border border-indigo-100 bg-indigo-50 px-4 py-3 text-xs font-medium text-indigo-700 sm:text-sm">
-            Товар ещё не выбран — обязательный шаблон ниже заполнен нулевыми значениями за период {fullDate(startDate)}–{fullDate(endDate)}.
+            Показана сводка по всему WB-кабинету за полгода: {fullDate(startDate)}–{fullDate(endDate)}. Выберите товар, чтобы отфильтровать факты по его артикулу WB.
           </div>
         )}
       </div>
 
       {(metricsLoading || metricsError) && (
         <div className={`rounded-xl border px-4 py-3 text-xs font-medium sm:text-sm ${metricsError ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-slate-200 bg-white text-slate-500'}`}>
-          {metricsError ? 'Данные по товару временно недоступны. Шаблон сохранён и показан с нулевыми значениями.' : 'Обновляю показатели выбранного товара…'}
+          {metricsError ? 'Данные временно недоступны. Шаблон сохранён и показан с нулевыми значениями.' : selected ? 'Обновляю показатели выбранного товара…' : 'Загружаю сводные показатели WB-кабинета…'}
         </div>
       )}
 
