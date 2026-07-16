@@ -61,6 +61,7 @@ import {
   MessageSquare,
   BarChart3,
 } from "lucide-react";
+import { WbCabinet } from "./wbcab/WbCabinet";
 import { DialogsView } from "./agent/views/DialogsView";
 import { AgentsView } from "./agent/views/AgentsView";
 import { KnowledgeBaseView } from "./agent/views/KnowledgeBaseView";
@@ -6283,6 +6284,10 @@ export default function App() {
       // Access management moved to Центр Агента → Агенты (Команда и доступы);
       // the old agent_settings panel is gone.
       return renderAiInstructionsSettings();
+    }
+
+    if (activeTab === "WB-кабинет") {
+      return <WbCabinet />;
     }
 
     if (activeTab !== "Сводная аналитика") {
