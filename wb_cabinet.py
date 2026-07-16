@@ -1,0 +1,1022 @@
+# -*- coding: utf-8 -*-
+"""WB-кабинет: аналитика Wildberries внутри Albery.
+
+Слои: (1) WBClient — единственная точка обращения к WB API, строго последовательная,
+с бэкоффом (глобальный лимитер WB отдаёт 429 уже на втором быстром вызове);
+(2) sync_* — инкрементальные выгрузки в Postgres (upsert по натуральным ключам, сырой
+ответ в raw jsonb); (3) запросы разделов UI + расчёт налогов; (4) Flask-роуты /api/wb-cab/*.
+UI и агент читают ТОЛЬКО из БД. Схема: database/migrations/053_wb_analytics.sql.
+Расширяемость метрик: слой запросов здесь + VIEW wb_daily_metrics — новые/расчётные
+метрики добавляются запросом, без изменения выгрузки.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+import datetime as dt
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+from app import app, pg_connect  # noqa: E402
+
+log = logging.getLogger("wb_cabinet")
+
+STAT = "https://statistics-api.wildberries.ru"
+ADV = "https://advert-api.wildberries.ru"
+CONTENT = "https://content-api.wildberries.ru"
+PRICES = "https://discounts-prices-api.wildberries.ru"
+ANALYTICS = "https://seller-analytics-api.wildberries.ru"
+
+
+# ------------------------------------------------------------------ client
+class WBClient:
+    """Sequential WB API client. Never call in parallel; 429/5xx → exponential backoff."""
+
+    def __init__(self) -> None:
+        self.token = (os.getenv("WB_ANALYTICS_TOKEN") or "").strip()
+        if not self.token:
+            raise RuntimeError("WB_ANALYTICS_TOKEN is not configured in .env")
+        self._last_call = 0.0
+
+    def call(self, url: str, params: dict | None = None, body: Any = None,
+             method: str | None = None, min_gap: float = 1.6, tries: int = 6) -> Any:
+        if params:
+            url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+        delay = 65.0
+        for attempt in range(1, tries + 1):
+            gap = self._last_call + min_gap - time.monotonic()
+            if gap > 0:
+                time.sleep(gap)
+            req = urllib.request.Request(url, method=method or ("POST" if body is not None else "GET"))
+            req.add_header("Authorization", self.token)
+            data = None
+            if body is not None:
+                data = json.dumps(body).encode()
+                req.add_header("Content-Type", "application/json")
+            self._last_call = time.monotonic()
+            try:
+                with urllib.request.urlopen(req, data, timeout=120) as r:
+                    raw = r.read()
+                    return json.loads(raw) if raw else None
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read()[:200].decode("utf-8", "replace")
+                except Exception:  # noqa: BLE001
+                    pass
+                if e.code in (429, 500, 502, 503, 504) and attempt < tries:
+                    log.info("wb %s -> %s, backoff %.0fs (try %d)", url.split("?")[0], e.code, delay, attempt)
+                    time.sleep(delay)
+                    delay = min(delay * 1.7, 600)
+                    continue
+                raise RuntimeError(f"WB API {e.code}: {detail[:180]} url={url.split('?')[0]}") from e
+            except Exception as e:  # noqa: BLE001 — network blip
+                if attempt < tries:
+                    time.sleep(min(20 * attempt, 60))
+                    continue
+                raise
+        raise RuntimeError("unreachable")
+
+
+def _num(v: Any) -> Any:
+    return v if isinstance(v, (int, float)) else None
+
+
+def _ts(v: Any) -> Any:
+    return v or None
+
+
+def _log_run(endpoint: str, rows: int, ok: bool, error: str | None = None,
+             started: dt.datetime | None = None) -> None:
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO wb_sync_log (endpoint, started_at, finished_at, rows_upserted, ok, error) "
+                        "VALUES (%s, %s, now(), %s, %s, %s)",
+                        (endpoint, started or dt.datetime.now(dt.timezone.utc), rows, ok, (error or "")[:500] or None),
+                    )
+                    cur.execute(
+                        "INSERT INTO wb_sync_state (endpoint, last_run_at, status, note) VALUES (%s, now(), %s, %s) "
+                        "ON CONFLICT (endpoint) DO UPDATE SET last_run_at=now(), status=EXCLUDED.status, note=EXCLUDED.note",
+                        (endpoint, "ok" if ok else "error", (error or "")[:300] or None),
+                    )
+    except Exception:  # noqa: BLE001
+        log.exception("wb sync log failed")
+
+
+def _state_get(endpoint: str, key: str) -> Any:
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {key} FROM wb_sync_state WHERE endpoint=%s", (endpoint,))
+            row = cur.fetchone()
+            return row[key] if row else None
+
+
+def _state_set(endpoint: str, **kv: Any) -> None:
+    cols = ", ".join(f"{k}=%s" for k in kv)
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO wb_sync_state (endpoint) VALUES (%s) ON CONFLICT (endpoint) DO NOTHING", (endpoint,))
+                cur.execute(f"UPDATE wb_sync_state SET {cols} WHERE endpoint=%s", (*kv.values(), endpoint))
+
+
+# ------------------------------------------------------------------ sync: orders / sales
+def sync_orders(client: WBClient, days_back: int | None = None) -> int:
+    started = dt.datetime.now(dt.timezone.utc)
+    try:
+        last = _state_get("orders", "last_from")
+        if days_back:
+            date_from = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
+        else:
+            date_from = ((last - dt.timedelta(hours=1)).isoformat() if last
+                         else (dt.date.today() - dt.timedelta(days=3)).isoformat())
+        rows = client.call(f"{STAT}/api/v1/supplier/orders", {"dateFrom": date_from, "flag": 0}) or []
+        n = 0
+        max_lcd = None
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    for r in rows:
+                        lcd = r.get("lastChangeDate")
+                        if lcd and (max_lcd is None or lcd > max_lcd):
+                            max_lcd = lcd
+                        cur.execute(
+                            """
+                            INSERT INTO wb_orders (srid, g_number, date, last_change_date, nm_id, barcode,
+                                supplier_article, tech_size, brand, subject, category, warehouse_name,
+                                warehouse_type, region_name, oblast, country, income_id, is_cancel, cancel_date,
+                                total_price, discount_percent, spp, finished_price, price_with_disc, order_type,
+                                sticker, raw)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (srid) DO UPDATE SET
+                                last_change_date=EXCLUDED.last_change_date, is_cancel=EXCLUDED.is_cancel,
+                                cancel_date=EXCLUDED.cancel_date, raw=EXCLUDED.raw, synced_at=now()
+                            """,
+                            (r.get("srid"), r.get("gNumber"), _ts(r.get("date")), _ts(lcd), r.get("nmId"),
+                             r.get("barcode"), r.get("supplierArticle"), r.get("techSize"), r.get("brand"),
+                             r.get("subject"), r.get("category"), r.get("warehouseName"), r.get("warehouseType"),
+                             r.get("regionName"), r.get("oblastOkrugName"), r.get("countryName"), r.get("incomeID"),
+                             bool(r.get("isCancel")), _ts(r.get("cancelDate") if str(r.get("cancelDate", "")).startswith("2") else None),
+                             _num(r.get("totalPrice")), _num(r.get("discountPercent")), _num(r.get("spp")),
+                             _num(r.get("finishedPrice")), _num(r.get("priceWithDisc")), r.get("orderType"),
+                             r.get("sticker"), json.dumps(r, ensure_ascii=False)),
+                        )
+                        n += 1
+        if max_lcd:
+            _state_set("orders", last_from=max_lcd)
+        _log_run("orders", n, True, started=started)
+        return n
+    except Exception as e:  # noqa: BLE001
+        _log_run("orders", 0, False, str(e), started=started)
+        raise
+
+
+def sync_sales(client: WBClient, days_back: int | None = None) -> int:
+    started = dt.datetime.now(dt.timezone.utc)
+    try:
+        last = _state_get("sales", "last_from")
+        if days_back:
+            date_from = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
+        else:
+            date_from = ((last - dt.timedelta(hours=1)).isoformat() if last
+                         else (dt.date.today() - dt.timedelta(days=3)).isoformat())
+        rows = client.call(f"{STAT}/api/v1/supplier/sales", {"dateFrom": date_from, "flag": 0}) or []
+        n = 0
+        max_lcd = None
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    for r in rows:
+                        lcd = r.get("lastChangeDate")
+                        if lcd and (max_lcd is None or lcd > max_lcd):
+                            max_lcd = lcd
+                        sale_id = r.get("saleID") or ""
+                        cur.execute(
+                            """
+                            INSERT INTO wb_sales (sale_id, srid, g_number, date, last_change_date, nm_id, barcode,
+                                supplier_article, tech_size, brand, subject, category, warehouse_name, region_name,
+                                oblast, country, is_return, total_price, discount_percent, spp, for_pay,
+                                finished_price, price_with_disc, payment_sale_amount, order_type, raw)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (sale_id) DO UPDATE SET
+                                last_change_date=EXCLUDED.last_change_date, for_pay=EXCLUDED.for_pay,
+                                raw=EXCLUDED.raw, synced_at=now()
+                            """,
+                            (sale_id, r.get("srid"), r.get("gNumber"), _ts(r.get("date")), _ts(lcd), r.get("nmId"),
+                             r.get("barcode"), r.get("supplierArticle"), r.get("techSize"), r.get("brand"),
+                             r.get("subject"), r.get("category"), r.get("warehouseName"), r.get("regionName"),
+                             r.get("oblastOkrugName"), r.get("countryName"), sale_id.startswith("R"),
+                             _num(r.get("totalPrice")), _num(r.get("discountPercent")), _num(r.get("spp")),
+                             _num(r.get("forPay")), _num(r.get("finishedPrice")), _num(r.get("priceWithDisc")),
+                             _num(r.get("paymentSaleAmount")), r.get("orderType"), json.dumps(r, ensure_ascii=False)),
+                        )
+                        n += 1
+        if max_lcd:
+            _state_set("sales", last_from=max_lcd)
+        _log_run("sales", n, True, started=started)
+        return n
+    except Exception as e:  # noqa: BLE001
+        _log_run("sales", 0, False, str(e), started=started)
+        raise
+
+
+def sync_stocks(client: WBClient) -> int:
+    started = dt.datetime.now(dt.timezone.utc)
+    try:
+        rows = client.call(f"{STAT}/api/v1/supplier/stocks",
+                           {"dateFrom": (dt.date.today() - dt.timedelta(days=1)).isoformat()}) or []
+        today = dt.date.today()
+        n = 0
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    for r in rows:
+                        cur.execute(
+                            """
+                            INSERT INTO wb_stocks_daily (snapshot_date, nm_id, barcode, warehouse_name,
+                                supplier_article, brand, subject, tech_size, quantity, in_way_to_client,
+                                in_way_from_client, quantity_full, price, discount, raw)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (snapshot_date, nm_id, barcode, warehouse_name) DO UPDATE SET
+                                quantity=EXCLUDED.quantity, in_way_to_client=EXCLUDED.in_way_to_client,
+                                in_way_from_client=EXCLUDED.in_way_from_client, quantity_full=EXCLUDED.quantity_full,
+                                price=EXCLUDED.price, discount=EXCLUDED.discount, raw=EXCLUDED.raw
+                            """,
+                            (today, r.get("nmId"), r.get("barcode") or "", r.get("warehouseName") or "",
+                             r.get("supplierArticle"), r.get("brand"), r.get("subject"), r.get("techSize"),
+                             r.get("quantity"), r.get("inWayToClient"), r.get("inWayFromClient"),
+                             r.get("quantityFull"), _num(r.get("Price")), _num(r.get("Discount")),
+                             json.dumps(r, ensure_ascii=False)),
+                        )
+                        n += 1
+        _log_run("stocks", n, True, started=started)
+        return n
+    except Exception as e:  # noqa: BLE001
+        _log_run("stocks", 0, False, str(e), started=started)
+        raise
+
+
+def sync_finance(client: WBClient, days_back: int = 8) -> int:
+    """reportDetailByPeriod: тяжёлый (лимит ~1/мин). Инкремент: последние days_back дней;
+    бэкфилл вызывает чанками по 7 дней."""
+    started = dt.datetime.now(dt.timezone.utc)
+    try:
+        date_to = dt.date.today()
+        date_from = date_to - dt.timedelta(days=days_back)
+        n = 0
+        rrd = 0
+        while True:
+            rows = client.call(
+                f"{STAT}/api/v5/supplier/reportDetailByPeriod",
+                {"dateFrom": date_from.isoformat(), "dateTo": date_to.isoformat(),
+                 "limit": 100000, "rrdid": rrd},
+                min_gap=62.0,
+            )
+            if not rows:
+                break
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        for r in rows:
+                            cur.execute(
+                                """
+                                INSERT INTO wb_finance_details (rrd_id, realizationreport_id, date_from, date_to,
+                                    create_dt, rr_dt, nm_id, brand_name, subject_name, sa_name, ts_name, barcode,
+                                    doc_type_name, supplier_oper_name, office_name, order_dt, sale_dt, quantity,
+                                    retail_price, retail_amount, retail_price_withdisc_rub, ppvz_for_pay,
+                                    delivery_rub, delivery_amount, return_amount, storage_fee, penalty, deduction,
+                                    acquiring_fee, acquiring_percent, ppvz_sales_commission, commission_percent,
+                                    ppvz_vw, ppvz_vw_nds, rebill_logistic_cost, raw)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT (rrd_id) DO UPDATE SET raw=EXCLUDED.raw, synced_at=now()
+                                """,
+                                (r.get("rrd_id"), r.get("realizationreport_id"), r.get("date_from"), r.get("date_to"),
+                                 r.get("create_dt") or None, r.get("rr_dt") or None, r.get("nm_id"), r.get("brand_name"),
+                                 r.get("subject_name"), r.get("sa_name"), r.get("ts_name"), r.get("barcode"),
+                                 r.get("doc_type_name"), r.get("supplier_oper_name"), r.get("office_name"),
+                                 _ts(r.get("order_dt")), _ts(r.get("sale_dt")), _num(r.get("quantity")),
+                                 _num(r.get("retail_price")), _num(r.get("retail_amount")),
+                                 _num(r.get("retail_price_withdisc_rub")), _num(r.get("ppvz_for_pay")),
+                                 _num(r.get("delivery_rub")), _num(r.get("delivery_amount")), _num(r.get("return_amount")),
+                                 _num(r.get("storage_fee")), _num(r.get("penalty")), _num(r.get("deduction")),
+                                 _num(r.get("acquiring_fee")), _num(r.get("acquiring_percent")),
+                                 _num(r.get("ppvz_sales_commission")), _num(r.get("commission_percent")),
+                                 _num(r.get("ppvz_vw")), _num(r.get("ppvz_vw_nds")), _num(r.get("rebill_logistic_cost")),
+                                 json.dumps(r, ensure_ascii=False)),
+                            )
+                            n += 1
+            last_row = rows[-1]
+            rrd = last_row.get("rrd_id") or 0
+            if len(rows) < 100000 or not rrd:
+                break
+        _log_run(f"finance_{date_from.isoformat()}", n, True, started=started)
+        return n
+    except Exception as e:  # noqa: BLE001
+        _log_run("finance", 0, False, str(e), started=started)
+        raise
+
+
+def sync_finance_backfill(client: WBClient, days: int = 182) -> int:
+    total = 0
+    end = dt.date.today()
+    start = end - dt.timedelta(days=days)
+    cur = start
+    while cur < end:
+        nxt = min(cur + dt.timedelta(days=7), end)
+        started = dt.datetime.now(dt.timezone.utc)
+        try:
+            rows = client.call(
+                f"{STAT}/api/v5/supplier/reportDetailByPeriod",
+                {"dateFrom": cur.isoformat(), "dateTo": nxt.isoformat(), "limit": 100000, "rrdid": 0},
+                min_gap=62.0,
+            ) or []
+            n = 0
+            if rows:
+                # переиспользуем insert из sync_finance через временную вставку
+                with pg_connect() as conn:
+                    with conn.transaction():
+                        with conn.cursor() as curq:
+                            for r in rows:
+                                curq.execute(
+                                    "INSERT INTO wb_finance_details (rrd_id, realizationreport_id, date_from, date_to, create_dt, rr_dt, nm_id, brand_name, subject_name, sa_name, ts_name, barcode, doc_type_name, supplier_oper_name, office_name, order_dt, sale_dt, quantity, retail_price, retail_amount, retail_price_withdisc_rub, ppvz_for_pay, delivery_rub, delivery_amount, return_amount, storage_fee, penalty, deduction, acquiring_fee, acquiring_percent, ppvz_sales_commission, commission_percent, ppvz_vw, ppvz_vw_nds, rebill_logistic_cost, raw) "
+                                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                                    "ON CONFLICT (rrd_id) DO NOTHING",
+                                    (r.get("rrd_id"), r.get("realizationreport_id"), r.get("date_from"), r.get("date_to"),
+                                     r.get("create_dt") or None, r.get("rr_dt") or None, r.get("nm_id"), r.get("brand_name"),
+                                     r.get("subject_name"), r.get("sa_name"), r.get("ts_name"), r.get("barcode"),
+                                     r.get("doc_type_name"), r.get("supplier_oper_name"), r.get("office_name"),
+                                     _ts(r.get("order_dt")), _ts(r.get("sale_dt")), _num(r.get("quantity")),
+                                     _num(r.get("retail_price")), _num(r.get("retail_amount")),
+                                     _num(r.get("retail_price_withdisc_rub")), _num(r.get("ppvz_for_pay")),
+                                     _num(r.get("delivery_rub")), _num(r.get("delivery_amount")), _num(r.get("return_amount")),
+                                     _num(r.get("storage_fee")), _num(r.get("penalty")), _num(r.get("deduction")),
+                                     _num(r.get("acquiring_fee")), _num(r.get("acquiring_percent")),
+                                     _num(r.get("ppvz_sales_commission")), _num(r.get("commission_percent")),
+                                     _num(r.get("ppvz_vw")), _num(r.get("ppvz_vw_nds")), _num(r.get("rebill_logistic_cost")),
+                                     json.dumps(r, ensure_ascii=False)),
+                                )
+                                n += 1
+            total += n
+            _log_run(f"finance_bf_{cur.isoformat()}", n, True, started=started)
+        except Exception as e:  # noqa: BLE001
+            _log_run(f"finance_bf_{cur.isoformat()}", 0, False, str(e), started=started)
+            log.warning("finance backfill chunk %s failed: %s", cur, e)
+        cur = nxt
+    return total
+
+
+def sync_cards(client: WBClient) -> int:
+    started = dt.datetime.now(dt.timezone.utc)
+    try:
+        n = 0
+        cursor = {"limit": 100}
+        while True:
+            body = {"settings": {"cursor": cursor, "filter": {"withPhoto": -1}}}
+            data = client.call(f"{CONTENT}/content/v2/get/cards/list", body=body) or {}
+            cards = data.get("cards") or []
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        for c in cards:
+                            photo = ""
+                            ph = c.get("photos") or []
+                            if ph and isinstance(ph, list):
+                                photo = (ph[0] or {}).get("tm") or (ph[0] or {}).get("big") or ""
+                            cur.execute(
+                                """
+                                INSERT INTO wb_cards (nm_id, imt_id, vendor_code, brand, title, subject_id,
+                                    subject_name, photo_url, raw, updated_at)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+                                ON CONFLICT (nm_id) DO UPDATE SET vendor_code=EXCLUDED.vendor_code,
+                                    brand=EXCLUDED.brand, title=EXCLUDED.title, subject_name=EXCLUDED.subject_name,
+                                    photo_url=EXCLUDED.photo_url, raw=EXCLUDED.raw, updated_at=now()
+                                """,
+                                (c.get("nmID"), c.get("imtID"), c.get("vendorCode"), c.get("brand"), c.get("title"),
+                                 c.get("subjectID"), c.get("subjectName"), photo, json.dumps(c, ensure_ascii=False)),
+                            )
+                            n += 1
+            cur_resp = data.get("cursor") or {}
+            if len(cards) < cursor.get("limit", 100):
+                break
+            cursor = {"limit": 100, "updatedAt": cur_resp.get("updatedAt"), "nmID": cur_resp.get("nmID")}
+        _log_run("cards", n, True, started=started)
+        return n
+    except Exception as e:  # noqa: BLE001
+        _log_run("cards", 0, False, str(e), started=started)
+        raise
+
+
+def sync_prices(client: WBClient) -> int:
+    started = dt.datetime.now(dt.timezone.utc)
+    try:
+        n = 0
+        offset = 0
+        today = dt.date.today()
+        while True:
+            data = client.call(f"{PRICES}/api/v2/list/goods/filter", {"limit": 1000, "offset": offset}) or {}
+            goods = ((data.get("data") or {}).get("listGoods")) or []
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        for g in goods:
+                            for s in (g.get("sizes") or [{}]):
+                                cur.execute(
+                                    """
+                                    INSERT INTO wb_prices_current (snapshot_date, nm_id, size_id, price,
+                                        discounted_price, discount, club_discount, raw)
+                                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                                    ON CONFLICT (snapshot_date, nm_id, size_id) DO UPDATE SET
+                                        price=EXCLUDED.price, discounted_price=EXCLUDED.discounted_price,
+                                        discount=EXCLUDED.discount, club_discount=EXCLUDED.club_discount, raw=EXCLUDED.raw
+                                    """,
+                                    (today, g.get("nmID"), s.get("sizeID") or 0, _num(s.get("price")),
+                                     _num(s.get("discountedPrice")), _num(g.get("discount")),
+                                     _num(g.get("clubDiscount")), json.dumps(g, ensure_ascii=False)),
+                                )
+                                n += 1
+            if len(goods) < 1000:
+                break
+            offset += 1000
+        _log_run("prices", n, True, started=started)
+        return n
+    except Exception as e:  # noqa: BLE001
+        _log_run("prices", 0, False, str(e), started=started)
+        raise
+
+
+def sync_adv_costs(client: WBClient, days_back: int = 31) -> int:
+    """История затрат на продвижение (upd). WB отдаёт максимум ~31 день за запрос."""
+    started = dt.datetime.now(dt.timezone.utc)
+    try:
+        d_to = dt.date.today()
+        d_from = d_to - dt.timedelta(days=min(days_back, 31))
+        rows = client.call(f"{ADV}/adv/v1/upd", {"from": d_from.isoformat(), "to": d_to.isoformat()}) or []
+        n = 0
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    for r in rows:
+                        cur.execute(
+                            """
+                            INSERT INTO wb_adv_costs (upd_num, upd_time, upd_sum, advert_id, campaign_name,
+                                advert_type, payment_type, raw)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (upd_num, advert_id) DO UPDATE SET upd_sum=EXCLUDED.upd_sum, raw=EXCLUDED.raw
+                            """,
+                            (r.get("updNum"), _ts(r.get("updTime")), _num(r.get("updSum")), r.get("advertId"),
+                             r.get("campName"), r.get("advertType"), str(r.get("paymentType") or ""),
+                             json.dumps(r, ensure_ascii=False)),
+                        )
+                        n += 1
+        _log_run("adv_costs", n, True, started=started)
+        return n
+    except Exception as e:  # noqa: BLE001
+        _log_run("adv_costs", 0, False, str(e), started=started)
+        raise
+
+
+def sync_adv_backfill(client: WBClient, days: int = 182) -> int:
+    total = 0
+    end = dt.date.today()
+    cur = end - dt.timedelta(days=days)
+    while cur < end:
+        nxt = min(cur + dt.timedelta(days=30), end)
+        try:
+            rows = client.call(f"{ADV}/adv/v1/upd", {"from": cur.isoformat(), "to": nxt.isoformat()}) or []
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as curq:
+                        for r in rows:
+                            curq.execute(
+                                "INSERT INTO wb_adv_costs (upd_num, upd_time, upd_sum, advert_id, campaign_name, advert_type, payment_type, raw) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (upd_num, advert_id) DO NOTHING",
+                                (r.get("updNum"), _ts(r.get("updTime")), _num(r.get("updSum")), r.get("advertId"),
+                                 r.get("campName"), r.get("advertType"), str(r.get("paymentType") or ""),
+                                 json.dumps(r, ensure_ascii=False)),
+                            )
+                            total += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("adv backfill chunk %s failed: %s", cur, e)
+        cur = nxt
+    _log_run("adv_backfill", total, True)
+    return total
+
+
+def sync_all(initial_days: int | None = None) -> dict[str, Any]:
+    """Одна последовательная сессия синка. initial_days → полный бэкфилл истории."""
+    client = WBClient()
+    out: dict[str, Any] = {}
+    steps = [
+        ("cards", lambda: sync_cards(client)),
+        ("orders", lambda: sync_orders(client, days_back=initial_days)),
+        ("sales", lambda: sync_sales(client, days_back=initial_days)),
+        ("stocks", lambda: sync_stocks(client)),
+        ("prices", lambda: sync_prices(client)),
+        ("adv", lambda: (sync_adv_backfill(client, initial_days) if initial_days else sync_adv_costs(client))),
+        ("finance", lambda: (sync_finance_backfill(client, initial_days) if initial_days else sync_finance(client))),
+    ]
+    for name, fn in steps:
+        try:
+            out[name] = fn()
+        except Exception as e:  # noqa: BLE001
+            out[name] = f"ERROR: {e}"
+            log.exception("wb sync step %s failed", name)
+    return out
+
+
+# ------------------------------------------------------------------ queries (разделы UI)
+def _brand_where(brand: str | None, col: str = "brand") -> tuple[str, list]:
+    if brand and brand.strip() and brand.strip().lower() != "все":
+        return f" AND {col} = %s", [brand.strip()]
+    return "", []
+
+
+def q_brands() -> list[str]:
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT brand FROM wb_cards WHERE brand IS NOT NULL AND brand<>'' ORDER BY 1")
+            return [r["brand"] for r in cur.fetchall()]
+
+
+def q_summary(d_from: str, d_to: str, brand: str | None) -> dict[str, Any]:
+    bw_o, bp = _brand_where(brand)
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT count(*) FILTER (WHERE NOT is_cancel) AS orders_cnt,
+                           COALESCE(sum(price_with_disc) FILTER (WHERE NOT is_cancel),0) AS orders_rub,
+                           count(*) FILTER (WHERE is_cancel) AS cancels_cnt
+                    FROM wb_orders WHERE date >= %s AND date < (%s::date + 1) {bw_o}""",
+                [d_from, d_to, *bp])
+            orders = dict(cur.fetchone())
+            cur.execute(
+                f"""SELECT count(*) FILTER (WHERE NOT is_return) AS sales_cnt,
+                           COALESCE(sum(price_with_disc) FILTER (WHERE NOT is_return),0) AS sales_rub,
+                           COALESCE(sum(for_pay) FILTER (WHERE NOT is_return),0) AS for_pay_rub,
+                           count(*) FILTER (WHERE is_return) AS returns_cnt,
+                           COALESCE(sum(price_with_disc) FILTER (WHERE is_return),0) AS returns_rub
+                    FROM wb_sales WHERE date >= %s AND date < (%s::date + 1) {bw_o}""",
+                [d_from, d_to, *bp])
+            sales = dict(cur.fetchone())
+            cur.execute(
+                f"""SELECT COALESCE(sum(quantity),0) AS stock_qty, COALESCE(sum(in_way_to_client),0) AS in_way_to,
+                           COALESCE(sum(in_way_from_client),0) AS in_way_from
+                    FROM wb_stocks_daily WHERE snapshot_date = (SELECT max(snapshot_date) FROM wb_stocks_daily) {bw_o}""",
+                bp)
+            stocks = dict(cur.fetchone())
+            cur.execute(
+                f"""SELECT date_trunc('day', date)::date AS day,
+                           count(*) FILTER (WHERE NOT is_cancel) AS orders_cnt,
+                           COALESCE(sum(price_with_disc) FILTER (WHERE NOT is_cancel),0) AS orders_rub
+                    FROM wb_orders WHERE date >= %s AND date < (%s::date + 1) {bw_o}
+                    GROUP BY 1 ORDER BY 1""",
+                [d_from, d_to, *bp])
+            daily = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                f"""SELECT o.nm_id, max(o.supplier_article) AS article, max(c.title) AS title,
+                           max(c.photo_url) AS photo, count(*) AS orders_cnt,
+                           COALESCE(sum(o.price_with_disc),0) AS orders_rub
+                    FROM wb_orders o LEFT JOIN wb_cards c ON c.nm_id = o.nm_id
+                    WHERE o.date >= %s AND o.date < (%s::date + 1) AND NOT o.is_cancel {_brand_where(brand, 'o.brand')[0]}
+                    GROUP BY o.nm_id ORDER BY orders_rub DESC LIMIT 10""",
+                [d_from, d_to, *bp])
+            top = [dict(r) for r in cur.fetchall()]
+    return {"orders": orders, "sales": sales, "stocks": stocks, "daily": daily, "top_articles": top}
+
+
+def q_articles(d_from: str, d_to: str, brand: str | None) -> list[dict[str, Any]]:
+    """Таблица «По артикулам»: остаток, динамика остатков (14 дн), заказы, скорость, по дням."""
+    bw, bp = _brand_where(brand, "c.brand")
+    days = max(1, (dt.date.fromisoformat(d_to) - dt.date.fromisoformat(d_from)).days + 1)
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH ord AS (
+                    SELECT nm_id, count(*) AS cnt, COALESCE(sum(price_with_disc),0) AS rub
+                    FROM wb_orders WHERE date >= %s AND date < (%s::date + 1) AND NOT is_cancel GROUP BY nm_id),
+                by_day AS (
+                    SELECT nm_id, jsonb_object_agg(day, cnt) AS days FROM (
+                        SELECT nm_id, date_trunc('day', date)::date::text AS day, count(*) AS cnt
+                        FROM wb_orders WHERE date >= %s AND date < (%s::date + 1) AND NOT is_cancel
+                        GROUP BY nm_id, 2) t GROUP BY nm_id),
+                stock_now AS (
+                    SELECT nm_id, sum(quantity) AS qty FROM wb_stocks_daily
+                    WHERE snapshot_date = (SELECT max(snapshot_date) FROM wb_stocks_daily) GROUP BY nm_id),
+                stock_hist AS (
+                    SELECT nm_id, jsonb_agg(qty ORDER BY snapshot_date) AS spark FROM (
+                        SELECT nm_id, snapshot_date, sum(quantity) AS qty FROM wb_stocks_daily
+                        WHERE snapshot_date >= CURRENT_DATE - 14 GROUP BY nm_id, snapshot_date) t GROUP BY nm_id)
+                SELECT c.nm_id, c.vendor_code, c.title, c.brand, c.subject_name, c.photo_url,
+                       COALESCE(sn.qty,0) AS stock_qty, sh.spark AS stock_spark,
+                       COALESCE(o.cnt,0) AS orders_cnt, COALESCE(o.rub,0) AS orders_rub,
+                       round(COALESCE(o.cnt,0)::numeric / %s, 1) AS orders_per_day,
+                       bd.days AS orders_by_day
+                FROM wb_cards c
+                LEFT JOIN ord o ON o.nm_id = c.nm_id
+                LEFT JOIN by_day bd ON bd.nm_id = c.nm_id
+                LEFT JOIN stock_now sn ON sn.nm_id = c.nm_id
+                LEFT JOIN stock_hist sh ON sh.nm_id = c.nm_id
+                WHERE 1=1 {bw}
+                ORDER BY orders_rub DESC NULLS LAST
+                """,
+                [d_from, d_to, d_from, d_to, days, *bp])
+            return [dict(r) for r in cur.fetchall()]
+
+
+def q_finance_groups(d_from: str, d_to: str, brand: str | None) -> dict[str, Any]:
+    """Базовые агрегаты финотчёта за период (по rr_dt) — сырьё для ОПиУ/ДДС/налогов."""
+    bw, bp = _brand_where(brand, "brand_name")
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                  COALESCE(sum(retail_amount) FILTER (WHERE doc_type_name='Продажа'),0)  AS sales_retail,
+                  COALESCE(sum(retail_amount) FILTER (WHERE doc_type_name='Возврат'),0)  AS returns_retail,
+                  COALESCE(sum(retail_price_withdisc_rub) FILTER (WHERE doc_type_name='Продажа'),0) AS sales_withdisc,
+                  COALESCE(sum(retail_price_withdisc_rub) FILTER (WHERE doc_type_name='Возврат'),0) AS returns_withdisc,
+                  COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Продажа'),0)   AS forpay_sales,
+                  COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Возврат'),0)   AS forpay_returns,
+                  COALESCE(sum(quantity) FILTER (WHERE doc_type_name='Продажа'),0)       AS qty_sales,
+                  COALESCE(sum(quantity) FILTER (WHERE doc_type_name='Возврат'),0)       AS qty_returns,
+                  COALESCE(sum(delivery_rub),0)   AS logistics,
+                  COALESCE(sum(storage_fee),0)    AS storage,
+                  COALESCE(sum(penalty),0)        AS penalty,
+                  COALESCE(sum(deduction),0)      AS deduction,
+                  COALESCE(sum(acquiring_fee),0)  AS acquiring,
+                  COALESCE(sum(retail_amount - ppvz_for_pay - delivery_rub) FILTER (WHERE doc_type_name='Продажа'),0) AS commission_est
+                FROM wb_finance_details
+                WHERE rr_dt >= %s AND rr_dt <= %s {bw}
+                """,
+                [d_from, d_to, *bp])
+            g = dict(cur.fetchone())
+            cur.execute(
+                f"""SELECT COALESCE(sum(upd_sum),0) AS adv FROM wb_adv_costs
+                    WHERE upd_time >= %s AND upd_time < (%s::date + 1)""",
+                [d_from, d_to])
+            g["adv"] = cur.fetchone()["adv"]
+            # себестоимость проданного (по баркодам из финотчёта × wb_cost_prices)
+            cur.execute(
+                f"""SELECT COALESCE(sum(cp.cost * f.quantity),0) AS cogs,
+                           count(DISTINCT f.barcode) FILTER (WHERE cp.barcode IS NULL) AS missing_barcodes
+                    FROM wb_finance_details f LEFT JOIN wb_cost_prices cp ON cp.barcode = f.barcode
+                    WHERE f.rr_dt >= %s AND f.rr_dt <= %s AND f.doc_type_name='Продажа' {bw}""",
+                [d_from, d_to, *bp])
+            row = dict(cur.fetchone())
+            g["cogs"] = row["cogs"]
+            g["cogs_missing_barcodes"] = row["missing_barcodes"]
+    for k, v in list(g.items()):
+        if v is not None and not isinstance(v, (int, str)):
+            g[k] = float(v)
+    return g
+
+
+def q_pnl(d_from: str, d_to: str, brand: str | None) -> dict[str, Any]:
+    """ОПиУ: помесячные строки + итог."""
+    bw, bp = _brand_where(brand, "brand_name")
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT to_char(date_trunc('month', rr_dt), 'YYYY-MM') AS month,
+                  COALESCE(sum(retail_amount) FILTER (WHERE doc_type_name='Продажа'),0)
+                    - COALESCE(sum(retail_amount) FILTER (WHERE doc_type_name='Возврат'),0) AS revenue,
+                  COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Продажа'),0)
+                    - COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Возврат'),0) AS payout,
+                  COALESCE(sum(delivery_rub),0) AS logistics,
+                  COALESCE(sum(storage_fee),0) AS storage,
+                  COALESCE(sum(penalty),0) + COALESCE(sum(deduction),0) AS penalties
+                FROM wb_finance_details WHERE rr_dt >= %s AND rr_dt <= %s {bw}
+                GROUP BY 1 ORDER BY 1
+                """,
+                [d_from, d_to, *bp])
+            months = [dict(r) for r in cur.fetchall()]
+    g = q_finance_groups(d_from, d_to, brand)
+    commission = g["sales_retail"] - g["returns_retail"] - (g["forpay_sales"] - g["forpay_returns"]) - g["logistics"]
+    pnl = {
+        "revenue": g["sales_retail"] - g["returns_retail"],
+        "commission": commission,
+        "logistics": g["logistics"],
+        "storage": g["storage"],
+        "penalties": g["penalty"] + g["deduction"],
+        "adv": g["adv"],
+        "cogs": g["cogs"],
+        "cogs_missing_barcodes": g["cogs_missing_barcodes"],
+    }
+    pnl["operating_profit"] = (pnl["revenue"] - pnl["commission"] - pnl["logistics"] - pnl["storage"]
+                               - pnl["penalties"] - pnl["adv"] - pnl["cogs"])
+    for m in months:
+        for k, v in list(m.items()):
+            if v is not None and not isinstance(v, (int, str)):
+                m[k] = float(v)
+    return {"months": months, "total": pnl}
+
+
+def q_cashflow(d_from: str, d_to: str, brand: str | None) -> list[dict[str, Any]]:
+    """ДДС: понедельные отчёты WB — поступления/удержания по realizationreport_id."""
+    bw, bp = _brand_where(brand, "brand_name")
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT realizationreport_id, min(date_from) AS date_from, max(date_to) AS date_to,
+                  COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Продажа'),0)
+                    - COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Возврат'),0) AS payout,
+                  COALESCE(sum(delivery_rub),0) AS logistics,
+                  COALESCE(sum(storage_fee),0) AS storage,
+                  COALESCE(sum(penalty),0) + COALESCE(sum(deduction),0) AS deductions,
+                  COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Продажа'),0)
+                    - COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Возврат'),0)
+                    - COALESCE(sum(delivery_rub),0) - COALESCE(sum(storage_fee),0)
+                    - COALESCE(sum(penalty),0) - COALESCE(sum(deduction),0) AS net_to_account
+                FROM wb_finance_details WHERE rr_dt >= %s AND rr_dt <= %s {bw}
+                GROUP BY realizationreport_id ORDER BY min(date_from)
+                """,
+                [d_from, d_to, *bp])
+            rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        for k, v in list(r.items()):
+            if v is not None and not isinstance(v, (int, str)) and k != "realizationreport_id":
+                r[k] = float(v) if not isinstance(v, dt.date) else v.isoformat()
+    return rows
+
+
+def q_rnp(d_from: str, d_to: str, brand: str | None) -> list[dict[str, Any]]:
+    """РНП «Рука на пульсе»: день к дню. Расширяемо: добавляй колонки в этот запрос."""
+    bw, bp = _brand_where(brand)
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH o AS (SELECT date_trunc('day', date)::date AS day, count(*) AS cnt,
+                                  COALESCE(sum(price_with_disc),0) AS rub
+                           FROM wb_orders WHERE NOT is_cancel AND date >= %s AND date < (%s::date+1) {bw} GROUP BY 1),
+                     s AS (SELECT date_trunc('day', date)::date AS day,
+                                  count(*) FILTER (WHERE NOT is_return) AS cnt,
+                                  COALESCE(sum(price_with_disc) FILTER (WHERE NOT is_return),0) AS rub,
+                                  count(*) FILTER (WHERE is_return) AS ret_cnt
+                           FROM wb_sales WHERE date >= %s AND date < (%s::date+1) {bw} GROUP BY 1),
+                     st AS (SELECT snapshot_date AS day, sum(quantity) AS qty
+                            FROM wb_stocks_daily WHERE snapshot_date >= %s::date AND snapshot_date <= %s::date
+                            {bw} GROUP BY 1),
+                     a AS (SELECT date_trunc('day', upd_time)::date AS day, COALESCE(sum(upd_sum),0) AS adv
+                           FROM wb_adv_costs WHERE upd_time >= %s AND upd_time < (%s::date+1) GROUP BY 1)
+                SELECT d.day::date AS day,
+                       COALESCE(o.cnt,0) AS orders_cnt, COALESCE(o.rub,0) AS orders_rub,
+                       COALESCE(s.cnt,0) AS sales_cnt, COALESCE(s.rub,0) AS sales_rub,
+                       COALESCE(s.ret_cnt,0) AS returns_cnt,
+                       COALESCE(st.qty,0) AS stock_qty, COALESCE(a.adv,0) AS adv_rub,
+                       CASE WHEN COALESCE(o.rub,0) > 0 THEN round(100*COALESCE(a.adv,0)/o.rub, 1) ELSE 0 END AS drr_pct
+                FROM (SELECT generate_series(%s::date, %s::date, '1 day')::date AS day) d
+                LEFT JOIN o ON o.day = d.day LEFT JOIN s ON s.day = d.day
+                LEFT JOIN st ON st.day = d.day LEFT JOIN a ON a.day = d.day
+                ORDER BY d.day
+                """,
+                [d_from, d_to, *bp, d_from, d_to, *bp, d_from, d_to, *bp, d_from, d_to, d_from, d_to])
+            rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        r["day"] = r["day"].isoformat()
+        for k, v in list(r.items()):
+            if v is not None and not isinstance(v, (int, str)):
+                r[k] = float(v)
+    return rows
+
+
+# ------------------------------------------------------------------ tax calculator
+TAX_MODES = {
+    "usn_d":   {"label": "УСН Доходы", "default_rate": 6.0, "base": "income"},
+    "usn_dr":  {"label": "УСН Доходы-Расходы", "default_rate": 15.0, "base": "income_minus_expenses"},
+    "ausn_d":  {"label": "АУСН Доходы", "default_rate": 8.0, "base": "income"},
+    "ausn_dr": {"label": "АУСН Доходы-Расходы", "default_rate": 20.0, "base": "income_minus_expenses"},
+    "sng":     {"label": "Страны СНГ", "default_rate": 0.0, "base": "income"},
+}
+VAT_MODES = {"none": 0.0, "vat5": 5.0, "vat7": 7.0, "vat20": 20.0}
+
+
+def q_tax(d_from: str, d_to: str, brand: str | None, mode: str, rate: float | None,
+          vat_mode: str = "none", vat_refund_percent: float = 0.0) -> dict[str, Any]:
+    """Налоговый калькулятор. Прозрачность: каждая строка расчёта в ответе.
+    Реализация до СПП = retail_amount(Продажи−Возвраты); после СПП = сумма фактической
+    оплаты покупателем (retail_price_withdisc_rub − СПП уже вычтен WB в forPay-механике) —
+    для налоговой базы УСН используется реализация ПОСЛЕ СПП (позиция ФНС: доход продавца
+    = стоимость реализации, применённая WB), режим АУСН/СНГ — та же база, своя ставка."""
+    m = TAX_MODES.get(mode) or TAX_MODES["usn_d"]
+    rate = float(rate if rate is not None else m["default_rate"])
+    vat_rate = VAT_MODES.get(vat_mode, 0.0)
+    g = q_finance_groups(d_from, d_to, brand)
+
+    realization_before_spp = g["sales_retail"] - g["returns_retail"]
+    realization_after_spp = g["sales_withdisc"] - g["returns_withdisc"]
+    payout = g["forpay_sales"] - g["forpay_returns"]
+    commission = realization_before_spp - payout - g["logistics"]
+    services_other = g["penalty"] + g["deduction"] + g["acquiring"]
+    services_total = commission + g["logistics"] + g["adv"] + services_other + g["storage"]
+
+    income_base = realization_after_spp
+    expenses = services_total + g["cogs"]
+    if m["base"] == "income":
+        tax_base = income_base
+    else:
+        tax_base = max(0.0, income_base - expenses)
+    tax = round(tax_base * rate / 100.0, 2)
+    vat = round(income_base * vat_rate / (100.0 + vat_rate), 2) if vat_rate else 0.0
+    vat_refund = round(vat * float(vat_refund_percent or 0) / 100.0, 2)
+    operating_profit = round(income_base - services_total - g["cogs"] - tax - vat + vat_refund, 2)
+
+    return {
+        "mode": mode, "mode_label": m["label"], "rate": rate,
+        "vat_mode": vat_mode, "vat_rate": vat_rate, "vat_refund_percent": vat_refund_percent,
+        "realization": {"before_spp": round(realization_before_spp, 2),
+                        "after_spp": round(realization_after_spp, 2)},
+        "services": {"commission": round(commission, 2), "logistics": round(g["logistics"], 2),
+                     "adv": round(g["adv"], 2), "storage": round(g["storage"], 2),
+                     "other": round(services_other, 2), "total": round(services_total, 2)},
+        "taxes_and_costs": {"tax_base": round(tax_base, 2), "tax": tax, "vat": vat,
+                            "vat_refund": vat_refund, "cogs": round(g["cogs"], 2),
+                            "cogs_missing_barcodes": g["cogs_missing_barcodes"]},
+        "payout_from_wb": round(payout, 2),
+        "operating_profit": operating_profit,
+        "modes_available": {k: v["label"] for k, v in TAX_MODES.items()},
+        "vat_modes_available": list(VAT_MODES.keys()),
+    }
+
+
+# ------------------------------------------------------------------ Flask API
+def _args() -> tuple[str, str, str | None]:
+    from flask import request
+    today = dt.date.today()
+    d_from = request.args.get("from") or (today - dt.timedelta(days=29)).isoformat()
+    d_to = request.args.get("to") or today.isoformat()
+    brand = request.args.get("brand") or None
+    return d_from, d_to, brand
+
+
+@app.route("/api/wb-cab/brands")
+def wbcab_brands():
+    from flask import jsonify
+    return jsonify({"brands": q_brands()})
+
+
+@app.route("/api/wb-cab/summary")
+def wbcab_summary():
+    from flask import jsonify
+    d_from, d_to, brand = _args()
+    data = q_summary(d_from, d_to, brand)
+    for sec in ("orders", "sales", "stocks"):
+        for k, v in list(data[sec].items()):
+            if v is not None and not isinstance(v, (int, str)):
+                data[sec][k] = float(v)
+    for d in data["daily"]:
+        d["day"] = d["day"].isoformat()
+        d["orders_rub"] = float(d["orders_rub"])
+    for t in data["top_articles"]:
+        t["orders_rub"] = float(t["orders_rub"])
+    return jsonify({"from": d_from, "to": d_to, "brand": brand, **data})
+
+
+@app.route("/api/wb-cab/articles")
+def wbcab_articles():
+    from flask import jsonify
+    d_from, d_to, brand = _args()
+    rows = q_articles(d_from, d_to, brand)
+    for r in rows:
+        for k, v in list(r.items()):
+            if v is not None and not isinstance(v, (int, str, list, dict, bool)):
+                r[k] = float(v)
+    return jsonify({"from": d_from, "to": d_to, "brand": brand, "articles": rows})
+
+
+@app.route("/api/wb-cab/pnl")
+def wbcab_pnl():
+    from flask import jsonify
+    d_from, d_to, brand = _args()
+    return jsonify({"from": d_from, "to": d_to, "brand": brand, **q_pnl(d_from, d_to, brand)})
+
+
+@app.route("/api/wb-cab/cashflow")
+def wbcab_cashflow():
+    from flask import jsonify
+    d_from, d_to, brand = _args()
+    return jsonify({"from": d_from, "to": d_to, "brand": brand, "reports": q_cashflow(d_from, d_to, brand)})
+
+
+@app.route("/api/wb-cab/rnp")
+def wbcab_rnp():
+    from flask import jsonify
+    d_from, d_to, brand = _args()
+    return jsonify({"from": d_from, "to": d_to, "brand": brand, "days": q_rnp(d_from, d_to, brand)})
+
+
+@app.route("/api/wb-cab/tax")
+def wbcab_tax():
+    from flask import jsonify, request
+    d_from, d_to, brand = _args()
+    mode = request.args.get("mode") or "usn_d"
+    rate = request.args.get("rate", type=float)
+    vat_mode = request.args.get("vat_mode") or "none"
+    vat_refund = request.args.get("vat_refund", type=float) or 0.0
+    return jsonify({"from": d_from, "to": d_to, "brand": brand,
+                    **q_tax(d_from, d_to, brand, mode, rate, vat_mode, vat_refund)})
+
+
+@app.route("/api/wb-cab/sync-status")
+def wbcab_sync_status():
+    from flask import jsonify
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT endpoint, last_run_at, status, note FROM wb_sync_state ORDER BY endpoint")
+            state = [dict(r) for r in cur.fetchall()]
+            cur.execute("""SELECT (SELECT count(*) FROM wb_orders) AS orders,
+                                  (SELECT count(*) FROM wb_sales) AS sales,
+                                  (SELECT count(*) FROM wb_finance_details) AS finance,
+                                  (SELECT count(*) FROM wb_cards) AS cards,
+                                  (SELECT count(*) FROM wb_stocks_daily) AS stocks,
+                                  (SELECT count(*) FROM wb_adv_costs) AS adv""")
+            counts = dict(cur.fetchone())
+    for s in state:
+        if s.get("last_run_at"):
+            s["last_run_at"] = s["last_run_at"].isoformat()
+    return jsonify({"counts": counts, "state": state})
+
+
+@app.route("/api/wb-cab/cost-prices", methods=["GET", "POST"])
+def wbcab_cost_prices():
+    """Болванка под себестоимость: GET — список+шаблон колонок; POST — upsert строк
+    [{barcode, cost, vendor_code?}] (импорт Excel будет поверх этого же эндпоинта)."""
+    from flask import jsonify, request
+    if request.method == "POST":
+        rows = (request.get_json(silent=True) or {}).get("rows") or []
+        n = 0
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    for r in rows:
+                        bc = str(r.get("barcode") or "").strip()
+                        cost = r.get("cost")
+                        if not bc or cost is None:
+                            continue
+                        cur.execute(
+                            """INSERT INTO wb_cost_prices (barcode, nm_id, vendor_code, cost, source, updated_at)
+                               VALUES (%s,%s,%s,%s,%s,now())
+                               ON CONFLICT (barcode) DO UPDATE SET cost=EXCLUDED.cost,
+                                   vendor_code=COALESCE(EXCLUDED.vendor_code, wb_cost_prices.vendor_code),
+                                   source=EXCLUDED.source, updated_at=now()""",
+                            (bc, r.get("nm_id"), r.get("vendor_code"), cost, r.get("source") or "api"))
+                        n += 1
+        return jsonify({"upserted": n})
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT barcode, nm_id, vendor_code, cost, valid_from, source FROM wb_cost_prices ORDER BY vendor_code NULLS LAST, barcode LIMIT 2000")
+            rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        r["cost"] = float(r["cost"])
+        r["valid_from"] = r["valid_from"].isoformat() if r.get("valid_from") else None
+    return jsonify({"template_columns": ["barcode", "vendor_code", "cost"],
+                    "note": "Импорт Excel по шаблону будет загружаться сюда же (POST rows).",
+                    "rows": rows})
+
+
+@app.route("/api/wb-cab/tax-settings", methods=["GET", "POST"])
+def wbcab_tax_settings():
+    from flask import jsonify, request
+    if request.method == "POST":
+        b = request.get_json(silent=True) or {}
+        mode = str(b.get("mode") or "usn_d")
+        if mode not in TAX_MODES:
+            return jsonify({"error": f"mode must be one of {list(TAX_MODES)}"}), 400
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO wb_tax_settings (mode, rate, vat_mode, vat_refund_percent, effective_from) "
+                        "VALUES (%s,%s,%s,%s,%s)",
+                        (mode, b.get("rate") or TAX_MODES[mode]["default_rate"],
+                         str(b.get("vat_mode") or "none"), b.get("vat_refund_percent") or 0,
+                         b.get("effective_from") or dt.date.today().isoformat()))
+        return jsonify({"saved": True})
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT mode, rate, vat_mode, vat_refund_percent, effective_from FROM wb_tax_settings "
+                        "WHERE effective_from <= CURRENT_DATE ORDER BY effective_from DESC, id DESC LIMIT 1")
+            row = cur.fetchone()
+    cur_settings = dict(row) if row else {"mode": "usn_d", "rate": 6.0, "vat_mode": "none", "vat_refund_percent": 0}
+    if cur_settings.get("rate") is not None:
+        cur_settings["rate"] = float(cur_settings["rate"])
+    if cur_settings.get("vat_refund_percent") is not None:
+        cur_settings["vat_refund_percent"] = float(cur_settings["vat_refund_percent"])
+    if cur_settings.get("effective_from") and not isinstance(cur_settings["effective_from"], str):
+        cur_settings["effective_from"] = cur_settings["effective_from"].isoformat()
+    return jsonify({"current": cur_settings, "modes": {k: v["label"] for k, v in TAX_MODES.items()},
+                    "vat_modes": list(VAT_MODES.keys())})
+
+
+log.info("wb_cabinet loaded: /api/wb-cab/* routes registered")

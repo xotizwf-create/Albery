@@ -18620,6 +18620,7 @@ from bitrix import (  # noqa: E402
 )
 import b24bot  # noqa: E402,F401
 import agent_center  # noqa: E402,F401
+import wb_cabinet  # noqa: E402,F401  — WB-кабинет: /api/wb-cab/*
 
 
 if __name__ == "__main__":

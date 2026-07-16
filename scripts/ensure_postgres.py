@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "database" / "postgres_schema_v1.sql"
 MIGRATIONS_DIR = ROOT / "database" / "migrations"
 REQUIRED_TABLE_MIGRATIONS = {
+    "wb_finance_details": "053_wb_analytics.sql",
     "goal_progress_events": "006_goal_progress_events.sql",
     "chat_overall_daily_reports": "007_chat_overall_daily_reports.sql",
     "chat_overall_weekly_reports": "008_chat_overall_weekly_reports.sql",
