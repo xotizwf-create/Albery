@@ -33,11 +33,18 @@ FUNNELS = {
 }
 # владелец воронки → его воронки (для сводки-задачи)
 OWNERS = {
-    28: {"name": "Артур Степанян", "funnels": [2, 4]},
-    30: {"name": "Наталья Горюнова", "funnels": [6]},
+    28: {"name": "Артур", "funnels": [2, 4]},
+    30: {"name": "Наталья", "funnels": [6]},
 }
 PORTAL = "https://b24-0xrp3s.bitrix24.ru"
 CREATOR_ID = 22  # ИИ Агент
+# На время тестов сводки-задачи ставятся на ИИ Агента (22), а не на реальных владельцев.
+# Убрать (поставить None), когда переключаем в боевой режим на Артура/Наталью.
+TEST_RESPONSIBLE = int(os.getenv("FUNNEL_SUMMARY_TEST_RESPONSIBLE", "22") or "0") or None
+
+# Серьёзность проблемы (для статуса): crit — данные противоречат/пустые; warn — не хватает шага/срок.
+_CRIT = ("оплата не подтверждена", "пустая карточка")
+_WARN = ("нет следующего", "просрочено")
 
 F_PAID = "UF_CRM_1783670137991"       # Оплата произведена (60=да, 58=нет)
 F_SUM = "UF_CRM_1783669649285"        # Сумма заказа (текст)
@@ -181,77 +188,105 @@ def _baseline(funnel_id: int) -> dict:
 
 
 # ---------- summary (Ср): картина + diff + рекомендации → задача владельцу --------------------
+def _ref(d) -> str:
+    return f"[URL={d['url']}]{d['title']}[/URL]"
+
+
+def _short(d) -> str:
+    return f"«{d['title']}»"
+
+
+def _severity(deals: list[dict]):
+    crit = [d for d in deals if any(any(k in p for k in _CRIT) for p in d["problems"])]
+    warn = [d for d in deals if d not in crit and any(any(k in p for k in _WARN) for p in d["problems"])]
+    if crit:
+        return ("🔴", f"[b]🔴 Требует внимания[/b] — {len(crit)} сделок с серьёзными проблемами "
+                f"(не подтверждена оплата / пустые карточки)"
+                + (f" и ещё {len(warn)} без следующего шага" if warn else "") + ".")
+    if warn:
+        return ("🟡", f"[b]🟡 Мелкие недочёты[/b] — {len(warn)} сделок без следующего шага или с "
+                "просрочкой; серьёзных проблем нет.")
+    return ("🟢", "[b]🟢 Всё в порядке[/b] — сделки заполнены и в движении.")
+
+
 def _funnel_picture(fid: int, deals: list[dict], base: dict) -> str:
     name = FUNNELS[fid]["name"]
-    lines = [f"[b]{name}[/b] — активных сделок: {len(deals)}"]
-    paid = sum(1 for d in deals if d["paid"] == "да")
+    active = [d for d in deals if d["sem"] != "S"]
+    won = [d for d in deals if d["sem"] == "S"]
+    lines = [f"[b]{name}[/b] — активных {len(active)}" + (f", закрытых «успешна» {len(won)}" if won else "")]
     if fid == 2:
-        lines.append(f"Оплачено: {paid} · оплата не подтверждена: {len(deals) - paid}")
-    # по этапам
-    from collections import Counter
-    by_stage = Counter(d["stage"] for d in deals)
-    lines.append("По этапам: " + ", ".join(f"{k} — {v}" for k, v in by_stage.items()))
-    # заказы в работе: номер + товар/срок
-    inwork = [d for d in deals if d["sem"] != "S"]
-    if inwork:
-        lines.append("\n[b]В работе:[/b]")
-        for d in inwork:
-            bits = [f"[URL={d['url']}]{d['title']}[/URL]", d["stage"]]
+        paid = sum(1 for d in deals if d["paid"] == "да")
+        lines.append(f"Деньги: оплата подтверждена у {paid}, НЕ подтверждена у {len(deals) - paid}.")
+
+    if active:
+        lines.append("\n[b]Сейчас ведутся:[/b]")
+        for d in active:
+            bits = [_ref(d) + " — " + d["stage"]]
             if d["order_no"]:
-                bits.append(f"заказ {d['order_no']}")
-            if d["ship_plan"]:
-                sd = _date(d["ship_plan"])
-                if sd:
-                    bits.append(f"отгрузка {sd.isoformat()}")
-            if d["arrival"]:
-                ad = _date(d["arrival"])
-                if ad:
-                    bits.append(f"приход {ad.isoformat()}")
-            lines.append("— " + " · ".join(bits))
-    # что изменилось с прошлой проверки
+                bits.append("заказ " + d["order_no"])
+            sd = _date(d["ship_plan"]) if d["ship_plan"] else None
+            if sd:
+                bits.append("отгрузка " + sd.isoformat())
+            ad = _date(d["arrival"]) if d["arrival"] else None
+            if ad:
+                bits.append("приход " + ad.isoformat())
+            line = "— " + " · ".join(bits)
+            if d["problems"]:
+                line += "\n   ⚠️ " + "; ".join(d["problems"])
+            lines.append(line)
+
+    won_unpaid = [d for d in won if d["paid"] != "да"]
+    if won_unpaid:
+        lines.append("\n[b]В этапе «успешна», но оплата не подтверждена:[/b]")
+        for d in won_unpaid:
+            lines.append(f"— {_ref(d)}")
+
     if base:
-        moved, stalled = [], []
-        for d in deals:
-            b = base.get(d["id"])
-            if not b:
-                moved.append(f"{d['title']} (новая в контроле)")
-            elif d["fingerprint"] != b["fingerprint"]:
-                moved.append(d["title"])
-            elif d["problems"]:
-                stalled.append(d["title"])
-        lines.append("\n[b]С прошлой проверки:[/b]")
-        lines.append(("Есть движение: " + ", ".join(moved)) if moved else "Движения по сделкам не было.")
+        moved = [d["title"] for d in deals if (base.get(d["id"]) or {}).get("fingerprint") != d["fingerprint"]
+                 and d["id"] in base]
+        new = [d["title"] for d in deals if d["id"] not in base]
+        stalled = [d["title"] for d in deals if d["problems"] and d["id"] in base
+                   and (base.get(d["id"]) or {}).get("fingerprint") == d["fingerprint"]]
+        lines.append("\n[b]Что изменилось с прошлой проверки:[/b]")
+        chunks = []
+        if moved:
+            chunks.append("двигались: " + ", ".join(f"«{t}»" for t in moved))
+        if new:
+            chunks.append("новые: " + ", ".join(f"«{t}»" for t in new))
+        lines.append(("• " + "; ".join(chunks)) if chunks else "• движения по сделкам не было.")
         if stalled:
-            lines.append("Без изменений и с проблемами: " + ", ".join(stalled))
+            lines.append("• без изменений и с проблемами: " + ", ".join(f"«{t}»" for t in stalled))
     else:
-        lines.append("\n[i]Это первая проверка — сравнивать пока не с чем.[/i]")
+        lines.append("\n[i]Первая проверка — сравнивать пока не с чем (со следующей будет видно, что сделали).[/i]")
     return "\n".join(lines)
 
 
 def _recommendations(all_deals: list[dict]) -> str:
-    def ids(pred):
-        return ", ".join("#%d" % d["id"] for d in all_deals if pred(d))
+    def names(pred):
+        picked = [_short(d) for d in all_deals if pred(d)]
+        return f"{len(picked)} — " + ", ".join(picked) if picked else ""
     recs = []
-    no_next = ids(lambda d: "нет следующего дела/задачи" in d["problems"])
-    if no_next:
-        recs.append(f"Проставьте следующий шаг (задачу/дело) по сделкам: {no_next}.")
-    unpaid = ids(lambda d: any("оплата не подтверждена" in p for p in d["problems"]))
+    unpaid = names(lambda d: any("оплата не подтверждена" in p for p in d["problems"]))
     if unpaid:
-        recs.append(f"Подтвердите оплату (поле «Оплата произведена») или верните на актуальный этап: {unpaid}.")
-    empty = ids(lambda d: any("пустая карточка" in p for p in d["problems"]))
+        recs.append(f"[b]Подтвердить оплату[/b] ({unpaid}) — они в этапе «успешна», но оплата не отмечена "
+                    "(поставьте «да» в поле «Оплата произведена» или верните сделку на актуальный этап).")
+    no_next = names(lambda d: "нет следующего дела/задачи" in d["problems"])
+    if no_next:
+        recs.append(f"[b]Проставить следующий шаг[/b] ({no_next}) — задачу или дело с дедлайном, "
+                    "иначе непонятно, кто двигает сделку дальше.")
+    empty = names(lambda d: any("пустая карточка" in p for p in d["problems"]))
     if empty:
-        recs.append(f"Заполните карточку (поставщик, товар, сумма): {empty}.")
-    overdue = ids(lambda d: any("просрочено" in p for p in d["problems"]))
+        recs.append(f"[b]Заполнить карточку[/b] ({empty}) — поставщик, товар, сумма.")
+    overdue = names(lambda d: any("просрочено" in p for p in d["problems"]))
     if overdue:
-        recs.append(f"Обновите даты/статус по просроченным сделкам: {overdue}.")
-    # общая по закупке (C2) — производственные/логистические поля не заполнены у активных сделок
+        recs.append(f"[b]Обновить просроченные сроки[/b] ({overdue}) — плановые даты в прошлом без факта.")
     if any(d["funnel"] == 2 and d["sem"] != "S" and not (d["prod_stage"] or d["ship_plan"] or d["arrival"])
            for d in all_deals):
-        recs.append("Заполняйте производственные и логистические поля (стадия пр-ва, даты отгрузки/"
-                    "прихода в КРД) — иначе не видно, где товар и когда он придёт.")
+        recs.append("[b]Заполнять производственные и логистические поля[/b] по закупке (стадия пр-ва, "
+                    "даты отгрузки/прихода в КРД) — иначе не видно, где товар и когда он придёт.")
     if not recs:
         return "Рекомендаций нет — данные в порядке. ✅"
-    return "\n".join(f"— {r}" for r in recs)
+    return "\n".join(f"{i}. {r}" for i, r in enumerate(recs, 1))
 
 
 def run_summary(dry=False):
@@ -261,27 +296,30 @@ def run_summary(dry=False):
         pictures, all_deals = [], []
         for fid in cfg["funnels"]:
             deals = collect(fid)
-            base = _baseline(fid)
-            pictures.append(_funnel_picture(fid, deals, base))
+            pictures.append(_funnel_picture(fid, deals, _baseline(fid)))
             all_deals += deals
-        n_probs = sum(1 for d in all_deals if d["problems"])
-        head = (f"[b]Сводка по воронкам на {today}[/b]\n"
-                f"Всего активных сделок: {len(all_deals)} · требуют внимания: {n_probs}\n")
-        body = head + "\n\n".join(pictures)
-        body += "\n\n[b]⚠️ Рекомендации — что исправить (срочно):[/b]\n" + _recommendations(all_deals)
-        title = f"Воронки: сводка и рекомендации на {today}"
+        icon, status_line = _severity(all_deals)
+        total = len(all_deals)
+        active = sum(1 for d in all_deals if d["sem"] != "S")
+        head = (f"[b]Сводка по воронкам «{cfg['name']}» на {today}[/b]\n"
+                f"{status_line}\n"
+                f"Сделок всего: {total} — в работе {active}, закрыто «успешна» {total - active}.")
+        body = head + "\n\n" + "\n\n".join(pictures)
+        body += "\n\n[b]⚠️ Что срочно исправить:[/b]\n" + _recommendations(all_deals)
+        title = f"{icon} Воронки «{cfg['name']}»: сводка на {today}"
+        responsible = TEST_RESPONSIBLE or owner_id
         if dry:
-            print(f"\n===== ЗАДАЧА → {cfg['name']} (id {owner_id}) =====\nЗаголовок: {title}\n{body}")
+            print(f"\n===== ЗАДАЧА (отв. id {responsible}) =====\nЗаголовок: {title}\n{body}")
             continue
         res = cs.tool_create_bitrix_task({
             "title": title, "description": body,
-            "responsible_bitrix_user_id": owner_id, "creator_bitrix_user_id": CREATOR_ID,
+            "responsible_bitrix_user_id": responsible, "creator_bitrix_user_id": CREATOR_ID,
             "deadline": (msk_now().replace(hour=18, minute=0, second=0, microsecond=0)).isoformat(),
             "confirm_past_deadline": True,
             "result_criteria": "Воронка актуализирована: данные заполнены, проставлены следующие шаги, проблемы устранены.",
         })
-        logging.info("funnel-control summary → %s (%s): task %s", cfg["name"], owner_id, res.get("task_id"))
-        print(f"создана задача {res.get('task_id')} → {cfg['name']}")
+        logging.info("funnel summary «%s» → отв.%s: task %s", cfg["name"], responsible, res.get("task_id"))
+        print(f"создана задача {res.get('task_id')} (воронки {cfg['name']}, отв. id {responsible})")
 
 
 if __name__ == "__main__":
