@@ -8,16 +8,18 @@
 - Квоты WB — истина в заголовке Retry-After: на 429 тик МГНОВЕННО пишет blocked_until в
   wb_sync_state и переходит к следующему источнику. Закрытый источник не трогается вообще
   (попытки тоже жгут квоту). Никаких ретраев по кругу.
-- Бэкфилл истории — резюмируемые курсоры в wb_sync_state (cursor_date/done): финансы по
-  7-дневным чанкам (≤20 за тик), реклама по 30-дневным; заказы/выкупы за полгода забираются
-  ОДНИМ вызовом (dateFrom полгода назад), когда квота открыта. Переживает kill/reboot/что угодно.
-- Лимиты по документации WB: statistics-api и advert-api — порядка 1 запрос/мин на метод
-  (v1 orders/sales/stocks отвечают 429 с пометкой deprecated при превышении) → пейсинг 62с
-  МЕЖДУ вызовами одного метода ДО обращения. X-Ratelimit-заголовки пишутся в журнал.
+- Бэкфилл истории — резюмируемые курсоры в wb_sync_state: финансовый отчёт берётся одним
+  полугодовым диапазоном и продолжается по rrdId, реклама — по 30-дневным диапазонам,
+  заказы/выкупы — по lastChangeDate. Переживает kill/reboot/что угодно.
+- Лимиты по документации WB задаются по методу: legacy statistics-api — 62с между
+  страницами, реклама /adv/v1/upd — не чаще раза в секунду, finance — согласно типу токена.
+  Retry-After и X-Ratelimit-заголовки считаются источником истины.
 UI и агент читают ТОЛЬКО Postgres. Схема: migrations/053 (+054 колонки состояния синка).
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -59,13 +61,14 @@ class WBClient:
     больше короткого порога — WBQuotaError наверх (без сна). Заголовки лимитов сохраняются."""
 
     SHORT_WAIT_MAX = 90.0     # столько ещё можно подождать внутри тика
-    _PACE_PER_METHOD = 62.0   # лимиты statistics/advert ≈ 1 запрос/мин на метод
-    _PACED_HOSTS = ("statistics-api.wildberries.ru", "advert-api.wildberries.ru")
+    _STATISTICS_GAP = 62.0
 
     def __init__(self) -> None:
         self.token = (os.getenv("WB_ANALYTICS_TOKEN") or "").strip()
         if not self.token:
             raise RuntimeError("WB_ANALYTICS_TOKEN is not configured in .env")
+        self.token_claims = _jwt_claims(self.token)
+        self.token_access = int(self.token_claims.get("acc") or 0)
         self._last_call = 0.0
         self._last_by_method: dict[str, float] = {}
         self.last_ratelimit: dict[str, str] = {}
@@ -75,8 +78,11 @@ class WBClient:
         if params:
             url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
         base = url.split("?")[0]
-        if any(h in base for h in self._PACED_HOSTS):
-            min_gap = max(min_gap, self._PACE_PER_METHOD)
+        # The legacy statistics methods are limited to one request per minute.
+        # Promotion /adv/v1/upd is documented at one request per second and is
+        # already covered by the client's 1.6 second account-wide gap.
+        if "statistics-api.wildberries.ru" in base:
+            min_gap = max(min_gap, self._STATISTICS_GAP)
         for attempt in range(1, tries + 1):
             gap = max(self._last_call + 1.6 - time.monotonic(),
                       self._last_by_method.get(base, -1e9) + min_gap - time.monotonic())
@@ -124,6 +130,17 @@ class WBClient:
                     continue
                 raise
         raise RuntimeError("unreachable")
+
+
+def _jwt_claims(token: str) -> dict[str, Any]:
+    """Read non-secret WB token metadata used to select a safe sync strategy."""
+    try:
+        part = token.split(".")[1]
+        part += "=" * ((4 - len(part) % 4) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(part.encode("ascii")))
+        return payload if isinstance(payload, dict) else {}
+    except (IndexError, ValueError, TypeError, json.JSONDecodeError, binascii.Error):
+        return {}
 
 
 def _num(v: Any) -> Any:
@@ -222,6 +239,11 @@ def _clear_report_task(endpoint: str) -> None:
     )
 
 
+def _history_page_complete(rows: list[dict[str, Any]]) -> bool:
+    """The legacy orders/sales endpoint caps a response at about 80k rows."""
+    return len(rows) < 80000
+
+
 # ------------------------------------------------------------------ sync steps
 def sync_orders(client: WBClient, days_back: int | None = None) -> int:
     started = dt.datetime.now(dt.timezone.utc)
@@ -230,7 +252,8 @@ def sync_orders(client: WBClient, days_back: int | None = None) -> int:
     if days_back:
         date_from = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
     else:
-        date_from = ((last - dt.timedelta(hours=1)).isoformat() if last
+        overlap = dt.timedelta(0) if last and not st.get("done") else dt.timedelta(hours=1)
+        date_from = ((last - overlap).isoformat() if last
                      else (dt.date.today() - dt.timedelta(days=3)).isoformat())
     rows = client.call(f"{STAT}/api/v1/supplier/orders", {"dateFrom": date_from, "flag": 0}) or []
     n = 0
@@ -267,8 +290,7 @@ def sync_orders(client: WBClient, days_back: int | None = None) -> int:
                     n += 1
     if max_lcd:
         _state_set("orders", last_from=max_lcd)
-    if days_back:
-        _state_set("orders", done=True)
+    _state_set("orders", done=_history_page_complete(rows))
     _log_run("orders", n, True, started=started)
     return n
 
@@ -280,7 +302,8 @@ def sync_sales(client: WBClient, days_back: int | None = None) -> int:
     if days_back:
         date_from = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
     else:
-        date_from = ((last - dt.timedelta(hours=1)).isoformat() if last
+        overlap = dt.timedelta(0) if last and not st.get("done") else dt.timedelta(hours=1)
+        date_from = ((last - overlap).isoformat() if last
                      else (dt.date.today() - dt.timedelta(days=3)).isoformat())
     rows = client.call(f"{STAT}/api/v1/supplier/sales", {"dateFrom": date_from, "flag": 0}) or []
     n = 0
@@ -315,8 +338,7 @@ def sync_sales(client: WBClient, days_back: int | None = None) -> int:
                     n += 1
     if max_lcd:
         _state_set("sales", last_from=max_lcd)
-    if days_back:
-        _state_set("sales", done=True)
+    _state_set("sales", done=_history_page_complete(rows))
     _log_run("sales", n, True, started=started)
     return n
 
@@ -546,81 +568,143 @@ def _finance_v2_row(r: dict[str, Any]) -> dict[str, Any]:
         "ppvz_vw": r.get("vw"),
         "ppvz_vw_nds": r.get("vwNds"),
         "rebill_logistic_cost": r.get("rebillLogisticCost"),
+        "paid_acceptance": r.get("paidAcceptance"),
+        "additional_payment": r.get("additionalPayment"),
+        "installment_cofinancing_amount": r.get("installmentCofinancingAmount"),
+        "cashback_amount": r.get("cashbackAmount"),
+        "cashback_discount": r.get("cashbackDiscount"),
+        "cashback_commission_change": r.get("cashbackCommissionChange"),
         "_raw": r,
     }
 
 
 def _fin_insert(cur, r: dict) -> None:
+    columns = (
+        "rrd_id", "realizationreport_id", "date_from", "date_to", "create_dt", "rr_dt",
+        "nm_id", "brand_name", "subject_name", "sa_name", "ts_name", "barcode",
+        "doc_type_name", "supplier_oper_name", "office_name", "order_dt", "sale_dt", "quantity",
+        "retail_price", "retail_amount", "retail_price_withdisc_rub", "ppvz_for_pay", "delivery_rub",
+        "delivery_amount", "return_amount", "storage_fee", "penalty", "deduction", "acquiring_fee",
+        "acquiring_percent", "ppvz_sales_commission", "commission_percent", "ppvz_vw", "ppvz_vw_nds",
+        "rebill_logistic_cost", "paid_acceptance", "additional_payment",
+        "installment_cofinancing_amount", "cashback_amount", "cashback_discount",
+        "cashback_commission_change", "raw",
+    )
+    values = (
+        r.get("rrd_id"), r.get("realizationreport_id"), r.get("date_from"), r.get("date_to"),
+        r.get("create_dt") or None, r.get("rr_dt") or None, r.get("nm_id"), r.get("brand_name"),
+        r.get("subject_name"), r.get("sa_name"), r.get("ts_name"), r.get("barcode"),
+        r.get("doc_type_name"), r.get("supplier_oper_name"), r.get("office_name"),
+        _ts(r.get("order_dt")), _ts(r.get("sale_dt")), _num(r.get("quantity")),
+        _num(r.get("retail_price")), _num(r.get("retail_amount")),
+        _num(r.get("retail_price_withdisc_rub")), _num(r.get("ppvz_for_pay")),
+        _num(r.get("delivery_rub")), _num(r.get("delivery_amount")), _num(r.get("return_amount")),
+        _num(r.get("storage_fee")), _num(r.get("penalty")), _num(r.get("deduction")),
+        _num(r.get("acquiring_fee")), _num(r.get("acquiring_percent")),
+        _num(r.get("ppvz_sales_commission")), _num(r.get("commission_percent")),
+        _num(r.get("ppvz_vw")), _num(r.get("ppvz_vw_nds")), _num(r.get("rebill_logistic_cost")),
+        _num(r.get("paid_acceptance")), _num(r.get("additional_payment")),
+        _num(r.get("installment_cofinancing_amount")), _num(r.get("cashback_amount")),
+        _num(r.get("cashback_discount")), _num(r.get("cashback_commission_change")),
+        json.dumps(r.get("_raw") or r, ensure_ascii=False),
+    )
+    updates = ", ".join(f"{column}=EXCLUDED.{column}" for column in columns if column != "rrd_id")
     cur.execute(
-        "INSERT INTO wb_finance_details (rrd_id, realizationreport_id, date_from, date_to, create_dt, rr_dt, "
-        "nm_id, brand_name, subject_name, sa_name, ts_name, barcode, doc_type_name, supplier_oper_name, "
-        "office_name, order_dt, sale_dt, quantity, retail_price, retail_amount, retail_price_withdisc_rub, "
-        "ppvz_for_pay, delivery_rub, delivery_amount, return_amount, storage_fee, penalty, deduction, "
-        "acquiring_fee, acquiring_percent, ppvz_sales_commission, commission_percent, ppvz_vw, ppvz_vw_nds, "
-        "rebill_logistic_cost, raw) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-        "%s,%s,%s,%s,%s,%s) "
-        "ON CONFLICT (rrd_id) DO UPDATE SET raw=EXCLUDED.raw, synced_at=now()",
-        (r.get("rrd_id"), r.get("realizationreport_id"), r.get("date_from"), r.get("date_to"),
-         r.get("create_dt") or None, r.get("rr_dt") or None, r.get("nm_id"), r.get("brand_name"),
-         r.get("subject_name"), r.get("sa_name"), r.get("ts_name"), r.get("barcode"),
-         r.get("doc_type_name"), r.get("supplier_oper_name"), r.get("office_name"),
-         _ts(r.get("order_dt")), _ts(r.get("sale_dt")), _num(r.get("quantity")),
-         _num(r.get("retail_price")), _num(r.get("retail_amount")),
-         _num(r.get("retail_price_withdisc_rub")), _num(r.get("ppvz_for_pay")),
-         _num(r.get("delivery_rub")), _num(r.get("delivery_amount")), _num(r.get("return_amount")),
-         _num(r.get("storage_fee")), _num(r.get("penalty")), _num(r.get("deduction")),
-         _num(r.get("acquiring_fee")), _num(r.get("acquiring_percent")),
-         _num(r.get("ppvz_sales_commission")), _num(r.get("commission_percent")),
-         _num(r.get("ppvz_vw")), _num(r.get("ppvz_vw_nds")), _num(r.get("rebill_logistic_cost")),
-         json.dumps(r.get("_raw") or r, ensure_ascii=False)),
+        f"INSERT INTO wb_finance_details ({', '.join(columns)}) "
+        f"VALUES ({', '.join(['%s'] * len(columns))}) "
+        f"ON CONFLICT (rrd_id) DO UPDATE SET {updates}, synced_at=now()",
+        values,
     )
 
 
-def sync_finance_tick(client: WBClient, chunk_days: int = 7, max_chunks: int = 1) -> int:
-    """Финансы: резюмируемый бэкфилл по курсору + хвост до сегодня. Каждый чанк фиксируется
-    в состоянии сразу — обрыв в любом месте продолжится со следующего чанка."""
-    st = _state_row("finance")
+def sync_finance_tick(client: WBClient, max_pages: int | None = None) -> int:
+    """Download the real WB financial report as one resumable six-month range.
+
+    WB paginates this report by ``rrdId`` with pages up to 100,000 rows.  The old
+    seven-day cursor wasted the extremely scarce Base-token allowance on 26
+    independent ranges.  We now spend every allowed request on the same full
+    range and durably commit its last ``rrdId``.  Personal/Service tokens may
+    consume several minute-paced pages per timer run; a Base token uses one.
+    """
+    endpoint = "finance"
     today = dt.date.today()
-    cursor = st.get("cursor_date") or (today - dt.timedelta(days=BACKFILL_DAYS))
+    st = _state_row(endpoint)
+    caught_up = bool(st.get("done"))
+    range_from = _as_date(st.get("range_from"))
+    range_to = _as_date(st.get("range_to"))
+    page_cursor = int(st.get("page_cursor") or 0)
+
+    if not range_from or not range_to:
+        range_from = today - dt.timedelta(days=10 if caught_up else BACKFILL_DAYS)
+        range_to = today
+        page_cursor = 0
+    elif caught_up and page_cursor == 0:
+        # Refresh the tail after a completed historical pass.  Reports can be
+        # corrected by WB after their first publication, so overlap ten days.
+        range_from = today - dt.timedelta(days=10)
+        range_to = today
+
+    if max_pages is None:
+        max_pages = 20 if client.token_access in (3, 4) else 1
+
     total = 0
-    chunks = 0
-    while cursor < today and chunks < max_chunks:
+    for _ in range(max(1, max_pages)):
         started = dt.datetime.now(dt.timezone.utc)
-        nxt = min(cursor + dt.timedelta(days=chunk_days), today)
-        rrd = 0
-        n = 0
-        while True:
-            rows = client.call(
-                f"{FINANCE}/api/finance/v1/sales-reports/detailed",
-                body={
-                    "dateFrom": cursor.isoformat(),
-                    "dateTo": nxt.isoformat(),
-                    "limit": 100000,
-                    "rrdId": rrd,
-                    "period": "daily",
-                },
-                min_gap=62.0,
-            )
-            if not rows:
-                break
+        rows = client.call(
+            f"{FINANCE}/api/finance/v1/sales-reports/detailed",
+            body={
+                "dateFrom": range_from.isoformat(),
+                "dateTo": range_to.isoformat(),
+                "limit": 100000,
+                "rrdId": page_cursor,
+                "period": "daily",
+            },
+            min_gap=62.0,
+        ) or []
+        n = len(rows)
+        if rows:
             with pg_connect() as conn:
                 with conn.transaction():
                     with conn.cursor() as curq:
-                        for r in rows:
-                            _fin_insert(curq, _finance_v2_row(r))
-                            n += 1
-            rrd = rows[-1].get("rrdId") or 0
-            if len(rows) < 100000 or not rrd:
-                break
-        _state_set("finance", cursor_date=nxt)
-        _log_run(f"finance {cursor.isoformat()}..{nxt.isoformat()}", n, True, started=started)
-        total += n
-        cursor = nxt
-        chunks += 1
-    if cursor >= today:
-        # хвост догнан: держим курсор в последних 10 днях, чтобы каждый тик обновлял свежие отчёты
-        _state_set("finance", cursor_date=today - dt.timedelta(days=10), done=True)
+                        for row in rows:
+                            _fin_insert(curq, _finance_v2_row(row))
+            total += n
+
+        next_cursor = int((rows[-1].get("rrdId") if rows else 0) or 0)
+        # WB explicitly requires repeating with the last rrdId until HTTP 204.
+        # A short non-empty page is therefore still resumable, not completion.
+        has_more = n > 0 and next_cursor > 0 and next_cursor != page_cursor
+        _log_run(
+            f"finance {range_from.isoformat()}..{range_to.isoformat()} rrd={page_cursor}",
+            n,
+            True,
+            started=started,
+        )
+        if has_more:
+            page_cursor = next_cursor
+            _state_set(
+                endpoint,
+                range_from=range_from,
+                range_to=range_to,
+                page_cursor=page_cursor,
+                cursor_date=range_from,
+                done=caught_up,
+                status="refreshing" if caught_up else "partial",
+                note=f"financial report page saved; next rrdId={page_cursor}",
+            )
+            continue
+
+        _state_set(
+            endpoint,
+            range_from=today - dt.timedelta(days=10),
+            range_to=today,
+            page_cursor=0,
+            cursor_date=today - dt.timedelta(days=10),
+            done=True,
+            status="ok",
+            note=f"financial report complete through {range_to.isoformat()}",
+        )
+        break
     return total
 
 
@@ -872,7 +956,29 @@ def q_summary(d_from: str, d_to: str, brand: str | None) -> dict[str, Any]:
                     GROUP BY o.nm_id ORDER BY orders_rub DESC LIMIT 10""",
                 [d_from, d_to, *bp])
             top = [dict(r) for r in cur.fetchall()]
-    return {"orders": orders, "sales": sales, "stocks": stocks, "daily": daily, "top_articles": top}
+            cur.execute(
+                """SELECT
+                     (SELECT min(date)::date::text FROM wb_orders) AS orders_min,
+                     (SELECT max(date)::date::text FROM wb_orders) AS orders_max,
+                     (SELECT min(date)::date::text FROM wb_sales) AS sales_min,
+                     (SELECT max(date)::date::text FROM wb_sales) AS sales_max,
+                     (SELECT done FROM wb_sync_state WHERE endpoint='orders') AS orders_done,
+                     (SELECT done FROM wb_sync_state WHERE endpoint='sales') AS sales_done"""
+            )
+            coverage = dict(cur.fetchone())
+    return {
+        "orders": orders,
+        "sales": sales,
+        "stocks": stocks,
+        "daily": daily,
+        "top_articles": top,
+        "quality": {
+            "orders": {"from": coverage.get("orders_min"), "to": coverage.get("orders_max"),
+                       "complete": bool(coverage.get("orders_done"))},
+            "sales_operational": {"from": coverage.get("sales_min"), "to": coverage.get("sales_max"),
+                                  "complete": bool(coverage.get("sales_done"))},
+        },
+    }
 
 
 def q_articles(d_from: str, d_to: str, brand: str | None) -> list[dict[str, Any]]:
@@ -923,6 +1029,9 @@ def q_finance_groups(d_from: str, d_to: str, brand: str | None) -> dict[str, Any
             cur.execute(
                 f"""
                 SELECT
+                  count(*) AS finance_rows,
+                  min(rr_dt)::text AS finance_min,
+                  max(rr_dt)::text AS finance_max,
                   COALESCE(sum(retail_amount) FILTER (WHERE doc_type_name='Продажа'),0)  AS sales_retail,
                   COALESCE(sum(retail_amount) FILTER (WHERE doc_type_name='Возврат'),0)  AS returns_retail,
                   COALESCE(sum(retail_price_withdisc_rub) FILTER (WHERE doc_type_name='Продажа'),0) AS sales_withdisc,
@@ -936,17 +1045,33 @@ def q_finance_groups(d_from: str, d_to: str, brand: str | None) -> dict[str, Any
                   COALESCE(sum(penalty),0)        AS penalty,
                   COALESCE(sum(deduction),0)      AS deduction,
                   COALESCE(sum(acquiring_fee),0)  AS acquiring,
-                  COALESCE(sum(retail_amount - ppvz_for_pay - delivery_rub) FILTER (WHERE doc_type_name='Продажа'),0) AS commission_est
+                  COALESCE(sum(rebill_logistic_cost),0) AS rebill_logistics,
+                  COALESCE(sum(paid_acceptance),0) AS paid_acceptance,
+                  COALESCE(sum(additional_payment),0) AS additional_payment,
+                  COALESCE(sum(installment_cofinancing_amount),0) AS installment_cofinancing,
+                  COALESCE(sum(cashback_commission_change),0) AS cashback_commission,
+                  COALESCE(sum(ppvz_sales_commission),0) AS commission_actual
                 FROM wb_finance_details
                 WHERE rr_dt >= %s AND rr_dt <= %s {bw}
                 """,
                 [d_from, d_to, *bp])
             g = dict(cur.fetchone())
             cur.execute(
-                """SELECT COALESCE(sum(upd_sum),0) AS adv FROM wb_adv_costs
-                    WHERE upd_time >= %s AND upd_time < (%s::date + 1)""",
-                [d_from, d_to])
-            g["adv"] = cur.fetchone()["adv"]
+                "SELECT done, blocked_until, status, note FROM wb_sync_state WHERE endpoint='finance'"
+            )
+            finance_state = dict(cur.fetchone() or {})
+            if brand and brand.strip() and brand.strip().lower() != "все":
+                # Campaign composition is not stored yet, therefore cabinet ad
+                # spend cannot be honestly assigned to one brand.
+                g["adv"] = 0
+                g["adv_allocated"] = False
+            else:
+                cur.execute(
+                    """SELECT COALESCE(sum(upd_sum),0) AS adv FROM wb_adv_costs
+                        WHERE upd_time >= %s AND upd_time < (%s::date + 1)""",
+                    [d_from, d_to])
+                g["adv"] = cur.fetchone()["adv"]
+                g["adv_allocated"] = True
             # себестоимость проданного (по баркодам из финотчёта × wb_cost_prices)
             cur.execute(
                 f"""SELECT COALESCE(sum(cp.cost * f.quantity),0) AS cogs,
@@ -957,10 +1082,68 @@ def q_finance_groups(d_from: str, d_to: str, brand: str | None) -> dict[str, Any
             row = dict(cur.fetchone())
             g["cogs"] = row["cogs"]
             g["cogs_missing_barcodes"] = row["missing_barcodes"]
+            g["finance_done"] = bool(finance_state.get("done"))
+            g["finance_status"] = finance_state.get("status")
+            blocked_until = finance_state.get("blocked_until")
+            g["finance_blocked_until"] = blocked_until.isoformat() if blocked_until else None
     for k, v in list(g.items()):
         if v is not None and not isinstance(v, (int, str)):
             g[k] = float(v)
     return g
+
+
+def q_finance_daily(d_from: str, d_to: str, brand: str | None) -> list[dict[str, Any]]:
+    """Daily dashboard series from financial-report rows, not operational sales."""
+    bw, bp = _brand_where(brand, "brand_name")
+    use_adv = not (brand and brand.strip() and brand.strip().lower() != "все")
+    adv_cte = (
+        """a AS (SELECT date_trunc('day', upd_time)::date AS day,
+                         COALESCE(sum(upd_sum),0) AS adv
+                  FROM wb_adv_costs WHERE upd_time >= %s AND upd_time < (%s::date+1)
+                  GROUP BY 1)""" if use_adv else
+        "a AS (SELECT NULL::date AS day, 0::numeric AS adv WHERE FALSE)"
+    )
+    adv_params: list[Any] = [d_from, d_to] if use_adv else []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH f AS (
+                    SELECT rr_dt AS day,
+                      COALESCE(sum(retail_price_withdisc_rub) FILTER (WHERE doc_type_name='Продажа'),0)
+                        - COALESCE(sum(retail_price_withdisc_rub) FILTER (WHERE doc_type_name='Возврат'),0) AS realization,
+                      COALESCE(sum(ppvz_sales_commission),0) AS commission,
+                      COALESCE(sum(delivery_rub),0) AS logistics,
+                      COALESCE(sum(storage_fee),0) AS storage,
+                      COALESCE(sum(penalty),0)+COALESCE(sum(deduction),0)+COALESCE(sum(acquiring_fee),0)
+                        +COALESCE(sum(rebill_logistic_cost),0)+COALESCE(sum(paid_acceptance),0)
+                        +COALESCE(sum(additional_payment),0)+COALESCE(sum(installment_cofinancing_amount),0)
+                        +COALESCE(sum(cashback_commission_change),0) AS other
+                    FROM wb_finance_details
+                    WHERE rr_dt >= %s AND rr_dt <= %s {bw}
+                    GROUP BY 1),
+                {adv_cte}
+                SELECT d.day::date AS day,
+                       COALESCE(f.realization,0) AS realization,
+                       COALESCE(f.commission,0) AS commission,
+                       COALESCE(f.logistics,0) AS logistics,
+                       COALESCE(f.storage,0) AS storage,
+                       COALESCE(f.other,0) AS other,
+                       COALESCE(a.adv,0) AS adv,
+                       COALESCE(f.commission,0)+COALESCE(f.logistics,0)+COALESCE(f.storage,0)
+                         +COALESCE(f.other,0)+COALESCE(a.adv,0) AS services
+                FROM (SELECT generate_series(%s::date, %s::date, '1 day')::date AS day) d
+                LEFT JOIN f ON f.day=d.day LEFT JOIN a ON a.day=d.day ORDER BY d.day
+                """,
+                [d_from, d_to, *bp, *adv_params, d_from, d_to],
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    for row in rows:
+        row["day"] = row["day"].isoformat()
+        for key, value in list(row.items()):
+            if value is not None and not isinstance(value, (int, str)):
+                row[key] = float(value)
+    return rows
 
 
 def q_pnl(d_from: str, d_to: str, brand: str | None) -> dict[str, Any]:
@@ -984,19 +1167,22 @@ def q_pnl(d_from: str, d_to: str, brand: str | None) -> dict[str, Any]:
                 [d_from, d_to, *bp])
             months = [dict(r) for r in cur.fetchall()]
     g = q_finance_groups(d_from, d_to, brand)
-    commission = g["sales_retail"] - g["returns_retail"] - (g["forpay_sales"] - g["forpay_returns"]) - g["logistics"]
+    commission = g["commission_actual"]
     pnl = {
         "revenue": g["sales_retail"] - g["returns_retail"],
         "commission": commission,
         "logistics": g["logistics"],
         "storage": g["storage"],
         "penalties": g["penalty"] + g["deduction"],
+        "other_services": (g["acquiring"] + g["rebill_logistics"] + g["paid_acceptance"]
+                           + g["additional_payment"] + g["installment_cofinancing"]
+                           + g["cashback_commission"]),
         "adv": g["adv"],
         "cogs": g["cogs"],
         "cogs_missing_barcodes": g["cogs_missing_barcodes"],
     }
     pnl["operating_profit"] = (pnl["revenue"] - pnl["commission"] - pnl["logistics"] - pnl["storage"]
-                               - pnl["penalties"] - pnl["adv"] - pnl["cogs"])
+                               - pnl["penalties"] - pnl["other_services"] - pnl["adv"] - pnl["cogs"])
     for m in months:
         for k, v in list(m.items()):
             if v is not None and not isinstance(v, (int, str)):
@@ -1016,11 +1202,19 @@ def q_cashflow(d_from: str, d_to: str, brand: str | None) -> list[dict[str, Any]
                     - COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Возврат'),0) AS payout,
                   COALESCE(sum(delivery_rub),0) AS logistics,
                   COALESCE(sum(storage_fee),0) AS storage,
-                  COALESCE(sum(penalty),0) + COALESCE(sum(deduction),0) AS deductions,
+                  COALESCE(sum(penalty),0) + COALESCE(sum(deduction),0)
+                    + COALESCE(sum(acquiring_fee),0) + COALESCE(sum(rebill_logistic_cost),0)
+                    + COALESCE(sum(paid_acceptance),0) + COALESCE(sum(additional_payment),0)
+                    + COALESCE(sum(installment_cofinancing_amount),0)
+                    + COALESCE(sum(cashback_commission_change),0) AS deductions,
                   COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Продажа'),0)
                     - COALESCE(sum(ppvz_for_pay) FILTER (WHERE doc_type_name='Возврат'),0)
                     - COALESCE(sum(delivery_rub),0) - COALESCE(sum(storage_fee),0)
-                    - COALESCE(sum(penalty),0) - COALESCE(sum(deduction),0) AS net_to_account
+                    - COALESCE(sum(penalty),0) - COALESCE(sum(deduction),0)
+                    - COALESCE(sum(acquiring_fee),0) - COALESCE(sum(rebill_logistic_cost),0)
+                    - COALESCE(sum(paid_acceptance),0) - COALESCE(sum(additional_payment),0)
+                    - COALESCE(sum(installment_cofinancing_amount),0)
+                    - COALESCE(sum(cashback_commission_change),0) AS net_to_account
                 FROM wb_finance_details WHERE rr_dt >= %s AND rr_dt <= %s {bw}
                 GROUP BY realizationreport_id ORDER BY min(date_from)
                 """,
@@ -1134,8 +1328,14 @@ def q_tax(d_from: str, d_to: str, brand: str | None, mode: str, rate: float | No
     realization_before_spp = g["sales_retail"] - g["returns_retail"]
     realization_after_spp = g["sales_withdisc"] - g["returns_withdisc"]
     payout = g["forpay_sales"] - g["forpay_returns"]
-    commission = realization_before_spp - payout - g["logistics"]
-    services_other = g["penalty"] + g["deduction"] + g["acquiring"]
+    # WB exposes the marketplace commission directly.  Reconstructing it from
+    # unrelated amount fields produces impossible values on current reports.
+    commission = g["commission_actual"]
+    services_other = (
+        g["penalty"] + g["deduction"] + g["acquiring"] + g["rebill_logistics"]
+        + g["paid_acceptance"] + g["additional_payment"] + g["installment_cofinancing"]
+        + g["cashback_commission"]
+    )
     services_total = commission + g["logistics"] + g["adv"] + services_other + g["storage"]
 
     income_base = realization_after_spp
@@ -1147,13 +1347,22 @@ def q_tax(d_from: str, d_to: str, brand: str | None, mode: str, rate: float | No
     tax = round(tax_base * rate / 100.0, 2)
     vat = round(income_base * vat_rate / (100.0 + vat_rate), 2) if vat_rate else 0.0
     vat_refund = round(vat * float(vat_refund_percent or 0) / 100.0, 2)
-    operating_profit = round(income_base - services_total - g["cogs"] - tax - vat + vat_refund, 2)
+    finance_ready = int(g.get("finance_rows") or 0) > 0
+    costs_ready = int(g.get("cogs_missing_barcodes") or 0) == 0
+    operating_profit = (
+        round(income_base - services_total - g["cogs"] - tax - vat + vat_refund, 2)
+        if finance_ready and costs_ready else None
+    )
 
     return {
         "mode": mode, "mode_label": m["label"], "rate": rate,
         "vat_mode": vat_mode, "vat_rate": vat_rate, "vat_refund_percent": vat_refund_percent,
         "realization": {"before_spp": round(realization_before_spp, 2),
-                        "after_spp": round(realization_after_spp, 2)},
+                        "after_spp": round(realization_after_spp, 2),
+                        "sales_before_spp": round(g["sales_retail"], 2),
+                        "returns_before_spp": round(g["returns_retail"], 2),
+                        "sales_after_spp": round(g["sales_withdisc"], 2),
+                        "returns_after_spp": round(g["returns_withdisc"], 2)},
         "services": {"commission": round(commission, 2), "logistics": round(g["logistics"], 2),
                      "adv": round(g["adv"], 2), "storage": round(g["storage"], 2),
                      "other": round(services_other, 2), "total": round(services_total, 2)},
@@ -1162,6 +1371,20 @@ def q_tax(d_from: str, d_to: str, brand: str | None, mode: str, rate: float | No
                             "cogs_missing_barcodes": g["cogs_missing_barcodes"]},
         "payout_from_wb": round(payout, 2),
         "operating_profit": operating_profit,
+        "quality": {
+            "finance_ready": finance_ready,
+            "finance_complete": bool(g.get("finance_done")),
+            "finance_rows": int(g.get("finance_rows") or 0),
+            "finance_from": g.get("finance_min"),
+            "finance_to": g.get("finance_max"),
+            "finance_status": g.get("finance_status"),
+            "finance_blocked_until": g.get("finance_blocked_until"),
+            "costs_ready": costs_ready,
+            "missing_cost_barcodes": int(g.get("cogs_missing_barcodes") or 0),
+            "profit_ready": finance_ready and costs_ready,
+            "advertising_allocated": bool(g.get("adv_allocated")),
+        },
+        "daily": q_finance_daily(d_from, d_to, brand),
         "modes_available": {k: v["label"] for k, v in TAX_MODES.items()},
         "vat_modes_available": list(VAT_MODES.keys()),
     }
