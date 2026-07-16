@@ -1,0 +1,9 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON_TZ=Europe/Moscow
+
+# Контроль воронок Albery (задача владельца 16.07).
+# Ежедневно 09:00 МСК — проверка воронок; при проблемах алерт владельцу (Закупка+Пополнение→Артур 28, Рекламации→Наталья 30).
+0 9 * * * root cd /var/www/albery && /var/www/albery/.venv/bin/python /var/www/albery/funnel_control.py daily >> /var/log/albery/funnel-control.log 2>&1
+# Среда 15:00 МСК — напоминание владельцам актуализировать воронки перед встречей руководителей (четверг).
+0 15 * * 3 root cd /var/www/albery && /var/www/albery/.venv/bin/python /var/www/albery/funnel_control.py weekly >> /var/log/albery/funnel-control.log 2>&1
