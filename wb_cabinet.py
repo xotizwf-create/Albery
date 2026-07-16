@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
 """WB-кабинет: аналитика Wildberries внутри Albery.
 
-Слои: (1) WBClient — единственная точка обращения к WB API, строго последовательная,
-с бэкоффом (глобальный лимитер WB отдаёт 429 уже на втором быстром вызове);
-(2) sync_* — инкрементальные выгрузки в Postgres (upsert по натуральным ключам, сырой
-ответ в raw jsonb); (3) запросы разделов UI + расчёт налогов; (4) Flask-роуты /api/wb-cab/*.
-UI и агент читают ТОЛЬКО из БД. Схема: database/migrations/053_wb_analytics.sql.
-Расширяемость метрик: слой запросов здесь + VIEW wb_daily_metrics — новые/расчётные
-метрики добавляются запросом, без изменения выгрузки.
+АРХИТЕКТУРА ЗАГРУЗКИ (tick-модель, пуленепробиваемая — переработано 16.07.2026 после
+инцидента со спящими процессами):
+- НЕТ долгоживущих процессов и многочасовых sleep. systemd-таймер каждые 30 минут запускает
+  короткий тик (scripts/wb_sync.py → run_tick), который выходит за минуты.
+- Квоты WB — истина в заголовке Retry-After: на 429 тик МГНОВЕННО пишет blocked_until в
+  wb_sync_state и переходит к следующему источнику. Закрытый источник не трогается вообще
+  (попытки тоже жгут квоту). Никаких ретраев по кругу.
+- Бэкфилл истории — резюмируемые курсоры в wb_sync_state (cursor_date/done): финансы по
+  7-дневным чанкам (≤20 за тик), реклама по 30-дневным; заказы/выкупы за полгода забираются
+  ОДНИМ вызовом (dateFrom полгода назад), когда квота открыта. Переживает kill/reboot/что угодно.
+- Лимиты по документации WB: statistics-api и advert-api — порядка 1 запрос/мин на метод
+  (v1 orders/sales/stocks отвечают 429 с пометкой deprecated при превышении) → пейсинг 62с
+  МЕЖДУ вызовами одного метода ДО обращения. X-Ratelimit-заголовки пишутся в журнал.
+UI и агент читают ТОЛЬКО Postgres. Схема: migrations/053 (+054 колонки состояния синка).
 """
 from __future__ import annotations
 
@@ -31,37 +38,46 @@ CONTENT = "https://content-api.wildberries.ru"
 PRICES = "https://discounts-prices-api.wildberries.ru"
 ANALYTICS = "https://seller-analytics-api.wildberries.ru"
 
+BACKFILL_DAYS = int(os.getenv("WB_BACKFILL_DAYS", "182"))
+
+
+class WBQuotaError(Exception):
+    """WB ответил 429 с длинным Retry-After: квота метода закрыта до known-времени.
+    Тик не ждёт — записывает blocked_until и идёт дальше."""
+
+    def __init__(self, retry_after: float, detail: str = ""):
+        super().__init__(f"quota closed for {retry_after:.0f}s: {detail[:120]}")
+        self.retry_after = float(retry_after)
+        self.detail = detail
+
 
 # ------------------------------------------------------------------ client
 class WBClient:
-    """Sequential WB API client. Never call in parallel; 429/5xx → exponential backoff."""
+    """Строго последовательный клиент. Пейсинг per-method ДО вызова; на 429 с Retry-After
+    больше короткого порога — WBQuotaError наверх (без сна). Заголовки лимитов сохраняются."""
+
+    SHORT_WAIT_MAX = 90.0     # столько ещё можно подождать внутри тика
+    _PACE_PER_METHOD = 62.0   # лимиты statistics/advert ≈ 1 запрос/мин на метод
+    _PACED_HOSTS = ("statistics-api.wildberries.ru", "advert-api.wildberries.ru")
 
     def __init__(self) -> None:
         self.token = (os.getenv("WB_ANALYTICS_TOKEN") or "").strip()
         if not self.token:
             raise RuntimeError("WB_ANALYTICS_TOKEN is not configured in .env")
         self._last_call = 0.0
-
-    # Documented WB limits: statistics-api methods = 1 request/min per method (v1 orders/
-    # sales/stocks answer 429 with a "deprecated" hint when exceeded). Pace BEFORE calling,
-    # per (host, path) — cheaper than burning attempts on 429s.
-    _PACE_PER_METHOD = 62.0
-    _PACED_HOSTS = ("statistics-api.wildberries.ru",)
+        self._last_by_method: dict[str, float] = {}
+        self.last_ratelimit: dict[str, str] = {}
 
     def call(self, url: str, params: dict | None = None, body: Any = None,
-             method: str | None = None, min_gap: float = 1.6, tries: int = 6) -> Any:
+             method: str | None = None, min_gap: float = 1.6, tries: int = 3) -> Any:
         if params:
             url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
         base = url.split("?")[0]
         if any(h in base for h in self._PACED_HOSTS):
             min_gap = max(min_gap, self._PACE_PER_METHOD)
-        if not hasattr(self, "_last_by_method"):
-            self._last_by_method = {}
-        delay = 65.0
         for attempt in range(1, tries + 1):
-            # global gap + per-method gap
             gap = max(self._last_call + 1.6 - time.monotonic(),
-                      self._last_by_method.get(base, 0.0) + min_gap - time.monotonic())
+                      self._last_by_method.get(base, -1e9) + min_gap - time.monotonic())
             if gap > 0:
                 time.sleep(gap)
             req = urllib.request.Request(url, method=method or ("POST" if body is not None else "GET"))
@@ -74,6 +90,8 @@ class WBClient:
             self._last_by_method[base] = self._last_call
             try:
                 with urllib.request.urlopen(req, data, timeout=120) as r:
+                    self.last_ratelimit = {k: v for k, v in r.headers.items()
+                                           if k.lower().startswith("x-ratelimit")}
                     raw = r.read()
                     return json.loads(raw) if raw else None
             except urllib.error.HTTPError as e:
@@ -82,19 +100,23 @@ class WBClient:
                     detail = e.read()[:200].decode("utf-8", "replace")
                 except Exception:  # noqa: BLE001
                     pass
-                if e.code in (429, 500, 502, 503, 504) and attempt < tries:
+                if e.code == 429:
                     retry_after = 0.0
                     try:
-                        retry_after = float(e.headers.get("Retry-After") or e.headers.get("X-Ratelimit-Retry") or 0)
+                        retry_after = float(e.headers.get("Retry-After")
+                                            or e.headers.get("X-Ratelimit-Retry") or 0)
                     except Exception:  # noqa: BLE001
                         pass
-                    wait = max(retry_after + 2.0, delay if e.code != 429 or not retry_after else 0)
-                    log.info("wb %s -> %s, wait %.0fs (retry-after=%s, try %d)", base, e.code, wait, retry_after, attempt)
-                    time.sleep(wait)
-                    delay = min(delay * 1.7, 600)
+                    if retry_after > self.SHORT_WAIT_MAX or attempt >= tries:
+                        raise WBQuotaError(max(retry_after, 65.0), detail)
+                    log.info("wb %s -> 429, short wait %.0fs (try %d)", base, retry_after or 65, attempt)
+                    time.sleep((retry_after or 65.0) + 2.0)
+                    continue
+                if e.code in (500, 502, 503, 504) and attempt < tries:
+                    time.sleep(20 * attempt)
                     continue
                 raise RuntimeError(f"WB API {e.code}: {detail[:180]} url={base}") from e
-            except Exception as e:  # noqa: BLE001 — network blip
+            except Exception:  # noqa: BLE001 — network blip
                 if attempt < tries:
                     time.sleep(min(20 * attempt, 60))
                     continue
@@ -110,6 +132,7 @@ def _ts(v: Any) -> Any:
     return v or None
 
 
+# ------------------------------------------------------------------ sync state
 def _log_run(endpoint: str, rows: int, ok: bool, error: str | None = None,
              started: dt.datetime | None = None) -> None:
     try:
@@ -119,7 +142,8 @@ def _log_run(endpoint: str, rows: int, ok: bool, error: str | None = None,
                     cur.execute(
                         "INSERT INTO wb_sync_log (endpoint, started_at, finished_at, rows_upserted, ok, error) "
                         "VALUES (%s, %s, now(), %s, %s, %s)",
-                        (endpoint, started or dt.datetime.now(dt.timezone.utc), rows, ok, (error or "")[:500] or None),
+                        (endpoint, started or dt.datetime.now(dt.timezone.utc), rows, ok,
+                         (error or "")[:500] or None),
                     )
                     cur.execute(
                         "INSERT INTO wb_sync_state (endpoint, last_run_at, status, note) VALUES (%s, now(), %s, %s) "
@@ -130,12 +154,12 @@ def _log_run(endpoint: str, rows: int, ok: bool, error: str | None = None,
         log.exception("wb sync log failed")
 
 
-def _state_get(endpoint: str, key: str) -> Any:
+def _state_row(endpoint: str) -> dict[str, Any]:
     with pg_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT {key} FROM wb_sync_state WHERE endpoint=%s", (endpoint,))
+            cur.execute("SELECT * FROM wb_sync_state WHERE endpoint=%s", (endpoint,))
             row = cur.fetchone()
-            return row[key] if row else None
+            return dict(row) if row else {}
 
 
 def _state_set(endpoint: str, **kv: Any) -> None:
@@ -143,413 +167,370 @@ def _state_set(endpoint: str, **kv: Any) -> None:
     with pg_connect() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute("INSERT INTO wb_sync_state (endpoint) VALUES (%s) ON CONFLICT (endpoint) DO NOTHING", (endpoint,))
+                cur.execute("INSERT INTO wb_sync_state (endpoint) VALUES (%s) ON CONFLICT (endpoint) DO NOTHING",
+                            (endpoint,))
                 cur.execute(f"UPDATE wb_sync_state SET {cols} WHERE endpoint=%s", (*kv.values(), endpoint))
 
 
-# ------------------------------------------------------------------ sync: orders / sales
+def _blocked(endpoint: str) -> dt.datetime | None:
+    bu = _state_row(endpoint).get("blocked_until")
+    if bu and bu > dt.datetime.now(dt.timezone.utc):
+        return bu
+    return None
+
+
+def _block(endpoint: str, seconds: float) -> dt.datetime:
+    until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds + 30)
+    _state_set(endpoint, blocked_until=until)
+    return until
+
+
+# ------------------------------------------------------------------ sync steps
 def sync_orders(client: WBClient, days_back: int | None = None) -> int:
     started = dt.datetime.now(dt.timezone.utc)
-    try:
-        last = _state_get("orders", "last_from")
-        if days_back:
-            date_from = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
-        else:
-            date_from = ((last - dt.timedelta(hours=1)).isoformat() if last
-                         else (dt.date.today() - dt.timedelta(days=3)).isoformat())
-        rows = client.call(f"{STAT}/api/v1/supplier/orders", {"dateFrom": date_from, "flag": 0}) or []
-        n = 0
-        max_lcd = None
-        with pg_connect() as conn:
-            with conn.transaction():
-                with conn.cursor() as cur:
-                    for r in rows:
-                        lcd = r.get("lastChangeDate")
-                        if lcd and (max_lcd is None or lcd > max_lcd):
-                            max_lcd = lcd
-                        cur.execute(
-                            """
-                            INSERT INTO wb_orders (srid, g_number, date, last_change_date, nm_id, barcode,
-                                supplier_article, tech_size, brand, subject, category, warehouse_name,
-                                warehouse_type, region_name, oblast, country, income_id, is_cancel, cancel_date,
-                                total_price, discount_percent, spp, finished_price, price_with_disc, order_type,
-                                sticker, raw)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (srid) DO UPDATE SET
-                                last_change_date=EXCLUDED.last_change_date, is_cancel=EXCLUDED.is_cancel,
-                                cancel_date=EXCLUDED.cancel_date, raw=EXCLUDED.raw, synced_at=now()
-                            """,
-                            (r.get("srid"), r.get("gNumber"), _ts(r.get("date")), _ts(lcd), r.get("nmId"),
-                             r.get("barcode"), r.get("supplierArticle"), r.get("techSize"), r.get("brand"),
-                             r.get("subject"), r.get("category"), r.get("warehouseName"), r.get("warehouseType"),
-                             r.get("regionName"), r.get("oblastOkrugName"), r.get("countryName"), r.get("incomeID"),
-                             bool(r.get("isCancel")), _ts(r.get("cancelDate") if str(r.get("cancelDate", "")).startswith("2") else None),
-                             _num(r.get("totalPrice")), _num(r.get("discountPercent")), _num(r.get("spp")),
-                             _num(r.get("finishedPrice")), _num(r.get("priceWithDisc")), r.get("orderType"),
-                             r.get("sticker"), json.dumps(r, ensure_ascii=False)),
-                        )
-                        n += 1
-        if max_lcd:
-            _state_set("orders", last_from=max_lcd)
-        _log_run("orders", n, True, started=started)
-        return n
-    except Exception as e:  # noqa: BLE001
-        _log_run("orders", 0, False, str(e), started=started)
-        raise
+    st = _state_row("orders")
+    last = st.get("last_from")
+    if days_back:
+        date_from = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
+    else:
+        date_from = ((last - dt.timedelta(hours=1)).isoformat() if last
+                     else (dt.date.today() - dt.timedelta(days=3)).isoformat())
+    rows = client.call(f"{STAT}/api/v1/supplier/orders", {"dateFrom": date_from, "flag": 0}) or []
+    n = 0
+    max_lcd = None
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for r in rows:
+                    lcd = r.get("lastChangeDate")
+                    if lcd and (max_lcd is None or lcd > max_lcd):
+                        max_lcd = lcd
+                    cur.execute(
+                        """
+                        INSERT INTO wb_orders (srid, g_number, date, last_change_date, nm_id, barcode,
+                            supplier_article, tech_size, brand, subject, category, warehouse_name,
+                            warehouse_type, region_name, oblast, country, income_id, is_cancel, cancel_date,
+                            total_price, discount_percent, spp, finished_price, price_with_disc, order_type,
+                            sticker, raw)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (srid) DO UPDATE SET
+                            last_change_date=EXCLUDED.last_change_date, is_cancel=EXCLUDED.is_cancel,
+                            cancel_date=EXCLUDED.cancel_date, raw=EXCLUDED.raw, synced_at=now()
+                        """,
+                        (r.get("srid"), r.get("gNumber"), _ts(r.get("date")), _ts(lcd), r.get("nmId"),
+                         r.get("barcode"), r.get("supplierArticle"), r.get("techSize"), r.get("brand"),
+                         r.get("subject"), r.get("category"), r.get("warehouseName"), r.get("warehouseType"),
+                         r.get("regionName"), r.get("oblastOkrugName"), r.get("countryName"), r.get("incomeID"),
+                         bool(r.get("isCancel")),
+                         _ts(r.get("cancelDate") if str(r.get("cancelDate", "")).startswith("2") else None),
+                         _num(r.get("totalPrice")), _num(r.get("discountPercent")), _num(r.get("spp")),
+                         _num(r.get("finishedPrice")), _num(r.get("priceWithDisc")), r.get("orderType"),
+                         r.get("sticker"), json.dumps(r, ensure_ascii=False)),
+                    )
+                    n += 1
+    if max_lcd:
+        _state_set("orders", last_from=max_lcd)
+    if days_back:
+        _state_set("orders", done=True)
+    _log_run("orders", n, True, started=started)
+    return n
 
 
 def sync_sales(client: WBClient, days_back: int | None = None) -> int:
     started = dt.datetime.now(dt.timezone.utc)
-    try:
-        last = _state_get("sales", "last_from")
-        if days_back:
-            date_from = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
-        else:
-            date_from = ((last - dt.timedelta(hours=1)).isoformat() if last
-                         else (dt.date.today() - dt.timedelta(days=3)).isoformat())
-        rows = client.call(f"{STAT}/api/v1/supplier/sales", {"dateFrom": date_from, "flag": 0}) or []
-        n = 0
-        max_lcd = None
-        with pg_connect() as conn:
-            with conn.transaction():
-                with conn.cursor() as cur:
-                    for r in rows:
-                        lcd = r.get("lastChangeDate")
-                        if lcd and (max_lcd is None or lcd > max_lcd):
-                            max_lcd = lcd
-                        sale_id = r.get("saleID") or ""
-                        cur.execute(
-                            """
-                            INSERT INTO wb_sales (sale_id, srid, g_number, date, last_change_date, nm_id, barcode,
-                                supplier_article, tech_size, brand, subject, category, warehouse_name, region_name,
-                                oblast, country, is_return, total_price, discount_percent, spp, for_pay,
-                                finished_price, price_with_disc, payment_sale_amount, order_type, raw)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (sale_id) DO UPDATE SET
-                                last_change_date=EXCLUDED.last_change_date, for_pay=EXCLUDED.for_pay,
-                                raw=EXCLUDED.raw, synced_at=now()
-                            """,
-                            (sale_id, r.get("srid"), r.get("gNumber"), _ts(r.get("date")), _ts(lcd), r.get("nmId"),
-                             r.get("barcode"), r.get("supplierArticle"), r.get("techSize"), r.get("brand"),
-                             r.get("subject"), r.get("category"), r.get("warehouseName"), r.get("regionName"),
-                             r.get("oblastOkrugName"), r.get("countryName"), sale_id.startswith("R"),
-                             _num(r.get("totalPrice")), _num(r.get("discountPercent")), _num(r.get("spp")),
-                             _num(r.get("forPay")), _num(r.get("finishedPrice")), _num(r.get("priceWithDisc")),
-                             _num(r.get("paymentSaleAmount")), r.get("orderType"), json.dumps(r, ensure_ascii=False)),
-                        )
-                        n += 1
-        if max_lcd:
-            _state_set("sales", last_from=max_lcd)
-        _log_run("sales", n, True, started=started)
-        return n
-    except Exception as e:  # noqa: BLE001
-        _log_run("sales", 0, False, str(e), started=started)
-        raise
+    st = _state_row("sales")
+    last = st.get("last_from")
+    if days_back:
+        date_from = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
+    else:
+        date_from = ((last - dt.timedelta(hours=1)).isoformat() if last
+                     else (dt.date.today() - dt.timedelta(days=3)).isoformat())
+    rows = client.call(f"{STAT}/api/v1/supplier/sales", {"dateFrom": date_from, "flag": 0}) or []
+    n = 0
+    max_lcd = None
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for r in rows:
+                    lcd = r.get("lastChangeDate")
+                    if lcd and (max_lcd is None or lcd > max_lcd):
+                        max_lcd = lcd
+                    sale_id = r.get("saleID") or ""
+                    cur.execute(
+                        """
+                        INSERT INTO wb_sales (sale_id, srid, g_number, date, last_change_date, nm_id, barcode,
+                            supplier_article, tech_size, brand, subject, category, warehouse_name, region_name,
+                            oblast, country, is_return, total_price, discount_percent, spp, for_pay,
+                            finished_price, price_with_disc, payment_sale_amount, order_type, raw)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (sale_id) DO UPDATE SET
+                            last_change_date=EXCLUDED.last_change_date, for_pay=EXCLUDED.for_pay,
+                            raw=EXCLUDED.raw, synced_at=now()
+                        """,
+                        (sale_id, r.get("srid"), r.get("gNumber"), _ts(r.get("date")), _ts(lcd), r.get("nmId"),
+                         r.get("barcode"), r.get("supplierArticle"), r.get("techSize"), r.get("brand"),
+                         r.get("subject"), r.get("category"), r.get("warehouseName"), r.get("regionName"),
+                         r.get("oblastOkrugName"), r.get("countryName"), sale_id.startswith("R"),
+                         _num(r.get("totalPrice")), _num(r.get("discountPercent")), _num(r.get("spp")),
+                         _num(r.get("forPay")), _num(r.get("finishedPrice")), _num(r.get("priceWithDisc")),
+                         _num(r.get("paymentSaleAmount")), r.get("orderType"), json.dumps(r, ensure_ascii=False)),
+                    )
+                    n += 1
+    if max_lcd:
+        _state_set("sales", last_from=max_lcd)
+    if days_back:
+        _state_set("sales", done=True)
+    _log_run("sales", n, True, started=started)
+    return n
 
 
 def sync_stocks(client: WBClient) -> int:
     started = dt.datetime.now(dt.timezone.utc)
-    try:
-        rows = client.call(f"{STAT}/api/v1/supplier/stocks",
-                           {"dateFrom": (dt.date.today() - dt.timedelta(days=1)).isoformat()}) or []
-        today = dt.date.today()
-        n = 0
+    rows = client.call(f"{STAT}/api/v1/supplier/stocks",
+                       {"dateFrom": (dt.date.today() - dt.timedelta(days=1)).isoformat()}) or []
+    today = dt.date.today()
+    n = 0
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for r in rows:
+                    cur.execute(
+                        """
+                        INSERT INTO wb_stocks_daily (snapshot_date, nm_id, barcode, warehouse_name,
+                            supplier_article, brand, subject, tech_size, quantity, in_way_to_client,
+                            in_way_from_client, quantity_full, price, discount, raw)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (snapshot_date, nm_id, barcode, warehouse_name) DO UPDATE SET
+                            quantity=EXCLUDED.quantity, in_way_to_client=EXCLUDED.in_way_to_client,
+                            in_way_from_client=EXCLUDED.in_way_from_client, quantity_full=EXCLUDED.quantity_full,
+                            price=EXCLUDED.price, discount=EXCLUDED.discount, raw=EXCLUDED.raw
+                        """,
+                        (today, r.get("nmId"), r.get("barcode") or "", r.get("warehouseName") or "",
+                         r.get("supplierArticle"), r.get("brand"), r.get("subject"), r.get("techSize"),
+                         r.get("quantity"), r.get("inWayToClient"), r.get("inWayFromClient"),
+                         r.get("quantityFull"), _num(r.get("Price")), _num(r.get("Discount")),
+                         json.dumps(r, ensure_ascii=False)),
+                    )
+                    n += 1
+    _log_run("stocks", n, True, started=started)
+    return n
+
+
+def sync_cards(client: WBClient) -> int:
+    started = dt.datetime.now(dt.timezone.utc)
+    n = 0
+    cursor = {"limit": 100}
+    while True:
+        body = {"settings": {"cursor": cursor, "filter": {"withPhoto": -1}}}
+        data = client.call(f"{CONTENT}/content/v2/get/cards/list", body=body) or {}
+        cards = data.get("cards") or []
         with pg_connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
-                    for r in rows:
+                    for c in cards:
+                        photo = ""
+                        ph = c.get("photos") or []
+                        if ph and isinstance(ph, list):
+                            photo = (ph[0] or {}).get("tm") or (ph[0] or {}).get("big") or ""
                         cur.execute(
                             """
-                            INSERT INTO wb_stocks_daily (snapshot_date, nm_id, barcode, warehouse_name,
-                                supplier_article, brand, subject, tech_size, quantity, in_way_to_client,
-                                in_way_from_client, quantity_full, price, discount, raw)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (snapshot_date, nm_id, barcode, warehouse_name) DO UPDATE SET
-                                quantity=EXCLUDED.quantity, in_way_to_client=EXCLUDED.in_way_to_client,
-                                in_way_from_client=EXCLUDED.in_way_from_client, quantity_full=EXCLUDED.quantity_full,
-                                price=EXCLUDED.price, discount=EXCLUDED.discount, raw=EXCLUDED.raw
+                            INSERT INTO wb_cards (nm_id, imt_id, vendor_code, brand, title, subject_id,
+                                subject_name, photo_url, raw, updated_at)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+                            ON CONFLICT (nm_id) DO UPDATE SET vendor_code=EXCLUDED.vendor_code,
+                                brand=EXCLUDED.brand, title=EXCLUDED.title, subject_name=EXCLUDED.subject_name,
+                                photo_url=EXCLUDED.photo_url, raw=EXCLUDED.raw, updated_at=now()
                             """,
-                            (today, r.get("nmId"), r.get("barcode") or "", r.get("warehouseName") or "",
-                             r.get("supplierArticle"), r.get("brand"), r.get("subject"), r.get("techSize"),
-                             r.get("quantity"), r.get("inWayToClient"), r.get("inWayFromClient"),
-                             r.get("quantityFull"), _num(r.get("Price")), _num(r.get("Discount")),
-                             json.dumps(r, ensure_ascii=False)),
+                            (c.get("nmID"), c.get("imtID"), c.get("vendorCode"), c.get("brand"), c.get("title"),
+                             c.get("subjectID"), c.get("subjectName"), photo, json.dumps(c, ensure_ascii=False)),
                         )
                         n += 1
-        _log_run("stocks", n, True, started=started)
-        return n
-    except Exception as e:  # noqa: BLE001
-        _log_run("stocks", 0, False, str(e), started=started)
-        raise
+        cur_resp = data.get("cursor") or {}
+        if len(cards) < cursor.get("limit", 100):
+            break
+        cursor = {"limit": 100, "updatedAt": cur_resp.get("updatedAt"), "nmID": cur_resp.get("nmID")}
+    _log_run("cards", n, True, started=started)
+    return n
 
 
-def sync_finance(client: WBClient, days_back: int = 8) -> int:
-    """reportDetailByPeriod: тяжёлый (лимит ~1/мин). Инкремент: последние days_back дней;
-    бэкфилл вызывает чанками по 7 дней."""
+def sync_prices(client: WBClient) -> int:
     started = dt.datetime.now(dt.timezone.utc)
-    try:
-        date_to = dt.date.today()
-        date_from = date_to - dt.timedelta(days=days_back)
-        n = 0
+    n = 0
+    offset = 0
+    today = dt.date.today()
+    while True:
+        data = client.call(f"{PRICES}/api/v2/list/goods/filter", {"limit": 1000, "offset": offset}) or {}
+        goods = ((data.get("data") or {}).get("listGoods")) or []
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    for g in goods:
+                        for s in (g.get("sizes") or [{}]):
+                            cur.execute(
+                                """
+                                INSERT INTO wb_prices_current (snapshot_date, nm_id, size_id, price,
+                                    discounted_price, discount, club_discount, raw)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT (snapshot_date, nm_id, size_id) DO UPDATE SET
+                                    price=EXCLUDED.price, discounted_price=EXCLUDED.discounted_price,
+                                    discount=EXCLUDED.discount, club_discount=EXCLUDED.club_discount, raw=EXCLUDED.raw
+                                """,
+                                (today, g.get("nmID"), s.get("sizeID") or 0, _num(s.get("price")),
+                                 _num(s.get("discountedPrice")), _num(g.get("discount")),
+                                 _num(g.get("clubDiscount")), json.dumps(g, ensure_ascii=False)),
+                            )
+                            n += 1
+        if len(goods) < 1000:
+            break
+        offset += 1000
+    _log_run("prices", n, True, started=started)
+    return n
+
+
+def _fin_insert(cur, r: dict) -> None:
+    cur.execute(
+        "INSERT INTO wb_finance_details (rrd_id, realizationreport_id, date_from, date_to, create_dt, rr_dt, "
+        "nm_id, brand_name, subject_name, sa_name, ts_name, barcode, doc_type_name, supplier_oper_name, "
+        "office_name, order_dt, sale_dt, quantity, retail_price, retail_amount, retail_price_withdisc_rub, "
+        "ppvz_for_pay, delivery_rub, delivery_amount, return_amount, storage_fee, penalty, deduction, "
+        "acquiring_fee, acquiring_percent, ppvz_sales_commission, commission_percent, ppvz_vw, ppvz_vw_nds, "
+        "rebill_logistic_cost, raw) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+        "%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (rrd_id) DO UPDATE SET raw=EXCLUDED.raw, synced_at=now()",
+        (r.get("rrd_id"), r.get("realizationreport_id"), r.get("date_from"), r.get("date_to"),
+         r.get("create_dt") or None, r.get("rr_dt") or None, r.get("nm_id"), r.get("brand_name"),
+         r.get("subject_name"), r.get("sa_name"), r.get("ts_name"), r.get("barcode"),
+         r.get("doc_type_name"), r.get("supplier_oper_name"), r.get("office_name"),
+         _ts(r.get("order_dt")), _ts(r.get("sale_dt")), _num(r.get("quantity")),
+         _num(r.get("retail_price")), _num(r.get("retail_amount")),
+         _num(r.get("retail_price_withdisc_rub")), _num(r.get("ppvz_for_pay")),
+         _num(r.get("delivery_rub")), _num(r.get("delivery_amount")), _num(r.get("return_amount")),
+         _num(r.get("storage_fee")), _num(r.get("penalty")), _num(r.get("deduction")),
+         _num(r.get("acquiring_fee")), _num(r.get("acquiring_percent")),
+         _num(r.get("ppvz_sales_commission")), _num(r.get("commission_percent")),
+         _num(r.get("ppvz_vw")), _num(r.get("ppvz_vw_nds")), _num(r.get("rebill_logistic_cost")),
+         json.dumps(r, ensure_ascii=False)),
+    )
+
+
+def sync_finance_tick(client: WBClient, chunk_days: int = 7, max_chunks: int = 20) -> int:
+    """Финансы: резюмируемый бэкфилл по курсору + хвост до сегодня. Каждый чанк фиксируется
+    в состоянии сразу — обрыв в любом месте продолжится со следующего чанка."""
+    st = _state_row("finance")
+    today = dt.date.today()
+    cursor = st.get("cursor_date") or (today - dt.timedelta(days=BACKFILL_DAYS))
+    total = 0
+    chunks = 0
+    while cursor < today and chunks < max_chunks:
+        started = dt.datetime.now(dt.timezone.utc)
+        nxt = min(cursor + dt.timedelta(days=chunk_days), today)
         rrd = 0
+        n = 0
         while True:
             rows = client.call(
                 f"{STAT}/api/v5/supplier/reportDetailByPeriod",
-                {"dateFrom": date_from.isoformat(), "dateTo": date_to.isoformat(),
-                 "limit": 100000, "rrdid": rrd},
-                min_gap=62.0,
+                {"dateFrom": cursor.isoformat(), "dateTo": nxt.isoformat(), "limit": 100000, "rrdid": rrd},
             )
             if not rows:
                 break
             with pg_connect() as conn:
                 with conn.transaction():
-                    with conn.cursor() as cur:
+                    with conn.cursor() as curq:
                         for r in rows:
-                            cur.execute(
-                                """
-                                INSERT INTO wb_finance_details (rrd_id, realizationreport_id, date_from, date_to,
-                                    create_dt, rr_dt, nm_id, brand_name, subject_name, sa_name, ts_name, barcode,
-                                    doc_type_name, supplier_oper_name, office_name, order_dt, sale_dt, quantity,
-                                    retail_price, retail_amount, retail_price_withdisc_rub, ppvz_for_pay,
-                                    delivery_rub, delivery_amount, return_amount, storage_fee, penalty, deduction,
-                                    acquiring_fee, acquiring_percent, ppvz_sales_commission, commission_percent,
-                                    ppvz_vw, ppvz_vw_nds, rebill_logistic_cost, raw)
-                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                                ON CONFLICT (rrd_id) DO UPDATE SET raw=EXCLUDED.raw, synced_at=now()
-                                """,
-                                (r.get("rrd_id"), r.get("realizationreport_id"), r.get("date_from"), r.get("date_to"),
-                                 r.get("create_dt") or None, r.get("rr_dt") or None, r.get("nm_id"), r.get("brand_name"),
-                                 r.get("subject_name"), r.get("sa_name"), r.get("ts_name"), r.get("barcode"),
-                                 r.get("doc_type_name"), r.get("supplier_oper_name"), r.get("office_name"),
-                                 _ts(r.get("order_dt")), _ts(r.get("sale_dt")), _num(r.get("quantity")),
-                                 _num(r.get("retail_price")), _num(r.get("retail_amount")),
-                                 _num(r.get("retail_price_withdisc_rub")), _num(r.get("ppvz_for_pay")),
-                                 _num(r.get("delivery_rub")), _num(r.get("delivery_amount")), _num(r.get("return_amount")),
-                                 _num(r.get("storage_fee")), _num(r.get("penalty")), _num(r.get("deduction")),
-                                 _num(r.get("acquiring_fee")), _num(r.get("acquiring_percent")),
-                                 _num(r.get("ppvz_sales_commission")), _num(r.get("commission_percent")),
-                                 _num(r.get("ppvz_vw")), _num(r.get("ppvz_vw_nds")), _num(r.get("rebill_logistic_cost")),
-                                 json.dumps(r, ensure_ascii=False)),
-                            )
+                            _fin_insert(curq, r)
                             n += 1
-            last_row = rows[-1]
-            rrd = last_row.get("rrd_id") or 0
+            rrd = rows[-1].get("rrd_id") or 0
             if len(rows) < 100000 or not rrd:
                 break
-        _log_run(f"finance_{date_from.isoformat()}", n, True, started=started)
-        return n
-    except Exception as e:  # noqa: BLE001
-        _log_run("finance", 0, False, str(e), started=started)
-        raise
-
-
-def sync_finance_backfill(client: WBClient, days: int = 182) -> int:
-    total = 0
-    end = dt.date.today()
-    start = end - dt.timedelta(days=days)
-    cur = start
-    while cur < end:
-        nxt = min(cur + dt.timedelta(days=7), end)
-        started = dt.datetime.now(dt.timezone.utc)
-        try:
-            rows = client.call(
-                f"{STAT}/api/v5/supplier/reportDetailByPeriod",
-                {"dateFrom": cur.isoformat(), "dateTo": nxt.isoformat(), "limit": 100000, "rrdid": 0},
-                min_gap=62.0,
-            ) or []
-            n = 0
-            if rows:
-                # переиспользуем insert из sync_finance через временную вставку
-                with pg_connect() as conn:
-                    with conn.transaction():
-                        with conn.cursor() as curq:
-                            for r in rows:
-                                curq.execute(
-                                    "INSERT INTO wb_finance_details (rrd_id, realizationreport_id, date_from, date_to, create_dt, rr_dt, nm_id, brand_name, subject_name, sa_name, ts_name, barcode, doc_type_name, supplier_oper_name, office_name, order_dt, sale_dt, quantity, retail_price, retail_amount, retail_price_withdisc_rub, ppvz_for_pay, delivery_rub, delivery_amount, return_amount, storage_fee, penalty, deduction, acquiring_fee, acquiring_percent, ppvz_sales_commission, commission_percent, ppvz_vw, ppvz_vw_nds, rebill_logistic_cost, raw) "
-                                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                                    "ON CONFLICT (rrd_id) DO NOTHING",
-                                    (r.get("rrd_id"), r.get("realizationreport_id"), r.get("date_from"), r.get("date_to"),
-                                     r.get("create_dt") or None, r.get("rr_dt") or None, r.get("nm_id"), r.get("brand_name"),
-                                     r.get("subject_name"), r.get("sa_name"), r.get("ts_name"), r.get("barcode"),
-                                     r.get("doc_type_name"), r.get("supplier_oper_name"), r.get("office_name"),
-                                     _ts(r.get("order_dt")), _ts(r.get("sale_dt")), _num(r.get("quantity")),
-                                     _num(r.get("retail_price")), _num(r.get("retail_amount")),
-                                     _num(r.get("retail_price_withdisc_rub")), _num(r.get("ppvz_for_pay")),
-                                     _num(r.get("delivery_rub")), _num(r.get("delivery_amount")), _num(r.get("return_amount")),
-                                     _num(r.get("storage_fee")), _num(r.get("penalty")), _num(r.get("deduction")),
-                                     _num(r.get("acquiring_fee")), _num(r.get("acquiring_percent")),
-                                     _num(r.get("ppvz_sales_commission")), _num(r.get("commission_percent")),
-                                     _num(r.get("ppvz_vw")), _num(r.get("ppvz_vw_nds")), _num(r.get("rebill_logistic_cost")),
-                                     json.dumps(r, ensure_ascii=False)),
-                                )
-                                n += 1
-            total += n
-            _log_run(f"finance_bf_{cur.isoformat()}", n, True, started=started)
-        except Exception as e:  # noqa: BLE001
-            _log_run(f"finance_bf_{cur.isoformat()}", 0, False, str(e), started=started)
-            log.warning("finance backfill chunk %s failed: %s", cur, e)
-        cur = nxt
+        _state_set("finance", cursor_date=nxt)
+        _log_run(f"finance {cursor.isoformat()}..{nxt.isoformat()}", n, True, started=started)
+        total += n
+        cursor = nxt
+        chunks += 1
+    if cursor >= today:
+        # хвост догнан: держим курсор в последних 10 днях, чтобы каждый тик обновлял свежие отчёты
+        _state_set("finance", cursor_date=today - dt.timedelta(days=10), done=True)
     return total
 
 
-def sync_cards(client: WBClient) -> int:
-    started = dt.datetime.now(dt.timezone.utc)
-    try:
-        n = 0
-        cursor = {"limit": 100}
-        while True:
-            body = {"settings": {"cursor": cursor, "filter": {"withPhoto": -1}}}
-            data = client.call(f"{CONTENT}/content/v2/get/cards/list", body=body) or {}
-            cards = data.get("cards") or []
-            with pg_connect() as conn:
-                with conn.transaction():
-                    with conn.cursor() as cur:
-                        for c in cards:
-                            photo = ""
-                            ph = c.get("photos") or []
-                            if ph and isinstance(ph, list):
-                                photo = (ph[0] or {}).get("tm") or (ph[0] or {}).get("big") or ""
-                            cur.execute(
-                                """
-                                INSERT INTO wb_cards (nm_id, imt_id, vendor_code, brand, title, subject_id,
-                                    subject_name, photo_url, raw, updated_at)
-                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
-                                ON CONFLICT (nm_id) DO UPDATE SET vendor_code=EXCLUDED.vendor_code,
-                                    brand=EXCLUDED.brand, title=EXCLUDED.title, subject_name=EXCLUDED.subject_name,
-                                    photo_url=EXCLUDED.photo_url, raw=EXCLUDED.raw, updated_at=now()
-                                """,
-                                (c.get("nmID"), c.get("imtID"), c.get("vendorCode"), c.get("brand"), c.get("title"),
-                                 c.get("subjectID"), c.get("subjectName"), photo, json.dumps(c, ensure_ascii=False)),
-                            )
-                            n += 1
-            cur_resp = data.get("cursor") or {}
-            if len(cards) < cursor.get("limit", 100):
-                break
-            cursor = {"limit": 100, "updatedAt": cur_resp.get("updatedAt"), "nmID": cur_resp.get("nmID")}
-        _log_run("cards", n, True, started=started)
-        return n
-    except Exception as e:  # noqa: BLE001
-        _log_run("cards", 0, False, str(e), started=started)
-        raise
-
-
-def sync_prices(client: WBClient) -> int:
-    started = dt.datetime.now(dt.timezone.utc)
-    try:
-        n = 0
-        offset = 0
-        today = dt.date.today()
-        while True:
-            data = client.call(f"{PRICES}/api/v2/list/goods/filter", {"limit": 1000, "offset": offset}) or {}
-            goods = ((data.get("data") or {}).get("listGoods")) or []
-            with pg_connect() as conn:
-                with conn.transaction():
-                    with conn.cursor() as cur:
-                        for g in goods:
-                            for s in (g.get("sizes") or [{}]):
-                                cur.execute(
-                                    """
-                                    INSERT INTO wb_prices_current (snapshot_date, nm_id, size_id, price,
-                                        discounted_price, discount, club_discount, raw)
-                                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                                    ON CONFLICT (snapshot_date, nm_id, size_id) DO UPDATE SET
-                                        price=EXCLUDED.price, discounted_price=EXCLUDED.discounted_price,
-                                        discount=EXCLUDED.discount, club_discount=EXCLUDED.club_discount, raw=EXCLUDED.raw
-                                    """,
-                                    (today, g.get("nmID"), s.get("sizeID") or 0, _num(s.get("price")),
-                                     _num(s.get("discountedPrice")), _num(g.get("discount")),
-                                     _num(g.get("clubDiscount")), json.dumps(g, ensure_ascii=False)),
-                                )
-                                n += 1
-            if len(goods) < 1000:
-                break
-            offset += 1000
-        _log_run("prices", n, True, started=started)
-        return n
-    except Exception as e:  # noqa: BLE001
-        _log_run("prices", 0, False, str(e), started=started)
-        raise
-
-
-def sync_adv_costs(client: WBClient, days_back: int = 31) -> int:
-    """История затрат на продвижение (upd). WB отдаёт максимум ~31 день за запрос."""
-    started = dt.datetime.now(dt.timezone.utc)
-    try:
-        d_to = dt.date.today()
-        d_from = d_to - dt.timedelta(days=min(days_back, 31))
-        rows = client.call(f"{ADV}/adv/v1/upd", {"from": d_from.isoformat(), "to": d_to.isoformat()}) or []
+def sync_adv_tick(client: WBClient) -> int:
+    """Реклама: бэкфилл 30-дневными чанками по курсору, затем инкремент последних 31 дня."""
+    st = _state_row("adv")
+    today = dt.date.today()
+    cursor = st.get("cursor_date") or (today - dt.timedelta(days=BACKFILL_DAYS))
+    total = 0
+    while cursor < today:
+        started = dt.datetime.now(dt.timezone.utc)
+        nxt = min(cursor + dt.timedelta(days=30), today)
+        rows = client.call(f"{ADV}/adv/v1/upd", {"from": cursor.isoformat(), "to": nxt.isoformat()}) or []
         n = 0
         with pg_connect() as conn:
             with conn.transaction():
-                with conn.cursor() as cur:
+                with conn.cursor() as curq:
                     for r in rows:
-                        cur.execute(
-                            """
-                            INSERT INTO wb_adv_costs (upd_num, upd_time, upd_sum, advert_id, campaign_name,
-                                advert_type, payment_type, raw)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (upd_num, advert_id) DO UPDATE SET upd_sum=EXCLUDED.upd_sum, raw=EXCLUDED.raw
-                            """,
+                        curq.execute(
+                            "INSERT INTO wb_adv_costs (upd_num, upd_time, upd_sum, advert_id, campaign_name, "
+                            "advert_type, payment_type, raw) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                            "ON CONFLICT (upd_num, advert_id) DO UPDATE SET upd_sum=EXCLUDED.upd_sum, raw=EXCLUDED.raw",
                             (r.get("updNum"), _ts(r.get("updTime")), _num(r.get("updSum")), r.get("advertId"),
                              r.get("campName"), r.get("advertType"), str(r.get("paymentType") or ""),
                              json.dumps(r, ensure_ascii=False)),
                         )
                         n += 1
-        _log_run("adv_costs", n, True, started=started)
-        return n
-    except Exception as e:  # noqa: BLE001
-        _log_run("adv_costs", 0, False, str(e), started=started)
-        raise
-
-
-def sync_adv_backfill(client: WBClient, days: int = 182) -> int:
-    total = 0
-    end = dt.date.today()
-    cur = end - dt.timedelta(days=days)
-    while cur < end:
-        nxt = min(cur + dt.timedelta(days=30), end)
-        try:
-            rows = client.call(f"{ADV}/adv/v1/upd", {"from": cur.isoformat(), "to": nxt.isoformat()}) or []
-            with pg_connect() as conn:
-                with conn.transaction():
-                    with conn.cursor() as curq:
-                        for r in rows:
-                            curq.execute(
-                                "INSERT INTO wb_adv_costs (upd_num, upd_time, upd_sum, advert_id, campaign_name, advert_type, payment_type, raw) "
-                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (upd_num, advert_id) DO NOTHING",
-                                (r.get("updNum"), _ts(r.get("updTime")), _num(r.get("updSum")), r.get("advertId"),
-                                 r.get("campName"), r.get("advertType"), str(r.get("paymentType") or ""),
-                                 json.dumps(r, ensure_ascii=False)),
-                            )
-                            total += 1
-        except Exception as e:  # noqa: BLE001
-            log.warning("adv backfill chunk %s failed: %s", cur, e)
-        cur = nxt
-    _log_run("adv_backfill", total, True)
+        _state_set("adv", cursor_date=nxt)
+        _log_run(f"adv {cursor.isoformat()}..{nxt.isoformat()}", n, True, started=started)
+        total += n
+        cursor = nxt
+    _state_set("adv", cursor_date=today - dt.timedelta(days=7), done=True)
     return total
 
 
-def sync_all(initial_days: int | None = None) -> dict[str, Any]:
-    """Одна последовательная сессия синка. initial_days → полный бэкфилл истории."""
+# ------------------------------------------------------------------ tick runner
+def run_tick() -> dict[str, Any]:
+    """Один короткий проход по всем источникам с учётом квот. Вызывается таймером каждые 30 мин."""
     client = WBClient()
     out: dict[str, Any] = {}
-    steps = [
+
+    def _needs_history(table: str) -> bool:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT count(*) AS c FROM {table}")
+                return (cur.fetchone() or {}).get("c", 0) == 0
+
+    steps: list[tuple[str, Any]] = [
         ("cards", lambda: sync_cards(client)),
-        ("orders", lambda: sync_orders(client, days_back=initial_days)),
-        ("sales", lambda: sync_sales(client, days_back=initial_days)),
-        ("stocks", lambda: sync_stocks(client)),
         ("prices", lambda: sync_prices(client)),
-        ("adv", lambda: (sync_adv_backfill(client, initial_days) if initial_days else sync_adv_costs(client))),
-        ("finance", lambda: (sync_finance_backfill(client, initial_days) if initial_days else sync_finance(client))),
+        ("stocks", lambda: sync_stocks(client)),
+        ("orders", lambda: sync_orders(
+            client, days_back=BACKFILL_DAYS if (not _state_row("orders").get("done") and _needs_history("wb_orders")) else None)),
+        ("sales", lambda: sync_sales(
+            client, days_back=BACKFILL_DAYS if (not _state_row("sales").get("done") and _needs_history("wb_sales")) else None)),
+        ("adv", lambda: sync_adv_tick(client)),
+        ("finance", lambda: sync_finance_tick(client)),
     ]
     for name, fn in steps:
+        bu = _blocked(name)
+        if bu:
+            out[name] = f"quota until {bu.astimezone(dt.timezone(dt.timedelta(hours=3))).strftime('%d.%m %H:%M')}"
+            continue
         try:
             out[name] = fn()
+        except WBQuotaError as q:
+            until = _block(name, q.retry_after)
+            msk = until.astimezone(dt.timezone(dt.timedelta(hours=3))).strftime("%d.%m %H:%M")
+            _log_run(name, 0, False, f"квота WB закрыта до {msk} МСК (Retry-After {q.retry_after:.0f}с)")
+            out[name] = f"quota -> blocked until {msk}"
         except Exception as e:  # noqa: BLE001
-            out[name] = f"ERROR: {e}"
-            log.exception("wb sync step %s failed", name)
+            _log_run(name, 0, False, str(e)[:300])
+            out[name] = f"ERROR: {str(e)[:160]}"
+            log.exception("wb tick step %s failed", name)
     return out
+
+
+# Обратная совместимость со старым entrypoint (wb_sync.py вызывает sync_all)
+def sync_all(initial_days: int | None = None) -> dict[str, Any]:  # noqa: ARG001 — история в курсорах
+    return run_tick()
 
 
 # ------------------------------------------------------------------ queries (разделы UI)
@@ -983,7 +964,16 @@ def wbcab_sync_status():
         for k in ("started_at", "finished_at"):
             if r.get(k):
                 r[k] = r[k].isoformat()
-    return jsonify({"counts": counts, "ranges": ranges, "recent_runs": recent, "sync_running": running})
+    blocked = {}
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT endpoint, blocked_until, cursor_date, done FROM wb_sync_state "
+                        "WHERE blocked_until IS NOT NULL AND blocked_until > now()")
+            for r in cur.fetchall():
+                blocked[r["endpoint"]] = r["blocked_until"].astimezone(
+                    dt.timezone(dt.timedelta(hours=3))).strftime("%d.%m %H:%M")
+    return jsonify({"counts": counts, "ranges": ranges, "recent_runs": recent,
+                    "sync_running": running, "blocked": blocked})
 
 
 @app.route("/api/wb-cab/cost-prices", methods=["GET", "POST"])

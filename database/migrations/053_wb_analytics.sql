@@ -273,3 +273,8 @@ LEFT JOIN (
     FROM wb_stocks_daily GROUP BY 1, 2
 ) st ON st.day = d.day AND st.brand IS NOT DISTINCT FROM o.brand
 WHERE o.brand IS NOT NULL OR s.brand IS NOT NULL OR st.brand IS NOT NULL;
+
+-- v2 (2026-07-16): tick-model sync state
+ALTER TABLE wb_sync_state ADD COLUMN IF NOT EXISTS blocked_until timestamptz;
+ALTER TABLE wb_sync_state ADD COLUMN IF NOT EXISTS cursor_date date;
+ALTER TABLE wb_sync_state ADD COLUMN IF NOT EXISTS done boolean NOT NULL DEFAULT false;
