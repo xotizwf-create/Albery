@@ -120,6 +120,11 @@ export function WbCabinet() {
               </div>
             ))}
           </div>
+          {syncInfo.blocked && Object.keys(syncInfo.blocked).length > 0 && (
+            <div className="mt-3 rounded-xl bg-amber-50 px-3 py-2 text-[12px] font-bold text-amber-700">
+              ⏳ Квоты WB (источник откроется автоматически): {Object.entries(syncInfo.blocked).map(([k, v]) => `${k} — ${v}`).join(" · ")}
+            </div>
+          )}
           <div className="mt-3">
             <div className={label}>Последние прогоны</div>
             <div className="mt-1 max-h-44 overflow-auto">
