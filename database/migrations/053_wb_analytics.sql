@@ -278,3 +278,6 @@ WHERE o.brand IS NOT NULL OR s.brand IS NOT NULL OR st.brand IS NOT NULL;
 ALTER TABLE wb_sync_state ADD COLUMN IF NOT EXISTS blocked_until timestamptz;
 ALTER TABLE wb_sync_state ADD COLUMN IF NOT EXISTS cursor_date date;
 ALTER TABLE wb_sync_state ADD COLUMN IF NOT EXISTS done boolean NOT NULL DEFAULT false;
+
+-- v3 (2026-07-16): catalogue curation flag for the Настройка tabs
+ALTER TABLE wb_cards ADD COLUMN IF NOT EXISTS excluded boolean NOT NULL DEFAULT false;

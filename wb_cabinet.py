@@ -1049,11 +1049,17 @@ def wbcab_tax_settings():
 
 @app.route("/api/wb-cab/cards")
 def wbcab_cards():
-    """Lightweight catalogue for the RNP article picker: our real WB cards (nm_id, vendor_code,
-    title, brand, photo). Optional q (vendor_code/title/nm_id ILIKE) and brand filters."""
+    """Our real catalogue (wb_cards) for the RNP picker AND the Настройка tabs.
+    Params: q (vendor_code/title/nm_id ILIKE), brand, limit (default 100, max 5000),
+    include_excluded (default 1; the План продаж tab passes 0 to hide excluded)."""
     from flask import jsonify, request
     q = (request.args.get("q") or "").strip()
     brand = (request.args.get("brand") or "").strip()
+    include_excluded = str(request.args.get("include_excluded", "1")).lower() not in ("0", "false", "no")
+    try:
+        limit = max(1, min(int(request.args.get("limit", 100)), 5000))
+    except (TypeError, ValueError):
+        limit = 100
     where = ["1=1"]
     params: list = []
     if q:
@@ -1062,15 +1068,36 @@ def wbcab_cards():
     if brand and brand.lower() not in ("", "все"):
         where.append("brand = %s")
         params.append(brand)
+    if not include_excluded:
+        where.append("NOT excluded")
+    params.append(limit)
     with pg_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT nm_id, vendor_code, title, brand, subject_name, photo_url "
+                "SELECT nm_id, vendor_code, title, brand, subject_name, photo_url, excluded "
                 "FROM wb_cards WHERE " + " AND ".join(where) +
-                " ORDER BY vendor_code NULLS LAST, nm_id LIMIT 100",
+                " ORDER BY excluded, vendor_code NULLS LAST, nm_id LIMIT %s",
                 params)
             rows = [dict(r) for r in cur.fetchall()]
     return jsonify({"cards": rows, "total": len(rows)})
+
+
+@app.route("/api/wb-cab/cards/exclude", methods=["POST"])
+def wbcab_cards_exclude():
+    """Curate the catalogue: mark a card excluded / returned. Persisted on wb_cards.excluded
+    (wb_sync upsert never touches this column), so the flag survives re-syncs and is shared by
+    the Артикулы and План продаж tabs."""
+    from flask import jsonify, request
+    b = request.get_json(silent=True) or {}
+    nm_id = b.get("nm_id")
+    excluded = bool(b.get("excluded"))
+    if nm_id is None:
+        return jsonify({"error": "nm_id required"}), 400
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("UPDATE wb_cards SET excluded=%s WHERE nm_id=%s", (excluded, int(nm_id)))
+    return jsonify({"nm_id": nm_id, "excluded": excluded})
 
 
 log.info("wb_cabinet loaded: /api/wb-cab/* routes registered")
