@@ -17,7 +17,7 @@ def test_filters_drop_noise_keep_value():
         _t(1, "Сформировать анализ по Ларетто"),                       # keep
         _t(2, "Оплатить счет за услуги связи"),                        # stop: оплат
         _t(3, "Итоги созвона 10.07, 10:00 - 10:30"),                   # stop: итоги созвона
-        _t(4, "Ознакомиться с отчётом"),                               # stop: ознаком
+        _t(4, "Ознакомиться с отчётом"),                               # keep: data-signal override
         _t(5, "🧪 ТЕСТ авто-повтор (del)"),                            # test marker
         _t(6, "Актуализировать данные в таблицах"),                    # keep
         _t(7, "Заполнить профиль в Б24", resp=30),                     # stop-word (also massish)
@@ -32,7 +32,7 @@ def test_filters_drop_noise_keep_value():
     access = {16: True, 14: True, 30: True, 99: False}
     survivors, stats = tc.filter_tasks(tasks, offered_ids={11}, access_ok=access)
     ids = {t["id"] for t in survivors}
-    assert ids == {1, 6, 8}
+    assert ids == {1, 4, 6, 8}
     assert stats["offered"] == 1
     assert stats["no_access"] == 1
     assert stats["mass"] == 3
