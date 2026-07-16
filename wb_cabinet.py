@@ -26,6 +26,7 @@ import datetime as dt
 import urllib.error
 import urllib.parse
 import urllib.request
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app import app, pg_connect  # noqa: E402
@@ -37,6 +38,7 @@ ADV = "https://advert-api.wildberries.ru"
 CONTENT = "https://content-api.wildberries.ru"
 PRICES = "https://discounts-prices-api.wildberries.ru"
 ANALYTICS = "https://seller-analytics-api.wildberries.ru"
+FINANCE = "https://finance-api.wildberries.ru"
 
 BACKFILL_DAYS = int(os.getenv("WB_BACKFILL_DAYS", "182"))
 
@@ -125,7 +127,14 @@ class WBClient:
 
 
 def _num(v: Any) -> Any:
-    return v if isinstance(v, (int, float)) else None
+    if isinstance(v, (int, float, Decimal)):
+        return v
+    if isinstance(v, str) and v.strip():
+        try:
+            return Decimal(v.strip())
+        except InvalidOperation:
+            return None
+    return None
 
 
 def _ts(v: Any) -> Any:
@@ -183,6 +192,34 @@ def _block(endpoint: str, seconds: float) -> dt.datetime:
     until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds + 30)
     _state_set(endpoint, blocked_until=until)
     return until
+
+
+def _ensure_api_version(endpoint: str, version: int) -> None:
+    """Drop quota state left by a retired API exactly once per endpoint version."""
+    st = _state_row(endpoint)
+    if int(st.get("api_version") or 0) >= version:
+        return
+    _state_set(
+        endpoint,
+        api_version=version,
+        blocked_until=None,
+        status="pending",
+        note=None,
+        task_id=None,
+        task_date_from=None,
+        task_date_to=None,
+        task_started_at=None,
+    )
+
+
+def _clear_report_task(endpoint: str) -> None:
+    _state_set(
+        endpoint,
+        task_id=None,
+        task_date_from=None,
+        task_date_to=None,
+        task_started_at=None,
+    )
 
 
 # ------------------------------------------------------------------ sync steps
@@ -284,15 +321,100 @@ def sync_sales(client: WBClient, days_back: int | None = None) -> int:
     return n
 
 
+_STOCKS_TOTAL = "Всего находится на складах"
+_STOCKS_TO_CLIENT = "В пути до получателей"
+_STOCKS_FROM_CLIENT = "В пути возвраты на склад WB"
+
+
+def _stock_report_rows(report: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten the asynchronous warehouse report without double-counting totals."""
+    out: list[dict[str, Any]] = []
+    for product in report:
+        base = {
+            "nm_id": product.get("nmId"),
+            "barcode": product.get("barcode") or "",
+            "supplier_article": product.get("vendorCode"),
+            "brand": product.get("brand"),
+            "subject": product.get("subjectName"),
+            "tech_size": product.get("techSize"),
+            "raw": product,
+        }
+        for warehouse in product.get("warehouses") or []:
+            name = warehouse.get("warehouseName") or ""
+            qty = int(warehouse.get("quantity") or 0)
+            if name == _STOCKS_TOTAL:
+                continue
+            row = {
+                **base,
+                "warehouse_name": name,
+                "quantity": qty,
+                "in_way_to_client": 0,
+                "in_way_from_client": 0,
+                "quantity_full": qty,
+            }
+            if name == _STOCKS_TO_CLIENT:
+                row.update(quantity=0, in_way_to_client=qty, quantity_full=qty)
+            elif name == _STOCKS_FROM_CLIENT:
+                row.update(quantity=0, in_way_from_client=qty, quantity_full=qty)
+            out.append(row)
+    return out
+
+
 def sync_stocks(client: WBClient) -> int:
+    """Current WB stock via the async report supported by the existing Base token."""
+    endpoint = "stocks"
     started = dt.datetime.now(dt.timezone.utc)
-    rows = client.call(f"{STAT}/api/v1/supplier/stocks",
-                       {"dateFrom": (dt.date.today() - dt.timedelta(days=1)).isoformat()}) or []
+    st = _state_row(endpoint)
+    task_id = st.get("task_id")
+    base_url = f"{ANALYTICS}/api/v1/warehouse_remains"
+
+    if not task_id:
+        data = client.call(
+            base_url,
+            {
+                "locale": "ru",
+                "groupByBrand": "true",
+                "groupBySubject": "true",
+                "groupBySa": "true",
+                "groupByNm": "true",
+                "groupByBarcode": "true",
+                "groupBySize": "true",
+            },
+        ) or {}
+        task_id = ((data.get("data") or {}).get("taskId") or "").strip()
+        if not task_id:
+            raise RuntimeError("WB warehouse report did not return taskId")
+        _log_run(endpoint, 0, True, started=started)
+        _state_set(endpoint, task_id=task_id, task_started_at=started,
+                   status="queued", note="warehouse report queued")
+        return 0
+
+    try:
+        data = client.call(f"{base_url}/tasks/{urllib.parse.quote(str(task_id))}/status") or {}
+    except RuntimeError as exc:
+        if "WB API 404" in str(exc):
+            _clear_report_task(endpoint)
+        raise
+    status = str((data.get("data") or {}).get("status") or "").lower()
+    if status != "done":
+        if status in {"failed", "canceled", "cancelled", "purged"}:
+            _clear_report_task(endpoint)
+            raise RuntimeError(f"WB warehouse report ended with status={status}")
+        _state_set(endpoint, status="waiting", note=f"warehouse report status={status or 'unknown'}")
+        return 0
+
+    try:
+        report = client.call(f"{base_url}/tasks/{urllib.parse.quote(str(task_id))}/download") or []
+    except RuntimeError as exc:
+        if "WB API 404" in str(exc):
+            _clear_report_task(endpoint)
+        raise
+    rows = _stock_report_rows(report if isinstance(report, list) else [])
     today = dt.date.today()
-    n = 0
     with pg_connect() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
+                cur.execute("DELETE FROM wb_stocks_daily WHERE snapshot_date=%s", (today,))
                 for r in rows:
                     cur.execute(
                         """
@@ -303,17 +425,16 @@ def sync_stocks(client: WBClient) -> int:
                         ON CONFLICT (snapshot_date, nm_id, barcode, warehouse_name) DO UPDATE SET
                             quantity=EXCLUDED.quantity, in_way_to_client=EXCLUDED.in_way_to_client,
                             in_way_from_client=EXCLUDED.in_way_from_client, quantity_full=EXCLUDED.quantity_full,
-                            price=EXCLUDED.price, discount=EXCLUDED.discount, raw=EXCLUDED.raw
+                            raw=EXCLUDED.raw
                         """,
-                        (today, r.get("nmId"), r.get("barcode") or "", r.get("warehouseName") or "",
-                         r.get("supplierArticle"), r.get("brand"), r.get("subject"), r.get("techSize"),
-                         r.get("quantity"), r.get("inWayToClient"), r.get("inWayFromClient"),
-                         r.get("quantityFull"), _num(r.get("Price")), _num(r.get("Discount")),
-                         json.dumps(r, ensure_ascii=False)),
+                        (today, r["nm_id"], r["barcode"], r["warehouse_name"], r["supplier_article"],
+                         r["brand"], r["subject"], r["tech_size"], r["quantity"],
+                         r["in_way_to_client"], r["in_way_from_client"], r["quantity_full"], None, None,
+                         json.dumps(r["raw"], ensure_ascii=False)),
                     )
-                    n += 1
-    _log_run("stocks", n, True, started=started)
-    return n
+    _clear_report_task(endpoint)
+    _log_run(endpoint, len(rows), True, started=started)
+    return len(rows)
 
 
 def sync_cards(client: WBClient) -> int:
@@ -387,6 +508,48 @@ def sync_prices(client: WBClient) -> int:
     return n
 
 
+def _finance_v2_row(r: dict[str, Any]) -> dict[str, Any]:
+    """Map the current finance-api camelCase payload to the existing DB contract."""
+    return {
+        "rrd_id": r.get("rrdId"),
+        "realizationreport_id": r.get("reportId"),
+        "date_from": r.get("dateFrom"),
+        "date_to": r.get("dateTo"),
+        "create_dt": r.get("createDate"),
+        "rr_dt": r.get("rrDate"),
+        "nm_id": r.get("nmId"),
+        "brand_name": r.get("brandName"),
+        "subject_name": r.get("subjectName"),
+        "sa_name": r.get("vendorCode"),
+        "ts_name": r.get("techSize"),
+        "barcode": r.get("sku"),
+        "doc_type_name": r.get("docTypeName"),
+        "supplier_oper_name": r.get("sellerOperName"),
+        "office_name": r.get("officeName"),
+        "order_dt": r.get("orderDt"),
+        "sale_dt": r.get("saleDt"),
+        "quantity": r.get("quantity"),
+        "retail_price": r.get("retailPrice"),
+        "retail_amount": r.get("retailAmount"),
+        "retail_price_withdisc_rub": r.get("retailPriceWithDisc"),
+        "ppvz_for_pay": r.get("forPay"),
+        "delivery_rub": r.get("deliveryService"),
+        "delivery_amount": r.get("deliveryAmount"),
+        "return_amount": r.get("returnAmount"),
+        "storage_fee": r.get("paidStorage"),
+        "penalty": r.get("penalty"),
+        "deduction": r.get("deduction"),
+        "acquiring_fee": r.get("acquiringFee"),
+        "acquiring_percent": r.get("acquiringPercent"),
+        "ppvz_sales_commission": r.get("ppvzSalesCommission"),
+        "commission_percent": r.get("commissionPercent"),
+        "ppvz_vw": r.get("vw"),
+        "ppvz_vw_nds": r.get("vwNds"),
+        "rebill_logistic_cost": r.get("rebillLogisticCost"),
+        "_raw": r,
+    }
+
+
 def _fin_insert(cur, r: dict) -> None:
     cur.execute(
         "INSERT INTO wb_finance_details (rrd_id, realizationreport_id, date_from, date_to, create_dt, rr_dt, "
@@ -410,11 +573,11 @@ def _fin_insert(cur, r: dict) -> None:
          _num(r.get("acquiring_fee")), _num(r.get("acquiring_percent")),
          _num(r.get("ppvz_sales_commission")), _num(r.get("commission_percent")),
          _num(r.get("ppvz_vw")), _num(r.get("ppvz_vw_nds")), _num(r.get("rebill_logistic_cost")),
-         json.dumps(r, ensure_ascii=False)),
+         json.dumps(r.get("_raw") or r, ensure_ascii=False)),
     )
 
 
-def sync_finance_tick(client: WBClient, chunk_days: int = 7, max_chunks: int = 20) -> int:
+def sync_finance_tick(client: WBClient, chunk_days: int = 7, max_chunks: int = 1) -> int:
     """Финансы: резюмируемый бэкфилл по курсору + хвост до сегодня. Каждый чанк фиксируется
     в состоянии сразу — обрыв в любом месте продолжится со следующего чанка."""
     st = _state_row("finance")
@@ -429,8 +592,15 @@ def sync_finance_tick(client: WBClient, chunk_days: int = 7, max_chunks: int = 2
         n = 0
         while True:
             rows = client.call(
-                f"{STAT}/api/v5/supplier/reportDetailByPeriod",
-                {"dateFrom": cursor.isoformat(), "dateTo": nxt.isoformat(), "limit": 100000, "rrdid": rrd},
+                f"{FINANCE}/api/finance/v1/sales-reports/detailed",
+                body={
+                    "dateFrom": cursor.isoformat(),
+                    "dateTo": nxt.isoformat(),
+                    "limit": 100000,
+                    "rrdId": rrd,
+                    "period": "daily",
+                },
+                min_gap=62.0,
             )
             if not rows:
                 break
@@ -438,9 +608,9 @@ def sync_finance_tick(client: WBClient, chunk_days: int = 7, max_chunks: int = 2
                 with conn.transaction():
                     with conn.cursor() as curq:
                         for r in rows:
-                            _fin_insert(curq, r)
+                            _fin_insert(curq, _finance_v2_row(r))
                             n += 1
-            rrd = rows[-1].get("rrd_id") or 0
+            rrd = rows[-1].get("rrdId") or 0
             if len(rows) < 100000 or not rrd:
                 break
         _state_set("finance", cursor_date=nxt)
@@ -452,6 +622,116 @@ def sync_finance_tick(client: WBClient, chunk_days: int = 7, max_chunks: int = 2
         # хвост догнан: держим курсор в последних 10 днях, чтобы каждый тик обновлял свежие отчёты
         _state_set("finance", cursor_date=today - dt.timedelta(days=10), done=True)
     return total
+
+
+def _paid_storage_row(r: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": r.get("date"),
+        "nm_id": r.get("nmId"),
+        "barcode": r.get("barcode") or "",
+        "warehouse": r.get("warehouse") or "",
+        "brand": r.get("brand"),
+        "vendor_code": r.get("vendorCode"),
+        "volume": r.get("volume"),
+        "warehouse_coef": r.get("warehouseCoef"),
+        "calc_type": r.get("calcType"),
+        "amount": r.get("warehousePrice"),
+        "_raw": r,
+    }
+
+
+def _as_date(value: Any) -> dt.date | None:
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    if value:
+        try:
+            return dt.date.fromisoformat(str(value)[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def sync_paid_storage_tick(client: WBClient) -> int:
+    """Backfill paid storage in resumable eight-day asynchronous reports."""
+    endpoint = "paid_storage"
+    started = dt.datetime.now(dt.timezone.utc)
+    st = _state_row(endpoint)
+    task_id = st.get("task_id")
+    base_url = f"{ANALYTICS}/api/v1/paid_storage"
+    today = dt.date.today()
+
+    if not task_id:
+        cursor = _as_date(st.get("cursor_date")) or (today - dt.timedelta(days=BACKFILL_DAYS))
+        date_to = min(cursor + dt.timedelta(days=7), today)
+        data = client.call(base_url, {"dateFrom": cursor.isoformat(), "dateTo": date_to.isoformat()}) or {}
+        task_id = ((data.get("data") or {}).get("taskId") or "").strip()
+        if not task_id:
+            raise RuntimeError("WB paid storage report did not return taskId")
+        _log_run(endpoint, 0, True, started=started)
+        _state_set(
+            endpoint,
+            task_id=task_id,
+            task_date_from=cursor,
+            task_date_to=date_to,
+            task_started_at=started,
+            status="queued",
+            note=f"paid storage report queued {cursor}..{date_to}",
+        )
+        return 0
+
+    try:
+        data = client.call(f"{base_url}/tasks/{urllib.parse.quote(str(task_id))}/status") or {}
+    except RuntimeError as exc:
+        if "WB API 404" in str(exc):
+            _clear_report_task(endpoint)
+        raise
+    status = str((data.get("data") or {}).get("status") or "").lower()
+    if status != "done":
+        if status in {"failed", "canceled", "cancelled", "purged"}:
+            _clear_report_task(endpoint)
+            raise RuntimeError(f"WB paid storage report ended with status={status}")
+        _state_set(endpoint, status="waiting", note=f"paid storage report status={status or 'unknown'}")
+        return 0
+
+    try:
+        report = client.call(f"{base_url}/tasks/{urllib.parse.quote(str(task_id))}/download") or []
+    except RuntimeError as exc:
+        if "WB API 404" in str(exc):
+            _clear_report_task(endpoint)
+        raise
+    rows = [_paid_storage_row(r) for r in report] if isinstance(report, list) else []
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for r in rows:
+                    if not r["date"] or not r["nm_id"]:
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO wb_paid_storage (date, nm_id, barcode, warehouse, brand, vendor_code,
+                            volume, warehouse_coef, calc_type, amount, raw)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (date, nm_id, barcode, warehouse) DO UPDATE SET
+                            brand=EXCLUDED.brand, vendor_code=EXCLUDED.vendor_code,
+                            volume=EXCLUDED.volume, warehouse_coef=EXCLUDED.warehouse_coef,
+                            calc_type=EXCLUDED.calc_type, amount=EXCLUDED.amount, raw=EXCLUDED.raw
+                        """,
+                        (r["date"], r["nm_id"], r["barcode"], r["warehouse"], r["brand"],
+                         r["vendor_code"], _num(r["volume"]), _num(r["warehouse_coef"]),
+                         r["calc_type"], _num(r["amount"]), json.dumps(r["_raw"], ensure_ascii=False)),
+                    )
+
+    completed_to = _as_date(st.get("task_date_to")) or today
+    next_cursor = completed_to + dt.timedelta(days=1)
+    caught_up = next_cursor > today
+    if caught_up:
+        next_cursor = today - dt.timedelta(days=7)
+    _clear_report_task(endpoint)
+    _state_set(endpoint, cursor_date=next_cursor, done=caught_up)
+    _log_run(endpoint, len(rows), True, started=started)
+    return len(rows)
 
 
 def sync_adv_tick(client: WBClient) -> int:
@@ -498,18 +778,20 @@ def run_tick() -> dict[str, Any]:
                 cur.execute(f"SELECT count(*) AS c FROM {table}")
                 return (cur.fetchone() or {}).get("c", 0) == 0
 
-    steps: list[tuple[str, Any]] = [
-        ("cards", lambda: sync_cards(client)),
-        ("prices", lambda: sync_prices(client)),
-        ("stocks", lambda: sync_stocks(client)),
-        ("orders", lambda: sync_orders(
+    steps: list[tuple[str, int, Any]] = [
+        ("cards", 0, lambda: sync_cards(client)),
+        ("prices", 0, lambda: sync_prices(client)),
+        ("stocks", 2, lambda: sync_stocks(client)),
+        ("orders", 0, lambda: sync_orders(
             client, days_back=BACKFILL_DAYS if (not _state_row("orders").get("done") and _needs_history("wb_orders")) else None)),
-        ("sales", lambda: sync_sales(
+        ("sales", 0, lambda: sync_sales(
             client, days_back=BACKFILL_DAYS if (not _state_row("sales").get("done") and _needs_history("wb_sales")) else None)),
-        ("adv", lambda: sync_adv_tick(client)),
-        ("finance", lambda: sync_finance_tick(client)),
+        ("adv", 0, lambda: sync_adv_tick(client)),
+        ("finance", 2, lambda: sync_finance_tick(client)),
+        ("paid_storage", 1, lambda: sync_paid_storage_tick(client)),
     ]
-    for name, fn in steps:
+    for name, api_version, fn in steps:
+        _ensure_api_version(name, api_version)
         bu = _blocked(name)
         if bu:
             out[name] = f"quota until {bu.astimezone(dt.timezone(dt.timedelta(hours=3))).strftime('%d.%m %H:%M')}"
@@ -661,7 +943,7 @@ def q_finance_groups(d_from: str, d_to: str, brand: str | None) -> dict[str, Any
                 [d_from, d_to, *bp])
             g = dict(cur.fetchone())
             cur.execute(
-                f"""SELECT COALESCE(sum(upd_sum),0) AS adv FROM wb_adv_costs
+                """SELECT COALESCE(sum(upd_sum),0) AS adv FROM wb_adv_costs
                     WHERE upd_time >= %s AND upd_time < (%s::date + 1)""",
                 [d_from, d_to])
             g["adv"] = cur.fetchone()["adv"]

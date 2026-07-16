@@ -96,15 +96,15 @@ export function DashboardContent() {
         </div>
 
         {/* Main Area */}
-        <div className="flex flex-col lg:flex-row items-start gap-6">
+        <div className="flex flex-col 2xl:flex-row items-start gap-6">
           {/* Tabs */}
-          <div className="w-full lg:w-64 shrink-0 flex flex-row lg:flex-col gap-2 overflow-x-auto pb-2 lg:pb-0 scrollbar-hide">
+          <div className="w-full 2xl:w-64 shrink-0 flex flex-row 2xl:flex-col gap-2 overflow-x-auto pb-2 2xl:pb-0 scrollbar-hide">
             {TABS.map((tab) => (
               <button
                 key={tab}
                 onClick={() => setActiveTab(tab)}
                 className={cn(
-                  "whitespace-nowrap lg:whitespace-normal w-auto lg:w-full text-left px-5 py-3.5 rounded-xl text-sm font-bold transition-all border",
+                  "whitespace-nowrap 2xl:whitespace-normal w-auto 2xl:w-full text-left px-5 py-3.5 rounded-xl text-sm font-bold transition-all border",
                   activeTab === tab
                     ? "bg-white text-brand-600 border-brand-600 shadow-md shadow-brand-500/10"
                     : "bg-white text-slate-700 border-transparent hover:border-slate-200 shadow-sm hover:shadow"

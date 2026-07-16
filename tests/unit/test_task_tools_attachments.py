@@ -55,8 +55,9 @@ def test_pick_agent_detects_main_trigger(monkeypatch):
          "triggers": {"агент-юрист", "юрист"}, "is_main": False},
     ])
     assert b24bot._b24_task_pick_agent("Албери, поставь задачу Иванову")["is_main"] is True
-    # longest-match wins: «юрист» picks the legal agent even though «албери» absent
-    assert b24bot._b24_task_pick_agent("нужен юрист по этому договору")["slug"] == "agent-sklad"
+    # A weak single-word trigger only summons the agent as a direct address.
+    assert b24bot._b24_task_pick_agent("нужен юрист по этому договору") is None
+    assert b24bot._b24_task_pick_agent("юрист, нужен совет по договору")["slug"] == "agent-sklad"
     # no agent named -> None (the vast majority of company comments)
     assert b24bot._b24_task_pick_agent("обычный рабочий комментарий без агента") is None
     # substring must not false-trigger inside another word
