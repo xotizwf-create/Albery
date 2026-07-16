@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AreaChart, Area, ResponsiveContainer } from 'recharts';
-import { Info, LayoutDashboard } from "lucide-react";
+import { AlertTriangle, Info, LayoutDashboard } from "lucide-react";
 import { cn } from "../lib/utils";
 import { DatePicker, BrandSelect } from "./shared/FormControls";
 import { RnpTab } from "./RnpTab";
@@ -104,14 +104,28 @@ export function DashboardContent() {
   }, [startDate, endDate, brand]);
 
   const r = tax?.realization || {}, svc = tax?.services || {}, tc = tax?.taxes_and_costs || {};
-  const o = summary?.orders || {}, s = summary?.sales || {};
-  const realization = Number(r.before_spp) || 0;
+  const o = summary?.orders || {};
+  const quality = tax?.quality || {};
+  const financialReady = Boolean(quality.finance_ready && quality.finance_complete);
+  const profitReady = Boolean(financialReady && quality.profit_ready);
+  const realization = Number(r.after_spp) || 0;
   const servicesTotal = Number(svc.total) || 0;
   const taxesTotal = (Number(tc.tax) || 0) + (Number(tc.vat) || 0) + (Number(tc.cogs) || 0);
-  const profit = Number(tax?.operating_profit) || 0;
-  const spark = useMemo(() => (summary?.daily || []).map((d: any) => ({ v: Number(d.orders_rub) || 0 })), [summary]);
+  const profit = profitReady ? Number(tax?.operating_profit) : null;
+  const orderSpark = useMemo(() => (summary?.daily || []).map((d: any) => ({ v: Number(d.orders_rub) || 0 })), [summary]);
+  const financeSparks = useMemo(() => {
+    const rows = tax?.daily || [];
+    const series = (key: string) => rows.map((d: any) => ({ v: Number(d[key]) || 0 }));
+    return { sales: series('realization'), logistics: series('logistics'), adv: series('adv'), services: series('services') };
+  }, [tax]);
   const bar = (part: number, whole: number) => (whole > 0 ? Math.max(0, Math.min(100, (part / whole) * 100)) : 0);
-  const salesRub = Number(s.sales_rub) || 0, returnsRub = Number(s.returns_rub) || 0;
+  const salesRub = Number(r.sales_after_spp) || 0, returnsRub = Number(r.returns_after_spp) || 0;
+  const financeMoney = (value: unknown) => financialReady ? money(value) : '—';
+  const financePct = (part: unknown, whole: unknown) => financialReady ? pct(part, whole) : '—';
+  const ordersCoverage = summary?.quality?.orders;
+  const ordersSubtitle = ordersCoverage?.from && ordersCoverage?.to
+    ? `${ordersCoverage.complete ? 'полный отчёт' : 'частично'} · ${ordersCoverage.from}—${ordersCoverage.to}`
+    : 'данные загружаются';
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-y-auto bg-slate-100">
@@ -165,19 +179,41 @@ export function DashboardContent() {
               <SettingsContent />
             ) : activeTab === 'Общий дашборд' ? (
               <>
+                {!financialReady && (
+                  <div className="flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
+                    <div>
+                      <div className="font-bold">Финансовый отчёт WB ещё загружается</div>
+                      <div className="mt-0.5 text-xs leading-5 text-amber-800">
+                        Реализация, услуги, налоги и прибыль скрыты до завершения всего отчёта за выбранный период — частичные строки не выдаются за итоговые. Оперативные заказы ниже показаны отдельно с фактическим покрытием.
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {financialReady && !profitReady && (
+                  <div className="flex items-start gap-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-950">
+                    <Info className="mt-0.5 h-5 w-5 shrink-0 text-sky-500" />
+                    <div>
+                      <div className="font-bold">Финансовый отчёт загружен, прибыль пока не рассчитана</div>
+                      <div className="mt-0.5 text-xs leading-5 text-sky-800">
+                        Не заполнена себестоимость для {Number(quality.missing_cost_barcodes) || 0} баркодов. До заполнения этих данных показывать прибыль как окончательную было бы неверно.
+                      </div>
+                    </div>
+                  </div>
+                )}
                 {/* Top Row Cards */}
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 xl:grid-cols-4 gap-4">
                   {/* Card 1: Реализация */}
                   <div className="bg-white p-6 rounded-2xl shadow-sm flex flex-col border border-slate-100 transition-shadow hover:shadow-md">
                     <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Реализация</div>
-                    <div className="text-3xl font-black text-slate-900 mb-6 tracking-tight">{money(realization)}</div>
+                    <div className="text-3xl font-black text-slate-900 mb-6 tracking-tight">{financeMoney(realization)}</div>
                     <div className="h-2 w-full bg-slate-100 rounded-full flex mb-6 overflow-hidden">
                       <div className="bg-[#10b981] h-full" style={{ width: `${bar(salesRub, salesRub + returnsRub)}%` }}></div>
                       <div className="bg-[#ef4444] h-full" style={{ width: `${bar(returnsRub, salesRub + returnsRub)}%` }}></div>
                     </div>
                     <div className="space-y-3 text-[11px]">
-                      <Row color="#10b981" name="Продажи" value={money(s.sales_rub)} ring />
-                      <Row color="#ef4444" name="Возвраты" value={money(s.returns_rub)} ring />
+                      <Row color="#10b981" name="Продажи по финотчёту" value={financeMoney(salesRub)} ring />
+                      <Row color="#ef4444" name="Возвраты по финотчёту" value={financeMoney(returnsRub)} ring />
                     </div>
                   </div>
 
@@ -185,8 +221,8 @@ export function DashboardContent() {
                   <div className="bg-white p-6 rounded-2xl shadow-sm flex flex-col border border-slate-100 transition-shadow hover:shadow-md">
                     <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Услуги</div>
                     <div className="flex items-baseline gap-3 mb-6">
-                      <div className="text-3xl font-black text-slate-900 tracking-tight">{money(servicesTotal)}</div>
-                      <div className="text-[11px] font-bold bg-slate-100 text-slate-500 px-2 py-1 rounded-md">{pct(servicesTotal, realization)}</div>
+                      <div className="text-3xl font-black text-slate-900 tracking-tight">{financeMoney(servicesTotal)}</div>
+                      <div className="text-[11px] font-bold bg-slate-100 text-slate-500 px-2 py-1 rounded-md">{financePct(servicesTotal, realization)}</div>
                     </div>
                     <div className="h-2 w-full bg-slate-100 rounded-full flex mb-6 overflow-hidden">
                       <div className="bg-[#f59e0b] h-full" style={{ width: `${bar(Number(svc.commission) || 0, servicesTotal)}%` }}></div>
@@ -195,10 +231,10 @@ export function DashboardContent() {
                       <div className="bg-[#3b82f6] h-full" style={{ width: `${bar((Number(svc.storage) || 0) + (Number(svc.other) || 0), servicesTotal)}%` }}></div>
                     </div>
                     <div className="space-y-2.5 text-[11px]">
-                      <Row color="#f59e0b" name="Комиссия" value={money(svc.commission)} share={pct(svc.commission, realization)} />
-                      <Row color="#60a5fa" name="Логистика" value={money(svc.logistics)} share={pct(svc.logistics, realization)} />
-                      <Row color="#a855f7" name="Реклама" value={money(svc.adv)} share={pct(svc.adv, realization)} />
-                      <Row color="#3b82f6" name="Остальные" value={money((Number(svc.storage) || 0) + (Number(svc.other) || 0))} share={pct((Number(svc.storage) || 0) + (Number(svc.other) || 0), realization)} />
+                      <Row color="#f59e0b" name="Комиссия WB" value={financeMoney(svc.commission)} share={financePct(svc.commission, realization)} />
+                      <Row color="#60a5fa" name="Логистика" value={financeMoney(svc.logistics)} share={financePct(svc.logistics, realization)} />
+                      <Row color="#a855f7" name="Реклама" value={quality.advertising_allocated === false ? '—' : financeMoney(svc.adv)} share={quality.advertising_allocated === false ? '—' : financePct(svc.adv, realization)} />
+                      <Row color="#3b82f6" name="Остальные" value={financeMoney((Number(svc.storage) || 0) + (Number(svc.other) || 0))} share={financePct((Number(svc.storage) || 0) + (Number(svc.other) || 0), realization)} />
                     </div>
                   </div>
 
@@ -206,8 +242,8 @@ export function DashboardContent() {
                   <div className="bg-white p-6 rounded-2xl shadow-sm flex flex-col border border-slate-100 transition-shadow hover:shadow-md">
                     <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Налоги и затраты</div>
                     <div className="flex items-baseline gap-3 mb-6">
-                      <div className="text-3xl font-black text-slate-900 tracking-tight">{money(taxesTotal)}</div>
-                      <div className="text-[11px] font-bold bg-slate-100 text-slate-500 px-2 py-1 rounded-md">{pct(taxesTotal, realization)}</div>
+                      <div className="text-3xl font-black text-slate-900 tracking-tight">{financeMoney(taxesTotal)}</div>
+                      <div className="text-[11px] font-bold bg-slate-100 text-slate-500 px-2 py-1 rounded-md">{financePct(taxesTotal, realization)}</div>
                     </div>
                     <div className="h-2 w-full bg-slate-100 rounded-full flex mb-6 overflow-hidden">
                       <div className="bg-[#f97316] h-full" style={{ width: `${bar(Number(tc.tax) || 0, taxesTotal)}%` }}></div>
@@ -215,11 +251,11 @@ export function DashboardContent() {
                       <div className="bg-[#a1a1aa] h-full" style={{ width: `${bar(Number(tc.cogs) || 0, taxesTotal)}%` }}></div>
                     </div>
                     <div className="space-y-2 text-[11px]">
-                      <Row color="#f97316" name="Налог" value={money(tc.tax)} share={pct(tc.tax, realization)} />
-                      <Row color="#ec4899" name="НДС к уплате" value={money(tc.vat)} share={pct(tc.vat, realization)} />
-                      <Row color="#a1a1aa" name="Себестоимость продаж" value={money(tc.cogs)} share={pct(tc.cogs, realization)} />
-                      <Row color="#78350f" name="Себестоимость самовыкупов" value={money(0)} share="0%" />
-                      <Row color="#84cc16" name="Затраты" value={money(0)} share="0%" />
+                      <Row color="#f97316" name="Налог" value={financeMoney(tc.tax)} share={financePct(tc.tax, realization)} />
+                      <Row color="#ec4899" name="НДС к уплате" value={financeMoney(tc.vat)} share={financePct(tc.vat, realization)} />
+                      <Row color="#a1a1aa" name="Себестоимость продаж" value={quality.costs_ready ? financeMoney(tc.cogs) : '—'} share={quality.costs_ready ? financePct(tc.cogs, realization) : '—'} />
+                      <Row color="#78350f" name="Себестоимость самовыкупов" value="—" share="—" />
+                      <Row color="#84cc16" name="Прочие затраты" value="—" share="—" />
                     </div>
                   </div>
 
@@ -229,33 +265,33 @@ export function DashboardContent() {
                       <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Операционная прибыль</div>
                       <Info className="w-4 h-4 text-slate-300 hover:text-brand-500 transition-colors cursor-help" />
                     </div>
-                    <div className={cn("text-4xl font-black mb-6 tracking-tight drop-shadow-sm", profit < 0 ? "text-[#ef4444]" : "text-[#10b981]")}>
-                      {money(profit)} <span className="text-2xl text-slate-400 font-bold">₽</span>
+                    <div className={cn("text-4xl font-black mb-6 tracking-tight drop-shadow-sm", profit !== null && profit < 0 ? "text-[#ef4444]" : "text-[#10b981]")}>
+                      {profitReady ? money(profit) : '—'} {profitReady && <span className="text-2xl text-slate-400 font-bold">₽</span>}
                     </div>
                     <div className="space-y-3 mb-6">
                       <div className="flex justify-between items-center">
                         <span className="text-slate-500 font-medium text-sm">Маржинальность</span>
-                        <span className="font-black text-slate-800 bg-white shadow-sm border border-slate-100 px-2 py-0.5 rounded-lg">{pct(profit, realization)}</span>
+                        <span className="font-black text-slate-800 bg-white shadow-sm border border-slate-100 px-2 py-0.5 rounded-lg">{profitReady ? pct(profit, realization) : '—'}</span>
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-slate-500 font-medium text-sm">Рентабельность</span>
-                        <span className="font-black text-slate-800 bg-white shadow-sm border border-slate-100 px-2 py-0.5 rounded-lg">{pct(profit, servicesTotal + (Number(tc.cogs) || 0))}</span>
+                        <span className="font-black text-slate-800 bg-white shadow-sm border border-slate-100 px-2 py-0.5 rounded-lg">{profitReady ? pct(profit, servicesTotal + (Number(tc.cogs) || 0)) : '—'}</span>
                       </div>
                     </div>
-                    <div className="h-24 mt-auto -mx-2 -mb-2"><Sparkline data={spark} color="#10b981" /></div>
+                    <div className="h-24 mt-auto -mx-2 -mb-2"><Sparkline data={profitReady ? financeSparks.sales : []} color="#10b981" /></div>
                   </div>
                 </div>
 
                 {/* Bottom Row Cards */}
                 <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
-                  <BottomCard title="Заказы" value={money(o.orders_rub)} color="#f97316" spark={spark} />
-                  <BottomCard title="Продажи" value={money(s.sales_rub)} color="#10b981" spark={spark} />
-                  <BottomCard title="Логистика" value={money(svc.logistics)} color="#3b82f6" spark={spark} />
-                  <BottomCard title="Реклама" value={money(svc.adv)} color="#a855f7" spark={spark} />
-                  <BottomCard title="Все услуги" value={money(servicesTotal)} color="#3b82f6" spark={spark} />
+                  <BottomCard title="Заказы" value={money(o.orders_rub)} color="#f97316" spark={orderSpark} subtitle={ordersSubtitle} />
+                  <BottomCard title="Продажи" value={financeMoney(realization)} color="#10b981" spark={financialReady ? financeSparks.sales : []} subtitle="по финансовому отчёту WB" />
+                  <BottomCard title="Логистика" value={financeMoney(svc.logistics)} color="#3b82f6" spark={financialReady ? financeSparks.logistics : []} subtitle="по финансовому отчёту WB" />
+                  <BottomCard title="Реклама" value={quality.advertising_allocated === false ? '—' : financeMoney(svc.adv)} color="#a855f7" spark={financialReady ? financeSparks.adv : []} subtitle="по списаниям рекламного кабинета" />
+                  <BottomCard title="Все услуги" value={financeMoney(servicesTotal)} color="#3b82f6" spark={financialReady ? financeSparks.services : []} subtitle="по финансовому отчёту WB" />
                 </div>
 
-                {(!summary || ((Number(o.orders_cnt) || 0) === 0 && (Number(s.sales_cnt) || 0) === 0)) && (
+                {(!summary || ((Number(o.orders_cnt) || 0) === 0 && !financialReady)) && (
                   <div className="bg-white border border-dashed border-slate-200 rounded-2xl p-5 text-center text-sm font-medium text-slate-500">
                     За выбранный период пока нет данных заказов/продаж — цифры появятся автоматически по мере синхронизации с WB.
                   </div>
@@ -275,11 +311,11 @@ export function DashboardContent() {
   );
 }
 
-function BottomCard({ title, value, color, spark }: { title: string, value: string, color: string, spark: { v: number }[] }) {
+function BottomCard({ title, value, color, spark, subtitle = 'за период' }: { title: string, value: string, color: string, spark: { v: number }[], subtitle?: string }) {
   return (
     <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-100 flex flex-col h-40 transition-shadow hover:shadow-md">
       <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">{title}</div>
-      <div className="text-[10px] font-medium text-slate-400 mb-2">за период</div>
+      <div className="text-[10px] font-medium text-slate-400 mb-2 truncate" title={subtitle}>{subtitle}</div>
       <div className="text-xl font-black text-slate-900 mb-1 tracking-tight">{value}</div>
       <div className="h-12 mt-auto -mx-2 -mb-2"><Sparkline data={spark} color={color} /></div>
     </div>

@@ -18,7 +18,6 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 # Import app first: it initializes Flask/routes and avoids circular partial imports.
-import app  # noqa: E402
 from app import pg_connect  # noqa: E402
 import wb_cabinet  # noqa: E402
 
