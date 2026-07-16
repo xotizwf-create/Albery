@@ -54,6 +54,9 @@ F_PROD_READY = "UF_CRM_WB_PROD_READY_PLAN"
 F_PREPAY_SUM = "UF_CRM_WB_PREPAYMENT_SUM"
 F_PREPAY_DATE = "UF_CRM_WB_PREPAYMENT_DATE"
 F_ARRIVAL = "UF_CRM_1783671293981"    # Дата прихода товара в КРД
+F_ARTICLE = "UF_CRM_WB_ARTICLE"       # Артикул(ы)
+F_QTY = "UF_CRM_WB_QTY"               # Количество, шт
+F_CONTENT = "UF_CRM_WB_ORDER_CONTENT" # Что в заказе
 PLAN_DATES = {
     F_PROD_READY: (None, "план готовности пр-ва"),
     "UF_CRM_WB_PLAN_SHIP_DATE": ("UF_CRM_WB_ACTUAL_SHIP_DATE", "плановая отгрузка"),
@@ -61,7 +64,7 @@ PLAN_DATES = {
 }
 SELECT = (["ID", "TITLE", "STAGE_ID", "OPPORTUNITY", "CURRENCY_ID", "MOVED_TIME",
            F_PAID, F_SUM_TEXT, F_SUPPLIER, F_PRODUCT, F_ORDER_NO, F_PROD_STAGE,
-           F_PREPAY_SUM, F_PREPAY_DATE, F_ARRIVAL]
+           F_PREPAY_SUM, F_PREPAY_DATE, F_ARRIVAL, F_ARTICLE, F_QTY, F_CONTENT]
           + list(PLAN_DATES) + [a for a, _ in PLAN_DATES.values() if a])
 
 DDL = """
@@ -215,11 +218,18 @@ def collect(funnel_id: int) -> list[dict]:
                 if pd and pd < today:
                     probs.append(f"просрочено: {label} ({pd.strftime('%d.%m')})")
         nxt = extras["next_act"]
+        # следующий этап по воронке (ближайший process/success этап после текущего по sort)
+        cur_sort = int(st.get("sort") or 0)
+        nxt_stage = next((s["name"] for s in sorted(stages.values(), key=lambda x: x["sort"])
+                          if s["sort"] > cur_sort and (s.get("semantics") or "P")[:1].upper() != "F"
+                          and "провал" not in (s["name"] or "").lower()), "")
         out.append({
             "id": int(d["ID"]), "funnel": funnel_id,
             "title": (d.get("TITLE") or "").strip() or f"Сделка #{d['ID']}",
             "stage": st.get("name") or d.get("STAGE_ID"), "sem": sem, "paid": paid,
-            "stage_since": _dmy(d.get("MOVED_TIME")),
+            "stage_since": _dmy(d.get("MOVED_TIME")), "next_stage": nxt_stage,
+            "article": (d.get(F_ARTICLE) or "").strip(),
+            "qty": d.get(F_QTY), "content": (d.get(F_CONTENT) or "").strip(),
             "amount": amount, "cur": cur, "money_src": money_src,
             "prepay": (d.get(F_PREPAY_SUM), _dmy(d.get(F_PREPAY_DATE))),
             "paid_acts": extras["paid_acts"],
@@ -263,12 +273,39 @@ def run_check(dry=False):
     logging.info("funnel-control check: снимок %s сделок сохранён", len(rows))
 
 
-def _baseline(funnel_id: int) -> dict:
-    start = msk_now().replace(hour=0, minute=0, second=0, microsecond=0)
+def _snapshot_at(funnel_id: int, where_ts: str, args: tuple) -> dict:
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT max(run_ts) AS rt FROM funnel_control_snapshots "
-                        "WHERE funnel_id=%s AND run_ts < %s", (funnel_id, start))
+            cur.execute(f"SELECT max(run_ts) AS rt FROM funnel_control_snapshots "
+                        f"WHERE funnel_id=%s AND {where_ts}", (funnel_id, *args))
+            row = cur.fetchone()
+            rt = row and row["rt"]
+            if not rt:
+                return {}
+            cur.execute("SELECT deal_id, stage, paid, has_next, problems, fingerprint "
+                        "FROM funnel_control_snapshots WHERE funnel_id=%s AND run_ts=%s",
+                        (funnel_id, rt))
+            return {r["deal_id"]: dict(r) for r in cur.fetchall()}
+
+
+def _baseline(funnel_id: int) -> dict:
+    """Снимок предыдущего дня (для «с прошлой проверки»)."""
+    start = msk_now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return _snapshot_at(funnel_id, "run_ts < %s", (start,))
+
+
+def _week_baseline(funnel_id: int) -> dict:
+    """Снимок ~недельной давности (для «изменения за неделю»): последний прогон старше 6 дней,
+    иначе самый ранний прогон старше сегодняшнего дня."""
+    now = msk_now()
+    week = _snapshot_at(funnel_id, "run_ts < %s", (now - __import__("datetime").timedelta(days=6),))
+    if week:
+        return week
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT min(run_ts) AS rt FROM funnel_control_snapshots "
+                        "WHERE funnel_id=%s AND run_ts < %s",
+                        (funnel_id, now.replace(hour=0, minute=0, second=0, microsecond=0)))
             row = cur.fetchone()
             rt = row and row["rt"]
             if not rt:
@@ -293,6 +330,142 @@ def _severity(deals):
     if warn:
         return ("🟡", f"[b]🟡 Недочёты[/b] — {len(warn)} сделок (нет следующего шага / сроки).")
     return ("🟢", "[b]🟢 Всё в порядке[/b] — сделки заполнены и в движении.")
+
+
+def _week_diff_text(d, bweek: dict) -> str:
+    """Человекочитаемые изменения сделки против недельного снимка."""
+    if not bweek:
+        return "первая проверка — сравнить пока не с чем"
+    b = bweek.get(d["id"])
+    if not b:
+        return "новая сделка (на прошлой проверке её не было)"
+    bits = []
+    if (b.get("stage") or "") != d["stage"]:
+        bits.append(f"этап: «{b.get('stage')}» → «{d['stage']}»")
+    if (b.get("paid") or "") != d["paid"]:
+        bits.append(f"оплата: «{b.get('paid') or 'не отмечена'}» → «{d['paid'] or 'не отмечена'}»")
+    if bool(b.get("has_next")) != d["has_next"]:
+        bits.append("появилось следующее дело" if d["has_next"] else "следующее дело закрыто/пропало")
+    old_probs, new_probs = set(b.get("problems") or []), set(d["problems"])
+    fixed = old_probs - new_probs
+    arisen = new_probs - old_probs
+    if fixed:
+        bits.append("исправлено: " + "; ".join(sorted(fixed)))
+    if arisen:
+        bits.append("новое: " + "; ".join(sorted(arisen)))
+    return "; ".join(bits) if bits else "изменений не было"
+
+
+def _card_procurement(d, bweek: dict) -> str:
+    """Карточка закупки в структуре владельца (задача 1500, формат 16.07)."""
+    L = [f"— {_ref(d)} — [b]{d['stage']}[/b]" + (f" (с {d['stage_since']})" if d["stage_since"] else "")]
+
+    # Сумма заказа
+    if d["amount"] is not None:
+        s = _fmt_money(d["amount"], d["cur"])
+        if d["money_src"] == "text":
+            s += " (в текстовом поле — на канбане 0 ₽)"
+    else:
+        s = "не указана ⚠️"
+    L.append(f"[b]Сумма заказа:[/b] {s}")
+
+    # Артикулы и название товаров, кол-во
+    goods = []
+    if d["article"]:
+        goods.append("арт. " + d["article"])
+    if d["product"]:
+        goods.append(d["product"])
+    elif d["content"]:
+        goods.append(d["content"][:120])
+    if d["qty"]:
+        goods.append(f"{d['qty']} шт")
+    L.append("[b]Артикулы и товары, кол-во:[/b] " + (" · ".join(goods) if goods else "не заполнено ⚠️"))
+
+    # Оплачено и даты оплат
+    pay = []
+    if d["paid"]:
+        pay.append(f"«Оплата произведена»: {d['paid']}")
+    pre_sum, pre_date = d["prepay"]
+    if pre_sum:
+        pay.append(f"предоплата {pre_sum}" + (f" от {pre_date}" if pre_date else ""))
+    for a in d["paid_acts"]:
+        pay.append(f"«{(a.get('SUBJECT') or '')[:60]}» — выполнено {_dmy(a.get('DEADLINE'))}")
+    L.append("[b]Оплачено и даты оплат:[/b] " + ("; ".join(pay) if pay else "данных об оплате нет ⚠️"))
+
+    # Текущий статус (этап + производство + сроки + лента)
+    stat = [d["stage"] + (f" с {d['stage_since']}" if d["stage_since"] else "")]
+    if d["prod_stage"]:
+        stat.append("стадия пр-ва: " + d["prod_stage"])
+    if d["prod_ready"]:
+        stat.append("готовность пр-ва: " + d["prod_ready"])
+    if d["ship_plan"]:
+        stat.append("отгрузка: " + d["ship_plan"])
+    if d["arrival"]:
+        stat.append("приход в КРД: " + d["arrival"])
+    line = "; ".join(stat)
+    if d["comments"]:
+        line += ". Из комментариев: " + " · ".join(f"«{txt}» ({when})" for when, txt in d["comments"])
+    L.append("[b]Текущий статус:[/b] " + line)
+
+    # Изменения за неделю
+    L.append("[b]Изменения за неделю:[/b] " + _week_diff_text(d, bweek))
+
+    # Текущие блокеры
+    nsubj = (d["next_act"][0] if d["next_act"] else "")[:60]
+    blk = [b for b in d["blockers"] if not (nsubj and b[:60] == nsubj)]
+    L.append("[b]Текущие блокеры:[/b] " + (" | ".join(blk[:2]) if blk else "не зафиксированы"))
+
+    # Незаполненная информация
+    missing = []
+    if d["amount"] is None:
+        missing.append("сумма заказа")
+    elif d["money_src"] == "text":
+        missing.append("сумма в поле «Сумма» (для канбана)")
+    if not (d["article"] or d["product"] or d["content"]):
+        missing.append("артикулы/товары")
+    if not d["qty"]:
+        missing.append("количество")
+    if not d["supplier"]:
+        missing.append("поставщик")
+    if d["sem"] != "S":
+        if not d["prod_stage"]:
+            missing.append("стадия производства")
+        if not d["prod_ready"]:
+            missing.append("готовность пр-ва")
+        if not d["ship_plan"]:
+            missing.append("дата отгрузки")
+        if not d["arrival"]:
+            missing.append("приход в КРД")
+    L.append("[b]Незаполненная информация:[/b] " + (", ".join(missing) if missing else "всё заполнено ✅"))
+
+    # Следующий шаг исходя из воронки
+    if d["next_act"]:
+        subj, dl = d["next_act"]
+        step = f"{subj}" + (f" (до {dl})" if dl else "")
+    elif d["sem"] == "S":
+        step = "сделка закрыта — подтвердить оплату и архивировать"
+    else:
+        step = ("дело не назначено ⚠️"
+                + (f" — по воронке следующий этап «{d['next_stage']}»" if d["next_stage"] else ""))
+    L.append("[b]Следующий шаг исходя из воронки:[/b] " + step)
+
+    # Что нужно доработать
+    todo = []
+    if any("оплата не подтверждена" in p for p in d["problems"]):
+        todo.append("подтвердить оплату (поле «Оплата произведена») или вернуть сделку на актуальный этап")
+    if not d["has_next"] and d["sem"] != "S":
+        todo.append("назначить ответственное дело/задачу с дедлайном")
+    if d["money_src"] == "text":
+        todo.append("перенести сумму в поле «Сумма» — сейчас на канбане 0 ₽")
+    if d["amount"] is None:
+        todo.append("указать сумму заказа")
+    if missing and d["sem"] != "S":
+        todo.append("заполнить: " + ", ".join(m for m in missing if "Сумма" not in m and "сумма" not in m)[:160])
+    for p in d["problems"]:
+        if "просрочено" in p:
+            todo.append("обновить " + p)
+    L.append("[b]Что нужно доработать:[/b] " + ("; ".join(dict.fromkeys(todo)) if todo else "ничего — карточка в порядке ✅"))
+    return "\n".join(L)
 
 
 def _passport(d) -> str:
@@ -362,6 +535,19 @@ def _funnel_picture(fid: int, deals: list[dict], base: dict) -> str:
     lines = [f"[b]═══ {name} ═══[/b]",
              f"Активных {len(active)}" + (f" на ~{_fmt_money(total_usd, 'USD')}" if total_usd else "")
              + (f", закрытых «успешна» {len(won)}" if won else "")]
+    if fid == 2:
+        # Воронка закупки: структурированная карточка по КАЖДОЙ закупке (формат владельца).
+        bweek = _week_baseline(fid)
+        won_unpaid = [d for d in won if d["paid"] != "да"]
+        won_paid = [d for d in won if d["paid"] == "да"]
+        lines.append("")
+        for d in active + won_unpaid:
+            lines.append(_card_procurement(d, bweek) + "\n")
+        if won_paid:
+            lines.append("[b]Закрыты и оплачены (без карточки):[/b] "
+                         + ", ".join(f"{_ref(d)}" + (f" · {_fmt_money(d['amount'], d['cur'])}" if d["amount"] else "")
+                                     for d in won_paid))
+        return "\n".join(lines)
     if active:
         lines.append("")
         lines += [_passport(d) + "\n" for d in active]
