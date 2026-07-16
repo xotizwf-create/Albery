@@ -110,6 +110,19 @@ function ArticlePhoto({ url }: { url: string | null }) {
   );
 }
 
+function ArticleIdentity({ article, compact = false }: { article: Card; compact?: boolean }) {
+  return (
+    <div className={cn("min-w-0", compact ? "w-56" : "w-64")}>
+      <div className="flex items-center gap-2">
+        <span className="shrink-0 rounded bg-brand-50 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-brand-600">WB</span>
+        <span className={cn("truncate text-sm font-black", article.excluded ? "text-slate-500 line-through" : "text-slate-900")}>{article.nm_id}</span>
+      </div>
+      {article.vendor_code && <div className="mt-0.5 truncate text-[10px] font-medium text-slate-400">Арт. поставщика: {article.vendor_code}</div>}
+      <div className="mt-0.5 truncate text-xs font-medium text-slate-500">{article.title || article.subject_name || ''}</div>
+    </div>
+  );
+}
+
 function LoadingBlock() {
   return (
     <div className="p-16 flex items-center justify-center text-slate-400 gap-3">
@@ -143,7 +156,7 @@ function ArticlesSettings({ articles, loading, toggleExclude }: { articles: Card
             <table className="min-w-[980px] w-full text-left whitespace-nowrap">
               <thead className="bg-white border-b border-slate-200 shadow-sm sticky top-0 z-20">
                 <tr>
-                  <th className="px-5 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-wider sticky left-0 bg-white z-10 w-64 border-r border-slate-100 shadow-[1px_0_0_0_#f1f5f9]">Артикул</th>
+                  <th className="px-5 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-wider sticky left-0 bg-white z-10 w-80 border-r border-slate-100 shadow-[1px_0_0_0_#f1f5f9]">Артикул WB</th>
                   <th className="px-5 py-4 text-[10px] font-bold text-slate-400 uppercase tracking-wider min-w-[120px]">Бренд</th>
                   {WEEKS.map((week) => (
                     <th key={week} className="px-5 py-4 text-[10px] font-bold text-slate-500 uppercase tracking-wider text-right min-w-[120px]">{week}</th>
@@ -157,10 +170,7 @@ function ArticlesSettings({ articles, loading, toggleExclude }: { articles: Card
                     <td className={cn("px-5 py-3 sticky left-0 border-r border-slate-100 z-10 transition-colors", a.excluded ? "bg-slate-50" : "bg-white group-hover:bg-slate-50")}>
                       <div className="flex items-center gap-3">
                         <ArticlePhoto url={a.photo_url} />
-                        <div className="min-w-0 w-44">
-                          <div className={cn("font-bold text-sm truncate", a.excluded ? "text-slate-500 line-through" : "text-slate-900")}>{a.vendor_code || a.nm_id}</div>
-                          <div className="text-xs text-slate-500 font-medium truncate">{a.title || a.subject_name || ''}</div>
-                        </div>
+                        <ArticleIdentity article={a} />
                       </div>
                     </td>
                     <td className="px-5 py-3 text-sm font-bold text-slate-600">{a.brand || '—'}</td>
@@ -311,8 +321,8 @@ function SalesPlanSettings({ articles, loading }: { articles: Card[], loading: b
                   ))}
                 </tr>
                 <tr className="border-b border-slate-200 shadow-sm">
-                  <th className="px-5 py-3 text-[10px] font-bold text-slate-500 uppercase tracking-wider sticky left-0 bg-white z-20 border-r border-slate-100 w-64">Артикул</th>
-                  <th className="px-5 py-3 text-[10px] font-bold text-slate-500 uppercase tracking-wider sticky left-64 bg-white z-20 border-r border-slate-100 shadow-[1px_0_0_0_#f1f5f9]">Бренд</th>
+                  <th className="px-5 py-3 text-[10px] font-bold text-slate-500 uppercase tracking-wider sticky left-0 bg-white z-20 border-r border-slate-100 w-80">Артикул WB</th>
+                  <th className="px-5 py-3 text-[10px] font-bold text-slate-500 uppercase tracking-wider sticky left-80 bg-white z-20 border-r border-slate-100 shadow-[1px_0_0_0_#f1f5f9]">Бренд</th>
                   {months.map((month) => (
                     <Fragment key={month + '-metrics'}>
                       <th className="px-4 py-3 text-[10px] font-bold text-slate-500 uppercase tracking-wider text-right border-l border-slate-100 bg-white">План руб.</th>
@@ -328,13 +338,10 @@ function SalesPlanSettings({ articles, loading }: { articles: Card[], loading: b
                     <td className="px-5 py-3 sticky left-0 bg-white group-hover:bg-slate-50 border-r border-slate-100 z-10">
                       <div className="flex items-center gap-3">
                         <ArticlePhoto url={a.photo_url} />
-                        <div className="min-w-0 w-48">
-                          <div className="font-bold text-slate-900 text-sm truncate">{a.vendor_code || a.nm_id}</div>
-                          <div className="text-xs text-slate-500 font-medium truncate">{a.title || a.subject_name || ''}</div>
-                        </div>
+                        <ArticleIdentity article={a} compact />
                       </div>
                     </td>
-                    <td className="px-5 py-3 text-sm font-bold text-slate-600 sticky left-64 bg-white group-hover:bg-slate-50 border-r border-slate-100 z-10 shadow-[1px_0_0_0_#f1f5f9]">{a.brand || '—'}</td>
+                    <td className="px-5 py-3 text-sm font-bold text-slate-600 sticky left-80 bg-white group-hover:bg-slate-50 border-r border-slate-100 z-10 shadow-[1px_0_0_0_#f1f5f9]">{a.brand || '—'}</td>
                     {months.map((month, monthIdx) => (
                       <Fragment key={month + '-' + a.nm_id}>
                         <td className="px-4 py-3 text-right border-l border-slate-100">

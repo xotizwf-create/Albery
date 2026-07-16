@@ -11,6 +11,7 @@ from wb_cabinet import (
     _stock_report_rows,
     q_rnp,
     sync_stocks,
+    wbcab_cards,
 )
 
 
@@ -174,3 +175,18 @@ def test_rnp_selected_article_keeps_calendar_row_and_never_mixes_cabinet_ad_spen
         "adv_rub": 0.0,
         "drr_pct": 0.0,
     }]
+
+
+def test_card_search_covers_wb_article_supplier_article_name_and_subject(fake_pg):
+    cursor = fake_pg(wb_cabinet, lambda sql, params: [])
+
+    with wb_cabinet.app.test_request_context("/api/wb-cab/cards?q=12345"):
+        response = wbcab_cards()
+
+    sql, params = cursor.executed[-1]
+    assert response.get_json() == {"cards": [], "total": 0}
+    assert "nm_id::text ILIKE %s" in sql
+    assert "vendor_code ILIKE %s" in sql
+    assert "title ILIKE %s" in sql
+    assert "subject_name ILIKE %s" in sql
+    assert params[:4] == ["%12345%"] * 4

@@ -278,7 +278,7 @@ export function RnpTab({ brand, startDate, endDate }: { brand?: string; startDat
           <input
             type="text"
             className="block w-full rounded-xl border border-slate-200 bg-slate-50 py-3.5 pl-11 pr-4 text-sm font-medium text-slate-900 shadow-sm transition-all placeholder:text-slate-400 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-brand-500"
-            placeholder="Введите артикул или название товара…"
+            placeholder="Артикул WB, артикул поставщика или название…"
             value={search}
             onChange={(event) => { setSearch(event.target.value); setIsSearching(true); }}
             onFocus={() => setIsSearching(true)}
@@ -293,14 +293,18 @@ export function RnpTab({ brand, startDate, endDate }: { brand?: string; startDat
                     <li key={card.nm_id}>
                       <button
                         className="flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-slate-50 sm:gap-4"
-                        onClick={() => { setSelected(card); setSearch(card.vendor_code || String(card.nm_id)); setIsSearching(false); }}
+                        onClick={() => { setSelected(card); setSearch(String(card.nm_id)); setIsSearching(false); }}
                       >
                         <div className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm sm:h-12 sm:w-12">
                           {card.photo_url ? <img src={card.photo_url} alt={card.title || ''} className="h-full w-full object-cover" /> : <ImageIcon className="h-5 w-5 text-slate-400" />}
                         </div>
                         <div className="min-w-0 flex-1">
-                          <div className="truncate font-bold text-slate-900">{card.vendor_code || card.nm_id}</div>
-                          <div className="line-clamp-1 text-xs font-medium text-slate-500">{card.title || card.subject_name || ''}</div>
+                          <div className="flex items-center gap-2">
+                            <span className="shrink-0 rounded bg-brand-50 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-brand-600">WB</span>
+                            <span className="truncate font-black text-slate-900">{card.nm_id}</span>
+                          </div>
+                          <div className="mt-0.5 line-clamp-1 text-xs font-medium text-slate-600">{card.title || card.subject_name || ''}</div>
+                          {card.vendor_code && <div className="mt-0.5 truncate text-[10px] font-medium text-slate-400">Арт. поставщика: {card.vendor_code}</div>}
                         </div>
                         {card.brand && <span className="hidden shrink-0 text-[10px] font-bold uppercase text-slate-400 sm:block">{card.brand}</span>}
                       </button>
@@ -321,9 +325,14 @@ export function RnpTab({ brand, startDate, endDate }: { brand?: string; startDat
             </div>
             <div className="min-w-0">
               <div className="mb-2 inline-flex rounded-md bg-brand-50 px-2.5 py-1 text-[9px] font-bold uppercase tracking-wider text-brand-600 sm:text-[10px]">Выбранный товар</div>
-              <div className="truncate text-xl font-black tracking-tight text-slate-900 sm:text-2xl">{selected.vendor_code || selected.nm_id}</div>
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="shrink-0 text-xs font-bold text-slate-400">Артикул WB</span>
+                <span className="truncate text-xl font-black tracking-tight text-slate-900 sm:text-2xl">{selected.nm_id}</span>
+              </div>
               <div className="line-clamp-2 text-xs font-medium text-slate-500 sm:text-sm">{selected.title || selected.subject_name || ''}</div>
-              <div className="mt-1 text-[11px] font-medium text-slate-400">nm_id {selected.nm_id}{selected.brand ? ` · ${selected.brand}` : ''}</div>
+              <div className="mt-1 text-[11px] font-medium text-slate-400">
+                {selected.vendor_code ? `Арт. поставщика: ${selected.vendor_code}` : 'Артикул поставщика не указан'}{selected.brand ? ` · ${selected.brand}` : ''}
+              </div>
             </div>
           </div>
         ) : (
