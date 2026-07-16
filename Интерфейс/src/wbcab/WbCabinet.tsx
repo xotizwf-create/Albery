@@ -54,9 +54,13 @@ export function WbCabinet() {
   const [brands, setBrands] = useState<string[]>([]);
   const [syncInfo, setSyncInfo] = useState<any>(null);
 
+  const [showSync, setShowSync] = useState(false);
   useEffect(() => {
     getJson<{ brands: string[] }>("/api/wb-cab/brands").then((d) => setBrands(d.brands || [])).catch(() => {});
-    getJson<any>("/api/wb-cab/sync-status").then(setSyncInfo).catch(() => {});
+    const load = () => getJson<any>("/api/wb-cab/sync-status").then(setSyncInfo).catch(() => {});
+    load();
+    const t = setInterval(load, 30000);
+    return () => clearInterval(t);
   }, []);
 
   const qs = useMemo(() => {
@@ -84,13 +88,58 @@ export function WbCabinet() {
             {brands.map((b) => (<option key={b} value={b}>{b}</option>))}
           </select>
         </div>
-        {syncInfo?.counts && (
-          <span className="ml-auto text-[12px] font-semibold text-slate-400">
-            в базе: заказов {fmtNum(syncInfo.counts.orders)} · выкупов {fmtNum(syncInfo.counts.sales)} ·
-            финстрок {fmtNum(syncInfo.counts.finance)}
-          </span>
+        {syncInfo && (
+          <button onClick={() => setShowSync(!showSync)}
+            className={`ml-auto flex items-center gap-2 rounded-xl border px-3 py-2 text-[12px] font-black transition-all ${
+              syncInfo.sync_running ? "border-amber-300 bg-amber-50 text-amber-700"
+              : (syncInfo.recent_runs || []).some((r: any) => r.ok === false)
+                ? "border-rose-200 bg-rose-50 text-rose-600"
+                : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>
+            <span className={`h-2 w-2 rounded-full ${syncInfo.sync_running ? "animate-pulse bg-amber-500" : "bg-emerald-500"}`} />
+            {syncInfo.sync_running ? "Загрузка данных идёт…" : "Данные"}
+            <span className="font-semibold text-slate-400">
+              заказы {fmtNum(syncInfo.counts?.orders)} · выкупы {fmtNum(syncInfo.counts?.sales)} · финстроки {fmtNum(syncInfo.counts?.finance)}
+            </span>
+          </button>
         )}
       </div>
+      {showSync && syncInfo && (
+        <div className={`${card} mb-5`}>
+          <div className="flex items-center justify-between">
+            <div className={h2}>Загрузка данных из WB</div>
+            <span className="text-[11px] font-bold text-slate-400">обновляется каждые 30 сек · синк из WB — каждые 30 мин</span>
+          </div>
+          <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-5">
+            {[["Заказы", "orders"], ["Выкупы", "sales"], ["Финстроки", "finance"], ["Остатки (снапшоты)", "stocks"], ["Реклама", "adv"]].map(([lbl, key]) => (
+              <div key={key} className="rounded-xl border border-[#F1F3F9] p-3">
+                <div className={label}>{lbl}</div>
+                <div className="text-[18px] font-black text-slate-900">{fmtNum(syncInfo.counts?.[key])}</div>
+                <div className="text-[11px] font-semibold text-slate-400">
+                  {syncInfo.ranges?.[key]?.min ? `${syncInfo.ranges[key].min} → ${syncInfo.ranges[key].max}` : "нет данных"}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3">
+            <div className={label}>Последние прогоны</div>
+            <div className="mt-1 max-h-44 overflow-auto">
+              <table className="w-full">
+                <tbody>
+                  {(syncInfo.recent_runs || []).map((r: any, i: number) => (
+                    <tr key={i} className="border-b border-[#F7F8FC] last:border-0">
+                      <td className="px-2 py-1 text-[12px] font-bold text-slate-600">{(r.started_at || "").slice(11, 19)}</td>
+                      <td className="px-2 py-1 text-[12px] font-black text-slate-800">{r.endpoint}</td>
+                      <td className="px-2 py-1 text-[12px] font-semibold text-slate-500">{fmtNum(r.rows_upserted)} строк</td>
+                      <td className={`px-2 py-1 text-[12px] font-black ${r.ok ? "text-emerald-600" : "text-rose-600"}`}>{r.ok ? "ок" : "ошибка"}</td>
+                      <td className="max-w-[380px] truncate px-2 py-1 text-[11px] text-slate-400">{r.error || ""}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="flex gap-5">
         <div className="w-56 shrink-0 space-y-2">
