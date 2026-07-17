@@ -16,6 +16,10 @@ __pycache__/
 .venv/
 node_modules/
 dist/
+# deploy backups/staging of built frontends (tar+swap) — kept on prod for rollback, never in git
+dist.old*/
+dist.new/
+dist.bak*/
 
 *.dump
 *.backup
