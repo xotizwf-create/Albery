@@ -1,0 +1,9 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON_TZ=Europe/Moscow
+
+# Ежедневный анализ папки «Новинки» (задача владельца 17.07.2026): новые файлы →
+# скоринг советов → синтез рекомендаций (Groq) → фильтр дублей с базой знаний →
+# Google-таблица + задача Наталье (дедлайн +3 рабочих дня). Пустая папка/нет нового —
+# молчит. Обработанные файлы удаляются из папки. По выходным не запускается (гейт в скрипте).
+0 13 * * * root cd /var/www/albery && /var/www/albery/.venv/bin/python /var/www/albery/novinki_watch.py >> /var/log/albery/novinki-watch.log 2>&1
