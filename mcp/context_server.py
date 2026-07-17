@@ -5871,6 +5871,28 @@ def tool_create_google_sheet(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"Create sheet failed: {exc}") from exc
 
 
+def tool_create_google_doc(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Создание Google-документа требует confirm=true. Сначала покажи пользователю название и краткую структуру "
+            "содержимого (и что доступ будет «по ссылке — редактор»), получи согласие, затем вызови с confirm=true.",
+        )
+    title = str(args.get("title") or "").strip()
+    if not title:
+        raise McpError(-32602, "title (название документа) обязателен.")
+    html = str(args.get("html") or args.get("html_body") or args.get("content") or "").strip()
+    if not html:
+        raise McpError(-32602, "html (содержимое документа, HTML) обязателен.")
+    share = args.get("share_anyone_writer", True)
+    try:
+        return app_workflow_function("create_google_doc")(title, html, bool(share))
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Create Google Doc failed: {exc}") from exc
+
+
 def tool_get_google_sheet_meta(args: dict[str, Any]) -> dict[str, Any]:
     sid = str(args.get("spreadsheet_id") or "").strip()
     if not sid:
@@ -9890,6 +9912,27 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_create_google_sheet,
     },
+    "create_google_doc": {
+        "description": (
+            "Создать НОВЫЙ Google-ДОКУМЕНТ (Google Docs) из HTML от имени Google-аккаунта агента. По умолчанию сразу "
+            "выдаёт доступ «по ссылке — редактор» и возвращает ссылку. Это ЕДИНСТВЕННЫЙ правильный путь на просьбу "
+            "«создай гугл документ»: НИКОГДА не создавай документы через Apps Script/веб-приложения и не давай "
+            "пользователю ссылок script.google.com — он получит «нет доступа». Перед созданием покажи пользователю "
+            "название и структуру, получи согласие, затем вызови с confirm=true."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Название документа"},
+                "html": {"type": "string", "description": "Содержимое: полный HTML (h1/h2/p/ul/table)"},
+                "share_anyone_writer": {"type": "boolean", "description": "Доступ «по ссылке — редактор» (по умолчанию true)"},
+                "confirm": {"type": "boolean", "description": "Должно быть true после явного согласия пользователя"},
+            },
+            "required": ["title", "html", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_create_google_doc,
+    },
     "get_google_sheet_meta": {
         "description": (
             "Read a Google Sheet's structure: its tabs (sheetId / title / grid size). Call this "
@@ -10777,6 +10820,7 @@ CORE_TOOL_NAMES: set[str] = {
     "fetch_url",
     # google workflow the bot prompt teaches
     "create_google_sheet",
+    "create_google_doc",
     "get_google_sheet_meta",
     "read_google_sheet_values",
     "write_google_sheet_values",

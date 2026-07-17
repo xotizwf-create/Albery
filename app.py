@@ -585,6 +585,41 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
     }
 
 
+def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = True) -> dict[str, Any]:
+    """Create a new Google Doc from HTML (as the agent's Google account), optionally share it
+    anyone-with-link = editor and return its id + url. The only sanctioned way to make a Google
+    Doc for a user: Apps Script web-app detours produce artifacts the requester cannot open."""
+    import io as _io
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+
+    creds = _google_user_credentials()
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    clean_title = (str(title or "").strip() or "Новый документ")[:200]
+    html = str(html_body or "").strip()
+    if not html:
+        raise RuntimeError("html_body пуст — соберите HTML содержимого документа.")
+    if not html.lstrip().lower().startswith(("<!doctype", "<html", "<h1", "<h2", "<h3", "<p", "<div", "<table", "<ul", "<ol")):
+        html = "<p>" + html.replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
+    media = MediaIoBaseUpload(_io.BytesIO(html.encode("utf-8")), mimetype="text/html", resumable=False)
+    created = drive.files().create(
+        body={"name": clean_title, "mimeType": "application/vnd.google-apps.document"},
+        media_body=media, fields="id,webViewLink,name,mimeType",
+    ).execute()
+    doc_id = created["id"]
+    if str(created.get("mimeType") or "") != "application/vnd.google-apps.document":
+        raise RuntimeError(f"Drive не сконвертировал HTML в Google-документ (mimeType={created.get('mimeType')}).")
+    if share_anyone_writer:
+        drive.permissions().create(fileId=doc_id, body={"type": "anyone", "role": "writer"}).execute()
+    url = created.get("webViewLink") or f"https://docs.google.com/document/d/{doc_id}/edit"
+    return {
+        "document_id": doc_id,
+        "url": url,
+        "title": created.get("name") or clean_title,
+        "access": "anyone_with_link_editor" if share_anyone_writer else "private",
+    }
+
+
 # === ALBERY GSHEET+APPSSCRIPT TOOLS (2026-06-18) ===
 
 
