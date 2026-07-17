@@ -6462,6 +6462,11 @@ def tool_get_compact_export(args: dict[str, Any]) -> dict[str, Any]:
 _GOOGLE_SHEETS_RE = re.compile(r"https?://docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_\-]+)")
 _GOOGLE_DOCS_RE = re.compile(r"https?://docs\.google\.com/document/d/([a-zA-Z0-9_\-]+)")
 _GOOGLE_GID_RE = re.compile(r"[?&#]gid=(\d+)")
+_GOOGLE_DRIVE_FILE_RE = re.compile(
+    r"https?://drive\.google\.com/(?:file/d/([a-zA-Z0-9_\-]+)"
+    r"|open\?[^#]*?\bid=([a-zA-Z0-9_\-]+)|uc\?[^#]*?\bid=([a-zA-Z0-9_\-]+))")
+_GOOGLE_DRIVE_FOLDER_RE = re.compile(
+    r"https?://drive\.google\.com/drive/(?:u/\d+/)?folders/([a-zA-Z0-9_\-]+)")
 
 
 def _rewrite_url_for_export(url: str) -> tuple[str, str]:
@@ -6479,6 +6484,12 @@ def _google_url_kind(url: str) -> tuple[str, str | None, str | None]:
     m = _GOOGLE_DOCS_RE.search(url)
     if m:
         return ("google_doc_text", m.group(1), None)
+    m = _GOOGLE_DRIVE_FOLDER_RE.search(url)
+    if m:
+        return ("google_drive_folder", m.group(1), None)
+    m = _GOOGLE_DRIVE_FILE_RE.search(url)
+    if m:
+        return ("google_drive_file", next(g for g in m.groups() if g), None)
     return ("raw", None, None)
 
 
@@ -6529,6 +6540,70 @@ def _extract_google_doc_text(document: dict[str, Any]) -> str:
     return text.strip()
 
 
+_DRIVE_GOOGLE_EXPORT_MIMES = {
+    "application/vnd.google-apps.spreadsheet": "text/csv",
+    "application/vnd.google-apps.document": "text/plain",
+    "application/vnd.google-apps.presentation": "text/plain",
+}
+_DRIVE_UNREADABLE_MIME_PREFIXES = ("image/", "video/", "audio/", "font/")
+
+
+def _fetch_drive_file_with_oauth(drive: Any, url: str, file_id: str) -> dict[str, Any] | None:
+    """Read a plain Drive file (uploaded html/pdf/docx/xlsx/text) through the agent's OAuth.
+
+    Anonymous HTTP on drive.google.com/file/d/... returns the viewer JS shell or a login page
+    even when a9ent.ai has full access to the file (16.07.2026, «нет доступа к папке Новинки»),
+    so Drive file links must be read via the API. Returns None on 403/404 so the caller can try
+    the public unauthenticated path (a file shared by link but not with the agent's account)."""
+    from googleapiclient.errors import HttpError
+    try:
+        meta = drive.files().get(fileId=file_id, fields="name,mimeType,size",
+                                 supportsAllDrives=True).execute()
+        mime = str(meta.get("mimeType") or "").split(";")[0].strip().lower()
+        name = str(meta.get("name") or "")
+        if mime == "application/vnd.google-apps.folder":
+            raise McpError(-32602, "Это ПАПКА Google Drive — её содержимое смотри инструментом "
+                                   "list_drive_folder_items, а файлы читай fetch_url по ссылке на файл.")
+        export_mime = _DRIVE_GOOGLE_EXPORT_MIMES.get(mime)
+        if export_mime:
+            exported = drive.files().export(fileId=file_id, mimeType=export_mime).execute()
+            text = exported.decode("utf-8", "replace") if isinstance(exported, bytes) else str(exported or "")
+            return {"status": 200, "content_type": f"{export_mime}; charset=utf-8",
+                    "text": text.strip(), "final_url": url, "kind": "google_drive_file"}
+        size = int(meta.get("size") or 0)
+        if size > _FETCH_DOC_MAX_BYTES:
+            raise McpError(-32010, f"Файл «{name}» на Drive слишком большой ({size} байт, лимит "
+                                   f"{_FETCH_DOC_MAX_BYTES}) — попроси выгрузить его часть.")
+        if mime.startswith(_DRIVE_UNREADABLE_MIME_PREFIXES):
+            raise McpError(-32010, f"Файл «{name}» ({mime}) — не текстовый документ, извлечь из него "
+                                   "текст fetch_url не умеет.")
+        data = drive.files().get_media(fileId=file_id).execute()
+        if not isinstance(data, bytes):
+            data = bytes(data or b"")
+        doc_ext = _binary_doc_ext(name, mime)
+        if doc_ext:
+            doc_text = _extract_binary_document(data, doc_ext)
+            if not doc_text:
+                raise McpError(-32010, f"Файл «{name}» скачан ({len(data)} байт), но текст извлечь не "
+                                       "удалось (возможно, скан без текстового слоя).")
+            return {"status": 200, "content_type": mime, "text": doc_text, "final_url": url,
+                    "kind": f"google_drive_file-{doc_ext}"}
+        text = data.decode("utf-8", "replace")
+        if "html" in mime or text.lstrip().lower().startswith(("<!doctype", "<html")):
+            text = _strip_html_to_text(text)
+        if "\ufffd" in text[:2000] and mime not in ("", "text/plain", "text/html"):
+            raise McpError(-32010, f"Файл «{name}» ({mime}) выглядит бинарным — читаемого текста нет.")
+        return {"status": 200, "content_type": mime or "text/plain", "text": text.strip(),
+                "final_url": url, "kind": "google_drive_file"}
+    except HttpError as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None) or 0
+        if status in (403, 404):
+            logging.warning("fetch_url: drive OAuth read %s -> HTTP %s; falling back to public fetch",
+                            file_id, status)
+            return None
+        raise
+
+
 def _fetch_google_url_with_oauth(url: str, max_chars: int) -> dict[str, Any] | None:
     kind, file_id, gid = _google_url_kind(url)
     if kind == "raw" or not file_id:
@@ -6566,6 +6641,12 @@ def _fetch_google_url_with_oauth(url: str, max_chars: int) -> dict[str, Any] | N
             return {"status": 200, "content_type": "text/csv; charset=utf-8", "text": text, "final_url": url, "kind": kind}
 
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        if kind == "google_drive_folder":
+            raise McpError(-32602, "Это ссылка на ПАПКУ Google Drive: содержимое папки смотри "
+                                   "инструментом list_drive_folder_items, а файлы из неё читай "
+                                   "fetch_url по ссылке на конкретный файл.")
+        if kind == "google_drive_file":
+            return _fetch_drive_file_with_oauth(drive, url, file_id)
         exported = drive.files().export(fileId=file_id, mimeType="text/plain").execute()
         if isinstance(exported, bytes):
             text = exported.decode("utf-8", "replace")
