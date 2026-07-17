@@ -171,9 +171,20 @@ def _creator_display(created_by: str, creator_label: str, kind: str, names: dict
     return cl or "—"
 
 
+def _schedule_view(schedule: str, is_active: bool) -> tuple[Any, str]:
+    """Next run + human label with per-row degradation: one malformed stored schedule
+    must surface as that row's own warning, never as a 500 for the whole list
+    (a registry row with a comment inside the cron field broke the tab, 2026-07-17)."""
+    try:
+        nxt = cron_schedule.next_run(schedule, msk_now()) if is_active else None
+        return nxt, cron_schedule.describe(schedule)
+    except ValueError:
+        return None, f"⚠ некорректное расписание «{schedule}» — нужно 5 полей cron, исправьте строку"
+
+
 def _automation_json(r: dict[str, Any], names: dict[int, str] | None = None) -> dict[str, Any]:
     names = names if names is not None else _user_names()
-    nxt = cron_schedule.next_run(r["schedule"], msk_now()) if r["is_active"] else None
+    nxt, schedule_label = _schedule_view(r["schedule"], bool(r["is_active"]))
     status = r["last_status"] or ""
     if _running_is_stale(r):
         status = "interrupted"
@@ -183,7 +194,7 @@ def _automation_json(r: dict[str, Any], names: dict[int, str] | None = None) -> 
         "name": r["name"],
         "description": r["description"] or "",
         "schedule": r["schedule"],
-        "schedule_label": cron_schedule.describe(r["schedule"]),
+        "schedule_label": schedule_label,
         "prompt": r["prompt"] or "",
         "deliver_to": r["deliver_to"] or "",
         "kind": r["kind"],
@@ -811,7 +822,7 @@ def automation_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, 
         return {
             "automations": [
                 {"name": r["name"], "schedule": r["schedule"],
-                 "schedule_label": cron_schedule.describe(r["schedule"]),
+                 "schedule_label": _schedule_view(r["schedule"], bool(r["is_active"]))[1],
                  "task": r["prompt"] or "", "deliver_to": r["deliver_to"] or "",
                  "active": bool(r["is_active"]),
                  "managed_by": ("Hermes (системная)" if r["kind"] == "system" else r["creator_label"] or r["created_by"]),
