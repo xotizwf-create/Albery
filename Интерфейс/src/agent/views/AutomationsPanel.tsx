@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Clock, Play, Plus, Trash2 } from "lucide-react";
+import { Clock, Play, Plus, Server, Trash2 } from "lucide-react";
 import {
   AgentAutomation,
   createAgentAutomation,
@@ -11,19 +11,12 @@ import {
   updateAgentAutomation,
   updateRecurringTask,
 } from "../api";
+import { ScheduleBuilder } from "./ScheduleBuilder";
 import { cn } from "../../lib/utils";
 
 // Sub-tab «Автоматизации» of the agent editor: the agent's own cron jobs. System rows
 // mirror the legacy Hermes crons (read-only); agent rows are created by the owner here
 // or by the agent itself from chat (schedule_my_automation) and run in-app.
-
-const SCHEDULE_PRESETS: Array<{ label: string; cron: string }> = [
-  { label: "каждый день в 9:00", cron: "0 9 * * *" },
-  { label: "по будням в 9:00", cron: "0 9 * * 1-5" },
-  { label: "по понедельникам в 10:00", cron: "0 10 * * 1" },
-  { label: "по пятницам в 18:00", cron: "0 18 * * 5" },
-  { label: "каждый час", cron: "0 * * * *" },
-];
 
 const statusChip = (a: AgentAutomation): { text: string; cls: string } => {
   if (!a.last_status) return { text: "ещё не запускалась", cls: "bg-gray-100 text-gray-500 border-gray-200" };
@@ -35,45 +28,12 @@ const statusChip = (a: AgentAutomation): { text: string; cls: string } => {
   return { text: `ок · ${a.last_run}`, cls: "bg-emerald-50 text-emerald-600 border-emerald-100" };
 };
 
-// --- Day/time schedule editor (any non-system row) ------------------------------------------
-// task rows edit weekdays/create_time in the recurring registry; agent rows edit the cron —
-// parseable "M H * * DOW" crons get the same chips, anything fancier falls back to raw cron.
+// --- Schedule editor -------------------------------------------------------------------------
+// task rows edit weekdays/create_time in the recurring registry (a monthly row edits time only);
+// every other row (agent cron + editable system) uses the human ScheduleBuilder, which round-trips
+// any 5-field cron — weekly / interval / annual / raw — so «0 9 22 1 *» is never typed by hand.
 
 const DAY_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]; // index+1 = Mon=1..Sun=7
-
-const parseSimpleCron = (cron: string): { time: string; days: number[] } | null => {
-  const f = (cron || "").trim().split(/\s+/);
-  if (f.length !== 5 || f[2] !== "*" || f[3] !== "*") return null;
-  if (!/^\d{1,2}$/.test(f[0]) || !/^\d{1,2}$/.test(f[1])) return null;
-  const mm = Number(f[0]);
-  const hh = Number(f[1]);
-  if (mm > 59 || hh > 23) return null;
-  let days: number[];
-  if (f[4] === "*") {
-    days = [1, 2, 3, 4, 5, 6, 7];
-  } else {
-    days = [];
-    for (const part of f[4].split(",")) {
-      const m = part.match(/^(\d)(?:-(\d))?$/);
-      if (!m) return null;
-      const a = Number(m[1]);
-      const b = m[2] !== undefined ? Number(m[2]) : a;
-      if (a > 7 || b > 7 || a > b) return null;
-      for (let d = a; d <= b; d++) {
-        const day = d === 0 ? 7 : d; // vixie: 0 and 7 are both Sunday
-        if (!days.includes(day)) days.push(day);
-      }
-    }
-    days.sort((x, y) => x - y);
-  }
-  return { time: `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`, days };
-};
-
-const buildCron = (time: string, days: number[]): string => {
-  const [hh, mm] = time.split(":").map(Number);
-  const dow = days.length === 7 ? "*" : days.map((d) => (d === 7 ? 0 : d)).sort((a, b) => a - b).join(",");
-  return `${mm} ${hh} * * ${dow}`;
-};
 
 const ScheduleEditor: React.FC<{
   row: AgentAutomation;
@@ -82,39 +42,26 @@ const ScheduleEditor: React.FC<{
 }> = ({ row, disabled, onSave }) => {
   const isTask = row.kind === "task";
   const monthly = isTask && row.period === "monthly";
-  const parsed = isTask ? null : parseSimpleCron(row.schedule);
-  const cronOnly = !isTask && !parsed; // fancy cron (*/5 etc.) — raw editing only
-  const [days, setDays] = useState<number[]>(isTask ? row.weekdays || [] : parsed?.days || []);
-  const [time, setTime] = useState<string>(isTask ? row.create_time || "09:00" : parsed?.time || "09:00");
-  const [rawCron, setRawCron] = useState<string>(row.schedule);
+  const [days, setDays] = useState<number[]>(isTask ? row.weekdays || [] : []);
+  const [time, setTime] = useState<string>(isTask ? row.create_time || "09:00" : "09:00");
+  const [cron, setCron] = useState<string>(row.schedule);
+  const [cronValid, setCronValid] = useState(true);
 
   const toggleDay = (d: number) =>
     setDays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort((a, b) => a - b)));
 
   const timeOk = /^\d{1,2}:\d{2}$/.test(time) && Number(time.split(":")[0]) < 24 && Number(time.split(":")[1]) < 60;
-  const canSave = cronOnly ? rawCron.trim().split(/\s+/).length === 5 : timeOk && (monthly || days.length > 0);
+  const canSave = isTask ? timeOk && (monthly || days.length > 0) : cronValid;
 
   const save = () => {
-    if (cronOnly) return onSave({ schedule: rawCron.trim() });
     if (isTask) return onSave(monthly ? { create_time: time } : { weekdays: days, create_time: time });
-    return onSave({ schedule: buildCron(time, days) });
+    return onSave({ schedule: cron.trim() });
   };
 
   return (
-    <div className="bg-slate-50/70 border border-gray-100 rounded-xl p-3 space-y-2">
+    <div className="bg-slate-50/70 border border-gray-100 rounded-xl p-3 space-y-3">
       <p className="text-[11px] font-bold uppercase text-gray-400">Изменить расписание</p>
-      {cronOnly ? (
-        <div className="flex items-center gap-2 flex-wrap">
-          <input
-            type="text"
-            value={rawCron}
-            onChange={(e) => setRawCron(e.target.value)}
-            title="5 полей cron (мин час день месяц день-недели), время МСК"
-            className="w-44 px-3 py-2 bg-white border border-gray-200/80 rounded-lg text-[12.5px] font-mono font-bold outline-none focus:border-indigo-500"
-          />
-          <span className="text-[11.5px] text-gray-400">это расписание сложнее, чем «дни + время» — правится как cron</span>
-        </div>
-      ) : (
+      {isTask ? (
         <div className="flex items-center gap-3 flex-wrap">
           {!monthly && (
             <div className="flex items-center gap-1">
@@ -148,6 +95,8 @@ const ScheduleEditor: React.FC<{
           />
           <span className="text-[11.5px] text-gray-400">МСК</span>
         </div>
+      ) : (
+        <ScheduleBuilder value={row.schedule} onChange={(c, v) => { setCron(c); setCronValid(v); }} />
       )}
       <button
         onClick={save}
@@ -179,6 +128,7 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
   const [creatorFilter, setCreatorFilter] = useState<string>("all");
   const [fName, setFName] = useState("");
   const [fSchedule, setFSchedule] = useState("0 9 * * 1-5");
+  const [fScheduleValid, setFScheduleValid] = useState(true);
   const [fPrompt, setFPrompt] = useState("");
   const [fDeliver, setFDeliver] = useState("");
 
@@ -243,35 +193,16 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
 
       {showForm && (
         <div className="bg-slate-50/70 border border-gray-200/80 rounded-2xl p-5 space-y-3">
-          <div className="flex gap-3 flex-wrap">
-            <input
-              type="text"
-              value={fName}
-              onChange={(e) => setFName(e.target.value)}
-              placeholder="Название (например «Утренняя сводка задач»)"
-              className="flex-1 min-w-[220px] px-3.5 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13px] font-bold focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none shadow-sm"
-            />
-            <div className="flex items-center gap-2">
-              <select
-                value={SCHEDULE_PRESETS.some((p) => p.cron === fSchedule) ? fSchedule : "custom"}
-                onChange={(e) => e.target.value !== "custom" && setFSchedule(e.target.value)}
-                className="px-3 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13px] font-bold text-gray-700 outline-none shadow-sm"
-              >
-                {SCHEDULE_PRESETS.map((p) => (
-                  <option key={p.cron} value={p.cron}>
-                    {p.label}
-                  </option>
-                ))}
-                <option value="custom">свой cron…</option>
-              </select>
-              <input
-                type="text"
-                value={fSchedule}
-                onChange={(e) => setFSchedule(e.target.value)}
-                title="5 полей cron (мин час день месяц день-недели), время МСК"
-                className="w-32 px-3 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13px] font-mono font-bold focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none shadow-sm"
-              />
-            </div>
+          <input
+            type="text"
+            value={fName}
+            onChange={(e) => setFName(e.target.value)}
+            placeholder="Название (например «Утренняя сводка задач»)"
+            className="w-full px-3.5 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13px] font-bold focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none shadow-sm"
+          />
+          <div className="bg-white border border-gray-200/80 rounded-xl p-3.5">
+            <p className="text-[11px] font-bold uppercase text-gray-400 mb-2">Когда запускать</p>
+            <ScheduleBuilder value={fSchedule} onChange={(c, v) => { setFSchedule(c); setFScheduleValid(v); }} />
           </div>
           <textarea
             rows={3}
@@ -302,7 +233,7 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                   setShowForm(false);
                 })
               }
-              disabled={busyId !== null || !fName.trim() || !fPrompt.trim()}
+              disabled={busyId !== null || !fName.trim() || !fPrompt.trim() || !fScheduleValid}
               className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-[13px] font-bold hover:bg-indigo-700 shadow-sm transition-all disabled:opacity-50"
             >
               Создать
@@ -360,6 +291,9 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
           const src = sourceChip(a);
           const open = openId === a.id;
           const system = a.kind === "system";
+          // Editable/runnable when not a system row, or a system row whose executor is known (057).
+          const canEdit = !system || a.can_edit === true;
+          const canRun = !system || a.can_run === true;
           return (
             <div key={a.id} className={cn("bg-white border border-gray-200/70 rounded-2xl shadow-sm overflow-hidden", !a.is_active && "opacity-60")}>
               <div className="p-4 flex items-center gap-3 cursor-pointer" onClick={() => setOpenId(open ? null : a.id)}>
@@ -391,64 +325,95 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                 <span className={cn("text-[10.5px] font-bold px-2 py-1 rounded-md border shrink-0 whitespace-nowrap", st.cls)} title={a.last_error || a.last_result}>
                   {st.text}
                 </span>
-                {!system && (
+                {(canRun || canEdit || !system) && (
                   <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
-                    <button
-                      onClick={() =>
-                        void act(a.id, () =>
-                          a.kind === "task" ? runRecurringTask(a.recurring_id!) : runAgentAutomation(a.id),
-                        )
-                      }
-                      disabled={busyId !== null || a.last_status === "running"}
-                      title={a.kind === "task" ? "Создать задачу сейчас (проверка)" : "Запустить сейчас (проверка)"}
-                      className="p-1.5 text-gray-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors disabled:opacity-40"
-                    >
-                      <Play className="w-4 h-4" />
-                    </button>
-                    <button
-                      onClick={() =>
-                        void act(a.id, () =>
-                          a.kind === "task"
-                            ? updateRecurringTask(a.recurring_id!, { is_active: !a.is_active })
-                            : updateAgentAutomation(a.id, { is_active: !a.is_active }),
-                        )
-                      }
-                      disabled={busyId !== null}
-                      title={a.is_active ? "Выключить" : "Включить"}
-                      className={cn(
-                        "px-2 py-1 text-[10px] font-bold uppercase rounded-md border transition-colors",
-                        a.is_active
-                          ? "bg-emerald-50 border-emerald-100 text-emerald-600 hover:bg-emerald-100"
-                          : "bg-gray-100 border-gray-200 text-gray-500 hover:bg-gray-200",
-                      )}
-                    >
-                      {a.is_active ? "вкл" : "выкл"}
-                    </button>
-                    <button
-                      onClick={() => {
-                        const label = a.kind === "task" ? "регулярную задачу" : "автоматизацию";
-                        if (window.confirm(`Удалить ${label} «${a.name}»?`)) {
+                    {canRun && (
+                      <button
+                        onClick={() =>
                           void act(a.id, () =>
-                            a.kind === "task" ? deleteRecurringTask(a.recurring_id!) : deleteAgentAutomation(a.id),
-                          );
+                            a.kind === "task" ? runRecurringTask(a.recurring_id!) : runAgentAutomation(a.id),
+                          )
                         }
-                      }}
-                      disabled={busyId !== null}
-                      title="Удалить"
-                      className="p-1.5 text-gray-300 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-colors disabled:opacity-40"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
+                        disabled={busyId !== null || a.last_status === "running"}
+                        title={a.kind === "task" ? "Создать задачу сейчас (проверка)" : "Запустить сейчас (проверка)"}
+                        className="p-1.5 text-gray-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors disabled:opacity-40"
+                      >
+                        <Play className="w-4 h-4" />
+                      </button>
+                    )}
+                    {canEdit && (
+                      <button
+                        onClick={() =>
+                          void act(a.id, () =>
+                            a.kind === "task"
+                              ? updateRecurringTask(a.recurring_id!, { is_active: !a.is_active })
+                              : updateAgentAutomation(a.id, { is_active: !a.is_active }),
+                          )
+                        }
+                        disabled={busyId !== null}
+                        title={a.is_active ? "Выключить" : "Включить"}
+                        className={cn(
+                          "px-2 py-1 text-[10px] font-bold uppercase rounded-md border transition-colors",
+                          a.is_active
+                            ? "bg-emerald-50 border-emerald-100 text-emerald-600 hover:bg-emerald-100"
+                            : "bg-gray-100 border-gray-200 text-gray-500 hover:bg-gray-200",
+                        )}
+                      >
+                        {a.is_active ? "вкл" : "выкл"}
+                      </button>
+                    )}
+                    {!system && (
+                      <button
+                        onClick={() => {
+                          const label = a.kind === "task" ? "регулярную задачу" : "автоматизацию";
+                          if (window.confirm(`Удалить ${label} «${a.name}»?`)) {
+                            void act(a.id, () =>
+                              a.kind === "task" ? deleteRecurringTask(a.recurring_id!) : deleteAgentAutomation(a.id),
+                            );
+                          }
+                        }}
+                        disabled={busyId !== null}
+                        title="Удалить"
+                        className="p-1.5 text-gray-300 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-colors disabled:opacity-40"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
               {open && (
                 <div className="px-4 pb-4 pt-1 border-t border-gray-100 space-y-2 text-[12.5px] font-medium text-gray-600">
-                  {system ? (
-                    <p>
-                      Живёт в Hermes cron на сервере ({a.creator_label}) — приложение показывает её как витрину,
-                      управление через владельца.
+                  {a.description && (
+                    <p className="whitespace-pre-wrap break-words">
+                      <span className="font-bold text-gray-800">Что делает:</span> {a.description}
                     </p>
+                  )}
+                  {system ? (
+                    <>
+                      <p className="flex items-center gap-1.5 text-gray-500">
+                        <Server className="w-3.5 h-3.5" />
+                        Выполняется на сервере ({a.creator_label || a.system_key || "системный процесс"})
+                        {a.can_edit
+                          ? " — расписанием и включением можно управлять отсюда."
+                          : " — управление только на сервере."}
+                      </p>
+                      {a.last_run && <p className="text-gray-500">Последний запуск: {a.last_run} · {a.last_status || "—"}</p>}
+                      {canEdit && (
+                        <ScheduleEditor
+                          key={`${a.id}:${a.schedule}`}
+                          row={a}
+                          disabled={busyId !== null}
+                          onSave={(payload) => void act(a.id, () => updateAgentAutomation(a.id, { schedule: payload.schedule! }))}
+                        />
+                      )}
+                      {a.last_error && <p className="text-rose-600 break-words">Последняя ошибка: {a.last_error}</p>}
+                      {a.last_result && (
+                        <p className="whitespace-pre-wrap break-words bg-slate-50 border border-gray-100 rounded-xl p-3 text-gray-600">
+                          {a.last_result}
+                        </p>
+                      )}
+                    </>
                   ) : (
                     <>
                       {a.prompt && (

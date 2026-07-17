@@ -527,14 +527,67 @@ def run_checkin(*, dry_run: bool = False, only_users: set[int] | None = None,
     return report
 
 
+def _registry_row() -> dict[str, Any] | None:
+    """The «Автоматизации» tab row for this thread (system_key='app:task-checkin',
+    migration 057): its schedule/toggle are the owner's controls for the daily sweep."""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT schedule, is_active FROM agent_automations "
+                            "WHERE kind = 'system' AND system_key = 'app:task-checkin'")
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception:  # noqa: BLE001
+        logging.warning("task checkin: registry read failed", exc_info=True)
+        return None
+
+
+def _due_now(now) -> bool:
+    row = _registry_row()
+    if row is None:
+        # Registry unavailable — legacy env-hour behaviour keeps the sweep alive.
+        return is_working_day(now) and now.hour == _CHECKIN_HOUR and now.minute < 5
+    if not row["is_active"]:
+        return False
+    try:
+        import cron_schedule
+        minute = now.replace(second=0, microsecond=0)
+        # 5-minute window (loop sleeps 120s): the per-date claim makes re-hits harmless.
+        return any(cron_schedule.matches(row["schedule"], minute - timedelta(minutes=back))
+                   for back in range(5))
+    except ValueError:
+        logging.warning("task checkin: bad registry schedule %r — env fallback", row["schedule"])
+        return is_working_day(now) and now.hour == _CHECKIN_HOUR and now.minute < 5
+
+
+def _mark(report: dict[str, Any] | None, error: str | None) -> None:
+    try:
+        from shared.automation_registry import mark_system_run
+        if error:
+            mark_system_run("app:task-checkin", "error", error=error[:300])
+        elif report and report.get("skipped"):
+            pass  # same-day duplicate window hit — not a run
+        else:
+            r = report or {}
+            mark_system_run("app:task-checkin", "ok",
+                            result=f"задач {r.get('scanned', 0)}, офферов {r.get('offers_posted', 0)}, "
+                                   f"ЛС {r.get('dms_sent', 0)}")
+    except Exception:  # noqa: BLE001
+        logging.warning("task checkin: registry mark failed", exc_info=True)
+
+
 def _loop() -> None:
     time.sleep(180)  # let the app boot
     while True:
         try:
             now = msk_now()
-            if (checkin_enabled() and is_working_day(now)
-                    and now.hour == _CHECKIN_HOUR and now.minute < 5):
-                run_checkin()
+            if checkin_enabled() and _due_now(now):
+                try:
+                    report = run_checkin()
+                    _mark(report, None)
+                except Exception as exc:  # noqa: BLE001
+                    _mark(None, str(exc))
+                    raise
         except Exception:  # noqa: BLE001
             logging.exception("task checkin: loop tick failed")
         time.sleep(120)

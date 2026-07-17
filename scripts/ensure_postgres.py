@@ -48,6 +48,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "054_wb_sync_state_v2.sql",
     "055_wb_async_reports.sql",
     "056_wb_finance_pagination.sql",
+    # Idempotent: system_key on kind='system' automation rows (executor mapping).
+    "057_system_automation_keys.sql",
     "022_chats_personal_dialog_types.sql",
     "024_chat_report_hot_path_indexes.sql",
     "025_mcp_search_indexes.sql",

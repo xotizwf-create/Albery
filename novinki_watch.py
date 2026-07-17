@@ -423,4 +423,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    _dry = ("--dry-run" in sys.argv) or ("--cleanup-only" in sys.argv)
+    try:
+        main()
+    except Exception as _exc:
+        if not _dry:
+            from shared.automation_registry import mark_system_run
+            mark_system_run("crond:albery-novinki-watch:main", "error", error=str(_exc)[:300])
+        raise
+    if not _dry:
+        from shared.automation_registry import mark_system_run
+        mark_system_run("crond:albery-novinki-watch:main", "ok")

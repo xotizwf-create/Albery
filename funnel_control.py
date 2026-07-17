@@ -645,7 +645,17 @@ def run_summary(dry=False):
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "check"
     dry = "--dry-run" in sys.argv
-    if mode == "summary":
-        run_summary(dry)
-    else:
-        run_check(dry)
+    _reg_key = f"crond:albery-funnel-control:{'summary' if mode == 'summary' else 'check'}"
+    try:
+        if mode == "summary":
+            run_summary(dry)
+        else:
+            run_check(dry)
+    except Exception as exc:
+        if not dry:
+            from shared.automation_registry import mark_system_run
+            mark_system_run(_reg_key, "error", error=str(exc)[:300])
+        raise
+    if not dry:
+        from shared.automation_registry import mark_system_run
+        mark_system_run(_reg_key, "ok")

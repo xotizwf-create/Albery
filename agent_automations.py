@@ -65,7 +65,8 @@ _work_q: "queue.Queue[tuple[dict[str, Any], int]]" = queue.Queue()
 # --- Storage ---------------------------------------------------------------------------------
 
 _COLS = ("id, agent_slug, name, description, schedule, prompt, deliver_to, kind, created_by, "
-         "creator_label, is_active, last_run_at, last_status, last_result, last_error, created_at")
+         "creator_label, is_active, last_run_at, last_status, last_result, last_error, created_at, "
+         "system_key")
 
 
 def _load_rows(where: str = "", args: tuple = ()) -> list[dict[str, Any]]:
@@ -188,6 +189,8 @@ def _automation_json(r: dict[str, Any], names: dict[int, str] | None = None) -> 
     status = r["last_status"] or ""
     if _running_is_stale(r):
         status = "interrupted"
+    # System rows are live-editable when their executor is known (system_key, migration 057).
+    system_manageable = r["kind"] != "system" or bool(r.get("system_key"))
     return {
         "id": r["id"],
         "agent_slug": r["agent_slug"],
@@ -195,6 +198,8 @@ def _automation_json(r: dict[str, Any], names: dict[int, str] | None = None) -> 
         "description": r["description"] or "",
         "schedule": r["schedule"],
         "schedule_label": schedule_label,
+        "can_edit": system_manageable,
+        "can_run": system_manageable and (r.get("system_key") or "").partition(":")[0] != "app",
         "prompt": r["prompt"] or "",
         "deliver_to": r["deliver_to"] or "",
         "kind": r["kind"],
@@ -468,14 +473,53 @@ def agent_automations_create(slug: str):
         return jsonify({"error": "Не удалось создать автоматизацию."}), 500
 
 
+def _update_system_row(row: dict[str, Any], body: dict[str, Any]):
+    """UI edits of a system row write THROUGH to the real executor (hermes cron / cron.d /
+    the in-app thread that reads its row), then land in the registry. Deterministic jobs,
+    not LLM turns — so the frequency cap is a sane 288/day (every 5 min), not the agent cap."""
+    import system_automations
+    schedule = str(body["schedule"]).strip() if body.get("schedule") is not None else None
+    is_active = bool(body["is_active"]) if body.get("is_active") is not None else None
+    if schedule is not None:
+        try:
+            if cron_schedule.max_fires_per_day(schedule) > 288:
+                return jsonify({"error": "Слишком часто: минимальный интервал системной автоматизации — 5 минут."}), 400
+        except ValueError as exc:
+            return jsonify({"error": f"Расписание: {exc}"}), 400
+    if schedule is not None or is_active is not None:
+        problem = system_automations.edit_system(row, schedule, is_active)
+        if problem:
+            return jsonify({"error": problem}), 502
+    name = str(body.get("name") if body.get("name") is not None else row["name"]).strip() or row["name"]
+    description = str(body.get("description") if body.get("description") is not None else row["description"]).strip()
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE agent_automations SET name = %s, description = %s, schedule = %s, "
+                        "is_active = %s, updated_at = now() WHERE id = %s",
+                        (name, description,
+                         schedule if schedule is not None else row["schedule"],
+                         is_active if is_active is not None else bool(row["is_active"]),
+                         row["id"]),
+                    )
+        return jsonify({"ok": True})
+    except Exception:  # noqa: BLE001
+        logging.exception("system automation update failed: %s", row["id"])
+        return jsonify({"error": "Исполнитель обновлён, но запись в реестре не сохранилась — обновите страницу."}), 500
+
+
 @app.patch("/api/agent-center/automations/<int:auto_id>")
 def agent_automation_update(auto_id: int):
     row = _row_by_id(auto_id)
     if not row:
         return jsonify({"error": "Автоматизация не найдена."}), 404
-    if row["kind"] == "system":
-        return jsonify({"error": "Системная автоматизация управляется Hermes на сервере — здесь только витрина."}), 403
     body = request.get_json(silent=True) or {}
+    if row["kind"] == "system":
+        if not row.get("system_key"):
+            return jsonify({"error": "У этой системной автоматизации не указан исполнитель — правится только на сервере."}), 403
+        return _update_system_row(row, body)
     name = str(body.get("name") if body.get("name") is not None else row["name"]).strip()
     schedule = str(body.get("schedule") if body.get("schedule") is not None else row["schedule"]).strip()
     prompt = str(body.get("prompt") if body.get("prompt") is not None else row["prompt"]).strip()
@@ -506,7 +550,8 @@ def agent_automation_delete(auto_id: int):
     if not row:
         return jsonify({"error": "Автоматизация не найдена."}), 404
     if row["kind"] == "system":
-        return jsonify({"error": "Системная автоматизация управляется Hermes на сервере."}), 403
+        return jsonify({"error": "Системную автоматизацию нельзя удалить из UI — её задание живёт на сервере. "
+                                 "Выключите её тумблером, а удаление закажите у агента."}), 403
     try:
         with pg_connect() as conn:
             with conn.transaction():
@@ -524,7 +569,12 @@ def agent_automation_run_now(auto_id: int):
     if not row:
         return jsonify({"error": "Автоматизация не найдена."}), 404
     if row["kind"] == "system":
-        return jsonify({"error": "Системную автоматизацию запускает Hermes по своему расписанию."}), 403
+        import system_automations
+        problem = system_automations.run_system(row)
+        if problem:
+            return jsonify({"error": problem}), 502
+        return jsonify({"ok": True, "started": True,
+                        "note": "Запуск передан исполнителю — статус обновится после завершения."})
     if row["last_status"] == "running" and not _running_is_stale(row):
         return jsonify({"error": "Уже выполняется."}), 409
     try:
@@ -747,6 +797,9 @@ if os.getenv("AGENT_AUTOMATIONS", "1").strip() != "0":
     threading.Thread(target=_scheduler_loop, daemon=True, name="agent-automations-scheduler").start()
     for _n in range(_AUTOMATION_WORKERS):
         threading.Thread(target=_worker_loop, daemon=True, name=f"agent-automations-worker-{_n}").start()
+    # Pull hermes-cron runs/state into the system mirror rows (own gate: SYSTEM_AUTOMATION_SYNC=0).
+    import system_automations as _system_automations
+    _system_automations.start_sync_thread()
 
 
 # --- Self-tools on the per-agent MCP connector (merged into agent_center._SELF_TOOL_SPECS) ---

@@ -296,6 +296,10 @@ export interface AgentAutomation {
   last_status: string;
   last_result: string;
   last_error: string;
+  // System rows: whether the executor is known (migration 057) so the UI can edit/run it.
+  can_edit?: boolean;
+  can_run?: boolean;
+  system_key?: string;
 }
 
 export async function fetchAgentAutomations(slug: string): Promise<AgentAutomation[]> {
