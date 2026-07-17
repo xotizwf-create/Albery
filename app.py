@@ -15836,7 +15836,6 @@ AUTH_EXEMPT_PREFIXES = (
     "/google-drive/events/",
     "/zoom-export/",
     "/applet/",
-    "/form/",  # public CRM lead questionnaires (crm_forms.py) — candidates have no admin session
 )
 
 

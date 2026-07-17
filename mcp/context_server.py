@@ -7839,180 +7839,52 @@ def tool_manage_crm_deal_field(args: dict[str, Any]) -> dict[str, Any]:
     return {"updated": True, "field_code": code}
 
 
-# --- CRM lead forms (self-hosted questionnaires that create deals) ------------------------------
-# The agent builds a public form (анкета) whose submissions create a DEAL in a funnel with the
-# answers mapped to deal fields (module crm_forms hosts /form/<token>). Bitrix REST cannot create
-# native CRM web-forms, so we host our own.
+# --- CRM forms (native Bitrix24 web-forms) ------------------------------------------------------
+# Bitrix REST can LIST forms (crm.webform.list) but has NO create method (crm.webform.add = 404
+# METHOD_NOT_FOUND on this portal — a platform limit, not a permission). So the agent finds the
+# native forms and hands out their public links / the admin page to build a new one; it must never
+# claim to create a Bitrix form programmatically.
 
-_FORM_Q_TYPES = {"text", "textarea", "number", "select", "phone", "email", "url"}
-_FORM_ROLES = {"name", "telegram", "phone", "email", ""}
-_FORM_TYPE_TO_UF = {"text": "string", "textarea": "string", "number": "double",
-                    "select": "enumeration", "phone": "string", "email": "string", "url": "url"}
-
-
-def _form_ensure_deal_field(label: str, qtype: str, options: list[str] | None,
-                            existing_code: str | None) -> tuple[str, dict[str, str]]:
-    """Reuse the given deal userfield or create one for this question. Returns
-    (field_code, option_ids) where option_ids maps a select label -> enum item id."""
-    uf_type = _FORM_TYPE_TO_UF[qtype]
-    if existing_code:
-        code = existing_code.strip().upper()
-        if not code.startswith("UF_"):
-            code = "UF_CRM_" + code
-    else:
-        base = _CRM_CODE_SANITIZE_RE.sub("_", _translit_upper(label))[:22].strip("_")
-        code = f"UF_CRM_PF_{base or ('Q' + str(int(time.time()) % 10**6))}"
-        fields: dict[str, Any] = {
-            "FIELD_NAME": code, "USER_TYPE_ID": uf_type,
-            "EDIT_FORM_LABEL": {"ru": label, "en": label},
-            "LIST_COLUMN_LABEL": {"ru": label, "en": label},
-            "LIST_FILTER_LABEL": {"ru": label, "en": label},
-            "MANDATORY": "N", "MULTIPLE": "N", "SHOW_IN_LIST": "Y",
-        }
-        if uf_type == "enumeration":
-            fields["LIST"] = [{"VALUE": str(v), "SORT": (i + 1) * 100} for i, v in enumerate(options or [])]
-        try:
-            _crm_call("crm.deal.userfield.add", {"fields": fields})
-        except McpError:
-            # A field with this code may already exist from a prior identical form — reuse it.
-            pass
-    option_ids: dict[str, str] = {}
-    if uf_type == "enumeration":
-        rows = _crm_call("crm.deal.userfield.list",
-                         {"filter": {"FIELD_NAME": code}}).get("result") or []
-        for r in rows:
-            for item in (r.get("LIST") or []):
-                option_ids[str(item.get("VALUE"))] = str(item.get("ID"))
-    return code, option_ids
+def _crm_portal_host() -> str:
+    base = (shared_load_env_value("B24_TESTBOT_WEBHOOK_BASE") or "").strip()
+    return urlparse(base).netloc if base else ""
 
 
-_TRANSLIT = {
-    "а": "A", "б": "B", "в": "V", "г": "G", "д": "D", "е": "E", "ё": "E", "ж": "ZH", "з": "Z",
-    "и": "I", "й": "I", "к": "K", "л": "L", "м": "M", "н": "N", "о": "O", "п": "P", "р": "R",
-    "с": "S", "т": "T", "у": "U", "ф": "F", "х": "H", "ц": "C", "ч": "CH", "ш": "SH", "щ": "SCH",
-    "ъ": "", "ы": "Y", "ь": "", "э": "E", "ю": "YU", "я": "YA",
-}
+def _crm_form_public_url(form: dict[str, Any]) -> str:
+    host = _crm_portal_host()
+    fid = form.get("ID")
+    code = form.get("SECURITY_CODE")
+    if host and fid and code:
+        return f"https://{host}/crm/form/detail/{fid}/{code}/"
+    return ""
 
 
-def _translit_upper(text: str) -> str:
-    return "".join(_TRANSLIT.get(ch, ch) for ch in (text or "").lower()).upper()
-
-
-def tool_create_crm_lead_form(args: dict[str, Any]) -> dict[str, Any]:
-    import crm_forms
-    title = str(args.get("title") or "").strip()
-    if not title:
-        raise McpError(-32602, "title (заголовок анкеты) обязателен.")
-    questions_in = args.get("questions")
-    if not isinstance(questions_in, list) or not questions_in:
-        raise McpError(-32602, "questions обязателен — список вопросов [{label, type, ...}].")
-
-    cat = _crm_resolve_category(args, required=True)
-    cid = int(cat["id"])
-    stages = _crm_stages(cid)
-    stage_ref = str(args.get("stage") or "").strip()
-    if stage_ref:
-        stage_id = _crm_resolve_stage(cid, stage_ref)["stage_id"]
-    else:
-        stage_id = next((s["stage_id"] for s in stages if not s["system"]),
-                        stages[0]["stage_id"] if stages else f"C{cid}:NEW")
-
-    assigned = _crm_resolve_portal_user(args, "responsible_bitrix_user_id", "responsible_name")
-
-    questions: list[dict[str, Any]] = []
-    name_key = None
-    for i, q in enumerate(questions_in, 1):
-        if not isinstance(q, dict) or not str(q.get("label") or "").strip():
-            raise McpError(-32602, "Каждый вопрос — объект с непустым label.")
-        qtype = str(q.get("type") or "text").strip().lower()
-        if qtype not in _FORM_Q_TYPES:
-            raise McpError(-32602, "type вопроса: %s." % ", ".join(sorted(_FORM_Q_TYPES)))
-        role = str(q.get("role") or "").strip().lower()
-        if role not in _FORM_ROLES:
-            raise McpError(-32602, "role вопроса: name | telegram | phone | email (или пусто).")
-        options = q.get("options") if isinstance(q.get("options"), list) else None
-        if qtype == "select" and not options:
-            raise McpError(-32602, "Для type=select обязателен options — список вариантов.")
-        key = f"q{i}"
-        entry: dict[str, Any] = {
-            "key": key, "label": str(q["label"]).strip(), "type": qtype,
-            "required": bool(q.get("required")), "role": role,
-            "placeholder": str(q.get("placeholder") or ""), "hint": str(q.get("hint") or ""),
-        }
-        if options:
-            entry["options"] = [str(o) for o in options]
-        if role == "name":
-            name_key = key
-        # phone/email live on the contact only; name goes to the title; everything else (incl.
-        # telegram) also becomes a visible deal field.
-        if role not in ("name", "phone", "email"):
-            code, option_ids = _form_ensure_deal_field(entry["label"], qtype, options, q.get("field_code"))
-            entry["field_code"] = code
-            if option_ids:
-                entry["option_ids"] = option_ids
-        questions.append(entry)
-
-    tpl = str(args.get("deal_title_template") or "").strip()
-    if not tpl:
-        tpl = ("Партнёр — {%s}" % name_key) if name_key else (title[:40] + " — заявка")
-
-    token = crm_forms._new_token()
-    crm_forms.save_form({
-        "token": token, "title": title, "intro": str(args.get("intro") or ""),
-        "category_id": cid, "stage_id": stage_id, "pipeline_name": cat.get("name") or "",
-        "assigned_by_id": assigned, "deal_title_tpl": tpl, "questions": questions,
-        "success_message": str(args.get("success_message") or ""),
-        "create_contact": args.get("create_contact") is not False, "created_by": "agent",
-    })
+def tool_list_crm_forms(args: dict[str, Any]) -> dict[str, Any]:
+    """Native Bitrix24 CRM web-forms (Битрикс24.Формы): each with its PUBLIC link to share with
+    candidates. Bitrix REST cannot create a form (no API) — new ones are made in the Bitrix UI;
+    this returns that admin URL too."""
+    rows = _crm_call("crm.webform.list", {}).get("result") or []
+    forms = []
+    for f in rows:
+        forms.append({
+            "id": int(f.get("ID") or 0),
+            "name": f.get("NAME"),
+            "active": str(f.get("ACTIVE") or "") == "Y",
+            "public_url": _crm_form_public_url(f),
+            "is_callback": str(f.get("IS_CALLBACK_FORM") or "") == "Y",
+        })
+    admin_url = ""
+    try:
+        cfg = _crm_call("crm.webform.configuration.get", {}).get("result") or {}
+        admin_url = cfg.get("URL") or ""
+    except Exception:  # noqa: BLE001
+        pass
     return {
-        "created": True, "url": crm_forms.form_url(token), "token": token,
-        "pipeline": cat.get("name"), "category_id": cid, "stage_id": stage_id,
-        "fields": [{"label": q["label"], "field_code": q.get("field_code"), "role": q.get("role") or None}
-                   for q in questions],
-        "note": ("Публичная ссылка готова — отправляй кандидатам. Каждая отправка создаёт сделку в "
-                 "воронке с ответами в полях. Проверить: list_crm_lead_forms."),
+        "count": len(forms), "forms": forms, "create_forms_url": admin_url,
+        "note": ("Публичную ссылку (public_url) активной формы шлют кандидатам — её заявки создают "
+                 "сделки в привязанной воронке (привязка настраивается в самой форме). СОЗДАТЬ новую "
+                 "форму через API нельзя: открой create_forms_url в Битрикс24 и собери форму там."),
     }
-
-
-def tool_list_crm_lead_forms(args: dict[str, Any]) -> dict[str, Any]:
-    import crm_forms
-    forms = crm_forms.list_forms()
-    return {"count": len(forms), "forms": [
-        {"token": f["token"], "title": f["title"], "url": crm_forms.form_url(f["token"]),
-         "pipeline": f["pipeline_name"], "category_id": f["category_id"],
-         "active": f["is_active"], "submissions": f["submissions"],
-         "last_submission": f["last_submission_at"].astimezone(_MSK_TZ).strftime("%d.%m %H:%M")
-         if f.get("last_submission_at") else None}
-        for f in forms]}
-
-
-def tool_manage_crm_lead_form(args: dict[str, Any]) -> dict[str, Any]:
-    import crm_forms
-    action = str(args.get("action") or "").strip().lower()
-    token = str(args.get("token") or "").strip()
-    if not token:
-        raise McpError(-32602, "token обязателен (list_crm_lead_forms покажет токены).")
-    if not crm_forms.get_form(token):
-        raise McpError(-32602, f"Форма token={token} не найдена.")
-    if action == "delete":
-        if args.get("confirm") is not True:
-            raise McpError(-32602, "Удаление формы требует confirm=true (ссылка перестанет работать).")
-        crm_forms.delete_form(token)
-        return {"deleted": True, "token": token}
-    changes: dict[str, Any] = {}
-    for k in ("title", "intro", "success_message", "deal_title_template"):
-        if args.get(k) is not None:
-            changes["deal_title_tpl" if k == "deal_title_template" else k] = str(args[k])
-    if action in ("enable", "disable"):
-        changes["is_active"] = action == "enable"
-    elif args.get("is_active") is not None:
-        changes["is_active"] = bool(args["is_active"])
-    if args.get("responsible_bitrix_user_id") is not None:
-        changes["assigned_by_id"] = int(args["responsible_bitrix_user_id"])
-    if not changes:
-        raise McpError(-32602, "Нечего менять: action enable/disable/delete или title/intro/success_message.")
-    crm_forms.update_form(token, changes)
-    return {"updated": True, "token": token, "changed": list(changes)}
 
 
 def tool_list_crm_deals(args: dict[str, Any]) -> dict[str, Any]:
@@ -10755,83 +10627,16 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_manage_crm_deal_field,
     },
-    "create_crm_lead_form": {
+    "list_crm_forms": {
         "description": (
-            "АНКЕТА → CRM: создать публичную анкету (форму), каждая отправка которой автоматически "
-            "создаёт СДЕЛКУ в воронке с ответами, разложенными по полям сделки (+ контакт клиента). "
-            "Вернёт публичную ссылку — её шлют кандидатам. Это ровно «анкета, чтобы лиды сразу "
-            "попадали в CRM». Обязательны: title и questions (список вопросов). Воронка — "
-            "category_id или pipeline_name; стадия stage (без неё — первая рабочая). Каждый вопрос: "
-            "label (текст), type (text|textarea|number|select|phone|email|url), required (bool), "
-            "options (для select), placeholder, hint, role (name — идёт в имя контакта и название "
-            "сделки; phone/email — в контакт; telegram/пусто — становится полем сделки), field_code "
-            "(переиспользовать существующее поле UF_CRM_*). Поля сделки создаются автоматически. "
-            "deal_title_template — шаблон названия сделки ({q1} = ответ). ПЕРЕД созданием покажи "
-            "пользователю состав анкеты (вопросы, воронка, стадия) и дождись подтверждения."
+            "ФОРМЫ CRM (Битрикс24.Формы): список нативных веб-форм с ПУБЛИЧНОЙ ссылкой (public_url) — "
+            "её шлют кандидатам, заявки создают сделки в привязанной к форме воронке. ВАЖНО: создать "
+            "новую форму через API НЕЛЬЗЯ (в Bitrix REST нет метода) — новую собирают в интерфейсе "
+            "Битрикс24 (адрес в create_forms_url). Не обещай создать форму сам — дай ссылку на "
+            "существующую или на страницу конструктора."
         ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Заголовок анкеты (виден кандидату)."},
-                "intro": {"type": "string", "description": "Вступительный текст под заголовком (необязательно)."},
-                "category_id": {"type": "integer", "description": "id воронки, куда падают заявки."},
-                "pipeline_name": {"type": "string", "description": "Название воронки (альтернатива category_id)."},
-                "stage": {"type": "string", "description": "Стартовая стадия: код или название (без неё — первая рабочая)."},
-                "questions": {
-                    "type": "array", "description": "Вопросы анкеты.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": {"type": "string", "description": "Текст вопроса."},
-                            "type": {"type": "string", "enum": ["text", "textarea", "number", "select", "phone", "email", "url"]},
-                            "required": {"type": "boolean", "description": "Обязательный вопрос."},
-                            "options": {"type": "array", "items": {"type": "string"}, "description": "Варианты для type=select."},
-                            "placeholder": {"type": "string", "description": "Подсказка внутри поля."},
-                            "hint": {"type": "string", "description": "Пояснение под полем."},
-                            "role": {"type": "string", "enum": ["name", "telegram", "phone", "email"], "description": "Спец-роль ответа."},
-                            "field_code": {"type": "string", "description": "Переиспользовать существующее поле сделки UF_CRM_*."},
-                        },
-                        "required": ["label"],
-                    },
-                },
-                "responsible_bitrix_user_id": {"type": "integer", "description": "Ответственный за сделки по id."},
-                "responsible_name": {"type": "string", "description": "Ответственный за сделки по имени."},
-                "deal_title_template": {"type": "string", "description": "Шаблон названия сделки, {qN} — ответ на вопрос N."},
-                "success_message": {"type": "string", "description": "Текст «спасибо» после отправки."},
-                "create_contact": {"type": "boolean", "description": "Создавать контакт клиента (по умолчанию да)."},
-            },
-            "required": ["title", "questions"],
-            "additionalProperties": False,
-        },
-        "handler": tool_create_crm_lead_form,
-    },
-    "list_crm_lead_forms": {
-        "description": "АНКЕТЫ CRM: список созданных анкет-форм — ссылка, воронка, включена ли, сколько заявок пришло.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-        "handler": tool_list_crm_lead_forms,
-    },
-    "manage_crm_lead_form": {
-        "description": (
-            "АНКЕТЫ CRM: управлять анкетой по token (из list_crm_lead_forms). action: enable | disable "
-            "(вкл/выкл ссылку) | delete (нужен confirm=true — ссылка перестанет работать). Можно "
-            "менять title, intro, success_message, deal_title_template, ответственного."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "token": {"type": "string", "description": "Токен анкеты."},
-                "action": {"type": "string", "enum": ["enable", "disable", "delete"], "description": "Действие (необязательно, если меняешь только тексты)."},
-                "title": {"type": "string"},
-                "intro": {"type": "string"},
-                "success_message": {"type": "string"},
-                "deal_title_template": {"type": "string"},
-                "responsible_bitrix_user_id": {"type": "integer"},
-                "confirm": {"type": "boolean", "description": "Для delete: обязательно true."},
-            },
-            "required": ["token"],
-            "additionalProperties": False,
-        },
-        "handler": tool_manage_crm_lead_form,
+        "handler": tool_list_crm_forms,
     },
     "list_crm_deals": {
         "description": (
