@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Image as ImageIcon, Search } from 'lucide-react';
+import { cn } from '../lib/utils';
 import { api, qs } from '../lib/api';
 
 type Card = {
@@ -141,6 +142,24 @@ const MAIN_ROWS: MetricRow[] = [
   { label: 'ROI, %', value: (p) => p.roiPct, summary: (p) => ratio(sum(p, 'for_pay_rub') - sum(p, 'cogs_rub') - sum(p, 'adv_rub'), sum(p, 'cogs_rub')), format: 'percent' },
 ];
 
+function TableSkeleton({ title, accent, rowCount }: { title: string; accent: 'navy' | 'purple'; rowCount: number }) {
+  const heading = accent === 'navy' ? 'bg-slate-800' : 'bg-violet-500';
+  return (
+    <section className="min-w-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" aria-busy="true">
+      <div className={`${heading} px-4 py-3 text-xs font-black uppercase tracking-wide text-white sm:px-5`}>{title}</div>
+      <div className="flex flex-col gap-3 p-4 sm:p-5">
+        {Array.from({ length: rowCount }, (_, index) => (
+          <div key={index} className="flex items-center gap-3">
+            <div className="skeleton h-4 w-20 shrink-0 rounded-md" />
+            <div className="skeleton h-4 w-44 shrink-0 rounded-md" />
+            <div className="skeleton h-4 flex-1 rounded-md" style={{ opacity: 1 - index * 0.06 }} />
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function MetricsTable({ title, rows, points, accent }: { title: string; rows: MetricRow[]; points: MetricPoint[]; accent: 'navy' | 'purple' }) {
   const visible = [...points].reverse();
   const heading = accent === 'navy' ? 'bg-slate-800' : 'bg-violet-500';
@@ -185,7 +204,8 @@ export function RnpTab({ brand, startDate, endDate }: { brand?: string; startDat
   const [search, setSearch] = useState('');
   const [cards, setCards] = useState<Card[]>([]);
   const [loading, setLoading] = useState(false);
-  const [metricsLoading, setMetricsLoading] = useState(false);
+  const [metricsLoading, setMetricsLoading] = useState(true);
+  const [metricsLoadedOnce, setMetricsLoadedOnce] = useState(false);
   const [metricsError, setMetricsError] = useState(false);
   const [selected, setSelected] = useState<Card | null>(null);
   const [days, setDays] = useState<RnpDay[]>([]);
@@ -222,7 +242,7 @@ export function RnpTab({ brand, startDate, endDate }: { brand?: string; startDat
     })}`)
       .then((data) => setDays(data.days || []))
       .catch(() => { setDays([]); setMetricsError(true); })
-      .finally(() => setMetricsLoading(false));
+      .finally(() => { setMetricsLoading(false); setMetricsLoadedOnce(true); });
   }, [selected, startDate, endDate, brand]);
 
   const points = useMemo<MetricPoint[]>(() => {
@@ -282,7 +302,17 @@ export function RnpTab({ brand, startDate, endDate }: { brand?: string; startDat
           {isSearching && (
             <div className="absolute z-50 mt-2 w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl">
               {loading ? (
-                <div className="px-4 py-8 text-center text-sm font-medium text-slate-500">Загружаю каталог…</div>
+                <div className="flex flex-col gap-3 px-4 py-4" aria-busy="true" aria-label="Загружаю каталог">
+                  {[0, 1, 2].map((index) => (
+                    <div key={index} className="flex items-center gap-3">
+                      <div className="skeleton h-11 w-11 shrink-0 rounded-lg" />
+                      <div className="flex min-w-0 flex-1 flex-col gap-2">
+                        <div className="skeleton h-3.5 w-28 rounded-md" />
+                        <div className="skeleton h-3 w-3/4 rounded-md" />
+                      </div>
+                    </div>
+                  ))}
+                </div>
               ) : cards.length > 0 ? (
                 <ul className="max-h-80 divide-y divide-slate-100 overflow-auto">
                   {cards.map((card) => (
@@ -338,14 +368,23 @@ export function RnpTab({ brand, startDate, endDate }: { brand?: string; startDat
         )}
       </div>
 
-      {(metricsLoading || metricsError) && (
-        <div className={`rounded-xl border px-4 py-3 text-xs font-medium sm:text-sm ${metricsError ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-slate-200 bg-white text-slate-500'}`}>
-          {metricsError ? 'Данные временно недоступны. Шаблон сохранён и показан с нулевыми значениями.' : selected ? 'Обновляю показатели выбранного товара…' : 'Загружаю сводные показатели WB-кабинета…'}
+      {metricsError && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-medium text-amber-800 sm:text-sm">
+          Данные временно недоступны. Шаблон сохранён и показан с нулевыми значениями.
         </div>
       )}
 
-      <MetricsTable title="План / факт" rows={PLAN_ROWS} points={points} accent="navy" />
-      <MetricsTable title="Основные метрики" rows={MAIN_ROWS} points={points} accent="purple" />
+      {!metricsLoadedOnce ? (
+        <>
+          <TableSkeleton title="План / факт" accent="navy" rowCount={6} />
+          <TableSkeleton title="Основные метрики" accent="purple" rowCount={10} />
+        </>
+      ) : (
+        <div className={cn('flex min-w-0 flex-col gap-5 sm:gap-6 fade-in', metricsLoading && 'refetching')}>
+          <MetricsTable title="План / факт" rows={PLAN_ROWS} points={points} accent="navy" />
+          <MetricsTable title="Основные метрики" rows={MAIN_ROWS} points={points} accent="purple" />
+        </div>
+      )}
     </div>
   );
 }

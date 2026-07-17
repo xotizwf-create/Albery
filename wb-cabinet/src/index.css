@@ -9,3 +9,37 @@
   --color-brand-600: #4f46e5;
 }
 
+/* Loading skeleton: soft base + travelling shimmer highlight. */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: #e2e8f0;
+}
+.skeleton::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.75), transparent);
+  animation: skeleton-shimmer 1.5s ease-in-out infinite;
+}
+@keyframes skeleton-shimmer {
+  100% { transform: translateX(100%); }
+}
+
+/* Content entrance once real data replaces a skeleton / on page switch. */
+.fade-in {
+  animation: fade-in-up 0.35s ease both;
+}
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Refetch: keep the frame, dim the stale render — no layout jump. */
+.refetching {
+  opacity: 0.55;
+  transition: opacity 0.25s ease;
+  pointer-events: none;
+}
+

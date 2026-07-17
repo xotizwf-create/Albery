@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, Fragment, ClipboardEvent } from 'react';
-import { Package, Target, Save, EyeOff, Eye, Calendar as CalendarIcon, ChevronLeft, ChevronRight, ChevronDown, Loader2 } from 'lucide-react';
+import { Package, Target, Save, EyeOff, Eye, Calendar as CalendarIcon, ChevronLeft, ChevronRight, ChevronDown } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { api, apiPost } from '../lib/api';
 
@@ -125,8 +125,17 @@ function ArticleIdentity({ article, compact = false }: { article: Card; compact?
 
 function LoadingBlock() {
   return (
-    <div className="p-16 flex items-center justify-center text-slate-400 gap-3">
-      <Loader2 className="w-5 h-5 animate-spin" /> <span className="text-sm font-bold">Загружаю каталог…</span>
+    <div className="flex flex-col gap-3 p-5" aria-busy="true" aria-label="Загружаю каталог">
+      {Array.from({ length: 6 }, (_, index) => (
+        <div key={index} className="flex items-center gap-4" style={{ opacity: 1 - index * 0.12 }}>
+          <div className="skeleton h-12 w-12 shrink-0 rounded-xl" />
+          <div className="flex min-w-0 flex-1 flex-col gap-2">
+            <div className="skeleton h-3.5 w-40 rounded-md" />
+            <div className="skeleton h-3 w-2/3 rounded-md" />
+          </div>
+          <div className="skeleton h-6 w-11 shrink-0 rounded-full" />
+        </div>
+      ))}
     </div>
   );
 }
