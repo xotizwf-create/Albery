@@ -5886,7 +5886,8 @@ def tool_create_google_doc(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32602, "html (содержимое документа, HTML) обязателен.")
     share = args.get("share_anyone_writer", True)
     try:
-        return app_workflow_function("create_google_doc")(title, html, bool(share))
+        return app_workflow_function("create_google_doc")(
+            title, html, bool(share), args.get("font_size_pt"), args.get("line_spacing"))
     except McpError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -9918,13 +9919,15 @@ TOOLS: dict[str, dict[str, Any]] = {
             "выдаёт доступ «по ссылке — редактор» и возвращает ссылку. Это ЕДИНСТВЕННЫЙ правильный путь на просьбу "
             "«создай гугл документ»: НИКОГДА не создавай документы через Apps Script/веб-приложения и не давай "
             "пользователю ссылок script.google.com — он получит «нет доступа». Перед созданием покажи пользователю "
-            "название и структуру, получи согласие, затем вызови с confirm=true."
+            "название и структуру, получи согласие, затем вызови с confirm=true. Оформление документа — один в один как у docx из export_document (тот же рендер docformat: заголовки, таблицы, отступы)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "Название документа"},
                 "html": {"type": "string", "description": "Содержимое: полный HTML (h1/h2/p/ul/table)"},
+                "font_size_pt": {"type": "number", "description": "Кегль, как в export_document (по умолчанию 12)"},
+                "line_spacing": {"type": "number", "description": "Межстрочный интервал (по умолчанию 1.5, ГОСТ)"},
                 "share_anyone_writer": {"type": "boolean", "description": "Доступ «по ссылке — редактор» (по умолчанию true)"},
                 "confirm": {"type": "boolean", "description": "Должно быть true после явного согласия пользователя"},
             },

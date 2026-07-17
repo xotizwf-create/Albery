@@ -585,7 +585,8 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
     }
 
 
-def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = True) -> dict[str, Any]:
+def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = True,
+                      font_size_pt: float | None = None, line_spacing: float | None = None) -> dict[str, Any]:
     """Create a new Google Doc from HTML (as the agent's Google account), optionally share it
     anyone-with-link = editor and return its id + url. The only sanctioned way to make a Google
     Doc for a user: Apps Script web-app detours produce artifacts the requester cannot open."""
@@ -601,7 +602,20 @@ def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = Tr
         raise RuntimeError("html_body пуст — соберите HTML содержимого документа.")
     if not html.lstrip().lower().startswith(("<!doctype", "<html", "<h1", "<h2", "<h3", "<p", "<div", "<table", "<ul", "<ol")):
         html = "<p>" + html.replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
-    media = MediaIoBaseUpload(_io.BytesIO(html.encode("utf-8")), mimetype="text/html", resumable=False)
+    # Same renderer as export_document (docformat html_to_docx), uploaded as docx with Drive
+    # conversion — so a Google Doc looks exactly like the agent's docx files (owner 2026-07-17:
+    # оформление «один в один»). A plain text/html upload rendered visibly differently.
+    from docformat import html_to_docx
+    docx_bytes = html_to_docx(
+        html,
+        font_size_pt=float(font_size_pt or 12),
+        line_spacing=float(line_spacing or 1.5),
+    )
+    media = MediaIoBaseUpload(
+        _io.BytesIO(docx_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        resumable=False,
+    )
     created = drive.files().create(
         body={"name": clean_title, "mimeType": "application/vnd.google-apps.document"},
         media_body=media, fields="id,webViewLink,name,mimeType",
