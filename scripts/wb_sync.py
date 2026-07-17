@@ -7,11 +7,18 @@ Usage: wb_sync.py            # incremental (cron, every 30 min)
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+# Offline process: keep the b24 background workers (idle sweep, offers, check-in)
+# inside the main app only — a second sweeper here could message live users.
+os.environ.setdefault("B24_SESSION_IDLE_WATCH", "0")
+os.environ.setdefault("B24_TASK_OFFER", "0")
+os.environ.setdefault("B24_TASK_CHECKIN", "0")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -37,10 +44,19 @@ def main() -> int:
             if not bool(row.get("locked")):
                 print(json.dumps({"ok": False, "busy": True, "message": "WB sync already running."}, ensure_ascii=False))
                 return 0
+            # The advisory lock is session-level and survives commit; ending the
+            # transaction keeps this connection out of idle-in-transaction timeout
+            # while a long tick (personal-token finance pages) runs for minutes.
+            lock_conn.commit()
             try:
                 result = wb_cabinet.sync_all(initial_days=initial)
             finally:
-                cur.execute("SELECT pg_advisory_unlock(%s)", (WB_SYNC_ADVISORY_LOCK_KEY,))
+                try:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (WB_SYNC_ADVISORY_LOCK_KEY,))
+                except Exception:
+                    # If Postgres already dropped this connection, the lock died
+                    # with it; a failed unlock must not fail the whole tick.
+                    pass
     print(json.dumps({"ok": True, "initial_days": initial, "elapsed_sec": round(time.time() - started, 1),
                       "result": result}, ensure_ascii=False))
     return 0
