@@ -1385,10 +1385,13 @@ def _b24_summarize_segment(dialog_id: str, agent_slug: str | None = None) -> str
         return None
 
 
-def _b24_notify_session_reset(dialog_id: str, agent_slug: str | None = None) -> None:
-    """A session reset must never be silent (owner 2026-07-16): when the idle gap starts a fresh
-    session, tell the user in the SAME dialog, from the SAME agent's bot, how to bring old context
-    back. Best-effort in a daemon thread — a notify failure must never affect the turn itself."""
+def _b24_notify_session_reset(dialog_id: str, agent_slug: str | None = None, late: bool = False) -> None:
+    """A session reset must never be silent (owner 2026-07-16): tell the user in the SAME dialog,
+    from the SAME agent's bot, how to bring old context back. Two modes (owner 2026-07-17 — the
+    old single banner arrived glued to the user's NEXT message and read like «бот перезапустился»):
+    default = sent by the idle sweep at the ACTUAL 3h mark; late=True = the lazy fallback fired
+    together with a user's message after downtime, so the text must say the NEW message opened a
+    new conversation and the bot is working normally. Best-effort — never affects the turn."""
     try:
         d = str(dialog_id or "").strip()
         if not re.fullmatch(r"(chat)?\d+", d):
@@ -1406,11 +1409,16 @@ def _b24_notify_session_reset(dialog_id: str, agent_slug: str | None = None) -> 
         if not (client_endpoint and access_token and bot_id):
             return
         hours = max(1, B24_IDLE_RESET_SECONDS // 3600)
+        if late:
+            msg = ("🔄 Ваше сообщение начало новый разговор: с прошлого сообщения прошло больше "
+                   f"{hours} ч, поэтому контекст прежней беседы закрыт. Я работаю штатно и уже "
+                   "отвечаю. Чтобы вернуть старую тему, нажмите «Ответить» на нужном сообщении.")
+        else:
+            msg = (f"⏸️ Больше {hours} ч без новых сообщений — этот разговор завершён, его контекст "
+                   "закрыт. Следующее сообщение начнёт новый разговор с чистого листа. Чтобы "
+                   "продолжить старую тему, нажмите «Ответить» на нужном сообщении.")
         _b24_app_call(client_endpoint, access_token, "imbot.message.add", {
-            "BOT_ID": bot_id, "DIALOG_ID": d,
-            "MESSAGE": ("🔄 Начата новая сессия: с последнего сообщения прошло больше "
-                        f"{hours} ч, контекст прошлого разговора очищен. Чтобы вернуться к "
-                        "старому контексту, найдите нужное сообщение и нажмите «Ответить»."),
+            "BOT_ID": bot_id, "DIALOG_ID": d, "MESSAGE": msg,
         })
     except Exception:  # noqa: BLE001
         logging.warning("b24: session reset notify failed dialog=%s", dialog_id, exc_info=True)
@@ -1466,8 +1474,11 @@ def _b24_session_prepare(dialog_id: str, agent_slug: str | None = None) -> tuple
                             (epoch, turns, summary, now, floor, scope),
                         )
                         # Notify off the critical path (never blocks/breaks the turn itself).
+                        # late=True: the sweep normally resets at the real 3h mark, so reaching
+                        # this branch means downtime — word the banner for «your message opened
+                        # a new conversation», not «session just expired».
                         threading.Thread(target=_b24_notify_session_reset,
-                                         args=(str(dialog_id), agent_slug), daemon=True).start()
+                                         args=(str(dialog_id), agent_slug, True), daemon=True).start()
                     else:
                         cur.execute(
                             "UPDATE bitrix_bot_sessions SET epoch=%s, turns=%s, summary=%s, last_at=%s WHERE dialog_id=%s",
@@ -1490,6 +1501,74 @@ def _b24_session_touch(dialog_id: str, agent_slug: str | None = None) -> None:
                     )
     except Exception:  # noqa: BLE001
         logging.exception("b24 testbot: session touch failed")
+
+
+B24_IDLE_NOTIFY_GRACE_SECONDS = int(os.getenv("B24_IDLE_NOTIFY_GRACE_SECONDS", "7200"))
+
+
+def _b24_idle_reset_sweep() -> int:
+    """Close sessions at the ACTUAL idle mark (owner 2026-07-17): the lazy-only reset fired
+    together with the user's NEXT message, so the banner claimed «прошло 3 ч» right under a
+    fresh message and read like the bot restarting. The sweep resets and notifies when the
+    idle window really elapses. Rows idle far beyond the window (first sweep after deploy or
+    downtime) reset silently so old dialogs never get a burst of notifications."""
+    notified: list[tuple[str, str | None]] = []
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT dialog_id, last_at FROM bitrix_bot_sessions "
+                        "WHERE turns > 0 AND last_at < now() - make_interval(secs => %s) "
+                        "FOR UPDATE SKIP LOCKED",
+                        (B24_IDLE_RESET_SECONDS,),
+                    )
+                    rows = cur.fetchall()
+                    now = datetime.now(timezone.utc)
+                    for row in rows:
+                        scope = str(row["dialog_id"])
+                        if ":" in scope:
+                            slug, dlg = scope.split(":", 1)
+                        else:
+                            slug, dlg = None, scope
+                        cur.execute(
+                            "SELECT COALESCE(MAX(id), 0) AS floor FROM bitrix_bot_interactions "
+                            "WHERE dialog_id=%s AND agent_slug IS NOT DISTINCT FROM %s::text",
+                            (dlg, slug),
+                        )
+                        floor = cur.fetchone()["floor"]
+                        cur.execute(
+                            "UPDATE bitrix_bot_sessions SET epoch=epoch+1, turns=0, summary=NULL, "
+                            "last_at=now(), history_floor_id=%s WHERE dialog_id=%s",
+                            (floor, scope),
+                        )
+                        idle = (now - row["last_at"]).total_seconds() if row["last_at"] else 1e12
+                        if idle < B24_IDLE_RESET_SECONDS + B24_IDLE_NOTIFY_GRACE_SECONDS:
+                            notified.append((dlg, slug))
+    except Exception:  # noqa: BLE001
+        logging.exception("b24: idle session sweep failed")
+        return 0
+    for dlg, slug in notified:
+        try:
+            _b24_notify_session_reset(dlg, slug)
+        except Exception:  # noqa: BLE001
+            logging.warning("b24: idle sweep notify failed dialog=%s", dlg, exc_info=True)
+    return len(notified)
+
+
+def _b24_idle_watch_loop() -> None:
+    time.sleep(180)  # let the app boot; short-lived offline scripts exit before the first sweep
+    logging.info("b24: session idle watch active (sweep every 120s, idle=%ss)", B24_IDLE_RESET_SECONDS)
+    while True:
+        try:
+            _b24_idle_reset_sweep()
+        except Exception:  # noqa: BLE001
+            logging.exception("b24: idle watch iteration failed")
+        time.sleep(120)
+
+
+if os.getenv("B24_SESSION_IDLE_WATCH", "1").strip() != "0":
+    threading.Thread(target=_b24_idle_watch_loop, daemon=True, name="b24-session-idle-watch").start()
 
 
 # Reset keywords/commands accepted from chat (typed text or a bot command). Matched against
