@@ -951,9 +951,36 @@ def _md_tables_to_lines(text: str) -> str:
     return "\n".join(out)
 
 
+def _html_to_bb(text: str) -> str:
+    """Turn HTML the model slips into its answer into Bitrix BB-code.
+
+    Bitrix chat renders BB-code, not HTML, so a stray tag is shown to the user as literal
+    text. The model routinely opens with BB-code and closes with HTML — «[b]Что улучшить:</b>»,
+    «[b]Палей</b>», «[i]…</i>» — and the reader sees «</b>» in the middle of the sentence
+    (reported by the owner 20.07.2026, seen in dialogs 14/16/28/30). Converting instead of
+    stripping keeps the formatting the model intended."""
+    t = text or ""
+    t = re.sub(r"<a\s[^<>]*href=[\"']([^\"']+)[\"'][^<>]*>(.*?)</a\s*>",
+               r"[URL=\1]\2[/URL]", t, flags=re.S | re.I)
+    for tags, bb in ((("b", "strong"), "b"), (("i", "em"), "i"), (("u",), "u"), (("s", "strike"), "s")):
+        for tag in tags:
+            t = re.sub(rf"<{tag}\s*>", f"[{bb}]", t, flags=re.I)
+            t = re.sub(rf"</{tag}\s*>", f"[/{bb}]", t, flags=re.I)
+    t = re.sub(r"<br\s*/?>", "\n", t, flags=re.I)
+    t = re.sub(r"</?(?:p|div|ul|ol|tr|table|tbody|thead|h[1-6])\s*[^<>]*>", "\n", t, flags=re.I)
+    t = re.sub(r"<li\s*[^<>]*>", "\n- ", t, flags=re.I)
+    t = re.sub(r"</li\s*>", "", t, flags=re.I)
+    t = re.sub(r"</?(?:td|th)\s*[^<>]*>", " ", t, flags=re.I)
+    # Safety net for anything left: a real tag needs a letter right after '<',
+    # so arithmetic like «a < b» and «<= 5» is not touched.
+    t = re.sub(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*)?/?>", "", t)
+    return t
+
+
 def bb_sanitize(text: str) -> str:
     """Strip/convert every Markdown artefact so Bitrix shows a clean, readable message."""
     t = _md_tables_to_lines(text or "")
+    t = _html_to_bb(t)
     t = _MD_FENCE_RE.sub("", t)
     t = _MD_HEADER_RE.sub(lambda m: "[b]" + m.group(1).strip() + "[/b]", t)
     t = _MD_LINK_RE.sub(lambda m: f"[URL={m.group(2)}]{m.group(1)}[/URL]", t)
