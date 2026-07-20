@@ -1176,6 +1176,48 @@ def participants_from_tasks_and_leaders(
     return people
 
 
+def _same_person(name_a: str, name_b: str) -> bool:
+    """Один и тот же человек с учётом алиасов и коротких подписей."""
+    b_tokens = _speaker_name_tokens(name_b)
+    return bool(b_tokens) and any(v and (v <= b_tokens or b_tokens <= v)
+                                  for v in alias_variants(name_a))
+
+
+def ensure_call_host(
+    participants: list[dict[str, Any]] | None,
+    leader_evals: list[dict[str, Any]] | None,
+    tasks: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Гарантирует, что среди участников есть ведущий созвона.
+
+    Карточка с итогами и задачами уходит ТОЛЬКО ведущему; если ведущего в списке нет,
+    рассылка молча не собирает ни одной карточки. Именно так 20.07.2026 пропали шесть готовых
+    задач: модель вернула участников без ролей, все оказались «рядовыми», ведущий не нашёлся.
+    Роль восстанавливается по оценке руководителя (там прямо назван лидер встречи), а если и
+    это не помогло — по назначенным задачам."""
+    people = [dict(p) for p in (participants or [])]
+    if any(str(p.get("role_on_call") or "").lower() == "host" or p.get("is_leader") for p in people):
+        return people
+
+    leader_ids = {to_int(e.get("bitrix_user_id")) for e in (leader_evals or [])}
+    leader_ids.discard(None)
+    leader_names = [str(e.get("leader_name") or "").strip() for e in (leader_evals or []) if e.get("leader_name")]
+    for person in people:
+        uid = to_int(person.get("bitrix_user_id"))
+        name = str(person.get("name") or "")
+        if (uid is not None and uid in leader_ids) or any(_same_person(n, name) for n in leader_names):
+            person["is_leader"] = True
+            person["role_on_call"] = "host"
+            logging.info("zoom: ведущий восстановлен по оценке руководителя — %s", name)
+            return people
+
+    derived = participants_from_tasks_and_leaders(tasks, leader_evals)
+    if derived:
+        known = {to_int(d.get("bitrix_user_id")) for d in derived}
+        return derived + [p for p in people if to_int(p.get("bitrix_user_id")) not in known]
+    return people
+
+
 def zoom_call_participants(call: dict[str, Any]) -> list[dict[str, Any]]:
     """Actual call participants from saved AI reports.
 

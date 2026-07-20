@@ -86,6 +86,56 @@ def test_alias_used_when_resolving_a_name(zoom_mod, monkeypatch):
     assert zoom_mod.org_user_id_for_name("Анастасия Клеблеева") is None
 
 
+def test_host_restored_from_leader_evaluation(zoom_mod, monkeypatch):
+    """Без ведущего рассылка не собирает НИ ОДНОЙ карточки — это и убило задачи 20.07."""
+    monkeypatch.setattr(zoom_mod, "name_alias_pairs", lambda: [])
+    participants = [
+        {"name": "Наталья Викторовна Горюнова", "bitrix_user_id": 30, "is_leader": False,
+         "role_on_call": "participant"},
+        {"name": "Дмитрий Александрович Строгонов", "bitrix_user_id": 38, "is_leader": False,
+         "role_on_call": "participant"},
+    ]
+    leaders = [{"leader_name": "Наталья Викторовна Горюнова", "bitrix_user_id": 30}]
+
+    people = zoom_mod.ensure_call_host(participants, leaders)
+
+    host = [p for p in people if p["role_on_call"] == "host"]
+    assert len(host) == 1 and host[0]["bitrix_user_id"] == 30
+    assert len(people) == 2, "остальных участников трогать нельзя"
+
+
+def test_existing_host_is_left_alone(zoom_mod):
+    participants = [{"name": "Наталья", "bitrix_user_id": 30, "role_on_call": "host", "is_leader": True},
+                    {"name": "Софья", "bitrix_user_id": 36, "role_on_call": "participant"}]
+
+    people = zoom_mod.ensure_call_host(participants, [])
+
+    assert people == participants
+
+
+def test_host_falls_back_to_tasks_when_leader_not_among_participants(zoom_mod, monkeypatch):
+    monkeypatch.setattr(zoom_mod, "name_alias_pairs", lambda: [])
+    participants = [{"name": "Кто-то Посторонний", "bitrix_user_id": 99, "role_on_call": "participant"}]
+    leaders = [{"leader_name": "Наталья Викторовна Горюнова", "bitrix_user_id": 30}]
+    tasks = [{"assignee_name": "Дмитрий Александрович Строгонов", "bitrix_user_id": 38}]
+
+    people = zoom_mod.ensure_call_host(participants, leaders, tasks)
+
+    assert people[0]["bitrix_user_id"] == 30 and people[0]["role_on_call"] == "host"
+    assert 99 in [p["bitrix_user_id"] for p in people], "известных участников не теряем"
+
+
+def test_host_matched_through_alias(zoom_mod, monkeypatch):
+    monkeypatch.setattr(zoom_mod, "name_alias_pairs",
+                        lambda: [("Анастасия Докучаева", "Анастасия Андрусяк")])
+    participants = [{"name": "Анастасия Докучаева", "bitrix_user_id": None, "role_on_call": "participant"}]
+    leaders = [{"leader_name": "Анастасия Андрусяк", "bitrix_user_id": 42}]
+
+    people = zoom_mod.ensure_call_host(participants, leaders)
+
+    assert people[0]["role_on_call"] == "host"
+
+
 def test_prompt_pins_the_participants_field(app_module):
     """Промпт обязан запрещать переименование поля — именно это и сломало рассылку."""
     from pathlib import Path

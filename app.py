@@ -2369,6 +2369,8 @@ def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = 
         # Never lose ready tasks because the participant block came out empty: the assignees
         # of those tasks ARE the recipients (see participants_from_tasks_and_leaders).
         participants = zoom.participants_from_tasks_and_leaders(operational_tasks, leader_evals)
+    # The card goes to the meeting lead, so a list without a host yields no cards at all.
+    participants = zoom.ensure_call_host(participants, leader_evals, operational_tasks)
     dispatch_summary = format_zoom_dispatch_summary(call)
     cleaned_section = format_zoom_operational_tasks_for_bitrix(operational_tasks)
 
