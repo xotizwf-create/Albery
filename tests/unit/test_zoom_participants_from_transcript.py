@@ -9,7 +9,18 @@ from __future__ import annotations
 import pytest
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(autouse=True)
+def alias_directory(app_module, monkeypatch):
+    """По умолчанию справочник алиасов пуст — тесты не ходят в БД и не влияют друг на друга.
+    Отдаёт настоящий загрузчик тем тестам, которые проверяют сам разбор справочника."""
+    real_loader = app_module.zoom.name_alias_pairs
+    app_module.zoom._NAME_ALIAS_CACHE.update({"at": 0.0, "pairs": []})
+    monkeypatch.setattr(app_module.zoom, "name_alias_pairs", lambda: [])
+    yield real_loader
+    app_module.zoom._NAME_ALIAS_CACHE.update({"at": 0.0, "pairs": []})
+
+
+@pytest.fixture
 def heard(app_module):
     return app_module.zoom.participants_heard_in_transcript
 
@@ -32,15 +43,67 @@ def test_word_order_and_case_do_not_matter(heard):
     assert len(heard(participants, segments)) == 1
 
 
+def test_alias_counts_as_the_same_person(app_module, heard, monkeypatch):
+    """«Анастасия Докучаева» и «Анастасия Андрусяк» — один человек по справочнику компании.
+    В логе Zoom она значится одной фамилией, в расшифровке говорит под другой."""
+    monkeypatch.setattr(app_module.zoom, "name_alias_pairs",
+                        lambda: [("Анастасия Докучаева", "Анастасия Андрусяк")])
+    participants = [{"name": "Анастасия Докучаева"}, {"name": "Наталья"}]
+    segments = [{"speaker": "Анастасия Андрусяк", "text": "а"}, {"speaker": "Наталья", "text": "б"}]
+
+    names = [p["name"] for p in heard(participants, segments)]
+    assert names == ["Анастасия Докучаева", "Наталья"], "алиас — тот же человек, её нельзя терять"
+
+
+def test_alias_does_not_merge_different_people(app_module, heard, monkeypatch):
+    monkeypatch.setattr(app_module.zoom, "name_alias_pairs",
+                        lambda: [("Анастасия Докучаева", "Анастасия Андрусяк")])
+    participants = [{"name": "Анастасия Клеблеева"}, {"name": "Анастасия Докучаева"}]
+    segments = [{"speaker": "Анастасия Андрусяк", "text": "а"}]
+
+    names = [p["name"] for p in heard(participants, segments)]
+    assert names == ["Анастасия Докучаева"], "Клеблеева — другой человек"
+
+
+def test_alias_directory_parsing(app_module, monkeypatch, alias_directory):
+    """Формат справочника: «- имя в созвоне = имя в Битриксе», комментарии игнорируются."""
+    block = ("# Сопоставление имён\n"
+             "# комментарий = не алиас\n"
+             "- Анастасия Докучаева = Анастасия Андрусяк\n"
+             "- Иван Петров => Иван Сидоров\n"
+             "- Анастасия Докучаева = Анастасия Андрусяк в нашей оргструктуре.\n")
+
+    class FakeCursor:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): pass
+        def fetchall(self): return [{"content": block}]
+
+    class FakeConn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return FakeCursor()
+
+    monkeypatch.setattr(app_module.zoom, "pg_connect", lambda: FakeConn())
+    app_module.zoom._NAME_ALIAS_CACHE.update({"at": 0.0, "pairs": []})
+
+    pairs = alias_directory()  # настоящий загрузчик, а не заглушка
+
+    assert ("Анастасия Докучаева", "Анастасия Андрусяк") in pairs
+    assert ("Иван Петров", "Иван Сидоров") in pairs
+    assert all("комментарий" not in left for left, _ in pairs)
+    # Хвост прозы не должен попадать в имя.
+    assert all(not right.endswith("оргструктуре") for _, right in pairs)
+
+
 def test_shared_first_name_is_not_enough(heard):
-    """Созвон 20.07 11:02: Анастасия Докучаева молчала, говорила Анастасия Андрусяк.
-    По одному лишь совпавшему имени молчавшего в участники брать нельзя."""
-    participants = [{"name": "Анастасия Андрусяк"}, {"name": "Анастасия Докучаева"},
+    """Полные тёзки по имени — разные люди, если они не связаны алиасом."""
+    participants = [{"name": "Анастасия Андрусяк"}, {"name": "Анастасия Клеблеева"},
                     {"name": "Наталья"}]
     segments = [{"speaker": "Анастасия Андрусяк", "text": "а"}, {"speaker": "Наталья", "text": "б"}]
     names = [p["name"] for p in heard(participants, segments)]
     assert names == ["Анастасия Андрусяк", "Наталья"]
-    assert "Анастасия Докучаева" not in names
+    assert "Анастасия Клеблеева" not in names
 
 
 def test_short_label_matches_full_name(heard):

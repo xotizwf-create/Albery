@@ -652,6 +652,59 @@ ZOOM_SPEAKER_NOISE_NAMES = {"unknown", "speaker", "webvtt", "transcript", "уч�
 def _speaker_name_tokens(value: str) -> set[str]:
     """Meaningful name words, lowercased — «Погорелова Софья» ~ «Софья Погорелова»."""
     return {w for w in re.split(r"[^\w]+", str(value or "").lower()) if len(w) > 2}
+_NAME_ALIAS_CACHE: dict[str, Any] = {"at": 0.0, "pairs": []}
+_NAME_ALIAS_TTL_S = 600
+_ALIAS_LINE_RE = re.compile(r"^\s*-\s*(.+?)\s*=>?\s*(.+?)\s*$")
+def name_alias_pairs() -> list[tuple[str, str]]:
+    """Employee name aliases from the company directory («Анастасия Докучаева = Анастасия Андрусяк»).
+
+    Kept in the instruction library (ai_instruction_folders) in the documented format: one alias
+    per line, «- имя в созвоне = имя в Битриксе», «#» comments ignored. The agent already reads
+    that directory as text; this reads the SAME source so code and agent agree on who is who.
+    Best-effort: any failure just means no aliases."""
+    now = time.time()
+    if now - float(_NAME_ALIAS_CACHE["at"]) < _NAME_ALIAS_TTL_S and _NAME_ALIAS_CACHE["pairs"]:
+        return list(_NAME_ALIAS_CACHE["pairs"])
+    pairs: list[tuple[str, str]] = []
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT content FROM ai_instruction_folders"
+                    " WHERE content ILIKE %s OR name ILIKE %s", ("%алиас%", "%алиас%"))
+                blocks = [r["content"] or "" for r in cur.fetchall()]
+        for block in blocks:
+            for line in block.splitlines():
+                if line.lstrip().startswith("#") or "=" not in line:
+                    continue
+                m = _ALIAS_LINE_RE.match(line)
+                if not m:
+                    continue
+                left, right = m.group(1).strip(), m.group(2).strip()
+                # Trailing prose after the name («… в нашей оргструктуре.») is not part of it.
+                right = re.split(r"\s+в нашей\b|\s+—|\.$", right)[0].strip(" .")
+                if left and right and len(left) < 80 and len(right) < 80:
+                    pairs.append((left, right))
+    except Exception:  # noqa: BLE001
+        logging.warning("zoom: не удалось прочитать справочник алиасов", exc_info=True)
+        return list(_NAME_ALIAS_CACHE["pairs"])
+    _NAME_ALIAS_CACHE.update({"at": now, "pairs": pairs})
+    return list(pairs)
+def alias_variants(name: str) -> list[set[str]]:
+    """Token sets for a name and every alias it is equivalent to."""
+    base = _speaker_name_tokens(name)
+    variants = [base]
+    if not base:
+        return variants
+    for left, right in name_alias_pairs():
+        lt, rt = _speaker_name_tokens(left), _speaker_name_tokens(right)
+        if not lt or not rt:
+            continue
+        if base == lt and rt not in variants:
+            variants.append(rt)
+        elif base == rt and lt not in variants:
+            variants.append(lt)
+    return variants
 _TRANSCRIPT_SPEAKER_RE = re.compile(r"^\s*(?:\d[\d:.,\s-]*)?([^:\n]{2,60}?)\s*:", re.M)
 def _speakers_from_transcript_text(text: str) -> set[str]:
     """Speaker labels from a plain-text transcript, for calls stored without segments."""
@@ -693,11 +746,12 @@ def participants_heard_in_transcript(
         name = str(person.get("name") or "").strip()
         if not name:
             continue
-        tokens = _speaker_name_tokens(name)
-        # One name must be contained in the other: «Наталья» ⊆ «Наталья Викторовна Горюнова».
-        # A shared first name is NOT enough — «Анастасия Докучаева» (молчала) не должна
-        # проходить по реплике «Анастасии Андрусяк» (созвон 20.07 11:02).
-        if tokens and any(tokens <= st or st <= tokens for st in speaker_tokens):
+        # Match on the name AND on every alias it maps to in the company directory:
+        # «Анастасия Докучаева» и «Анастасия Андрусяк» — один человек, и в расшифровке
+        # она может быть подписана любым из двух. Одного совпавшего имени при этом мало —
+        # «Анастасия Клеблеева» это другой человек, поэтому требуется вложенность имён.
+        variants = alias_variants(name)
+        if any(v and (v <= st or st <= v) for v in variants for st in speaker_tokens):
             heard.append(person)
         else:
             logging.info("zoom: участник «%s» не звучит в расшифровке — исключён из отчёта", name)
