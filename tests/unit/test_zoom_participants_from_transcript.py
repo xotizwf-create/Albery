@@ -32,6 +32,24 @@ def test_word_order_and_case_do_not_matter(heard):
     assert len(heard(participants, segments)) == 1
 
 
+def test_shared_first_name_is_not_enough(heard):
+    """Созвон 20.07 11:02: Анастасия Докучаева молчала, говорила Анастасия Андрусяк.
+    По одному лишь совпавшему имени молчавшего в участники брать нельзя."""
+    participants = [{"name": "Анастасия Андрусяк"}, {"name": "Анастасия Докучаева"},
+                    {"name": "Наталья"}]
+    segments = [{"speaker": "Анастасия Андрусяк", "text": "а"}, {"speaker": "Наталья", "text": "б"}]
+    names = [p["name"] for p in heard(participants, segments)]
+    assert names == ["Анастасия Андрусяк", "Наталья"]
+    assert "Анастасия Докучаева" not in names
+
+
+def test_short_label_matches_full_name(heard):
+    """Расшифровка часто подписывает человека одним именем."""
+    participants = [{"name": "Наталья Викторовна Горюнова"}]
+    segments = [{"speaker": "Наталья", "text": "реплика"}]
+    assert len(heard(participants, segments)) == 1
+
+
 def test_every_speaking_participant_is_kept(heard):
     participants = [{"name": "Евгений Палей"}, {"name": "Наталья Горюнова"}]
     segments = [{"speaker": "Евгений Палей", "text": "а"}, {"speaker": "Наталья", "text": "б"}]

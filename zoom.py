@@ -694,7 +694,10 @@ def participants_heard_in_transcript(
         if not name:
             continue
         tokens = _speaker_name_tokens(name)
-        if any(tokens & st for st in speaker_tokens):
+        # One name must be contained in the other: «Наталья» ⊆ «Наталья Викторовна Горюнова».
+        # A shared first name is NOT enough — «Анастасия Докучаева» (молчала) не должна
+        # проходить по реплике «Анастасии Андрусяк» (созвон 20.07 11:02).
+        if tokens and any(tokens <= st or st <= tokens for st in speaker_tokens):
             heard.append(person)
         else:
             logging.info("zoom: участник «%s» не звучит в расшифровке — исключён из отчёта", name)
