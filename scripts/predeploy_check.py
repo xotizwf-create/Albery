@@ -36,7 +36,8 @@ def changed_files() -> list[str]:
     staged = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=REPO,
                             capture_output=True, text=True)
     names = set((proc.stdout or "").split()) | set((staged.stdout or "").split())
-    return sorted(n for n in names if n.endswith(".py"))
+    # Удалённые файлы тоже попадают в diff — компилировать их нечем.
+    return sorted(n for n in names if n.endswith(".py") and (REPO / n).is_file())
 
 
 def main() -> int:

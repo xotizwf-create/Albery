@@ -649,113 +649,20 @@ ZOOM_TECHNICAL_PARTICIPANT_NAMES = {
     if name.strip()
 }
 ZOOM_SPEAKER_NOISE_NAMES = {"unknown", "speaker", "webvtt", "transcript", "участник", "спикер"}
-def _speaker_name_tokens(value: str) -> set[str]:
-    """Meaningful name words, lowercased — «Погорелова Софья» ~ «Софья Погорелова»."""
-    return {w for w in re.split(r"[^\w]+", str(value or "").lower()) if len(w) > 2}
-_NAME_ALIAS_CACHE: dict[str, Any] = {"at": 0.0, "pairs": []}
-_NAME_ALIAS_TTL_S = 600
-_ALIAS_LINE_RE = re.compile(r"^\s*-\s*(.+?)\s*=>?\s*(.+?)\s*$")
-def name_alias_pairs() -> list[tuple[str, str]]:
-    """Employee name aliases from the company directory («Анастасия Докучаева = Анастасия Андрусяк»).
+def drop_service_participants(participants: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Убрать служебные аккаунты Zoom из списка участников созвона.
 
-    Kept in the instruction library (ai_instruction_folders) in the documented format: one alias
-    per line, «- имя в созвоне = имя в Битриксе», «#» comments ignored. The agent already reads
-    that directory as text; this reads the SAME source so code and agent agree on who is who.
-    Best-effort: any failure just means no aliases."""
-    now = time.time()
-    if now - float(_NAME_ALIAS_CACHE["at"]) < _NAME_ALIAS_TTL_S and _NAME_ALIAS_CACHE["pairs"]:
-        return list(_NAME_ALIAS_CACHE["pairs"])
-    pairs: list[tuple[str, str]] = []
-    try:
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT content FROM ai_instruction_folders"
-                    " WHERE content ILIKE %s OR name ILIKE %s", ("%алиас%", "%алиас%"))
-                blocks = [r["content"] or "" for r in cur.fetchall()]
-        for block in blocks:
-            for line in block.splitlines():
-                if line.lstrip().startswith("#") or "=" not in line:
-                    continue
-                m = _ALIAS_LINE_RE.match(line)
-                if not m:
-                    continue
-                left, right = m.group(1).strip(), m.group(2).strip()
-                # Trailing prose after the name («… в нашей оргструктуре.») is not part of it.
-                right = re.split(r"\s+в нашей\b|\s+—|\.$", right)[0].strip(" .")
-                if left and right and len(left) < 80 and len(right) < 80:
-                    pairs.append((left, right))
-    except Exception:  # noqa: BLE001
-        logging.warning("zoom: не удалось прочитать справочник алиасов", exc_info=True)
-        return list(_NAME_ALIAS_CACHE["pairs"])
-    _NAME_ALIAS_CACHE.update({"at": now, "pairs": pairs})
-    return list(pairs)
-def alias_variants(name: str) -> list[set[str]]:
-    """Token sets for a name and every alias it is equivalent to."""
-    base = _speaker_name_tokens(name)
-    variants = [base]
-    if not base:
-        return variants
-    for left, right in name_alias_pairs():
-        lt, rt = _speaker_name_tokens(left), _speaker_name_tokens(right)
-        if not lt or not rt:
-            continue
-        if base == lt and rt not in variants:
-            variants.append(rt)
-        elif base == rt and lt not in variants:
-            variants.append(lt)
-    return variants
-_TRANSCRIPT_SPEAKER_RE = re.compile(r"^\s*(?:\d[\d:.,\s-]*)?([^:\n]{2,60}?)\s*:", re.M)
-def _speakers_from_transcript_text(text: str) -> set[str]:
-    """Speaker labels from a plain-text transcript, for calls stored without segments."""
-    return {m.strip() for m in _TRANSCRIPT_SPEAKER_RE.findall(text or "") if m.strip()}
-def participants_heard_in_transcript(
-    participants: list[dict[str, Any]] | None,
-    segments: list[dict[str, Any]] | None,
-    transcript_text: str = "",
-) -> list[dict[str, Any]]:
-    """Keep only participants who actually speak in the transcript.
-
-    Zoom's technical log also lists room/service accounts («Координатор», Zoom Rooms), which
-    never say anything. They were reaching the report as «не сопоставлен с оргструктурой,
-    требуется уточнение», so every report carried a phantom participant the owner then had to
-    explain (reported 20.07.2026). Rule from the owner: judge by who is actually heard in the
-    transcript, not by the technical log.
-
-    Service accounts are dropped unconditionally: a room named «Координатор» is never a
-    participant, even when the transcription has not produced speaker labels yet. Beyond that,
-    falls back to the remaining list when nothing is attributed to any speaker (a failed or
-    speaker-less transcription must not erase real participants)."""
-    people = [
-        p for p in (participants or [])
-        if str(p.get("name") or "").strip().lower() not in ZOOM_TECHNICAL_PARTICIPANT_NAMES
-    ]
-    speakers = {
-        str(s.get("speaker") or "").strip()
-        for s in (segments or [])
-        if str(s.get("speaker") or "").strip()
-    }
-    if not speakers:
-        speakers = _speakers_from_transcript_text(transcript_text)
-    speakers = {s for s in speakers if s.lower() not in ZOOM_SPEAKER_NOISE_NAMES}
-    if not speakers or not people:
-        return people
-    speaker_tokens = [_speaker_name_tokens(s) for s in speakers]
-    heard: list[dict[str, Any]] = []
+    В техническом логе Zoom вместе с людьми числится аккаунт зала («Координатор», Zoom Room,
+    рекордер). Человеком он не является, но доходил до отчёта строкой «не сопоставлен с
+    оргструктурой, требуется уточнение» — фантомный участник в каждом созвоне
+    (сообщил владелец 20.07.2026). Ничего, кроме служебных имён, не отбрасываем."""
+    people = list(participants or [])
+    kept = [p for p in people
+            if str(p.get("name") or "").strip().lower() not in ZOOM_TECHNICAL_PARTICIPANT_NAMES]
     for person in people:
-        name = str(person.get("name") or "").strip()
-        if not name:
-            continue
-        # Match on the name AND on every alias it maps to in the company directory:
-        # «Анастасия Докучаева» и «Анастасия Андрусяк» — один человек, и в расшифровке
-        # она может быть подписана любым из двух. Одного совпавшего имени при этом мало —
-        # «Анастасия Клеблеева» это другой человек, поэтому требуется вложенность имён.
-        variants = alias_variants(name)
-        if any(v and (v <= st or st <= v) for v in variants for st in speaker_tokens):
-            heard.append(person)
-        else:
-            logging.info("zoom: участник «%s» не звучит в расшифровке — исключён из отчёта", name)
-    return heard or people
+        if person not in kept:
+            logging.info("zoom: служебный аккаунт «%s» исключён из участников", person.get("name"))
+    return kept
 def zoom_call_row_payload(
     row: dict[str, Any],
     participants: list[dict[str, Any]] | None = None,
@@ -1126,98 +1033,6 @@ def _zoom_ai_analysis(call: dict[str, Any]) -> dict[str, Any]:
     ai_report = raw_json.get("ai_report") if isinstance(raw_json.get("ai_report"), dict) else {}
     analysis = ai_report.get("analysis") if isinstance(ai_report.get("analysis"), dict) else {}
     return analysis if isinstance(analysis, dict) else {}
-def org_user_id_for_name(name: str) -> int | None:
-    """Bitrix id of an employee by a name said on a call, aliases included. None if unclear."""
-    variants = alias_variants(name)
-    if not any(variants):
-        return None
-    try:
-        from app import load_team_members
-        for member in load_team_members():
-            member_tokens = _speaker_name_tokens(member.get("name") or "")
-            if not member_tokens:
-                continue
-            if any(v and (v <= member_tokens or member_tokens <= v) for v in variants):
-                return to_int(member.get("user_id"))
-    except Exception:  # noqa: BLE001
-        logging.warning("zoom: сопоставление «%s» с оргструктурой не удалось", name, exc_info=True)
-    return None
-
-
-def participants_from_tasks_and_leaders(
-    tasks: list[dict[str, Any]] | None,
-    leader_evals: list[dict[str, Any]] | None,
-) -> list[dict[str, Any]]:
-    """Recipients rebuilt from what the report DOES contain — assigned tasks and leader
-    evaluations.
-
-    A report with six tasks on named people is not a report «without recipients», but that is
-    exactly how the dispatch failed on 20.07.2026: the participant list was empty because the
-    model changed the JSON shape, and six ready tasks were never delivered to anyone. Tasks
-    carry the assignee's Bitrix id, so they are a sufficient source on their own."""
-    seen: set[int] = set()
-    people: list[dict[str, Any]] = []
-    for evaluation in leader_evals or []:
-        uid = to_int(evaluation.get("bitrix_user_id"))
-        name = str(evaluation.get("leader_name") or "").strip()
-        if uid and uid not in seen and name:
-            seen.add(uid)
-            people.append({"name": name, "bitrix_user_id": uid, "org_match": "matched",
-                           "is_leader": True, "role_on_call": "host"})
-    for task in tasks or []:
-        uid = to_int(task.get("bitrix_user_id"))
-        name = str(task.get("assignee_name") or "").strip()
-        if uid and uid not in seen and name:
-            seen.add(uid)
-            people.append({"name": name, "bitrix_user_id": uid, "org_match": "matched",
-                           "is_leader": False, "role_on_call": "participant"})
-    if people:
-        logging.info("zoom: получатели восстановлены из задач/оценок — %d чел.", len(people))
-    return people
-
-
-def _same_person(name_a: str, name_b: str) -> bool:
-    """Один и тот же человек с учётом алиасов и коротких подписей."""
-    b_tokens = _speaker_name_tokens(name_b)
-    return bool(b_tokens) and any(v and (v <= b_tokens or b_tokens <= v)
-                                  for v in alias_variants(name_a))
-
-
-def ensure_call_host(
-    participants: list[dict[str, Any]] | None,
-    leader_evals: list[dict[str, Any]] | None,
-    tasks: list[dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    """Гарантирует, что среди участников есть ведущий созвона.
-
-    Карточка с итогами и задачами уходит ТОЛЬКО ведущему; если ведущего в списке нет,
-    рассылка молча не собирает ни одной карточки. Именно так 20.07.2026 пропали шесть готовых
-    задач: модель вернула участников без ролей, все оказались «рядовыми», ведущий не нашёлся.
-    Роль восстанавливается по оценке руководителя (там прямо назван лидер встречи), а если и
-    это не помогло — по назначенным задачам."""
-    people = [dict(p) for p in (participants or [])]
-    if any(str(p.get("role_on_call") or "").lower() == "host" or p.get("is_leader") for p in people):
-        return people
-
-    leader_ids = {to_int(e.get("bitrix_user_id")) for e in (leader_evals or [])}
-    leader_ids.discard(None)
-    leader_names = [str(e.get("leader_name") or "").strip() for e in (leader_evals or []) if e.get("leader_name")]
-    for person in people:
-        uid = to_int(person.get("bitrix_user_id"))
-        name = str(person.get("name") or "")
-        if (uid is not None and uid in leader_ids) or any(_same_person(n, name) for n in leader_names):
-            person["is_leader"] = True
-            person["role_on_call"] = "host"
-            logging.info("zoom: ведущий восстановлен по оценке руководителя — %s", name)
-            return people
-
-    derived = participants_from_tasks_and_leaders(tasks, leader_evals)
-    if derived:
-        known = {to_int(d.get("bitrix_user_id")) for d in derived}
-        return derived + [p for p in people if to_int(p.get("bitrix_user_id")) not in known]
-    return people
-
-
 def zoom_call_participants(call: dict[str, Any]) -> list[dict[str, Any]]:
     """Actual call participants from saved AI reports.
 
@@ -1244,31 +1059,6 @@ def zoom_call_participants(call: dict[str, Any]) -> list[dict[str, Any]]:
         })
     if result:
         return result
-
-    # The model does not always keep the documented shape: on 20.07.2026 it returned
-    # people.participants_matched as a list of plain names instead of actual_participants,
-    # dispatch found no recipients and the whole «Итоги созвона» rollout for that call failed
-    # with 400. Read the alternative shapes instead of losing the participants.
-    for key in ("participants_matched", "participants", "actual_participants_matched"):
-        raw_alt = people.get(key)
-        if not isinstance(raw_alt, list) or not raw_alt:
-            continue
-        for entry in raw_alt:
-            name = (str(entry.get("person_name") or entry.get("raw_name") or "").strip()
-                    if isinstance(entry, dict) else str(entry or "").strip())
-            if not name:
-                continue
-            uid = to_int(entry.get("bitrix_user_id")) if isinstance(entry, dict) else None
-            if uid is None:
-                uid = org_user_id_for_name(name)
-            result.append({
-                "name": name, "bitrix_user_id": uid,
-                "org_match": "matched" if uid else "not_found",
-                "is_leader": bool(entry.get("is_leader")) if isinstance(entry, dict) else False,
-                "role_on_call": "participant",
-            })
-        if result:
-            return result
 
     leaders_present = analysis.get("leaders_present") if isinstance(analysis.get("leaders_present"), list) else []
     for index, leader in enumerate(leaders_present):

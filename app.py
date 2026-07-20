@@ -2365,12 +2365,6 @@ def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = 
     operational_tasks = zoom_call_operational_tasks(call)
     participants = zoom_call_participants(call)
     leader_evals = zoom_call_leader_evaluations(call)
-    if not participants:
-        # Never lose ready tasks because the participant block came out empty: the assignees
-        # of those tasks ARE the recipients (see participants_from_tasks_and_leaders).
-        participants = zoom.participants_from_tasks_and_leaders(operational_tasks, leader_evals)
-    # The card goes to the meeting lead, so a list without a host yields no cards at all.
-    participants = zoom.ensure_call_host(participants, leader_evals, operational_tasks)
     dispatch_summary = format_zoom_dispatch_summary(call)
     cleaned_section = format_zoom_operational_tasks_for_bitrix(operational_tasks)
 
@@ -3112,11 +3106,9 @@ def generate_zoom_call_report_if_needed(call_id: str) -> None:
         "call_id": call.get("id"),
         "topic": call.get("topic"),
         "technical_topic": call.get("technical_topic"),
-        # Only people actually heard in the transcript: Zoom's technical log also lists room
-        # accounts («Координатор»), which used to surface in every report as an unmatched
-        # participant needing clarification.
-        "participants": zoom.participants_heard_in_transcript(
-            call.get("participants"), segments, transcript_text),
+        # Служебные аккаунты Zoom (аккаунт зала «Координатор») людьми не являются и не должны
+        # попадать в отчёт как участник «требуется уточнение».
+        "participants": zoom.drop_service_participants(call.get("participants")),
         "org_context": {
             "users": [
                 {
