@@ -499,7 +499,7 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "use_for": ["people", "roles", "managers", "departments", "Bitrix user ids"],
             },
             "bitrix_tasks": {
-                "tools": ["search_tasks", "get_task_comments", "add_bitrix_task_comment", "create_bitrix_task", "reopen_bitrix_task", "delete_bitrix_task"],
+                "tools": ["search_tasks", "list_overdue_tasks", "get_task_comments", "add_bitrix_task_comment", "create_bitrix_task", "reopen_bitrix_task", "delete_bitrix_task"],
                 "tables": ["bitrix_tasks", "bitrix_task_members", "bitrix_task_snapshots"],
                 "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments", "adding Bitrix task comments", "creating Bitrix tasks with required title/responsible/deadline", "reopening completed tasks with reason/comment", "deleting Bitrix tasks only after exact id lookup and explicit confirmation"],
             },
@@ -3632,6 +3632,81 @@ def normalize_task_comment(item: dict[str, Any], names_by_id: dict[int, str]) ->
 
 
 TASK_DESCRIPTION_PREVIEW_CHARS = 500
+
+# A task counts as done when Bitrix closed it; everything else with a passed deadline is overdue.
+_CLOSED_TASK_STATUSES = ("completed", "closed", "declined")
+
+
+def tool_list_overdue_tasks(args: dict[str, Any]) -> dict[str, Any]:
+    """Tasks whose deadline has passed, optionally limited to the day the deadline fell on.
+
+    search_tasks filters by ACTIVITY date and knows nothing about closure, so the daily
+    overdue report could not be built with it — the agent had to answer «нет данных»
+    (automation #36, 20.07.2026). A deadline is exactly the moment a task becomes overdue,
+    so this is a plain deterministic query, not something the model should reconstruct."""
+    became_from = parse_date_arg(args, "became_overdue_from", required=False)
+    became_to = parse_date_arg(args, "became_overdue_to", required=False)
+    responsible = args.get("responsible_bitrix_user_id")
+    only_open = args.get("only_open", True) is not False
+    limit = parse_limit(args)
+
+    filters = ["t.deadline_at IS NOT NULL", "t.deadline_at < now()"]
+    params: list[Any] = []
+    if became_from:
+        filters.append("(t.deadline_at AT TIME ZONE 'Europe/Moscow')::date >= %s")
+        params.append(became_from)
+    if became_to:
+        filters.append("(t.deadline_at AT TIME ZONE 'Europe/Moscow')::date <= %s")
+        params.append(became_to)
+    if only_open:
+        filters.append("t.closed_at_bitrix IS NULL")
+        filters.append("COALESCE(t.status, '') <> ALL(%s)")
+        params.append(list(_CLOSED_TASK_STATUSES))
+    if responsible not in (None, ""):
+        filters.append("t.responsible_bitrix_user_id = %s")
+        params.append(int(responsible))
+    params.append(limit)
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT t.bitrix_task_id, t.title, t.status, t.status_name, t.deadline_at,
+                       t.closed_at_bitrix,
+                       ru.bitrix_user_id AS responsible_bitrix_user_id,
+                       ru.full_name AS responsible_name,
+                       EXTRACT(day FROM now() - t.deadline_at)::int AS days_overdue
+                FROM bitrix_tasks t
+                LEFT JOIN users ru ON ru.id = t.responsible_id
+                WHERE {' AND '.join(filters)}
+                ORDER BY t.deadline_at
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+    by_responsible: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        row["task_url"] = _task_deep_link(row.get("bitrix_task_id"))
+        by_responsible.setdefault(row.get("responsible_name") or "не назначен", []).append(row)
+
+    return {
+        "items": rows,
+        "total": len(rows),
+        "grouped_by_responsible": [
+            {"responsible_name": name, "count": len(items),
+             "bitrix_task_ids": [i["bitrix_task_id"] for i in items]}
+            for name, items in sorted(by_responsible.items(), key=lambda kv: -len(kv[1]))
+        ],
+        "period": {"became_overdue_from": became_from, "became_overdue_to": became_to,
+                   "only_open": only_open},
+        "display_rule": (
+            "Пустой список — это ДОСТОВЕРНЫЙ ответ «просроченных задач нет», так и напиши; "
+            "не пиши, что данных не хватает. Номер задачи показывай кликабельной ссылкой "
+            "[URL=<task_url>]<номер>[/URL], рядом дедлайн и ответственного."
+        ),
+    }
 
 
 def tool_search_tasks(args: dict[str, Any]) -> dict[str, Any]:
@@ -8606,6 +8681,29 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_search_tasks,
     },
+    "list_overdue_tasks": {
+        "description": (
+            "Просроченные задачи Bitrix: дедлайн уже прошёл, задача не закрыта. Используй для любых "
+            "вопросов и отчётов про просрочку («что просрочено», «кто сорвал сроки», «задачи, ставшие "
+            "просроченными вчера/в пятницу»). Задача становится просроченной В МОМЕНТ дедлайна, поэтому "
+            "«стали просроченными за такой-то день» = became_overdue_from/to на этот день. "
+            "search_tasks для этого НЕ подходит: он фильтрует по дате активности и не знает про закрытие. "
+            "Пустой ответ означает достоверное «просроченных нет» — так и отвечай, это НЕ нехватка данных. "
+            "Результат сгруппирован по ответственным (grouped_by_responsible)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "became_overdue_from": {"type": "string", "description": "YYYY-MM-DD: дедлайн истёк не раньше этого дня (МСК)."},
+                "became_overdue_to": {"type": "string", "description": "YYYY-MM-DD: дедлайн истёк не позже этого дня (МСК)."},
+                "responsible_bitrix_user_id": {"type": "integer", "description": "Только задачи этого ответственного."},
+                "only_open": {"type": "boolean", "description": "Только незакрытые (по умолчанию true). false — включая уже закрытые с опозданием."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_overdue_tasks,
+    },
     "get_task_comments": {
         "description": (
             "Read the discussion/comments of one Bitrix task by bitrix_task_id (from search_tasks). "
@@ -10846,6 +10944,7 @@ CORE_TOOL_NAMES: set[str] = {
     "get_employee_absences",
     # tasks
     "search_tasks",
+    "list_overdue_tasks",
     "get_task_comments",
     "add_bitrix_task_comment",
     "create_bitrix_task",
