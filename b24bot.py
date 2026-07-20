@@ -1142,6 +1142,20 @@ def _b24_bootstrap_all_commands(client_endpoint: str, access_token: str, main_bo
     threading.Thread(target=_do, daemon=True).start()
 
 
+# When this interpreter started. Boot recovery only touches turns older than this, so a turn
+# running right now can never be mistaken for one killed by a restart.
+_PROCESS_STARTED_AT = time.time()
+
+
+def web_process_enabled() -> bool:
+    """True only in the process that actually serves the app (run_5002.py sets the flag).
+
+    Cron scripts, one-off tools and tests import this module too, and process-start routines
+    must not fire there: the hourly daily-sync cron was apologising to live users for turns it
+    had no business touching."""
+    return str(os.getenv("ALBERY_WEB_PROCESS", "")).strip().lower() in {"1", "true", "yes"}
+
+
 def _b24_inflight_register(bot_id: Any, dialog_id: str, agent_slug: str | None, from_user_id: Any,
                            message_id: Any, status_message_id: Any, user_preview: str) -> str | None:
     """Record that a brain turn is starting. Returns the row id (or None on failure — the turn
@@ -1183,13 +1197,21 @@ def _b24_recover_inflight_turns(endpoint: str = "", token: str = "") -> int:
     mid-flight (deploy restart, OOM, crash) — its worker thread died with the process, so the
     user got no answer and a stuck 'typing…'. For each, delete the stale progress message and
     tell that user (as the exact bot they wrote to) to resend, then remove the row. This is the
-    hard guarantee that a killed turn NEVER looks like an eternal hang. Best-effort, never raises."""
+    hard guarantee that a killed turn NEVER looks like an eternal hang. Best-effort, never raises.
+
+    Only turns started BEFORE this process did are considered. A row younger than our own start
+    belongs to a turn running right now in the live app, and apologising for it would interrupt a
+    working conversation: that is exactly what happened 11 times in a month, when the hourly
+    daily-sync cron imported this module and «recovered» live turns of other people
+    (dialogs 14/16/28 — the user got «я перезапустился», while the real agent answered normally)."""
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id::text AS id, bot_id, dialog_id, status_message_id"
-                    " FROM bitrix_inflight_turns ORDER BY started_at"
+                    " FROM bitrix_inflight_turns WHERE started_at < to_timestamp(%s)"
+                    " ORDER BY started_at",
+                    (_PROCESS_STARTED_AT,),
                 )
                 rows = [dict(r) for r in cur.fetchall()]
     except Exception:  # noqa: BLE001
@@ -1238,7 +1260,14 @@ def _b24_startup_register_commands() -> None:
     """On process start, register keyboard commands for ALL bots without waiting for an event, so
     buttons are live immediately after a deploy/restart (not only after the first message). Uses the
     stored app refresh_token to mint a token off-event; best-effort and idempotent (per-bot flags).
-    Also runs the in-flight turn recovery net so any turn cut off by the restart is answered."""
+    Also runs the in-flight turn recovery net so any turn cut off by the restart is answered.
+
+    Runs ONLY in the web process: every cron script and one-off tool imports this module, and
+    firing process-start routines there both spams the portal with command registrations and —
+    worse — used to «recover» turns that were running fine."""
+    if not web_process_enabled():
+        return
+
     def _do() -> None:
         time.sleep(15)  # let the app + DB pool settle after startup
         try:

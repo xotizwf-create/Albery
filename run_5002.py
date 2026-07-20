@@ -3,7 +3,13 @@ import signal
 import threading
 import time
 
-from app import app
+# Marks THIS interpreter as the app server. Process-start routines (bot command registration,
+# recovery of turns killed mid-flight) run only here — cron scripts and tools import the same
+# modules, and firing those routines there interrupted live conversations. Must be set before
+# importing app, because the routines are kicked off at import time.
+os.environ["ALBERY_WEB_PROCESS"] = "1"
+
+from app import app  # noqa: E402
 
 _draining = threading.Event()
 
