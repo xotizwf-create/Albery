@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import re
 import subprocess
@@ -24,6 +25,7 @@ from flask import send_file
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from urllib.parse import unquote
 import requests
 
 from config import (
@@ -711,6 +713,69 @@ def _zoom_export_public_url(filename: str) -> str:
         except Exception:
             host = ""
     return f"https://{host}{path}" if host else path
+def _export_display_name_path(filename: str) -> Path:
+    return ZOOM_EXPORT_DIR / (os.path.basename(filename) + ".name")
+def write_export_display_name(filename: str, display_name: str) -> None:
+    """Remember the human title of an export next to it, so the URL can stay short and ASCII
+    while the browser still saves «Договор оказания услуг.docx»."""
+    try:
+        _export_display_name_path(filename).write_text(display_name, encoding="utf-8")
+    except OSError:
+        logging.warning("export display name not saved for %s", filename, exc_info=True)
+def export_display_name(filename: str) -> str:
+    """Human title for a stored export; falls back to the on-disk name (legacy links)."""
+    safe = os.path.basename(filename)
+    try:
+        name = _export_display_name_path(safe).read_text(encoding="utf-8").strip()
+        if name:
+            return os.path.basename(name)
+    except OSError:
+        pass
+    return safe
+_EXPORT_URL_RE = re.compile(r"/zoom-export/(\d{9,12})/([0-9a-f]{8,32})/([^\s\]\)\"'<>]+)")
+def repair_export_links(text: str) -> str:
+    """Fix download links whose filename no longer matches their signature.
+
+    The model has to reproduce the URL in its answer, and on long links it drops characters
+    (19.07.2026: «…оказания услуг…» arrived as «…оказания слуг…», 18.07: «договор возмездного»
+    → «договозмездного», 14.07: «.xlsx» → «.xls»). The filename is covered by the HMAC, so one
+    lost character turns a live link into a 404 — the user sees a broken link on the first try
+    and a working one after asking again. The token is unforgeable and therefore trustworthy:
+    we re-derive which stored file it was issued for and rebuild the link. Only files that
+    exist in the export dir can be addressed, so this cannot leak anything new."""
+    if not text or "/zoom-export/" not in text:
+        return text
+
+    def _fix(m: re.Match[str]) -> str:
+        expires_s, token, raw_name = m.group(1), m.group(2), m.group(3)
+        expires = int(expires_s)
+        name = os.path.basename(unquote(raw_name))
+        if hmac.compare_digest(token, _zoom_export_token(name, expires)):
+            return m.group(0)  # intact
+        repaired = None
+        try:
+            for path in ZOOM_EXPORT_DIR.iterdir():
+                if not path.is_file() or path.name.endswith(".name"):
+                    continue
+                # The token identifies the file it was issued for — trust it over the text.
+                if hmac.compare_digest(token, _zoom_export_token(path.name, expires)):
+                    repaired = (expires, token, path.name)
+                    break
+            else:
+                # Token damaged instead: if the named file is really there, re-sign it.
+                if name and (ZOOM_EXPORT_DIR / name).is_file():
+                    fresh = int(time.time()) + zoom_export_ttl_seconds()
+                    repaired = (fresh, _zoom_export_token(name, fresh), name)
+        except OSError:
+            logging.warning("repair_export_links: export dir unreadable", exc_info=True)
+        if not repaired:
+            logging.warning("repair_export_links: no stored export matches a damaged link (%s)", raw_name[:80])
+            return m.group(0)
+        exp, tok, fname = repaired
+        logging.info("repair_export_links: rebuilt a damaged download link -> %s", fname)
+        return f"/zoom-export/{exp}/{tok}/{quote(fname)}"
+
+    return _EXPORT_URL_RE.sub(_fix, text)
 def cleanup_zoom_exports() -> int:
     """Delete export files older than the TTL so they don't accumulate on disk.
     Called opportunistically on each new export; safe to call anytime."""
@@ -1065,12 +1130,15 @@ def zoom_export_download(expires_at: int, token: str, filename: str):
         except OSError:
             pass
         abort(404)
+    # The stored name is short and ASCII (so the URL survives being retyped); the human
+    # title lives in a sidecar and is what the browser saves the file as.
+    display_name = export_display_name(safe_name)
     return send_file(
         file_path,
         as_attachment=True,
-        download_name=safe_name,
-        mimetype=(__import__("mimetypes").guess_type(safe_name)[0]
-                  or ("text/markdown; charset=utf-8" if safe_name.lower().endswith((".md", ".markdown"))
+        download_name=display_name,
+        mimetype=(__import__("mimetypes").guess_type(display_name)[0]
+                  or ("text/markdown; charset=utf-8" if display_name.lower().endswith((".md", ".markdown"))
                       else "application/octet-stream")),
     )
 @app.route("/zoom/events/<secret>", methods=["GET", "POST"])

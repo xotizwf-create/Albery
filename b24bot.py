@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import subprocess
 import threading
@@ -41,6 +42,7 @@ from app import (  # noqa: E501 — single home for shared helpers until service
     absolute_bitrix_url,
     app,
     cleanup_zoom_exports,
+    export_display_name,
     first_non_empty,
     flatten_request_payload,
     llm_api_key,
@@ -50,7 +52,9 @@ from app import (  # noqa: E501 — single home for shared helpers until service
     msk_now,
     pg_connect,
     reportlab_font_paths,
+    repair_export_links,
     to_int,
+    write_export_display_name,
 )
 
 # --- Agent access management API (/api/agent-access) --------------------------------------
@@ -973,6 +977,9 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
     format, we retry with an INLINE italic footnote so the answer is always delivered."""
     if not (client_endpoint and access_token and bot_id and dialog_id):
         return None
+    # The model retypes download URLs into its answer and drops characters on long ones,
+    # which breaks the link signature; rebuild such links before the user ever sees them.
+    text = repair_export_links(text)
     text = bb_sanitize(text)
     disclaimer = _b24_disclaimer()
     base: dict[str, Any] = {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text}
@@ -1855,14 +1862,17 @@ def _b24_text_to_pdf(title: str, text: str) -> bytes:
 
 def _b24_save_pdf_export(pdf_bytes: bytes, name: str) -> str:
     """Save a PDF to the export dir and return a public, token-protected, time-limited download URL
-    (reuses the zoom-export token mechanism; the route serves any file in that dir)."""
-    base = re.sub(r"[^\w.\-() а-яёА-ЯЁ]+", "_", str(name or "Документ")).strip() or "Документ"
-    if not base.lower().endswith(".pdf"):
-        base += ".pdf"
-    fname = "%d_%s" % (int(time.time()), base)
+    (reuses the zoom-export token mechanism; the route serves any file in that dir).
+
+    Short ASCII name in the URL, human title in a sidecar — see _b24_save_export."""
+    pretty = re.sub(r"[^\w.\-() а-яёА-ЯЁ]+", "_", str(name or "Документ")).strip() or "Документ"
+    if not pretty.lower().endswith(".pdf"):
+        pretty += ".pdf"
+    fname = "%d_%s.pdf" % (int(time.time()), secrets.token_hex(4))
     ZOOM_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     cleanup_zoom_exports()
     (ZOOM_EXPORT_DIR / fname).write_bytes(pdf_bytes)
+    write_export_display_name(fname, pretty)
     url = _zoom_export_public_url(fname)
     if url.startswith("/"):
         url = "https://mcp.m4s.ru" + url
@@ -2124,13 +2134,20 @@ def _b24_text_to_docx(title: str, text: str) -> bytes:
 
 def _b24_save_export(data: bytes, name: str, ext: str = "pdf") -> str:
     """Save a generated document (pdf/xlsx/docx) to the export dir and return a public,
-    token-protected, time-limited download URL (same mechanism as the PDF export)."""
-    base = re.sub(r"[^\w.\-() а-яёА-ЯЁ]+", "_", str(name or "Документ")).strip() or "Документ"
-    base = re.sub(r"\.(pdf|xlsx|docx)$", "", base, flags=re.I) + "." + ext
-    fname = "%d_%s" % (int(time.time()), base)
+    token-protected, time-limited download URL (same mechanism as the PDF export).
+
+    The file is stored under a SHORT ASCII name and the human title travels in a sidecar,
+    not in the URL. A Russian title used to be percent-encoded into the path (~470 chars)
+    and is covered by the HMAC, so when the model retyped the link into its answer and
+    dropped a single character the signature broke and the user got a 404 (proved
+    19.07.2026 — see docs/playbooks/file-delivery-via-mcp.md)."""
+    pretty = re.sub(r"[^\w.\-() а-яёА-ЯЁ]+", "_", str(name or "Документ")).strip() or "Документ"
+    pretty = re.sub(r"\.(pdf|xlsx|docx)$", "", pretty, flags=re.I) + "." + ext
+    fname = "%d_%s.%s" % (int(time.time()), secrets.token_hex(4), ext)
     ZOOM_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     cleanup_zoom_exports()
     (ZOOM_EXPORT_DIR / fname).write_bytes(data)
+    write_export_display_name(fname, pretty)
     url = _zoom_export_public_url(fname)
     if url.startswith("/"):
         url = "https://mcp.m4s.ru" + url
@@ -2540,8 +2557,11 @@ def _b24_capture_generated_doc(dialog_id: str, agent_slug: str | None, from_user
             if not (text or "").strip():
                 continue
             import attachments as _att
+            # Store the human title, not the short on-disk name: it is quoted back to the
+            # agent next turn as «ТВОЙ ПОСЛЕДНИЙ СОЗДАННЫЙ ДОКУМЕНТ «…»».
             _att.store_attachment(
-                data=b"", file_name=fname, kind="agent_doc", extracted_text=text[:60000],
+                data=b"", file_name=export_display_name(fname), kind="agent_doc",
+                extracted_text=text[:60000],
                 agent_slug=agent_slug, dialog_id=str(dialog_id or ""), bitrix_user_id=from_user_id)
     except Exception:  # noqa: BLE001
         logging.warning("b24 testbot: generated-doc capture failed dlg=%s", dialog_id, exc_info=True)
