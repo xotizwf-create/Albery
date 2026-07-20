@@ -147,3 +147,44 @@ def test_codex_absent_binary_is_safe(app_module, monkeypatch):
                         lambda name: None, raising=False)
     # even without the binary the call must not raise
     assert isinstance(b24bot._b24_vision_ocr_codex(b"PNG", "s.png"), str)
+
+
+def test_unauthenticated_codex_fails_fast(app_module, monkeypatch):
+    """Незалогиненный codex переподключается 20 секунд — пользователь столько ждать не должен."""
+    import b24bot
+
+    b24bot._B24_CODEX_AUTH_CACHE.update({"at": 0.0, "ok": False})
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "Not logged in"
+        stderr = ""
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/codex")
+    monkeypatch.setattr(b24bot.subprocess, "run",
+                        lambda *a, **k: calls.append(a[0]) or _Proc())
+
+    assert b24bot._b24_vision_ocr_codex(b"PNG", "s.png") == ""
+    assert calls and calls[0][:3] == ["codex", "login", "status"], "сначала дешёвая проверка входа"
+    assert all("exec" not in c for c in calls), "тяжёлый вызов не запускается"
+
+
+def test_codex_auth_verdict_is_cached(app_module, monkeypatch):
+    import b24bot
+
+    b24bot._B24_CODEX_AUTH_CACHE.update({"at": 0.0, "ok": False})
+    runs = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "Not logged in"
+        stderr = ""
+
+    monkeypatch.setattr(b24bot.subprocess, "run", lambda *a, **k: runs.append(1) or _Proc())
+
+    b24bot._b24_codex_logged_in()
+    b24bot._b24_codex_logged_in()
+    b24bot._b24_codex_logged_in()
+
+    assert len(runs) == 1, "проверка входа кешируется, а не дёргается на каждую картинку"

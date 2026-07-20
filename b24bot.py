@@ -1762,6 +1762,31 @@ _B24_VISION_PROMPT = (
 )
 
 
+_B24_CODEX_AUTH_CACHE: dict[str, Any] = {"at": 0.0, "ok": False}
+_B24_CODEX_AUTH_TTL_S = int(os.getenv("B24_CODEX_AUTH_TTL_S", "600") or "600")
+
+
+def _b24_codex_logged_in() -> bool:
+    """Залогинен ли codex на этом сервере (ответ кешируется).
+
+    Без проверки каждая картинка стоила бы ~20 секунд: незалогиненный codex пять раз
+    переподключается к websocket и только потом отдаёт 401. Пользователь ждать этого не должен."""
+    now = time.time()
+    if now - float(_B24_CODEX_AUTH_CACHE["at"]) < _B24_CODEX_AUTH_TTL_S:
+        return bool(_B24_CODEX_AUTH_CACHE["ok"])
+    ok = False
+    try:
+        proc = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=20)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        ok = proc.returncode == 0 and "not logged in" not in out.lower()
+    except Exception:  # noqa: BLE001
+        ok = False
+    _B24_CODEX_AUTH_CACHE.update({"at": now, "ok": ok})
+    if not ok:
+        logging.info("b24 vision: codex не залогинен — распознавание идёт запасным провайдером")
+    return ok
+
+
 def _b24_vision_ocr_codex(image_bytes: bytes, name: str = "") -> str:
     """Распознать картинку СВОИМ агентом на Codex (тот же аккаунт, что и мозг).
 
@@ -1772,6 +1797,8 @@ def _b24_vision_ocr_codex(image_bytes: bytes, name: str = "") -> str:
     import tempfile
 
     if not image_bytes or not shutil.which("codex"):
+        return ""
+    if not _b24_codex_logged_in():
         return ""
     ext = (name.rsplit(".", 1)[-1] if "." in name else "png").lower()
     if ext not in {"png", "jpg", "jpeg", "gif", "webp"}:
