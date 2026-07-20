@@ -649,6 +649,44 @@ ZOOM_TECHNICAL_PARTICIPANT_NAMES = {
     if name.strip()
 }
 ZOOM_SPEAKER_NOISE_NAMES = {"unknown", "speaker", "webvtt", "transcript", "участник", "спикер"}
+def _speaker_name_tokens(value: str) -> set[str]:
+    """Meaningful name words, lowercased — «Погорелова Софья» ~ «Софья Погорелова»."""
+    return {w for w in re.split(r"[^\w]+", str(value or "").lower()) if len(w) > 2}
+def participants_heard_in_transcript(
+    participants: list[dict[str, Any]] | None,
+    segments: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Keep only participants who actually speak in the transcript.
+
+    Zoom's technical log also lists room/service accounts («Координатор», Zoom Rooms), which
+    never say anything. They were reaching the report as «не сопоставлен с оргструктурой,
+    требуется уточнение», so every report carried a phantom participant the owner then had to
+    explain (reported 20.07.2026). Rule from the owner: judge by who is actually heard in the
+    transcript, not by the technical log.
+
+    Falls back to the original list when nothing is attributed to any speaker (a failed or
+    speaker-less transcription must not erase real participants)."""
+    people = list(participants or [])
+    speakers = {
+        str(s.get("speaker") or "").strip()
+        for s in (segments or [])
+        if str(s.get("speaker") or "").strip()
+    }
+    speakers = {s for s in speakers if s.lower() not in ZOOM_SPEAKER_NOISE_NAMES}
+    if not speakers or not people:
+        return people
+    speaker_tokens = [_speaker_name_tokens(s) for s in speakers]
+    heard: list[dict[str, Any]] = []
+    for person in people:
+        name = str(person.get("name") or "").strip()
+        if not name:
+            continue
+        tokens = _speaker_name_tokens(name)
+        if any(tokens & st for st in speaker_tokens):
+            heard.append(person)
+        else:
+            logging.info("zoom: участник «%s» не звучит в расшифровке — исключён из отчёта", name)
+    return heard or people
 def zoom_call_row_payload(
     row: dict[str, Any],
     participants: list[dict[str, Any]] | None = None,

@@ -3106,7 +3106,10 @@ def generate_zoom_call_report_if_needed(call_id: str) -> None:
         "call_id": call.get("id"),
         "topic": call.get("topic"),
         "technical_topic": call.get("technical_topic"),
-        "participants": call.get("participants") or [],
+        # Only people actually heard in the transcript: Zoom's technical log also lists room
+        # accounts («Координатор»), which used to surface in every report as an unmatched
+        # participant needing clarification.
+        "participants": zoom.participants_heard_in_transcript(call.get("participants"), segments),
         "org_context": {
             "users": [
                 {
