@@ -1746,36 +1746,128 @@ def _b24_groq_api_key() -> str:
     return ""
 
 
+# Модели зрения перебираются по порядку: провайдер снимает их с обслуживания без предупреждения,
+# и жёстко зашитая модель однажды просто перестаёт существовать. 20.07.2026 так и вышло —
+# llama-4-scout вернула model_not_found, картинка Натальи распозналась в ноль символов, и агент
+# просто не увидел присланный скриншот.
+_B24_VISION_MODELS = [m.strip() for m in os.getenv(
+    "B24_VISION_MODELS", "qwen/qwen3.6-27b,meta-llama/llama-4-scout-17b-16e-instruct").split(",") if m.strip()]
+_B24_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.S | re.I)
+
+
+_B24_VISION_PROMPT = (
+    "Это изображение/скриншот, который пользователь прислал ассистенту в чате. Извлеки ВЕСЬ "
+    "текст с него ДОСЛОВНО, а затем кратко (1-2 предложения) опиши, что на нём и какая может "
+    "быть проблема/смысл. Ответь по-русски, без лишних вступлений и без рассуждений."
+)
+
+
+def _b24_vision_ocr_codex(image_bytes: bytes, name: str = "") -> str:
+    """Распознать картинку СВОИМ агентом на Codex (тот же аккаунт, что и мозг).
+
+    Владелец 20.07.2026: «может давать расшифровку фото просто нашему агенту на кодексе, а не
+    на других нейронках». codex CLI умеет `-i/--image`; если аккаунт на этом сервере не
+    залогинен (`codex login`), вызов честно падает и работает запасной провайдер."""
+    import shutil
+    import tempfile
+
+    if not image_bytes or not shutil.which("codex"):
+        return ""
+    ext = (name.rsplit(".", 1)[-1] if "." in name else "png").lower()
+    if ext not in {"png", "jpg", "jpeg", "gif", "webp"}:
+        ext = "png"
+    tmp = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="b24_ocr_", suffix="." + ext, delete=False) as fh:
+            fh.write(image_bytes)
+            tmp = fh.name
+        timeout_s = int(os.getenv("B24_VISION_CODEX_TIMEOUT_S", "120") or "120")
+        proc = subprocess.run(
+            ["codex", "exec", "-i", tmp, "--skip-git-repo-check", _B24_VISION_PROMPT],
+            capture_output=True, text=True, timeout=timeout_s, cwd="/tmp")
+        out = (proc.stdout or "")
+        if proc.returncode != 0 or "Not logged in" in out or "401 Unauthorized" in out:
+            logging.warning("b24 vision OCR: codex недоступен (rc=%s) — нужен `codex login` на сервере",
+                            proc.returncode)
+            return ""
+        # codex exec печатает служебные строки; берём осмысленный хвост ответа
+        lines = [ln for ln in out.splitlines()
+                 if ln.strip() and not ln.lstrip().startswith(("[", "ERROR", "warning:", "20"))]
+        return _B24_THINK_RE.sub("", "\n".join(lines)).strip()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("b24 vision OCR: codex не сработал: %s", repr(exc)[:200])
+        return ""
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def _b24_vision_ocr(image_bytes: bytes, name: str = "") -> str:
-    """OCR/describe an image with Groq vision. NOTE: api.groq.com blocks urllib's default
-    User-Agent with Cloudflare 1010 — a browser UA passes (same gotcha as the STT path)."""
+    """Распознать изображение. Порядок провайдеров — B24_VISION_ORDER (по умолчанию сначала наш
+    агент на Codex, затем Groq).
+
+    NOTE: api.groq.com blocks urllib's default User-Agent with Cloudflare 1010 — a browser UA
+    passes (same gotcha as the STT path).
+
+    Модели Groq перебираются по списку: если провайдер снял модель (404 model_not_found), берём
+    следующую, а не остаёмся слепыми. Пустая строка означает «прочитать не удалось» — вызывающий
+    обязан сказать об этом агенту, иначе картинка молча исчезнет из разговора."""
+    if not image_bytes:
+        return ""
+    order = [p.strip().lower() for p in os.getenv("B24_VISION_ORDER", "codex,groq").split(",") if p.strip()]
+    for provider in order:
+        if provider == "codex":
+            text = _b24_vision_ocr_codex(image_bytes, name)
+            if text:
+                return text
+        elif provider == "groq":
+            text = _b24_vision_ocr_groq(image_bytes, name)
+            if text:
+                return text
+    return ""
+
+
+def _b24_vision_ocr_groq(image_bytes: bytes, name: str = "") -> str:
+    """Запасной провайдер распознавания — Groq."""
     key = _b24_groq_api_key()
     if not key or not image_bytes:
         return ""
     ext = (name.rsplit(".", 1)[-1] if "." in name else "png").lower()
     mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif", "webp": "webp"}.get(ext, "png")
     b64 = base64.b64encode(image_bytes).decode()
-    payload = {
-        "model": os.getenv("B24_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
-        "max_tokens": 800, "temperature": 0,
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "Это изображение/скриншот, который пользователь прислал ассистенту "
-             "в чате. Извлеки ВЕСЬ текст с него ДОСЛОВНО, а затем кратко (1-2 предложения) опиши, что на "
-             "нём и какая может быть проблема/смысл. Ответь по-русски, без лишних вступлений."},
-            {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}}]}],
-    }
-    try:
-        req = urllib.request.Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
-                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        with urllib.request.urlopen(req, timeout=70) as r:
-            d = json.loads(r.read().decode("utf-8", "ignore"))
-        return ((d.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "").strip()
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("b24 vision OCR failed: %s", repr(exc)[:200])
-        return ""
+    last_error = ""
+    for model in _B24_VISION_MODELS:
+        payload = {
+            "model": model,
+            "max_tokens": 800, "temperature": 0,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": _B24_VISION_PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}}]}],
+        }
+        try:
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=70) as r:
+                d = json.loads(r.read().decode("utf-8", "ignore"))
+            text = ((d.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "")
+            # Рассуждающие модели отдают <think>…</think> — читателю это мусор.
+            text = _B24_THINK_RE.sub("", text or "").strip()
+            if text:
+                if model != _B24_VISION_MODELS[0]:
+                    logging.warning("b24 vision OCR: сработала запасная модель %s", model)
+                return text
+            last_error = "пустой ответ модели " + model
+        except Exception as exc:  # noqa: BLE001
+            last_error = repr(exc)[:200]
+            logging.warning("b24 vision OCR: модель %s не сработала: %s", model, last_error)
+    logging.warning("b24 vision OCR failed на всех моделях (%s): %s", len(_B24_VISION_MODELS), last_error)
+    return ""
 
 
 def _b24_transcribe_audio(audio_bytes: bytes, name: str = "") -> str:
@@ -2582,6 +2674,13 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
             token = _store("image", txt)
             if txt:
                 image_texts.append(txt)
+            else:
+                # Молчать нельзя: иначе агент отвечает так, будто картинки и не было, а человек
+                # видит, что прислал скрин (20.07.2026 — скриншот Натальи распознался в ноль).
+                image_texts.append(
+                    f"(⚠️ Изображение «{name or 'image'}» прислано, но распознать его не удалось. "
+                    "Не делай вид, что картинки не было: скажи пользователю, что скрин не "
+                    "прочитался, и попроси прислать его текстом или повторить.)")
             if token:
                 attachments.append({"token": token, "name": name or "image",
                                     "kind": "image", "char_len": len(txt or "")})
