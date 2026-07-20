@@ -3109,7 +3109,8 @@ def generate_zoom_call_report_if_needed(call_id: str) -> None:
         # Only people actually heard in the transcript: Zoom's technical log also lists room
         # accounts («Координатор»), which used to surface in every report as an unmatched
         # participant needing clarification.
-        "participants": zoom.participants_heard_in_transcript(call.get("participants"), segments),
+        "participants": zoom.participants_heard_in_transcript(
+            call.get("participants"), segments, transcript_text),
         "org_context": {
             "users": [
                 {

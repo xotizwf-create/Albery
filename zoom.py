@@ -652,9 +652,14 @@ ZOOM_SPEAKER_NOISE_NAMES = {"unknown", "speaker", "webvtt", "transcript", "уч�
 def _speaker_name_tokens(value: str) -> set[str]:
     """Meaningful name words, lowercased — «Погорелова Софья» ~ «Софья Погорелова»."""
     return {w for w in re.split(r"[^\w]+", str(value or "").lower()) if len(w) > 2}
+_TRANSCRIPT_SPEAKER_RE = re.compile(r"^\s*(?:\d[\d:.,\s-]*)?([^:\n]{2,60}?)\s*:", re.M)
+def _speakers_from_transcript_text(text: str) -> set[str]:
+    """Speaker labels from a plain-text transcript, for calls stored without segments."""
+    return {m.strip() for m in _TRANSCRIPT_SPEAKER_RE.findall(text or "") if m.strip()}
 def participants_heard_in_transcript(
     participants: list[dict[str, Any]] | None,
     segments: list[dict[str, Any]] | None,
+    transcript_text: str = "",
 ) -> list[dict[str, Any]]:
     """Keep only participants who actually speak in the transcript.
 
@@ -664,14 +669,21 @@ def participants_heard_in_transcript(
     explain (reported 20.07.2026). Rule from the owner: judge by who is actually heard in the
     transcript, not by the technical log.
 
-    Falls back to the original list when nothing is attributed to any speaker (a failed or
+    Service accounts are dropped unconditionally: a room named «Координатор» is never a
+    participant, even when the transcription has not produced speaker labels yet. Beyond that,
+    falls back to the remaining list when nothing is attributed to any speaker (a failed or
     speaker-less transcription must not erase real participants)."""
-    people = list(participants or [])
+    people = [
+        p for p in (participants or [])
+        if str(p.get("name") or "").strip().lower() not in ZOOM_TECHNICAL_PARTICIPANT_NAMES
+    ]
     speakers = {
         str(s.get("speaker") or "").strip()
         for s in (segments or [])
         if str(s.get("speaker") or "").strip()
     }
+    if not speakers:
+        speakers = _speakers_from_transcript_text(transcript_text)
     speakers = {s for s in speakers if s.lower() not in ZOOM_SPEAKER_NOISE_NAMES}
     if not speakers or not people:
         return people

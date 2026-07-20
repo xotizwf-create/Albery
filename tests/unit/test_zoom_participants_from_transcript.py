@@ -38,11 +38,34 @@ def test_every_speaking_participant_is_kept(heard):
     assert len(heard(participants, segments)) == 2
 
 
-def test_transcript_without_speakers_keeps_everyone(heard):
+def test_transcript_without_speakers_keeps_real_people(heard):
     """A speaker-less transcription must not erase real participants."""
     participants = [{"name": "Погорелова Софья"}, {"name": "Наталья"}]
     segments = [{"speaker": "", "text": "сплошной текст"}]
     assert len(heard(participants, segments)) == 2
+
+
+def test_room_account_is_dropped_even_without_any_transcript(heard):
+    """Созвон 20.07 11:02: расшифровка ещё без спикеров, а «Координатор» уже в логе Zoom."""
+    participants = [{"name": "Анастасия Докучаева"}, {"name": "Дмитрий Строгонов"},
+                    {"name": "Координатор"}, {"name": "Оксана Хапова"}]
+    names = [p["name"] for p in heard(participants, [])]
+    assert "Координатор" not in names
+    assert len(names) == 3, "остальных участников трогать нельзя"
+
+
+def test_other_service_accounts_are_dropped_too(heard):
+    participants = [{"name": "Наталья"}, {"name": "Zoom Room"}, {"name": "Recorder"}]
+    assert [p["name"] for p in heard(participants, [])] == ["Наталья"]
+
+
+def test_speakers_are_read_from_plain_text_transcript(heard):
+    """Некоторые созвоны хранятся текстом без сегментов — спикеров берём из него."""
+    participants = [{"name": "Погорелова Софья"}, {"name": "Наталья"}, {"name": "Артур Степанян"}]
+    text = "00:01:00 Наталья: корзин двадцать тысяч\n00:02:02 Погорелова Софья: СПП растёт"
+    names = [p["name"] for p in heard(participants, [], text)]
+    assert names == ["Погорелова Софья", "Наталья"]
+    assert "Артур Степанян" not in names
 
 
 def test_no_segments_keeps_everyone(heard):
