@@ -3797,12 +3797,28 @@ def _albery_bitrix_notify(text: str, dialog_id: str | None = None, *,
             return False, str(exc)[:300]
     if not (client_endpoint and access_token and bot_id and dialog_id):
         return False, "bitrix bot token/chat not bootstrapped yet"
-    try:
-        _b24_app_call(client_endpoint, access_token, "imbot.message.add",
-                      {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text})
-        return True, None
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)[:300]
+    # The portal occasionally answers a perfectly valid send with HTTP 500
+    # (INTERNAL_SERVER_ERROR): on 20.07.2026 three people silently never got their check-in
+    # message, and minutes later the very same channel worked. A short retry turns such a
+    # blip into a delivered message instead of a lost one; a 500 means the portal did not
+    # accept the message, so a retry does not duplicate it.
+    last_error = ""
+    for attempt, pause in enumerate((1, 3, 0), start=1):
+        try:
+            _b24_app_call(client_endpoint, access_token, "imbot.message.add",
+                          {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text})
+            if attempt > 1:
+                logging.info("b24 notify: доставлено с попытки %d (диалог %s)", attempt, dialog_id)
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)[:300]
+            transient = any(m in last_error for m in ("HTTP 5", "INTERNAL_SERVER_ERROR",
+                                                      "timed out", "Timeout", "Connection"))
+            if not transient or not pause:
+                break
+            logging.warning("b24 notify: временная ошибка (%s), повтор через %d с", last_error[:120], pause)
+            time.sleep(pause)
+    return False, last_error
 
 
 def _b24_user_name(client_endpoint: str, access_token: str, user_id: Any) -> str:

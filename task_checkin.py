@@ -326,6 +326,11 @@ _NUDGE_DM = (
 _NUDGE_EVERY_H = int(os.getenv("B24_CHECKIN_NUDGE_HOURS", "72"))  # раз в 3 дня
 
 
+# Сообщения, которые не удалось доставить в этом прогоне. Молчаливая потеря личного сообщения
+# незаметна никому: 20.07.2026 трое не получили обход задач, и это осталось только в логе.
+_UNDELIVERED: list[str] = []
+
+
 def _send_dms(offers_by_user: dict[int, list[dict[str, Any]]], main_bot_id: Any) -> list[str]:
     """Offer-DMs; returns the recipients' names (for the owner's report)."""
     import b24bot
@@ -358,6 +363,7 @@ def _send_dms(offers_by_user: dict[int, list[dict[str, Any]]], main_bot_id: Any)
                             "last_dm_at = now(), updated_at = now()", (uid,))
             else:
                 logging.warning("task checkin: DM to %s failed: %s", uid, err)
+                _UNDELIVERED.append(f"{directory.get(uid, {}).get('name') or uid}: {str(err)[:80]}")
         except Exception:  # noqa: BLE001
             logging.warning("task checkin: DM flow failed uid=%s", uid, exc_info=True)
     return sent
@@ -402,6 +408,7 @@ def _send_nudges(exclude_uids: set[int], main_bot_id: Any) -> list[str]:
                 logging.warning("task checkin: nudge stamp failed uid=%s", uid, exc_info=True)
         else:
             logging.warning("task checkin: nudge to %s failed: %s", uid, err)
+            _UNDELIVERED.append(f"{r.get('full_name') or uid}: {str(err)[:80]}")
     return nudged
 
 
@@ -426,6 +433,9 @@ def _report_to_owner(report: dict[str, Any], offers_by_user: dict[int, list[dict
         lines.append("Отписался в ЛС: " + ", ".join(dm_names))
     if nudged:
         lines.append("Напомнил о себе (пока не работают с агентом): " + ", ".join(nudged))
+    if _UNDELIVERED:
+        lines.append("[b]⚠️ Не доставлено[/b] (портал вернул ошибку, сообщения потеряны): "
+                     + "; ".join(_UNDELIVERED))
     st = report.get("filter_stats") or {}
     lines.append(f"Статистика: задач {report.get('scanned', 0)}, прошли фильтры "
                  f"{report.get('passed_filters', 0)}, отобрано {report.get('offers_posted', 0)}; "
@@ -445,6 +455,7 @@ def run_checkin(*, dry_run: bool = False, only_users: set[int] | None = None,
     posting to these responsibles (careful live tests); force = ignore the daily claim."""
     import b24bot
     from task_offers import _post_offer
+    _UNDELIVERED.clear()  # счётчик потерь этого прогона
     report: dict[str, Any] = {"dry_run": dry_run}
     if not force and not dry_run:
         try:
