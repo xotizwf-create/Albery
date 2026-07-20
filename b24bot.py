@@ -1448,6 +1448,53 @@ def _b24_summarize_segment(dialog_id: str, agent_slug: str | None = None) -> str
         return None
 
 
+# Linux не позволяет передать одному аргументу командной строки больше 128 КБ (MAX_ARG_STRLEN),
+# а промпт уходит в argv команды hermes. У агента-юриста диалог с вшитыми документами перевалил
+# за лимит, и ход падал мгновенно: «[Errno 7] Argument list too long: 'hermes'»
+# (20.07.2026, диалог 16). Держим запас до лимита.
+_B24_PROMPT_MAX_BYTES = int(os.getenv("B24_PROMPT_MAX_BYTES", "100000") or "100000")
+_B24_PROMPT_CUT_NOTE = ("\n\n[…контекст сокращён, чтобы уложиться в лимит запуска. Полный текст "
+                        "документа бери инструментом get_attachment_text(attachment_id, offset).]")
+
+
+def _b24_fit_prompt(parts: list[str], limit: int = 0) -> str:
+    """Собрать промпт из блоков, уложившись в лимит одного аргумента командной строки.
+
+    Текущее сообщение пользователя (последний блок) не урезается — режутся самые большие
+    предыдущие блоки: история диалога и вшитые тексты документов. Иначе процесс вообще не
+    стартует, и пользователь получает мгновенную ошибку вместо ответа."""
+    limit = limit or _B24_PROMPT_MAX_BYTES
+    blocks = [str(p or "") for p in (parts or []) if str(p or "").strip()]
+    if not blocks:
+        return ""
+    sep = "\n\n"
+
+    def size(bs: list[str]) -> int:
+        return len(sep.join(bs).encode("utf-8"))
+
+    if size(blocks) <= limit:
+        return sep.join(blocks)
+
+    original = size(blocks)
+    while size(blocks) > limit and len(blocks) > 1:
+        idx = max(range(len(blocks) - 1), key=lambda i: len(blocks[i].encode("utf-8")))
+        raw = blocks[idx].encode("utf-8")
+        if len(raw) <= 2000:
+            break
+        blocks[idx] = raw[: max(1000, len(raw) // 2)].decode("utf-8", "ignore") + _B24_PROMPT_CUT_NOTE
+
+    out = sep.join(blocks)
+    if len(out.encode("utf-8")) > limit:
+        # Крайний случай: даже само сообщение пользователя не помещается — сохраняем его хвост.
+        # Место под пояснение резервируем заранее, иначе снова вылезем за лимит.
+        prefix = "[…предыдущий контекст опущен: не помещается в лимит запуска…]\n\n"
+        room = max(0, limit - len(prefix.encode("utf-8")))
+        out = prefix + blocks[-1].encode("utf-8")[-room:].decode("utf-8", "ignore")
+    logging.warning("b24: промпт сокращён %d -> %d байт (лимит %d)",
+                    original, len(out.encode("utf-8")), limit)
+    return out
+
+
 def _b24_notify_session_reset(dialog_id: str, agent_slug: str | None = None, late: bool = False) -> None:
     """A session reset must never be silent (owner 2026-07-16): tell the user in the SAME dialog,
     from the SAME agent's bot, how to bring old context back. Two modes (owner 2026-07-17 — the
@@ -1471,15 +1518,14 @@ def _b24_notify_session_reset(dialog_id: str, agent_slug: str | None = None, lat
         client_endpoint, access_token = _b24_app_access_token()
         if not (client_endpoint and access_token and bot_id):
             return
-        hours = max(1, B24_IDLE_RESET_SECONDS // 3600)
         if late:
-            msg = ("🔄 Ваше сообщение начало новый разговор: с прошлого сообщения прошло больше "
-                   f"{hours} ч, поэтому контекст прежней беседы закрыт. Я работаю штатно и уже "
-                   "отвечаю. Чтобы вернуть старую тему, нажмите «Ответить» на нужном сообщении.")
-        else:
-            msg = (f"⏸️ Больше {hours} ч без новых сообщений — этот разговор завершён, его контекст "
-                   "закрыт. Следующее сообщение начнёт новый разговор с чистого листа. Чтобы "
-                   "продолжить старую тему, нажмите «Ответить» на нужном сообщении.")
+            # Владелец 2026-07-20: догоняющий баннер «ваше сообщение начало новый разговор» —
+            # лишний флуд. Пользователю достаточно одного предупреждения от планового обхода.
+            return
+        hours = max(1, B24_IDLE_RESET_SECONDS // 3600)
+        msg = (f"⏸️ Больше {hours} ч без новых сообщений — этот разговор завершён, его контекст "
+               "закрыт. Следующее сообщение начнёт новый разговор с чистого листа. Чтобы "
+               "продолжить старую тему, нажмите «Ответить» на нужном сообщении.")
         _b24_app_call(client_endpoint, access_token, "imbot.message.add", {
             "BOT_ID": bot_id, "DIALOG_ID": d, "MESSAGE": msg,
         })
@@ -3357,7 +3403,7 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         convo = "\n".join(f"Пользователь: {_clip(q, 6000)}\nАссистент: {_clip(a, 3000)}" for q, a in history)
         parts.append("История этого диалога (предыдущие реплики, помни их):\n" + convo)
     parts.append("Текущее сообщение пользователя:\n" + user_text)
-    prompt = "\n\n".join(parts)
+    prompt = _b24_fit_prompt(parts)
     # Hermes >=0.17 actually RESUMES a named --continue session (0.14 one-shots never did).
     # Our only memory channel is the prompt-injected history above; a resumed session would
     # duplicate it AND replay every past tool result into each turn's context (compression is
