@@ -1126,6 +1126,56 @@ def _zoom_ai_analysis(call: dict[str, Any]) -> dict[str, Any]:
     ai_report = raw_json.get("ai_report") if isinstance(raw_json.get("ai_report"), dict) else {}
     analysis = ai_report.get("analysis") if isinstance(ai_report.get("analysis"), dict) else {}
     return analysis if isinstance(analysis, dict) else {}
+def org_user_id_for_name(name: str) -> int | None:
+    """Bitrix id of an employee by a name said on a call, aliases included. None if unclear."""
+    variants = alias_variants(name)
+    if not any(variants):
+        return None
+    try:
+        from app import load_team_members
+        for member in load_team_members():
+            member_tokens = _speaker_name_tokens(member.get("name") or "")
+            if not member_tokens:
+                continue
+            if any(v and (v <= member_tokens or member_tokens <= v) for v in variants):
+                return to_int(member.get("user_id"))
+    except Exception:  # noqa: BLE001
+        logging.warning("zoom: сопоставление «%s» с оргструктурой не удалось", name, exc_info=True)
+    return None
+
+
+def participants_from_tasks_and_leaders(
+    tasks: list[dict[str, Any]] | None,
+    leader_evals: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Recipients rebuilt from what the report DOES contain — assigned tasks and leader
+    evaluations.
+
+    A report with six tasks on named people is not a report «without recipients», but that is
+    exactly how the dispatch failed on 20.07.2026: the participant list was empty because the
+    model changed the JSON shape, and six ready tasks were never delivered to anyone. Tasks
+    carry the assignee's Bitrix id, so they are a sufficient source on their own."""
+    seen: set[int] = set()
+    people: list[dict[str, Any]] = []
+    for evaluation in leader_evals or []:
+        uid = to_int(evaluation.get("bitrix_user_id"))
+        name = str(evaluation.get("leader_name") or "").strip()
+        if uid and uid not in seen and name:
+            seen.add(uid)
+            people.append({"name": name, "bitrix_user_id": uid, "org_match": "matched",
+                           "is_leader": True, "role_on_call": "host"})
+    for task in tasks or []:
+        uid = to_int(task.get("bitrix_user_id"))
+        name = str(task.get("assignee_name") or "").strip()
+        if uid and uid not in seen and name:
+            seen.add(uid)
+            people.append({"name": name, "bitrix_user_id": uid, "org_match": "matched",
+                           "is_leader": False, "role_on_call": "participant"})
+    if people:
+        logging.info("zoom: получатели восстановлены из задач/оценок — %d чел.", len(people))
+    return people
+
+
 def zoom_call_participants(call: dict[str, Any]) -> list[dict[str, Any]]:
     """Actual call participants from saved AI reports.
 
@@ -1152,6 +1202,31 @@ def zoom_call_participants(call: dict[str, Any]) -> list[dict[str, Any]]:
         })
     if result:
         return result
+
+    # The model does not always keep the documented shape: on 20.07.2026 it returned
+    # people.participants_matched as a list of plain names instead of actual_participants,
+    # dispatch found no recipients and the whole «Итоги созвона» rollout for that call failed
+    # with 400. Read the alternative shapes instead of losing the participants.
+    for key in ("participants_matched", "participants", "actual_participants_matched"):
+        raw_alt = people.get(key)
+        if not isinstance(raw_alt, list) or not raw_alt:
+            continue
+        for entry in raw_alt:
+            name = (str(entry.get("person_name") or entry.get("raw_name") or "").strip()
+                    if isinstance(entry, dict) else str(entry or "").strip())
+            if not name:
+                continue
+            uid = to_int(entry.get("bitrix_user_id")) if isinstance(entry, dict) else None
+            if uid is None:
+                uid = org_user_id_for_name(name)
+            result.append({
+                "name": name, "bitrix_user_id": uid,
+                "org_match": "matched" if uid else "not_found",
+                "is_leader": bool(entry.get("is_leader")) if isinstance(entry, dict) else False,
+                "role_on_call": "participant",
+            })
+        if result:
+            return result
 
     leaders_present = analysis.get("leaders_present") if isinstance(analysis.get("leaders_present"), list) else []
     for index, leader in enumerate(leaders_present):

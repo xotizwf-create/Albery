@@ -2365,6 +2365,10 @@ def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = 
     operational_tasks = zoom_call_operational_tasks(call)
     participants = zoom_call_participants(call)
     leader_evals = zoom_call_leader_evaluations(call)
+    if not participants:
+        # Never lose ready tasks because the participant block came out empty: the assignees
+        # of those tasks ARE the recipients (see participants_from_tasks_and_leaders).
+        participants = zoom.participants_from_tasks_and_leaders(operational_tasks, leader_evals)
     dispatch_summary = format_zoom_dispatch_summary(call)
     cleaned_section = format_zoom_operational_tasks_for_bitrix(operational_tasks)
 
