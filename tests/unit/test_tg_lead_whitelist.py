@@ -112,36 +112,60 @@ def test_username_normalisation(tg):
     assert tg._norm_username("не username с пробелами") == ""
 
 
-def test_funnel_usernames_are_read_from_crm(tg, monkeypatch):
-    """Проверяем сам запрос в Bitrix: фильтр по воронке и нужное поле."""
+def test_funnel_usernames_are_read_through_local_mcp(tg, monkeypatch):
+    """Вебхук Bitrix не имеет прав на CRM — список берётся через MCP приложения."""
     captured = {}
 
     class Resp:
-        content = b"{}"
-        @staticmethod
-        def json():
-            return {"result": [{"ID": "82", tg.CRM_TELEGRAM_FIELD: "@Griaznov.D"},
-                               {"ID": "80", tg.CRM_TELEGRAM_FIELD: ""}]}
+        text = json.dumps({"result": {"contacts": [
+            {"username": "griaznov.d", "deal_id": 82},
+            {"username": "", "deal_id": 80},
+        ]}})
 
-    monkeypatch.setenv("BITRIX_WEBHOOK_BASE", "https://portal/rest/1/token")
+    monkeypatch.setenv("MCP_SHARED_SECRET", "secret")
     monkeypatch.setattr(tg.requests, "post",
-                        lambda url, json=None, timeout=0: captured.update(url=url, body=json) or Resp())
+                        lambda url, json=None, headers=None, timeout=0:
+                        captured.update(url=url, body=json, headers=headers) or Resp())
 
     out = tg.crm_lead_usernames(force=True)
 
     assert out == {"griaznov.d": 82}, "пустые значения не попадают в список"
-    assert captured["body"]["filter"]["CATEGORY_ID"] == tg.CRM_LEAD_CATEGORY_ID
-    assert tg.CRM_TELEGRAM_FIELD in captured["body"]["select"]
+    assert captured["body"]["params"]["name"] == "list_crm_lead_contacts"
+    assert captured["headers"]["Authorization"].startswith("Bearer ")
+
+
+def test_sse_wrapped_answer_is_understood(tg, monkeypatch):
+    """MCP может ответить потоком — иначе список молча окажется пустым."""
+    body = json.dumps({"result": {"contacts": [{"username": "lead_one", "deal_id": 5}]}})
+
+    class Resp:
+        text = "event: message\ndata: " + body + "\n\n"
+
+    monkeypatch.setenv("MCP_SHARED_SECRET", "secret")
+    monkeypatch.setattr(tg.requests, "post", lambda *a, **kw: Resp())
+
+    assert tg.crm_lead_usernames(force=True) == {"lead_one": 5}
+
+
+def test_no_secret_means_no_whitelist(tg, monkeypatch):
+    monkeypatch.delenv("MCP_SHARED_SECRET", raising=False)
+    assert tg.crm_lead_usernames(force=True) == {}
 
 
 def test_crm_failure_falls_back_to_cached_list(tg, monkeypatch):
-    """Разрыв связи с Bitrix не должен мгновенно затыкать агента для уже известных лидов."""
+    """Разрыв связи не должен мгновенно затыкать агента для уже известных лидов."""
     tg._LEADS_CACHE.update({"at": 9e9, "map": {"griaznov.d": 82}})
 
     def boom(*a, **kw):
         raise RuntimeError("сеть недоступна")
 
-    monkeypatch.setenv("BITRIX_WEBHOOK_BASE", "https://portal/rest/1/token")
+    monkeypatch.setenv("MCP_SHARED_SECRET", "secret")
     monkeypatch.setattr(tg.requests, "post", boom)
 
     assert tg.crm_lead_usernames(force=True) == {"griaznov.d": 82}
+
+
+def test_mcp_tool_is_registered(ctx):
+    spec = ctx.TOOLS["list_crm_lead_contacts"]
+    assert callable(spec["handler"])
+    assert "воронки" in spec["description"]

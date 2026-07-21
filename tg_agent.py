@@ -672,27 +672,39 @@ def crm_lead_usernames(force: bool = False) -> dict[str, int]:
     now = time.time()
     if not force and _LEADS_CACHE["map"] and now - float(_LEADS_CACHE["at"]) < _LEADS_TTL_S:
         return dict(_LEADS_CACHE["map"])
-    base = (os.getenv("BITRIX_WEBHOOK_BASE") or "").strip().rstrip("/")
-    if not base:
-        log.warning("BITRIX_WEBHOOK_BASE не задан — белый список лидов недоступен")
+    # Идём через локальный MCP приложения: вебхук Bitrix не имеет прав на CRM
+    # (insufficient_scope), а MCP работает по OAuth приложения — тем же путём, что и все
+    # остальные CRM-инструменты.
+    secret = (os.getenv("MCP_SHARED_SECRET") or "").strip()
+    if not secret:
+        log.warning("MCP_SHARED_SECRET не задан — белый список лидов недоступен")
         return dict(_LEADS_CACHE["map"])
+    url = os.getenv("ALBERY_MCP_URL", "http://127.0.0.1:5002/mcp").strip()
     out: dict[str, int] = {}
     try:
-        start = 0
-        while True:
-            resp = requests.post(f"{base}/crm.deal.list", json={
-                "filter": {"CATEGORY_ID": CRM_LEAD_CATEGORY_ID},
-                "select": ["ID", CRM_TELEGRAM_FIELD], "start": start,
-            }, timeout=30)
-            data = resp.json() if resp.content else {}
-            for row in (data.get("result") or []):
-                uname = _norm_username(row.get(CRM_TELEGRAM_FIELD) or "")
-                if uname:
-                    out[uname] = int(row.get("ID") or 0)
-            nxt = data.get("next")
-            if not nxt:
-                break
-            start = int(nxt)
+        resp = requests.post(url, json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "list_crm_lead_contacts", "arguments": {}},
+        }, headers={"Authorization": "Bearer " + secret,
+                    "Accept": "application/json, text/event-stream"}, timeout=45)
+        raw = resp.text or ""
+        if "data:" in raw[:200]:      # ответ может прийти потоком SSE
+            raw = "\n".join(l[5:].strip() for l in raw.splitlines() if l.startswith("data:"))
+        payload = json.loads(raw) if raw.strip() else {}
+        result = payload.get("result") or {}
+        content = result.get("structuredContent") or result
+        if isinstance(content.get("content"), list):    # текстовая обёртка MCP
+            for part in content["content"]:
+                if part.get("type") == "text":
+                    try:
+                        content = json.loads(part.get("text") or "{}")
+                        break
+                    except Exception:  # noqa: BLE001
+                        pass
+        for row in (content.get("contacts") or []):
+            uname = _norm_username(row.get("username") or "")
+            if uname:
+                out[uname] = int(row.get("deal_id") or 0)
     except Exception:  # noqa: BLE001
         log.warning("не удалось прочитать лидов из CRM", exc_info=True)
         return dict(_LEADS_CACHE["map"])

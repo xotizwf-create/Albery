@@ -7341,6 +7341,47 @@ def tool_get_agent_monitoring(args: dict[str, Any]) -> dict[str, Any]:
     return app_workflow_function("agent_center_report")(period)
 
 
+CRM_LEAD_CATEGORY_ID = int(os.getenv("CRM_LEAD_CATEGORY_ID", "16") or 16)
+CRM_TELEGRAM_FIELD = (os.getenv("CRM_TELEGRAM_FIELD", "UF_CRM_1784296997") or "").strip()
+
+
+def tool_list_crm_lead_contacts(args: dict[str, Any]) -> dict[str, Any]:
+    """Telegram-контакты лидов воронки: {username -> сделка}.
+
+    Вебхук Bitrix не имеет прав на CRM (insufficient_scope), поэтому идём тем же путём, что и
+    остальные CRM-инструменты — через OAuth приложения."""
+    category = int(args.get("category_id") or CRM_LEAD_CATEGORY_ID)
+    field = str(args.get("field") or CRM_TELEGRAM_FIELD).strip()
+    contacts: list[dict[str, Any]] = []
+    start = 0
+    while True:
+        res = _crm_call("crm.deal.list", {
+            "filter": {"CATEGORY_ID": category},
+            "select": ["ID", "TITLE", "STAGE_ID", field],
+            "start": start,
+        })
+        rows = res.get("result") or []
+        for row in rows:
+            raw = str(row.get(field) or "").strip()
+            uname = re.sub(r"^(https?://)?(t\.me/|telegram\.me/)", "", raw.lower()).lstrip("@").strip()
+            if not re.fullmatch(r"[a-z0-9._-]{3,64}", uname or ""):
+                continue
+            contacts.append({"username": uname, "deal_id": int(row.get("ID") or 0),
+                             "stage_id": row.get("STAGE_ID"), "raw": raw})
+        nxt = res.get("next")
+        if not nxt:
+            break
+        start = int(nxt)
+    return {
+        "contacts": contacts,
+        "total": len(contacts),
+        "category_id": category,
+        "field": field,
+        "note": ("Это те лиды, у кого в сделке заполнен Telegram. Агент отвечает в личке только "
+                 "им; остальным входящим на аккаунт компании он не отвечает."),
+    }
+
+
 def tool_send_telegram_message(args: dict[str, Any]) -> dict[str, Any]:
     """Написать человеку в Telegram ОТ ЛИЦА аккаунта компании."""
     who = str(args.get("to") or args.get("username") or args.get("user_id") or "").strip()
@@ -8525,6 +8566,23 @@ def tool_get_latest_news_digest(args: dict[str, Any]) -> dict[str, Any]:
 
 
 TOOLS: dict[str, dict[str, Any]] = {
+    "list_crm_lead_contacts": {
+        "description": (
+            "Telegram-контакты лидов воронки «Партнёрская программа WB — индивидуальные условия»: "
+            "какой username к какой сделке относится. Используй, чтобы понять, кто из написавших "
+            "в Telegram — лид из воронки, и по какой сделке идёт разговор. Именно по этому списку "
+            "агент решает, отвечать ли на входящее в личке аккаунта компании."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category_id": {"type": "integer", "description": "Воронка. По умолчанию воронка лидов."},
+                "field": {"type": "string", "description": "Код поля с Telegram. По умолчанию из конфига."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_crm_lead_contacts,
+    },
     "send_telegram_message": {
         "description": (
             "Написать человеку в Telegram ОТ ЛИЦА аккаунта компании @AlberyAIManager (не от бота). "
