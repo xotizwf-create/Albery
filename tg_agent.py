@@ -251,6 +251,9 @@ HELP_TEXT = (
     "/channels — список каналов еженедельного обзора\n"
     "/add_channel <@канал или ссылка, можно несколько> — следить только за этими\n"
     "/del_channel <канал> — убрать из списка\n"
+    "/id — добавить человека в справочник (кнопка выбора контакта → его числовой id)\n"
+    "/contacts — известные контакты и их id\n"
+    "/write @username текст — написать человеку ОТ ЛИЦА вашего аккаунта\n"
     "/chats — что видит подключённая сессия аккаунта (каналы/группы/чаты)\n"
     "/digest — собрать обзор прямо сейчас\n"
     "/new — начать новую сессию (забыть историю)\n\n"
@@ -261,12 +264,161 @@ HELP_TEXT = (
 )
 
 
+# --- справочник контактов: username -> числовой id --------------------------------------------
+# Bot API НЕ умеет находить человека по @username: sendMessage принимает только числовой id,
+# а getChat на чужой username отвечает «chat not found» — и это не лечится правами.
+# Штатный способ получить id — кнопка выбора контакта (KeyboardButtonRequestUsers): владелец
+# тыкает человека в своём списке, Telegram сам возвращает его user_id. Дальше писать этому
+# человеку от лица аккаунта можно когда угодно (проверено 21.07.2026: доставка вне окна 24 ч).
+
+
+def contacts() -> dict:
+    return (load_state().get("contacts") or {}) if True else {}
+
+
+def remember_contact(user: dict) -> dict:
+    """Сохранить человека в справочник. Ключ — username в нижнем регистре, плюс id."""
+    uid = user.get("user_id") or user.get("id")
+    if not uid:
+        return {}
+    entry = {
+        "id": int(uid),
+        "username": (user.get("username") or "").lstrip("@"),
+        "name": " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x).strip(),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _state_lock:
+        state = load_state()
+        book = state.setdefault("contacts", {})
+        if entry["username"]:
+            book[entry["username"].lower()] = entry
+        book[str(entry["id"])] = entry
+        save_state(state)
+    return entry
+
+
+def find_contact(who: str) -> dict | None:
+    """Найти в справочнике по @username или по числовому id."""
+    key = (who or "").strip().lstrip("@").lower()
+    if not key:
+        return None
+    return contacts().get(key)
+
+
+def send_as_account(user_id: int, text: str) -> tuple[bool, str]:
+    """Написать человеку ОТ ЛИЦА аккаунта владельца (Telegram Business), а не от бота."""
+    state = load_state()
+    conn_ids = list((state.get("business") or {}).keys())
+    if not conn_ids:
+        return False, "бизнес-подключение не настроено: подключите бота в Telegram → Настройки → Telegram для бизнеса → Чат-боты"
+    try:
+        api("sendMessage", business_connection_id=conn_ids[0], chat_id=int(user_id), text=text)
+        return True, ""
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)[:200]
+
+
+def _request_contact_keyboard() -> dict:
+    """Кнопка «выбрать человека»: Telegram вернёт его числовой id в users_shared."""
+    return {
+        "keyboard": [[{
+            "text": "👤 Выбрать человека",
+            "request_users": {"request_id": 1, "user_is_bot": False, "max_quantity": 1,
+                              "request_username": True, "request_name": True},
+        }]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+def handle_forward(chat_id, msg: dict) -> bool:
+    """Достать числовой id автора ПЕРЕСЛАННОГО сообщения. True — сообщение обработано.
+
+    Так работают публичные «боты для получения id»: волшебного поиска по @username в Bot API
+    нет, зато у пересланного сообщения есть автор. Если человек закрыл пересылку в настройках
+    приватности, Telegram отдаёт только имя без id — тогда честно говорим об этом."""
+    origin = msg.get("forward_origin") or {}
+    user = origin.get("sender_user") or msg.get("forward_from") or {}
+    if user.get("id"):
+        entry = remember_contact({"user_id": user["id"], "username": user.get("username"),
+                                  "first_name": user.get("first_name"),
+                                  "last_name": user.get("last_name")})
+        who = ("@" + entry["username"]) if entry["username"] else (entry["name"] or "контакт")
+        send_text(chat_id, f"Записал: {who} — id {entry['id']}.\n\n"
+                           f"Написать ему от лица вашего аккаунта:\n"
+                           f"/write {('@' + entry['username']) if entry['username'] else entry['id']} текст")
+        return True
+    hidden = origin.get("sender_user_name") or msg.get("forward_sender_name")
+    if hidden:
+        send_text(chat_id, f"«{hidden}» закрыл пересылку в настройках приватности — "
+                           "Telegram не отдаёт его id при пересылке.\n"
+                           "Добавьте его кнопкой: /id — там выбор из ваших контактов.")
+        return True
+    return False
+
+
+def handle_users_shared(chat_id, shared: dict) -> None:
+    """Владелец выбрал человека кнопкой — Telegram прислал его настоящий числовой id."""
+    people = shared.get("users") or shared.get("user_ids") or []
+    saved = []
+    for u in people:
+        entry = remember_contact(u if isinstance(u, dict) else {"user_id": u})
+        if entry:
+            saved.append(entry)
+    if not saved:
+        send_text(chat_id, "Не удалось разобрать выбранного человека, попробуйте ещё раз.")
+        return
+    lines = ["Записал в справочник:"]
+    for e in saved:
+        who = ("@" + e["username"]) if e["username"] else (e["name"] or "без имени")
+        lines.append(f"• {who} — id {e['id']}")
+    lines.append("")
+    lines.append("Теперь можно писать от лица вашего аккаунта:")
+    lines.append(f"/write {('@' + saved[0]['username']) if saved[0]['username'] else saved[0]['id']} текст сообщения")
+    send_text(chat_id, "\n".join(lines))
+
+
 def handle_command(chat_id, text: str) -> bool:
     """True when the message was a command and is fully handled."""
     cmd, _, args = text.strip().partition(" ")
     cmd = cmd.lower().split("@", 1)[0]
     if cmd in ("/start", "/help"):
         send_text(chat_id, HELP_TEXT)
+    elif cmd in ("/id", "/contact", "/контакт"):
+        try:
+            api("sendMessage", chat_id=chat_id,
+                text="Нажмите кнопку и выберите человека — я запомню его числовой id, "
+                     "и потом смогу писать ему от лица вашего аккаунта.",
+                reply_markup=_request_contact_keyboard())
+        except Exception as exc:  # noqa: BLE001
+            send_text(chat_id, f"Не получилось показать кнопку: {str(exc)[:150]}")
+    elif cmd in ("/contacts", "/контакты"):
+        book = {v["id"]: v for v in contacts().values()}
+        if not book:
+            send_text(chat_id, "Справочник пуст. Добавьте человека: /id")
+        else:
+            lines = ["Известные контакты:"]
+            for e in sorted(book.values(), key=lambda x: x.get("name") or ""):
+                who = ("@" + e["username"]) if e.get("username") else (e.get("name") or "без имени")
+                lines.append(f"• {who} — id {e['id']}")
+            send_text(chat_id, "\n".join(lines))
+    elif cmd in ("/write", "/напиши"):
+        who, _, body = args.strip().partition(" ")
+        body = body.strip()
+        if not who or not body:
+            send_text(chat_id, "Формат: /write @username текст сообщения\n"
+                               "Человек должен быть в справочнике — добавьте через /id.")
+        else:
+            entry = find_contact(who)
+            target_id = entry["id"] if entry else (int(who) if who.lstrip("-").isdigit() else None)
+            if target_id is None:
+                send_text(chat_id, f"«{who}» нет в справочнике. Добавьте его кнопкой: /id\n"
+                                   "Telegram не позволяет боту искать людей по @username — "
+                                   "нужен либо выбор контакта, либо его числовой id.")
+            else:
+                ok, err = send_as_account(target_id, body)
+                send_text(chat_id, "Отправлено от лица вашего аккаунта." if ok
+                          else f"Не отправилось: {err}")
     elif cmd == "/channels":
         names = channels()
         send_text(chat_id, ("Каналы обзора:\n" + "\n".join(f"• t.me/{n}" for n in names))
@@ -346,6 +498,27 @@ def handle_message(msg: dict) -> None:
     chat_id = chat.get("id")
     sender = msg.get("from") or {}
     text = (msg.get("text") or "").strip()
+    # Выбор контакта приходит БЕЗ текста — разбираем до проверки на пустоту, иначе id потеряется.
+    shared = msg.get("users_shared") or msg.get("user_shared")
+    if shared:
+        if is_owner(sender):
+            _remember_owner_chat(sender)
+            handle_users_shared(chat_id, shared)
+        return
+    # Пересланное сообщение — второй штатный способ узнать числовой id человека: Telegram
+    # кладёт автора оригинала в forward_origin/forward_from. Работает, только если человек не
+    # закрыл пересылку в настройках приватности.
+    if is_owner(sender) and handle_forward(chat_id, msg):
+        return
+    # Присланный контакт из адресной книги тоже несёт user_id.
+    contact = msg.get("contact") or {}
+    if contact.get("user_id") and is_owner(sender):
+        entry = remember_contact({"user_id": contact["user_id"],
+                                  "first_name": contact.get("first_name"),
+                                  "last_name": contact.get("last_name")})
+        send_text(chat_id, f"Записал: {entry['name'] or 'контакт'} — id {entry['id']}.\n"
+                           f"Написать от лица аккаунта: /write {entry['id']} текст")
+        return
     if not text:
         return
     if not is_owner(sender):
