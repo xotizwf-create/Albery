@@ -32,6 +32,7 @@ from app import (
     msk_now,
     pg_connect,
 )
+from utils import to_int
 
 _DIALOGS_LIMIT_DEFAULT = 100
 _MESSAGES_LIMIT_DEFAULT = 200
@@ -242,19 +243,157 @@ def agent_center_dialogs():
 
 def _dialog_error_counts() -> dict:
     """Failed turns per (agent, dialog) — the message journal stores what was actually sent, while
-    the turn log keeps the error status, so the error badge keeps working."""
+    the turn log keeps the error status, so the error badge keeps working.
+
+    Разобранные ошибки (error_resolved_at) не считаются: иначе один давний таймаут навсегда
+    помечал диалог как проблемный и снять это было нечем (владелец 2026-07-20)."""
     out: dict = {}
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT dialog_id, agent_slug, COUNT(*) AS n FROM bitrix_bot_interactions"
-                    " WHERE status <> 'ok' GROUP BY dialog_id, agent_slug")
+                    " WHERE status <> 'ok' AND error_resolved_at IS NULL"
+                    " GROUP BY dialog_id, agent_slug")
                 for r in cur.fetchall():
                     out[(r["agent_slug"] or MAIN_AGENT_SLUG, r["dialog_id"])] = int(r["n"])
     except Exception:  # noqa: BLE001
         logging.debug("agent_center: error counts failed", exc_info=True)
     return out
+
+
+MAIN_SLUG_SENTINEL = "main"
+
+
+def list_dialog_errors(dialog_id: str = "", agent_slug: str = "", include_resolved: bool = False,
+                       limit: int = 50) -> list[dict[str, Any]]:
+    """Ошибочные ходы для разбора: что упало, когда, у кого и разобрано ли это.
+
+    Один источник правды и для интерфейса, и для MCP-инструмента агента."""
+    where = ["status <> 'ok'"]
+    params: list[Any] = []
+    if not include_resolved:
+        where.append("error_resolved_at IS NULL")
+    if dialog_id:
+        where.append("dialog_id = %s")
+        params.append(str(dialog_id))
+    if agent_slug:
+        if agent_slug == MAIN_SLUG_SENTINEL:
+            where.append("agent_slug IS NULL")
+        else:
+            where.append("agent_slug = %s")
+            params.append(agent_slug)
+    params.append(max(1, min(int(limit or 50), 200)))
+    rows: list[dict[str, Any]] = []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT id, created_at, dialog_id, agent_slug, bitrix_user_id, status,
+                           left(coalesce(error, ''), 300) AS error,
+                           left(coalesce(question, ''), 200) AS question,
+                           error_resolved_at, error_resolved_by, error_resolved_task,
+                           error_resolved_note
+                    FROM bitrix_bot_interactions
+                    WHERE {' AND '.join(where)}
+                    ORDER BY created_at DESC LIMIT %s""",
+                params,
+            )
+            for r in cur.fetchall():
+                rows.append({
+                    "interaction_id": r["id"],
+                    "at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "dialog_id": r["dialog_id"],
+                    "agent_slug": r["agent_slug"] or MAIN_SLUG_SENTINEL,
+                    "bitrix_user_id": r["bitrix_user_id"],
+                    "status": r["status"],
+                    "error": r["error"],
+                    "question_preview": r["question"],
+                    "resolved": r["error_resolved_at"] is not None,
+                    "resolved_at": r["error_resolved_at"].isoformat() if r["error_resolved_at"] else None,
+                    "resolved_by": r["error_resolved_by"],
+                    "resolved_task_id": r["error_resolved_task"],
+                    "resolved_note": r["error_resolved_note"],
+                })
+    return rows
+
+
+def resolve_dialog_errors(dialog_id: str, agent_slug: str = "", task_id: Any = None,
+                          note: str = "", by: str = "", interaction_id: Any = None) -> int:
+    """Пометить ошибки разобранными. Возвращает число снятых отметок.
+
+    Требование владельца: указывать номер задачи, в которой ошибка устранена, — чтобы метка
+    снималась не «просто так», а со ссылкой на проделанную работу."""
+    if not dialog_id and interaction_id is None:
+        raise ValueError("нужен dialog_id или interaction_id")
+    where = ["status <> 'ok'", "error_resolved_at IS NULL"]
+    params: list[Any] = [str(by or "")[:120], to_int(task_id), str(note or "")[:500]]
+    if interaction_id is not None:
+        where.append("id = %s")
+        params.append(int(interaction_id))
+    else:
+        where.append("dialog_id = %s")
+        params.append(str(dialog_id))
+        if agent_slug:
+            if agent_slug == MAIN_SLUG_SENTINEL:
+                where.append("agent_slug IS NULL")
+            else:
+                where.append("agent_slug = %s")
+                params.append(agent_slug)
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""UPDATE bitrix_bot_interactions
+                        SET error_resolved_at = now(), error_resolved_by = %s,
+                            error_resolved_task = %s, error_resolved_note = %s
+                        WHERE {' AND '.join(where)}""",
+                    params,
+                )
+                return cur.rowcount or 0
+
+
+@app.get("/api/agent-center/dialog-errors")
+def agent_center_dialog_errors():
+    """Список ошибок диалога — что именно упало и разобрано ли."""
+    try:
+        rows = list_dialog_errors(
+            dialog_id=(request.args.get("dialog_id") or "").strip(),
+            agent_slug=(request.args.get("agent") or "").strip(),
+            include_resolved=(request.args.get("include_resolved") or "").lower() in {"1", "true", "yes"},
+            limit=_limit_arg(50, 200),
+        )
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center: dialog errors failed")
+        return jsonify({"error": "Не удалось получить список ошибок."}), 500
+    return jsonify({"errors": rows, "total": len(rows)})
+
+
+@app.post("/api/agent-center/dialog-errors/resolve")
+def agent_center_resolve_dialog_errors():
+    """Снять метку «ОШИБКА» с диалога, указав задачу, в которой всё устранено."""
+    body = request.get_json(silent=True) or {}
+    dialog_id = str(body.get("dialog_id") or "").strip()
+    task_id = body.get("task_id")
+    if not dialog_id and body.get("interaction_id") is None:
+        return jsonify({"error": "Укажите диалог."}), 400
+    if to_int(task_id) is None and not str(body.get("note") or "").strip():
+        return jsonify({"error": "Укажите номер задачи Битрикса или комментарий, "
+                                 "в чём ошибка устранена."}), 400
+    try:
+        n = resolve_dialog_errors(
+            dialog_id=dialog_id,
+            agent_slug=str(body.get("agent") or "").strip(),
+            task_id=task_id,
+            note=str(body.get("note") or ""),
+            by=str(body.get("by") or "владелец (интерфейс)"),
+            interaction_id=body.get("interaction_id"),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center: resolve dialog errors failed")
+        return jsonify({"error": "Не удалось снять метку."}), 500
+    return jsonify({"ok": True, "resolved": n})
 
 
 def _dialog_last_status() -> dict:

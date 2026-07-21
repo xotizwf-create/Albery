@@ -7340,6 +7340,49 @@ def tool_get_agent_monitoring(args: dict[str, Any]) -> dict[str, Any]:
     return app_workflow_function("agent_center_report")(period)
 
 
+def tool_list_dialog_errors(args: dict[str, Any]) -> dict[str, Any]:
+    """Сбои в диалогах: что упало, когда и разобрано ли это."""
+    rows = app_workflow_function("list_dialog_errors")(
+        str(args.get("dialog_id") or "").strip(),
+        str(args.get("agent_slug") or "").strip(),
+        bool(args.get("include_resolved")),
+        int(args.get("limit") or 50),
+    )
+    return {
+        "errors": rows,
+        "total": len(rows),
+        "note": ("Пустой список = неразобранных сбоев нет, метка «ОШИБКА» в интерфейсе снята. "
+                 "Разобранный сбой закрывается инструментом resolve_dialog_errors с номером "
+                 "задачи Битрикса, в которой он устранён."),
+    }
+
+
+def tool_resolve_dialog_errors(args: dict[str, Any]) -> dict[str, Any]:
+    """Снять метку «ОШИБКА» с диалога, сославшись на задачу, где сбой устранён."""
+    dialog_id = str(args.get("dialog_id") or "").strip()
+    task_id = args.get("task_id")
+    note = str(args.get("note") or "").strip()
+    if not dialog_id and args.get("interaction_id") is None:
+        raise McpError(-32602, "Нужен dialog_id (или interaction_id для одного конкретного сбоя).")
+    if to_int(task_id) is None and not note:
+        raise McpError(-32602, "Нужен task_id задачи Битрикса, в которой сбой устранён "
+                               "(или note с объяснением, если задачи нет).")
+    try:
+        n = app_workflow_function("resolve_dialog_errors")(
+            dialog_id, str(args.get("agent_slug") or "").strip(), task_id, note,
+            str(args.get("by") or "агент"), args.get("interaction_id"))
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    return {
+        "resolved": n,
+        "dialog_id": dialog_id or None,
+        "task_id": to_int(task_id),
+        "note": ("Метка снята: эти сбои больше не помечают диалог как проблемный. "
+                 "История разбора сохранена — её видно с include_resolved=true.")
+        if n else "Неразобранных сбоев по этому фильтру не нашлось — снимать нечего.",
+    }
+
+
 def tool_get_employee_absences(args: dict[str, Any]) -> dict[str, Any]:
     """Whether employees are on vacation/absent per the Bitrix «График отсутствий» (bot portal
     b24-0xrp3s). Resolves by bitrix_user_id or employee_name; with neither, returns everyone who is
@@ -8461,6 +8504,48 @@ def tool_get_latest_news_digest(args: dict[str, Any]) -> dict[str, Any]:
 
 
 TOOLS: dict[str, dict[str, Any]] = {
+    "list_dialog_errors": {
+        "description": (
+            "Сбои в диалогах с агентом (таймаут, обрыв хода, внутренняя ошибка): что именно упало, "
+            "когда, в каком диалоге, у какого пользователя, и разобран ли сбой. Вызывай, когда "
+            "спрашивают «почему у диалога метка ОШИБКА», «что там сломалось», «какие сбои остались». "
+            "По умолчанию показывает только НЕразобранные; include_resolved=true покажет и историю "
+            "разбора. Пустой список = неразобранных сбоев нет."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dialog_id": {"type": "string", "description": "Диалог (Bitrix id пользователя или task-<номер>). Пусто = все."},
+                "agent_slug": {"type": "string", "description": "Агент: main, agent-sklad и т.д. Пусто = все."},
+                "include_resolved": {"type": "boolean", "description": "Показать и уже разобранные сбои. По умолчанию false."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_dialog_errors,
+    },
+    "resolve_dialog_errors": {
+        "description": (
+            "Снять метку «ОШИБКА» с диалога после разбора сбоя. ОБЯЗАТЕЛЬНО указывай task_id "
+            "задачи Битрикса, в которой сбой устранён (или note, если задачи нет) — метка "
+            "снимается со ссылкой на проделанную работу, а не «просто так». Сначала посмотри "
+            "list_dialog_errors и убедись, что причина действительно устранена; не снимай метку "
+            "с сбоя, который ещё воспроизводится. История разбора сохраняется."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dialog_id": {"type": "string", "description": "Диалог, с которого снимаем метку."},
+                "agent_slug": {"type": "string", "description": "Ограничить конкретным агентом (main, agent-sklad…)."},
+                "task_id": {"type": "integer", "description": "Номер задачи Битрикса, в которой сбой устранён."},
+                "note": {"type": "string", "description": "Чем устранено, если задачи нет."},
+                "interaction_id": {"type": "integer", "description": "Снять метку с ОДНОГО конкретного сбоя (id из list_dialog_errors)."},
+                "by": {"type": "string", "description": "Кто снял метку. По умолчанию «агент»."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_resolve_dialog_errors,
+    },
     "get_agent_monitoring": {
         "description": (
             "Мониторинг и учёт использования самого агента (живые данные страниц «Центра Агента»): "
@@ -10906,6 +10991,9 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
     "delete_zoom_call_report",
     # Per-employee usage/monitoring is management data — admin connector only.
     "get_agent_monitoring",
+    # Разбор сбоев — служебная работа над самой системой, не для публичных коннекторов.
+    "list_dialog_errors",
+    "resolve_dialog_errors",
     # Employee dossiers are internal management data — never on the public scoped connectors.
     "get_employee_dossier",
     "update_employee_dossier",

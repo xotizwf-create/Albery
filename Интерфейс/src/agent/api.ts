@@ -377,6 +377,52 @@ export async function fetchAgentDialogs(params: {
   return { chats: ((data.dialogs || []) as RawDialog[]).map(toChat), note: data.note };
 }
 
+export interface DialogError {
+  interaction_id: number;
+  at: string | null;
+  dialog_id: string;
+  agent_slug: string;
+  status: string;
+  error: string;
+  question_preview: string;
+  resolved: boolean;
+  resolved_task_id: number | null;
+}
+
+export async function fetchDialogErrors(
+  dialogId: string,
+  agent?: string,
+): Promise<DialogError[]> {
+  const search = new URLSearchParams({ dialog_id: dialogId });
+  if (agent && agent !== "all") search.set("agent", agent);
+  const data = await fetchJsonSafe(`/api/agent-center/dialog-errors?${search}`, undefined, 30000);
+  return (data.errors || []) as DialogError[];
+}
+
+/** Снять метку «ОШИБКА»: сбой разобран, работа сделана в задаче Битрикса. */
+export async function resolveDialogErrors(params: {
+  dialogId: string;
+  agent?: string;
+  taskId?: number | null;
+  note?: string;
+}): Promise<number> {
+  const data = await fetchJsonSafe(
+    "/api/agent-center/dialog-errors/resolve",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        dialog_id: params.dialogId,
+        agent: params.agent && params.agent !== "all" ? params.agent : undefined,
+        task_id: params.taskId ?? undefined,
+        note: params.note || undefined,
+      }),
+    },
+    30000,
+  );
+  return Number(data.resolved || 0);
+}
+
 export async function fetchDialogTurns(dialogId: string, agent?: string): Promise<DialogTurn[]> {
   const search = new URLSearchParams({ dialog_id: dialogId });
   // Scope the thread to the bot — a dialog_id is shared across bots, so without this the

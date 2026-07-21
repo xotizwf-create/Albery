@@ -12,7 +12,13 @@ import {
   ArrowUp,
   ArrowDown,
 } from "lucide-react";
-import { fetchAgentDialogs, fetchAgents, fetchDialogTurns, DialogTurn } from "../api";
+import {
+  fetchAgentDialogs,
+  fetchAgents,
+  fetchDialogTurns,
+  resolveDialogErrors,
+  DialogTurn,
+} from "../api";
 import { AgentConfig, Chat } from "../types";
 import { agentSubSegments, setAgentPath } from "../route";
 import { cn } from "../../lib/utils";
@@ -49,6 +55,9 @@ export function DialogsView() {
   );
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterId>("all");
+  // Контекстное меню по правому клику на диалоге: снять метку «ОШИБКА» после разбора.
+  const [errorMenu, setErrorMenu] = useState<{ chat: Chat; x: number; y: number } | null>(null);
+  const [resolving, setResolving] = useState(false);
   // Initial selection comes from the URL (/agent-dialogs/<agent>/<dialog>) so a refresh
   // or a shared link restores exactly what was open instead of resetting.
   const [activeAgentId, setActiveAgentId] = useState<string>(
@@ -168,6 +177,50 @@ export function DialogsView() {
 
   const activeChat =
     visibleChats.find((c) => c.id === activeChatId) || chats.find((c) => c.id === activeChatId) || null;
+
+  // Снятие метки «ОШИБКА»: спрашиваем номер задачи, в которой сбой устранён, чтобы метка
+  // снималась по факту работы, а не «просто так» (требование владельца 20.07.2026).
+  async function markErrorsResolved(chat: Chat) {
+    setErrorMenu(null);
+    const answer = window.prompt(
+      `Снять метку «ОШИБКА» с диалога «${chat.userName}».\n\n` +
+        "Укажите номер задачи Битрикса, в которой сбой устранён\n" +
+        "(или коротко напишите, чем устранён, если задачи нет):",
+      "",
+    );
+    if (answer === null) return;
+    const text = answer.trim();
+    if (!text) return;
+    const taskId = /^\d+$/.test(text) ? Number(text) : null;
+    setResolving(true);
+    try {
+      const n = await resolveDialogErrors({
+        dialogId: chat.dialogId,
+        agent: chat.agentId,
+        taskId,
+        note: taskId ? "" : text,
+      });
+      setChats((prev) =>
+        prev.map((c) => (c.id === chat.id && c.tag === "ошибка" ? { ...c, tag: "ops" } : c)),
+      );
+      window.alert(n ? `Метка снята: разобрано сбоев — ${n}.` : "Неразобранных сбоев не нашлось.");
+    } catch (e) {
+      window.alert(`Не удалось снять метку: ${(e as Error).message}`);
+    } finally {
+      setResolving(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!errorMenu) return;
+    const close = () => setErrorMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [errorMenu]);
 
   useEffect(() => {
     if (!activeChatId && visibleChats.length > 0) setActiveChatId(visibleChats[0].id);
@@ -394,6 +447,12 @@ export function DialogsView() {
               <button
                 key={chat.id}
                 onClick={() => setActiveChatId(chat.id)}
+                onContextMenu={(e) => {
+                  if (chat.tag !== "ошибка") return;
+                  e.preventDefault();
+                  setErrorMenu({ chat, x: e.clientX, y: e.clientY });
+                }}
+                title={chat.tag === "ошибка" ? "Правый клик — снять метку «ОШИБКА» после разбора" : undefined}
                 className={cn(
                   "w-full p-4 flex items-start gap-3 border-b border-gray-50 transition-all text-left relative",
                   activeChatId === chat.id ? "bg-indigo-50/30" : "hover:bg-gray-50",
@@ -564,6 +623,29 @@ export function DialogsView() {
           </>
         )}
       </div>
+
+      {errorMenu && (
+        <div
+          className="fixed z-50 bg-white border border-gray-200 rounded-xl shadow-xl py-1.5 min-w-[260px]"
+          style={{ left: errorMenu.x, top: errorMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="px-3 py-1.5 text-[11px] font-bold text-gray-400 uppercase tracking-wider">
+            {errorMenu.chat.userName}
+          </div>
+          <button
+            disabled={resolving}
+            onClick={() => markErrorsResolved(errorMenu.chat)}
+            className="w-full text-left px-3 py-2 text-[13px] font-semibold text-gray-700 hover:bg-emerald-50 hover:text-emerald-700 disabled:opacity-50 flex items-center gap-2"
+          >
+            {resolving ? <Loader2 className="w-4 h-4 animate-spin" /> : <AlertTriangle className="w-4 h-4" />}
+            Ошибка устранена — снять метку
+          </button>
+          <div className="px-3 pb-1.5 pt-0.5 text-[11px] text-gray-400 leading-snug">
+            Спросим номер задачи, в которой сбой устранён
+          </div>
+        </div>
+      )}
     </div>
   );
 }

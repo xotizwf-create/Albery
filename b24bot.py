@@ -1495,6 +1495,63 @@ def _b24_fit_prompt(parts: list[str], limit: int = 0) -> str:
     return out
 
 
+# --- склейка подряд идущих сообщений в один ход --------------------------------------------
+# Битрикс не умеет отправлять несколько файлов одним сообщением: каждая картинка приходит
+# отдельным событием. 20.07.2026 Наталья прислала запрос, скриншот и документ тремя сообщениями
+# за 8 секунд — агент завёл два независимых хода и переспросил данные, которые были на скрине.
+# Поэтому короткое окно ожидания: всё, что человек прислал подряд, попадает в ОДИН ход.
+_B24_BATCH_TEXT_WINDOW_S = float(os.getenv("B24_BATCH_TEXT_WINDOW_S", "2.5") or 2.5)
+_B24_BATCH_FILE_WINDOW_S = float(os.getenv("B24_BATCH_FILE_WINDOW_S", "7") or 7)
+_B24_BATCH_MAX_WAIT_S = float(os.getenv("B24_BATCH_MAX_WAIT_S", "25") or 25)
+_B24_BATCHES: dict[tuple, dict[str, Any]] = {}
+_B24_BATCH_LOCK = threading.Lock()
+
+
+def _b24_batch_message(scope: tuple, piece: dict[str, Any], run) -> None:
+    """Накопить сообщение и запустить ход, когда человек закончил присылать.
+
+    Окно продлевается с каждым новым сообщением, но не дольше _B24_BATCH_MAX_WAIT_S — иначе
+    непрерывный поток файлов откладывал бы ответ бесконечно. Сообщения с вложениями ждут дольше:
+    файл долетает медленнее текста."""
+    has_files = bool(piece["attachments"] or piece["doc_blocks"]
+                     or piece["image_texts"] or piece["voice_texts"])
+    with _B24_BATCH_LOCK:
+        batch = _B24_BATCHES.get(scope)
+        if batch is None:
+            batch = {"texts": [], "image_texts": [], "doc_blocks": [], "attachments": [],
+                     "voice_texts": [], "reply_text": "", "message_ids": [],
+                     "started": time.monotonic(), "timer": None}
+            _B24_BATCHES[scope] = batch
+        for key in ("texts", "image_texts", "doc_blocks", "attachments", "voice_texts", "message_ids"):
+            batch[key].extend(piece.get(key) or [])
+        if piece.get("reply_text") and not batch["reply_text"]:
+            batch["reply_text"] = piece["reply_text"]
+
+        window = _B24_BATCH_FILE_WINDOW_S if has_files else _B24_BATCH_TEXT_WINDOW_S
+        elapsed = time.monotonic() - batch["started"]
+        window = max(0.1, min(window, _B24_BATCH_MAX_WAIT_S - elapsed))
+        if batch["timer"] is not None:
+            batch["timer"].cancel()
+
+        def _fire() -> None:
+            with _B24_BATCH_LOCK:
+                ready = _B24_BATCHES.pop(scope, None)
+            if not ready:
+                return
+            if len(ready["message_ids"]) > 1:
+                logging.info("b24: склеено %d сообщений в один ход (диалог %s)",
+                             len(ready["message_ids"]), scope[1])
+            try:
+                run(ready)
+            except Exception:  # noqa: BLE001
+                logging.exception("b24: обработка склеенного сообщения упала")
+
+        timer = threading.Timer(window, _fire)
+        timer.daemon = True
+        batch["timer"] = timer
+        timer.start()
+
+
 def _b24_notify_session_reset(dialog_id: str, agent_slug: str | None = None, late: bool = False) -> None:
     """A session reset must never be silent (owner 2026-07-16): tell the user in the SAME dialog,
     from the SAME agent's bot, how to bring old context back. Two modes (owner 2026-07-17 — the
@@ -4844,22 +4901,37 @@ def _bitrix_imbot_app_event():
         # Return to Bitrix immediately. Even cosmetic pre-processing calls (reaction/typing)
         # can hang during Bitrix/network degradation; if they run before the HTTP response,
         # Bitrix retries or drops the webhook. Do those signals inside the background worker.
-        def _process_message_async() -> None:
-            _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
+        def _run_turn(parts: dict[str, Any]) -> None:
+            last_message_id = parts["message_ids"][-1]
+            _b24_app_react(endpoint, access_token, last_message_id, "eyes", add=True)
             _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
             recent_atts, recent_doc = [], None
-            if not (msg_attachments or doc_blocks or image_texts or voice_texts):
+            if not (parts["attachments"] or parts["doc_blocks"]
+                    or parts["image_texts"] or parts["voice_texts"]):
                 recent_atts = _b24_recent_dialog_attachments(dialog_id, (agent or {}).get("slug"))
                 recent_doc = _b24_recent_generated_doc(dialog_id, (agent or {}).get("slug"))
             _b24_app_process(
                 endpoint, access_token, bot_id, dialog_id,
-                _b24_compose_user_text(message_text, image_texts, reply_text, doc_blocks,
-                                       msg_attachments, recent_attachments=recent_atts,
-                                       recent_doc=recent_doc, voice_texts=voice_texts),
-                message_id, from_user_id, agent=agent,
+                _b24_compose_user_text("\n".join(parts["texts"]), parts["image_texts"],
+                                       parts["reply_text"], parts["doc_blocks"],
+                                       parts["attachments"], recent_attachments=recent_atts,
+                                       recent_doc=recent_doc, voice_texts=parts["voice_texts"]),
+                last_message_id, from_user_id, agent=agent,
             )
 
-        threading.Thread(target=_process_message_async, daemon=True).start()
+        _b24_batch_message(
+            scope=(str(bot_id), str(dialog_id), str(from_user_id)),
+            piece={
+                "texts": [message_text] if str(message_text or "").strip() else [],
+                "image_texts": list(image_texts or []),
+                "doc_blocks": list(doc_blocks or []),
+                "attachments": list(msg_attachments or []),
+                "voice_texts": list(voice_texts or []),
+                "reply_text": reply_text,
+                "message_ids": [message_id],
+            },
+            run=_run_turn,
+        )
         return jsonify({"ok": True, "event": event_name, "accepted": True})
 
     return jsonify({"ok": True, "event": event_name, "ignored": True}), 200
