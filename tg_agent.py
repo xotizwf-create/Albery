@@ -631,6 +631,69 @@ def handle_business_message(msg: dict) -> None:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         log.exception("business log write failed")
+    if business_autoreply_enabled():
+        try:
+            maybe_autoreply(msg)
+        except Exception:  # noqa: BLE001
+            log.exception("автоответ в личке не удался")
+
+
+def business_autoreply_enabled() -> bool:
+    """Отвечать ли самому на входящие в личных чатах аккаунта (TG_BUSINESS_AUTOREPLY=1)."""
+    return str(os.getenv("TG_BUSINESS_AUTOREPLY", "")).strip().lower() in {"1", "true", "yes"}
+
+
+def _business_owner_id() -> int | None:
+    """Числовой id владельца аккаунта, к которому подключён бот."""
+    for info in (load_state().get("business") or {}).values():
+        if info.get("user_id"):
+            return int(info["user_id"])
+    return None
+
+
+def maybe_autoreply(msg: dict) -> None:
+    """Ответить лиду в личке ОТ ЛИЦА аккаунта компании.
+
+    Отвечаем ТОЛЬКО на входящие от живых людей. Свои же исходящие тоже приходят этим
+    апдейтом, и без фильтра агент отвечал бы сам себе бесконечно."""
+    author = msg.get("from") or {}
+    chat = msg.get("chat") or {}
+    author_id = author.get("id")
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    if not author_id or not text:
+        return
+    if author.get("is_bot"):
+        return
+    owner_id = _business_owner_id()
+    if owner_id and author_id == owner_id:
+        return  # это исходящее самого владельца, а не входящее от клиента
+    if str(chat.get("type") or "private") != "private":
+        return  # phase 2: только личные переписки
+    conn_id = msg.get("business_connection_id") or ""
+    if not conn_id:
+        return
+
+    name = (author.get("first_name") or "").strip()
+    prompt = (
+        "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
+        "Пишет клиент или лид по партнёрской программе Wildberries. Отвечай по-русски, "
+        "коротко и по-человечески, обычным текстом без разметки, как менеджер в мессенджере — "
+        "1-3 предложения. Не представляйся ботом и не пиши, что ты ИИ. Если для ответа не "
+        "хватает данных, задай один уточняющий вопрос. Если вопрос вне твоей компетенции или "
+        "требует решения человека — скажи, что уточнишь у коллег и вернёшься с ответом.\n\n"
+        f"Собеседник: {name or 'клиент'}\n"
+        f"Его сообщение:\n{text}"
+    )
+    try:
+        answer = hermes_answer(prompt, f"tg-biz-{author_id}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("мозг не ответил лиду %s: %s", author_id, str(exc)[:200])
+        return
+    answer = _strip_markup((answer or "").strip())
+    if not answer:
+        return
+    ok, err = send_as_account(author_id, answer[:3500])
+    log.info("автоответ лиду %s: %s", author_id, "отправлен" if ok else f"не отправлен ({err})")
 
 
 def poll_forever() -> None:
