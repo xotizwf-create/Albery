@@ -143,7 +143,8 @@ def local_app_base_url() -> str:
 
 # app.py is being split module-by-module (move-only refactor), so a workflow may now
 # live in an extracted module; resolve across all of them, app first.
-WORKFLOW_MODULES = ("app", "bitrix", "gdrive", "zoom", "b24bot", "llm", "utils", "agent_center")
+WORKFLOW_MODULES = ("app", "bitrix", "gdrive", "zoom", "b24bot", "llm", "utils", "agent_center",
+                    "tg_agent")
 
 
 def app_workflow_function(name: str) -> Any:
@@ -7340,6 +7341,26 @@ def tool_get_agent_monitoring(args: dict[str, Any]) -> dict[str, Any]:
     return app_workflow_function("agent_center_report")(period)
 
 
+def tool_send_telegram_message(args: dict[str, Any]) -> dict[str, Any]:
+    """Написать человеку в Telegram ОТ ЛИЦА аккаунта компании."""
+    who = str(args.get("to") or args.get("username") or args.get("user_id") or "").strip()
+    text = str(args.get("text") or "").strip()
+    try:
+        return app_workflow_function("telegram_send_as_account")(who, text)
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"send_telegram_message failed: {exc}") from exc
+
+
+def tool_list_telegram_contacts(_: dict[str, Any]) -> dict[str, Any]:
+    """Кому агент может писать в Telegram прямо сейчас."""
+    try:
+        return app_workflow_function("telegram_contacts_list")()
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"list_telegram_contacts failed: {exc}") from exc
+
+
 def tool_list_dialog_errors(args: dict[str, Any]) -> dict[str, Any]:
     """Сбои в диалогах: что упало, когда и разобрано ли это."""
     rows = app_workflow_function("list_dialog_errors")(
@@ -8504,6 +8525,39 @@ def tool_get_latest_news_digest(args: dict[str, Any]) -> dict[str, Any]:
 
 
 TOOLS: dict[str, dict[str, Any]] = {
+    "send_telegram_message": {
+        "description": (
+            "Написать человеку в Telegram ОТ ЛИЦА аккаунта компании @AlberyAIManager (не от бота). "
+            "Используй для работы с лидами воронки «Партнёрская программа WB — индивидуальные "
+            "условия»: первое касание, уточнение условий, приглашение к подключению. "
+            "to = @username или числовой id. ВАЖНО: писать можно только тем, чей числовой id уже "
+            "известен — Telegram не позволяет боту искать людей по @username. Контакт попадает в "
+            "справочник САМ, как только человек написал на аккаунт. Кому можно писать прямо "
+            "сейчас — смотри list_telegram_contacts. Если человека там нет, не выдумывай id: "
+            "скажи владельцу, что нужен первый контакт от этого человека (ссылка "
+            "t.me/AlberyAIManager) либо MTProto-сессия."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "@username или числовой id получателя."},
+                "text": {"type": "string", "description": "Текст сообщения (обычный текст, без разметки)."},
+            },
+            "required": ["to", "text"],
+            "additionalProperties": False,
+        },
+        "handler": tool_send_telegram_message,
+    },
+    "list_telegram_contacts": {
+        "description": (
+            "Кому агент может писать в Telegram от лица аккаунта компании: справочник известных "
+            "числовых id с @username и именами. Вызывай ПЕРЕД send_telegram_message, чтобы "
+            "убедиться, что получатель доступен, и чтобы сопоставить лида из CRM (поле Telegram "
+            "в сделке) с реальным контактом."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "handler": tool_list_telegram_contacts,
+    },
     "list_dialog_errors": {
         "description": (
             "Сбои в диалогах с агентом (таймаут, обрыв хода, внутренняя ошибка): что именно упало, "
@@ -10994,6 +11048,9 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
     # Разбор сбоев — служебная работа над самой системой, не для публичных коннекторов.
     "list_dialog_errors",
     "resolve_dialog_errors",
+    # Письмо от лица личного аккаунта компании — только доверенным агентам.
+    "send_telegram_message",
+    "list_telegram_contacts",
     # Employee dossiers are internal management data — never on the public scoped connectors.
     "get_employee_dossier",
     "update_employee_dossier",

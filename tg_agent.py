@@ -331,6 +331,47 @@ def _request_contact_keyboard() -> dict:
     }
 
 
+# --- рабочие функции для агента (вызываются MCP-инструментами) --------------------------------
+
+def telegram_send_as_account(who: str, text: str) -> dict:
+    """Написать человеку от лица аккаунта владельца. who = @username или числовой id.
+
+    Telegram не даёт боту искать людей по @username, поэтому пишем только тем, чей числовой id
+    уже известен: он попадает в справочник сам, как только человек написал на аккаунт."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Пустой текст сообщения.")
+    key = (who or "").strip()
+    if not key:
+        raise ValueError("Не указан получатель.")
+    entry = find_contact(key)
+    target = entry["id"] if entry else (int(key) if key.lstrip("-").isdigit() else None)
+    if target is None:
+        raise ValueError(
+            f"«{key}» нет в справочнике, а Telegram не позволяет боту найти человека по "
+            "@username — нужен его числовой id. Он появится сам, как только человек напишет "
+            "на аккаунт (например, по ссылке t.me/AlberyAIManager). Список известных — "
+            "list_telegram_contacts.")
+    ok, err = send_as_account(target, text)
+    if not ok:
+        raise RuntimeError(f"Telegram отказал: {err}")
+    return {"sent": True, "to_id": target,
+            "to": ("@" + entry["username"]) if (entry and entry.get("username")) else str(target),
+            "from": "аккаунт владельца (Telegram Business)", "chars": len(text)}
+
+
+def telegram_contacts_list() -> dict:
+    """Кому агент может писать прямо сейчас (справочник числовых id)."""
+    uniq = {v["id"]: v for v in contacts().values() if isinstance(v, dict) and v.get("id")}
+    people = sorted(uniq.values(), key=lambda x: (x.get("username") or x.get("name") or ""))
+    return {
+        "contacts": people,
+        "total": len(people),
+        "note": ("Писать можно только этим людям: Telegram не даёт боту искать по @username. "
+                 "Новые контакты попадают сюда автоматически, когда человек пишет на аккаунт."),
+    }
+
+
 def handle_forward(chat_id, msg: dict) -> bool:
     """Достать числовой id автора ПЕРЕСЛАННОГО сообщения. True — сообщение обработано.
 
@@ -562,7 +603,19 @@ def handle_business_connection(conn: dict) -> None:
 
 
 def handle_business_message(msg: dict) -> None:
-    """Log an incoming message from the owner's personal chats (suppliers). Read-only in phase 1."""
+    """Log an incoming message from the owner's personal chats (suppliers). Read-only in phase 1.
+
+    Заодно САМ пополняет справочник контактов: во входящем есть и числовой id, и @username.
+    Это и делает рассылку лидам автоматической — как только человек написал на аккаунт хоть
+    раз, агент может писать ему сам, без участия владельца."""
+    author = msg.get("from") or {}
+    if author.get("id") and not author.get("is_bot"):
+        try:
+            remember_contact({"user_id": author["id"], "username": author.get("username"),
+                              "first_name": author.get("first_name"),
+                              "last_name": author.get("last_name")})
+        except Exception:  # noqa: BLE001
+            log.warning("не удалось записать контакт из входящего", exc_info=True)
     record = {
         "at": datetime.now(timezone.utc).isoformat(),
         "connection_id": msg.get("business_connection_id"),
