@@ -26,6 +26,9 @@ def tg(monkeypatch, tmp_path):
     monkeypatch.setattr(tg_agent, "save_state",
                         lambda s: state_file.write_text(json.dumps(s, ensure_ascii=False), encoding="utf-8"))
     monkeypatch.setenv("TG_BUSINESS_AUTOREPLY", "1")
+    # Отвечаем только лидам воронки — здесь проверяется сам механизм автоответа, поэтому
+    # собеседник считается лидом. Сам белый список проверяется в test_tg_lead_whitelist.
+    monkeypatch.setattr(tg_agent, "crm_lead_usernames", lambda force=False: {"lead": 82})
     return tg_agent
 
 

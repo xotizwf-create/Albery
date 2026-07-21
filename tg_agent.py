@@ -643,6 +643,78 @@ def business_autoreply_enabled() -> bool:
     return str(os.getenv("TG_BUSINESS_AUTOREPLY", "")).strip().lower() in {"1", "true", "yes"}
 
 
+# --- белый список: отвечаем только лидам из воронки -------------------------------------------
+# Аккаунт @AlberyAIManager живой: туда пишут не только лиды, но и поставщики, и знакомые.
+# Автоответ разрешён ТОЛЬКО тем, чей Telegram указан в сделке воронки «Партнёрская программа
+# WB — индивидуальные условия» (требование владельца 22.07.2026).
+CRM_LEAD_CATEGORY_ID = int(os.getenv("CRM_LEAD_CATEGORY_ID", "16") or 16)
+CRM_TELEGRAM_FIELD = os.getenv("CRM_TELEGRAM_FIELD", "UF_CRM_1784296997").strip()
+_LEADS_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
+_LEADS_TTL_S = float(os.getenv("CRM_LEADS_TTL_S", "300") or 300)
+
+
+def _norm_username(value: str) -> str:
+    """@Griaznov.D -> griaznov.d. Пустая строка, если это не похоже на username."""
+    s = str(value or "").strip().lower()
+    s = re.sub(r"^(https?://)?(t\.me/|telegram\.me/)", "", s)
+    s = s.lstrip("@").strip()
+    return s if re.fullmatch(r"[a-z0-9._-]{3,64}", s or "") else ""
+
+
+def _squash(value: str) -> str:
+    """griaznov.d и griaznov_d — почти наверняка один человек: в анкете точки ставят по ошибке,
+    в самом Telegram точек в username не бывает."""
+    return re.sub(r"[._-]", "", value or "")
+
+
+def crm_lead_usernames(force: bool = False) -> dict[str, int]:
+    """{username: deal_id} по сделкам воронки лидов. Пустой словарь при недоступности CRM."""
+    now = time.time()
+    if not force and _LEADS_CACHE["map"] and now - float(_LEADS_CACHE["at"]) < _LEADS_TTL_S:
+        return dict(_LEADS_CACHE["map"])
+    base = (os.getenv("BITRIX_WEBHOOK_BASE") or "").strip().rstrip("/")
+    if not base:
+        log.warning("BITRIX_WEBHOOK_BASE не задан — белый список лидов недоступен")
+        return dict(_LEADS_CACHE["map"])
+    out: dict[str, int] = {}
+    try:
+        start = 0
+        while True:
+            resp = requests.post(f"{base}/crm.deal.list", json={
+                "filter": {"CATEGORY_ID": CRM_LEAD_CATEGORY_ID},
+                "select": ["ID", CRM_TELEGRAM_FIELD], "start": start,
+            }, timeout=30)
+            data = resp.json() if resp.content else {}
+            for row in (data.get("result") or []):
+                uname = _norm_username(row.get(CRM_TELEGRAM_FIELD) or "")
+                if uname:
+                    out[uname] = int(row.get("ID") or 0)
+            nxt = data.get("next")
+            if not nxt:
+                break
+            start = int(nxt)
+    except Exception:  # noqa: BLE001
+        log.warning("не удалось прочитать лидов из CRM", exc_info=True)
+        return dict(_LEADS_CACHE["map"])
+    _LEADS_CACHE.update({"at": now, "map": out})
+    return dict(out)
+
+
+def lead_deal_for_username(username: str) -> int | None:
+    """Номер сделки, если этот человек — лид воронки. Иначе None (значит не отвечаем)."""
+    uname = _norm_username(username)
+    if not uname:
+        return None
+    leads = crm_lead_usernames()
+    if uname in leads:
+        return leads[uname]
+    squashed = _squash(uname)
+    for known, deal_id in leads.items():
+        if _squash(known) == squashed:
+            return deal_id
+    return None
+
+
 def _business_owner_id() -> int | None:
     """Числовой id владельца аккаунта, к которому подключён бот."""
     for info in (load_state().get("business") or {}).values():
@@ -673,14 +745,25 @@ def maybe_autoreply(msg: dict) -> None:
     if not conn_id:
         return
 
+    # Отвечаем ТОЛЬКО лидам воронки. Аккаунт живой: поставщикам и знакомым агент писать не
+    # должен. Если CRM недоступна, список пуст — и мы молчим, а не отвечаем всем подряд.
+    username = author.get("username") or ""
+    deal_id = lead_deal_for_username(username)
+    if deal_id is None:
+        log.info("автоответ пропущен: @%s (id %s) не найден в воронке лидов",
+                 username or "без_username", author_id)
+        return
+
     name = (author.get("first_name") or "").strip()
     prompt = (
         "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
-        "Пишет клиент или лид по партнёрской программе Wildberries. Отвечай по-русски, "
-        "коротко и по-человечески, обычным текстом без разметки, как менеджер в мессенджере — "
-        "1-3 предложения. Не представляйся ботом и не пиши, что ты ИИ. Если для ответа не "
-        "хватает данных, задай один уточняющий вопрос. Если вопрос вне твоей компетенции или "
-        "требует решения человека — скажи, что уточнишь у коллег и вернёшься с ответом.\n\n"
+        "Пишет ЛИД по партнёрской программе Wildberries — он оставил заявку на индивидуальные "
+        "условия. Отвечай по-русски, коротко и по-человечески, обычным текстом без разметки, "
+        "как менеджер в мессенджере — 1-3 предложения. Не представляйся ботом и не пиши, что ты "
+        "ИИ. Если для ответа не хватает данных, задай один уточняющий вопрос. Если вопрос вне "
+        "твоей компетенции или требует решения человека — скажи, что уточнишь у коллег и "
+        "вернёшься с ответом.\n\n"
+        f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
         f"Собеседник: {name or 'клиент'}\n"
         f"Его сообщение:\n{text}"
     )
