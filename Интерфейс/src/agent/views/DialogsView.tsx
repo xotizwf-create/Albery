@@ -11,6 +11,8 @@ import {
   Package,
   ArrowUp,
   ArrowDown,
+  X,
+  Check,
 } from "lucide-react";
 import {
   fetchAgentDialogs,
@@ -57,6 +59,10 @@ export function DialogsView() {
   const [filter, setFilter] = useState<FilterId>("all");
   // Контекстное меню по правому клику на диалоге: снять метку «ОШИБКА» после разбора.
   const [errorMenu, setErrorMenu] = useState<{ chat: Chat; x: number; y: number } | null>(null);
+  const [resolveDialog, setResolveDialog] = useState<Chat | null>(null);
+  const [resolveValue, setResolveValue] = useState("");
+  const [resolveError, setResolveError] = useState("");
+  const [resolveDone, setResolveDone] = useState("");
   const [resolving, setResolving] = useState(false);
   // Initial selection comes from the URL (/agent-dialogs/<agent>/<dialog>) so a refresh
   // or a shared link restores exactly what was open instead of resetting.
@@ -180,19 +186,25 @@ export function DialogsView() {
 
   // Снятие метки «ОШИБКА»: спрашиваем номер задачи, в которой сбой устранён, чтобы метка
   // снималась по факту работы, а не «просто так» (требование владельца 20.07.2026).
-  async function markErrorsResolved(chat: Chat) {
+  function openResolveDialog(chat: Chat) {
     setErrorMenu(null);
-    const answer = window.prompt(
-      `Снять метку «ОШИБКА» с диалога «${chat.userName}».\n\n` +
-        "Укажите номер задачи Битрикса, в которой сбой устранён\n" +
-        "(или коротко напишите, чем устранён, если задачи нет):",
-      "",
-    );
-    if (answer === null) return;
-    const text = answer.trim();
-    if (!text) return;
+    setResolveValue("");
+    setResolveError("");
+    setResolveDone("");
+    setResolveDialog(chat);
+  }
+
+  async function submitResolve() {
+    const chat = resolveDialog;
+    if (!chat || resolving) return;
+    const text = resolveValue.trim();
+    if (!text) {
+      setResolveError("Укажите номер задачи или напишите, чем сбой устранён.");
+      return;
+    }
     const taskId = /^\d+$/.test(text) ? Number(text) : null;
     setResolving(true);
+    setResolveError("");
     try {
       const n = await resolveDialogErrors({
         dialogId: chat.dialogId,
@@ -200,12 +212,17 @@ export function DialogsView() {
         taskId,
         note: taskId ? "" : text,
       });
-      setChats((prev) =>
-        prev.map((c) => (c.id === chat.id && c.tag === "ошибка" ? { ...c, tag: "ops" } : c)),
+      if (n > 0) {
+        setChats((prev) =>
+          prev.map((c) => (c.id === chat.id && c.tag === "ошибка" ? { ...c, tag: "ops" } : c)),
+        );
+      }
+      setResolveDone(
+        n ? `Метка снята — разобрано сбоев: ${n}.` : "Неразобранных сбоев в этом диалоге не нашлось.",
       );
-      window.alert(n ? `Метка снята: разобрано сбоев — ${n}.` : "Неразобранных сбоев не нашлось.");
+      window.setTimeout(() => setResolveDialog(null), 1600);
     } catch (e) {
-      window.alert(`Не удалось снять метку: ${(e as Error).message}`);
+      setResolveError((e as Error).message || "Не удалось снять метку.");
     } finally {
       setResolving(false);
     }
@@ -634,15 +651,93 @@ export function DialogsView() {
             {errorMenu.chat.userName}
           </div>
           <button
-            disabled={resolving}
-            onClick={() => markErrorsResolved(errorMenu.chat)}
-            className="w-full text-left px-3 py-2 text-[13px] font-semibold text-gray-700 hover:bg-emerald-50 hover:text-emerald-700 disabled:opacity-50 flex items-center gap-2"
+            onClick={() => openResolveDialog(errorMenu.chat)}
+            className="w-full text-left px-3 py-2 text-[13px] font-semibold text-gray-700 hover:bg-emerald-50 hover:text-emerald-700 flex items-center gap-2"
           >
-            {resolving ? <Loader2 className="w-4 h-4 animate-spin" /> : <AlertTriangle className="w-4 h-4" />}
+            <AlertTriangle className="w-4 h-4" />
             Ошибка устранена — снять метку
           </button>
           <div className="px-3 pb-1.5 pt-0.5 text-[11px] text-gray-400 leading-snug">
             Спросим номер задачи, в которой сбой устранён
+          </div>
+        </div>
+      )}
+
+      {resolveDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
+          <div
+            className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm"
+            onClick={() => !resolving && setResolveDialog(null)}
+          />
+          <div className="relative bg-white rounded-3xl shadow-2xl border border-gray-100 w-full max-w-md p-7">
+            <div className="flex items-start justify-between mb-5">
+              <div>
+                <h2 className="text-lg font-bold text-gray-900 leading-tight">Ошибка устранена</h2>
+                <p className="text-[13px] text-gray-500 font-medium mt-1">
+                  Диалог «{resolveDialog.userName}»
+                </p>
+              </div>
+              <button
+                onClick={() => !resolving && setResolveDialog(null)}
+                className="text-gray-400 hover:text-gray-600 p-1 rounded-lg hover:bg-gray-100 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {resolveDone ? (
+              <div className="flex items-center gap-2.5 px-4 py-3.5 rounded-2xl bg-emerald-50 border border-emerald-100 text-emerald-700 text-[13px] font-bold">
+                <Check className="w-4.5 h-4.5 shrink-0" />
+                {resolveDone}
+              </div>
+            ) : (
+              <>
+                <label className="block text-sm font-bold text-gray-900 mb-2">
+                  Номер задачи Битрикса
+                </label>
+                <input
+                  autoFocus
+                  type="text"
+                  value={resolveValue}
+                  onChange={(e) => {
+                    setResolveValue(e.target.value);
+                    setResolveError("");
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void submitResolve();
+                    if (e.key === "Escape" && !resolving) setResolveDialog(null);
+                  }}
+                  placeholder="Например: 1820"
+                  className="w-full px-4 py-3 bg-gray-50 border border-gray-200/80 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all font-bold shadow-sm"
+                />
+                <p className="text-[12px] text-gray-400 font-medium mt-2 leading-snug">
+                  В задаче должно быть видно, что сбой действительно устранён. Если задачи нет —
+                  напишите словами, чем устранён.
+                </p>
+                {resolveError && (
+                  <div className="mt-3 px-3.5 py-2.5 rounded-xl bg-rose-50 border border-rose-100 text-rose-600 text-[12px] font-bold">
+                    {resolveError}
+                  </div>
+                )}
+                <div className="flex gap-2.5 mt-6">
+                  <button
+                    onClick={() => void submitResolve()}
+                    disabled={resolving}
+                    className="flex-1 px-4 py-3 rounded-xl bg-indigo-600 text-white text-[13px] font-bold hover:bg-indigo-700 active:scale-[0.99] disabled:opacity-60 transition-all flex items-center justify-center gap-2 shadow-sm"
+                  >
+                    {resolving && <Loader2 className="w-4 h-4 animate-spin" />}
+                    Снять метку
+                  </button>
+                  <button
+                    onClick={() => setResolveDialog(null)}
+                    disabled={resolving}
+                    className="px-4 py-3 rounded-xl bg-gray-50 border border-gray-200/80 text-gray-600 text-[13px] font-bold hover:bg-gray-100 disabled:opacity-60 transition-all"
+                  >
+                    Отмена
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
