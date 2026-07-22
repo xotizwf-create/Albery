@@ -169,6 +169,31 @@ def delete_bot_via_botfather(username: str) -> str:
     return reply[:300]
 
 
+def revoke_token_via_botfather(username: str) -> str:
+    """Отозвать токен бота и получить новый (BotFather /revoke).
+
+    Старый токен перестаёт работать сразу, поэтому вызывающий ОБЯЗАН сохранить новый в базу —
+    иначе поток опроса останется со старым и бот замолчит."""
+    username = username.strip().lstrip("@")
+    if not username:
+        raise ValueError("Нужен @username бота.")
+
+    def _step(send_text: str, timeout_s: int = 25) -> str:
+        mark = _journal_size()
+        _botfather_say(send_text)
+        got = _botfather_wait(mark, timeout_s=timeout_s)
+        if not got.strip():
+            raise RuntimeError("BotFather молчит — попробуйте позже.")
+        return got
+
+    _step("/revoke")
+    reply = _step("@" + username, timeout_s=30)
+    found = _TOKEN_RE.search(reply)
+    if not found:
+        raise RuntimeError(f"BotFather не выдал новый токен: {reply[:250]}")
+    return found.group(1)
+
+
 def _answer(agent: dict, chat_id, sender: dict, text: str) -> None:
     """Ход агента: доступ → мозг → ответ → журнал. Ошибки не роняют поток опроса."""
     slug = agent["slug"]
@@ -214,15 +239,22 @@ def _answer(agent: dict, chat_id, sender: dict, text: str) -> None:
                  status="ok" if ok else "error")
 
 
-def _is_wanted(slug: str) -> bool:
-    """Существует ли агент ещё. Удалили в кабинете — бот обязан замолчать, а не отвечать
-    от имени несуществующего агента (владелец поймал это 22.07.2026)."""
+def _is_wanted(slug: str, token: str | None = None) -> bool:
+    """Работает ли этот агент с этим токеном.
+
+    Удалили в кабинете — бот обязан замолчать, а не отвечать от имени несуществующего агента
+    (владелец поймал это 22.07.2026). Отозвали токен в BotFather и выпустили новый — поток со
+    старым токеном должен завершиться, иначе бот навсегда останется молчащим: Telegram отвечает
+    ему 401, а перечитать токен потоку негде."""
     try:
         with core._db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM agents WHERE slug = %s AND is_active"
+                cur.execute("SELECT telegram_bot_token FROM agents WHERE slug = %s AND is_active"
                             " AND telegram_bot_token IS NOT NULL", (slug,))
-                return bool(cur.fetchone())
+                row = cur.fetchone()
+                if not row:
+                    return False
+                return token is None or str(row["telegram_bot_token"]) == str(token)
     except Exception:  # noqa: BLE001
         # База недоступна — не глушим уже работающего агента из-за сбоя связи.
         return True
@@ -233,8 +265,8 @@ def _poll(agent: dict) -> None:
     token = agent["bot_token"]
     log.info("Telegram-агент «%s» (@%s) начал работу", agent.get("name"), agent.get("username"))
     while True:
-        if not _is_wanted(slug):
-            log.info("агент %s удалён или выключен — поток опроса остановлен", slug)
+        if not _is_wanted(slug, token):
+            log.info("агент %s удалён, выключен или ему сменили токен — поток остановлен", slug)
             _threads.pop(slug, None)
             return
         try:
@@ -255,8 +287,8 @@ def _poll(agent: dict) -> None:
                 continue
             # Проверяем перед КАЖДЫМ ответом: длинный опрос висит до минуты, и без этой
             # проверки удалённый агент успел бы ответить ещё раз.
-            if not _is_wanted(slug):
-                log.info("агент %s удалён — сообщение оставлено без ответа", slug)
+            if not _is_wanted(slug, token):
+                log.info("агент %s удалён или сменил токен — сообщение без ответа", slug)
                 _threads.pop(slug, None)
                 return
             try:

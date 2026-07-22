@@ -238,7 +238,7 @@ def test_silent_botfather_does_not_hang_forever(multi, botfather, monkeypatch):
 def test_deleted_agent_stops_answering(multi, monkeypatch):
     """Самое неприятное для владельца: удалил — а бот продолжает говорить от имени компании."""
     import tg_agent
-    monkeypatch.setattr(multi, "_is_wanted", lambda slug: False)
+    monkeypatch.setattr(multi, "_is_wanted", lambda slug, token=None: False)
     calls = []
     monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
     sent = []
@@ -261,3 +261,25 @@ def test_database_outage_does_not_silence_a_live_agent(multi, monkeypatch):
     monkeypatch.setattr(tg_agent, "_db", broken_db)
 
     assert multi._is_wanted("prodazhi-bot") is True
+
+
+def test_token_change_restarts_the_polling_thread(multi, monkeypatch):
+    """Владелец отозвал токен в BotFather и выпустил новый: поток со старым токеном обязан
+    завершиться. Иначе он вечно ловит от Telegram 401 — бот молчит, а в кабинете «работает»."""
+    import tg_agent
+
+    class Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **kw): pass
+        def fetchone(self): return {"telegram_bot_token": "НОВЫЙ:token"}
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return Cur()
+
+    monkeypatch.setattr(tg_agent, "_db", lambda: Conn())
+
+    assert multi._is_wanted("prodazhi-bot", "СТАРЫЙ:token") is False
+    assert multi._is_wanted("prodazhi-bot", "НОВЫЙ:token") is True
