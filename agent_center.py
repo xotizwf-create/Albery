@@ -184,7 +184,9 @@ def _tg_identities() -> dict[str, dict[str, str]]:
 
 
 def _tg_channel_meta() -> dict[str, dict[str, str]]:
-    """Подписи каналов: имя из Telegram, если оно доступно, иначе запасное."""
+    """Все Telegram-каналы: два штатных + заведённые владельцем.
+
+    Имена берутся из Telegram, если он доступен, иначе запасные."""
     live = _tg_identities()
     meta = {}
     for slug, base in TG_CHANNELS.items():
@@ -192,6 +194,12 @@ def _tg_channel_meta() -> dict[str, dict[str, str]]:
         meta[slug] = {**base,
                       "name": got.get("name") or base["name"],
                       "handle": got.get("handle") or base["handle"]}
+    for a in telegram_agents_list():
+        if not a.get("is_active"):
+            continue
+        meta[a["slug"]] = {"name": a.get("name") or a["slug"],
+                           "handle": "@" + str(a.get("username") or ""),
+                           "subtitle": "агент владельца"}
     return meta
 # Подвкладки менеджера: разговор с самим агентом и переписки с людьми — разные потоки.
 TG_KINDS = {"bot_dm": "В боте", "lead_chat": "Диалоги с пользователями"}
@@ -307,6 +315,90 @@ def _telegram_dialog_messages(dialog_id: str, agent: str):
     return jsonify({"turns": turns})
 
 
+def telegram_agents_list() -> list[dict[str, Any]]:
+    """Агенты, заведённые владельцем. Токен наружу не отдаётся никогда."""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT slug, name, username, role_prompt, is_active, bot_user_id,"
+                            " bot_token IS NOT NULL AS has_token"
+                            " FROM telegram_agents ORDER BY id")
+                return [{k: v for k, v in dict(r).items()} for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        logging.exception("telegram agents list failed")
+        return []
+
+
+def telegram_agent_create(name: str, token: str, role_prompt: str = "") -> dict[str, Any]:
+    """Завести Telegram-агента по токену от BotFather.
+
+    Имя и @username берутся из самого Telegram, а не со слов создателя: в кабинете агент
+    должен называться ровно так же, как в мессенджере. Битый токен отсекается сразу — иначе
+    агент молча не заработал бы."""
+    token = (token or "").strip()
+    if not token or ":" not in token:
+        raise ValueError("Нужен токен бота от @BotFather (вида 123456:AA...).")
+    import tg_multi
+    try:
+        who = tg_multi.describe(token)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Telegram не принял токен: {str(exc)[:200]}") from exc
+    username = (who.get("username") or "").strip()
+    if not username:
+        raise ValueError("Telegram не вернул @username бота — проверьте токен.")
+    slug = re.sub(r"[^a-z0-9]+", "-", username.lower()).strip("-")[:40] or "tg-agent"
+    display = (name or "").strip() or who.get("name") or username
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM telegram_agents WHERE slug = %s", (slug,))
+            if cur.fetchone():
+                raise ValueError(f"Агент @{username} уже заведён.")
+            cur.execute(
+                "INSERT INTO telegram_agents (slug, name, username, bot_token, role_prompt,"
+                " bot_user_id) VALUES (%s, %s, %s, %s, %s, %s)",
+                (slug, display, username, token, (role_prompt or "").strip(),
+                 who.get("bot_user_id")))
+    # Служба albery-tg подхватывает новых агентов сама (супервизор раз в минуту) — перезапуск
+    # не нужен, чтобы не рвать переписки основного бота.
+    return {"slug": slug, "name": display, "username": username,
+            "bot_user_id": who.get("bot_user_id")}
+
+
+@app.get("/api/agent-center/telegram-agents")
+def agent_center_telegram_agents():
+    return jsonify({"agents": telegram_agents_list()})
+
+
+@app.post("/api/agent-center/telegram-agents")
+def agent_center_telegram_agent_create():
+    body = request.get_json(silent=True) or {}
+    try:
+        created = telegram_agent_create(str(body.get("name") or ""),
+                                        str(body.get("bot_token") or ""),
+                                        str(body.get("role_prompt") or ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:  # noqa: BLE001
+        logging.exception("telegram agent create failed")
+        return jsonify({"error": "Не удалось создать агента."}), 500
+    return jsonify({"ok": True, **created})
+
+
+@app.post("/api/agent-center/telegram-agents/<slug>/toggle")
+def agent_center_telegram_agent_toggle(slug: str):
+    body = request.get_json(silent=True) or {}
+    active = bool(body.get("is_active"))
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE telegram_agents SET is_active = %s WHERE slug = %s",
+                            (active, slug))
+    except Exception:  # noqa: BLE001
+        logging.exception("telegram agent toggle failed")
+        return jsonify({"error": "Не удалось изменить агента."}), 500
+    return jsonify({"ok": True, "slug": slug, "is_active": active})
+
+
 @app.get("/api/agent-center/telegram-access")
 def agent_center_telegram_access():
     """Кто может писать Telegram-агентам. До этого список жил строкой в .env на сервере."""
@@ -332,7 +424,7 @@ def agent_center_telegram_access_save():
     body = request.get_json(silent=True) or {}
     bot = str(body.get("bot") or "").strip()
     username = str(body.get("username") or "").strip().lstrip("@").lower()
-    if bot not in TG_CHANNELS:
+    if bot not in _tg_channel_meta():
         return jsonify({"error": "Неизвестный агент."}), 400
     if not re.fullmatch(r"[a-z0-9_]{3,64}", username or ""):
         return jsonify({"error": "Укажите @username (латиница, цифры, подчёркивание)."}), 400

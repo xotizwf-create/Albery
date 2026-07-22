@@ -1088,6 +1088,13 @@ def maybe_autoreply(msg: dict) -> None:
 def poll_forever() -> None:
     log.info("tg agent starting; owner ids=%s usernames=%s",
              sorted(owner_ids()), sorted(owner_usernames()))
+    # Агенты, заведённые владельцем в кабинете, работают рядом — каждый своим потоком и своим
+    # токеном. Сбой там не должен мешать основному боту: он несёт бизнес-режим и лидов.
+    try:
+        import tg_multi
+        tg_multi.start_all()
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось запустить дополнительных Telegram-агентов")
     me = api("getMe")
     log.info("bot: @%s (id %s)", me.get("username"), me.get("id"))
     offset = int(load_state().get("offset") or 0)

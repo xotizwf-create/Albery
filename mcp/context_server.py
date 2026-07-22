@@ -7403,6 +7403,63 @@ def tool_notify_iu_group(args: dict[str, Any]) -> dict[str, Any]:
     return {"sent": True, "message_id": message_id, "dialog_id": dialog_id, "bot_id": bot_id}
 
 
+def tool_list_telegram_agents(args: dict[str, Any]) -> dict[str, Any]:
+    """Telegram-агенты компании и то, кому разрешено им писать."""
+    agents = app_workflow_function("telegram_agents_list")()
+    access: dict[str, list[str]] = {}
+    with pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT bot, username FROM telegram_bot_access WHERE is_active"
+                        " ORDER BY bot, username")
+            for r in cur.fetchall():
+                access.setdefault(r["bot"], []).append(str(r["username"]))
+    rows = [{"slug": "albery-ai-bot", "name": "основной бот", "builtin": True},
+            {"slug": "albery-ai-manager", "name": "аккаунт компании", "builtin": True}]
+    rows += [{"slug": a["slug"], "name": a.get("name"), "username": a.get("username"),
+              "is_active": a.get("is_active"), "builtin": False} for a in agents]
+    for r in rows:
+        r["can_write"] = access.get(r["slug"], [])
+    return {"agents": rows, "total": len(rows)}
+
+
+def tool_create_telegram_agent(args: dict[str, Any]) -> dict[str, Any]:
+    """Завести нового Telegram-агента по токену от BotFather."""
+    token = str(args.get("bot_token") or "").strip()
+    if not token:
+        raise McpError(-32602, "Нужен bot_token от @BotFather.")
+    try:
+        created = app_workflow_function("telegram_agent_create")(
+            str(args.get("name") or ""), token, str(args.get("role_prompt") or ""))
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    return {"created": True, **created,
+            "note": ("Агент заработает в течение минуты — служба подхватывает новых сама. "
+                     "Кому разрешено писать, настраивается через set_telegram_access.")}
+
+
+def tool_set_telegram_access(args: dict[str, Any]) -> dict[str, Any]:
+    """Выдать или забрать доступ к Telegram-агенту по @username."""
+    bot = str(args.get("agent") or args.get("bot") or "").strip()
+    username = str(args.get("username") or "").strip().lstrip("@").lower()
+    if not bot or not username:
+        raise McpError(-32602, "Нужны agent (slug) и username.")
+    remove = bool(args.get("remove"))
+    with pg_connection() as conn:
+        with conn.cursor() as cur:
+            if remove:
+                cur.execute("DELETE FROM telegram_bot_access WHERE bot = %s AND username = %s",
+                            (bot, username))
+            else:
+                cur.execute(
+                    "INSERT INTO telegram_bot_access (bot, username, display_name)"
+                    " VALUES (%s, %s, %s) ON CONFLICT (bot, username)"
+                    " DO UPDATE SET is_active = true",
+                    (bot, username, str(args.get("display_name") or "").strip() or None))
+    return {"ok": True, "agent": bot, "username": username, "removed": remove,
+            "note": ("Telegram не ищет людей по @username: числовой id запишется сам, когда "
+                     "человек напишет агенту.")}
+
+
 def tool_send_telegram_message(args: dict[str, Any]) -> dict[str, Any]:
     """Написать человеку в Telegram ОТ ЛИЦА аккаунта компании."""
     who = str(args.get("to") or args.get("username") or args.get("user_id") or "").strip()
@@ -8603,6 +8660,52 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_list_crm_lead_contacts,
+    },
+    "list_telegram_agents": {
+        "description": (
+            "Telegram-агенты компании: встроенные (основной бот и аккаунт компании) и "
+            "заведённые владельцем, плюс список тех, кому разрешено каждому писать. "
+            "Смотри сюда, прежде чем заводить нового агента или выдавать доступ."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "handler": tool_list_telegram_agents,
+    },
+    "create_telegram_agent": {
+        "description": (
+            "Завести нового Telegram-агента по токену от @BotFather. Имя и @username берутся "
+            "из самого Telegram, а не со слов создателя. Битый токен отсекается сразу. Агент "
+            "начинает работать в течение минуты, перезапуск не нужен. ВАЖНО: токен — секрет, "
+            "не печатай его в ответе и не сохраняй в переписке."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bot_token": {"type": "string", "description": "Токен от @BotFather (123456:AA…)."},
+                "name": {"type": "string", "description": "Имя. По умолчанию — имя бота из Telegram."},
+                "role_prompt": {"type": "string", "description": "Кем агент работает и как отвечает."},
+            },
+            "required": ["bot_token"],
+            "additionalProperties": False,
+        },
+        "handler": tool_create_telegram_agent,
+    },
+    "set_telegram_access": {
+        "description": (
+            "Выдать или забрать доступ к Telegram-агенту по @username. Кто не в списке — "
+            "получает вежливый отказ. remove=true забирает доступ."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "slug агента (см. list_telegram_agents)."},
+                "username": {"type": "string", "description": "@username человека."},
+                "display_name": {"type": "string", "description": "Имя для кабинета."},
+                "remove": {"type": "boolean", "description": "true — забрать доступ."},
+            },
+            "required": ["agent", "username"],
+            "additionalProperties": False,
+        },
+        "handler": tool_set_telegram_access,
     },
     "notify_iu_group": {
         "description": (
