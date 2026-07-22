@@ -1038,11 +1038,17 @@ def reply_to_stranger(author: dict, text: str) -> bool:
         return False
     author_id = author.get("id")
     name = (author.get("first_name") or "").strip()
+    # Роль из карточки ЗАМЕНЯЕТ встроенный сценарий, а не дополняет его. Склейка давала
+    # противоречивый промпт: роль велит сперва проверить воронку, а встроенный текст — сразу
+    # слать анкету. Агент шёл по встроенному, и владелец получал «после обработки анкеты
+    # продолжим» вместо разговора (22.07.2026).
     role = channel_role_prompt(MANAGER_CHANNEL)
-    base = STRANGER_PROMPT.format(name=name or "клиент", text=text)
+    uname = author.get("username") or "без username"
+    base = (f"{role}\n\nСобеседник: {name or 'клиент'} (@{uname})\n"
+            f"Его сообщение:\n{text}") if role else STRANGER_PROMPT.format(
+                name=name or "клиент", text=text)
     try:
-        answer = hermes_answer(f"{role}\n\n{base}" if role else base,
-                               f"tg-new-{author_id}",
+        answer = hermes_answer(base, f"tg-new-{author_id}",
                                toolsets=channel_toolsets(MANAGER_CHANNEL))
     except Exception as exc:  # noqa: BLE001
         log.warning("мозг не ответил незнакомцу %s: %s", author_id, str(exc)[:200])
@@ -1125,8 +1131,11 @@ def maybe_autoreply(msg: dict) -> None:
     name = (author.get("first_name") or "").strip()
     role = channel_role_prompt(MANAGER_CHANNEL)
     prompt = (
-        f"{role}\n\n" if role else ""
-    ) + (
+        f"{role}\n\n"
+        f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
+        f"Собеседник: {name or 'клиент'} (@{username or 'без username'})\n"
+        f"Его сообщение:\n{text}"
+    ) if role else (
         "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
         "Пишет ЛИД по партнёрской программе Wildberries — он оставил заявку на индивидуальные "
         "условия. Отвечай по-русски, коротко и по-человечески, обычным текстом без разметки, "
