@@ -71,10 +71,21 @@ def owner_ids() -> set[int]:
     return out
 
 
+# Два канала одного бот-токена (@Albery_AI2_Bot): личка самого бота и бизнес-переписки аккаунта
+# компании @AlberyAIManager. Для владельца это два разных агента, поэтому и журнал, и права
+# доступа ведутся отдельно по каналам.
+BOT_CHANNEL = "albery-ai-bot"
+MANAGER_CHANNEL = "albery-ai-manager"
+
+
 def owner_usernames() -> set[str]:
-    """Whitelist by @username — the Bot API cannot resolve a username to an id up front, but
-    every incoming update carries from.username, so this is how the owner account is granted
-    access before it ever wrote to the bot. Owner rule 2026-07-09: ONLY @AlberyAIManager."""
+    """Кому разрешено писать агенту в личку бота.
+
+    Список живёт в БД (telegram_bot_access) и правится в кабинете; .env остаётся запасным
+    источником на случай, когда база недоступна — иначе сбой БД молча закрыл бы агента для всех."""
+    from_db = access_usernames(BOT_CHANNEL)
+    if from_db:
+        return from_db
     raw = os.getenv("TG_AGENT_OWNER_USERNAMES", "AlberyAIManager")
     return {u.strip().lstrip("@").lower() for u in raw.replace(";", ",").split(",") if u.strip()}
 
@@ -96,6 +107,82 @@ def to_int_safe(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+# --- журнал переписок и доступ (PostgreSQL) -----------------------------------------------------
+# Битрикс-диалоги живут в bitrix_bot_messages с 052 и на них построен кабинет; Telegram писался
+# только в файл рядом со службой, поэтому вкладка Telegram была заглушкой. Пишем сюда же — в БД.
+# Импортировать app/b24bot в этот процесс нельзя (их импорт стартует живые планировщики), а
+# shared.db — чистый слой без Flask, поэтому берём соединение оттуда.
+_ACCESS_CACHE: dict[str, Any] = {"at": 0.0, "by_bot": {}}
+_ACCESS_TTL_S = float(os.getenv("TG_ACCESS_TTL_S", "60") or 60)
+
+
+def _db():
+    from shared.db import connect
+    return connect()
+
+
+def journal(bot: str, dialog_id, direction: str, text: str, *, kind: str = "bot_dm",
+            user: dict | None = None, tg_message_id=None, status: str = "ok",
+            meta: dict | None = None) -> None:
+    """Записать сообщение в журнал переписок. Никогда не мешает работе агента.
+
+    Логируем только те чаты, где участвовал агент (решение владельца 22.07.2026): бизнес-режим
+    видит и личные переписки аккаунта с поставщиками и знакомыми, им не место в кабинете."""
+    try:
+        user = user or {}
+        uname = str(user.get("username") or "").lstrip("@").lower() or None
+        name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x).strip()
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO telegram_bot_messages (bot, dialog_id, tg_user_id, username,"
+                    " display_name, direction, kind, text, tg_message_id, status, meta)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (bot, str(dialog_id), to_int_safe(user.get("id")), uname, name or None,
+                     direction, kind, (text or "")[:20000], to_int_safe(tg_message_id), status,
+                     json.dumps(meta, ensure_ascii=False) if meta else None),
+                )
+    except Exception:  # noqa: BLE001
+        log.warning("журнал Telegram недоступен", exc_info=True)
+
+
+def access_usernames(bot: str) -> set[str]:
+    """Кому разрешено писать этому агенту. Пустое множество = список не задан/БД недоступна."""
+    now = time.time()
+    cached = (_ACCESS_CACHE["by_bot"] or {}).get(bot)
+    if cached is not None and now - float(_ACCESS_CACHE["at"]) < _ACCESS_TTL_S:
+        return set(cached)
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT username FROM telegram_bot_access"
+                            " WHERE bot = %s AND is_active", (bot,))
+                names = {str(r["username"]).lstrip("@").lower() for r in cur.fetchall()}
+    except Exception:  # noqa: BLE001
+        log.warning("список доступа Telegram недоступен", exc_info=True)
+        return set(cached or ())
+    _ACCESS_CACHE["by_bot"][bot] = names
+    _ACCESS_CACHE["at"] = now
+    return set(names)
+
+
+def remember_access_user_id(bot: str, user: dict) -> None:
+    """Дописать числовой id к записи доступа: по @username Telegram искать людей не умеет,
+    id становится известен только когда человек написал сам."""
+    uname = str((user or {}).get("username") or "").lstrip("@").lower()
+    uid = to_int_safe((user or {}).get("id"))
+    if not uname or not uid:
+        return
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE telegram_bot_access SET tg_user_id = %s"
+                            " WHERE bot = %s AND username = %s AND tg_user_id IS DISTINCT FROM %s",
+                            (uid, bot, uname, uid))
+    except Exception:  # noqa: BLE001
+        log.warning("не удалось запомнить id для доступа", exc_info=True)
 
 
 def _remember_owner_chat(user: dict) -> None:
@@ -564,10 +651,16 @@ def handle_message(msg: dict) -> None:
         return
     if not text:
         return
+    journal(BOT_CHANNEL, chat_id, "in", text, kind="bot_dm", user=sender,
+            tg_message_id=msg.get("message_id"))
     if not is_owner(sender):
-        send_text(chat_id, "Я — внутренний агент компании Albery и работаю только с владельцем. "
-                           "Если вам нужен доступ — напишите Евгению.")
+        refusal = ("Я — внутренний агент компании Albery и работаю только с владельцем. "
+                   "Если вам нужен доступ — напишите Евгению.")
+        send_text(chat_id, refusal)
+        journal(BOT_CHANNEL, chat_id, "out", refusal, kind="bot_dm", user=sender,
+                meta={"denied": True})
         return
+    remember_access_user_id(BOT_CHANNEL, sender)
     _remember_owner_chat(sender)
     if handle_command(chat_id, text):
         return
@@ -576,11 +669,16 @@ def handle_message(msg: dict) -> None:
     except Exception:  # noqa: BLE001
         pass
     try:
-        send_text(chat_id, owner_turn(chat_id, text))
+        answer = owner_turn(chat_id, text)
+        send_text(chat_id, answer)
+        journal(BOT_CHANNEL, chat_id, "out", answer, kind="bot_dm", user=sender)
     except Exception as exc:  # noqa: BLE001
         log.exception("owner turn failed")
-        send_text(chat_id, f"Не получилось ответить (мозг сбоит): {str(exc)[:150]}. "
-                           "Попробуйте ещё раз через минуту.")
+        failure = (f"Не получилось ответить (мозг сбоит): {str(exc)[:150]}. "
+                   "Попробуйте ещё раз через минуту.")
+        send_text(chat_id, failure)
+        # status=error: в кабинете такие ходы видно как сбойные, а не как обычный ответ.
+        journal(BOT_CHANNEL, chat_id, "out", failure, kind="bot_dm", user=sender, status="error")
 
 
 def handle_business_connection(conn: dict) -> None:
@@ -633,6 +731,13 @@ def handle_business_message(msg: dict) -> None:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         log.exception("business log write failed")
+    # Разговор владельца аккаунта с самим агентом — это отдельная подвкладка кабинета
+    # («в боте»), она не должна смешиваться с перепиской по лидам.
+    owner_id = _business_owner_id()
+    text_in = (msg.get("text") or msg.get("caption") or "").strip()
+    if owner_id and text_in and to_int_safe(author.get("id")) == owner_id:
+        journal(MANAGER_CHANNEL, record["chat_id"], "in", text_in, kind="bot_dm", user=author,
+                tg_message_id=msg.get("message_id"))
     if business_autoreply_enabled():
         try:
             maybe_autoreply(msg)
@@ -893,6 +998,12 @@ def reply_to_stranger(author: dict, text: str) -> bool:
     ok, err = send_as_account(author_id, answer[:3500])
     if ok and invite_now:
         _mark_invited(author_id)    # отмечаем только фактически доставленное
+    # Незнакомец попадает в журнал только теперь: агент с ним заговорил. Пока он молчал, это была
+    # обычная личная переписка аккаунта, которой в кабинете не место.
+    journal(MANAGER_CHANNEL, author_id, "in", text, kind="lead_chat", user=author)
+    journal(MANAGER_CHANNEL, author_id, "out", answer if ok else f"{answer}\n\n[не доставлено: {err}]",
+            kind="lead_chat", user=author, status="ok" if ok else "error",
+            meta={"stranger": True, "invited": bool(invite_now and ok)})
     log.info("ответ незнакомцу %s: %s%s", author_id, "отправлен" if ok else f"не ушёл ({err})",
              " (+анкета)" if invite_now and ok else "")
     return ok
@@ -940,6 +1051,10 @@ def maybe_autoreply(msg: dict) -> None:
         reply_to_stranger(author, text)
         return
 
+    # В журнал попадают только переписки, где участвует агент: у лида воронки он ведёт разговор.
+    journal(MANAGER_CHANNEL, author_id, "in", text, kind="lead_chat", user=author,
+            tg_message_id=msg.get("message_id"), meta={"deal_id": deal_id})
+
     name = (author.get("first_name") or "").strip()
     prompt = (
         "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
@@ -957,11 +1072,16 @@ def maybe_autoreply(msg: dict) -> None:
         answer = hermes_answer(prompt, f"tg-biz-{author_id}")
     except Exception as exc:  # noqa: BLE001
         log.warning("мозг не ответил лиду %s: %s", author_id, str(exc)[:200])
+        journal(MANAGER_CHANNEL, author_id, "out", f"мозг не ответил: {str(exc)[:200]}",
+                kind="lead_chat", user=author, status="error", meta={"deal_id": deal_id})
         return
     answer = _strip_markup((answer or "").strip())
     if not answer:
         return
     ok, err = send_as_account(author_id, answer[:3500])
+    journal(MANAGER_CHANNEL, author_id, "out", answer if ok else f"{answer}\n\n[не доставлено: {err}]",
+            kind="lead_chat", user=author, status="ok" if ok else "error",
+            meta={"deal_id": deal_id})
     log.info("автоответ лиду %s: %s", author_id, "отправлен" if ok else f"не отправлен ({err})")
 
 

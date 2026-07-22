@@ -120,11 +120,193 @@ def _user_names() -> dict[int, dict[str, str]]:
     return out
 
 
+# --- Telegram side of the agent centre ------------------------------------------------------
+# Один бот-токен (@Albery_AI2_Bot) обслуживает два канала, и для владельца это разные агенты:
+# личка самого бота и бизнес-переписки аккаунта компании @AlberyAIManager. Журнал пишет
+# tg_agent (служба albery-tg) в telegram_bot_messages — миграция 060.
+TG_BOT_CHANNEL = "albery-ai-bot"
+TG_MANAGER_CHANNEL = "albery-ai-manager"
+TG_CHANNELS = {
+    TG_BOT_CHANNEL: {"name": "Албери AI бот", "handle": "@Albery_AI2_Bot",
+                     "subtitle": "личные сообщения боту"},
+    TG_MANAGER_CHANNEL: {"name": "Албери AI менеджер", "handle": "@AlberyAIManager",
+                         "subtitle": "аккаунт компании • лиды"},
+}
+# Подвкладки менеджера: разговор с самим агентом и переписки с людьми — разные потоки.
+TG_KINDS = {"bot_dm": "В боте", "lead_chat": "Диалоги с пользователями"}
+
+
+def _telegram_dialogs(q: str, agent: str, kind: str, limit: int) -> list[dict[str, Any]]:
+    """Список Telegram-переписок: последнее сообщение, счётчики, сбои — как во вкладке Bitrix."""
+    where = ["dialog_id IS NOT NULL"]
+    scope: list[Any] = []               # параметры одного блока условий
+    if agent and agent != "all":
+        where.append("bot = %s")
+        scope.append(agent)
+    if kind and kind != "all":
+        where.append("kind = %s")
+        scope.append(kind)
+    cond = " AND ".join(where)
+    sql = f"""
+        WITH last AS (
+            SELECT DISTINCT ON (bot, dialog_id)
+                   bot, dialog_id, tg_user_id, username, display_name, direction, kind,
+                   text, created_at
+            FROM telegram_bot_messages WHERE {cond}
+            ORDER BY bot, dialog_id, id DESC
+        ),
+        agg AS (
+            SELECT bot, dialog_id, COUNT(*) AS turns, MAX(created_at) AS last_at,
+                   COUNT(*) FILTER (WHERE status <> 'ok') AS errors,
+                   MAX(display_name) AS any_name, MAX(username) AS any_username
+            FROM telegram_bot_messages WHERE {cond}
+            GROUP BY bot, dialog_id
+        )
+        SELECT l.*, a.turns, a.last_at, a.errors,
+               COALESCE(l.display_name, a.any_name) AS name2,
+               COALESCE(l.username, a.any_username) AS username2
+        FROM last l JOIN agg a ON a.bot = l.bot AND a.dialog_id = l.dialog_id
+    """
+    params: list[Any] = [*scope, *scope]        # блок last + блок agg
+    if q:
+        sql += (f" WHERE l.dialog_id IN (SELECT DISTINCT dialog_id FROM telegram_bot_messages"
+                f" WHERE text ILIKE %s AND {cond})")
+        params += [f"%{q}%", *scope]            # поиск остаётся внутри выбранного агента
+    sql += " ORDER BY a.last_at DESC LIMIT %s"
+    params.append(limit)
+    out: list[dict[str, Any]] = []
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+    for r in rows:
+        preview = (r["text"] or "").strip()
+        if r["direction"] == "out":
+            preview = "Агент: " + preview
+        if len(preview) > 100:
+            preview = preview[:100].rstrip() + "…"
+        uname = r["username2"] or ""
+        title = r["name2"] or (f"@{uname}" if uname else f"Пользователь {r['dialog_id']}")
+        out.append({
+            "dialog_id": str(r["dialog_id"]),
+            "task_id": None,
+            "bitrix_user_id": None,
+            "user_name": title,
+            "user_position": (f"@{uname}" if uname else ""),
+            "tier": "ops",
+            "agent_slug": r["bot"],
+            "kind": r["kind"],
+            "last_message": preview,
+            "last_status": "error" if int(r["errors"] or 0) else "ok",
+            "turns": int(r["turns"] or 0),
+            "errors": int(r["errors"] or 0),
+            "time": _when_label(r["last_at"]),
+        })
+    return out
+
+
+def _telegram_dialog_messages(dialog_id: str, agent: str):
+    """Одна Telegram-переписка целиком — тем же форматом, что и вкладка Bitrix."""
+    where = ["dialog_id = %s"]
+    params: list[Any] = [dialog_id]
+    if agent and agent != "all":
+        where.append("bot = %s")
+        params.append(agent)
+    limit = _limit_arg(_MESSAGES_LIMIT_DEFAULT, 1000)
+    turns = []
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, created_at, direction, kind, text, status, display_name, username"
+                    f" FROM telegram_bot_messages WHERE {' AND '.join(where)}"
+                    " ORDER BY id DESC LIMIT %s", [*params, limit])
+                rows = cur.fetchall()
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center telegram dialog messages failed")
+        return jsonify({"error": "Не удалось загрузить переписку."}), 500
+    for r in reversed(rows):
+        local = r["created_at"].astimezone(MSK_TZ) if r["created_at"] else None
+        text = (r["text"] or "").strip()
+        inbound = r["direction"] == "in"
+        turns.append({
+            "id": int(r["id"]),
+            "date": local.strftime("%d.%m.%Y") if local else "",
+            "time": local.strftime("%H:%M") if local else "",
+            "question": text if inbound else "",
+            "answer": "" if inbound else text,
+            "status": r["status"] or "ok",
+            "error": None,
+            "latency_ms": None,
+            "kind": TG_KINDS.get(r["kind"], r["kind"]),
+        })
+    return jsonify({"turns": turns})
+
+
+@app.get("/api/agent-center/telegram-access")
+def agent_center_telegram_access():
+    """Кто может писать Telegram-агентам. До этого список жил строкой в .env на сервере."""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, bot, username, tg_user_id, display_name, is_active, note"
+                            " FROM telegram_bot_access ORDER BY bot, username")
+                rows = [dict(r) for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center telegram access failed")
+        return jsonify({"error": "Не удалось загрузить доступ."}), 500
+    agents = [{"slug": slug, **meta,
+               "users": [r for r in rows if r["bot"] == slug]} for slug, meta in TG_CHANNELS.items()]
+    return jsonify({"agents": agents})
+
+
+@app.post("/api/agent-center/telegram-access")
+def agent_center_telegram_access_save():
+    """Добавить/убрать доступ. Telegram не умеет искать людей по @username, поэтому ключ —
+    username, а числовой id дописывается сам, когда человек впервые написал агенту."""
+    body = request.get_json(silent=True) or {}
+    bot = str(body.get("bot") or "").strip()
+    username = str(body.get("username") or "").strip().lstrip("@").lower()
+    if bot not in TG_CHANNELS:
+        return jsonify({"error": "Неизвестный агент."}), 400
+    if not re.fullmatch(r"[a-z0-9_]{3,64}", username or ""):
+        return jsonify({"error": "Укажите @username (латиница, цифры, подчёркивание)."}), 400
+    remove = bool(body.get("remove"))
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                if remove:
+                    cur.execute("DELETE FROM telegram_bot_access WHERE bot = %s AND username = %s",
+                                (bot, username))
+                else:
+                    cur.execute(
+                        "INSERT INTO telegram_bot_access (bot, username, display_name, note)"
+                        " VALUES (%s, %s, %s, %s)"
+                        " ON CONFLICT (bot, username) DO UPDATE SET is_active = true,"
+                        " display_name = COALESCE(EXCLUDED.display_name, telegram_bot_access.display_name)",
+                        (bot, username, str(body.get("display_name") or "").strip() or None,
+                         str(body.get("note") or "").strip() or None))
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center telegram access save failed")
+        return jsonify({"error": "Не удалось сохранить доступ."}), 500
+    return jsonify({"ok": True, "bot": bot, "username": username, "removed": remove})
+
+
 @app.get("/api/agent-center/dialogs")
 def agent_center_dialogs():
     channel = (request.args.get("channel") or "bitrix").strip().lower()
     if channel == "telegram":
-        return jsonify({"dialogs": [], "note": "Telegram-переписка появится после моста с Hermes."})
+        agent = (request.args.get("agent") or "all").strip()
+        kind = (request.args.get("kind") or "all").strip().lower()
+        try:
+            dialogs = _telegram_dialogs((request.args.get("q") or "").strip(), agent, kind,
+                                        _limit_arg(_DIALOGS_LIMIT_DEFAULT, 500))
+        except Exception:  # noqa: BLE001
+            logging.exception("agent_center telegram dialogs failed")
+            return jsonify({"error": "Не удалось загрузить Telegram-переписки."}), 500
+        note = "" if dialogs else ("Переписок пока нет. Здесь появятся диалоги, в которых "
+                                   "участвовал агент.")
+        return jsonify({"dialogs": dialogs, "note": note})
     q = (request.args.get("q") or "").strip()
     # Each bot keeps its OWN dialog history — do not pool them. Subagent turns carry
     # agent_slug=<slug>; the universal/main agent's turns have agent_slug IS NULL.
@@ -419,6 +601,8 @@ def agent_center_dialog_messages():
     dialog_id = (request.args.get("dialog_id") or "").strip()
     if not dialog_id:
         return jsonify({"error": "Укажите dialog_id."}), 400
+    if (request.args.get("channel") or "").strip().lower() == "telegram":
+        return _telegram_dialog_messages(dialog_id, (request.args.get("agent") or "all").strip())
     # Same dialog_id is shared across bots (Bitrix keys a private bot chat by the user),
     # so a thread MUST be scoped to the bot or it leaks other bots' turns into this one.
     agent = (request.args.get("agent") or "all").strip()
@@ -566,7 +750,60 @@ def agent_center_agents():
             })
     except Exception:  # noqa: BLE001
         logging.exception("agent_center: subagents list failed")
+    agents.extend(_telegram_agent_cards())
     return jsonify({"agents": agents})
+
+
+def _telegram_agent_cards() -> list[dict[str, Any]]:
+    """Карточки Telegram-агентов. Каналы разделены: у этих агентов нет ни Битрикса, ни
+    bitrix_bot_interactions — их обороты считаются по журналу telegram_bot_messages."""
+    day_start = msk_now().replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = day_start - timedelta(days=7)
+    stats: dict[str, dict[str, Any]] = {}
+    access: dict[str, list[str]] = {}
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT bot,"
+                    " COUNT(*) FILTER (WHERE created_at >= %s) AS turns_today,"
+                    " COUNT(*) FILTER (WHERE created_at >= %s) AS turns_7d,"
+                    " COUNT(*) FILTER (WHERE status <> 'ok' AND created_at >= %s) AS errors_7d,"
+                    " COUNT(DISTINCT dialog_id) AS dialogs,"
+                    " MAX(created_at) AS last_at"
+                    " FROM telegram_bot_messages GROUP BY bot",
+                    (day_start, week_start, week_start))
+                stats = {r["bot"]: dict(r) for r in cur.fetchall()}
+                cur.execute("SELECT bot, username FROM telegram_bot_access WHERE is_active"
+                            " ORDER BY username")
+                for r in cur.fetchall():
+                    access.setdefault(r["bot"], []).append("@" + str(r["username"]))
+    except Exception:  # noqa: BLE001
+        logging.exception("agent_center: telegram agent cards failed")
+        return []
+    cards = []
+    for slug, meta in TG_CHANNELS.items():
+        st = stats.get(slug, {})
+        users = access.get(slug, [])
+        cards.append({
+            "id": slug,
+            "name": meta["name"],
+            "kind": f"Telegram • {meta['subtitle']}",
+            "icon": "box",
+            "icon_bg": "bg-sky-100 text-sky-500",
+            "is_system": True,
+            "is_active": True,
+            "channels": ["Telegram"],
+            "handle": meta["handle"],
+            "users_count": len(users),
+            "users_preview": ", ".join(users[:3]) + (f" +{len(users) - 3}" if len(users) > 3 else ""),
+            "turns_today": int(st.get("turns_today") or 0),
+            "turns_7d": int(st.get("turns_7d") or 0),
+            "errors_7d": int(st.get("errors_7d") or 0),
+            "avg_speed": "—",
+            "last_at": _when_label(st.get("last_at")),
+        })
+    return cards
 
 
 @app.get("/api/agent-center/tools")

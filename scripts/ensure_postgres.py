@@ -94,6 +94,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "051_bitrix_bot_message_seen.sql",
     # Idempotent: full agent<->human message journal (what the owner sees in the UI).
     "052_bitrix_bot_messages.sql",
+    # Idempotent: Telegram message journal + per-bot access list (Telegram tab of the agent centre).
+    "060_telegram_agent_journal.sql",
 ]
 
 
