@@ -322,6 +322,22 @@ def channel_toolsets(channel: str) -> str | None:
     return f"agent-{channel},{extra}" if extra else f"agent-{channel}"
 
 
+def channel_role_prompt(channel: str) -> str:
+    """Роль агента из его карточки в кабинете.
+
+    Промпт живёт в карточке, а не в коде: владелец правит поведение агента сам, без деплоя.
+    Пусто или база недоступна — работает встроенный текст ниже, чтобы агент не остался немым."""
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT role_prompt FROM agents WHERE slug = %s AND is_active",
+                            (channel,))
+                row = cur.fetchone()
+                return (row["role_prompt"] or "").strip() if row else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
                   timeout_s: int | None = None) -> str:
     toolsets = toolsets or os.getenv("TG_AGENT_TOOLSETS", "albery,web")
@@ -910,6 +926,11 @@ _INVITE_COOLDOWN_S = float(os.getenv("TG_INVITE_COOLDOWN_DAYS", "30") or 30) * 8
 
 # Хвост с анкетой. Обычный текст без разметки: ответ мозга подставляется рядом, а любой <, > или &
 # из его ответа сломал бы HTML-режим и Telegram отклонил бы сообщение целиком.
+# Ссылка, по которой лид приходит в чат ПОСЛЕ формы: текст подставляется в поле ввода, ему
+# остаётся нажать «отправить». Так агент сразу понимает контекст, а не выспрашивает заново.
+LEAD_CHAT_URL = os.getenv(
+    "LEAD_CHAT_URL", "https://t.me/AlberyAIManager?text=%D0%97%D0%B4%D1%80%D0%B0%D0%B2%D1%81%D1%82%D0%B2%D1%83%D0%B9%D1%82%D0%B5%21%20%D0%A4%D0%BE%D1%80%D0%BC%D1%83%20%D0%BE%D1%82%D0%BF%D1%80%D0%B0%D0%B2%D0%B8%D0%BB%2C%20%D0%BA%D0%B0%D0%BA%D0%B8%D0%B5%20%D0%BC%D0%BE%D0%B8%20%D0%B4%D0%B0%D0%BB%D1%8C%D0%BD%D0%B5%D0%B9%D1%88%D0%B8%D0%B5%20%D0%B4%D0%B5%D0%B9%D1%81%D1%82%D0%B2%D0%B8%D1%8F%3F").strip()
+
 FORM_TAIL = (
     "\n\n———\n"
     "📝 Чтобы подобрать условия под ваш магазин, заполните короткую анкету — пара минут:\n"
@@ -1017,8 +1038,10 @@ def reply_to_stranger(author: dict, text: str) -> bool:
         return False
     author_id = author.get("id")
     name = (author.get("first_name") or "").strip()
+    role = channel_role_prompt(MANAGER_CHANNEL)
+    base = STRANGER_PROMPT.format(name=name or "клиент", text=text)
     try:
-        answer = hermes_answer(STRANGER_PROMPT.format(name=name or "клиент", text=text),
+        answer = hermes_answer(f"{role}\n\n{base}" if role else base,
                                f"tg-new-{author_id}",
                                toolsets=channel_toolsets(MANAGER_CHANNEL))
     except Exception as exc:  # noqa: BLE001
@@ -1100,7 +1123,10 @@ def maybe_autoreply(msg: dict) -> None:
     react(author_id, msg.get("message_id"), "👀", conn_id_react)
 
     name = (author.get("first_name") or "").strip()
+    role = channel_role_prompt(MANAGER_CHANNEL)
     prompt = (
+        f"{role}\n\n" if role else ""
+    ) + (
         "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
         "Пишет ЛИД по партнёрской программе Wildberries — он оставил заявку на индивидуальные "
         "условия. Отвечай по-русски, коротко и по-человечески, обычным текстом без разметки, "
