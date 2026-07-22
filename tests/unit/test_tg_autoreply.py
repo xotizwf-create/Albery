@@ -42,7 +42,7 @@ def _incoming(uid=1451982360, text="Здравствуйте, интересую
 def test_lead_gets_an_answer_from_the_company_account(tg, monkeypatch):
     sent = {}
     monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Расскажите про ваш оборот.")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (sent.update(uid=uid, text=t), (True, ""))[1])
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (sent.update(uid=uid, text=t), (True, ""))[1])
 
     tg.maybe_autoreply(_incoming())
 
@@ -54,7 +54,7 @@ def test_own_outgoing_messages_never_trigger_a_reply(tg, monkeypatch):
     """Самое опасное: иначе агент отвечает сам себе по кругу."""
     calls = []
     monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (True, ""))
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
 
     tg.maybe_autoreply(_incoming(uid=8715335144))  # id самого владельца аккаунта
 
@@ -112,7 +112,7 @@ def test_brain_failure_does_not_crash_the_pipeline(tg, monkeypatch):
         raise RuntimeError("мозг недоступен")
 
     monkeypatch.setattr(tg, "hermes_answer", boom)
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (True, ""))
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
 
     tg.maybe_autoreply(_incoming())  # не должно бросить исключение
 
@@ -121,7 +121,7 @@ def test_answer_is_sent_as_plain_text(tg, monkeypatch):
     """В мессенджере разметка выглядит мусором."""
     sent = {}
     monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "**Жирный** текст")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (sent.update(text=t), (True, ""))[1])
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (sent.update(text=t), (True, ""))[1])
 
     tg.maybe_autoreply(_incoming())
 

@@ -37,7 +37,7 @@ def test_lead_from_the_funnel_gets_an_answer(tg, monkeypatch):
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
     sent = {}
     monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Уточните оборот, пожалуйста.")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (sent.update(uid=uid, text=t), (True, ""))[1])
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (sent.update(uid=uid, text=t), (True, ""))[1])
 
     tg.maybe_autoreply(_msg())
 
@@ -90,7 +90,7 @@ def test_deal_number_is_given_to_the_agent(tg, monkeypatch):
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
     prompts = []
     monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: prompts.append(p) or "ок")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (True, ""))
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
 
     tg.maybe_autoreply(_msg())
 

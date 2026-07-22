@@ -19,6 +19,7 @@ Secrets: TG_AGENT_BOT_TOKEN lives only in /var/www/albery/.env (never in git).
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -961,10 +962,10 @@ def lead_deal_for_username(username: str) -> int | None:
 # Партнёрская программа WB»), а ссылка на анкету добавляется к первому ответу хвостом.
 # Чего в базе нет — агент НЕ придумывает: он передаёт вопрос живому менеджеру (эскалация).
 
-# ПУБЛИЧНАЯ ссылка формы (/pub/form/...). Адрес вида /crm/form/detail/... — это карточка формы
-# внутри портала: клиента он уводит на страницу входа в Битрикс, а не на анкету.
+# Ссылка для клиентов — сайт компании (владелец, 22.07.2026). Прежний адрес /pub/form/… —
+# внутренний адрес формы на портале; клиентам его не показываем.
 LEAD_FORM_URL = os.getenv(
-    "CRM_LEAD_FORM_URL", "https://b24-0xrp3s.bitrix24.ru/pub/form/2_nvunq5/").strip()
+    "CRM_LEAD_FORM_URL", "https://b24-9qcm4m.bitrix24site.ru/").strip()
 _INVITE_COOLDOWN_S = float(os.getenv("TG_INVITE_COOLDOWN_DAYS", "30") or 30) * 86400
 
 # Хвост с анкетой. Обычный текст без разметки: ответ мозга подставляется рядом, а любой <, > или &
@@ -974,12 +975,40 @@ _INVITE_COOLDOWN_S = float(os.getenv("TG_INVITE_COOLDOWN_DAYS", "30") or 30) * 8
 LEAD_CHAT_URL = os.getenv(
     "LEAD_CHAT_URL", "https://t.me/AlberyAIManager?text=%D0%97%D0%B4%D1%80%D0%B0%D0%B2%D1%81%D1%82%D0%B2%D1%83%D0%B9%D1%82%D0%B5%21%20%D0%A4%D0%BE%D1%80%D0%BC%D1%83%20%D0%BE%D1%82%D0%BF%D1%80%D0%B0%D0%B2%D0%B8%D0%BB%2C%20%D0%BA%D0%B0%D0%BA%D0%B8%D0%B5%20%D0%BC%D0%BE%D0%B8%20%D0%B4%D0%B0%D0%BB%D1%8C%D0%BD%D0%B5%D0%B9%D1%88%D0%B8%D0%B5%20%D0%B4%D0%B5%D0%B9%D1%81%D1%82%D0%B2%D0%B8%D1%8F%3F").strip()
 
+# Хвост с анкетой — уже в HTML: ссылка приходит клиенту кликабельной подписью, как у агентов
+# в Битриксе ([URL=…]…[/URL]), а не голым адресом.
 FORM_TAIL = (
     "\n\n———\n"
-    "📝 Чтобы подобрать условия под ваш магазин, заполните короткую анкету — пара минут:\n"
-    "{url}\n"
-    "Как заполните, вернитесь сюда и напишите — продолжим уже по вашим цифрам. 🤝"
+    "Чтобы подобрать условия под ваш магазин, нужна короткая анкета — пара минут:\n"
+    '<a href="{url}">Заполнить анкету</a>\n'
+    "Как заполните, возвращайтесь сюда — продолжим уже по вашим цифрам 🤝"
 )
+# Тот же хвост без разметки — на случай, когда Telegram отверг HTML: адрес должен остаться
+# видимым, иначе «Заполнить анкету» превратится в слова без ссылки.
+FORM_TAIL_PLAIN = FORM_TAIL.replace('<a href="{url}">Заполнить анкету</a>', "{url}")
+
+
+# Модель пишет ссылки по-человечески — [Заполнить анкету](https://…). Превращаем их в
+# кликабельные подписи. Экранируем ВСЁ до этого: любой <, > или & из ответа мозга иначе
+# сломал бы HTML-режим, и Telegram отклонил бы сообщение целиком.
+_MD_LINK_RE = re.compile(r"\[([^\]\n]{1,80})\]\((https?://[^\s)]+)\)")
+
+
+def as_html(text: str) -> str:
+    safe = html.escape(text or "", quote=False)
+    return _MD_LINK_RE.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', safe)
+
+
+def send_html(user_id: int, body_html: str, plain: str) -> tuple[bool, str]:
+    """Отправить размеченное сообщение, с откатом на обычный текст.
+
+    Разметка косметическая: если Telegram придерётся к ней, клиент всё равно должен получить
+    ответ — молчание из-за неудачного символа хуже сообщения без кликабельной ссылки."""
+    ok, err = send_as_account(user_id, body_html[:3500], parse_mode="HTML")
+    if ok:
+        return True, ""
+    log.warning("HTML-режим отклонён (%s) — шлём обычным текстом", err[:120])
+    return send_as_account(user_id, plain[:3500])
 
 # Мозг отвечает этим маркером, когда ответа в базе знаний нет. Тогда вопрос уходит живым людям
 # в группу «Работа с ИУ», а клиенту агент НЕ пишет ничего (владелец, 22.07.2026): отписка
@@ -1134,9 +1163,13 @@ def reply_to_stranger(author: dict, text: str) -> bool:
 
     # Анкета — хвостом к первому ответу, один раз: это приглашение, а не подпись под каждым словом.
     invite_now = LEAD_FORM_URL and not _invite_already_sent(author_id)
+    body = as_html(answer)
+    plain = answer
     if invite_now:
-        answer = answer + FORM_TAIL.format(url=LEAD_FORM_URL)
-    ok, err = send_as_account(author_id, answer[:3500])
+        body += FORM_TAIL.format(url=LEAD_FORM_URL)
+        plain += FORM_TAIL_PLAIN.format(url=LEAD_FORM_URL)
+    ok, err = send_html(author_id, body, plain)
+    answer = plain
     if ok and invite_now:
         _mark_invited(author_id)    # отмечаем только фактически доставленное
     # Незнакомец попадает в журнал только теперь: агент с ним заговорил. Пока он молчал, это была
@@ -1233,7 +1266,7 @@ def maybe_autoreply(msg: dict) -> None:
                 "в группу «Работа с ИУ», клиенту не отвечено", kind="lead_chat", user=author,
                 status="ok", meta={"deal_id": deal_id, "escalated": True})
         return
-    ok, err = send_as_account(author_id, answer[:3500])
+    ok, err = send_html(author_id, as_html(answer), answer)
     journal(MANAGER_CHANNEL, author_id, "out", answer if ok else f"{answer}\n\n[не доставлено: {err}]",
             kind="lead_chat", user=author, status="ok" if ok else "error",
             meta={"deal_id": deal_id})

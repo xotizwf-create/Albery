@@ -39,8 +39,8 @@ def tg(monkeypatch, tmp_path):
 def sent(tg, monkeypatch):
     box = []
     monkeypatch.setattr(tg, "send_as_account",
-                        lambda uid, text, parse_mode="": box.append({"uid": uid, "text": text})
-                        or (True, ""))
+                        lambda uid, text, parse_mode="": box.append(
+                            {"uid": uid, "text": text, "mode": parse_mode}) or (True, ""))
     return box
 
 
@@ -154,10 +154,50 @@ def test_group_answering_without_message_id_is_not_trusted(tg, sent, to_human, m
     assert len(to_human) == 1
 
 
-def test_form_link_is_the_public_one(tg):
-    """/crm/form/detail/... уводит клиента на страницу входа в Битрикс вместо анкеты."""
-    assert "/pub/form/" in tg.LEAD_FORM_URL
-    assert "/crm/form/detail/" not in tg.LEAD_FORM_URL
+def test_client_link_is_the_public_site(tg):
+    """Владелец 22.07.2026: клиентам уходит только сайт компании, внутренние адреса портала — нет."""
+    assert tg.LEAD_FORM_URL.startswith("https://b24-9qcm4m.bitrix24site.ru")
+    assert "/pub/form/" not in tg.LEAD_FORM_URL
+    assert "/crm/" not in tg.LEAD_FORM_URL
+
+
+def test_form_invite_is_a_clickable_link(tg, sent, monkeypatch):
+    """В Битриксе ссылка приходит подписью [URL=…]…[/URL]; в Telegram должно быть так же."""
+    _brain(tg, monkeypatch)
+
+    tg.maybe_autoreply(_msg(text="Здравствуйте"))
+
+    assert sent[0]["mode"] == "HTML", "без parse_mode ссылка останется голым адресом"
+    assert f'<a href="{tg.LEAD_FORM_URL}">Заполнить анкету</a>' in sent[0]["text"]
+
+
+def test_model_links_become_clickable_too(tg):
+    """Мозг пишет ссылки по-человечески — [подпись](адрес); клиент должен получить подпись."""
+    out = tg.as_html("Смотрите [условия работы](https://example.com/x) — там всё есть")
+
+    assert '<a href="https://example.com/x">условия работы</a>' in out
+
+
+def test_stray_angle_brackets_do_not_break_the_message(tg):
+    """Любой < или & из ответа мозга иначе сломал бы HTML-режим, и клиент не получил бы ничего."""
+    out = tg.as_html("оборот < 5 млн & растёт")
+
+    assert "&lt; 5 млн &amp; растёт" in out
+
+
+def test_broken_markup_still_reaches_the_client(tg, monkeypatch):
+    """Разметка косметическая: молчание из-за неудачного символа хуже сообщения без ссылки."""
+    tries = []
+
+    def flaky(uid, text, parse_mode=""):
+        tries.append({"text": text, "mode": parse_mode})
+        return (False, "can't parse entities") if parse_mode else (True, "")
+
+    monkeypatch.setattr(tg, "send_as_account", flaky)
+    ok, _ = tg.send_html(999, "<a href='x'>битая</a>", "обычный текст")
+
+    assert ok and len(tries) == 2
+    assert tries[1]["mode"] == "" and tries[1]["text"] == "обычный текст"
 
 
 def test_client_gets_nothing_while_the_question_goes_to_people(tg, sent, to_group, monkeypatch):
