@@ -423,13 +423,57 @@ export async function resolveDialogErrors(params: {
   return Number(data.resolved || 0);
 }
 
-export async function fetchDialogTurns(dialogId: string, agent?: string): Promise<DialogTurn[]> {
+export async function fetchDialogTurns(
+  dialogId: string,
+  agent?: string,
+  channel?: string,
+): Promise<DialogTurn[]> {
   const search = new URLSearchParams({ dialog_id: dialogId });
   // Scope the thread to the bot — a dialog_id is shared across bots, so without this the
   // thread would mix in other bots' turns with the same user.
   if (agent && agent !== "all") search.set("agent", agent);
+  // Telegram lives in its own journal (telegram_bot_messages), not in the Bitrix one.
+  if (channel && channel.toLowerCase() === "telegram") search.set("channel", "telegram");
   const data = await fetchJsonSafe(`/api/agent-center/dialog-messages?${search}`, undefined, 30000);
   return (data.turns || []) as DialogTurn[];
+}
+
+// --- Telegram access: who may write to each Telegram agent ---
+// Раньше список жил строкой TG_AGENT_OWNER_USERNAMES в .env на сервере и правился только руками.
+
+export interface TelegramAccessUser {
+  id: number;
+  bot: string;
+  username: string;
+  tg_user_id: number | null;
+  display_name: string | null;
+  is_active: boolean;
+}
+
+export interface TelegramAccessAgent {
+  slug: string;
+  name: string;
+  handle: string;
+  subtitle: string;
+  users: TelegramAccessUser[];
+}
+
+export async function fetchTelegramAccess(): Promise<TelegramAccessAgent[]> {
+  const data = await fetchJsonSafe("/api/agent-center/telegram-access", undefined, 30000);
+  return (data.agents || []) as TelegramAccessAgent[];
+}
+
+export async function saveTelegramAccess(params: {
+  bot: string;
+  username: string;
+  display_name?: string;
+  remove?: boolean;
+}): Promise<void> {
+  await fetchJsonSafe(
+    "/api/agent-center/telegram-access",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(params) },
+    30000,
+  );
 }
 
 export async function fetchAgents(): Promise<AgentConfig[]> {

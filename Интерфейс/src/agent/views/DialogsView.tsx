@@ -18,8 +18,11 @@ import {
   fetchAgentDialogs,
   fetchAgents,
   fetchDialogTurns,
+  fetchTelegramAccess,
   resolveDialogErrors,
+  saveTelegramAccess,
   DialogTurn,
+  TelegramAccessAgent,
 } from "../api";
 import { AgentConfig, Chat } from "../types";
 import { agentSubSegments, setAgentPath } from "../route";
@@ -43,6 +46,15 @@ const FILTERS = [
 
 type FilterId = (typeof FILTERS)[number]["id"];
 
+// Подвкладки Telegram: разговор с самим агентом и переписки с людьми — разные потоки.
+const TG_SCOPES = [
+  { id: "all", label: "Все" },
+  { id: "bot_dm", label: "В боте" },
+  { id: "lead_chat", label: "С пользователями" },
+] as const;
+
+type TgScope = (typeof TG_SCOPES)[number]["id"];
+
 export function DialogsView() {
   const [agents, setAgents] = useState<AgentConfig[]>([]);
   const [chats, setChats] = useState<Chat[]>([]);
@@ -55,6 +67,12 @@ export function DialogsView() {
   const [scope, setScope] = useState<"chat" | "task">(
     () => (agentSubSegments(DIALOGS_BASE)[1]?.startsWith("task-") ? "task" : "chat"),
   );
+  const [tgScope, setTgScope] = useState<TgScope>("all");
+  const [tgAccess, setTgAccess] = useState<TelegramAccessAgent[]>([]);
+  const [accessOpen, setAccessOpen] = useState(false);
+  const [accessInput, setAccessInput] = useState("");
+  const [accessBusy, setAccessBusy] = useState(false);
+  const [accessError, setAccessError] = useState("");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterId>("all");
   // Контекстное меню по правому клику на диалоге: снять метку «ОШИБКА» после разбора.
@@ -104,6 +122,40 @@ export function DialogsView() {
     fetchAgents().then(setAgents).catch(() => setAgents([]));
   }, []);
 
+  const reloadAccess = () =>
+    fetchTelegramAccess().then(setTgAccess).catch(() => setTgAccess([]));
+
+  useEffect(() => {
+    if (channel === "Telegram") void reloadAccess();
+  }, [channel]);
+
+  // Каналы разделены: у битрикс-ботов channels=["Bitrix"], у телеграмных — ["Telegram"].
+  // Без этого в списке Telegram висели бы битрикс-субагенты, у которых там нет переписок.
+  const channelAgents = useMemo(
+    () => agents.filter((a) => (a.channels || []).includes(channel)),
+    [agents, channel],
+  );
+
+  const accessForAgent = useMemo(
+    () => tgAccess.find((a) => a.slug === activeAgentId) || null,
+    [tgAccess, activeAgentId],
+  );
+
+  const submitAccess = async (username: string, remove: boolean) => {
+    if (!accessForAgent) return;
+    setAccessBusy(true);
+    setAccessError("");
+    try {
+      await saveTelegramAccess({ bot: accessForAgent.slug, username, remove });
+      await reloadAccess();
+      if (!remove) setAccessInput("");
+    } catch (e) {
+      setAccessError((e as Error).message);
+    } finally {
+      setAccessBusy(false);
+    }
+  };
+
   // User picked a bot in the left pane: drop the open dialog + stale list so one bot's
   // conversation never lingers under another. URL-driven changes (deep link / back) set
   // the selection directly and intentionally skip this reset.
@@ -118,6 +170,16 @@ export function DialogsView() {
   const selectScope = (s: "chat" | "task") => {
     if (s === scope) return;
     setScope(s);
+    setActiveChatId(null);
+    setChats([]);
+  };
+
+  // Telegram has its own two streams: the conversation with the agent itself ("В боте") and
+  // the chats with people the agent handles ("Диалоги с пользователями"). Same idea as the
+  // Bitrix chats/tasks split — kept apart so they never mix.
+  const selectTgScope = (s: TgScope) => {
+    if (s === tgScope) return;
+    setTgScope(s);
     setActiveChatId(null);
     setChats([]);
   };
@@ -150,7 +212,12 @@ export function DialogsView() {
     const timer = window.setTimeout(() => {
       setChatsLoading(true);
       setError("");
-      fetchAgentDialogs({ channel, q: query, agent: activeAgentId, kind: channel === "Bitrix" ? scope : undefined })
+      fetchAgentDialogs({
+        channel,
+        q: query,
+        agent: activeAgentId,
+        kind: channel === "Bitrix" ? scope : tgScope === "all" ? undefined : tgScope,
+      })
         .then(({ chats: loaded, note }) => {
           if (cancelled) return;
           setChats(loaded);
@@ -167,7 +234,7 @@ export function DialogsView() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [channel, query, activeAgentId, scope]);
+  }, [channel, query, activeAgentId, scope, tgScope]);
 
   // The agents pane narrows the list to one bot server-side (each bot has its own
   // dialog history — never pooled); here only the tag chips narrow it further.
@@ -257,7 +324,7 @@ export function DialogsView() {
     initialScrollRef.current = true;
     atBottomRef.current = true;
     setTurnsLoading(true);
-    fetchDialogTurns(chatDialogId, chatAgentId)
+    fetchDialogTurns(chatDialogId, chatAgentId, channel)
       .then((loaded) => {
         if (!cancelled) setTurns(loaded);
       })
@@ -270,7 +337,7 @@ export function DialogsView() {
     // Live updates: silently re-pull the open conversation (state changes only
     // when a new turn actually arrived, so no flicker while reading).
     const timer = window.setInterval(() => {
-      fetchDialogTurns(chatDialogId, chatAgentId)
+      fetchDialogTurns(chatDialogId, chatAgentId, channel)
         .then((loaded) => {
           if (cancelled) return;
           setTurns((prev) => {
@@ -291,12 +358,17 @@ export function DialogsView() {
   // Live refresh of the dialog list (new dialogs / previews / error tags).
   useEffect(() => {
     const timer = window.setInterval(() => {
-      fetchAgentDialogs({ channel, q: query, agent: activeAgentId, kind: channel === "Bitrix" ? scope : undefined })
+      fetchAgentDialogs({
+        channel,
+        q: query,
+        agent: activeAgentId,
+        kind: channel === "Bitrix" ? scope : tgScope === "all" ? undefined : tgScope,
+      })
         .then(({ chats: loaded }) => setChats(loaded))
         .catch(() => {});
     }, 20000);
     return () => window.clearInterval(timer);
-  }, [channel, query, activeAgentId, scope]);
+  }, [channel, query, activeAgentId, scope, tgScope]);
 
   const agentIcon = (iconType: AgentConfig["iconType"]) =>
     iconType === "zap" ? Zap : iconType === "book" ? BookOpen : iconType === "crown" ? Crown : Package;
@@ -328,7 +400,7 @@ export function DialogsView() {
               <div className="text-[12px] text-gray-500 font-medium truncate mt-0.5">без фильтра</div>
             </div>
           </button>
-          {agents
+          {channelAgents
             .filter((a) => a.isActive)
             .map((agent) => {
               const isActive = agent.id === activeAgentId;
@@ -388,6 +460,89 @@ export function DialogsView() {
               </button>
             ))}
           </div>
+          {channel === "Telegram" && (
+            <div className="flex gap-1 p-1 bg-gray-100/70 rounded-xl">
+              {TG_SCOPES.map((s) => (
+                <button
+                  key={s.id}
+                  onClick={() => selectTgScope(s.id)}
+                  className={cn(
+                    "flex-1 px-2 py-1.5 text-[12.5px] font-bold rounded-lg transition-colors flex items-center justify-center gap-1.5",
+                    tgScope === s.id ? "bg-white text-sky-700 shadow-sm" : "text-gray-500 hover:text-gray-700",
+                  )}
+                >
+                  {s.label}
+                  {tgScope === s.id && (
+                    <span className="text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded-md text-[11px]">
+                      {chats.length}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+          {channel === "Telegram" && accessForAgent && (
+            <div className="rounded-xl border border-gray-200 bg-gray-50/70 p-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-[12px] font-bold text-gray-700 truncate">
+                    Доступ · {accessForAgent.handle}
+                  </div>
+                  <div className="text-[11.5px] text-gray-500 truncate mt-0.5">
+                    {accessForAgent.users.length
+                      ? accessForAgent.users.map((u) => "@" + u.username).join(", ")
+                      : "никто не добавлен"}
+                  </div>
+                </div>
+                <button
+                  onClick={() => setAccessOpen((v) => !v)}
+                  className="text-[12px] font-bold text-sky-600 hover:text-sky-700 shrink-0"
+                >
+                  {accessOpen ? "скрыть" : "изменить"}
+                </button>
+              </div>
+              {accessOpen && (
+                <div className="mt-2.5 space-y-2">
+                  {accessForAgent.users.map((u) => (
+                    <div key={u.id} className="flex items-center justify-between gap-2 text-[12.5px]">
+                      <span className="truncate text-gray-700">
+                        @{u.username}
+                        {u.display_name ? <span className="text-gray-400"> · {u.display_name}</span> : null}
+                      </span>
+                      <button
+                        disabled={accessBusy}
+                        onClick={() => void submitAccess(u.username, true)}
+                        className="text-gray-400 hover:text-rose-600 shrink-0 disabled:opacity-40"
+                        title="Убрать доступ"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                  <div className="flex gap-1.5">
+                    <input
+                      value={accessInput}
+                      onChange={(e) => setAccessInput(e.target.value)}
+                      placeholder="@username"
+                      className="flex-1 min-w-0 px-2.5 py-1.5 text-[12.5px] rounded-lg border border-gray-200 focus:outline-none focus:border-sky-400"
+                    />
+                    <button
+                      disabled={accessBusy || !accessInput.trim()}
+                      onClick={() => void submitAccess(accessInput.trim().replace(/^@/, "").toLowerCase(), false)}
+                      className="px-2.5 py-1.5 text-[12.5px] font-bold rounded-lg bg-sky-600 text-white disabled:opacity-40"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  {accessError && <div className="text-[11.5px] text-rose-600">{accessError}</div>}
+                  <div className="text-[11px] text-gray-400 leading-snug">
+                    Telegram не ищет людей по @username — числовой id запишется сам, когда человек
+                    напишет агенту.
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           {channel === "Bitrix" && (
             <div className="flex gap-1 p-1 bg-gray-100/70 rounded-xl">
               {(
