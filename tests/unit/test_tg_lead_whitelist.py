@@ -24,7 +24,7 @@ def tg(monkeypatch, tmp_path):
     monkeypatch.setattr(tg_agent, "save_state",
                         lambda s: state_file.write_text(json.dumps(s, ensure_ascii=False), encoding="utf-8"))
     monkeypatch.setenv("TG_BUSINESS_AUTOREPLY", "1")
-    tg_agent._LEADS_CACHE.update({"at": 0.0, "map": {}})
+    tg_agent._LEADS_CACHE.update({"at": 0.0, "map": {}, "ok": True})
     return tg_agent
 
 
@@ -44,37 +44,45 @@ def test_lead_from_the_funnel_gets_an_answer(tg, monkeypatch):
     assert sent["uid"] == 555 and "оборот" in sent["text"]
 
 
-def test_stranger_is_ignored(tg, monkeypatch):
-    """Поставщику или знакомому агент писать не должен."""
+def test_stranger_never_gets_a_generated_reply(tg, monkeypatch):
+    """С не-лидом агент диалог не ведёт: ему полагается только анкета (test_tg_lead_invite)."""
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
     calls = []
     monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (True, ""))
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
 
     tg.maybe_autoreply(_msg(username="postavshik_ivan", uid=999))
 
-    assert calls == [], "не лид — агент обязан молчать"
+    assert calls == [], "не лид — переписку с ним агент не ведёт"
 
 
-def test_user_without_username_is_ignored(tg, monkeypatch):
+def test_user_without_username_gets_no_generated_reply(tg, monkeypatch):
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
     calls = []
     monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
 
     tg.maybe_autoreply(_msg(username="", uid=1234))
 
     assert calls == []
 
 
-def test_crm_unavailable_means_silence_not_reply_to_everyone(tg, monkeypatch):
-    """Безопасный отказ: если воронку не прочитать, молчим, а не отвечаем всем подряд."""
+def test_crm_unavailable_means_total_silence(tg, monkeypatch):
+    """Если воронку не прочитать, лида не отличить от незнакомца — не пишем НИЧЕГО.
+
+    Иначе при сбое Bitrix живой лид получил бы приглашение заполнить анкету, которую он уже
+    заполнил."""
+    monkeypatch.setenv("TG_LEAD_INVITE", "1")
+    tg._LEADS_CACHE.update({"at": 0.0, "map": {}, "ok": False})
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {})
-    calls = []
+    calls, sent = [], []
     monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
+    monkeypatch.setattr(tg, "send_as_account",
+                        lambda uid, t, parse_mode="": sent.append(t) or (True, ""))
 
     tg.maybe_autoreply(_msg())
 
-    assert calls == []
+    assert calls == [] and sent == []
 
 
 def test_deal_number_is_given_to_the_agent(tg, monkeypatch):

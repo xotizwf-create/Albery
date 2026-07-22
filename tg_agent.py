@@ -305,14 +305,16 @@ def find_contact(who: str) -> dict | None:
     return contacts().get(key)
 
 
-def send_as_account(user_id: int, text: str) -> tuple[bool, str]:
+def send_as_account(user_id: int, text: str, parse_mode: str = "") -> tuple[bool, str]:
     """Написать человеку ОТ ЛИЦА аккаунта владельца (Telegram Business), а не от бота."""
     state = load_state()
     conn_ids = list((state.get("business") or {}).keys())
     if not conn_ids:
         return False, "бизнес-подключение не настроено: подключите бота в Telegram → Настройки → Telegram для бизнеса → Чат-боты"
+    extra = {"parse_mode": parse_mode} if parse_mode else {}
     try:
-        api("sendMessage", business_connection_id=conn_ids[0], chat_id=int(user_id), text=text)
+        api("sendMessage", business_connection_id=conn_ids[0], chat_id=int(user_id), text=text,
+            link_preview_options={"is_disabled": True}, **extra)
         return True, ""
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)[:200]
@@ -649,7 +651,7 @@ def business_autoreply_enabled() -> bool:
 # WB — индивидуальные условия» (требование владельца 22.07.2026).
 CRM_LEAD_CATEGORY_ID = int(os.getenv("CRM_LEAD_CATEGORY_ID", "16") or 16)
 CRM_TELEGRAM_FIELD = os.getenv("CRM_TELEGRAM_FIELD", "UF_CRM_1784296997").strip()
-_LEADS_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
+_LEADS_CACHE: dict[str, Any] = {"at": 0.0, "map": {}, "ok": False}
 _LEADS_TTL_S = float(os.getenv("CRM_LEADS_TTL_S", "300") or 300)
 
 
@@ -668,7 +670,10 @@ def _squash(value: str) -> str:
 
 
 def crm_lead_usernames(force: bool = False) -> dict[str, int]:
-    """{username: deal_id} по сделкам воронки лидов. Пустой словарь при недоступности CRM."""
+    """{username: deal_id} по сделкам воронки лидов. Пустой словарь при недоступности CRM.
+
+    Пустой ответ двусмыслен (воронка пуста ИЛИ CRM недоступна), поэтому успех запроса
+    отмечается отдельно в _LEADS_CACHE["ok"] — см. crm_leads_reachable()."""
     now = time.time()
     if not force and _LEADS_CACHE["map"] and now - float(_LEADS_CACHE["at"]) < _LEADS_TTL_S:
         return dict(_LEADS_CACHE["map"])
@@ -678,6 +683,7 @@ def crm_lead_usernames(force: bool = False) -> dict[str, int]:
     secret = (os.getenv("MCP_SHARED_SECRET") or "").strip()
     if not secret:
         log.warning("MCP_SHARED_SECRET не задан — белый список лидов недоступен")
+        _LEADS_CACHE["ok"] = False
         return dict(_LEADS_CACHE["map"])
     url = os.getenv("ALBERY_MCP_URL", "http://127.0.0.1:5002/mcp").strip()
     out: dict[str, int] = {}
@@ -707,9 +713,16 @@ def crm_lead_usernames(force: bool = False) -> dict[str, int]:
                 out[uname] = int(row.get("deal_id") or 0)
     except Exception:  # noqa: BLE001
         log.warning("не удалось прочитать лидов из CRM", exc_info=True)
+        _LEADS_CACHE["ok"] = False
         return dict(_LEADS_CACHE["map"])
-    _LEADS_CACHE.update({"at": now, "map": out})
+    _LEADS_CACHE.update({"at": now, "map": out, "ok": True})
     return dict(out)
+
+
+def crm_leads_reachable() -> bool:
+    """Удалось ли прочитать воронку. Незнакомцу пишут приглашение, а лиду — ответ; если CRM
+    молчит, отличить одного от другого нельзя, и тогда безопаснее не писать вообще."""
+    return bool(_LEADS_CACHE.get("ok"))
 
 
 def lead_deal_for_username(username: str) -> int | None:
@@ -725,6 +738,69 @@ def lead_deal_for_username(username: str) -> int | None:
         if _squash(known) == squashed:
             return deal_id
     return None
+
+
+# --- приглашение незнакомца заполнить анкету ----------------------------------------------------
+# Написал человек, которого нет в воронке (спросил про подключение или что-то своё). Менеджер
+# отвечать не успевает, а лид остывает — поэтому аккаунт сам вручает ссылку на анкету. Заполнив
+# её, человек создаёт сделку, его username попадает в белый список, и следующее его сообщение уже
+# ведёт агент как лида. Приглашение отправляется ОДИН раз, иначе это превращается в спам.
+
+LEAD_FORM_URL = os.getenv(
+    "CRM_LEAD_FORM_URL", "https://b24-0xrp3s.bitrix24.ru/crm/form/detail/2/nvunq5/").strip()
+_INVITE_COOLDOWN_S = float(os.getenv("TG_INVITE_COOLDOWN_DAYS", "30") or 30) * 86400
+
+INVITE_TEXT = (
+    "👋 <b>Добрый день!</b>\n"
+    "\n"
+    "Это Albery. Мы помогаем брендам подключиться к <b>индивидуальным условиям на Wildberries</b> "
+    "— это партнёрская программа для селлеров.\n"
+    "\n"
+    "Чтобы подобрать условия под ваш магазин, заполните, пожалуйста, короткую анкету — "
+    "это займёт пару минут:\n"
+    "\n"
+    "📝 {url}\n"
+    "\n"
+    "Как заполните — <b>вернитесь в этот чат</b> и напишите любое сообщение. "
+    "Я увижу вашу заявку и продолжу разговор уже по вашим цифрам. 🤝"
+)
+
+
+def lead_invite_enabled() -> bool:
+    return (os.getenv("TG_LEAD_INVITE") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _invite_already_sent(user_id: int) -> bool:
+    """Приглашали ли этого человека недавно. Второй раз одно и то же слать нельзя."""
+    sent_at = (load_state().get("invited") or {}).get(str(user_id))
+    if not sent_at:
+        return False
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(sent_at)).total_seconds()
+    except Exception:  # noqa: BLE001
+        return True      # дата битая — считаем, что уже писали, чтобы точно не задваивать
+    return age < _INVITE_COOLDOWN_S
+
+
+def _mark_invited(user_id: int) -> None:
+    with _state_lock:
+        state = load_state()
+        state.setdefault("invited", {})[str(user_id)] = datetime.now(timezone.utc).isoformat()
+        save_state(state)
+
+
+def invite_stranger(user_id: int) -> bool:
+    """Вручить незнакомцу ссылку на анкету. True, если сообщение ушло."""
+    if not lead_invite_enabled() or not LEAD_FORM_URL:
+        return False
+    if _invite_already_sent(user_id):
+        log.info("приглашение уже отправлялось %s — молчим", user_id)
+        return False
+    ok, err = send_as_account(user_id, INVITE_TEXT.format(url=LEAD_FORM_URL), parse_mode="HTML")
+    if ok:
+        _mark_invited(user_id)      # отмечаем только фактически доставленное
+    log.info("приглашение незнакомцу %s: %s", user_id, "отправлено" if ok else f"не ушло ({err})")
+    return ok
 
 
 def _business_owner_id() -> int | None:
@@ -762,8 +838,11 @@ def maybe_autoreply(msg: dict) -> None:
     username = author.get("username") or ""
     deal_id = lead_deal_for_username(username)
     if deal_id is None:
-        log.info("автоответ пропущен: @%s (id %s) не найден в воронке лидов",
-                 username or "без_username", author_id)
+        if not crm_leads_reachable():
+            log.warning("CRM недоступна — не пишем %s: лида не отличить от незнакомца", author_id)
+            return
+        # Человека в воронке нет: вручаем анкету, чтобы он сам стал лидом.
+        invite_stranger(author_id)
         return
 
     name = (author.get("first_name") or "").strip()
