@@ -276,6 +276,23 @@ def test_bitrix_report_format_is_not_pushed_into_the_chat(tg, sent, monkeypatch)
     assert "Стандартный формат ответа" not in seen[0]
 
 
+def test_answer_and_side_question_go_together(tg, sent, to_group, monkeypatch):
+    """Есть что ответить по существу, но нет конкретики: клиент получает ответ, люди — вопрос.
+
+    Молчать здесь нельзя — новый лид остался бы совсем без ответа (владелец 22.07.2026)."""
+    _brain(tg, monkeypatch, "Расскажу, как всё устроено: сначала смотрим категорию\n"
+                            "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ: какая комиссия и сроки подключения")
+
+    tg.maybe_autoreply(_msg(text="Что за ИУ и сколько стоит?"))
+
+    assert len(sent) == 1, "клиент должен получить ответ по существу"
+    assert "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ" not in sent[0]["text"], "служебная строка клиенту не уходит"
+    assert "сначала смотрим категорию" in sent[0]["text"]
+    assert len(to_group) == 1 and "комиссия и сроки" in to_group[0]["text"]
+    assert "Клиенту отвечено по существу" in to_group[0]["text"], \
+        "сотрудник должен понимать, что человек не сидит в тишине"
+
+
 def _journal_rows(tg, monkeypatch, rows):
     """Подменяем чтение журнала переписки — историю агент берёт оттуда."""
     monkeypatch.setattr(tg, "chat_history",

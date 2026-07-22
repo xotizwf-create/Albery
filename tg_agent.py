@@ -1058,6 +1058,11 @@ def send_html(user_id: int, body_html: str, plain: str) -> tuple[bool, str]:
 # «уточню у коллег и вернусь» обещает ответ, который агент сам дать не может, и клиент считает
 # минуты. Пауза без обещания честнее — а сотрудник тем временем отвечает по-настоящему.
 ESCALATION_MARKER = "НУЖЕН_ЧЕЛОВЕК"
+# Второй случай: агенту ЕСТЬ что ответить по существу (порядок работы, уточняющий вопрос), но
+# конкретики — цифр, сроков, гарантий — в базе нет. Молчать здесь неправильно: новый лид
+# остался бы совсем без ответа. Тогда агент отвечает клиенту И отдельной строкой просит людей
+# дать недостающее. Строка клиенту не уходит.
+SIDE_ESCALATION_MARKER = "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ"
 
 STRANGER_PROMPT = (
     "Ты — менеджер компании Albery, отвечаешь в Telegram от лица аккаунта компании. Пишет "
@@ -1107,7 +1112,8 @@ def _mark_invited(user_id: int) -> None:
 IU_AGENT_NAME = os.getenv("IU_AGENT_NAME", "Агент по работе с ИУ").strip()
 
 
-def escalate_to_human(author: dict, question: str, client_text: str) -> None:
+def escalate_to_human(author: dict, question: str, client_text: str,
+                      answered: bool = False) -> None:
     """Принести вопрос лида живым людям в группу Битрикса «Работа с ИУ».
 
     Ответ сотрудника в той же группе агент передаёт клиенту сам — поэтому в карточке есть
@@ -1118,8 +1124,10 @@ def escalate_to_human(author: dict, question: str, client_text: str) -> None:
     # Оформление — по стандарту компании: блоки через пустую строку, заголовки [b]…[/b].
     # Клиент в этот момент СИДИТ БЕЗ ОТВЕТА, поэтому карточка начинается со срочности: сотрудник
     # должен понять это с первой строки, а не вычитать из середины.
-    card = (f"[b]⚠️ Клиент ждёт ответа — ему пока НИЧЕГО не отвечено[/b]\n"
-            f"\n"
+    card = ((f"[b]Клиенту отвечено по существу, но нужна конкретика от вас[/b]\n"
+             if answered else
+             f"[b]⚠️ Клиент ждёт ответа — ему пока НИЧЕГО не отвечено[/b]\n")
+            + f"\n"
             f"Пользователь задал вопрос: «{client_text[:600]}»\n"
             f"Что мне на него ответить?\n"
             f"\n"
@@ -1154,6 +1162,22 @@ def escalate_to_human(author: dict, question: str, client_text: str) -> None:
         log.info("эскалация по %s ушла в Telegram (запасной канал)", uid)
     except Exception as exc:  # noqa: BLE001
         log.warning("эскалация не доставлена вообще: %s", str(exc)[:200])
+
+
+def split_side_question(author: dict, answer: str, client_text: str) -> str:
+    """Вынуть из ответа строку «ТАКЖЕ_СПРОСИ_ЛЮДЕЙ: …», унести вопрос людям, вернуть чистый текст.
+
+    Клиент получает ответ по существу, а недостающую конкретику сотрудники досылают следом."""
+    if SIDE_ESCALATION_MARKER not in answer:
+        return answer
+    kept, question = [], ""
+    for line in answer.splitlines():
+        if line.strip().startswith(SIDE_ESCALATION_MARKER):
+            question = line.split(":", 1)[-1].strip()
+        else:
+            kept.append(line)
+    escalate_to_human(author, (question or client_text)[:200], client_text, answered=True)
+    return "\n".join(kept).strip()
 
 
 def escalated(author: dict, answer: str, client_text: str) -> bool:
@@ -1205,6 +1229,10 @@ def reply_to_stranger(author: dict, text: str) -> bool:
         journal(MANAGER_CHANNEL, author_id, "out", "вопрос без ответа в базе — унесён людям "
                 "в группу «Работа с ИУ», клиенту не отвечено", kind="lead_chat", user=author,
                 status="ok", meta={"stranger": True, "escalated": True})
+        return False
+
+    answer = split_side_question(author, answer, text)
+    if not answer:
         return False
 
     # Анкета — хвостом к первому ответу, один раз: это приглашение, а не подпись под каждым словом.
@@ -1312,6 +1340,9 @@ def maybe_autoreply(msg: dict) -> None:
         journal(MANAGER_CHANNEL, author_id, "out", "вопрос без ответа в базе — унесён людям "
                 "в группу «Работа с ИУ», клиенту не отвечено", kind="lead_chat", user=author,
                 status="ok", meta={"deal_id": deal_id, "escalated": True})
+        return
+    answer = split_side_question(author, answer, text)
+    if not answer:
         return
     ok, err = send_html(author_id, as_html(answer), answer)
     journal(MANAGER_CHANNEL, author_id, "out", answer if ok else f"{answer}\n\n[не доставлено: {err}]",
