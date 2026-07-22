@@ -740,29 +740,51 @@ def lead_deal_for_username(username: str) -> int | None:
     return None
 
 
-# --- приглашение незнакомца заполнить анкету ----------------------------------------------------
-# Написал человек, которого нет в воронке (спросил про подключение или что-то своё). Менеджер
-# отвечать не успевает, а лид остывает — поэтому аккаунт сам вручает ссылку на анкету. Заполнив
-# её, человек создаёт сделку, его username попадает в белый список, и следующее его сообщение уже
-# ведёт агент как лида. Приглашение отправляется ОДИН раз, иначе это превращается в спам.
+# --- разговор с незнакомцем ---------------------------------------------------------------------
+# Написал человек, которого нет в воронке. Он ведёт себя как живой человек: здоровается, о чём-то
+# спрашивает — значит и отвечать надо как живой менеджер, а не выдавать всем одну и ту же простыню.
+# Поэтому ответ сочиняет мозг, опираясь на базу знаний воронки в Google Drive («База знаний —
+# Партнёрская программа WB»), а ссылка на анкету добавляется к первому ответу хвостом.
+# Чего в базе нет — агент НЕ придумывает: он передаёт вопрос живому менеджеру (эскалация).
 
 LEAD_FORM_URL = os.getenv(
     "CRM_LEAD_FORM_URL", "https://b24-0xrp3s.bitrix24.ru/crm/form/detail/2/nvunq5/").strip()
 _INVITE_COOLDOWN_S = float(os.getenv("TG_INVITE_COOLDOWN_DAYS", "30") or 30) * 86400
 
-INVITE_TEXT = (
-    "👋 <b>Добрый день!</b>\n"
+# Хвост с анкетой. Обычный текст без разметки: ответ мозга подставляется рядом, а любой <, > или &
+# из его ответа сломал бы HTML-режим и Telegram отклонил бы сообщение целиком.
+FORM_TAIL = (
+    "\n\n———\n"
+    "📝 Чтобы подобрать условия под ваш магазин, заполните короткую анкету — пара минут:\n"
+    "{url}\n"
+    "Как заполните, вернитесь сюда и напишите — продолжим уже по вашим цифрам. 🤝"
+)
+
+# Мозг отвечает этим маркером, когда ответа в базе знаний нет. Тогда клиент получает вежливое
+# «уточню у коллег», а вопрос уходит живому человеку — вместо выдуманного ответа.
+ESCALATION_MARKER = "НУЖЕН_ЧЕЛОВЕК"
+ESCALATION_REPLY = ("Спасибо за вопрос! Уточню детали у коллег и вернусь с ответом — "
+                    "обычно это занимает немного времени. 🙌")
+
+STRANGER_PROMPT = (
+    "Ты — менеджер компании Albery, отвечаешь в Telegram от лица аккаунта компании. Пишет "
+    "человек, которого ещё нет в CRM. Веди себя как живой человек, а не как автоответчик.\n"
     "\n"
-    "Это Albery. Мы помогаем брендам подключиться к <b>индивидуальным условиям на Wildberries</b> "
-    "— это партнёрская программа для селлеров.\n"
+    "Как отвечать:\n"
+    "- по-русски, обычным текстом без разметки, 1-3 предложения, тепло и по-деловому;\n"
+    "- поздоровался — поздоровайся в ответ и спроси, чем можешь помочь;\n"
+    "- задал вопрос — СНАЧАЛА поищи ответ в базе знаний компании инструментом "
+    "search_company_knowledge (раздел «База знаний — Партнёрская программа WB»), затем отвечай "
+    "по найденному;\n"
+    "- никогда не представляйся ботом или ИИ и не упоминай, что смотришь какие-то документы.\n"
     "\n"
-    "Чтобы подобрать условия под ваш магазин, заполните, пожалуйста, короткую анкету — "
-    "это займёт пару минут:\n"
+    "ЗАПРЕЩЕНО придумывать факты о компании: условия, цены, комиссии, сроки, гарантии. Если в базе "
+    "знаний ответа нет или он неполный — не сочиняй и не отвечай общими словами. Вместо этого "
+    f"верни РОВНО одну строку в формате: {ESCALATION_MARKER}: <суть вопроса клиента в 10 словах>. "
+    "Ничего больше в таком случае не пиши.\n"
     "\n"
-    "📝 {url}\n"
-    "\n"
-    "Как заполните — <b>вернитесь в этот чат</b> и напишите любое сообщение. "
-    "Я увижу вашу заявку и продолжу разговор уже по вашим цифрам. 🤝"
+    "Собеседник: {name}\n"
+    "Его сообщение:\n{text}"
 )
 
 
@@ -789,17 +811,60 @@ def _mark_invited(user_id: int) -> None:
         save_state(state)
 
 
-def invite_stranger(user_id: int) -> bool:
-    """Вручить незнакомцу ссылку на анкету. True, если сообщение ушло."""
-    if not lead_invite_enabled() or not LEAD_FORM_URL:
+def escalate_to_human(author: dict, question: str, client_text: str) -> None:
+    """Передать вопрос живому менеджеру: агент не знает ответа и не должен его выдумывать."""
+    uid = author.get("id")
+    uname = author.get("username") or ""
+    name = " ".join(x for x in (author.get("first_name"), author.get("last_name")) if x).strip()
+    chat_id = (os.getenv("TG_ESCALATION_CHAT_ID") or "").strip() or _business_owner_id()
+    if not chat_id:
+        log.warning("эскалация некуда: не задан TG_ESCALATION_CHAT_ID")
+        return
+    card = (f"🙋 Вопрос из личных сообщений — нужен человек\n\n"
+            f"От: {name or 'без имени'}"
+            + (f" (@{uname})" if uname else "") + f", id {uid}\n"
+            f"Не нашлось в базе знаний: {question}\n\n"
+            f"Его сообщение:\n{client_text[:600]}\n\n"
+            f"Клиенту отвечено, что уточним и вернёмся.")
+    try:
+        api("sendMessage", chat_id=chat_id, text=card)
+        log.info("эскалация по %s отправлена человеку", uid)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("эскалация не доставлена: %s", str(exc)[:200])
+
+
+def reply_to_stranger(author: dict, text: str) -> bool:
+    """Живой ответ незнакомцу: по базе знаний, с анкетой при первом контакте.
+
+    Вопросы без ответа в базе уходят человеку — выдуманный ответ клиенту хуже паузы."""
+    if not lead_invite_enabled():
         return False
-    if _invite_already_sent(user_id):
-        log.info("приглашение уже отправлялось %s — молчим", user_id)
+    author_id = author.get("id")
+    name = (author.get("first_name") or "").strip()
+    try:
+        answer = hermes_answer(STRANGER_PROMPT.format(name=name or "клиент", text=text),
+                               f"tg-new-{author_id}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("мозг не ответил незнакомцу %s: %s", author_id, str(exc)[:200])
         return False
-    ok, err = send_as_account(user_id, INVITE_TEXT.format(url=LEAD_FORM_URL), parse_mode="HTML")
-    if ok:
-        _mark_invited(user_id)      # отмечаем только фактически доставленное
-    log.info("приглашение незнакомцу %s: %s", user_id, "отправлено" if ok else f"не ушло ({err})")
+    answer = _strip_markup((answer or "").strip())
+    if not answer:
+        return False
+
+    if ESCALATION_MARKER in answer:
+        question = answer.split(":", 1)[-1].strip() if ":" in answer else text
+        escalate_to_human(author, question[:200], text)
+        answer = ESCALATION_REPLY
+
+    # Анкета — хвостом к первому ответу, один раз: это приглашение, а не подпись под каждым словом.
+    invite_now = LEAD_FORM_URL and not _invite_already_sent(author_id)
+    if invite_now:
+        answer = answer + FORM_TAIL.format(url=LEAD_FORM_URL)
+    ok, err = send_as_account(author_id, answer[:3500])
+    if ok and invite_now:
+        _mark_invited(author_id)    # отмечаем только фактически доставленное
+    log.info("ответ незнакомцу %s: %s%s", author_id, "отправлен" if ok else f"не ушёл ({err})",
+             " (+анкета)" if invite_now and ok else "")
     return ok
 
 
@@ -841,8 +906,8 @@ def maybe_autoreply(msg: dict) -> None:
         if not crm_leads_reachable():
             log.warning("CRM недоступна — не пишем %s: лида не отличить от незнакомца", author_id)
             return
-        # Человека в воронке нет: вручаем анкету, чтобы он сам стал лидом.
-        invite_stranger(author_id)
+        # Человека в воронке нет: разговариваем как менеджер и даём анкету, чтобы он стал лидом.
+        reply_to_stranger(author, text)
         return
 
     name = (author.get("first_name") or "").strip()

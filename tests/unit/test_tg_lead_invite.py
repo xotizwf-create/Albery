@@ -1,12 +1,13 @@
-"""Незнакомцу в личке аккаунта агент вручает анкету.
+"""Разговор с незнакомцем в личке аккаунта компании.
 
-Требование владельца 22.07.2026: пишет человек, которого нет в воронке («хочу подключить
-систему» или что угодно своё) — аккаунт сам отправляет приветствие со ссылкой на CRM-форму и
-просит вернуться в чат. Заполнив анкету, человек создаёт сделку, его username попадает в белый
-список — и дальше его ведёт агент как лида.
+Требование владельца 22.07.2026: агент должен вести себя как живой человек. Здороваются —
+здоровается в ответ. Спрашивают — отвечает по базе знаний воронки (папка Google Drive «База
+знаний — Партнёрская программа WB»). Ответа в базе нет — НЕ выдумывает, а передаёт вопрос
+живому менеджеру. Плюс при первом контакте даёт ссылку на анкету, чтобы человек стал лидом.
 
-Главная опасность — спам: без дедупликации приглашение уходило бы на КАЖДОЕ сообщение
-незнакомца, и аккаунт компании выглядел бы как автоответчик, сорвавшийся с цепи.
+Две главные опасности:
+1. выдуманные условия и цены — клиенту пообещают то, чего компания не даёт;
+2. спам анкетой — без дедупликации она уходила бы в каждом сообщении.
 """
 from __future__ import annotations
 
@@ -38,130 +39,168 @@ def tg(monkeypatch, tmp_path):
 def sent(tg, monkeypatch):
     box = []
     monkeypatch.setattr(tg, "send_as_account",
-                        lambda uid, text, parse_mode="": box.append(
-                            {"uid": uid, "text": text, "parse_mode": parse_mode}) or (True, ""))
+                        lambda uid, text, parse_mode="": box.append({"uid": uid, "text": text})
+                        or (True, ""))
     return box
 
 
-def _msg(username="ivan_novy", uid=999, text="Здравствуйте, хочу подключить систему", **kw):
+@pytest.fixture
+def to_human(tg, monkeypatch):
+    """Перехват сообщений живому менеджеру (обычный бот, не бизнес-канал)."""
+    box = []
+    monkeypatch.setattr(tg, "api", lambda method, **p: box.append(p) or {"message_id": 1})
+    monkeypatch.setenv("TG_ESCALATION_CHAT_ID", "8715335144")
+    return box
+
+
+def _brain(tg, monkeypatch, answer="Здравствуйте! Чем могу помочь?"):
+    seen = []
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: seen.append(p) or answer)
+    return seen
+
+
+def _msg(username="ivan_novy", uid=999, text="Здравствуйте", **kw):
     msg = {"business_connection_id": "C1", "chat": {"id": uid, "type": "private"},
            "from": {"id": uid, "username": username, "first_name": "Иван"}, "text": text}
     msg.update(kw)
     return msg
 
 
-def test_stranger_receives_the_form_link(tg, sent):
-    tg.maybe_autoreply(_msg())
+def test_greeting_gets_a_human_greeting_back(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch, "Здравствуйте! Чем могу помочь?")
+
+    tg.maybe_autoreply(_msg(text="Здравствуйте"))
 
     assert len(sent) == 1
-    assert sent[0]["uid"] == 999
-    assert tg.LEAD_FORM_URL in sent[0]["text"], "без ссылки на анкету сообщение бесполезно"
+    assert "Чем могу помочь" in sent[0]["text"]
 
 
-def test_invite_is_sent_only_once(tg, sent):
-    """Иначе на каждое сообщение незнакомца летит одна и та же простыня."""
+def test_first_reply_carries_the_form_link(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch)
+
     tg.maybe_autoreply(_msg())
+
+    assert tg.LEAD_FORM_URL in sent[0]["text"]
+
+
+def test_form_link_is_offered_only_once(tg, sent, monkeypatch):
+    """Анкета — приглашение, а не подпись под каждым сообщением."""
+    _brain(tg, monkeypatch)
+
+    tg.maybe_autoreply(_msg(text="Здравствуйте"))
     tg.maybe_autoreply(_msg(text="а сколько стоит?"))
     tg.maybe_autoreply(_msg(text="ну что там?"))
 
-    assert len(sent) == 1
+    assert len(sent) == 3, "разговор продолжается"
+    assert sum(tg.LEAD_FORM_URL in m["text"] for m in sent) == 1
 
 
-def test_invite_asks_to_come_back_to_the_chat(tg, sent):
-    """Без возврата в чат сделка не свяжется с перепиской."""
-    tg.maybe_autoreply(_msg())
+def test_agent_is_told_to_use_the_knowledge_base(tg, sent, monkeypatch):
+    seen = _brain(tg, monkeypatch)
 
-    assert "верн" in sent[0]["text"].lower()
+    tg.maybe_autoreply(_msg(text="какие у вас условия?"))
+
+    assert "search_company_knowledge" in seen[0]
+    assert "Партнёрская программа WB" in seen[0]
 
 
-def test_lead_gets_a_real_answer_not_the_invite(tg, sent, monkeypatch):
-    """Тому, кто анкету уже заполнил, предлагать её снова — оскорбительно."""
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: "Здравствуйте! Уточните ваш оборот.")
+def test_unknown_question_goes_to_a_human_not_invented(tg, sent, to_human, monkeypatch):
+    """Сердце требования: не знаешь — спроси человека, а не сочиняй условия."""
+    _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про комиссию для маркетплейса")
 
-    tg.maybe_autoreply(_msg(username="griaznov.d", uid=555))
+    tg.maybe_autoreply(_msg(text="Какая у вас комиссия?"))
 
-    assert len(sent) == 1
+    assert len(to_human) == 1, "живой менеджер должен получить вопрос"
+    card = to_human[0]["text"]
+    assert "комиссию" in card and "@ivan_novy" in card and "999" in card
+    assert "Какая у вас комиссия?" in card, "человеку нужен исходный текст клиента"
+
+
+def test_client_never_sees_the_escalation_marker(tg, sent, to_human, monkeypatch):
+    """Иначе клиент получит служебную строку вместо ответа."""
+    _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про сроки")
+
+    tg.maybe_autoreply(_msg(text="Как быстро подключите?"))
+
+    assert tg.ESCALATION_MARKER not in sent[0]["text"]
+    assert "уточню" in sent[0]["text"].lower()
+
+
+def test_escalation_failure_does_not_block_the_client_reply(tg, sent, monkeypatch):
+    """Не дозвонились до менеджера — клиент всё равно не должен остаться без ответа."""
+    monkeypatch.setattr(tg, "api", lambda method, **p: (_ for _ in ()).throw(RuntimeError("нет сети")))
+    monkeypatch.setenv("TG_ESCALATION_CHAT_ID", "8715335144")
+    _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: что-то непонятное")
+
+    tg.maybe_autoreply(_msg(text="вопрос"))
+
+    assert len(sent) == 1 and "уточню" in sent[0]["text"].lower()
+
+
+def test_lead_is_answered_as_a_lead_not_as_a_stranger(tg, sent, monkeypatch):
+    """Тому, кто анкету заполнил, предлагать её снова — оскорбительно."""
+    seen = _brain(tg, monkeypatch, "Здравствуйте! Уточните ваш оборот.")
+
+    tg.maybe_autoreply(_msg(username="griaznov.d", uid=555, text="привет"))
+
     assert tg.LEAD_FORM_URL not in sent[0]["text"]
-    assert "оборот" in sent[0]["text"]
+    assert "№82" in seen[0], "агент должен знать номер сделки"
 
 
-def test_brain_is_not_called_for_strangers(tg, sent, monkeypatch):
-    """Незнакомцу идёт готовый текст: модель не должна ни сочинять, ни жечь токены."""
-    calls = []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
-
-    tg.maybe_autoreply(_msg())
-
-    assert calls == []
-
-
-def test_invite_can_be_switched_off(tg, sent, monkeypatch):
+def test_conversation_can_be_switched_off(tg, sent, monkeypatch):
     monkeypatch.delenv("TG_LEAD_INVITE", raising=False)
+    _brain(tg, monkeypatch)
 
     tg.maybe_autoreply(_msg())
 
     assert sent == []
-    assert tg.lead_invite_enabled() is False
 
 
-def test_owner_own_messages_never_get_the_invite(tg, sent):
-    """Исходящие самого аккаунта приходят тем же апдейтом — приглашать себя нельзя."""
+def test_owner_own_messages_are_never_answered(tg, sent, monkeypatch):
+    """Исходящие самого аккаунта приходят тем же апдейтом — иначе агент зациклится на себе."""
+    _brain(tg, monkeypatch)
+
     tg.maybe_autoreply(_msg(uid=8715335144, username="alberyaimanager"))
 
     assert sent == []
 
 
-def test_bots_and_groups_get_nothing(tg, sent):
+def test_bots_and_groups_get_nothing(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch)
     bot = _msg(uid=777)
     bot["from"]["is_bot"] = True
-    tg.maybe_autoreply(bot)
 
+    tg.maybe_autoreply(bot)
     tg.maybe_autoreply(_msg(uid=778, chat={"id": -100, "type": "group"}))
 
     assert sent == []
 
 
-def test_failed_delivery_is_not_marked_as_sent(tg, monkeypatch):
-    """Иначе одна сетевая ошибка молча лишает человека приглашения навсегда."""
+def test_undelivered_reply_does_not_burn_the_invite(tg, monkeypatch):
+    """Сетевая ошибка не должна молча лишить человека анкеты навсегда."""
+    _brain(tg, monkeypatch)
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (False, "сеть"))
 
-    assert tg.invite_stranger(999) is False
+    tg.maybe_autoreply(_msg())
+
     assert tg._invite_already_sent(999) is False
 
 
-def test_invite_repeats_after_the_cooldown(tg, sent, monkeypatch):
-    """Написал снова спустя месяцы — уместно напомнить про анкету."""
-    tg.maybe_autoreply(_msg())
-    assert len(sent) == 1
+def test_brain_failure_leaves_no_reply_and_no_crash(tg, sent, monkeypatch):
+    def boom(p, s):
+        raise RuntimeError("мозг недоступен")
 
-    monkeypatch.setattr(tg, "_INVITE_COOLDOWN_S", 0.0)
-    tg.maybe_autoreply(_msg(text="всё ещё интересно"))
+    monkeypatch.setattr(tg, "hermes_answer", boom)
 
-    assert len(sent) == 2
-
-
-def test_corrupt_invite_timestamp_does_not_cause_a_repeat(tg, sent):
-    state = json.loads(tg.STATE_PATH.read_text(encoding="utf-8"))
-    state["invited"] = {"999": "не дата"}
-    tg.STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-
-    tg.maybe_autoreply(_msg())
+    tg.maybe_autoreply(_msg())      # не должно бросить исключение
 
     assert sent == []
 
 
-def test_invite_is_sent_as_formatted_html(tg, sent):
-    """Оформление — часть первого впечатления от компании."""
+def test_reply_is_plain_text_without_markup(tg, sent, monkeypatch):
+    """HTML-режим сломался бы на любом < или & из ответа модели — шлём чистый текст."""
+    _brain(tg, monkeypatch, "**Здравствуйте!** Чем помочь?")
+
     tg.maybe_autoreply(_msg())
 
-    assert sent[0]["parse_mode"] == "HTML"
-    assert "<b>" in sent[0]["text"]
-
-
-def test_invite_html_is_well_formed(tg, sent):
-    """Незакрытый тег — и Telegram отклонит сообщение целиком."""
-    tg.maybe_autoreply(_msg())
-
-    text = sent[0]["text"]
-    assert text.count("<b>") == text.count("</b>")
-    assert "**" not in text and "__" not in text, "markdown в HTML-режиме отображается как мусор"
+    assert "**" not in sent[0]["text"]
