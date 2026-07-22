@@ -167,3 +167,48 @@ def test_stranger_message_to_the_bot_is_journalled_with_the_refusal(tg, rows, mo
     assert [r["direction"] for r in rows] == ["in", "out"]
     assert all(r["bot"] == tg.BOT_CHANNEL for r in rows)
     assert rows[1]["meta"]["denied"] is True
+
+
+# --- реакции на сообщения -------------------------------------------------------------------
+# Требование владельца 22.07.2026: у всех Telegram-ботов реакция на сообщение должна быть такой
+# же, как у агента в Битриксе — 👀 «прочитал, думаю» и 👍 «ответил». Человек видит, что его не
+# игнорируют, пока модель думает.
+
+def test_reaction_is_set_on_the_incoming_message(tg, monkeypatch):
+    calls = []
+    monkeypatch.setattr(tg, "api", lambda method, **p: calls.append({"method": method, **p}) or {})
+
+    tg.react(555, 42, "👀")
+
+    assert calls[0]["method"] == "setMessageReaction"
+    assert calls[0]["chat_id"] == 555 and calls[0]["message_id"] == 42
+    assert calls[0]["reaction"] == [{"type": "emoji", "emoji": "👀"}]
+
+
+def test_business_reaction_carries_the_connection(tg, monkeypatch):
+    """В бизнес-чате реакция ставится от лица аккаунта — без connection Telegram откажет."""
+    calls = []
+    monkeypatch.setattr(tg, "api", lambda method, **p: calls.append(p) or {})
+
+    tg.react(555, 42, "👍", "CONN-1")
+
+    assert calls[0]["business_connection_id"] == "CONN-1"
+
+
+def test_reaction_failure_never_breaks_the_answer(tg, monkeypatch):
+    """Реакция — косметика: отказ Telegram не должен мешать ответить клиенту."""
+    def boom(method, **p):
+        raise RuntimeError("Telegram отказал")
+
+    monkeypatch.setattr(tg, "api", boom)
+
+    tg.react(555, 42, "👀")      # не должно бросить исключение
+
+
+def test_no_message_id_means_no_call(tg, monkeypatch):
+    calls = []
+    monkeypatch.setattr(tg, "api", lambda method, **p: calls.append(p) or {})
+
+    tg.react(555, None, "👀")
+
+    assert calls == []

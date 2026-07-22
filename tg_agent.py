@@ -243,6 +243,23 @@ def _strip_markup(text: str) -> str:
     return text
 
 
+def react(chat_id, message_id, emoji: str, business_connection_id: str = "") -> None:
+    """Поставить реакцию на сообщение собеседника — как агент в Битриксе.
+
+    Там это 👀 «прочитал, думаю» → 👍 «ответил», и человек видит, что его не игнорируют.
+    Реакция косметическая: любая ошибка гасится, ответ клиенту важнее."""
+    if not message_id:
+        return
+    params = {"chat_id": chat_id, "message_id": int(message_id),
+              "reaction": [{"type": "emoji", "emoji": emoji}] if emoji else []}
+    if business_connection_id:
+        params["business_connection_id"] = business_connection_id
+    try:
+        api("setMessageReaction", **params)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("реакция %s не поставлена: %s", emoji, str(exc)[:120])
+
+
 def send_text(chat_id, text: str) -> None:
     """Plain-text send with chunking (TG hard limit 4096)."""
     text = _strip_markup((text or "").strip()) or "(пустой ответ)"
@@ -682,6 +699,7 @@ def handle_message(msg: dict) -> None:
         return
     remember_access_user_id(BOT_CHANNEL, sender)
     _remember_owner_chat(sender)
+    react(chat_id, msg.get("message_id"), "👀")      # прочитал, думаю — как агент в Битриксе
     if handle_command(chat_id, text):
         return
     try:
@@ -691,6 +709,7 @@ def handle_message(msg: dict) -> None:
     try:
         answer = owner_turn(chat_id, text)
         send_text(chat_id, answer)
+        react(chat_id, msg.get("message_id"), "👍")   # ответил
         journal(BOT_CHANNEL, chat_id, "out", answer, kind="bot_dm", user=sender)
     except Exception as exc:  # noqa: BLE001
         log.exception("owner turn failed")
@@ -1075,6 +1094,8 @@ def maybe_autoreply(msg: dict) -> None:
     # В журнал попадают только переписки, где участвует агент: у лида воронки он ведёт разговор.
     journal(MANAGER_CHANNEL, author_id, "in", text, kind="lead_chat", user=author,
             tg_message_id=msg.get("message_id"), meta={"deal_id": deal_id})
+    conn_id_react = msg.get("business_connection_id") or ""
+    react(author_id, msg.get("message_id"), "👀", conn_id_react)
 
     name = (author.get("first_name") or "").strip()
     prompt = (

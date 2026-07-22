@@ -194,7 +194,20 @@ def revoke_token_via_botfather(username: str) -> str:
     return found.group(1)
 
 
-def _answer(agent: dict, chat_id, sender: dict, text: str) -> None:
+def _react(token: str, chat_id, message_id, emoji: str) -> None:
+    """Реакция на сообщение — тот же сигнал, что у агента в Битриксе: 👀 прочитал, 👍 ответил.
+    Косметика: ошибка не должна мешать ответу."""
+    if not message_id:
+        return
+    try:
+        api(token, "setMessageReaction", http_timeout=15, chat_id=chat_id,
+            message_id=int(message_id),
+            reaction=[{"type": "emoji", "emoji": emoji}] if emoji else [])
+    except Exception as exc:  # noqa: BLE001
+        log.debug("реакция %s не поставлена: %s", emoji, str(exc)[:120])
+
+
+def _answer(agent: dict, chat_id, sender: dict, text: str, message_id=None) -> None:
     """Ход агента: доступ → мозг → ответ → журнал. Ошибки не роняют поток опроса."""
     slug = agent["slug"]
     allowed = core.access_usernames(slug)
@@ -211,6 +224,7 @@ def _answer(agent: dict, chat_id, sender: dict, text: str) -> None:
                      meta={"denied": True})
         return
     core.remember_access_user_id(slug, sender)
+    _react(agent["bot_token"], chat_id, message_id, "👀")
     prompt = ((agent.get("role_prompt") or "").strip()
               or "Ты — ИИ-агент компании Albery в Telegram. Отвечай по-русски, кратко и по делу, "
                  "обычным текстом без разметки.")
@@ -235,6 +249,8 @@ def _answer(agent: dict, chat_id, sender: dict, text: str) -> None:
     except Exception as exc:  # noqa: BLE001
         ok = False
         log.warning("ответ не доставлен (%s): %s", slug, str(exc)[:200])
+    if ok:
+        _react(agent["bot_token"], chat_id, message_id, "👍")
     core.journal(slug, chat_id, "out", answer, kind="bot_dm", user=sender,
                  status="ok" if ok else "error")
 
@@ -292,7 +308,7 @@ def _poll(agent: dict) -> None:
                 _threads.pop(slug, None)
                 return
             try:
-                _answer(agent, chat.get("id"), sender, text)
+                _answer(agent, chat.get("id"), sender, text, msg.get("message_id"))
             except Exception:  # noqa: BLE001
                 log.exception("ход агента %s упал", slug)
 
