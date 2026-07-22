@@ -58,6 +58,40 @@ def test_agent_sends_from_the_company_account(tg, monkeypatch):
     assert calls["chat_id"] == 555
 
 
+def test_relayed_answer_lands_in_the_journal(tg, monkeypatch):
+    """Ответ, отправленный сотрудником через группу Битрикса, — тоже сообщение клиенту.
+
+    Без записи переписка в кабинете рвалась, и агент в следующем ходе не знал, что клиенту
+    уже ответили (22.07.2026)."""
+    tg.save_state({"business": {"CONN-1": {}},
+                   "contacts": {"griaznov_d": {"id": 555, "username": "griaznov_d", "name": "Дмитрий"}}})
+    monkeypatch.setattr(tg, "api", lambda method, **p: {"ok": True})
+    rows = []
+    monkeypatch.setattr(tg, "journal",
+                        lambda bot, dialog_id, direction, text, **kw:
+                        rows.append({"dialog": dialog_id, "dir": direction, "text": text, **kw}))
+
+    tg.telegram_send_as_account("@griaznov_d", "Подключение занимает 2 дня")
+
+    assert len(rows) == 1
+    assert rows[0]["dir"] == "out" and rows[0]["dialog"] == 555
+    assert rows[0]["text"] == "Подключение занимает 2 дня"
+    assert rows[0]["meta"]["relay"] is True, "видно, что ответ пришёл из группы, а не от агента"
+
+
+def test_relayed_links_are_clickable(tg, monkeypatch):
+    """Сотрудник пишет ссылку подписью — клиент должен получить кликабельную, как от агента."""
+    tg.save_state({"business": {"CONN-1": {}}})
+    calls = {}
+    monkeypatch.setattr(tg, "api", lambda method, **p: calls.update(**p) or {"ok": True})
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+
+    tg.telegram_send_as_account("555", "Вот анкета: [Заполнить анкету](https://example.com/f)")
+
+    assert '<a href="https://example.com/f">Заполнить анкету</a>' in calls["text"]
+    assert calls["parse_mode"] == "HTML"
+
+
 def test_unknown_username_fails_loudly_with_a_way_out(tg):
     """Агент не должен выдумывать id — он обязан объяснить, что делать."""
     tg.save_state({"business": {"CONN-1": {}}})

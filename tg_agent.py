@@ -583,9 +583,18 @@ def telegram_send_as_account(who: str, text: str) -> dict:
             "@username — нужен его числовой id. Он появится сам, как только человек напишет "
             "на аккаунт (например, по ссылке t.me/AlberyAIManager). Список известных — "
             "list_telegram_contacts.")
-    ok, err = send_as_account(target, text)
+    # Тот же вид, что и у собственных ответов агента: ссылки приходят кликабельной подписью,
+    # а не голым адресом. Разметка косметическая — при отказе уходит обычный текст.
+    ok, err = send_html(target, as_html(text), text)
     if not ok:
         raise RuntimeError(f"Telegram отказал: {err}")
+    # В журнал — обязательно: это сообщение клиенту, и в кабинете переписка должна быть целой.
+    # Без записи ответы, отправленные сотрудником через группу Битрикса, пропадали из истории,
+    # и агент в следующем ходе не знал, что клиенту уже ответили (22.07.2026).
+    journal(MANAGER_CHANNEL, target, "out", text, kind="lead_chat",
+            user={"id": target, "username": (entry or {}).get("username"),
+                  "first_name": (entry or {}).get("name")},
+            meta={"relay": True, "via": "bitrix"})
     return {"sent": True, "to_id": target,
             "to": ("@" + entry["username"]) if (entry and entry.get("username")) else str(target),
             "from": "аккаунт владельца (Telegram Business)", "chars": len(text)}
