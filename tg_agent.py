@@ -338,6 +338,44 @@ def channel_role_prompt(channel: str) -> str:
         return ""
 
 
+_INSTR_CACHE: dict[str, object] = {"at": 0.0, "text": ""}
+_INSTR_CAP = int(os.getenv("TG_AGENT_INSTR_CAP", "12000") or "12000")
+
+
+def channel_instructions(channel: str) -> str:
+    """Инструкции, подключённые владельцем ИМЕННО этому агенту (его манифест в кабинете).
+
+    Доставляем их прямо в промпт, а не надеемся, что модель сама позовёт start_here: у неё
+    один ход на ответ клиенту, и «забыла спросить» означает неоформленное сообщение.
+    Универсальные инструкции сюда НЕ идут намеренно: они написаны под отчёты в Битриксе и
+    несут BB-коды, а в Telegram те доходят до клиента мусором (жалоба владельца 14.07.2026)."""
+    now = time.time()
+    if now - float(_INSTR_CACHE["at"] or 0) < 120 and _INSTR_CACHE["text"]:
+        return _INSTR_CACHE["text"]
+    try:
+        from agent_knowledge import load_instructions, load_manifest
+        connected = set(load_manifest(channel)["instructions"])
+        if not connected:
+            return ""
+        picked = [f"# {i['name']}\n{i['content'].strip()}"
+                  for i in (load_instructions() or []) if i["path"] in connected]
+    except Exception:  # noqa: BLE001 — без оформления агент ответит хуже, но ответит
+        log.warning("инструкции агента %s не загрузились", channel, exc_info=True)
+        return _INSTR_CACHE["text"] or ""
+    text = "\n\n".join(picked)[:_INSTR_CAP]
+    _INSTR_CACHE.update({"at": now, "text": text})
+    return text
+
+
+def _with_instructions(prompt: str, channel: str) -> str:
+    instr = channel_instructions(channel)
+    if not instr:
+        return prompt
+    return (f"{prompt}\n\n"
+            f"ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА ОФОРМЛЕНИЯ — подключены владельцем, следуй им буквально:\n"
+            f"{instr}")
+
+
 def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
                   timeout_s: int | None = None) -> str:
     toolsets = toolsets or os.getenv("TG_AGENT_TOOLSETS", "albery,web")
@@ -938,11 +976,11 @@ FORM_TAIL = (
     "Как заполните, вернитесь сюда и напишите — продолжим уже по вашим цифрам. 🤝"
 )
 
-# Мозг отвечает этим маркером, когда ответа в базе знаний нет. Тогда клиент получает вежливое
-# «уточню у коллег», а вопрос уходит живому человеку — вместо выдуманного ответа.
+# Мозг отвечает этим маркером, когда ответа в базе знаний нет. Тогда вопрос уходит живым людям
+# в группу «Работа с ИУ», а клиенту агент НЕ пишет ничего (владелец, 22.07.2026): отписка
+# «уточню у коллег и вернусь» обещает ответ, который агент сам дать не может, и клиент считает
+# минуты. Пауза без обещания честнее — а сотрудник тем временем отвечает по-настоящему.
 ESCALATION_MARKER = "НУЖЕН_ЧЕЛОВЕК"
-ESCALATION_REPLY = ("Спасибо за вопрос! Уточню детали у коллег и вернусь с ответом — "
-                    "обычно это занимает немного времени. 🙌")
 
 STRANGER_PROMPT = (
     "Ты — менеджер компании Albery, отвечаешь в Telegram от лица аккаунта компании. Пишет "
@@ -1000,13 +1038,23 @@ def escalate_to_human(author: dict, question: str, client_text: str) -> None:
     uid = author.get("id")
     uname = author.get("username") or ""
     name = " ".join(x for x in (author.get("first_name"), author.get("last_name")) if x).strip()
-    card = (f"Пользователь задал вопрос: «{client_text[:600]}»\n"
-            f"Что мне на него ответить?\n\n"
-            f"Клиент: {name or 'без имени'}" + (f", @{uname}" if uname else "")
+    # Оформление — по стандарту компании: блоки через пустую строку, заголовки [b]…[/b].
+    # Клиент в этот момент СИДИТ БЕЗ ОТВЕТА, поэтому карточка начинается со срочности: сотрудник
+    # должен понять это с первой строки, а не вычитать из середины.
+    card = (f"[b]⚠️ Клиент ждёт ответа — ему пока НИЧЕГО не отвечено[/b]\n"
+            f"\n"
+            f"Пользователь задал вопрос: «{client_text[:600]}»\n"
+            f"Что мне на него ответить?\n"
+            f"\n"
+            f"[b]Клиент[/b]\n"
+            f"{name or 'без имени'}" + (f", @{uname}" if uname else "")
             + f", telegram id {uid}\n"
-            f"В базе знаний не нашлось: {question}\n"
-            f"Клиенту уже отвечено, что уточним и вернёмся.\n\n"
+            f"\n"
+            f"[b]В базе знаний не нашлось[/b]\n"
+            f"{question}\n"
+            f"\n"
             f"———\n"
+            f"\n"
             f"Скажите мне здесь: «{IU_AGENT_NAME}, ответь, что …» — и я передам ответ клиенту "
             f"в Telegram.")
     try:
@@ -1024,10 +1072,23 @@ def escalate_to_human(author: dict, question: str, client_text: str) -> None:
         log.warning("эскалация некуда: группа недоступна и TG_ESCALATION_CHAT_ID не задан")
         return
     try:
-        api("sendMessage", chat_id=chat_id, text=card)
+        # BB-коды живут только в Битриксе; в Telegram они дошли бы до человека как мусор.
+        api("sendMessage", chat_id=chat_id, text=_strip_markup(card))
         log.info("эскалация по %s ушла в Telegram (запасной канал)", uid)
     except Exception as exc:  # noqa: BLE001
         log.warning("эскалация не доставлена вообще: %s", str(exc)[:200])
+
+
+def escalated(author: dict, answer: str, client_text: str) -> bool:
+    """Вопрос без ответа в базе: унести людям в группу и промолчать в чате.
+
+    Одна точка на обе ветки — лида и незнакомца. Раньше маркер обрабатывался только у
+    незнакомцев, и лид воронки получал служебную строку «НУЖЕН_ЧЕЛОВЕК: …» прямо в чат."""
+    if ESCALATION_MARKER not in answer:
+        return False
+    question = answer.split(":", 1)[-1].strip() if ":" in answer else client_text
+    escalate_to_human(author, question[:200], client_text)
+    return True
 
 
 def reply_to_stranger(author: dict, text: str) -> bool:
@@ -1048,7 +1109,7 @@ def reply_to_stranger(author: dict, text: str) -> bool:
             f"Его сообщение:\n{text}") if role else STRANGER_PROMPT.format(
                 name=name or "клиент", text=text)
     try:
-        answer = hermes_answer(base, f"tg-new-{author_id}",
+        answer = hermes_answer(_with_instructions(base, MANAGER_CHANNEL), f"tg-new-{author_id}",
                                toolsets=channel_toolsets(MANAGER_CHANNEL))
     except Exception as exc:  # noqa: BLE001
         log.warning("мозг не ответил незнакомцу %s: %s", author_id, str(exc)[:200])
@@ -1057,10 +1118,14 @@ def reply_to_stranger(author: dict, text: str) -> bool:
     if not answer:
         return False
 
-    if ESCALATION_MARKER in answer:
-        question = answer.split(":", 1)[-1].strip() if ":" in answer else text
-        escalate_to_human(author, question[:200], text)
-        answer = ESCALATION_REPLY
+    if escalated(author, answer, text):
+        # В чате — тишина: обещать ответ, которого у агента нет, хуже паузы. Но переписку в
+        # журнал пишем, иначе в кабинете вопрос клиента исчезнет вместе с ответом.
+        journal(MANAGER_CHANNEL, author_id, "in", text, kind="lead_chat", user=author)
+        journal(MANAGER_CHANNEL, author_id, "out", "вопрос без ответа в базе — унесён людям "
+                "в группу «Работа с ИУ», клиенту не отвечено", kind="lead_chat", user=author,
+                status="ok", meta={"stranger": True, "escalated": True})
+        return False
 
     # Анкета — хвостом к первому ответу, один раз: это приглашение, а не подпись под каждым словом.
     invite_now = LEAD_FORM_URL and not _invite_already_sent(author_id)
@@ -1148,7 +1213,7 @@ def maybe_autoreply(msg: dict) -> None:
         f"Его сообщение:\n{text}"
     )
     try:
-        answer = hermes_answer(prompt, f"tg-biz-{author_id}",
+        answer = hermes_answer(_with_instructions(prompt, MANAGER_CHANNEL), f"tg-biz-{author_id}",
                                toolsets=channel_toolsets(MANAGER_CHANNEL))
     except Exception as exc:  # noqa: BLE001
         log.warning("мозг не ответил лиду %s: %s", author_id, str(exc)[:200])
@@ -1157,6 +1222,11 @@ def maybe_autoreply(msg: dict) -> None:
         return
     answer = _strip_markup((answer or "").strip())
     if not answer:
+        return
+    if escalated(author, answer, text):
+        journal(MANAGER_CHANNEL, author_id, "out", "вопрос без ответа в базе — унесён людям "
+                "в группу «Работа с ИУ», клиенту не отвечено", kind="lead_chat", user=author,
+                status="ok", meta={"deal_id": deal_id, "escalated": True})
         return
     ok, err = send_as_account(author_id, answer[:3500])
     journal(MANAGER_CHANNEL, author_id, "out", answer if ok else f"{answer}\n\n[не доставлено: {err}]",

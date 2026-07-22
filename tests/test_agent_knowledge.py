@@ -1,7 +1,22 @@
 """Loader for the GitHub-backed knowledge registry (agent_knowledge.py)."""
 import importlib
+import os
+
+import pytest
 
 import agent_knowledge
+
+
+@pytest.fixture(autouse=True)
+def _knowledge_module_restored():
+    """Вернуть модуль на настоящий реестр после теста.
+
+    Тесты перенацеливают его на tmp через reload; monkeypatch откатывает переменную окружения,
+    но НЕ глобальные пути внутри уже перезагруженного модуля. Из-за этого следующие тесты
+    видели пустой реестр — так «потерялись» подключённые инструкции агента (22.07.2026)."""
+    yield
+    os.environ.pop("AGENT_KNOWLEDGE_DIR", None)
+    importlib.reload(agent_knowledge)
 
 
 def _reload_with(root, monkeypatch):

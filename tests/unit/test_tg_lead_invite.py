@@ -123,7 +123,7 @@ def test_unknown_question_goes_to_the_iu_group(tg, sent, to_group, monkeypatch):
     assert len(to_group) == 1, "вопрос должен уйти в группу «Работа с ИУ»"
     assert to_group[0]["tool"] == "notify_iu_group"
     card = to_group[0]["text"]
-    assert card.startswith("Пользователь задал вопрос:")
+    assert "Пользователь задал вопрос:" in card
     assert "что мне на него ответить" in card.lower()
     assert "Какая у вас комиссия?" in card, "людям нужен исходный текст клиента"
     assert "@ivan_novy" in card and "999" in card, "без telegram id ответ передать некому"
@@ -160,25 +160,75 @@ def test_form_link_is_the_public_one(tg):
     assert "/crm/form/detail/" not in tg.LEAD_FORM_URL
 
 
-def test_client_never_sees_the_escalation_marker(tg, sent, to_group, monkeypatch):
-    """Иначе клиент получит служебную строку вместо ответа."""
+def test_client_gets_nothing_while_the_question_goes_to_people(tg, sent, to_group, monkeypatch):
+    """Требование владельца 22.07.2026: никаких «уточню у коллег и вернусь».
+
+    Отписка обещает ответ, которого у агента нет, и клиент считает минуты. Правильно —
+    промолчать в чате и немедленно принести вопрос людям."""
     _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про сроки")
 
     tg.maybe_autoreply(_msg(text="Как быстро подключите?"))
 
-    assert tg.ESCALATION_MARKER not in sent[0]["text"]
-    assert "уточню" in sent[0]["text"].lower()
+    assert sent == [], "клиенту не должно уйти ничего — ни отписки, ни анкеты"
+    assert len(to_group) == 1, "вопрос обязан уйти людям в тот же момент"
 
 
-def test_escalation_failure_does_not_block_the_client_reply(tg, sent, monkeypatch):
-    """Не дозвонились до менеджера — клиент всё равно не должен остаться без ответа."""
+def test_lead_question_also_goes_to_people_silently(tg, sent, to_group, monkeypatch):
+    """Дыра до 22.07.2026: маркер обрабатывался только у незнакомцев, и ЛИД воронки
+    получал служебную строку «НУЖЕН_ЧЕЛОВЕК: …» прямо в чат."""
+    _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про комиссию")
+
+    tg.maybe_autoreply(_msg(username="griaznov.d", uid=555, text="Какая комиссия?"))
+
+    assert sent == [], "лид тем более не должен видеть служебный маркер"
+    assert len(to_group) == 1 and "Какая комиссия?" in to_group[0]["text"]
+
+
+def test_escalation_card_says_the_client_is_still_waiting(tg, sent, to_group, monkeypatch):
+    """Сотрудник должен с первой строки понять, что человек сидит без ответа."""
+    _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про сроки")
+
+    tg.maybe_autoreply(_msg(text="Как быстро подключите?"))
+
+    card = to_group[0]["text"]
+    assert "ждёт ответа" in card and "НИЧЕГО не отвечено" in card
+    assert "уже отвечено" not in card, "старое обещание клиенту снято — не вводим людей в заблуждение"
+
+
+def test_escalation_failure_still_leaves_the_client_unanswered(tg, sent, monkeypatch):
+    """Сбой доставки не повод выдумывать ответ клиенту: он ждёт человека, а не отписку."""
     monkeypatch.setattr(tg, "api", lambda method, **p: (_ for _ in ()).throw(RuntimeError("нет сети")))
     monkeypatch.setenv("TG_ESCALATION_CHAT_ID", "8715335144")
     _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: что-то непонятное")
 
     tg.maybe_autoreply(_msg(text="вопрос"))
 
-    assert len(sent) == 1 and "уточню" in sent[0]["text"].lower()
+    assert sent == []
+
+
+def test_formatting_rules_are_delivered_to_the_agent(tg, sent, monkeypatch):
+    """Оформление подключено инструкцией в кабинете и обязано доходить до модели.
+
+    Через start_here надеяться нельзя: у агента один ход на ответ клиенту, и «забыл спросить»
+    означает слипшееся сообщение."""
+    tg._INSTR_CACHE.update({"at": 0.0, "text": ""})
+    seen = _brain(tg, monkeypatch)
+
+    tg.maybe_autoreply(_msg(text="Здравствуйте"))
+
+    assert "Оформление сообщений клиенту в Telegram" in seen[0]
+    assert "ПУСТАЯ строка" in seen[0], "правило про воздух между блоками должно дойти дословно"
+
+
+def test_bitrix_report_format_is_not_pushed_into_the_chat(tg, sent, monkeypatch):
+    """Универсальные инструкции написаны под отчёты в Битриксе и несут BB-коды; в Telegram
+    они дошли бы до клиента мусором (жалоба владельца 14.07.2026)."""
+    tg._INSTR_CACHE.update({"at": 0.0, "text": ""})
+    seen = _brain(tg, monkeypatch)
+
+    tg.maybe_autoreply(_msg(text="Здравствуйте"))
+
+    assert "Стандартный формат ответа" not in seen[0]
 
 
 def test_lead_is_answered_as_a_lead_not_as_a_stranger(tg, sent, monkeypatch):
