@@ -58,7 +58,7 @@ def test_lead_conversation_is_journalled_both_ways(tg, rows, monkeypatch):
     tg.maybe_autoreply(_biz(text="какие условия?"))
 
     assert [r["direction"] for r in rows] == ["in", "out"]
-    assert all(r["bot"] == tg.MANAGER_CHANNEL and r["kind"] == "lead_chat" for r in rows)
+    assert all(r["bot"] == tg.BOT_CHANNEL and r["kind"] == "lead_chat" for r in rows)
     assert rows[0]["text"] == "какие условия?"
     assert rows[0]["meta"]["deal_id"] == 82, "переписку надо связать со сделкой"
 
@@ -91,7 +91,7 @@ def test_owner_talk_to_the_agent_is_a_separate_stream(tg, rows):
                                 "text": "покажи сделки"})
 
     assert len(rows) == 1
-    assert rows[0]["bot"] == tg.MANAGER_CHANNEL and rows[0]["kind"] == "bot_dm"
+    assert rows[0]["bot"] == tg.BOT_CHANNEL and rows[0]["kind"] == "bot_dm"
 
 
 def test_failed_delivery_is_marked_as_error(tg, rows, monkeypatch):
@@ -123,7 +123,7 @@ def test_journal_failure_never_breaks_the_agent(tg, monkeypatch):
 
     monkeypatch.setattr(tg, "_db", broken_db)
 
-    tg.journal(tg.MANAGER_CHANNEL, 1, "in", "текст")   # не должно бросить исключение
+    tg.journal(tg.BOT_CHANNEL, 1, "in", "текст")   # не должно бросить исключение
 
 
 # --- доступ к агенту -----------------------------------------------------------------------
@@ -212,3 +212,17 @@ def test_no_message_id_means_no_call(tg, monkeypatch):
     tg.react(555, None, "👀")
 
     assert calls == []
+
+
+def test_account_conversations_belong_to_the_bot(tg, rows, monkeypatch):
+    """@AlberyAIManager — аккаунт, а не бот: отвечает всегда бот, аккаунт лишь подключил его в
+    «Telegram для бизнеса». Поэтому переписки аккаунта пишутся в журнал ТОГО ЖЕ бота, а источник
+    различает kind — иначе в списке агентов появлялся бы несуществующий «бот-аккаунт»."""
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте!")
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
+
+    tg.maybe_autoreply(_biz(text="какие условия?"))
+
+    assert tg.MANAGER_CHANNEL == tg.BOT_CHANNEL, "аккаунт не должен быть отдельным агентом"
+    assert all(r["bot"] == tg.BOT_CHANNEL for r in rows)
+    assert {r["kind"] for r in rows} == {"lead_chat"}, "источник различает kind, а не имя бота"

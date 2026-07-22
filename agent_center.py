@@ -128,15 +128,16 @@ def _user_names() -> dict[int, dict[str, str]]:
 # Один бот-токен (@Albery_AI2_Bot) обслуживает два канала, и для владельца это разные агенты:
 # личка самого бота и бизнес-переписки аккаунта компании @AlberyAIManager. Журнал пишет
 # tg_agent (служба albery-tg) в telegram_bot_messages — миграция 060.
+# АГЕНТ = БОТ. @AlberyAIManager — аккаунт Telegram, а не бот: он подключил бота
+# @Albery_AI2_Bot в «Telegram для бизнеса», и ответы лидам шлёт этот бот от лица аккаунта.
+# Поэтому в разделе агентов аккаунта нет — есть бот, у которого показано его подключение.
 TG_BOT_CHANNEL = "albery-ai-bot"
-TG_MANAGER_CHANNEL = "albery-ai-manager"
+TG_MANAGER_CHANNEL = TG_BOT_CHANNEL
 # Запасные подписи на случай, если Telegram недоступен. Настоящие имя и @username всегда
 # берутся из самого Telegram (_tg_identities): в кабинете агент должен называться ровно так же,
 # как в мессенджере — иначе владелец ищет в интерфейсе имя, которого там нет.
 TG_CHANNELS = {
-    TG_BOT_CHANNEL: {"name": "Telegram-бот", "handle": "", "subtitle": "личные сообщения боту"},
-    TG_MANAGER_CHANNEL: {"name": "Аккаунт компании", "handle": "",
-                         "subtitle": "аккаунт компании • лиды"},
+    TG_BOT_CHANNEL: {"name": "Telegram-бот", "handle": "", "subtitle": "бот компании"},
 }
 _TG_IDENTITY_CACHE: dict[str, Any] = {"at": 0.0, "data": {}}
 
@@ -166,7 +167,8 @@ def _tg_identities() -> dict[str, dict[str, str]]:
     if me:
         out[TG_BOT_CHANNEL] = {"name": str(me.get("first_name") or "").strip(),
                                "handle": "@" + str(me.get("username") or "")}
-    # Аккаунт компании — владелец бизнес-подключения; его id знает служба albery-tg.
+    # Аккаунт компании — не отдельный агент, а бизнес-подключение бота: показываем его как
+    # свойство бота («отвечает от лица @…»), а не как второго участника списка.
     owner_id = None
     try:
         state = json.loads((Path("/var/www/albery") / ".tg_agent_state.json").read_text(encoding="utf-8"))
@@ -176,25 +178,29 @@ def _tg_identities() -> dict[str, dict[str, str]]:
         owner_id = None
     if owner_id:
         chat = _tg_api("getChat", chat_id=owner_id)
-        if chat:
+        if chat and out.get(TG_BOT_CHANNEL) is not None:
             name = " ".join(x for x in (chat.get("first_name"), chat.get("last_name")) if x).strip()
-            out[TG_MANAGER_CHANNEL] = {"name": name, "handle": "@" + str(chat.get("username") or "")}
+            out[TG_BOT_CHANNEL]["business_account"] = "@" + str(chat.get("username") or "")
+            out[TG_BOT_CHANNEL]["business_name"] = name
     if out:
         _TG_IDENTITY_CACHE.update({"at": now, "data": out})
     return out
 
 
 def _tg_channel_meta() -> dict[str, dict[str, str]]:
-    """Все Telegram-каналы: два штатных + заведённые владельцем.
+    """Telegram-агенты: встроенный бот + заведённые владельцем.
 
-    Имена берутся из Telegram, если он доступен, иначе запасные."""
+    Имена берутся из Telegram, если он доступен, иначе запасные. Бизнес-аккаунт сюда приходит
+    свойством бота (business_account), а не отдельной записью: аккаунт — не агент."""
     live = _tg_identities()
     meta = {}
     for slug, base in TG_CHANNELS.items():
         got = live.get(slug) or {}
         meta[slug] = {**base,
                       "name": got.get("name") or base["name"],
-                      "handle": got.get("handle") or base["handle"]}
+                      "handle": got.get("handle") or base["handle"],
+                      "business_account": got.get("business_account", ""),
+                      "business_name": got.get("business_name", "")}
     for a in telegram_agents_list():
         if not a.get("is_active"):
             continue
@@ -326,10 +332,9 @@ def ensure_builtin_telegram_agents() -> None:
     getUpdates на тот же токен запускать нельзя."""
     import secrets
     live = _tg_identities()
-    seeds = [
-        (TG_BOT_CHANNEL, "личные сообщения боту"),
-        (TG_MANAGER_CHANNEL, "аккаунт компании • лиды"),
-    ]
+    # Один встроенный агент — сам бот. Его бизнес-подключение к аккаунту компании
+    # отображается в карточке, отдельным агентом не является.
+    seeds = [(TG_BOT_CHANNEL, "бот компании")]
     for slug, position in seeds:
         ident = live.get(slug) or {}
         name = ident.get("name") or TG_CHANNELS[slug]["name"]
