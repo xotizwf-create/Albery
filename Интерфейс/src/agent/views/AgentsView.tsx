@@ -25,6 +25,7 @@ import {
   McpTool,
   TIER_LABELS,
   TelegramAccessAgent,
+  createTelegramAgent,
   fetchTelegramAccess,
   saveTelegramAccess,
   addAgentInstruction,
@@ -985,6 +986,99 @@ const AgentEditor: React.FC<{
   );
 };
 
+function CreateTelegramAgentModal({
+  onClose,
+  onCreated,
+}: {
+  onClose: () => void;
+  onCreated: (slug: string) => void;
+}) {
+  const [token, setToken] = useState("");
+  const [name, setName] = useState("");
+  const [role, setRole] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const created = await createTelegramAgent({
+        bot_token: token.trim(),
+        name: name.trim(),
+        role_prompt: role.trim(),
+      });
+      onCreated(created.slug);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div
+        className="bg-white rounded-3xl shadow-xl w-full max-w-lg p-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="font-bold text-gray-900 text-[19px]">Новый Telegram-агент</h2>
+        <p className="text-[13px] text-gray-500 mt-1.5">
+          Создайте бота в <span className="font-bold">@BotFather</span> и вставьте его токен.
+          Имя и @username подтянутся из Telegram сами.
+        </p>
+
+        <label className="block mt-5 text-[13px] font-bold text-gray-700">Токен бота</label>
+        <input
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          placeholder="123456789:AAE..."
+          className="mt-1.5 w-full px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400"
+        />
+
+        <label className="block mt-4 text-[13px] font-bold text-gray-700">
+          Имя <span className="font-medium text-gray-400">— необязательно</span>
+        </label>
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="по умолчанию — имя бота из Telegram"
+          className="mt-1.5 w-full px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400"
+        />
+
+        <label className="block mt-4 text-[13px] font-bold text-gray-700">Кем работает</label>
+        <textarea
+          value={role}
+          onChange={(e) => setRole(e.target.value)}
+          rows={3}
+          placeholder="Например: консультант по подключению к индивидуальным условиям WB."
+          className="mt-1.5 w-full px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400 resize-none"
+        />
+
+        {error && <div className="mt-3 text-[12.5px] text-rose-600">{error}</div>}
+
+        <div className="mt-4 text-[12px] text-gray-400 leading-snug">
+          Агент заработает в течение минуты — служба подхватывает новых сама. Дальше добавьте
+          тех, кому можно ему писать: остальным он отвечает отказом.
+        </div>
+
+        <div className="mt-5 flex gap-2 justify-end">
+          <button onClick={onClose} className="px-4 py-2.5 text-[13.5px] font-bold text-gray-600 rounded-xl hover:bg-gray-100">
+            Отмена
+          </button>
+          <button
+            disabled={busy || !token.trim()}
+            onClick={() => void submit()}
+            className="px-4 py-2.5 text-[13.5px] font-bold rounded-xl bg-indigo-600 text-white disabled:opacity-40"
+          >
+            {busy ? "Проверяю токен…" : "Создать"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function AgentsView() {
   const [agents, setAgents] = useState<AgentConfig[]>([]);
   // Initial agent comes from the URL (/agent/<slug>) so a refresh keeps that agent open.
@@ -1259,7 +1353,18 @@ export function AgentsView() {
         )}
       </div>
 
-      {showCreate && (
+      {showCreate && channel === "Telegram" && (
+        <CreateTelegramAgentModal
+          onClose={() => setShowCreate(false)}
+          onCreated={(slug) => {
+            setShowCreate(false);
+            void reloadAgents().then(() => setActiveAgentId(slug));
+            void reloadAccess();
+          }}
+        />
+      )}
+
+      {showCreate && channel === "Bitrix" && (
         <CreateAgentModal
           onClose={() => setShowCreate(false)}
           onCreated={(slug, warnings) => {

@@ -458,6 +458,19 @@ export interface TelegramAccessAgent {
   users: TelegramAccessUser[];
 }
 
+export async function createTelegramAgent(params: {
+  bot_token: string;
+  name?: string;
+  role_prompt?: string;
+}): Promise<{ slug: string; name: string; username: string }> {
+  const data = await fetchJsonSafe(
+    "/api/agent-center/telegram-agents",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(params) },
+    60000,
+  );
+  return data as { slug: string; name: string; username: string };
+}
+
 export async function fetchTelegramAccess(): Promise<TelegramAccessAgent[]> {
   const data = await fetchJsonSafe("/api/agent-center/telegram-access", undefined, 30000);
   return (data.agents || []) as TelegramAccessAgent[];
