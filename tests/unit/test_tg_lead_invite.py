@@ -218,6 +218,10 @@ def test_formatting_rules_are_delivered_to_the_agent(tg, sent, monkeypatch):
 
     assert "Оформление сообщений клиенту в Telegram" in seen[0]
     assert "ПУСТАЯ строка" in seen[0], "правило про воздух между блоками должно дойти дословно"
+    # К агенту подключены и объёмные инструкции по работе в системе: оформление обязано
+    # стоять раньше них, иначе лимит промпта обрежет именно его.
+    block = seen[0].split("ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА ОФОРМЛЕНИЯ", 1)[-1]
+    assert block.lstrip().startswith("— подключены владельцем, следуй им буквально:\n# Оформление")
 
 
 def test_bitrix_report_format_is_not_pushed_into_the_chat(tg, sent, monkeypatch):

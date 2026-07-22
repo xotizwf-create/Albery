@@ -340,6 +340,7 @@ def channel_role_prompt(channel: str) -> str:
 
 _INSTR_CACHE: dict[str, object] = {"at": 0.0, "text": ""}
 _INSTR_CAP = int(os.getenv("TG_AGENT_INSTR_CAP", "12000") or "12000")
+_INSTR_DOC_CAP = int(os.getenv("TG_AGENT_INSTR_DOC_CAP", "6000") or "6000")
 
 
 def channel_instructions(channel: str) -> str:
@@ -357,8 +358,12 @@ def channel_instructions(channel: str) -> str:
         connected = set(load_manifest(channel)["instructions"])
         if not connected:
             return ""
-        picked = [f"# {i['name']}\n{i['content'].strip()}"
-                  for i in (load_instructions() or []) if i["path"] in connected]
+        items = [i for i in (load_instructions() or []) if i["path"] in connected]
+        # Правила оформления идут ПЕРВЫМИ и целиком: к агенту подключены и объёмные
+        # инструкции по работе в системе (десятки килобайт), и без явного порядка они
+        # съедали бы лимит, а оформление обрезалось бы на середине.
+        items.sort(key=lambda i: (not i["path"].startswith("Формат ответа"), i["path"]))
+        picked = [f"# {i['name']}\n{i['content'].strip()}"[:_INSTR_DOC_CAP] for i in items]
     except Exception:  # noqa: BLE001 — без оформления агент ответит хуже, но ответит
         log.warning("инструкции агента %s не загрузились", channel, exc_info=True)
         return _INSTR_CACHE["text"] or ""
