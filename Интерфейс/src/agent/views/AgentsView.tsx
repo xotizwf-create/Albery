@@ -24,6 +24,9 @@ import {
   LEVEL_LABELS,
   McpTool,
   TIER_LABELS,
+  TelegramAccessAgent,
+  fetchTelegramAccess,
+  saveTelegramAccess,
   addAgentInstruction,
   createAgent,
   deleteAgent,
@@ -989,6 +992,13 @@ export function AgentsView() {
   const [showCreate, setShowCreate] = useState(false);
   const [createNote, setCreateNote] = useState("");
   const [, setForceUpdate] = useState(0);
+  // Агенты живут в двух каналах и настраиваются по-разному: у битриксовых — состав команды и
+  // инструменты, у телеграмных — список тех, кто вообще может им писать.
+  const [channel, setChannel] = useState<"Bitrix" | "Telegram">("Bitrix");
+  const [tgAccess, setTgAccess] = useState<TelegramAccessAgent[]>([]);
+  const [accessInput, setAccessInput] = useState("");
+  const [accessBusy, setAccessBusy] = useState(false);
+  const [accessError, setAccessError] = useState("");
 
   const reloadAgents = (selectFirst = false) =>
     fetchAgents()
@@ -1020,13 +1030,56 @@ export function AgentsView() {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
-  const activeAgent = agents.find((a) => a.id === activeAgentId) || agents[0];
+  const reloadAccess = () =>
+    fetchTelegramAccess().then(setTgAccess).catch(() => setTgAccess([]));
+
+  useEffect(() => {
+    if (channel === "Telegram") void reloadAccess();
+  }, [channel]);
+
+  const channelAgents = agents.filter((a) => (a.channels || []).includes(channel));
+  const activeAgent =
+    channelAgents.find((a) => a.id === activeAgentId) || channelAgents[0] || agents[0];
+  const activeAccess = tgAccess.find((a) => a.slug === activeAgent?.id) || null;
+
+  const submitAccess = async (username: string, remove: boolean) => {
+    if (!activeAccess) return;
+    setAccessBusy(true);
+    setAccessError("");
+    try {
+      await saveTelegramAccess({ bot: activeAccess.slug, username, remove });
+      await reloadAccess();
+      if (!remove) setAccessInput("");
+    } catch (e) {
+      setAccessError((e as Error).message);
+    } finally {
+      setAccessBusy(false);
+    }
+  };
 
   return (
     <div className="flex flex-col lg:flex-row items-start gap-6 h-[calc(100vh-14rem)] min-h-[560px]">
       {/* Left Sidebar - Agents List */}
       <div className="w-full lg:w-[320px] xl:w-[340px] shrink-0 flex flex-col h-full bg-white rounded-3xl border border-gray-200/60 shadow-sm overflow-hidden">
         <div className="p-4 border-b border-gray-100 bg-slate-50/50">
+          <div className="flex gap-1 p-1 bg-gray-100/70 rounded-xl mb-3">
+            {(["Bitrix", "Telegram"] as const).map((ch) => (
+              <button
+                key={ch}
+                onClick={() => {
+                  setChannel(ch);
+                  const first = agents.find((a) => (a.channels || []).includes(ch));
+                  if (first) setActiveAgentId(first.id);
+                }}
+                className={cn(
+                  "flex-1 px-3 py-1.5 text-[12.5px] font-bold rounded-lg transition-colors",
+                  channel === ch ? "bg-white text-indigo-700 shadow-sm" : "text-gray-500 hover:text-gray-700",
+                )}
+              >
+                {ch}
+              </button>
+            ))}
+          </div>
           <button
             onClick={() => setShowCreate(true)}
             className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 transition-all shadow-sm font-bold text-[14px]"
@@ -1042,8 +1095,8 @@ export function AgentsView() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-3 space-y-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-          {agents.map((agent) => {
-            const isActive = agent.id === activeAgentId;
+          {channelAgents.map((agent) => {
+            const isActive = agent.id === activeAgent?.id;
             const Icon =
               agent.iconType === "zap"
                 ? Zap
@@ -1124,7 +1177,75 @@ export function AgentsView() {
 
       {/* Right Content - Editor: one unified editor for every agent (universal + subagents) */}
       <div className="flex-1 min-w-0 h-full overflow-y-auto">
-        {activeAgent ? (
+        {channel === "Telegram" && activeAgent ? (
+          // У Telegram-агента нет ни команды Битрикса, ни его инструментов: единственная
+          // настройка — кто вообще может ему писать.
+          <div className="bg-white rounded-3xl shadow-sm border border-gray-200/60 p-6">
+            <div className="flex items-baseline gap-2 flex-wrap">
+              <h2 className="font-bold text-gray-900 text-[19px]">{activeAgent.name}</h2>
+              {activeAccess?.handle && (
+                <span className="text-[13px] font-bold text-sky-600">{activeAccess.handle}</span>
+              )}
+            </div>
+            <p className="text-[13px] text-gray-500 font-medium mt-1">{activeAgent.type}</p>
+
+            <div className="mt-6">
+              <h3 className="font-bold text-gray-900 text-[15px]">Кто может писать агенту</h3>
+              <p className="text-[12.5px] text-gray-500 mt-1">
+                Остальным агент отвечает отказом. Telegram не ищет людей по @username — числовой
+                id запишется сам, когда человек напишет агенту.
+              </p>
+
+              <div className="mt-4 space-y-2">
+                {(activeAccess?.users || []).map((u) => (
+                  <div
+                    key={u.id}
+                    className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl border border-gray-200 bg-gray-50/60"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-bold text-gray-900 text-[13.5px] truncate">@{u.username}</div>
+                      <div className="text-[12px] text-gray-500 truncate">
+                        {u.display_name || "—"}
+                        {u.tg_user_id ? ` · id ${u.tg_user_id}` : " · id появится после первого сообщения"}
+                      </div>
+                    </div>
+                    <button
+                      disabled={accessBusy}
+                      onClick={() => void submitAccess(u.username, true)}
+                      className="text-[12.5px] font-bold text-gray-400 hover:text-rose-600 shrink-0 disabled:opacity-40"
+                    >
+                      Убрать
+                    </button>
+                  </div>
+                ))}
+                {activeAccess && activeAccess.users.length === 0 && (
+                  <div className="text-[13px] text-amber-600 bg-amber-50 border border-amber-100 rounded-xl px-3.5 py-2.5">
+                    Пока никого нет — агент отвечает только тем, кто указан в .env.
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-4 flex gap-2 max-w-md">
+                <input
+                  value={accessInput}
+                  onChange={(e) => setAccessInput(e.target.value)}
+                  placeholder="@username"
+                  className="flex-1 min-w-0 px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400"
+                />
+                <button
+                  disabled={accessBusy || !accessInput.trim()}
+                  onClick={() =>
+                    void submitAccess(accessInput.trim().replace(/^@/, "").toLowerCase(), false)
+                  }
+                  className="px-4 py-2.5 text-[13.5px] font-bold rounded-xl bg-indigo-600 text-white disabled:opacity-40"
+                >
+                  Добавить
+                </button>
+              </div>
+              {accessError && <div className="mt-2 text-[12.5px] text-rose-600">{accessError}</div>}
+            </div>
+          </div>
+        ) : activeAgent ? (
           <AgentEditor
             key={activeAgent.id}
             slug={activeAgent.id}

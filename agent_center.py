@@ -12,11 +12,14 @@ behind the site's admin session login + /api gate (require_admin_auth in app.py)
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import subprocess
 import time
+
+import requests
 
 from datetime import datetime
 from datetime import timedelta
@@ -32,6 +35,7 @@ from app import (
     msk_now,
     pg_connect,
 )
+from shared.db import load_env_value as shared_load_env_value
 from utils import to_int
 
 _DIALOGS_LIMIT_DEFAULT = 100
@@ -126,12 +130,69 @@ def _user_names() -> dict[int, dict[str, str]]:
 # tg_agent (служба albery-tg) в telegram_bot_messages — миграция 060.
 TG_BOT_CHANNEL = "albery-ai-bot"
 TG_MANAGER_CHANNEL = "albery-ai-manager"
+# Запасные подписи на случай, если Telegram недоступен. Настоящие имя и @username всегда
+# берутся из самого Telegram (_tg_identities): в кабинете агент должен называться ровно так же,
+# как в мессенджере — иначе владелец ищет в интерфейсе имя, которого там нет.
 TG_CHANNELS = {
-    TG_BOT_CHANNEL: {"name": "Албери AI бот", "handle": "@Albery_AI2_Bot",
-                     "subtitle": "личные сообщения боту"},
-    TG_MANAGER_CHANNEL: {"name": "Албери AI менеджер", "handle": "@AlberyAIManager",
+    TG_BOT_CHANNEL: {"name": "Telegram-бот", "handle": "", "subtitle": "личные сообщения боту"},
+    TG_MANAGER_CHANNEL: {"name": "Аккаунт компании", "handle": "",
                          "subtitle": "аккаунт компании • лиды"},
 }
+_TG_IDENTITY_CACHE: dict[str, Any] = {"at": 0.0, "data": {}}
+
+
+def _tg_api(method: str, **params) -> dict[str, Any]:
+    token = (shared_load_env_value("TG_AGENT_BOT_TOKEN") or "").strip()
+    if not token:
+        return {}
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{token}/{method}",
+                             json=params, timeout=15)
+        data = resp.json() if resp.content else {}
+        return (data.get("result") or {}) if data.get("ok") else {}
+    except Exception:  # noqa: BLE001
+        logging.warning("telegram %s failed", method, exc_info=True)
+        return {}
+
+
+def _tg_identities() -> dict[str, dict[str, str]]:
+    """Имя и @username каждого Telegram-канала — как их видит сам Telegram."""
+    now = time.time()
+    if _TG_IDENTITY_CACHE["data"] and now - float(_TG_IDENTITY_CACHE["at"]) < 600:
+        return dict(_TG_IDENTITY_CACHE["data"])
+    out: dict[str, dict[str, str]] = {}
+    me = _tg_api("getMe")
+    if me:
+        out[TG_BOT_CHANNEL] = {"name": str(me.get("first_name") or "").strip(),
+                               "handle": "@" + str(me.get("username") or "")}
+    # Аккаунт компании — владелец бизнес-подключения; его id знает служба albery-tg.
+    owner_id = None
+    try:
+        state = json.loads((Path("/var/www/albery") / ".tg_agent_state.json").read_text(encoding="utf-8"))
+        for info in (state.get("business") or {}).values():
+            owner_id = info.get("user_id") or owner_id
+    except Exception:  # noqa: BLE001
+        owner_id = None
+    if owner_id:
+        chat = _tg_api("getChat", chat_id=owner_id)
+        if chat:
+            name = " ".join(x for x in (chat.get("first_name"), chat.get("last_name")) if x).strip()
+            out[TG_MANAGER_CHANNEL] = {"name": name, "handle": "@" + str(chat.get("username") or "")}
+    if out:
+        _TG_IDENTITY_CACHE.update({"at": now, "data": out})
+    return out
+
+
+def _tg_channel_meta() -> dict[str, dict[str, str]]:
+    """Подписи каналов: имя из Telegram, если оно доступно, иначе запасное."""
+    live = _tg_identities()
+    meta = {}
+    for slug, base in TG_CHANNELS.items():
+        got = live.get(slug) or {}
+        meta[slug] = {**base,
+                      "name": got.get("name") or base["name"],
+                      "handle": got.get("handle") or base["handle"]}
+    return meta
 # Подвкладки менеджера: разговор с самим агентом и переписки с людьми — разные потоки.
 TG_KINDS = {"bot_dm": "В боте", "lead_chat": "Диалоги с пользователями"}
 
@@ -185,14 +246,17 @@ def _telegram_dialogs(q: str, agent: str, kind: str, limit: int) -> list[dict[st
             preview = "Агент: " + preview
         if len(preview) > 100:
             preview = preview[:100].rstrip() + "…"
+        # В Telegram человека узнают по @username — его и ставим заголовком переписки. Имя
+        # профиля идёт подписью: у половины собеседников оно одинаковое или вовсе «Albery».
         uname = r["username2"] or ""
-        title = r["name2"] or (f"@{uname}" if uname else f"Пользователь {r['dialog_id']}")
+        title = f"@{uname}" if uname else (r["name2"] or f"id {r['dialog_id']}")
+        subtitle = (r["name2"] or "") if uname else ""
         out.append({
             "dialog_id": str(r["dialog_id"]),
             "task_id": None,
             "bitrix_user_id": None,
             "user_name": title,
-            "user_position": (f"@{uname}" if uname else ""),
+            "user_position": subtitle,
             "tier": "ops",
             "agent_slug": r["bot"],
             "kind": r["kind"],
@@ -256,7 +320,8 @@ def agent_center_telegram_access():
         logging.exception("agent_center telegram access failed")
         return jsonify({"error": "Не удалось загрузить доступ."}), 500
     agents = [{"slug": slug, **meta,
-               "users": [r for r in rows if r["bot"] == slug]} for slug, meta in TG_CHANNELS.items()]
+               "users": [r for r in rows if r["bot"] == slug]}
+              for slug, meta in _tg_channel_meta().items()]
     return jsonify({"agents": agents})
 
 
@@ -782,11 +847,12 @@ def _telegram_agent_cards() -> list[dict[str, Any]]:
         logging.exception("agent_center: telegram agent cards failed")
         return []
     cards = []
-    for slug, meta in TG_CHANNELS.items():
+    for slug, meta in _tg_channel_meta().items():
         st = stats.get(slug, {})
         users = access.get(slug, [])
         cards.append({
             "id": slug,
+            # Имя ровно как в Telegram: владелец ищет в кабинете то же, что видит в мессенджере.
             "name": meta["name"],
             "kind": f"Telegram • {meta['subtitle']}",
             "icon": "box",
