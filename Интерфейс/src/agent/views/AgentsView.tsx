@@ -734,7 +734,15 @@ const AgentEditor: React.FC<{
               )}
             </div>
             <p className="text-sm text-gray-500 font-medium mt-1">
-              {detail.is_main ? "универсальный агент · для всех сотрудников" : "субагент · самообучение включено"}
+              {isTelegram
+                ? detail.telegram_business_account
+                  // Аккаунт — не второй агент, а подключение этого бота: он отвечает лидам от
+                  // лица аккаунта в «Telegram для бизнеса».
+                  ? `Telegram-бот · отвечает и от лица аккаунта ${detail.telegram_business_account}`
+                  : "Telegram-бот · личные сообщения"
+                : detail.is_main
+                  ? "универсальный агент · для всех сотрудников"
+                  : "субагент · самообучение включено"}
             </p>
           </div>
         </div>

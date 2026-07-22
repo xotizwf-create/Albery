@@ -133,6 +133,7 @@ export interface AgentDetail {
   is_active: boolean;
   bitrix_bot_id: number | null;
   telegram_username?: string;
+  telegram_business_account?: string;
   members: Array<{ id: number; name: string }>;
   instructions: Array<{
     id: string;

@@ -2022,8 +2022,10 @@ def agent_center_agent_detail(slug: str):
         "is_active": agent["is_active"],
         "bitrix_bot_id": display_bot_id if slug == MAIN_AGENT_SLUG else agent["bitrix_bot_id"],
         # Телеграмный мост: по нему интерфейс понимает, что это Telegram-агент, и не предлагает
-        # ему битриксовые действия.
+        # ему битриксовые действия. business_account — аккаунт, от лица которого бот отвечает
+        # лидам (Telegram для бизнеса); это не второй агент, а подключение этого же бота.
         "telegram_username": agent.get("telegram_username") or "",
+        "telegram_business_account": (_tg_channel_meta().get(slug) or {}).get("business_account", ""),
         "members": [
             {"id": uid, "name": names.get(uid, {}).get("name") or f"#{uid}"}
             for uid in member_ids
