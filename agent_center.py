@@ -1821,10 +1821,16 @@ def agent_center_create_agent():
                     return jsonify({"error": f"Агент со slug «{slug}» уже есть — назовите иначе."}), 409
                 cur.execute("SELECT COUNT(*) AS n FROM agents")
                 color = _AGENT_COLORS[int(cur.fetchone()["n"]) % len(_AGENT_COLORS)]
+                # Новый агент стартует ЧИСТЫМ: tools_customized=TRUE с пустым списком оставляет
+                # только обязательный минимум. Раньше он получал весь пресет уровня — сотню
+                # инструментов, которыми не пользуется, и это делало настройку бессмысленной
+                # (владелец 22.07.2026). Нужные инструменты подключает владелец в кабинете или
+                # агент-разработчик через set_agent_tools.
                 cur.execute(
-                    "INSERT INTO agents (slug, name, role_prompt, position, tier, mcp_token, color)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id::text AS id",
-                    (slug, name, role_prompt, position, tier, token, color),
+                    "INSERT INTO agents (slug, name, role_prompt, position, tier, mcp_token,"
+                    " color, tools, tools_customized)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE) RETURNING id::text AS id",
+                    (slug, name, role_prompt, position, tier, token, color, []),
                 )
                 agent_id = cur.fetchone()["id"]
                 for uid in members:
@@ -2130,6 +2136,9 @@ def agent_center_agent_delete(slug: str):
                 # Automations go with the agent — an orphaned row would fire forever
                 # into "агент не найден" errors.
                 cur.execute("DELETE FROM agent_automations WHERE agent_slug = %s", (slug,))
+                # Права доступа к его Telegram-боту тоже уходят с агентом: иначе они
+                # всплывут у будущего агента с тем же slug.
+                cur.execute("DELETE FROM telegram_bot_access WHERE bot = %s", (slug,))
                 cur.execute("DELETE FROM agents WHERE slug = %s", (slug,))
     except Exception:  # noqa: BLE001
         logging.exception("agent delete failed")

@@ -145,6 +145,30 @@ def create_bot_via_botfather(display_name: str, username: str) -> dict:
     return {"token": found.group(1), "username": username, "name": display_name}
 
 
+def delete_bot_via_botfather(username: str) -> str:
+    """Удалить бота в @BotFather. Необратимо: @username освобождается не сразу."""
+    username = username.strip().lstrip("@")
+    if not username:
+        raise ValueError("Нужен @username бота.")
+
+    def _step(send_text: str, timeout_s: int = 25) -> str:
+        mark = _journal_size()
+        _botfather_say(send_text)
+        got = _botfather_wait(mark, timeout_s=timeout_s)
+        if not got.strip():
+            raise RuntimeError("BotFather молчит — попробуйте позже.")
+        return got
+
+    _step("/deletebot")
+    reply = _step("@" + username)
+    # BotFather просит подтверждение фразой «Yes, I am totally sure.»
+    if "sure" in reply.lower() or "yes" in reply.lower():
+        reply = _step("Yes, I am totally sure.")
+    if re.search(r"\b(sorry|invalid|error)\b", reply, re.IGNORECASE):
+        raise RuntimeError(f"BotFather отказал: {reply[:250]}")
+    return reply[:300]
+
+
 def _answer(agent: dict, chat_id, sender: dict, text: str) -> None:
     """Ход агента: доступ → мозг → ответ → журнал. Ошибки не роняют поток опроса."""
     slug = agent["slug"]
@@ -190,11 +214,29 @@ def _answer(agent: dict, chat_id, sender: dict, text: str) -> None:
                  status="ok" if ok else "error")
 
 
+def _is_wanted(slug: str) -> bool:
+    """Существует ли агент ещё. Удалили в кабинете — бот обязан замолчать, а не отвечать
+    от имени несуществующего агента (владелец поймал это 22.07.2026)."""
+    try:
+        with core._db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM agents WHERE slug = %s AND is_active"
+                            " AND telegram_bot_token IS NOT NULL", (slug,))
+                return bool(cur.fetchone())
+    except Exception:  # noqa: BLE001
+        # База недоступна — не глушим уже работающего агента из-за сбоя связи.
+        return True
+
+
 def _poll(agent: dict) -> None:
     slug = agent["slug"]
     token = agent["bot_token"]
     log.info("Telegram-агент «%s» (@%s) начал работу", agent.get("name"), agent.get("username"))
     while True:
+        if not _is_wanted(slug):
+            log.info("агент %s удалён или выключен — поток опроса остановлен", slug)
+            _threads.pop(slug, None)
+            return
         try:
             updates = api(token, "getUpdates", http_timeout=_POLL_TIMEOUT + 15,
                           timeout=_POLL_TIMEOUT, offset=_offsets.get(slug, 0),
@@ -211,6 +253,12 @@ def _poll(agent: dict) -> None:
             sender = msg.get("from") or {}
             if chat.get("type") != "private" or not text or sender.get("is_bot"):
                 continue
+            # Проверяем перед КАЖДЫМ ответом: длинный опрос висит до минуты, и без этой
+            # проверки удалённый агент успел бы ответить ещё раз.
+            if not _is_wanted(slug):
+                log.info("агент %s удалён — сообщение оставлено без ответа", slug)
+                _threads.pop(slug, None)
+                return
             try:
                 _answer(agent, chat.get("id"), sender, text)
             except Exception:  # noqa: BLE001

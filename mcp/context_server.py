@@ -7449,6 +7449,48 @@ def tool_create_telegram_agent(args: dict[str, Any]) -> dict[str, Any]:
                      "set_telegram_access.")}
 
 
+def tool_delete_telegram_agent(args: dict[str, Any]) -> dict[str, Any]:
+    """Удалить Telegram-агента. По умолчанию бот остаётся жив — только агент перестаёт работать."""
+    slug = str(args.get("agent") or args.get("slug") or "").strip()
+    if not slug:
+        raise McpError(-32602, "Нужен slug агента (см. list_telegram_agents).")
+    if slug in ("albery-ai-bot", "albery-ai-manager"):
+        raise McpError(-32602, "Это встроенный канал Albery, его удалять нельзя.")
+    if args.get("confirm") is not True:
+        raise McpError(-32602, "Удаление агента требует confirm=true. Сначала покажи владельцу, "
+                               "какой агент удаляется, и получи подтверждение.")
+    username = ""
+    with pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT telegram_username FROM agents WHERE slug = %s", (slug,))
+            row = cur.fetchone()
+            if not row:
+                raise McpError(-32602, f"Агент {slug} не найден.")
+            username = row["telegram_username"] or ""
+    botfather = ""
+    if args.get("delete_bot") is True and username:
+        # Удаление самого бота необратимо, поэтому только по явному запросу.
+        import tg_multi
+        try:
+            botfather = tg_multi.delete_bot_via_botfather(username)
+        except Exception as exc:  # noqa: BLE001
+            botfather = f"бот не удалён: {str(exc)[:200]}"
+    from app import app as flask_app
+    import agent_center
+    with flask_app.test_request_context(f"/api/agent-center/agents/{slug}", method="DELETE"):
+        resp = agent_center.agent_center_agent_delete(slug)
+    body, code = (resp if isinstance(resp, tuple) else (resp, 200))
+    data = body.get_json() or {}
+    if code != 200 or not data.get("ok"):
+        raise McpError(-32010, str(data.get("error") or "не удалось удалить агента"))
+    return {"deleted": True, "agent": slug, "bot_username": username or None,
+            "botfather": botfather or None,
+            "note": ("Агент удалён: опрос Telegram останавливается в течение минуты, права "
+                     "доступа к нему стёрты. Журнал переписок сохранён как история."
+                     if not botfather else
+                     "Агент удалён вместе с ботом в BotFather.")}
+
+
 def tool_set_telegram_access(args: dict[str, Any]) -> dict[str, Any]:
     """Выдать или забрать доступ к Telegram-агенту по @username."""
     bot = str(args.get("agent") or args.get("bot") or "").strip()
@@ -8705,6 +8747,25 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_create_telegram_agent,
+    },
+    "delete_telegram_agent": {
+        "description": (
+            "Удалить Telegram-агента: опрос останавливается, коннектор и права доступа "
+            "стираются, журнал переписок остаётся историей. Сам бот по умолчанию продолжает "
+            "существовать — чтобы удалить и его в @BotFather, передай delete_bot=true (это "
+            "необратимо). Требует confirm=true. Встроенные каналы удалять нельзя."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "slug агента (см. list_telegram_agents)."},
+                "confirm": {"type": "boolean", "description": "true — подтверждение владельца получено."},
+                "delete_bot": {"type": "boolean", "description": "true — удалить и бота в BotFather."},
+            },
+            "required": ["agent", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_delete_telegram_agent,
     },
     "set_telegram_access": {
         "description": (
@@ -11467,7 +11528,7 @@ AGENT_MGMT_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "handler": tool_list_agents,
     },
     "create_agent": {
-        "description": "Создать нового субагента (Bitrix-бот зарегистрируется автоматически). Стартует с широкого набора «все функции» — дальше настрой инструменты через set_agent_tools.",
+        "description": "Создать нового субагента (Bitrix-бот зарегистрируется автоматически). Стартует ЧИСТЫМ — только обязательный минимум инструментов; нужные подключи через set_agent_tools, иначе агент не сможет ничего сделать.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -25,6 +25,7 @@ import {
   McpTool,
   TIER_LABELS,
   TelegramAccessAgent,
+  TelegramAccessUser,
   createTelegramAgent,
   fetchTelegramAccess,
   saveTelegramAccess,
@@ -591,7 +592,38 @@ const AgentEditor: React.FC<{
   slug: string;
   onChanged: () => void;
   onDeleted: () => void;
-}> = ({ slug, onChanged, onDeleted }) => {
+  // Telegram-агент: доступ у него не по сотрудникам портала, а по @username в Telegram.
+  isTelegram?: boolean;
+}> = ({ slug, onChanged, onDeleted, isTelegram = false }) => {
+  const [tgUsers, setTgUsers] = useState<TelegramAccessUser[]>([]);
+  const [tgInput, setTgInput] = useState("");
+  const [tgBusy, setTgBusy] = useState(false);
+  const [tgError, setTgError] = useState("");
+
+  const reloadTgAccess = React.useCallback(() => {
+    if (!isTelegram) return;
+    fetchTelegramAccess()
+      .then((list) => setTgUsers(list.find((a) => a.slug === slug)?.users || []))
+      .catch(() => setTgUsers([]));
+  }, [isTelegram, slug]);
+
+  useEffect(() => {
+    reloadTgAccess();
+  }, [reloadTgAccess]);
+
+  const changeTgAccess = async (username: string, remove: boolean) => {
+    setTgBusy(true);
+    setTgError("");
+    try {
+      await saveTelegramAccess({ bot: slug, username, remove });
+      reloadTgAccess();
+      if (!remove) setTgInput("");
+    } catch (e) {
+      setTgError((e as Error).message);
+    } finally {
+      setTgBusy(false);
+    }
+  };
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [name, setName] = useState("");
   const [position, setPosition] = useState("");
@@ -803,6 +835,67 @@ const AgentEditor: React.FC<{
             />
           </div>
 
+          {isTelegram ? (
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <label className="block text-sm font-bold text-gray-900">Кто может писать агенту</label>
+                <span className="text-xs font-bold text-gray-500 bg-gray-100 px-2 py-0.5 rounded-md">
+                  {tgUsers.length === 0 ? "никого нет" : `${tgUsers.length} в Telegram`}
+                </span>
+              </div>
+              <div
+                className={cn(
+                  "p-2.5 bg-gray-50/80 border border-gray-200/80 rounded-2xl space-y-2 shadow-sm",
+                  tgBusy && "opacity-60 pointer-events-none",
+                )}
+              >
+                {tgUsers.map((u) => (
+                  <div
+                    key={u.id}
+                    className="px-3 py-2 bg-white border border-gray-200/80 rounded-xl flex items-center justify-between gap-2 shadow-sm"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-bold text-gray-900 text-[13px] truncate">@{u.username}</div>
+                      <div className="text-[11.5px] text-gray-500 truncate">
+                        {u.display_name || "—"}
+                        {u.tg_user_id ? ` · id ${u.tg_user_id}` : " · id появится после первого сообщения"}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => void changeTgAccess(u.username, true)}
+                      className="text-gray-300 hover:text-rose-500 shrink-0"
+                      title="Убрать доступ"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
+                <div className="flex gap-2">
+                  <input
+                    value={tgInput}
+                    onChange={(e) => setTgInput(e.target.value)}
+                    placeholder="@username"
+                    className="flex-1 min-w-0 px-3 py-2 bg-white border border-gray-200/80 rounded-xl text-[13px] focus:outline-none focus:border-indigo-400"
+                  />
+                  <button
+                    disabled={!tgInput.trim()}
+                    onClick={() =>
+                      void changeTgAccess(tgInput.trim().replace(/^@/, "").toLowerCase(), false)
+                    }
+                    className="px-3.5 py-2 text-[13px] font-bold rounded-xl bg-indigo-600 text-white disabled:opacity-40"
+                  >
+                    Добавить
+                  </button>
+                </div>
+                {tgError && <div className="text-[12px] text-rose-600">{tgError}</div>}
+                <div className="text-[11.5px] text-gray-400 leading-snug">
+                  В Telegram нет прав портала — доступ решает этот список. Остальным агент
+                  отвечает отказом. Telegram не ищет людей по @username, поэтому числовой id
+                  запишется сам, когда человек напишет агенту.
+                </div>
+              </div>
+            </div>
+          ) : (
           <div>
             <div className="flex items-center justify-between mb-2">
               <label className="block text-sm font-bold text-gray-900">Команда и доступы</label>
@@ -870,6 +963,7 @@ const AgentEditor: React.FC<{
               </div>
             </div>
           </div>
+          )}
 
           {error && <div className="text-[13px] font-bold text-rose-500">{error}</div>}
         </div>
@@ -1282,80 +1376,14 @@ export function AgentsView() {
 
       {/* Right Content - Editor: one unified editor for every agent (universal + subagents) */}
       <div className="flex-1 min-w-0 h-full overflow-y-auto">
-        {channel === "Telegram" && activeAgent ? (
-          // Telegram-агент настраивается ТАК ЖЕ, как битриксовый: тот же редактор возможностей
-          // (инструменты, инструкции, знания) — отличается только мост. Сверху добавлен блок
-          // доступа: в Telegram нет прав портала, и кто может писать боту, решает белый список.
-          <div className="space-y-6">
-            <div className="bg-white rounded-3xl shadow-sm border border-gray-200/60 p-6">
-              <h3 className="font-bold text-gray-900 text-[15px]">Кто может писать агенту</h3>
-              <p className="text-[12.5px] text-gray-500 mt-1">
-                Остальным агент отвечает отказом. Telegram не ищет людей по @username — числовой
-                id запишется сам, когда человек напишет агенту.
-              </p>
-
-              <div className="mt-4 space-y-2">
-                {(activeAccess?.users || []).map((u) => (
-                  <div
-                    key={u.id}
-                    className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl border border-gray-200 bg-gray-50/60"
-                  >
-                    <div className="min-w-0">
-                      <div className="font-bold text-gray-900 text-[13.5px] truncate">@{u.username}</div>
-                      <div className="text-[12px] text-gray-500 truncate">
-                        {u.display_name || "—"}
-                        {u.tg_user_id ? ` · id ${u.tg_user_id}` : " · id появится после первого сообщения"}
-                      </div>
-                    </div>
-                    <button
-                      disabled={accessBusy}
-                      onClick={() => void submitAccess(u.username, true)}
-                      className="text-[12.5px] font-bold text-gray-400 hover:text-rose-600 shrink-0 disabled:opacity-40"
-                    >
-                      Убрать
-                    </button>
-                  </div>
-                ))}
-                {activeAccess && activeAccess.users.length === 0 && (
-                  <div className="text-[13px] text-amber-600 bg-amber-50 border border-amber-100 rounded-xl px-3.5 py-2.5">
-                    Пока никого нет — агент отвечает только тем, кто указан в .env.
-                  </div>
-                )}
-              </div>
-
-              <div className="mt-4 flex gap-2 max-w-md">
-                <input
-                  value={accessInput}
-                  onChange={(e) => setAccessInput(e.target.value)}
-                  placeholder="@username"
-                  className="flex-1 min-w-0 px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400"
-                />
-                <button
-                  disabled={accessBusy || !accessInput.trim()}
-                  onClick={() =>
-                    void submitAccess(accessInput.trim().replace(/^@/, "").toLowerCase(), false)
-                  }
-                  className="px-4 py-2.5 text-[13.5px] font-bold rounded-xl bg-indigo-600 text-white disabled:opacity-40"
-                >
-                  Добавить
-                </button>
-              </div>
-              {accessError && <div className="mt-2 text-[12.5px] text-rose-600">{accessError}</div>}
-            </div>
-
-            {/* Дальше — тот же редактор, что у агентов Битрикса: роль, инструменты (MCP),
-                инструкции и знания. Мост другой, настройки те же. */}
-            <AgentEditor
-              key={activeAgent.id}
-              slug={activeAgent.id}
-              onChanged={() => void reloadAgents()}
-              onDeleted={() => void reloadAgents(true)}
-            />
-          </div>
-        ) : activeAgent ? (
+        {activeAgent ? (
+          // Telegram-агент настраивается ТЕМ ЖЕ редактором, что и битриксовый: роль,
+          // инструменты, инструкции, знания. Отличается только мост и то, что доступ у него —
+          // по @username, а не по сотрудникам портала (это учтено внутри редактора).
           <AgentEditor
             key={activeAgent.id}
             slug={activeAgent.id}
+            isTelegram={channel === "Telegram"}
             onChanged={() => void reloadAgents()}
             onDeleted={() => void reloadAgents(true)}
           />

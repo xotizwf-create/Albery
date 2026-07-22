@@ -229,3 +229,35 @@ def test_silent_botfather_does_not_hang_forever(multi, botfather, monkeypatch):
 
     with pytest.raises(RuntimeError, match="молчит"):
         multi.create_bot_via_botfather("Агент", "albery_x_bot")
+
+
+# --- удаление агента ------------------------------------------------------------------------
+# Владелец удалил агента в кабинете, а бот в Telegram продолжал отвечать (22.07.2026): поток
+# опроса жил своей жизнью, потому что супервизор только ПОДНИМАЛ потоки и никогда их не гасил.
+
+def test_deleted_agent_stops_answering(multi, monkeypatch):
+    """Самое неприятное для владельца: удалил — а бот продолжает говорить от имени компании."""
+    import tg_agent
+    monkeypatch.setattr(multi, "_is_wanted", lambda slug: False)
+    calls = []
+    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
+    sent = []
+    monkeypatch.setattr(multi, "api", lambda token, method, http_timeout=35, **p: (
+        sent.append(p) or ([] if method == "getUpdates" else {"message_id": 1})))
+
+    multi._poll(AGENT)      # должен выйти сам, а не крутиться вечно
+
+    assert calls == [], "удалённый агент не должен обращаться к модели"
+    assert multi._threads.get("prodazhi-bot") is None
+
+
+def test_database_outage_does_not_silence_a_live_agent(multi, monkeypatch):
+    """Обрыв базы — не повод глушить работающего агента: иначе сбой связи = молчащий бот."""
+    import tg_agent
+
+    def broken_db():
+        raise RuntimeError("postgres недоступен")
+
+    monkeypatch.setattr(tg_agent, "_db", broken_db)
+
+    assert multi._is_wanted("prodazhi-bot") is True
