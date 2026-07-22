@@ -1,8 +1,9 @@
 """Telegram-агенты, которых владелец заводит сам.
 
-Требование владельца 22.07.2026: в Telegram тоже нужно спокойно создавать агентов, и под это
-нужны MCP-инструменты. Каждый такой агент — отдельный бот со своим токеном, своим списком
-доступа и своей веткой журнала.
+Требование владельца 22.07.2026: в Telegram агенты создаются и настраиваются ТАК ЖЕ, как в
+Битриксе — с инструментами, инструкциями и знаниями; отличается только мост. Поэтому такой
+агент — обычная запись в таблице `agents` (как субагент Битрикса), у которой вместо
+bitrix_bot_id заполнен telegram_bot_token, и он работает на своём коннекторе agent-<slug>.
 
 Главное ограничение: основной бот (@Albery_AI2_Bot) несёт бизнес-режим, лидов и воронку —
 новые агенты не должны его задевать, поэтому они живут в отдельном модуле и отдельных потоках.
@@ -55,7 +56,7 @@ def rows(multi, monkeypatch):
 def test_allowed_person_gets_an_answer(multi, sent, rows, monkeypatch):
     import tg_agent
     monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: {"alexxandrn"})
-    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s: "Здравствуйте! Слушаю вас.")
+    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Слушаю вас.")
 
     multi._answer(AGENT, 555, {"id": 555, "username": "alexxandrn"}, "привет")
 
@@ -69,7 +70,7 @@ def test_stranger_is_refused_and_the_brain_is_not_called(multi, sent, rows, monk
     import tg_agent
     calls = []
     monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: {"alexxandrn"})
-    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
+    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
 
     multi._answer(AGENT, 777, {"id": 777, "username": "chuzhoy"}, "пусти")
 
@@ -81,18 +82,32 @@ def test_role_prompt_reaches_the_brain(multi, sent, rows, monkeypatch):
     import tg_agent
     prompts = []
     monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: set())
-    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s: prompts.append(p) or "ок")
+    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: prompts.append((p, toolsets)) or "ок")
 
     multi._answer(AGENT, 555, {"id": 555, "username": "kto_ugodno"}, "вопрос")
 
-    assert "консультант по продажам" in prompts[0]
+    assert "консультант по продажам" in prompts[0][0]
+
+
+def test_agent_runs_on_its_own_connector(multi, sent, rows, monkeypatch):
+    """Ради этого Telegram-агент и живёт в общей таблице agents: коннектор agent-<slug> даёт
+    ему ИМЕННО его набор MCP-инструментов, подключённые инструкции и знания. Без него агент
+    был бы говорящей головой без инструментов — не то же самое, что агент в Битриксе."""
+    import tg_agent
+    seen = []
+    monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: set())
+    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: seen.append(toolsets) or "ок")
+
+    multi._answer(AGENT, 555, {"id": 555, "username": "kto"}, "вопрос")
+
+    assert seen[0].startswith("agent-prodazhi-bot"), seen
 
 
 def test_empty_access_list_does_not_lock_everyone_out(multi, sent, rows, monkeypatch):
     """Пустой список = ограничений нет. Иначе новый агент был бы нем сразу после создания."""
     import tg_agent
     monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: set())
-    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s: "Здравствуйте!")
+    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте!")
 
     multi._answer(AGENT, 555, {"id": 555, "username": "kto_ugodno"}, "привет")
 
@@ -103,7 +118,7 @@ def test_brain_failure_is_journalled_and_does_not_crash(multi, sent, rows, monke
     import tg_agent
     monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: set())
 
-    def boom(p, s):
+    def boom(p, s, toolsets=None):
         raise RuntimeError("мозг недоступен")
 
     monkeypatch.setattr(tg_agent, "hermes_answer", boom)
@@ -116,7 +131,7 @@ def test_brain_failure_is_journalled_and_does_not_crash(multi, sent, rows, monke
 def test_undelivered_answer_is_marked_as_error(multi, rows, monkeypatch):
     import tg_agent
     monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: set())
-    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s: "ответ")
+    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: "ответ")
 
     def broken(token, method, http_timeout=35, **p):
         raise RuntimeError("Telegram отказал")

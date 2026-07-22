@@ -28,12 +28,20 @@ _offsets: dict[str, int] = {}
 
 
 def load_agents() -> list[dict]:
-    """Активные агенты владельца. Пустой список — база недоступна или агентов нет."""
+    """Активные агенты с телеграмным мостом. Пустой список — база недоступна или агентов нет.
+
+    Агенты живут в общей таблице `agents` — той же, что и субагенты Битрикса. Отличается только
+    мост: там bitrix_bot_id, здесь telegram_bot_token. Благодаря этому у телеграмного агента
+    есть всё то же самое: свой коннектор agent-<slug> с набором MCP-инструментов, подключённые
+    инструкции, база знаний и личные инструкции."""
     try:
         with core._db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT slug, name, username, bot_token, role_prompt, bot_user_id"
-                            " FROM telegram_agents WHERE is_active ORDER BY id")
+                cur.execute("SELECT slug, name, telegram_username AS username,"
+                            " telegram_bot_token AS bot_token, role_prompt,"
+                            " telegram_bot_user_id AS bot_user_id"
+                            " FROM agents WHERE is_active AND telegram_bot_token IS NOT NULL"
+                            " ORDER BY created_at")
                 return [dict(r) for r in cur.fetchall()]
     except Exception:  # noqa: BLE001
         log.warning("не удалось прочитать список Telegram-агентов", exc_info=True)
@@ -77,9 +85,13 @@ def _answer(agent: dict, chat_id, sender: dict, text: str) -> None:
     prompt = ((agent.get("role_prompt") or "").strip()
               or "Ты — ИИ-агент компании Albery в Telegram. Отвечай по-русски, кратко и по делу, "
                  "обычным текстом без разметки.")
+    # Личный коннектор агента — то же, на чём работают субагенты в Битриксе. Через него агент
+    # получает ИМЕННО свой набор MCP-инструментов, подключённые инструкции и знания; без него
+    # телеграмный агент был бы говорящей головой без инструментов.
+    toolsets = f"agent-{slug},{os.getenv('TG_MULTI_EXTRA_TOOLSETS', 'web').strip()}".rstrip(",")
     try:
         answer = core.hermes_answer(f"{prompt}\n\nСообщение собеседника:\n{text}",
-                                    f"tg-{slug}-{chat_id}")
+                                    f"tg-{slug}-{chat_id}", toolsets=toolsets)
     except Exception as exc:  # noqa: BLE001
         log.warning("мозг не ответил (%s): %s", slug, str(exc)[:200])
         core.journal(slug, chat_id, "out", f"мозг не ответил: {str(exc)[:200]}", kind="bot_dm",

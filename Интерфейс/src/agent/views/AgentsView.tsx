@@ -1000,6 +1000,10 @@ function CreateTelegramAgentModal({
   const [error, setError] = useState("");
 
   const submit = async () => {
+    if (!name.trim()) {
+      setError("Укажите имя агента.");
+      return;
+    }
     setBusy(true);
     setError("");
     try {
@@ -1036,13 +1040,11 @@ function CreateTelegramAgentModal({
           className="mt-1.5 w-full px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400"
         />
 
-        <label className="block mt-4 text-[13px] font-bold text-gray-700">
-          Имя <span className="font-medium text-gray-400">— необязательно</span>
-        </label>
+        <label className="block mt-4 text-[13px] font-bold text-gray-700">Имя агента</label>
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="по умолчанию — имя бота из Telegram"
+          placeholder="Например: Агент по подключению"
           className="mt-1.5 w-full px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400"
         />
 
@@ -1058,8 +1060,9 @@ function CreateTelegramAgentModal({
         {error && <div className="mt-3 text-[12.5px] text-rose-600">{error}</div>}
 
         <div className="mt-4 text-[12px] text-gray-400 leading-snug">
-          Агент заработает в течение минуты — служба подхватывает новых сама. Дальше добавьте
-          тех, кому можно ему писать: остальным он отвечает отказом.
+          Агент заработает в течение минуты — служба подхватывает новых сама. Инструменты,
+          инструкции и знания настраиваются потом в его карточке — так же, как у агентов
+          Битрикса. Дальше добавьте тех, кому можно ему писать: остальным он отвечает отказом.
         </div>
 
         <div className="mt-5 flex gap-2 justify-end">
@@ -1272,18 +1275,11 @@ export function AgentsView() {
       {/* Right Content - Editor: one unified editor for every agent (universal + subagents) */}
       <div className="flex-1 min-w-0 h-full overflow-y-auto">
         {channel === "Telegram" && activeAgent ? (
-          // У Telegram-агента нет ни команды Битрикса, ни его инструментов: единственная
-          // настройка — кто вообще может ему писать.
-          <div className="bg-white rounded-3xl shadow-sm border border-gray-200/60 p-6">
-            <div className="flex items-baseline gap-2 flex-wrap">
-              <h2 className="font-bold text-gray-900 text-[19px]">{activeAgent.name}</h2>
-              {activeAccess?.handle && (
-                <span className="text-[13px] font-bold text-sky-600">{activeAccess.handle}</span>
-              )}
-            </div>
-            <p className="text-[13px] text-gray-500 font-medium mt-1">{activeAgent.type}</p>
-
-            <div className="mt-6">
+          // Telegram-агент настраивается ТАК ЖЕ, как битриксовый: тот же редактор возможностей
+          // (инструменты, инструкции, знания) — отличается только мост. Сверху добавлен блок
+          // доступа: в Telegram нет прав портала, и кто может писать боту, решает белый список.
+          <div className="space-y-6">
+            <div className="bg-white rounded-3xl shadow-sm border border-gray-200/60 p-6">
               <h3 className="font-bold text-gray-900 text-[15px]">Кто может писать агенту</h3>
               <p className="text-[12.5px] text-gray-500 mt-1">
                 Остальным агент отвечает отказом. Telegram не ищет людей по @username — числовой
@@ -1338,6 +1334,22 @@ export function AgentsView() {
               </div>
               {accessError && <div className="mt-2 text-[12.5px] text-rose-600">{accessError}</div>}
             </div>
+
+            {/* Встроенные каналы (основной бот и аккаунт компании) — не субагенты: у них нет
+                записи в agents, поэтому и редактора возможностей у них нет. */}
+            {activeAgent.isSystem ? (
+              <div className="bg-white rounded-3xl shadow-sm border border-gray-200/60 p-6 text-[13px] text-gray-500">
+                Это встроенный канал Albery — набор инструментов и инструкции у него общие с
+                основным агентом. Отдельно настраиваются только те, кто может ему писать.
+              </div>
+            ) : (
+              <AgentEditor
+                key={activeAgent.id}
+                slug={activeAgent.id}
+                onChanged={() => void reloadAgents()}
+                onDeleted={() => void reloadAgents(true)}
+              />
+            )}
           </div>
         ) : activeAgent ? (
           <AgentEditor

@@ -98,6 +98,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "060_telegram_agent_journal.sql",
     # Idempotent: Telegram agents the owner creates himself (own bot token per agent).
     "061_telegram_agents.sql",
+    # Idempotent: Telegram as a second bridge on a normal agent (same editor as Bitrix subagents).
+    "062_agents_telegram_bridge.sql",
 ]
 
 

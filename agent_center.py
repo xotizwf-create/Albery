@@ -316,87 +316,27 @@ def _telegram_dialog_messages(dialog_id: str, agent: str):
 
 
 def telegram_agents_list() -> list[dict[str, Any]]:
-    """Агенты, заведённые владельцем. Токен наружу не отдаётся никогда."""
+    """Агенты с телеграмным мостом. Токен наружу не отдаётся никогда — только признак.
+
+    Живут в общей таблице `agents`: у телеграмного агента тот же редактор возможностей, что и
+    у битриксового субагента (инструменты, инструкции, знания), отличается только мост."""
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT slug, name, username, role_prompt, is_active, bot_user_id,"
-                            " bot_token IS NOT NULL AS has_token"
-                            " FROM telegram_agents ORDER BY id")
-                return [{k: v for k, v in dict(r).items()} for r in cur.fetchall()]
+                cur.execute("SELECT slug, name, telegram_username AS username, role_prompt,"
+                            " is_active, telegram_bot_user_id AS bot_user_id,"
+                            " telegram_bot_token IS NOT NULL AS has_token"
+                            " FROM agents WHERE telegram_bot_token IS NOT NULL"
+                            " ORDER BY created_at")
+                return [dict(r) for r in cur.fetchall()]
     except Exception:  # noqa: BLE001
         logging.exception("telegram agents list failed")
         return []
 
 
-def telegram_agent_create(name: str, token: str, role_prompt: str = "") -> dict[str, Any]:
-    """Завести Telegram-агента по токену от BotFather.
-
-    Имя и @username берутся из самого Telegram, а не со слов создателя: в кабинете агент
-    должен называться ровно так же, как в мессенджере. Битый токен отсекается сразу — иначе
-    агент молча не заработал бы."""
-    token = (token or "").strip()
-    if not token or ":" not in token:
-        raise ValueError("Нужен токен бота от @BotFather (вида 123456:AA...).")
-    import tg_multi
-    try:
-        who = tg_multi.describe(token)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Telegram не принял токен: {str(exc)[:200]}") from exc
-    username = (who.get("username") or "").strip()
-    if not username:
-        raise ValueError("Telegram не вернул @username бота — проверьте токен.")
-    slug = re.sub(r"[^a-z0-9]+", "-", username.lower()).strip("-")[:40] or "tg-agent"
-    display = (name or "").strip() or who.get("name") or username
-    with pg_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM telegram_agents WHERE slug = %s", (slug,))
-            if cur.fetchone():
-                raise ValueError(f"Агент @{username} уже заведён.")
-            cur.execute(
-                "INSERT INTO telegram_agents (slug, name, username, bot_token, role_prompt,"
-                " bot_user_id) VALUES (%s, %s, %s, %s, %s, %s)",
-                (slug, display, username, token, (role_prompt or "").strip(),
-                 who.get("bot_user_id")))
-    # Служба albery-tg подхватывает новых агентов сама (супервизор раз в минуту) — перезапуск
-    # не нужен, чтобы не рвать переписки основного бота.
-    return {"slug": slug, "name": display, "username": username,
-            "bot_user_id": who.get("bot_user_id")}
-
-
 @app.get("/api/agent-center/telegram-agents")
 def agent_center_telegram_agents():
     return jsonify({"agents": telegram_agents_list()})
-
-
-@app.post("/api/agent-center/telegram-agents")
-def agent_center_telegram_agent_create():
-    body = request.get_json(silent=True) or {}
-    try:
-        created = telegram_agent_create(str(body.get("name") or ""),
-                                        str(body.get("bot_token") or ""),
-                                        str(body.get("role_prompt") or ""))
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    except Exception:  # noqa: BLE001
-        logging.exception("telegram agent create failed")
-        return jsonify({"error": "Не удалось создать агента."}), 500
-    return jsonify({"ok": True, **created})
-
-
-@app.post("/api/agent-center/telegram-agents/<slug>/toggle")
-def agent_center_telegram_agent_toggle(slug: str):
-    body = request.get_json(silent=True) or {}
-    active = bool(body.get("is_active"))
-    try:
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE telegram_agents SET is_active = %s WHERE slug = %s",
-                            (active, slug))
-    except Exception:  # noqa: BLE001
-        logging.exception("telegram agent toggle failed")
-        return jsonify({"error": "Не удалось изменить агента."}), 500
-    return jsonify({"ok": True, "slug": slug, "is_active": active})
 
 
 @app.get("/api/agent-center/telegram-access")
@@ -888,15 +828,23 @@ def agent_center_agents():
             ss = sub_stats.get(a["slug"], {})
             member_names = [names.get(uid, {}).get("name") or f"#{uid}" for uid in sorted(a["members"])]
             sub_avg = ss.get("avg_ms")
+            # Канал агента = его мост. Телеграмный агент — тот же субагент с тем же редактором
+            # возможностей, просто говорит через другой мессенджер.
+            channels = (["Bitrix"] if a["bitrix_bot_id"] else []) + \
+                       (["Telegram"] if a.get("has_telegram") else [])
+            tg_handle = f"@{a['telegram_username']}" if a.get("telegram_username") else ""
             agents.append({
                 "id": a["slug"],
                 "name": a["name"],
-                "kind": f"субагент • {_LEVEL_LABELS.get(a['tier'], 'база знаний')}",
+                "kind": (f"Telegram {tg_handle} • {_LEVEL_LABELS.get(a['tier'], 'база знаний')}"
+                         if a.get("has_telegram")
+                         else f"субагент • {_LEVEL_LABELS.get(a['tier'], 'база знаний')}"),
                 "icon": "box",
                 "icon_bg": "bg-blue-100 text-blue-500",
                 "is_system": False,
                 "is_active": bool(a["is_active"]),
-                "channels": ["Bitrix"] if a["bitrix_bot_id"] else [],
+                "handle": tg_handle,
+                "channels": channels,
                 "users_count": len(member_names),
                 "users_preview": ", ".join(member_names[:3]) + (f" +{len(member_names) - 3}" if len(member_names) > 3 else ""),
                 "turns_today": int(ss.get("turns_today") or 0),
@@ -1498,7 +1446,9 @@ def _load_agents_full() -> list[dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id::text AS id, slug, name, role_prompt, position, tier, tools, tools_customized,"
-                " bitrix_bot_id, mcp_token, is_active, color, created_at FROM agents ORDER BY created_at"
+                " bitrix_bot_id, telegram_username, telegram_bot_user_id,"
+                " telegram_bot_token IS NOT NULL AS has_telegram,"
+                " mcp_token, is_active, color, created_at FROM agents ORDER BY created_at"
             )
             agents = [dict(r) for r in cur.fetchall()]
             cur.execute("SELECT agent_id::text AS agent_id, bitrix_user_id FROM agent_members")
@@ -1777,6 +1727,18 @@ def agent_center_create_agent():
         return jsonify({"error": "Укажите имя агента (до 60 символов)."}), 400
     # No level selector any more: a new agent starts with the broad 'ops' preset (все функции,
     # без admin); the owner then narrows/extends its tools in the capability panel.
+    # Канал агента задаётся мостом: есть токен бота — агент живёт в Telegram, нет — в Битриксе.
+    # Токен проверяем ДО создания записи: битый токен не должен оставлять мёртвого агента.
+    tg_token = str(body.get("telegram_bot_token") or "").strip()
+    tg_who: dict[str, Any] = {}
+    if tg_token:
+        import tg_multi
+        try:
+            tg_who = tg_multi.describe(tg_token)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"Telegram не принял токен: {str(exc)[:200]}"}), 400
+        if not tg_who.get("username"):
+            return jsonify({"error": "Telegram не вернул @username бота — проверьте токен."}), 400
     tier = str(body.get("tier") or "ops").strip()
     if tier not in AGENT_LEVELS:
         tier = "ops"
@@ -1810,14 +1772,28 @@ def agent_center_create_agent():
 
     warnings = []
     bot_id = None
-    try:
-        bot_id = _register_agent_bot(slug, name, color, position)
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE agents SET bitrix_bot_id = %s, updated_at = now() WHERE id = %s", (bot_id, agent_id))
-    except Exception as exc:  # noqa: BLE001
-        logging.exception("agent create: bitrix bot registration failed")
-        warnings.append(f"Bitrix-бот не зарегистрирован: {str(exc)[:200]}")
+    if tg_token:
+        # Телеграмный мост вместо битриксового. Всё остальное у агента такое же: свой коннектор
+        # agent-<slug>, набор инструментов, инструкции и знания — редактор возможностей общий.
+        try:
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE agents SET telegram_bot_token = %s, telegram_username = %s,"
+                        " telegram_bot_user_id = %s, updated_at = now() WHERE id = %s",
+                        (tg_token, tg_who.get("username"), tg_who.get("bot_user_id"), agent_id))
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("agent create: telegram bridge failed")
+            warnings.append(f"Telegram-мост не сохранён: {str(exc)[:200]}")
+    else:
+        try:
+            bot_id = _register_agent_bot(slug, name, color, position)
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE agents SET bitrix_bot_id = %s, updated_at = now() WHERE id = %s", (bot_id, agent_id))
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("agent create: bitrix bot registration failed")
+            warnings.append(f"Bitrix-бот не зарегистрирован: {str(exc)[:200]}")
     try:
         _hermes_connector_add(slug, token)
     except Exception as exc:  # noqa: BLE001

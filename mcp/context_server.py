@@ -7423,18 +7423,28 @@ def tool_list_telegram_agents(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_create_telegram_agent(args: dict[str, Any]) -> dict[str, Any]:
-    """Завести нового Telegram-агента по токену от BotFather."""
+    """Завести нового Telegram-агента: тот же субагент, только мост — Telegram."""
     token = str(args.get("bot_token") or "").strip()
+    name = str(args.get("name") or "").strip()
     if not token:
         raise McpError(-32602, "Нужен bot_token от @BotFather.")
-    try:
-        created = app_workflow_function("telegram_agent_create")(
-            str(args.get("name") or ""), token, str(args.get("role_prompt") or ""))
-    except ValueError as exc:
-        raise McpError(-32602, str(exc)) from exc
-    return {"created": True, **created,
+    if not name:
+        raise McpError(-32602, "Нужно имя агента.")
+    from app import app as flask_app
+    import agent_center
+    payload = {"name": name, "role_prompt": str(args.get("role_prompt") or ""),
+               "telegram_bot_token": token, "tier": "ops"}
+    with flask_app.test_request_context("/api/agent-center/agents", method="POST", json=payload):
+        resp = agent_center.agent_center_create_agent()
+    body, code = (resp if isinstance(resp, tuple) else (resp, 200))
+    data = body.get_json() or {}
+    if code != 200 or not data.get("ok"):
+        raise McpError(-32602, str(data.get("error") or "не удалось создать агента"))
+    return {"created": True, "slug": data.get("slug"), "warnings": data.get("warnings") or [],
             "note": ("Агент заработает в течение минуты — служба подхватывает новых сама. "
-                     "Кому разрешено писать, настраивается через set_telegram_access.")}
+                     "У него свой набор MCP-инструментов, инструкции и знания — как у "
+                     "субагента Битрикса; настраиваются в кабинете. Кому можно ему писать — "
+                     "set_telegram_access.")}
 
 
 def tool_set_telegram_access(args: dict[str, Any]) -> dict[str, Any]:
