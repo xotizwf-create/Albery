@@ -151,6 +151,40 @@ def journal(bot: str, dialog_id, direction: str, text: str, *, kind: str = "bot_
         log.warning("журнал Telegram недоступен", exc_info=True)
 
 
+def chat_history(bot: str, dialog_id, current_text: str = "", limit: int = 12) -> str:
+    """Последние сообщения этого диалога — чтобы агент помнил, о чём уже говорили.
+
+    Без истории каждый ход был чистым листом: клиент здоровался, агент отвечал «Здравствуйте!»,
+    клиент спрашивал по делу — и агент здоровался ВТОРОЙ раз, будто видит человека впервые
+    (жалоба владельца 22.07.2026, переписка с @AlberyAIManager 23:06-23:08).
+
+    Служебные записи об эскалации в историю не идут: клиенту они не отправлялись, и агент
+    не должен считать, что уже что-то ответил."""
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT direction, text FROM telegram_bot_messages"
+                    " WHERE bot = %s AND dialog_id = %s AND status = 'ok'"
+                    "   AND COALESCE(meta->>'escalated', '') <> 'true'"
+                    " ORDER BY id DESC LIMIT %s",
+                    (bot, str(dialog_id), limit),
+                )
+                rows = list(cur.fetchall())[::-1]
+    except Exception:  # noqa: BLE001 — без истории агент ответит хуже, но ответит
+        log.warning("история диалога %s недоступна", dialog_id, exc_info=True)
+        return ""
+    # Текущее сообщение уже могло попасть в журнал — в промпте оно идёт отдельно, дублировать
+    # его в истории значит показать агенту, будто клиент написал это дважды.
+    while rows and rows[-1]["direction"] == "in" and (rows[-1]["text"] or "").strip() == (current_text or "").strip():
+        rows.pop()
+    if not rows:
+        return ""
+    lines = [f"{'Клиент' if r['direction'] == 'in' else 'Ты'}: {(r['text'] or '').strip()[:400]}"
+             for r in rows if (r["text"] or "").strip()]
+    return "\n".join(lines)
+
+
 def access_usernames(bot: str) -> set[str]:
     """Кому разрешено писать этому агенту. Пустое множество = список не задан/БД недоступна."""
     now = time.time()
@@ -342,6 +376,8 @@ def channel_role_prompt(channel: str) -> str:
 _INSTR_CACHE: dict[str, object] = {"at": 0.0, "text": ""}
 _INSTR_CAP = int(os.getenv("TG_AGENT_INSTR_CAP", "12000") or "12000")
 _INSTR_DOC_CAP = int(os.getenv("TG_AGENT_INSTR_DOC_CAP", "6000") or "6000")
+# Разделы инструкций в порядке важности для разговора с клиентом; остальные идут после.
+_INSTR_PRIORITY = {"Работа с клиентами": 0, "Формат ответа": 1}
 
 
 def channel_instructions(channel: str) -> str:
@@ -360,10 +396,10 @@ def channel_instructions(channel: str) -> str:
         if not connected:
             return ""
         items = [i for i in (load_instructions() or []) if i["path"] in connected]
-        # Правила оформления идут ПЕРВЫМИ и целиком: к агенту подключены и объёмные
-        # инструкции по работе в системе (десятки килобайт), и без явного порядка они
-        # съедали бы лимит, а оформление обрезалось бы на середине.
-        items.sort(key=lambda i: (not i["path"].startswith("Формат ответа"), i["path"]))
+        # То, что определяет РАЗГОВОР с клиентом, идёт первым и целиком: к агенту подключены
+        # и объёмные инструкции по работе в системе (десятки килобайт), и без явного порядка
+        # они съедали бы лимит, а правила общения обрезались бы на середине.
+        items.sort(key=lambda i: (_INSTR_PRIORITY.get(i["path"].split(" / ")[0], 9), i["path"]))
         picked = [f"# {i['name']}\n{i['content'].strip()}"[:_INSTR_DOC_CAP] for i in items]
     except Exception:  # noqa: BLE001 — без оформления агент ответит хуже, но ответит
         log.warning("инструкции агента %s не загрузились", channel, exc_info=True)
@@ -371,6 +407,13 @@ def channel_instructions(channel: str) -> str:
     text = "\n\n".join(picked)[:_INSTR_CAP]
     _INSTR_CACHE.update({"at": now, "text": text})
     return text
+
+
+def _with_history(prompt: str, dialog_id, current_text: str) -> str:
+    history = chat_history(MANAGER_CHANNEL, dialog_id, current_text)
+    if not history:
+        return prompt
+    return f"{prompt}\n\nО чём вы уже говорили в этом чате:\n{history}"
 
 
 def _with_instructions(prompt: str, channel: str) -> str:
@@ -1140,8 +1183,11 @@ def reply_to_stranger(author: dict, text: str) -> bool:
     role = channel_role_prompt(MANAGER_CHANNEL)
     uname = author.get("username") or "без username"
     base = (f"{role}\n\nСобеседник: {name or 'клиент'} (@{uname})\n"
-            f"Его сообщение:\n{text}") if role else STRANGER_PROMPT.format(
+            f"\nЕго сообщение:\n{text}") if role else STRANGER_PROMPT.format(
                 name=name or "клиент", text=text)
+    # История добавляется к ЛЮБОМУ промпту, в том числе к запасному: помнить разговор агент
+    # обязан и тогда, когда карточка недоступна.
+    base = _with_history(base, author_id, text)
     try:
         answer = hermes_answer(_with_instructions(base, MANAGER_CHANNEL), f"tg-new-{author_id}",
                                toolsets=channel_toolsets(MANAGER_CHANNEL))
@@ -1237,7 +1283,7 @@ def maybe_autoreply(msg: dict) -> None:
         f"{role}\n\n"
         f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
         f"Собеседник: {name or 'клиент'} (@{username or 'без username'})\n"
-        f"Его сообщение:\n{text}"
+        f"\nЕго сообщение:\n{text}"
     ) if role else (
         "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
         "Пишет ЛИД по партнёрской программе Wildberries — он оставил заявку на индивидуальные "
@@ -1251,7 +1297,8 @@ def maybe_autoreply(msg: dict) -> None:
         f"Его сообщение:\n{text}"
     )
     try:
-        answer = hermes_answer(_with_instructions(prompt, MANAGER_CHANNEL), f"tg-biz-{author_id}",
+        answer = hermes_answer(_with_instructions(_with_history(prompt, author_id, text),
+                                                  MANAGER_CHANNEL), f"tg-biz-{author_id}",
                                toolsets=channel_toolsets(MANAGER_CHANNEL))
     except Exception as exc:  # noqa: BLE001
         log.warning("мозг не ответил лиду %s: %s", author_id, str(exc)[:200])

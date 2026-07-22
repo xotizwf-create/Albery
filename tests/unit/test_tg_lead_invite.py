@@ -258,10 +258,11 @@ def test_formatting_rules_are_delivered_to_the_agent(tg, sent, monkeypatch):
 
     assert "Оформление сообщений клиенту в Telegram" in seen[0]
     assert "ПУСТАЯ строка" in seen[0], "правило про воздух между блоками должно дойти дословно"
-    # К агенту подключены и объёмные инструкции по работе в системе: оформление обязано
-    # стоять раньше них, иначе лимит промпта обрежет именно его.
+    assert "Анкета — не пропуск в разговор" in seen[0], "правила общения тоже обязаны дойти"
+    # К агенту подключены и объёмные инструкции по работе в системе: разговорные обязаны
+    # стоять раньше них, иначе лимит промпта обрежет именно их.
     block = seen[0].split("ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА ОФОРМЛЕНИЯ", 1)[-1]
-    assert block.lstrip().startswith("— подключены владельцем, следуй им буквально:\n# Оформление")
+    assert block.lstrip().startswith("— подключены владельцем, следуй им буквально:\n# Общение в переписке")
 
 
 def test_bitrix_report_format_is_not_pushed_into_the_chat(tg, sent, monkeypatch):
@@ -273,6 +274,37 @@ def test_bitrix_report_format_is_not_pushed_into_the_chat(tg, sent, monkeypatch)
     tg.maybe_autoreply(_msg(text="Здравствуйте"))
 
     assert "Стандартный формат ответа" not in seen[0]
+
+
+def _journal_rows(tg, monkeypatch, rows):
+    """Подменяем чтение журнала переписки — историю агент берёт оттуда."""
+    monkeypatch.setattr(tg, "chat_history",
+                        lambda bot, dialog_id, current_text="", limit=12:
+                        "\n".join(f"{'Клиент' if d == 'in' else 'Ты'}: {t}" for d, t in rows))
+
+
+def test_agent_sees_what_was_already_said(tg, sent, monkeypatch):
+    """Жалоба владельца 22.07.2026: агент поздоровался ВТОРОЙ раз, будто видит человека впервые.
+
+    Причина — каждый ход был чистым листом: в промпт уходило только последнее сообщение."""
+    seen = _brain(tg, monkeypatch)
+    _journal_rows(tg, monkeypatch, [("in", "Здравствуйте!"),
+                                    ("out", "Здравствуйте! Какой у вас вопрос?")])
+
+    tg.maybe_autoreply(_msg(text="Расскажите про Вашу систему ИУ, хочу подключить"))
+
+    assert "О чём вы уже говорили в этом чате:" in seen[0]
+    assert "Ты: Здравствуйте! Какой у вас вопрос?" in seen[0], "агент должен видеть, что уже здоровался"
+
+
+def test_current_message_is_not_shown_twice(tg, sent, monkeypatch):
+    """Входящее уже попало в журнал: в истории оно выглядело бы как повтор клиента."""
+    seen = _brain(tg, monkeypatch)
+    monkeypatch.setattr(tg, "_db", lambda: (_ for _ in ()).throw(RuntimeError("нет БД")))
+
+    tg.maybe_autoreply(_msg(text="привет"))
+
+    assert "О чём вы уже говорили" not in seen[0], "пустая история не должна попадать в промпт"
 
 
 def test_lead_is_answered_as_a_lead_not_as_a_stranger(tg, sent, monkeypatch):
