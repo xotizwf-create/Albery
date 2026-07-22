@@ -158,7 +158,8 @@ def _tg_api(method: str, **params) -> dict[str, Any]:
 def _tg_identities() -> dict[str, dict[str, str]]:
     """Имя и @username каждого Telegram-канала — как их видит сам Telegram."""
     now = time.time()
-    if _TG_IDENTITY_CACHE["data"] and now - float(_TG_IDENTITY_CACHE["at"]) < 600:
+    # Короткий кэш: владелец меняет имя бота в BotFather и ждёт этого в кабинете сразу.
+    if _TG_IDENTITY_CACHE["data"] and now - float(_TG_IDENTITY_CACHE["at"]) < 30:
         return dict(_TG_IDENTITY_CACHE["data"])
     out: dict[str, dict[str, str]] = {}
     me = _tg_api("getMe")
@@ -336,11 +337,17 @@ def ensure_builtin_telegram_agents() -> None:
         try:
             with pg_connect() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT mcp_token FROM agents WHERE slug = %s", (slug,))
+                    cur.execute("SELECT mcp_token, bitrix_bot_id FROM agents WHERE slug = %s", (slug,))
                     row = cur.fetchone()
                     if row:
+                        # Имя и @username подтягиваются из Telegram при каждой сверке: владелец
+                        # переименовал бота в BotFather — кабинет обязан показать это сразу.
+                        # bitrix_bot_id у телеграмного канала обнуляется: он попадал сюда по
+                        # ошибке (кнопка «зарегистрировать бота» заводила Bitrix-бота ТГ-агенту).
+                        if row.get("bitrix_bot_id"):
+                            _unregister_agent_bot(row["bitrix_bot_id"])
                         cur.execute("UPDATE agents SET name = %s, telegram_username = %s,"
-                                    " updated_at = now() WHERE slug = %s",
+                                    " bitrix_bot_id = NULL, updated_at = now() WHERE slug = %s",
                                     (name, username, slug))
                         token = row["mcp_token"]
                     else:
@@ -353,7 +360,45 @@ def ensure_builtin_telegram_agents() -> None:
             _hermes_connector_add(slug, token)
         except Exception:  # noqa: BLE001
             logging.exception("ensure_builtin_telegram_agents: %s", slug)
+    _sync_own_bot_identities()
     _agent_cache_bust()
+
+
+def _sync_own_bot_identities() -> None:
+    """Подтянуть имя и @username агентов с собственным ботом прямо из Telegram.
+
+    Владелец переименовывает бота в BotFather — кабинет должен показать это сразу, а не хранить
+    имя, введённое при создании."""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT slug, name, telegram_username, telegram_bot_token FROM agents"
+                            " WHERE telegram_bot_token IS NOT NULL AND is_active")
+                rows = [dict(r) for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        logging.exception("telegram identity sync: load failed")
+        return
+    if not rows:
+        return
+    import tg_multi
+    for r in rows:
+        try:
+            who = tg_multi.describe(r["telegram_bot_token"])
+        except Exception:  # noqa: BLE001
+            continue        # бот недоступен — оставляем то, что знали
+        name = (who.get("name") or "").strip()
+        username = (who.get("username") or "").strip()
+        if not username or (name == r["name"] and username == r["telegram_username"]):
+            continue
+        try:
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE agents SET name = %s, telegram_username = %s,"
+                                " updated_at = now() WHERE slug = %s",
+                                (name or r["name"], username, r["slug"]))
+            logging.info("telegram identity synced: %s -> %s @%s", r["slug"], name, username)
+        except Exception:  # noqa: BLE001
+            logging.exception("telegram identity sync: update failed for %s", r["slug"])
 
 
 def telegram_agents_list() -> list[dict[str, Any]]:
@@ -806,7 +851,7 @@ _BUILTIN_TG_AT = {"at": 0.0}
 def agent_center_agents():
     # Встроенные Telegram-каналы должны существовать как агенты, иначе у них нет редактора
     # возможностей. Проверяем изредка: запрос к Telegram + пара строк в БД.
-    if time.time() - float(_BUILTIN_TG_AT["at"]) > 600:
+    if time.time() - float(_BUILTIN_TG_AT["at"]) > 30:
         _BUILTIN_TG_AT["at"] = time.time()
         try:
             ensure_builtin_telegram_agents()
@@ -1971,6 +2016,9 @@ def agent_center_agent_detail(slug: str):
         "is_main": slug == MAIN_AGENT_SLUG,
         "is_active": agent["is_active"],
         "bitrix_bot_id": display_bot_id if slug == MAIN_AGENT_SLUG else agent["bitrix_bot_id"],
+        # Телеграмный мост: по нему интерфейс понимает, что это Telegram-агент, и не предлагает
+        # ему битриксовые действия.
+        "telegram_username": agent.get("telegram_username") or "",
         "members": [
             {"id": uid, "name": names.get(uid, {}).get("name") or f"#{uid}"}
             for uid in member_ids

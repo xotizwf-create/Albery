@@ -706,7 +706,14 @@ const AgentEditor: React.FC<{
               >
                 {detail.is_active ? "включён" : "выключен"}
               </button>
-              {detail.bitrix_bot_id ? (
+              {/* У телеграмного агента мост — Telegram. Показывать ему битриксовый бейдж и
+                  предлагать «зарегистрировать бота» неверно: нажатие заводило Bitrix-бота
+                  телеграмному агенту (владелец поймал «Bitrix-BOT 90» на ТГ-агенте). */}
+              {isTelegram ? (
+                <span className="px-2 py-0.5 border text-[10px] font-bold rounded-md uppercase tracking-wider bg-sky-50 border-sky-100 text-sky-600">
+                  telegram {detail.telegram_username ? "@" + detail.telegram_username : "бот"}
+                </span>
+              ) : detail.bitrix_bot_id ? (
                 <span className="px-2 py-0.5 border text-[10px] font-bold rounded-md uppercase tracking-wider bg-indigo-50 border-indigo-100 text-indigo-600">
                   bitrix-бот #{detail.bitrix_bot_id}
                 </span>

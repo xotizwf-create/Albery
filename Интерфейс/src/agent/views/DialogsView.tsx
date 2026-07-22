@@ -195,9 +195,31 @@ export function DialogsView() {
           if (!cancelled) setChatsLoading(false);
         });
     }, query ? 400 : 0);
+    // Живая лента: список переписок сам подтягивает новые вопросы и ответы, иначе владелец
+    // видит разговор только после ручного обновления страницы. Тихо — без индикатора загрузки.
+    const poll = window.setInterval(() => {
+      fetchAgentDialogs({
+        channel,
+        q: query,
+        agent: activeAgentId,
+        kind: channel === "Bitrix" ? scope : tgScope === "all" ? undefined : tgScope,
+      })
+        .then(({ chats: loaded, note }) => {
+          if (cancelled) return;
+          setChats((prev) => {
+            const same =
+              prev.length === loaded.length &&
+              prev.every((c, i) => c.id === loaded[i].id && c.lastMessage === loaded[i].lastMessage);
+            return same ? prev : loaded;
+          });
+          setChannelNote(note || "");
+        })
+        .catch(() => {});
+    }, 7000);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
+      window.clearInterval(poll);
     };
   }, [channel, query, activeAgentId, scope, tgScope]);
 
