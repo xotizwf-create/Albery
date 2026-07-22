@@ -285,6 +285,24 @@ _HERMES_ERROR_RE = re.compile(
     r"^(API call failed|Ошибка LLM|Error:|Traceback \(most recent call last\))", re.IGNORECASE)
 
 
+def channel_toolsets(channel: str) -> str | None:
+    """Личный коннектор канала agent-<slug>, если он настроен в кабинете.
+
+    Через него применяются набор MCP-инструментов, инструкции и знания, выбранные владельцем
+    для этого агента, — то же самое, что у субагентов Битрикса. Пока агента нет (или он
+    выключен), работает прежний общий набор из .env, чтобы бот не остался без инструментов."""
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM agents WHERE slug = %s AND is_active", (channel,))
+                if not cur.fetchone():
+                    return None
+    except Exception:  # noqa: BLE001
+        return None
+    extra = os.getenv("TG_AGENT_EXTRA_TOOLSETS", "web").strip().strip(",")
+    return f"agent-{channel},{extra}" if extra else f"agent-{channel}"
+
+
 def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
                   timeout_s: int | None = None) -> str:
     toolsets = toolsets or os.getenv("TG_AGENT_TOOLSETS", "albery,web")
@@ -325,7 +343,9 @@ def owner_turn(chat_id, user_text: str) -> str:
         convo = "\n".join(f"Владелец: {q}\nАссистент: {a}" for q, a in hist)
         parts.append("История диалога (помни её):\n" + convo)
     parts.append("Сообщение владельца:\n" + user_text)
-    answer = hermes_answer("\n\n".join(parts), f"tg-{chat_id}")
+    # Инструменты, инструкции и знания — из карточки этого агента в кабинете.
+    answer = hermes_answer("\n\n".join(parts), f"tg-{chat_id}",
+                           toolsets=channel_toolsets(BOT_CHANNEL))
     _remember(chat_id, user_text, answer)
     return answer
 
@@ -978,7 +998,8 @@ def reply_to_stranger(author: dict, text: str) -> bool:
     name = (author.get("first_name") or "").strip()
     try:
         answer = hermes_answer(STRANGER_PROMPT.format(name=name or "клиент", text=text),
-                               f"tg-new-{author_id}")
+                               f"tg-new-{author_id}",
+                               toolsets=channel_toolsets(MANAGER_CHANNEL))
     except Exception as exc:  # noqa: BLE001
         log.warning("мозг не ответил незнакомцу %s: %s", author_id, str(exc)[:200])
         return False
@@ -1069,7 +1090,8 @@ def maybe_autoreply(msg: dict) -> None:
         f"Его сообщение:\n{text}"
     )
     try:
-        answer = hermes_answer(prompt, f"tg-biz-{author_id}")
+        answer = hermes_answer(prompt, f"tg-biz-{author_id}",
+                               toolsets=channel_toolsets(MANAGER_CHANNEL))
     except Exception as exc:  # noqa: BLE001
         log.warning("мозг не ответил лиду %s: %s", author_id, str(exc)[:200])
         journal(MANAGER_CHANNEL, author_id, "out", f"мозг не ответил: {str(exc)[:200]}",

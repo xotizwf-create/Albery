@@ -315,6 +315,47 @@ def _telegram_dialog_messages(dialog_id: str, agent: str):
     return jsonify({"turns": turns})
 
 
+def ensure_builtin_telegram_agents() -> None:
+    """Завести два встроенных Telegram-канала как обычных агентов.
+
+    Без записи в `agents` у них нет ни редактора возможностей, ни коннектора agent-<slug> —
+    то есть нельзя подключить инструменты, инструкции и знания. Владелец потребовал, чтобы
+    раздел Telegram работал 1 в 1 как Битрикс, поэтому каналы становятся полноценными
+    агентами. Токен им не прописывается: они работают на общем токене службы, и второй
+    getUpdates на тот же токен запускать нельзя."""
+    import secrets
+    live = _tg_identities()
+    seeds = [
+        (TG_BOT_CHANNEL, "личные сообщения боту"),
+        (TG_MANAGER_CHANNEL, "аккаунт компании • лиды"),
+    ]
+    for slug, position in seeds:
+        ident = live.get(slug) or {}
+        name = ident.get("name") or TG_CHANNELS[slug]["name"]
+        username = (ident.get("handle") or "").lstrip("@") or None
+        try:
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT mcp_token FROM agents WHERE slug = %s", (slug,))
+                    row = cur.fetchone()
+                    if row:
+                        cur.execute("UPDATE agents SET name = %s, telegram_username = %s,"
+                                    " updated_at = now() WHERE slug = %s",
+                                    (name, username, slug))
+                        token = row["mcp_token"]
+                    else:
+                        token = secrets.token_urlsafe(32)
+                        cur.execute(
+                            "INSERT INTO agents (slug, name, role_prompt, position, tier,"
+                            " mcp_token, color, telegram_username) VALUES"
+                            " (%s, %s, '', %s, 'ops', %s, 'AQUA', %s)",
+                            (slug, name, position, token, username))
+            _hermes_connector_add(slug, token)
+        except Exception:  # noqa: BLE001
+            logging.exception("ensure_builtin_telegram_agents: %s", slug)
+    _agent_cache_bust()
+
+
 def telegram_agents_list() -> list[dict[str, Any]]:
     """Агенты с телеграмным мостом. Токен наружу не отдаётся никогда — только признак.
 
@@ -758,8 +799,19 @@ def agent_center_dialog_messages():
     return jsonify({"dialog_id": dialog_id, "turns": turns})
 
 
+_BUILTIN_TG_AT = {"at": 0.0}
+
+
 @app.get("/api/agent-center/agents")
 def agent_center_agents():
+    # Встроенные Telegram-каналы должны существовать как агенты, иначе у них нет редактора
+    # возможностей. Проверяем изредка: запрос к Telegram + пара строк в БД.
+    if time.time() - float(_BUILTIN_TG_AT["at"]) > 600:
+        _BUILTIN_TG_AT["at"] = time.time()
+        try:
+            ensure_builtin_telegram_agents()
+        except Exception:  # noqa: BLE001
+            logging.exception("agents: builtin telegram seed failed")
     day_start = msk_now().replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = day_start - timedelta(days=7)
     st: dict[str, Any] = {}
@@ -855,7 +907,6 @@ def agent_center_agents():
             })
     except Exception:  # noqa: BLE001
         logging.exception("agent_center: subagents list failed")
-    agents.extend(_telegram_agent_cards())
     return jsonify({"agents": agents})
 
 
@@ -1447,7 +1498,10 @@ def _load_agents_full() -> list[dict[str, Any]]:
             cur.execute(
                 "SELECT id::text AS id, slug, name, role_prompt, position, tier, tools, tools_customized,"
                 " bitrix_bot_id, telegram_username, telegram_bot_user_id,"
-                " telegram_bot_token IS NOT NULL AS has_telegram,"
+                # Канал = телеграмный, если у агента есть @username бота. Токен есть только у
+                # агентов с собственным ботом; два встроенных канала работают на общем токене
+                # службы, и второй getUpdates на него запускать нельзя.
+                " telegram_username IS NOT NULL AS has_telegram,"
                 " mcp_token, is_active, color, created_at FROM agents ORDER BY created_at"
             )
             agents = [dict(r) for r in cur.fetchall()]
@@ -1730,7 +1784,19 @@ def agent_center_create_agent():
     # Канал агента задаётся мостом: есть токен бота — агент живёт в Telegram, нет — в Битриксе.
     # Токен проверяем ДО создания записи: битый токен не должен оставлять мёртвого агента.
     tg_token = str(body.get("telegram_bot_token") or "").strip()
+    tg_username = str(body.get("telegram_username") or "").strip().lstrip("@")
     tg_who: dict[str, Any] = {}
+    if tg_username and not tg_token:
+        # Бота регистрирует сам агент: аккаунт компании ведёт диалог /newbot с @BotFather —
+        # владельцу не нужно вручную создавать бота и переносить токен.
+        import tg_multi
+        try:
+            made = tg_multi.create_bot_via_botfather(str(body.get("name") or "").strip(),
+                                                     tg_username)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("botfather create failed")
+            return jsonify({"error": str(exc)[:400]}), 400
+        tg_token = made["token"]
     if tg_token:
         import tg_multi
         try:

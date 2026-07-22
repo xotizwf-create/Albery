@@ -10,10 +10,13 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import threading
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -63,6 +66,83 @@ def describe(token: str) -> dict:
     return {"name": str(me.get("first_name") or "").strip(),
             "username": str(me.get("username") or "").strip(),
             "bot_user_id": me.get("id")}
+
+
+# --- создание бота через @BotFather -------------------------------------------------------------
+# Проверено 22.07.2026: аккаунт компании может писать BotFather от лица бизнес-подключения, И ЕГО
+# ОТВЕТЫ ПРИХОДЯТ обратно в бизнес-журнал. Значит диалог /newbot агент проводит сам, и владельцу
+# не нужно вручную регистрировать бота и переносить токен.
+
+BOTFATHER_ID = 93372553
+_TOKEN_RE = re.compile(r"\b(\d{6,}:[A-Za-z0-9_-]{30,})\b")
+
+
+def _botfather_say(text: str) -> None:
+    ok, err = core.send_as_account(BOTFATHER_ID, text)
+    if not ok:
+        raise RuntimeError(f"BotFather недоступен: {err}")
+
+
+def _journal_size() -> int:
+    """Сколько строк в бизнес-журнале сейчас. Отметка «до отправки» для поиска ответа."""
+    try:
+        return len(core.BUSINESS_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return 0
+
+
+def _botfather_wait(from_line: int, timeout_s: int = 25) -> str:
+    """Дождаться ответа BotFather, появившегося ПОСЛЕ строки from_line.
+
+    Ориентируемся на позицию в файле, а не на время: журнал пишет другой процесс (служба
+    albery-tg), и сравнение его меток времени с нашими даёт осечки — при быстром ответе метки
+    совпадают до микросекунды, и ответ терялся."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            lines = core.BUSINESS_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        for raw in lines[from_line:]:
+            try:
+                rec = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            if str(rec.get("from_id")) == str(BOTFATHER_ID):
+                return str(rec.get("text") or "")
+        time.sleep(1.5)
+    return ""
+
+
+def create_bot_via_botfather(display_name: str, username: str) -> dict:
+    """Провести диалог /newbot и вернуть токен нового бота.
+
+    Каждый шаг ждёт ответа BotFather: он может отказать (имя занято, неверный формат), и тогда
+    его текст возвращается владельцу как есть — гадать, что не так, не нужно."""
+    username = username.strip().lstrip("@")
+    if not username.lower().endswith("bot"):
+        raise ValueError("Telegram требует, чтобы имя бота заканчивалось на «bot».")
+    # Ответы BotFather не проверяем по конкретным словам: это чужой сервис, формулировки там
+    # меняются. Достаточно, что он ответил и не отказал — отказ он говорит прямо.
+    def _step(send_text: str, timeout_s: int = 25) -> str:
+        mark = _journal_size()
+        _botfather_say(send_text)
+        got = _botfather_wait(mark, timeout_s=timeout_s)
+        if not got.strip():
+            raise RuntimeError("BotFather молчит — попробуйте позже.")
+        if re.search(r"\b(sorry|invalid|error)\b", got, re.IGNORECASE):
+            raise RuntimeError(f"BotFather отказал: {got[:250]}")
+        return got
+
+    _step("/newbot")
+    _step(display_name)
+
+    # Занятый username — самый частый отказ; _step вернёт слова BotFather как есть.
+    reply = _step(username, timeout_s=30)
+    found = _TOKEN_RE.search(reply)
+    if not found:
+        raise RuntimeError(f"BotFather не выдал токен: {reply[:250]}")
+    return {"token": found.group(1), "username": username, "name": display_name}
 
 
 def _answer(agent: dict, chat_id, sender: dict, text: str) -> None:

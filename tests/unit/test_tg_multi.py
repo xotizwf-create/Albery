@@ -153,3 +153,79 @@ def test_database_outage_leaves_no_agents_instead_of_crashing(multi, monkeypatch
     monkeypatch.setattr(tg_agent, "_db", broken_db)
 
     assert multi.load_agents() == []
+
+
+# --- регистрация бота через @BotFather ---------------------------------------------------
+# Проверено на живом Telegram 22.07.2026: аккаунт компании пишет BotFather от бизнес-подключения,
+# и его ответы возвращаются в бизнес-журнал. Поэтому агент проводит диалог /newbot сам.
+
+@pytest.fixture
+def botfather(multi, monkeypatch, tmp_path):
+    """Поддельный BotFather: пишет ответы в тот же журнал, который читает агент."""
+    import tg_agent
+    log_path = tmp_path / "business.jsonl"
+    log_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(tg_agent, "BUSINESS_LOG_PATH", log_path)
+    monkeypatch.setattr(multi.core, "BUSINESS_LOG_PATH", log_path, raising=False)
+    said = []
+    replies = {}
+
+    def fake_send(uid, text, parse_mode=""):
+        said.append(text)
+        reply = replies.get(len(said))
+        if reply is not None:
+            import json as _json
+            from datetime import datetime as _dt, timezone as _tz
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(_json.dumps({"at": _dt.now(_tz.utc).isoformat(),
+                                      "from_id": multi.BOTFATHER_ID, "chat_id": multi.BOTFATHER_ID,
+                                      "text": reply}, ensure_ascii=False) + "\n")
+        return (True, "")
+
+    monkeypatch.setattr(multi.core, "send_as_account", fake_send)
+    monkeypatch.setattr(multi.time, "sleep", lambda s: None)
+    return {"said": said, "replies": replies}
+
+
+def test_bot_is_registered_through_botfather(multi, botfather):
+    botfather["replies"].update({
+        1: "Alright, a new bot. How are we going to call it? Please choose a name for your bot.",
+        2: "Good. Now let's choose a username for your bot. It must end in `bot`.",
+        3: ("Done! Congratulations on your new bot.\n\nUse this token to access the HTTP API:\n"
+            "8123456789:AAFakeTokenForTestsOnly-000111222333\n\nKeep your token secure."),
+    })
+
+    made = multi.create_bot_via_botfather("Агент продаж", "albery_sales_bot")
+
+    assert made["token"] == "8123456789:AAFakeTokenForTestsOnly-000111222333"
+    assert botfather["said"][0] == "/newbot"
+    assert botfather["said"][1] == "Агент продаж"
+    assert botfather["said"][2] == "albery_sales_bot"
+
+
+def test_taken_username_returns_botfathers_own_words(multi, botfather):
+    """Гадать за BotFather нельзя: его текст точнее объясняет, что не так."""
+    botfather["replies"].update({
+        1: "Alright, a new bot. How are we going to call it?",
+        2: "Good. Now let's choose a username for your bot.",
+        3: "Sorry, this username is already taken. Please try something different.",
+    })
+
+    with pytest.raises(RuntimeError, match="already taken"):
+        multi.create_bot_via_botfather("Агент продаж", "albery_sales_bot")
+
+
+def test_username_must_end_with_bot(multi, botfather):
+    """Telegram откажет всё равно — отсекаем до диалога, чтобы не мусорить в чате BotFather."""
+    with pytest.raises(ValueError, match="bot"):
+        multi.create_bot_via_botfather("Агент", "albery_sales")
+
+    assert botfather["said"] == []
+
+
+def test_silent_botfather_does_not_hang_forever(multi, botfather, monkeypatch):
+    """Молчание BotFather должно давать понятную ошибку, а не вечное ожидание."""
+    monkeypatch.setattr(multi, "_botfather_wait", lambda from_line, timeout_s=25: "")
+
+    with pytest.raises(RuntimeError, match="молчит"):
+        multi.create_bot_via_botfather("Агент", "albery_x_bot")

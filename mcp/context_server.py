@@ -7425,15 +7425,17 @@ def tool_list_telegram_agents(args: dict[str, Any]) -> dict[str, Any]:
 def tool_create_telegram_agent(args: dict[str, Any]) -> dict[str, Any]:
     """Завести нового Telegram-агента: тот же субагент, только мост — Telegram."""
     token = str(args.get("bot_token") or "").strip()
+    username = str(args.get("telegram_username") or "").strip().lstrip("@")
     name = str(args.get("name") or "").strip()
-    if not token:
-        raise McpError(-32602, "Нужен bot_token от @BotFather.")
     if not name:
         raise McpError(-32602, "Нужно имя агента.")
+    if not token and not username:
+        raise McpError(-32602, "Укажи telegram_username — бот будет создан через @BotFather; "
+                               "либо передай готовый bot_token.")
     from app import app as flask_app
     import agent_center
     payload = {"name": name, "role_prompt": str(args.get("role_prompt") or ""),
-               "telegram_bot_token": token, "tier": "ops"}
+               "telegram_bot_token": token, "telegram_username": username, "tier": "ops"}
     with flask_app.test_request_context("/api/agent-center/agents", method="POST", json=payload):
         resp = agent_center.agent_center_create_agent()
     body, code = (resp if isinstance(resp, tuple) else (resp, 200))
@@ -8682,19 +8684,24 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "create_telegram_agent": {
         "description": (
-            "Завести нового Telegram-агента по токену от @BotFather. Имя и @username берутся "
-            "из самого Telegram, а не со слов создателя. Битый токен отсекается сразу. Агент "
-            "начинает работать в течение минуты, перезапуск не нужен. ВАЖНО: токен — секрет, "
-            "не печатай его в ответе и не сохраняй в переписке."
+            "Завести нового Telegram-агента. Обычный путь: указать telegram_username — бота "
+            "зарегистрирует сам агент, проведя диалог /newbot с @BotFather от аккаунта "
+            "компании; вручную ничего создавать не нужно. Имя бота обязано заканчиваться на "
+            "«bot». Если BotFather откажет (занят username, неверный формат) — его ответ "
+            "вернётся как есть. Готовый bot_token можно передать вместо username. Агент "
+            "получает свой набор MCP-инструментов, инструкции и знания — как субагент "
+            "Битрикса; настраиваются в кабинете. ВАЖНО: токен — секрет, не печатай его."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "bot_token": {"type": "string", "description": "Токен от @BotFather (123456:AA…)."},
-                "name": {"type": "string", "description": "Имя. По умолчанию — имя бота из Telegram."},
+                "name": {"type": "string", "description": "Имя агента (оно же имя бота)."},
+                "telegram_username": {"type": "string",
+                                      "description": "@username будущего бота, оканчивается на «bot»."},
+                "bot_token": {"type": "string", "description": "Готовый токен, если бот уже создан."},
                 "role_prompt": {"type": "string", "description": "Кем агент работает и как отвечает."},
             },
-            "required": ["bot_token"],
+            "required": ["name"],
             "additionalProperties": False,
         },
         "handler": tool_create_telegram_agent,

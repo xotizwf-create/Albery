@@ -461,8 +461,9 @@ export interface TelegramAccessAgent {
 // Telegram-агент создаётся ТЕМ ЖЕ эндпоинтом, что и субагент Битрикса: это один и тот же
 // агент со своим коннектором, инструментами и знаниями — отличается только мост.
 export async function createTelegramAgent(params: {
-  bot_token: string;
   name: string;
+  telegram_username?: string;
+  bot_token?: string;
   role_prompt?: string;
 }): Promise<{ slug: string; warnings: string[] }> {
   const data = await fetchJsonSafe(
@@ -473,11 +474,14 @@ export async function createTelegramAgent(params: {
       body: JSON.stringify({
         name: params.name,
         role_prompt: params.role_prompt || "",
-        telegram_bot_token: params.bot_token,
+        // Обычный путь: даём @username, бота регистрирует сам агент через @BotFather.
+        telegram_username: params.telegram_username || "",
+        telegram_bot_token: params.bot_token || "",
         tier: "ops",
       }),
     },
-    60000,
+    // Диалог с BotFather идёт в три шага с ожиданием ответа — минуты может не хватить.
+    180000,
   );
   return { slug: (data.slug || "") as string, warnings: (data.warnings || []) as string[] };
 }

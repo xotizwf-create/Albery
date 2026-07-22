@@ -65,7 +65,7 @@ def to_human(tg, monkeypatch):
 
 def _brain(tg, monkeypatch, answer="Здравствуйте! Чем могу помочь?"):
     seen = []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: seen.append(p) or answer)
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: seen.append(p) or answer)
     return seen
 
 
@@ -231,7 +231,7 @@ def test_undelivered_reply_does_not_burn_the_invite(tg, monkeypatch):
 
 
 def test_brain_failure_leaves_no_reply_and_no_crash(tg, sent, monkeypatch):
-    def boom(p, s):
+    def boom(p, s, toolsets=None):
         raise RuntimeError("мозг недоступен")
 
     monkeypatch.setattr(tg, "hermes_answer", boom)

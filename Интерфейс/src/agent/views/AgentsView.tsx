@@ -993,7 +993,7 @@ function CreateTelegramAgentModal({
   onClose: () => void;
   onCreated: (slug: string) => void;
 }) {
-  const [token, setToken] = useState("");
+  const [username, setUsername] = useState("");
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1004,12 +1004,16 @@ function CreateTelegramAgentModal({
       setError("Укажите имя агента.");
       return;
     }
+    if (!username.trim().toLowerCase().replace(/^@/, "").endsWith("bot")) {
+      setError("Telegram требует, чтобы @username бота заканчивался на «bot».");
+      return;
+    }
     setBusy(true);
     setError("");
     try {
       const created = await createTelegramAgent({
-        bot_token: token.trim(),
         name: name.trim(),
+        telegram_username: username.trim().replace(/^@/, ""),
         role_prompt: role.trim(),
       });
       onCreated(created.slug);
@@ -1028,17 +1032,20 @@ function CreateTelegramAgentModal({
       >
         <h2 className="font-bold text-gray-900 text-[19px]">Новый Telegram-агент</h2>
         <p className="text-[13px] text-gray-500 mt-1.5">
-          Создайте бота в <span className="font-bold">@BotFather</span> и вставьте его токен.
-          Имя и @username подтянутся из Telegram сами.
+          Бота зарегистрирует сам агент — проведёт диалог с <span className="font-bold">@BotFather</span> от
+          аккаунта компании. Вручную создавать ничего не нужно.
         </p>
 
-        <label className="block mt-5 text-[13px] font-bold text-gray-700">Токен бота</label>
+        <label className="block mt-5 text-[13px] font-bold text-gray-700">@username бота</label>
         <input
-          value={token}
-          onChange={(e) => setToken(e.target.value)}
-          placeholder="123456789:AAE..."
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          placeholder="albery_sales_bot"
           className="mt-1.5 w-full px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400"
         />
+        <p className="mt-1 text-[11.5px] text-gray-400">
+          Должен заканчиваться на «bot» и быть свободным — иначе Telegram откажет.
+        </p>
 
         <label className="block mt-4 text-[13px] font-bold text-gray-700">Имя агента</label>
         <input
@@ -1070,11 +1077,12 @@ function CreateTelegramAgentModal({
             Отмена
           </button>
           <button
-            disabled={busy || !token.trim()}
+            disabled={busy || !username.trim() || !name.trim()}
             onClick={() => void submit()}
             className="px-4 py-2.5 text-[13.5px] font-bold rounded-xl bg-indigo-600 text-white disabled:opacity-40"
           >
-            {busy ? "Проверяю токен…" : "Создать"}
+            {/* Диалог с BotFather идёт в три шага с ожиданием ответа — это не мгновенно. */}
+            {busy ? "Регистрирую бота…" : "Создать"}
           </button>
         </div>
       </div>
@@ -1335,21 +1343,14 @@ export function AgentsView() {
               {accessError && <div className="mt-2 text-[12.5px] text-rose-600">{accessError}</div>}
             </div>
 
-            {/* Встроенные каналы (основной бот и аккаунт компании) — не субагенты: у них нет
-                записи в agents, поэтому и редактора возможностей у них нет. */}
-            {activeAgent.isSystem ? (
-              <div className="bg-white rounded-3xl shadow-sm border border-gray-200/60 p-6 text-[13px] text-gray-500">
-                Это встроенный канал Albery — набор инструментов и инструкции у него общие с
-                основным агентом. Отдельно настраиваются только те, кто может ему писать.
-              </div>
-            ) : (
-              <AgentEditor
-                key={activeAgent.id}
-                slug={activeAgent.id}
-                onChanged={() => void reloadAgents()}
-                onDeleted={() => void reloadAgents(true)}
-              />
-            )}
+            {/* Дальше — тот же редактор, что у агентов Битрикса: роль, инструменты (MCP),
+                инструкции и знания. Мост другой, настройки те же. */}
+            <AgentEditor
+              key={activeAgent.id}
+              slug={activeAgent.id}
+              onChanged={() => void reloadAgents()}
+              onDeleted={() => void reloadAgents(true)}
+            />
           </div>
         ) : activeAgent ? (
           <AgentEditor

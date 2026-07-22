@@ -52,7 +52,7 @@ def _biz(username="griaznov.d", uid=555, text="привет"):
 
 
 def test_lead_conversation_is_journalled_both_ways(tg, rows, monkeypatch):
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: "Здравствуйте! Уточните оборот.")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Уточните оборот.")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
 
     tg.maybe_autoreply(_biz(text="какие условия?"))
@@ -66,7 +66,7 @@ def test_lead_conversation_is_journalled_both_ways(tg, rows, monkeypatch):
 def test_supplier_chat_is_not_journalled_while_agent_stays_silent(tg, rows, monkeypatch):
     """Главная граница приватности: молчит агент — записи нет."""
     monkeypatch.delenv("TG_LEAD_INVITE", raising=False)   # незнакомцам агент не отвечает
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: "ответ")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "ответ")
 
     tg.maybe_autoreply(_biz(username="postavshik", uid=999, text="привезём завтра"))
 
@@ -74,7 +74,7 @@ def test_supplier_chat_is_not_journalled_while_agent_stays_silent(tg, rows, monk
 
 
 def test_stranger_is_journalled_once_the_agent_replies(tg, rows, monkeypatch):
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: "Здравствуйте! Чем помочь?")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Чем помочь?")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
 
     tg.maybe_autoreply(_biz(username="ivan_novy", uid=999, text="хочу подключить"))
@@ -96,7 +96,7 @@ def test_owner_talk_to_the_agent_is_a_separate_stream(tg, rows):
 
 def test_failed_delivery_is_marked_as_error(tg, rows, monkeypatch):
     """В кабинете сбойный ход должен быть видно, а не выглядеть обычным ответом."""
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: "ответ")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "ответ")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (False, "сеть"))
 
     tg.maybe_autoreply(_biz(text="вопрос"))
@@ -106,7 +106,7 @@ def test_failed_delivery_is_marked_as_error(tg, rows, monkeypatch):
 
 def test_brain_failure_is_journalled_too(tg, rows, monkeypatch):
     """Иначе в кабинете будет вопрос клиента без единого следа ответа."""
-    def boom(p, s):
+    def boom(p, s, toolsets=None):
         raise RuntimeError("мозг недоступен")
 
     monkeypatch.setattr(tg, "hermes_answer", boom)

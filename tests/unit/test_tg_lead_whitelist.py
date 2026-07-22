@@ -36,7 +36,7 @@ def _msg(username="griaznov.d", uid=555, text="Здравствуйте, инт�
 def test_lead_from_the_funnel_gets_an_answer(tg, monkeypatch):
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
     sent = {}
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: "Здравствуйте! Уточните оборот, пожалуйста.")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Уточните оборот, пожалуйста.")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (sent.update(uid=uid, text=t), (True, ""))[1])
 
     tg.maybe_autoreply(_msg())
@@ -48,7 +48,7 @@ def test_stranger_never_gets_a_generated_reply(tg, monkeypatch):
     """С не-лидом агент диалог не ведёт: ему полагается только анкета (test_tg_lead_invite)."""
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
     calls = []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
 
     tg.maybe_autoreply(_msg(username="postavshik_ivan", uid=999))
@@ -59,7 +59,7 @@ def test_stranger_never_gets_a_generated_reply(tg, monkeypatch):
 def test_user_without_username_gets_no_generated_reply(tg, monkeypatch):
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
     calls = []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
 
     tg.maybe_autoreply(_msg(username="", uid=1234))
@@ -76,7 +76,7 @@ def test_crm_unavailable_means_total_silence(tg, monkeypatch):
     tg._LEADS_CACHE.update({"at": 0.0, "map": {}, "ok": False})
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {})
     calls, sent = [], []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
     monkeypatch.setattr(tg, "send_as_account",
                         lambda uid, t, parse_mode="": sent.append(t) or (True, ""))
 
@@ -89,7 +89,7 @@ def test_deal_number_is_given_to_the_agent(tg, monkeypatch):
     """Агент должен знать, по какой сделке идёт разговор."""
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
     prompts = []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: prompts.append(p) or "ок")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: prompts.append(p) or "ок")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (True, ""))
 
     tg.maybe_autoreply(_msg())

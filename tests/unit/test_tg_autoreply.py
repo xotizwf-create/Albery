@@ -41,7 +41,7 @@ def _incoming(uid=1451982360, text="Здравствуйте, интересую
 
 def test_lead_gets_an_answer_from_the_company_account(tg, monkeypatch):
     sent = {}
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: "Здравствуйте! Расскажите про ваш оборот.")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Расскажите про ваш оборот.")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (sent.update(uid=uid, text=t), (True, ""))[1])
 
     tg.maybe_autoreply(_incoming())
@@ -53,7 +53,7 @@ def test_lead_gets_an_answer_from_the_company_account(tg, monkeypatch):
 def test_own_outgoing_messages_never_trigger_a_reply(tg, monkeypatch):
     """Самое опасное: иначе агент отвечает сам себе по кругу."""
     calls = []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (True, ""))
 
     tg.maybe_autoreply(_incoming(uid=8715335144))  # id самого владельца аккаунта
@@ -63,7 +63,7 @@ def test_own_outgoing_messages_never_trigger_a_reply(tg, monkeypatch):
 
 def test_bots_are_ignored(tg, monkeypatch):
     calls = []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
 
     msg = _incoming()
     msg["from"]["is_bot"] = True
@@ -74,7 +74,7 @@ def test_bots_are_ignored(tg, monkeypatch):
 
 def test_group_chats_are_ignored(tg, monkeypatch):
     calls = []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
 
     tg.maybe_autoreply(_incoming(chat={"id": -100, "type": "group"}))
 
@@ -83,7 +83,7 @@ def test_group_chats_are_ignored(tg, monkeypatch):
 
 def test_empty_message_is_ignored(tg, monkeypatch):
     calls = []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: calls.append(1) or "ответ")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
 
     tg.maybe_autoreply(_incoming(text="   "))
 
@@ -108,7 +108,7 @@ def test_incoming_still_registers_contact_when_autoreply_off(tg, monkeypatch):
 
 
 def test_brain_failure_does_not_crash_the_pipeline(tg, monkeypatch):
-    def boom(p, s):
+    def boom(p, s, toolsets=None):
         raise RuntimeError("мозг недоступен")
 
     monkeypatch.setattr(tg, "hermes_answer", boom)
@@ -120,7 +120,7 @@ def test_brain_failure_does_not_crash_the_pipeline(tg, monkeypatch):
 def test_answer_is_sent_as_plain_text(tg, monkeypatch):
     """В мессенджере разметка выглядит мусором."""
     sent = {}
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s: "**Жирный** текст")
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "**Жирный** текст")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t: (sent.update(text=t), (True, ""))[1])
 
     tg.maybe_autoreply(_incoming())
