@@ -669,6 +669,39 @@ def _squash(value: str) -> str:
     return re.sub(r"[._-]", "", value or "")
 
 
+def mcp_call(tool: str, arguments: dict) -> dict:
+    """Вызвать инструмент Albery через локальный MCP приложения.
+
+    Вебхук Bitrix не имеет прав на CRM (insufficient_scope), а MCP работает по OAuth приложения —
+    тем же путём, что и все остальные инструменты системы. Импортировать app/b24bot в этот
+    процесс нельзя: их импорт запускает живые планировщики."""
+    secret = (os.getenv("MCP_SHARED_SECRET") or "").strip()
+    if not secret:
+        raise RuntimeError("MCP_SHARED_SECRET не задан")
+    url = os.getenv("ALBERY_MCP_URL", "http://127.0.0.1:5002/mcp").strip()
+    resp = requests.post(url, json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    }, headers={"Authorization": "Bearer " + secret,
+                "Accept": "application/json, text/event-stream"}, timeout=45)
+    raw = resp.text or ""
+    if "data:" in raw[:200]:      # ответ может прийти потоком SSE
+        raw = "\n".join(l[5:].strip() for l in raw.splitlines() if l.startswith("data:"))
+    payload = json.loads(raw) if raw.strip() else {}
+    if payload.get("error"):
+        raise RuntimeError(str(payload["error"])[:300])
+    result = payload.get("result") or {}
+    content = result.get("structuredContent") or result
+    if isinstance(content.get("content"), list):      # текстовая обёртка MCP
+        for part in content["content"]:
+            if part.get("type") == "text":
+                try:
+                    return json.loads(part.get("text") or "{}")
+                except Exception:  # noqa: BLE001
+                    pass
+    return content
+
+
 def crm_lead_usernames(force: bool = False) -> dict[str, int]:
     """{username: deal_id} по сделкам воронки лидов. Пустой словарь при недоступности CRM.
 
@@ -680,33 +713,9 @@ def crm_lead_usernames(force: bool = False) -> dict[str, int]:
     # Идём через локальный MCP приложения: вебхук Bitrix не имеет прав на CRM
     # (insufficient_scope), а MCP работает по OAuth приложения — тем же путём, что и все
     # остальные CRM-инструменты.
-    secret = (os.getenv("MCP_SHARED_SECRET") or "").strip()
-    if not secret:
-        log.warning("MCP_SHARED_SECRET не задан — белый список лидов недоступен")
-        _LEADS_CACHE["ok"] = False
-        return dict(_LEADS_CACHE["map"])
-    url = os.getenv("ALBERY_MCP_URL", "http://127.0.0.1:5002/mcp").strip()
     out: dict[str, int] = {}
     try:
-        resp = requests.post(url, json={
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "list_crm_lead_contacts", "arguments": {}},
-        }, headers={"Authorization": "Bearer " + secret,
-                    "Accept": "application/json, text/event-stream"}, timeout=45)
-        raw = resp.text or ""
-        if "data:" in raw[:200]:      # ответ может прийти потоком SSE
-            raw = "\n".join(l[5:].strip() for l in raw.splitlines() if l.startswith("data:"))
-        payload = json.loads(raw) if raw.strip() else {}
-        result = payload.get("result") or {}
-        content = result.get("structuredContent") or result
-        if isinstance(content.get("content"), list):    # текстовая обёртка MCP
-            for part in content["content"]:
-                if part.get("type") == "text":
-                    try:
-                        content = json.loads(part.get("text") or "{}")
-                        break
-                    except Exception:  # noqa: BLE001
-                        pass
+        content = mcp_call("list_crm_lead_contacts", {})
         for row in (content.get("contacts") or []):
             uname = _norm_username(row.get("username") or "")
             if uname:
@@ -747,8 +756,10 @@ def lead_deal_for_username(username: str) -> int | None:
 # Партнёрская программа WB»), а ссылка на анкету добавляется к первому ответу хвостом.
 # Чего в базе нет — агент НЕ придумывает: он передаёт вопрос живому менеджеру (эскалация).
 
+# ПУБЛИЧНАЯ ссылка формы (/pub/form/...). Адрес вида /crm/form/detail/... — это карточка формы
+# внутри портала: клиента он уводит на страницу входа в Битрикс, а не на анкету.
 LEAD_FORM_URL = os.getenv(
-    "CRM_LEAD_FORM_URL", "https://b24-0xrp3s.bitrix24.ru/crm/form/detail/2/nvunq5/").strip()
+    "CRM_LEAD_FORM_URL", "https://b24-0xrp3s.bitrix24.ru/pub/form/2_nvunq5/").strip()
 _INVITE_COOLDOWN_S = float(os.getenv("TG_INVITE_COOLDOWN_DAYS", "30") or 30) * 86400
 
 # Хвост с анкетой. Обычный текст без разметки: ответ мозга подставляется рядом, а любой <, > или &
@@ -811,26 +822,45 @@ def _mark_invited(user_id: int) -> None:
         save_state(state)
 
 
+IU_AGENT_NAME = os.getenv("IU_AGENT_NAME", "Агент по работе с ИУ").strip()
+
+
 def escalate_to_human(author: dict, question: str, client_text: str) -> None:
-    """Передать вопрос живому менеджеру: агент не знает ответа и не должен его выдумывать."""
+    """Принести вопрос лида живым людям в группу Битрикса «Работа с ИУ».
+
+    Ответ сотрудника в той же группе агент передаёт клиенту сам — поэтому в карточке есть
+    telegram id: без него передать ответ будет некому."""
     uid = author.get("id")
     uname = author.get("username") or ""
     name = " ".join(x for x in (author.get("first_name"), author.get("last_name")) if x).strip()
+    card = (f"Пользователь задал вопрос: «{client_text[:600]}»\n"
+            f"Что мне на него ответить?\n\n"
+            f"Клиент: {name or 'без имени'}" + (f", @{uname}" if uname else "")
+            + f", telegram id {uid}\n"
+            f"В базе знаний не нашлось: {question}\n"
+            f"Клиенту уже отвечено, что уточним и вернёмся.\n\n"
+            f"———\n"
+            f"Скажите мне здесь: «{IU_AGENT_NAME}, ответь, что …» — и я передам ответ клиенту "
+            f"в Telegram.")
+    try:
+        res = mcp_call("notify_iu_group", {"text": card})
+        if not res.get("sent"):
+            raise RuntimeError(str(res)[:200])
+        log.info("вопрос лида %s принесён в группу «Работа с ИУ» (сообщение %s)",
+                 uid, res.get("message_id"))
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.warning("группа недоступна (%s) — дублирую вопрос в Telegram", str(exc)[:200])
+    # Запасной канал: вопрос клиента не должен потеряться из-за сбоя Битрикса.
     chat_id = (os.getenv("TG_ESCALATION_CHAT_ID") or "").strip() or _business_owner_id()
     if not chat_id:
-        log.warning("эскалация некуда: не задан TG_ESCALATION_CHAT_ID")
+        log.warning("эскалация некуда: группа недоступна и TG_ESCALATION_CHAT_ID не задан")
         return
-    card = (f"🙋 Вопрос из личных сообщений — нужен человек\n\n"
-            f"От: {name or 'без имени'}"
-            + (f" (@{uname})" if uname else "") + f", id {uid}\n"
-            f"Не нашлось в базе знаний: {question}\n\n"
-            f"Его сообщение:\n{client_text[:600]}\n\n"
-            f"Клиенту отвечено, что уточним и вернёмся.")
     try:
         api("sendMessage", chat_id=chat_id, text=card)
-        log.info("эскалация по %s отправлена человеку", uid)
+        log.info("эскалация по %s ушла в Telegram (запасной канал)", uid)
     except Exception as exc:  # noqa: BLE001
-        log.warning("эскалация не доставлена: %s", str(exc)[:200])
+        log.warning("эскалация не доставлена вообще: %s", str(exc)[:200])
 
 
 def reply_to_stranger(author: dict, text: str) -> bool:

@@ -7382,6 +7382,27 @@ def tool_list_crm_lead_contacts(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Группа «Работа с ИУ» (чат 2424) и её агент — бот 86. Сюда уходят вопросы лидов, на которые
+# в базе знаний нет ответа: агент спрашивает живых людей, что ответить.
+IU_GROUP_DIALOG_ID = os.getenv("IU_GROUP_DIALOG_ID", "chat2424").strip()
+IU_AGENT_BOT_ID = int(os.getenv("IU_AGENT_BOT_ID", "86") or 86)
+
+
+def tool_notify_iu_group(args: dict[str, Any]) -> dict[str, Any]:
+    """Написать в группу «Работа с ИУ» от лица Агента по работе с ИУ."""
+    text = str(args.get("text") or "").strip()
+    if not text:
+        raise McpError(-32602, "text обязателен.")
+    dialog_id = str(args.get("dialog_id") or IU_GROUP_DIALOG_ID).strip()
+    bot_id = int(args.get("bot_id") or IU_AGENT_BOT_ID)
+    res = _crm_call("imbot.message.add", {
+        "BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text[:20000]})
+    message_id = res.get("result")
+    if not message_id:
+        raise McpError(-32010, "Битрикс не вернул id сообщения — не считаем отправку успешной.")
+    return {"sent": True, "message_id": message_id, "dialog_id": dialog_id, "bot_id": bot_id}
+
+
 def tool_send_telegram_message(args: dict[str, Any]) -> dict[str, Any]:
     """Написать человеку в Telegram ОТ ЛИЦА аккаунта компании."""
     who = str(args.get("to") or args.get("username") or args.get("user_id") or "").strip()
@@ -8582,6 +8603,24 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_list_crm_lead_contacts,
+    },
+    "notify_iu_group": {
+        "description": (
+            "Написать в группу Битрикса «Работа с ИУ» от лица Агента по работе с ИУ. Сюда "
+            "приносят вопросы лидов по индивидуальным условиям, на которые нет ответа в базе "
+            "знаний, и здесь же сотрудники говорят, что ответить клиенту."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Текст сообщения в группу."},
+                "dialog_id": {"type": "string", "description": "Чат. По умолчанию группа «Работа с ИУ»."},
+                "bot_id": {"type": "integer", "description": "Бот-отправитель. По умолчанию Агент по работе с ИУ."},
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        "handler": tool_notify_iu_group,
     },
     "send_telegram_message": {
         "description": (

@@ -45,8 +45,18 @@ def sent(tg, monkeypatch):
 
 
 @pytest.fixture
+def to_group(tg, monkeypatch):
+    """Перехват сообщений в группу Битрикса «Работа с ИУ»."""
+    box = []
+    monkeypatch.setattr(tg, "mcp_call",
+                        lambda tool, args: box.append({"tool": tool, **args})
+                        or {"sent": True, "message_id": 27698})
+    return box
+
+
+@pytest.fixture
 def to_human(tg, monkeypatch):
-    """Перехват сообщений живому менеджеру (обычный бот, не бизнес-канал)."""
+    """Перехват запасного канала — личка владельца в Telegram."""
     box = []
     monkeypatch.setattr(tg, "api", lambda method, **p: box.append(p) or {"message_id": 1})
     monkeypatch.setenv("TG_ESCALATION_CHAT_ID", "8715335144")
@@ -104,19 +114,53 @@ def test_agent_is_told_to_use_the_knowledge_base(tg, sent, monkeypatch):
     assert "Партнёрская программа WB" in seen[0]
 
 
-def test_unknown_question_goes_to_a_human_not_invented(tg, sent, to_human, monkeypatch):
-    """Сердце требования: не знаешь — спроси человека, а не сочиняй условия."""
+def test_unknown_question_goes_to_the_iu_group(tg, sent, to_group, monkeypatch):
+    """Сердце требования: не знаешь — спроси людей в группе, а не сочиняй условия."""
     _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про комиссию для маркетплейса")
 
     tg.maybe_autoreply(_msg(text="Какая у вас комиссия?"))
 
-    assert len(to_human) == 1, "живой менеджер должен получить вопрос"
-    card = to_human[0]["text"]
-    assert "комиссию" in card and "@ivan_novy" in card and "999" in card
-    assert "Какая у вас комиссия?" in card, "человеку нужен исходный текст клиента"
+    assert len(to_group) == 1, "вопрос должен уйти в группу «Работа с ИУ»"
+    assert to_group[0]["tool"] == "notify_iu_group"
+    card = to_group[0]["text"]
+    assert card.startswith("Пользователь задал вопрос:")
+    assert "что мне на него ответить" in card.lower()
+    assert "Какая у вас комиссия?" in card, "людям нужен исходный текст клиента"
+    assert "@ivan_novy" in card and "999" in card, "без telegram id ответ передать некому"
+    assert "ответь, что" in card, "в группе должно быть видно, как ответить агенту"
 
 
-def test_client_never_sees_the_escalation_marker(tg, sent, to_human, monkeypatch):
+def test_group_failure_falls_back_to_telegram(tg, sent, to_human, monkeypatch):
+    """Сбой Битрикса не должен проглотить вопрос клиента."""
+    def boom(tool, args):
+        raise RuntimeError("Битрикс недоступен")
+
+    monkeypatch.setattr(tg, "mcp_call", boom)
+    _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про сроки")
+
+    tg.maybe_autoreply(_msg(text="Как быстро подключите?"))
+
+    assert len(to_human) == 1, "вопрос должен уйти хотя бы в запасной канал"
+    assert "Как быстро подключите?" in to_human[0]["text"]
+
+
+def test_group_answering_without_message_id_is_not_trusted(tg, sent, to_human, monkeypatch):
+    """Ответ без id сообщения — не доказательство доставки: уходим в запасной канал."""
+    monkeypatch.setattr(tg, "mcp_call", lambda tool, args: {"sent": False})
+    _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: вопрос")
+
+    tg.maybe_autoreply(_msg(text="вопрос"))
+
+    assert len(to_human) == 1
+
+
+def test_form_link_is_the_public_one(tg):
+    """/crm/form/detail/... уводит клиента на страницу входа в Битрикс вместо анкеты."""
+    assert "/pub/form/" in tg.LEAD_FORM_URL
+    assert "/crm/form/detail/" not in tg.LEAD_FORM_URL
+
+
+def test_client_never_sees_the_escalation_marker(tg, sent, to_group, monkeypatch):
     """Иначе клиент получит служебную строку вместо ответа."""
     _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про сроки")
 
