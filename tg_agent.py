@@ -747,6 +747,98 @@ def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "
                        f"владельцу." if gaps else "")}
 
 
+SIGNING_FIELD = os.getenv("CRM_SIGNING_FIELD", "UF_CRM_F84751395").strip()
+
+# Маршрут воронки: стадия → что уже должно быть сделано и что делать дальше. Считается по
+# ФАКТАМ сделки, а не по памяти агента: 23.07.2026 клиент спросил «а что такое ЭДО?», агент
+# ответил — и забыл, что за ответом «давайте ЭДО» должна была идти задача на отправку. Любое
+# число вопросов между шагами теперь ничего не ломает: шаг приходит в каждом сообщении.
+def funnel_next_step(deal: dict) -> dict:
+    """Что агент обязан сделать на текущем шаге сделки."""
+    uf = deal.get("custom_fields") or {}
+    stage = str(deal.get("stage") or deal.get("stage_id") or "")
+    deal_id = deal.get("id") or deal.get("ID")
+    has_req = bool(str(uf.get(CONTRACT_REQUISITES_FIELD) or "").strip())
+    has_contract = bool(str(uf.get(CONTRACT_NUMBER_FIELD) or "").strip())
+    signing = str(uf.get(SIGNING_FIELD) or "").strip()
+
+    if stage in ("C16:NEW", "C16:CONTACTED"):
+        return {"step": "Сверка анкеты и согласие",
+                "need": "подтверждение данных анкеты и готовность двигаться дальше",
+                "action": (f"Как только клиент подтвердил данные и сказал, что готов — переведи "
+                           f"сделку {deal_id} на стадию C16:S84294149 (update_crm_deal) и в том "
+                           f"же сообщении попроси реквизиты организации для договора.")}
+    if stage == "C16:S84294149" and not has_req:
+        return {"step": "Сбор реквизитов",
+                "need": "реквизиты организации (название, ИНН, КПП, ОГРН, адрес, р/с, банк, БИК, ФИО директора)",
+                "action": (f"Как только реквизиты пришли — запиши их в поле "
+                           f"{CONTRACT_REQUISITES_FIELD} сделки {deal_id} и СРАЗУ вызови "
+                           f"send_contract(deal_id={deal_id}, telegram_id=<id клиента>). "
+                           f"Не хватает части реквизитов — спроси именно недостающее.")}
+    if stage == "C16:S84294149" or (stage == "C16:NDA" and not has_contract):
+        return {"step": "Отправка договора",
+                "need": "ничего — договор отправляешь ты",
+                "action": (f"Реквизиты уже есть. Вызови send_contract(deal_id={deal_id}, "
+                           f"telegram_id=<id клиента>) и попроси посмотреть, всё ли верно.")}
+    if stage == "C16:NDA" and not signing:
+        return {"step": "Выбор способа подписания",
+                "need": "ответ клиента: ЭДО или бумага",
+                "action": (f"ЭТО ГЛАВНОЕ, ЧТО СЕЙЧАС НУЖНО. Клиент может по дороге задать любые "
+                           f"вопросы — ответь и ВЕРНИСЬ к этому. Как только он назвал способ: "
+                           f"1) запиши его в поле {SIGNING_FIELD} сделки {deal_id}; "
+                           f"2) create_bitrix_task ответственному (ИИ Агент, id 22) «Направить "
+                           f"договор на подписание (<способ>)» со сроком 1 час, в описании — "
+                           f"номер договора и реквизиты; "
+                           f"3) СРАЗУ notify_client_when_task_done(задача, telegram_id клиента, "
+                           f"текст «договор отправили, посмотрите и подпишите»); "
+                           f"4) скажи клиенту, что направляешь, и что напишешь, когда уйдёт.")}
+    if stage == "C16:NDA" and signing:
+        return {"step": "Договор на подписании",
+                "need": "подтверждение клиента, что подписал",
+                "action": (f"Способ подписания уже выбран ({signing}). Если задача на отправку "
+                           f"ещё не поставлена — поставь и повесь на неё "
+                           f"notify_client_when_task_done. Клиент сказал, что подписал → "
+                           f"переведи сделку {deal_id} на C16:UC_SGZRVS.")}
+    if stage == "C16:UC_SGZRVS":
+        return {"step": "Счёт на оплату",
+                "need": "ничего — счёт готовит бухгалтер",
+                "action": (f"Поставь задачу бухгалтеру (ИИ Агент, id 22) «Выставить счёт по "
+                           f"договору» со сроком 1 час, приложи реквизиты, и повесь "
+                           f"notify_client_when_task_done с текстом про счёт. Переведи сделку "
+                           f"{deal_id} на C16:PREPAYMENT_INVOIC.")}
+    if stage == "C16:PREPAYMENT_INVOIC":
+        return {"step": "Ожидание оплаты",
+                "need": "подтверждение ОТ БУХГАЛТЕРА, что деньги пришли",
+                "action": (f"Слова клиента «я оплатил» — не деньги на счету: стадию по ним не "
+                           f"двигай. Подтвердил бухгалтер → сделка {deal_id} на C16:EXECUTING.")}
+    if stage == "C16:EXECUTING":
+        return {"step": "Подключение",
+                "need": "то, что нужно технически для подключения кабинета",
+                "action": (f"Направь клиенту инструкции и ссылки, запроси необходимое. Когда "
+                           f"подключение сделано — сделка {deal_id} на C16:CONNECTED.")}
+    return {"step": f"Стадия {stage}", "need": "—",
+            "action": "Веди разговор по маршруту воронки; стадию не двигай без факта."}
+
+
+def funnel_step_block(deal_id: int) -> str:
+    """Текущий шаг воронки текстом — уходит в промпт КАЖДОГО сообщения."""
+    try:
+        from mcp import context_server as cs
+        deal = cs.TOOLS["get_crm_deal"]["handler"]({"deal_id": int(deal_id)})
+        deal = deal.get("deal") or deal
+    except Exception:  # noqa: BLE001 — без шага агент ответит хуже, но ответит
+        log.warning("шаг воронки для сделки %s не определён", deal_id, exc_info=True)
+        return ""
+    st = funnel_next_step(deal)
+    return ("ТЕКУЩИЙ ШАГ ВОРОНКИ (считан из сделки прямо сейчас — это важнее твоей памяти о "
+            f"разговоре):\n"
+            f"- этап: {st['step']}\n"
+            f"- ждёшь от клиента: {st['need']}\n"
+            f"- что сделать: {st['action']}\n"
+            "Клиент может задать сколько угодно вопросов по дороге — отвечай на них и "
+            "возвращайся к этому шагу. Пока шаг не выполнен, он остаётся твоей задачей.")
+
+
 def watch_task_for_client(bitrix_task_id: int, telegram_id: int, client_message: str,
                           deal_id: int | None = None, kind: str = "other",
                           next_stage: str = "") -> dict:
@@ -1579,6 +1671,7 @@ def _autoreply_turn(msg: dict) -> None:
         f"{role}\n\n"
         f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
         f"Собеседник: {name or 'клиент'} (@{username or 'без username'})\n"
+        f"\n{funnel_step_block(deal_id)}\n"
         f"\nЕго сообщение:\n{text}"
     ) if role else (
         "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
