@@ -40,3 +40,6 @@ tmp_*.py
 .tg_business_log.jsonl
 .tg_userbot*
 .tg_userbot_login.json
+
+# graphify knowledge graph output (generated, rebuildable via `graphify update .`)
+graphify-out/

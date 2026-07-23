@@ -36,6 +36,39 @@ def tg(monkeypatch):
     return tg_agent
 
 
+def test_marker_mentioned_in_the_instruction_does_not_split_the_document(tg, monkeypatch):
+    """Владелец заполнил условия, а агент всё равно отказывался их слать (23.07.2026).
+
+    Причина была в шапке документа: там маркер упомянут в самой инструкции, и разрез по первому
+    вхождению отдавал «клиентской частью» остаток инструкции — вместе с примером пометки
+    [ЗАПОЛНИТЬ]."""
+    from mcp import context_server as cs
+
+    doc = ("Условия ИУ — текст для клиента\n\n"
+           "Всё, что ниже строки «--- ТЕКСТ КЛИЕНТУ ---», агент отправляет ДОСЛОВНО.\n\n"
+           "Пока в тексте остаётся пометка [ЗАПОЛНИТЬ], агент ничего не отправит.\n\n"
+           "--- ТЕКСТ КЛИЕНТУ ---\n\n"
+           "Комиссия WB снижена до 35%.\n\n"
+           "Подключение занимает не более 2 рабочих дней")
+    monkeypatch.setitem(cs.TOOLS, "get_company_file", {"handler": lambda a: {"content": doc}})
+
+    body = tg.terms_text()
+
+    assert body.startswith("Комиссия WB снижена")
+    assert "ДОСЛОВНО" not in body and "[ЗАПОЛНИТЬ]" not in body
+
+
+def test_document_without_the_marker_is_never_sent(tg, monkeypatch):
+    """Иначе клиент получил бы инструкцию для владельца вместо условий."""
+    from mcp import context_server as cs
+
+    monkeypatch.setitem(cs.TOOLS, "get_company_file",
+                        {"handler": lambda a: {"content": "Просто текст без разметки"}})
+
+    with pytest.raises(ValueError, match="ТЕКСТ КЛИЕНТУ"):
+        tg.terms_text()
+
+
 def test_only_the_client_part_is_taken(tg):
     """Инструкция для владельца в начале документа клиенту уходить не должна."""
     body = tg.terms_text()

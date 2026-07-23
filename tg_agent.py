@@ -754,6 +754,26 @@ TERMS_MARKER = "--- ТЕКСТ КЛИЕНТУ ---"
 TERMS_QUESTION = "Есть вопросы по условиям?"
 
 
+def _after_terms_marker(raw: str) -> str:
+    """Взять из документа ТОЛЬКО текст клиенту — часть после строки-маркера.
+
+    Маркер ищем как ОТДЕЛЬНУЮ СТРОКУ, а не подстроку: в шапке документа он упомянут в самой
+    инструкции («всё, что ниже строки "--- ТЕКСТ КЛИЕНТУ ---", отправляется дословно»), и
+    разрез по первому вхождению отдавал клиенту остаток инструкции вместе с примером пометки
+    [ЗАПОЛНИТЬ] — из-за этого агент отказывался слать уже заполненные условия (23.07.2026).
+
+    Маркера нет вовсе — возвращаем пустоту: отправить документ целиком, вместе с инструкцией
+    для владельца, хуже, чем не отправить ничего."""
+    lines = raw.replace("\r\n", "\n").split("\n")
+    marker_at = -1
+    for i, line in enumerate(lines):
+        if line.strip().strip("«»\"'").strip() == TERMS_MARKER:
+            marker_at = i          # берём ПОСЛЕДНЮЮ такую строку
+    if marker_at < 0:
+        return ""
+    return "\n".join(lines[marker_at + 1:]).strip()
+
+
 def terms_text() -> str:
     """Условия для клиента — ДОСЛОВНО из документа владельца в базе знаний.
 
@@ -770,12 +790,14 @@ def terms_text() -> str:
         raise ValueError(f"В базе знаний нет документа «{TERMS_DOC_NAME}» — отправлять нечего.")
     res = cs.TOOLS["get_company_file"]["handler"]({"google_file_id": match["google_file_id"]})
     raw = str(res.get("content") or res.get("text") or "")
-    body = raw.split(TERMS_MARKER, 1)[1] if TERMS_MARKER in raw else raw
+    body = _after_terms_marker(raw)
     # Служебную шапку базы знаний клиенту показывать нельзя.
     body = re.sub(r"^(?:Источник|Обновлено в Google Drive|Тип):.*$", "", body,
                   flags=re.MULTILINE).strip()
     if not body:
-        raise ValueError(f"Документ «{TERMS_DOC_NAME}» пуст — отправлять нечего.")
+        raise ValueError(
+            f"В документе «{TERMS_DOC_NAME}» нет строки «{TERMS_MARKER}» или под ней пусто — "
+            f"отправлять нечего. Скажи владельцу.")
     if "[ЗАПОЛНИТЬ]" in body:
         # Неполные условия у клиента хуже паузы: молча слать заготовку нельзя.
         raise ValueError(

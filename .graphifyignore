@@ -1,0 +1,8 @@
+# Albery's own business knowledge base (486 md about clients/services) is data, not
+# architecture — excluded from the semantic pass to keep extraction time sane.
+# The Python loaders in agent_knowledge/ are still indexed by the AST pass.
+agent_knowledge/**/*.md
+graphify-out/
+.claude/
+attachments_cache/
+exports/
