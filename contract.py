@@ -229,6 +229,27 @@ def parse_blocks(text: str) -> list[tuple[str, Any]]:
     return blocks
 
 
+def build_styles() -> dict[str, Any]:
+    """Стили вёрстки договора. Отдельной функцией — чтобы их можно было проверить тестом."""
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import cm
+
+    base = ParagraphStyle("base", fontName=FONT_MAIN, fontSize=11, leading=15.5,
+                          alignment=TA_JUSTIFY, firstLineIndent=1.25 * cm, spaceAfter=5)
+    return {
+        "body": base,
+        # Заголовки разделов — по центру (владелец, 23.07.2026): так принято в договорах.
+        "head": ParagraphStyle("head", parent=base, fontName=FONT_BOLD, fontSize=11.5,
+                               firstLineIndent=0, spaceBefore=12, spaceAfter=7,
+                               alignment=TA_CENTER),
+        "title": ParagraphStyle("title", parent=base, fontName=FONT_BOLD, fontSize=13.5,
+                                alignment=TA_CENTER, firstLineIndent=0, spaceAfter=12),
+        "cell": ParagraphStyle("cell", parent=base, firstLineIndent=0, alignment=0,
+                               fontSize=10, leading=13, spaceAfter=0),
+    }
+
+
 def _cell(text: str, style) -> Any:
     """Ячейка таблицы: переносы строк внутри неё должны остаться переносами."""
     from reportlab.platypus import Paragraph
@@ -258,15 +279,8 @@ def render_contract_pdf(number: str, date: str, client: dict[str, str],
                             leftMargin=2.5 * cm, rightMargin=1.5 * cm,
                             title=f"Договор № {number}", author=str(ex.get("name") or ""))
     width = doc.width
-    base = ParagraphStyle("base", fontName=FONT_MAIN, fontSize=11, leading=15.5,
-                          alignment=TA_JUSTIFY, firstLineIndent=1.25 * cm, spaceAfter=5)
-    head = ParagraphStyle("head", parent=base, fontName=FONT_BOLD, fontSize=11.5,
-                          firstLineIndent=0, spaceBefore=12, spaceAfter=7, alignment=0)
-    title = ParagraphStyle("title", parent=base, fontName=FONT_BOLD, fontSize=13.5,
-                           alignment=TA_CENTER, firstLineIndent=0, spaceAfter=12)
-    cell = ParagraphStyle("cell", parent=base, firstLineIndent=0, alignment=0, fontSize=10,
-                          leading=13, spaceAfter=0)
-    styles = {"title": title, "head": head, "body": base}
+    styles = build_styles()
+    cell = styles["cell"]
 
     story: list[Any] = []
     for kind, value in parse_blocks(body_text):

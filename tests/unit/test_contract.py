@@ -195,6 +195,19 @@ def test_appendix_starts_on_a_new_page():
     assert kinds == ["pagebreak", "head"]
 
 
+def test_section_headings_are_centered():
+    """Владелец 23.07.2026: заголовки разделов в PDF должны стоять по центру."""
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+
+    from contract import build_styles
+
+    styles = build_styles()
+
+    assert styles["head"].alignment == TA_CENTER, "заголовки разделов — по центру"
+    assert styles["title"].alignment == TA_CENTER
+    assert styles["body"].alignment == TA_JUSTIFY, "текст пунктов остаётся по ширине"
+
+
 def test_section_headings_are_recognised():
     from contract import parse_blocks
 
