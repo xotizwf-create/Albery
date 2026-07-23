@@ -7514,6 +7514,22 @@ def tool_set_telegram_access(args: dict[str, Any]) -> dict[str, Any]:
                      "человек напишет агенту.")}
 
 
+def tool_send_contract(args: dict[str, Any]) -> dict[str, Any]:
+    """Собрать договор по реквизитам сделки и отправить клиенту PDF на согласование."""
+    deal_id = args.get("deal_id")
+    telegram_id = args.get("telegram_id") or args.get("to")
+    if not deal_id or not telegram_id:
+        raise McpError(-32602, "Нужны deal_id и telegram_id клиента.")
+    try:
+        return app_workflow_function("contract_send")(
+            int(deal_id), telegram_id, str(args.get("requisites") or ""),
+            str(args.get("number") or ""))
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"send_contract failed: {exc}") from exc
+
+
 def tool_get_telegram_dialog(args: dict[str, Any]) -> dict[str, Any]:
     """Переписка агента с клиентом в Telegram — по telegram id или @username."""
     who = str(args.get("telegram_id") or args.get("username") or args.get("to") or "").strip()
@@ -8869,6 +8885,26 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_notify_iu_group,
+    },
+    "send_contract": {
+        "description": (
+            "ДОГОВОР КЛИЕНТУ: собирает готовый PDF по реквизитам из сделки (постоянный текст + "
+            "реквизиты сторон), присваивает номер и отправляет клиенту в Telegram НА "
+            "СОГЛАСОВАНИЕ. Делай это САМ, не ставя задачу человеку. Если реквизитов не хватает — "
+            "вернёт список недостающих, спроси у клиента именно их."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "deal_id": {"type": "integer", "description": "Номер сделки в CRM."},
+                "telegram_id": {"type": "string", "description": "Telegram id клиента."},
+                "requisites": {"type": "string", "description": "Реквизиты текстом, если их ещё нет в сделке."},
+                "number": {"type": "string", "description": "Номер договора. По умолчанию берётся из сделки или выдаётся новый."},
+            },
+            "required": ["deal_id", "telegram_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_send_contract,
     },
     "get_telegram_dialog": {
         "description": (
@@ -11432,6 +11468,7 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
     "send_telegram_message",
     "list_telegram_contacts",
     "get_telegram_dialog",
+    "send_contract",
     # Employee dossiers are internal management data — never on the public scoped connectors.
     "get_employee_dossier",
     "update_employee_dossier",

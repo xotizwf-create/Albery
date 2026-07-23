@@ -28,7 +28,7 @@ import subprocess
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -598,6 +598,92 @@ def telegram_send_as_account(who: str, text: str) -> dict:
     return {"sent": True, "to_id": target,
             "to": ("@" + entry["username"]) if (entry and entry.get("username")) else str(target),
             "from": "аккаунт владельца (Telegram Business)", "chars": len(text)}
+
+
+def send_document_as_account(user_id: int, data: bytes, filename: str,
+                             caption: str = "") -> tuple[bool, str]:
+    """Отправить файл человеку от лица аккаунта компании (договор, счёт).
+
+    До 23.07.2026 агент умел только текст, поэтому договор клиенту отправить не мог —
+    и вместо файла присылал обещание «направим»."""
+    state = load_state()
+    conn_ids = list((state.get("business") or {}).keys())
+    if not conn_ids:
+        return False, "бизнес-подключение не настроено"
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{bot_token()}/sendDocument",
+            data={"business_connection_id": conn_ids[0], "chat_id": int(user_id),
+                  "caption": caption[:1000]},
+            files={"document": (filename, data)},
+            timeout=120,
+        )
+        body = r.json()
+        if not body.get("ok"):
+            return False, str(body.get("description") or body)[:200]
+        return True, ""
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)[:200]
+
+
+CONTRACT_REQUISITES_FIELD = os.getenv("CRM_REQUISITES_FIELD", "UF_CRM_F84751394").strip()
+CONTRACT_NUMBER_FIELD = os.getenv("CRM_CONTRACT_NUMBER_FIELD", "UF_CRM_F84792019").strip()
+_MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+           "сентября", "октября", "ноября", "декабря")
+
+
+def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "",
+                  number: str = "") -> dict:
+    """Собрать договор по реквизитам сделки и отправить клиенту PDF на согласование.
+
+    Один вызов вместо цепочки «поставь задачу человеку → человек соберёт → человек отправит».
+    Владелец 23.07.2026: агент должен заполнять шаблон сам, от клиента к клиенту меняются
+    только реквизиты."""
+    import contract as contract_mod
+
+    from mcp import context_server as cs
+
+    deal = cs.TOOLS["get_crm_deal"]["handler"]({"deal_id": int(deal_id)})
+    deal = deal.get("deal") or deal
+    uf = deal.get("custom_fields") or {}
+    raw = (requisites_text or uf.get(CONTRACT_REQUISITES_FIELD) or "").strip()
+    if not raw:
+        raise ValueError(f"В сделке {deal_id} нет реквизитов — попроси их у клиента и запиши "
+                         f"в поле {CONTRACT_REQUISITES_FIELD}.")
+    fields = contract_mod.parse_requisites(raw)
+    gaps = contract_mod.missing_fields(fields)
+    if gaps:
+        # Договор с дырами в реквизитах подписывать нельзя: сторона не определена.
+        return {"sent": False, "missing": gaps,
+                "note": ("Не хватает реквизитов: " + ", ".join(gaps)
+                         + ". Спроси у клиента ИМЕННО их, не проси прислать всё заново.")}
+
+    number = (number or uf.get(CONTRACT_NUMBER_FIELD) or "").strip()
+    if not number:
+        number = cs.TOOLS["next_contract_number"]["handler"](
+            {"category_id": int(deal.get("category_id") or 16)})["number"]
+    now = datetime.now(timezone.utc) + timedelta(hours=3)
+    human_date = f"«{now.day:02d}» {_MONTHS[now.month - 1]} {now.year} г."
+
+    pdf = contract_mod.render_contract_pdf(number, human_date, fields)
+    filename = f"Договор {number}.pdf"
+    ok, err = send_document_as_account(
+        int(telegram_id), pdf, filename,
+        caption=f"Договор № {number} на согласование. Посмотрите, всё ли верно")
+    if not ok:
+        raise RuntimeError(f"Договор собран, но не отправлен: {err}")
+
+    cs.TOOLS["update_crm_deal"]["handler"]({
+        "deal_id": int(deal_id),
+        "custom_fields": {CONTRACT_NUMBER_FIELD: number},
+        "comments": f"Договор № {number} отправлен клиенту в Telegram на согласование.",
+    })
+    journal(MANAGER_CHANNEL, telegram_id, "out", f"[файл] {filename} — на согласование",
+            kind="lead_chat", meta={"contract": number, "deal_id": int(deal_id)})
+    return {"sent": True, "number": number, "file": filename, "size_bytes": len(pdf),
+            "client_name": fields.get("name"),
+            "note": "PDF ушёл клиенту. Дождись подтверждения, что всё верно, и только потом "
+                    "ставь задачу на подписание."}
 
 
 def telegram_contacts_list() -> dict:
