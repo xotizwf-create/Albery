@@ -1024,6 +1024,26 @@ def watch_task_for_client(bitrix_task_id: int, telegram_id: int, client_message:
         raise ValueError("Нужен текст, который получит клиент после закрытия задачи.")
     with _db() as conn:
         with conn.cursor() as cur:
+            # Новое ожидание того же смысла ЗАМЕНЯЕТ старое: если по сделке пересоздали задачу
+            # шага (23.07.2026 по сделке 92 висели задачи 1996 и 2006 с одним текстом), клиент
+            # при закрытии обеих получил бы одно и то же дважды. kind='other' не трогаем: там
+            # смысл определяется текстом, и один шаг не заменяет другой.
+            if kind != "other":
+                if deal_id:
+                    cur.execute(
+                        "UPDATE funnel_task_watch SET cancelled_at = now(),"
+                        " note = %s WHERE notified_at IS NULL AND cancelled_at IS NULL"
+                        " AND bitrix_task_id <> %s AND kind = %s AND deal_id = %s",
+                        (f"заменено новой задачей {int(bitrix_task_id)}",
+                         int(bitrix_task_id), kind, int(deal_id)))
+                else:
+                    cur.execute(
+                        "UPDATE funnel_task_watch SET cancelled_at = now(),"
+                        " note = %s WHERE notified_at IS NULL AND cancelled_at IS NULL"
+                        " AND bitrix_task_id <> %s AND kind = %s AND deal_id IS NULL"
+                        " AND telegram_id = %s",
+                        (f"заменено новой задачей {int(bitrix_task_id)}",
+                         int(bitrix_task_id), kind, int(telegram_id)))
             cur.execute(
                 "INSERT INTO funnel_task_watch (bitrix_task_id, deal_id, telegram_id, kind,"
                 " client_message, next_stage) VALUES (%s, %s, %s, %s, %s, %s)"
@@ -1039,13 +1059,34 @@ def watch_task_for_client(bitrix_task_id: int, telegram_id: int, client_message:
             "note": "Как только задачу закроют, клиент получит сообщение автоматически."}
 
 
+def _cancel_watch(watch_id: int, note: str) -> None:
+    """Снять ожидание с пометкой, почему оно больше не нужно."""
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE funnel_task_watch SET cancelled_at = now(), note = %s"
+                        " WHERE id = %s", (note[:300], int(watch_id)))
+
+
+def _watch_key(w: dict) -> tuple:
+    """По какому признаку два ожидания — «одно и то же» для клиента.
+
+    Обычно это сделка + вид шага (edo и т.п.). Для kind='other' смысл задаёт сам текст:
+    два разных сообщения по одной сделке — это два разных события, их не склеиваем."""
+    who = ("deal", w["deal_id"]) if w.get("deal_id") else ("tg", w["telegram_id"])
+    kind = str(w.get("kind") or "other")
+    if kind == "other":
+        return (who, kind, (w.get("client_message") or "").strip())
+    return (who, kind)
+
+
 def check_finished_tasks(limit: int = 50) -> dict:
-    """Пройтись по ожиданиям: закрытые задачи → сообщение клиенту. Вызывается сторожем.
+    """Пройтись по ожиданиям: закрытые задачи → сообщение клиенту. Крутится сторожем
+    _task_watch_loop в службе tg-агента.
 
-    Идемпотентно: отметка notified_at ставится в той же транзакции, поэтому повторный проход
-    не отправит клиенту то же самое второй раз."""
-    from mcp import context_server as cs
-
+    Идемпотентно: отметка notified_at ставится сразу после доставки, поэтому повторный проход
+    не отправит клиенту то же самое второй раз. context_server сюда НЕ импортируется: в
+    процессе tg-агента его импорт запускает живые планировщики (та же причина, по которой
+    существует mcp_call) — статус задачи берём прямым REST, сделку двигаем через MCP по HTTP."""
     sent, still_open, failed = [], 0, []
     with _db() as conn:
         with conn.cursor() as cur:
@@ -1054,13 +1095,27 @@ def check_finished_tasks(limit: int = 50) -> dict:
                 " FROM funnel_task_watch WHERE notified_at IS NULL AND cancelled_at IS NULL"
                 " ORDER BY id LIMIT %s", (int(limit),))
             watches = list(cur.fetchall())
+    served: set[tuple] = set()      # кому уже отправлено в этом проходе (по смыслу)
     for w in watches:
+        key = _watch_key(w)
+        if key in served:
+            # Второе ожидание того же смысла (сделка 92, задачи 1996 и 2006, 23.07.2026):
+            # клиент уже получил это сообщение в этом же проходе — второй раз слать нельзя.
+            _cancel_watch(w["id"], f"дубль: клиенту уже сообщено в этом проходе "
+                                   f"(задача {w['bitrix_task_id']})")
+            continue
         try:
-            info = cs.TOOLS["get_bitrix_task"]["handler"]({"bitrix_task_id": w["bitrix_task_id"]}) \
-                if "get_bitrix_task" in cs.TOOLS else _task_status(w["bitrix_task_id"])
-            status = str((info or {}).get("status") or "")
+            status = str((_task_status(w["bitrix_task_id"]) or {}).get("status") or "")
         except Exception as exc:  # noqa: BLE001 — одна недоступная задача не должна ронять проход
+            if "not found" in str(exc).lower() or "не найден" in str(exc).lower():
+                _cancel_watch(w["id"], "задача удалена из Битрикса")
+                continue
             failed.append({"task": w["bitrix_task_id"], "error": str(exc)[:150]})
+            continue
+        if not status:
+            # Портал отвечает 200 без задачи — её удалили. Ждать её закрытия бессмысленно,
+            # иначе ожидание висит вечно и каждый проход тратится на мёртвый запрос.
+            _cancel_watch(w["id"], "задача удалена из Битрикса")
             continue
         if status not in _TASK_DONE_STATUSES:
             still_open += 1
@@ -1075,11 +1130,14 @@ def check_finished_tasks(limit: int = 50) -> dict:
             with conn.cursor() as cur:
                 cur.execute("UPDATE funnel_task_watch SET notified_at = now() WHERE id = %s",
                             (w["id"],))
+        served.add(key)
         if w["deal_id"] and w["next_stage"]:
             try:
-                cs.TOOLS["update_crm_deal"]["handler"](
-                    {"deal_id": int(w["deal_id"]), "stage": w["next_stage"],
-                     "comments": f"Задача {w['bitrix_task_id']} выполнена, клиенту сообщено."})
+                # Через MCP по HTTP: у вебхука нет прав на CRM, а импортировать context_server
+                # в процесс tg-агента нельзя.
+                mcp_call("update_crm_deal",
+                         {"deal_id": int(w["deal_id"]), "stage": w["next_stage"],
+                          "comments": f"Задача {w['bitrix_task_id']} выполнена, клиенту сообщено."})
             except Exception:  # noqa: BLE001 — сообщение клиенту важнее записи в CRM
                 log.warning("стадия сделки %s не сдвинулась", w["deal_id"], exc_info=True)
         sent.append({"task": w["bitrix_task_id"], "client": w["telegram_id"]})
@@ -1087,6 +1145,34 @@ def check_finished_tasks(limit: int = 50) -> dict:
                  w["bitrix_task_id"], w["telegram_id"])
     return {"checked": len(watches), "notified": len(sent), "still_open": still_open,
             "failed": failed}
+
+
+_TASK_WATCH_INTERVAL_S = float(os.getenv("TG_TASK_WATCH_INTERVAL_S", "20") or 20)
+
+
+def _task_watch_loop() -> None:
+    """Сторож ожиданий: сотрудник закрыл задачу — клиент узнаёт в пределах интервала.
+
+    Живёт отдельным потоком в службе tg-агента: Битрикс не шлёт сюда событий о закрытии
+    задач, а агент отвечает только на входящие — без сторожа механизм ожиданий не работал
+    вовсе (23.07.2026 владелец закрыл задачу, клиенту не ушло ничего). Когда ожиданий нет,
+    Битрикс не дёргается: проход обходится одним запросом к своей БД."""
+    while True:
+        try:
+            res = check_finished_tasks()
+            if res.get("notified") or res.get("failed"):
+                log.info("сторож задач: %s", res)
+        except Exception:  # noqa: BLE001 — сторож не имеет права умереть от одного сбоя
+            log.warning("сторож задач: проход не удался", exc_info=True)
+        time.sleep(_TASK_WATCH_INTERVAL_S)
+
+
+def start_task_watchdog() -> threading.Thread:
+    """Запустить сторожа ожиданий фоновым потоком службы."""
+    t = threading.Thread(target=_task_watch_loop, name="task-watch", daemon=True)
+    t.start()
+    log.info("сторож задач запущен (интервал %s c)", _TASK_WATCH_INTERVAL_S)
+    return t
 
 
 # Статусы Битрикса, при которых работа считается выполненной: 4 — «завершена», 5 — «закрыта».
@@ -1928,6 +2014,9 @@ def poll_forever() -> None:
         tg_multi.start_all()
     except Exception:  # noqa: BLE001
         log.exception("не удалось запустить дополнительных Telegram-агентов")
+    # Сторож ожиданий: без него «задача закрыта → сообщение клиенту» не срабатывало никогда —
+    # check_finished_tasks существовал, но его никто не вызывал (владелец, 23.07.2026).
+    start_task_watchdog()
     me = api("getMe")
     log.info("bot: @%s (id %s)", me.get("username"), me.get("id"))
     offset = int(load_state().get("offset") or 0)

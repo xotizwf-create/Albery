@@ -131,6 +131,82 @@ def test_undelivered_message_is_not_marked_as_sent(tg, monkeypatch):
     assert not any("notified_at" in sql for sql, _ in updates)
 
 
+def test_watchdog_actually_drives_the_check(tg, monkeypatch):
+    """Главная жалоба 23.07.2026: владелец закрыл задачу — клиенту не ушло НИЧЕГО.
+
+    Механизм ожиданий существовал, но check_finished_tasks не вызывался ниоткуда: в докстринге
+    значился «сторож», которого никто не написал. Сторож обязан крутиться в службе tg-агента."""
+    calls = []
+    monkeypatch.setattr(tg, "check_finished_tasks",
+                        lambda: calls.append(1) or {"notified": 0, "failed": []})
+    monkeypatch.setattr(tg, "_TASK_WATCH_INTERVAL_S", 0.01)
+
+    th = tg.start_task_watchdog()
+    time.sleep(0.12)
+
+    assert th.daemon, "сторож не должен держать процесс при остановке службы"
+    assert len(calls) >= 2, "сторож должен гонять проверку регулярно, а не один раз"
+
+
+def test_same_meaning_watch_is_not_sent_twice(tg, monkeypatch):
+    """23.07.2026, сделка 92: два ожидания (задачи 1996 и 2006) с одним текстом. Обе задачи
+    закрыты — клиент должен получить сообщение ОДИН раз, второе ожидание снимается."""
+    watches = [
+        {"id": 3, "bitrix_task_id": 1996, "deal_id": 92, "telegram_id": 555,
+         "kind": "edo", "client_message": "Договор отправили вам в ЭДО", "next_stage": ""},
+        {"id": 4, "bitrix_task_id": 2006, "deal_id": 92, "telegram_id": 555,
+         "kind": "edo", "client_message": "Договор отправили вам в ЭДО", "next_stage": ""},
+    ]
+    sent, updates = [], []
+    monkeypatch.setattr(tg, "_db", _fake_db(watches, updates))
+    monkeypatch.setattr(tg, "_task_status", lambda tid: {"status": "5"})
+    monkeypatch.setattr(tg, "send_html",
+                        lambda uid, html, plain: sent.append((uid, plain)) or (True, ""))
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+
+    res = tg.check_finished_tasks()
+
+    assert len(sent) == 1, "клиент получил одно и то же дважды — это и есть жалоба на дубли"
+    assert res["notified"] == 1
+    assert any("cancelled_at" in sql for sql, _ in updates), "второе ожидание должно сняться"
+
+
+def test_watch_for_deleted_task_is_cancelled(tg, monkeypatch):
+    """Задачу удалили из Битрикса (реальная 1994, 23.07.2026): портал отдаёт 200 без задачи.
+    Ожидание должно сняться, а не висеть вечно, съедая каждый проход сторожа."""
+    watch = {"id": 2, "bitrix_task_id": 1994, "deal_id": 90, "telegram_id": 555,
+             "kind": "edo", "client_message": "готово", "next_stage": ""}
+    sent, updates = [], []
+    monkeypatch.setattr(tg, "_db", _fake_db([watch], updates))
+    monkeypatch.setattr(tg, "_task_status", lambda tid: {"status": ""})
+    monkeypatch.setattr(tg, "send_html", lambda *a: sent.append(a) or (True, ""))
+
+    res = tg.check_finished_tasks()
+
+    assert sent == [] and res["notified"] == 0
+    assert res["still_open"] == 0, "удалённая задача не «открыта» — её больше нет"
+    assert any("cancelled_at" in sql for sql, _ in updates), "мёртвое ожидание должно сняться"
+
+
+def test_next_stage_moves_through_http_mcp(tg, monkeypatch):
+    """Стадию двигаем через mcp_call (HTTP): импортировать context_server в процесс tg-агента
+    нельзя — его импорт запускает живые планировщики (см. комментарий у mcp_call)."""
+    watch = {"id": 1, "bitrix_task_id": 1972, "deal_id": 86, "telegram_id": 555,
+             "kind": "edo", "client_message": "готово", "next_stage": "C16:FINAL_INVOICE"}
+    moved, updates = [], []
+    monkeypatch.setattr(tg, "_db", _fake_db([watch], updates))
+    monkeypatch.setattr(tg, "_task_status", lambda tid: {"status": "5"})
+    monkeypatch.setattr(tg, "send_html", lambda *a: (True, ""))
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "mcp_call", lambda tool, args: moved.append((tool, args)) or {})
+
+    res = tg.check_finished_tasks()
+
+    assert res["notified"] == 1
+    assert moved and moved[0][0] == "update_crm_deal"
+    assert moved[0][1]["deal_id"] == 86 and moved[0][1]["stage"] == "C16:FINAL_INVOICE"
+
+
 def _fake_db(rows, updates):
     """БД-заглушка: выдаёт ожидания и запоминает изменения."""
     import contextlib
