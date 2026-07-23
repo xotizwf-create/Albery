@@ -628,6 +628,10 @@ def send_document_as_account(user_id: int, data: bytes, filename: str,
 
 CONTRACT_REQUISITES_FIELD = os.getenv("CRM_REQUISITES_FIELD", "UF_CRM_F84751394").strip()
 CONTRACT_NUMBER_FIELD = os.getenv("CRM_CONTRACT_NUMBER_FIELD", "UF_CRM_F84792019").strip()
+CONTRACT_FILE_FIELD = os.getenv("CRM_CONTRACT_FILE_FIELD", "UF_CRM_F84792018").strip()
+CONTRACT_DATE_FIELD = os.getenv("CRM_CONTRACT_DATE_FIELD", "UF_CRM_F84792022").strip()
+# Договор отправлен — человек уже не на «Согласовании условий», а на подписании.
+CONTRACT_STAGE = os.getenv("CRM_CONTRACT_STAGE", "C16:NDA").strip()
 _MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
            "сентября", "октября", "ноября", "декабря")
 
@@ -673,17 +677,44 @@ def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "
     if not ok:
         raise RuntimeError(f"Договор собран, но не отправлен: {err}")
 
-    cs.TOOLS["update_crm_deal"]["handler"]({
+    # Договор кладём В САМУ СДЕЛКУ и двигаем стадию: иначе файл живёт только в Telegram, а
+    # воронка показывает, что человек всё ещё на согласовании условий (владелец, 23.07.2026).
+    import base64
+    updates: dict = {
         "deal_id": int(deal_id),
-        "custom_fields": {CONTRACT_NUMBER_FIELD: number},
-        "comments": f"Договор № {number} отправлен клиенту в Telegram на согласование.",
-    })
+        "stage": CONTRACT_STAGE,
+        "custom_fields": {
+            CONTRACT_NUMBER_FIELD: number,
+            CONTRACT_DATE_FIELD: now.strftime("%Y-%m-%d"),
+            CONTRACT_FILE_FIELD: {"fileData": [filename,
+                                               base64.b64encode(pdf).decode("ascii")]},
+        },
+        "comments": f"Договор № {number} собран по шаблону и отправлен клиенту в Telegram "
+                    f"на согласование. Файл приложен к сделке.",
+    }
+    try:
+        cs.TOOLS["update_crm_deal"]["handler"](updates)
+    except Exception as exc:  # noqa: BLE001
+        # Файл клиенту уже ушёл — молча терять этот факт нельзя, но и падать поздно.
+        log.warning("договор %s отправлен, но сделка %s не обновлена: %s",
+                    number, deal_id, str(exc)[:200])
+        cs.TOOLS["update_crm_deal"]["handler"]({
+            "deal_id": int(deal_id), "stage": CONTRACT_STAGE,
+            "custom_fields": {CONTRACT_NUMBER_FIELD: number},
+            "comments": f"Договор № {number} отправлен клиенту. Файл приложить не удалось: "
+                        f"{str(exc)[:200]}"})
     journal(MANAGER_CHANNEL, telegram_id, "out", f"[файл] {filename} — на согласование",
             kind="lead_chat", meta={"contract": number, "deal_id": int(deal_id)})
+    gaps = contract_mod.unfilled_placeholders(
+        contract_mod.fill_template(contract_mod.load_template(), fields, number, human_date))
     return {"sent": True, "number": number, "file": filename, "size_bytes": len(pdf),
-            "client_name": fields.get("name"),
-            "note": "PDF ушёл клиенту. Дождись подтверждения, что всё верно, и только потом "
-                    "ставь задачу на подписание."}
+            "client_name": fields.get("name"), "stage": CONTRACT_STAGE,
+            "attached_to_deal": True, "unfilled_in_template": gaps,
+            "note": ("PDF ушёл клиенту, приложен к сделке, стадия сдвинута на подписание. "
+                     "Дождись подтверждения, что всё верно, и только потом ставь задачу на "
+                     "подписание.")
+                    + (f" ВНИМАНИЕ: в шаблоне не заполнено {len(gaps)} мест — скажи об этом "
+                       f"владельцу." if gaps else "")}
 
 
 def telegram_contacts_list() -> dict:

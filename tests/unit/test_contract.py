@@ -80,12 +80,80 @@ def test_complete_requisites_have_no_gaps():
     assert missing_fields(parse_requisites(REAL)) == []
 
 
-def test_pdf_is_built_with_the_client_data():
-    """Договор должен собираться целиком, без участия человека."""
-    pdf = render_contract_pdf("23.07.2026-1", "23 июля 2026 г.", parse_requisites(REAL))
+# Кусок шаблона владельца в том виде, в каком его отдаёт база знаний (с шапкой источника).
+TEMPLATE = """Источник: https://docs.google.com/document/d/XXX/edit
+Обновлено в Google Drive: 2026-07-23T07:31:25.257Z
+Тип: application/vnd.google-apps.document
+
+ДОГОВОР ВОЗМЕЗДНОГО ОКАЗАНИЯ УСЛУГ № {НОМЕР ДОГОВОРА}
+
+Таблица 1
+
+| г. {ГОРОД} | {ДАТА ДОГОВОРА} |
+| --- | --- |
+
+{ИСПОЛНИТЕЛЬ — НАЗВАНИЕ}, ИНН {ИСПОЛНИТЕЛЬ — ИНН}, именуемое «Исполнитель», в лице {ИСПОЛНИТЕЛЬ — ДОЛЖНОСТЬ} {ИСПОЛНИТЕЛЬ — ФИО}, с одной стороны, и
+
+ООО «{НАЗВАНИЕ}», ИНН {ИНН}, КПП {КПП}, ОГРН {ОГРН}, именуемое «Заказчик», в лице {ДОЛЖНОСТЬ} {ФИО}, с другой стороны.
+
+1. ПРЕДМЕТ ДОГОВОРА
+
+1.1. Исполнитель оказывает услуги по подключению к индивидуальным условиям.
+
+Юридический адрес: {АДРЕС}
+Р/с {РАСЧЁТНЫЙ СЧЁТ} в {БАНК}, БИК {БИК}"""
+
+
+def test_template_source_header_is_not_in_the_contract():
+    """База знаний приклеивает к тексту «Источник:» и «Тип:» — клиенту это видеть незачем."""
+    from contract import load_template
+
+    text = load_template(fetch_text=lambda _: TEMPLATE)
+
+    assert "Источник:" not in text and "Обновлено в Google Drive" not in text
+    assert text.startswith("ДОГОВОР ВОЗМЕЗДНОГО")
+
+
+def test_client_placeholders_are_filled_from_requisites():
+    from contract import fill_template
+
+    out = fill_template(TEMPLATE, parse_requisites(REAL), "23.07.2026-1", "23 июля 2026 г.")
+
+    assert "ООО «Альфа Трейд», ИНН 7704123456, КПП 770401001" in out
+    assert "Иванов Иван Иванович" in out
+    assert "40702810912345678901" in out and "АО «Тест Банк»" in out
+    assert "23.07.2026-1" in out and "23 июля 2026 г." in out
+
+
+def test_executor_placeholders_are_not_eaten_by_client_ones():
+    """«{ИСПОЛНИТЕЛЬ — ИНН}» содержит «{ИНН}» — наивная замена подставила бы туда ИНН клиента."""
+    from contract import fill_template
+
+    out = fill_template(TEMPLATE, parse_requisites(REAL), "23.07.2026", "23 июля 2026 г.",
+                        executor={"name": "ООО «АЛБЕРИ»", "inn": "9999999999",
+                                  "director": "Никитенко А.", "position": "Генеральный директор"})
+
+    assert "ООО «АЛБЕРИ», ИНН 9999999999" in out
+    assert "ИНН 7704123456" in out, "ИНН заказчика тоже должен остаться на своём месте"
+
+
+def test_unfilled_placeholders_are_reported():
+    """Владелец должен видеть, что в договоре осталось незаполненным."""
+    from contract import fill_template, unfilled_placeholders
+
+    out = fill_template(TEMPLATE, parse_requisites(REAL), "23.07.2026", "23 июля 2026 г.")
+
+    gaps = unfilled_placeholders(out)
+    assert any("ИСПОЛНИТЕЛЬ" in g for g in gaps), "реквизиты Албери не заданы — это надо видеть"
+
+
+def test_pdf_is_built_from_the_template():
+    """Договор собирается целиком, без участия человека."""
+    pdf = render_contract_pdf("23.07.2026-1", "23 июля 2026 г.", parse_requisites(REAL),
+                              template=TEMPLATE)
 
     assert pdf.startswith(b"%PDF"), "это должен быть настоящий PDF"
-    assert len(pdf) > 8000, "договор из одной страницы — значит текст не попал"
+    assert len(pdf) > 3000
 
 
 def test_pdf_fails_loudly_without_a_cyrillic_font(monkeypatch):
@@ -94,4 +162,5 @@ def test_pdf_fails_loudly_without_a_cyrillic_font(monkeypatch):
 
     monkeypatch.setattr(contract, "_register_fonts", lambda: False)
     with pytest.raises(RuntimeError, match="шрифт"):
-        render_contract_pdf("23.07.2026", "23 июля 2026 г.", parse_requisites(REAL))
+        render_contract_pdf("23.07.2026", "23 июля 2026 г.", parse_requisites(REAL),
+                            template=TEMPLATE)
