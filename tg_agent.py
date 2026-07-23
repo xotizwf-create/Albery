@@ -748,6 +748,67 @@ def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "
 
 
 SIGNING_FIELD = os.getenv("CRM_SIGNING_FIELD", "UF_CRM_F84751395").strip()
+TERMS_SENT_FIELD = os.getenv("CRM_TERMS_SENT_FIELD", "").strip()
+TERMS_DOC_NAME = os.getenv("TERMS_DOC_NAME", "Условия ИУ — текст для клиента").strip()
+TERMS_MARKER = "--- ТЕКСТ КЛИЕНТУ ---"
+TERMS_QUESTION = "Есть вопросы по условиям?"
+
+
+def terms_text() -> str:
+    """Условия для клиента — ДОСЛОВНО из документа владельца в базе знаний.
+
+    Владелец 23.07.2026: агент должен слать условия слово в слово, а не пересказывать. Поэтому
+    текст не идёт через модель: читаем документ и отправляем как есть."""
+    from mcp import context_server as cs
+
+    files = cs.TOOLS["list_company_files"]["handler"]({"limit": 300})
+    wanted = TERMS_DOC_NAME.casefold()
+    match = next((f for f in (files.get("files") or files.get("items") or [])
+                  if wanted in str(f.get("name") or "").casefold() and f.get("google_file_id")),
+                 None)
+    if not match:
+        raise ValueError(f"В базе знаний нет документа «{TERMS_DOC_NAME}» — отправлять нечего.")
+    res = cs.TOOLS["get_company_file"]["handler"]({"google_file_id": match["google_file_id"]})
+    raw = str(res.get("content") or res.get("text") or "")
+    body = raw.split(TERMS_MARKER, 1)[1] if TERMS_MARKER in raw else raw
+    # Служебную шапку базы знаний клиенту показывать нельзя.
+    body = re.sub(r"^(?:Источник|Обновлено в Google Drive|Тип):.*$", "", body,
+                  flags=re.MULTILINE).strip()
+    if not body:
+        raise ValueError(f"Документ «{TERMS_DOC_NAME}» пуст — отправлять нечего.")
+    if "[ЗАПОЛНИТЬ]" in body:
+        # Неполные условия у клиента хуже паузы: молча слать заготовку нельзя.
+        raise ValueError(
+            f"В документе «{TERMS_DOC_NAME}» остались пометки [ЗАПОЛНИТЬ] — условия клиенту не "
+            f"отправлены. Скажи об этом владельцу и попроси дозаполнить документ.")
+    return body
+
+
+def send_terms(deal_id: int, telegram_id: int) -> dict:
+    """Отправить клиенту условия дословно и спросить, есть ли вопросы."""
+    body = terms_text()
+    message = f"{body}\n\n{TERMS_QUESTION}"
+    ok, err = send_html(int(telegram_id), as_html(message), message)
+    if not ok:
+        raise RuntimeError(f"Условия не отправлены: {err}")
+    journal(MANAGER_CHANNEL, telegram_id, "out", message, kind="lead_chat",
+            meta={"terms": True, "deal_id": int(deal_id) if deal_id else None})
+    if deal_id:
+        fields = {TERMS_SENT_FIELD: datetime.now(timezone.utc).strftime("%Y-%m-%d")} \
+            if TERMS_SENT_FIELD else {}
+        try:
+            from mcp import context_server as cs
+            cs.TOOLS["update_crm_deal"]["handler"](
+                {"deal_id": int(deal_id), **({"custom_fields": fields} if fields else {}),
+                 "comments": "Условия отправлены клиенту дословно из документа базы знаний."})
+        except Exception:  # noqa: BLE001 — условия клиенту важнее отметки в CRM
+            log.warning("отметка об отправке условий не записана (сделка %s)", deal_id,
+                        exc_info=True)
+    log.info("условия отправлены клиенту %s (сделка %s), %s символов",
+             telegram_id, deal_id, len(body))
+    return {"sent": True, "chars": len(body), "deal_id": deal_id,
+            "note": ("Условия ушли клиенту дословно, вопрос про вопросы добавлен. Дальше отвечай "
+                     "на его вопросы по базе знаний и не теряй следующий шаг — реквизиты.")}
 
 
 def _enum_label(field: str, value) -> str:
@@ -787,13 +848,35 @@ def funnel_next_step(deal: dict) -> dict:
     has_req = _filled(uf.get(CONTRACT_REQUISITES_FIELD))
     has_contract = _filled(uf.get(CONTRACT_NUMBER_FIELD))
     signing = _enum_label(SIGNING_FIELD, uf.get(SIGNING_FIELD))
+    # Отметку об отправке условий держим в поле сделки, если оно заведено; пока поля нет —
+    # признаком служат уже собранные реквизиты (значит, условия давно позади).
+    terms_sent = _filled(uf.get(TERMS_SENT_FIELD)) if TERMS_SENT_FIELD else has_req
 
     if stage in ("C16:NEW", "C16:CONTACTED"):
-        return {"step": "Сверка анкеты и согласие",
-                "need": "подтверждение данных анкеты и готовность двигаться дальше",
-                "action": (f"Как только клиент подтвердил данные и сказал, что готов — переведи "
-                           f"сделку {deal_id} на стадию C16:S84294149 (update_crm_deal) и в том "
-                           f"же сообщении попроси реквизиты организации для договора.")}
+        return {"step": "Сверка анкеты",
+                "need": "подтверждение данных анкеты",
+                "action": (f"Как только клиент подтвердил данные — переведи сделку {deal_id} на "
+                           f"стадию C16:S84294149 (update_crm_deal) и СРАЗУ вызови "
+                           f"send_terms(deal_id={deal_id}, telegram_id=<id клиента>). Условия "
+                           f"НЕ пересказывай своими словами: инструмент отправит их дословно из "
+                           f"документа и сам спросит, есть ли вопросы.")}
+    if stage == "C16:S84294149" and not terms_sent and not has_req:
+        return {"step": "Отправка условий",
+                "need": "ничего — условия отправляешь ты",
+                "action": (f"Вызови send_terms(deal_id={deal_id}, telegram_id=<id клиента>). "
+                           f"Он отправит условия ДОСЛОВНО и спросит про вопросы. Своими словами "
+                           f"условия не рассказывай и из головы ничего не добавляй. Инструмент "
+                           f"сказал, что в документе пометки [ЗАПОЛНИТЬ] — не отправляй ничего, "
+                           f"сообщи владельцу через ТАКЖЕ_СПРОСИ_ЛЮДЕЙ.")}
+    if stage == "C16:S84294149" and terms_sent and not has_req:
+        return {"step": "Вопросы по условиям",
+                "need": "вопросы клиента по условиям — или его согласие идти дальше",
+                "action": (f"Условия клиент уже получил. Отвечай на его вопросы по базе знаний "
+                           f"(search_company_knowledge), помня весь разговор. Нет фактов — "
+                           f"ТАКЖЕ_СПРОСИ_ЛЮДЕЙ, но разговор продолжай. Когда вопросы "
+                           f"закончились — попроси реквизиты организации для договора; как "
+                           f"придут, запиши в {CONTRACT_REQUISITES_FIELD} сделки {deal_id} и "
+                           f"вызови send_contract.")}
     if stage == "C16:S84294149" and not has_req:
         return {"step": "Сбор реквизитов",
                 "need": "реквизиты организации (название, ИНН, КПП, ОГРН, адрес, р/с, банк, БИК, ФИО директора)",

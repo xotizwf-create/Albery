@@ -15,17 +15,23 @@ def _deal(stage, **uf):
     return {"id": 86, "stage": stage, "custom_fields": uf}
 
 
-def test_new_deal_leads_to_collecting_requisites():
+def test_confirmed_form_leads_to_terms():
+    """С 23.07.2026 между сверкой анкеты и реквизитами стоит отправка условий."""
     st = funnel_next_step(_deal("C16:CONTACTED"))
 
     assert "C16:S84294149" in st["action"]
+    assert "send_terms" in st["action"]
+
+
+def test_requisites_are_asked_after_the_terms_are_discussed(monkeypatch):
+    """Реквизиты идут после условий и ответов на вопросы, а не сразу после анкеты."""
+    import tg_agent
+
+    monkeypatch.setattr(tg_agent, "TERMS_SENT_FIELD", "UF_CRM_TERMS")
+    st = funnel_next_step(_deal("C16:S84294149", **{"UF_CRM_TERMS": "2026-07-23"}))
+
+    assert st["step"] == "Вопросы по условиям"
     assert "реквизиты" in st["action"].lower()
-
-
-def test_requisites_missing_is_the_step():
-    st = funnel_next_step(_deal("C16:S84294149"))
-
-    assert "реквизиты" in st["need"].lower()
     assert "send_contract" in st["action"], "как придут — сразу собрать договор"
 
 

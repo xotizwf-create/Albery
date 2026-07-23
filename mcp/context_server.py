@@ -7514,6 +7514,20 @@ def tool_set_telegram_access(args: dict[str, Any]) -> dict[str, Any]:
                      "человек напишет агенту.")}
 
 
+def tool_send_terms(args: dict[str, Any]) -> dict[str, Any]:
+    """Отправить клиенту условия ДОСЛОВНО из документа базы знаний."""
+    telegram_id = args.get("telegram_id") or args.get("to")
+    if not telegram_id:
+        raise McpError(-32602, "Нужен telegram_id клиента.")
+    try:
+        return app_workflow_function("send_terms")(
+            int(args["deal_id"]) if args.get("deal_id") else 0, int(telegram_id))
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"send_terms failed: {exc}") from exc
+
+
 def tool_notify_client_when_task_done(args: dict[str, Any]) -> dict[str, Any]:
     """Сообщить клиенту, как только сотрудник закроет задачу."""
     task_id = args.get("bitrix_task_id")
@@ -8970,6 +8984,26 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_notify_iu_group,
+    },
+    "send_terms": {
+        "description": (
+            "УСЛОВИЯ КЛИЕНТУ: отправляет текст условий ДОСЛОВНО из документа «Условия ИУ — текст "
+            "для клиента» в базе знаний и сам добавляет вопрос «Есть вопросы по условиям?». "
+            "Вызывай сразу после того, как клиент подтвердил данные анкеты. Своими словами "
+            "условия не пересказывай — для этого и есть инструмент. Если в документе остались "
+            "пометки [ЗАПОЛНИТЬ], инструмент откажет: сообщи об этом владельцу и НИЧЕГО клиенту "
+            "не отправляй."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "telegram_id": {"type": "string", "description": "Telegram id клиента."},
+                "deal_id": {"type": "integer", "description": "Сделка — для отметки об отправке."},
+            },
+            "required": ["telegram_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_send_terms,
     },
     "notify_client_when_task_done": {
         "description": (
