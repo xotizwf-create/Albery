@@ -8199,6 +8199,46 @@ def tool_list_crm_forms(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+CONTRACT_NUMBER_FIELD = os.getenv("CRM_CONTRACT_NUMBER_FIELD", "UF_CRM_F84792019").strip()
+_CONTRACT_SUFFIX_RE = re.compile(r"^(\d{2}\.\d{2}\.\d{4})(?:-(\d+))?$")
+
+
+def next_contract_number(existing: list[str], today: str) -> str:
+    """Номер договора по правилу владельца: первый за день — дата, дальше «дата-1», «дата-2».
+
+    Считаем по УЖЕ выданным номерам, а не по количеству сделок: договор могли отменить, и
+    повторно выданный номер означал бы два разных документа с одним номером."""
+    taken = set()
+    for raw in existing:
+        m = _CONTRACT_SUFFIX_RE.match(str(raw or "").strip().lstrip("№").strip())
+        if m and m.group(1) == today:
+            taken.add(int(m.group(2) or 0))
+    if not taken:
+        return today
+    return f"{today}-{max(taken) + 1}"
+
+
+def tool_next_contract_number(args: dict[str, Any]) -> dict[str, Any]:
+    """Свободный номер договора на сегодня (или на указанную дату)."""
+    from datetime import datetime, timedelta, timezone
+    day = str(args.get("date") or "").strip()
+    if not day:
+        msk = datetime.now(timezone.utc) + timedelta(hours=3)
+        day = msk.strftime("%d.%m.%Y")
+    cat = _crm_resolve_category(args, required=False)
+    filt: dict[str, Any] = {}
+    if cat is not None:
+        filt["CATEGORY_ID"] = int(cat["id"])
+    rows = (_crm_call("crm.deal.list", {"filter": filt, "select": ["ID", CONTRACT_NUMBER_FIELD],
+                                        "order": {"ID": "DESC"}}).get("result") or [])
+    existing = [r.get(CONTRACT_NUMBER_FIELD) for r in rows if r.get(CONTRACT_NUMBER_FIELD)]
+    number = next_contract_number(existing, day)
+    return {"number": number, "date": day, "issued_today": len([
+        n for n in existing if str(n).lstrip("№").strip().startswith(day)]),
+        "note": ("Запиши номер в поле «Договор — номер» сделки СРАЗУ после создания договора, "
+                 "иначе следующий договор получит тот же номер.")}
+
+
 def tool_list_crm_deals(args: dict[str, Any]) -> dict[str, Any]:
     limit = min(int(args.get("limit") or 50), 200)
     offset = max(int(args.get("offset") or 0), 0)
@@ -11152,6 +11192,23 @@ TOOLS: dict[str, dict[str, Any]] = {
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "handler": tool_list_crm_forms,
+    },
+    "next_contract_number": {
+        "description": (
+            "НОМЕР ДОГОВОРА: свободный номер на сегодня по правилу «дата, затем дата-1, дата-2» "
+            "(23.07.2026, 23.07.2026-1). Считает по уже выданным номерам в сделках воронки. "
+            "Вызывай ПЕРЕД созданием договора, затем сразу запиши номер в поле «Договор — номер»."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Дата ДД.ММ.ГГГГ. По умолчанию сегодня (МСК)."},
+                "category_id": {"type": "integer", "description": "id воронки."},
+                "pipeline_name": {"type": "string", "description": "Название воронки."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_next_contract_number,
     },
     "list_crm_deals": {
         "description": (
