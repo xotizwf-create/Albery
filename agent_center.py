@@ -284,6 +284,80 @@ def _telegram_dialogs(q: str, agent: str, kind: str, limit: int) -> list[dict[st
     return out
 
 
+def purge_dialog(channel: str, dialog_id: str = "", username: str = "",
+                 agent: str = "all") -> dict[str, Any]:
+    """НАВСЕГДА удалить переписку из БД — по dialog_id или по @username.
+
+    Нужно, чтобы убирать тестовые прогоны и по требованию человека стирать его переписку.
+    Восстановления нет: журнал — единственное место, где эти сообщения хранятся, поэтому
+    сначала считаем, что попадёт под удаление, и возвращаем это в ответе."""
+    channel = (channel or "telegram").strip().lower()
+    key = str(username or "").lstrip("@").strip().lower()
+    dialog_id = str(dialog_id or "").strip()
+    if not dialog_id and not key:
+        raise ValueError("Укажите dialog_id или username переписки.")
+
+    if channel == "telegram":
+        table, where, params = "telegram_bot_messages", [], []
+        if dialog_id:
+            where.append("dialog_id = %s")
+            params.append(dialog_id)
+        if key:
+            where.append("lower(username) = %s")
+            params.append(key)
+        # dialog_id ИЛИ username: у одного человека это одна и та же переписка, но в старых
+        # записях username мог быть пустым.
+        cond = " OR ".join(where)
+        if agent and agent != "all":
+            cond = f"({cond}) AND bot = %s"
+            params.append(agent)
+    elif channel == "bitrix":
+        if not dialog_id:
+            raise ValueError("Для Битрикса нужен dialog_id.")
+        table, cond, params = "bitrix_bot_messages", "dialog_id = %s", [dialog_id]
+        if agent and agent != "all":
+            cond += " AND agent_slug = %s"
+            params.append(agent)
+    else:
+        raise ValueError(f"Неизвестный канал: {channel}")
+
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) AS n, min(created_at) AS first_at,"
+                        f" max(created_at) AS last_at FROM {table} WHERE {cond}", params)
+            found = cur.fetchone() or {}
+            n = int(found.get("n") or 0)
+            if n:
+                cur.execute(f"DELETE FROM {table} WHERE {cond}", params)
+    logging.info("переписка удалена: канал=%s dialog=%s username=%s сообщений=%s",
+                 channel, dialog_id or "—", key or "—", n)
+    return {"deleted": n, "channel": channel, "dialog_id": dialog_id or None,
+            "username": key or None,
+            "period": [str(found.get("first_at") or "")[:19], str(found.get("last_at") or "")[:19]]
+            if n else [],
+            "note": ("Переписка удалена из базы навсегда." if n
+                     else "Под условие ничего не попало — удалять было нечего.")}
+
+
+@app.delete("/api/agent-center/dialog")
+def agent_center_dialog_delete():
+    """Удалить переписку целиком (кнопка «Удалить переписку» в кабинете)."""
+    args = request.args
+    try:
+        res = purge_dialog(
+            channel=(args.get("channel") or "telegram").strip(),
+            dialog_id=(args.get("dialog_id") or "").strip(),
+            username=(args.get("username") or "").strip(),
+            agent=(args.get("agent") or "all").strip(),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:  # noqa: BLE001
+        logging.exception("agent center: dialog delete failed")
+        return jsonify({"error": "Не удалось удалить переписку."}), 500
+    return jsonify({"ok": True, **res})
+
+
 def _telegram_dialog_messages(dialog_id: str, agent: str):
     """Одна Telegram-переписка целиком — тем же форматом, что и вкладка Bitrix."""
     where = ["dialog_id = %s"]

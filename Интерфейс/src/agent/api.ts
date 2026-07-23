@@ -440,6 +440,23 @@ export async function fetchDialogTurns(
   return (data.turns || []) as DialogTurn[];
 }
 
+/** Удалить переписку из базы НАВСЕГДА. Восстановления нет — спрашивать подтверждение до вызова. */
+export async function deleteDialog(
+  dialogId: string,
+  agent?: string,
+  channel?: string,
+): Promise<{ deleted: number }> {
+  const search = new URLSearchParams({ dialog_id: dialogId });
+  if (agent && agent !== "all") search.set("agent", agent);
+  if (channel && channel.toLowerCase() === "telegram") search.set("channel", "telegram");
+  const data = await fetchJsonSafe(
+    `/api/agent-center/dialog?${search}`,
+    { method: "DELETE" },
+    30000,
+  );
+  return { deleted: Number(data.deleted || 0) };
+}
+
 // --- Telegram access: who may write to each Telegram agent ---
 // Раньше список жил строкой TG_AGENT_OWNER_USERNAMES в .env на сервере и правился только руками.
 

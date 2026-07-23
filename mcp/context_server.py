@@ -7514,6 +7514,25 @@ def tool_set_telegram_access(args: dict[str, Any]) -> dict[str, Any]:
                      "человек напишет агенту.")}
 
 
+def tool_delete_dialog(args: dict[str, Any]) -> dict[str, Any]:
+    """Удалить переписку из журнала НАВСЕГДА."""
+    if args.get("confirm") is not True:
+        raise McpError(-32602,
+                       "Удаление переписки необратимо. Покажи человеку, ЧТО будет удалено "
+                       "(канал, собеседник), и вызови снова с confirm=true.")
+    try:
+        return app_workflow_function("purge_dialog")(
+            str(args.get("channel") or "telegram"),
+            str(args.get("dialog_id") or ""),
+            str(args.get("username") or ""),
+            str(args.get("agent") or "all"),
+        )
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"delete_dialog failed: {exc}") from exc
+
+
 def tool_send_contract(args: dict[str, Any]) -> dict[str, Any]:
     """Собрать договор по реквизитам сделки и отправить клиенту PDF на согласование."""
     deal_id = args.get("deal_id")
@@ -8885,6 +8904,26 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_notify_iu_group,
+    },
+    "delete_dialog": {
+        "description": (
+            "УДАЛИТЬ ПЕРЕПИСКУ из журнала НАВСЕГДА — по dialog_id или @username. "
+            "Восстановления нет: журнал единственное место, где эти сообщения хранятся. "
+            "Сначала покажи человеку, что именно будет удалено, и только потом вызывай с "
+            "confirm=true. Каналы: telegram (по умолчанию) и bitrix."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "telegram | bitrix."},
+                "dialog_id": {"type": "string", "description": "Идентификатор переписки."},
+                "username": {"type": "string", "description": "@username собеседника (telegram)."},
+                "agent": {"type": "string", "description": "Ограничить одним агентом; по умолчанию все."},
+                "confirm": {"type": "boolean", "description": "Обязательное подтверждение удаления."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_delete_dialog,
     },
     "send_contract": {
         "description": (
@@ -11469,6 +11508,7 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
     "list_telegram_contacts",
     "get_telegram_dialog",
     "send_contract",
+    "delete_dialog",
     # Employee dossiers are internal management data — never on the public scoped connectors.
     "get_employee_dossier",
     "update_employee_dossier",

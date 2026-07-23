@@ -13,11 +13,13 @@ import {
   ArrowDown,
   X,
   Check,
+  Trash2,
 } from "lucide-react";
 import {
   fetchAgentDialogs,
   fetchAgents,
   fetchDialogTurns,
+  deleteDialog,
   resolveDialogErrors,
   DialogTurn,
 } from "../api";
@@ -85,6 +87,7 @@ export function DialogsView() {
   });
   const [chatsLoading, setChatsLoading] = useState(true);
   const [turnsLoading, setTurnsLoading] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
   const messagesRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
@@ -296,6 +299,33 @@ export function DialogsView() {
   useEffect(() => {
     if (!activeChatId && visibleChats.length > 0) setActiveChatId(visibleChats[0].id);
   }, [visibleChats, activeChatId]);
+
+  // Удаление переписки необратимо — журнал единственное место, где эти сообщения хранятся.
+  // Поэтому подтверждение с именем собеседника и числом сообщений, а не голое «удалить?».
+  const onDeleteDialog = async () => {
+    if (!activeChatId || !activeChat) return;
+    const sep = activeChatId.indexOf(":");
+    const chatAgentId = activeChatId.slice(0, sep);
+    const chatDialogId = activeChatId.slice(sep + 1);
+    const ok = window.confirm(
+      `Удалить переписку с ${activeChat.userName} (${turns.length} сообщ.) из базы?\n\n` +
+        "Она исчезнет навсегда — восстановить будет нельзя.",
+    );
+    if (!ok) return;
+    setDeleting(true);
+    try {
+      await deleteDialog(chatDialogId, chatAgentId, channel);
+      // Убираем переписку из списка сразу: живой опрос подтвердит это через несколько секунд,
+      // но владелец не должен видеть удалённый диалог в ленте всё это время.
+      setChats((prev) => prev.filter((c) => c.id !== activeChatId));
+      setActiveChatId(null);
+      setTurns([]);
+    } catch {
+      window.alert("Не удалось удалить переписку. Попробуйте ещё раз.");
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   useEffect(() => {
     if (!activeChatId) {
@@ -617,9 +647,21 @@ export function DialogsView() {
                   </div>
                 </div>
               </div>
-              <div className="flex items-center gap-2 px-4 py-2 text-[13px] font-bold text-gray-400 bg-white border border-gray-100 rounded-xl">
-                {activeChat.taskId ? `в задаче #${activeChat.taskId}` : `диалог ${activeChat.dialogId}`}
-                <ExternalLink className="w-4 h-4" />
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 px-4 py-2 text-[13px] font-bold text-gray-400 bg-white border border-gray-100 rounded-xl">
+                  {activeChat.taskId ? `в задаче #${activeChat.taskId}` : `диалог ${activeChat.dialogId}`}
+                  <ExternalLink className="w-4 h-4" />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void onDeleteDialog()}
+                  disabled={deleting}
+                  title="Удалить переписку из базы навсегда"
+                  className="flex items-center gap-2 px-3 py-2 text-[13px] font-bold text-gray-400 bg-white border border-gray-100 rounded-xl hover:text-red-600 hover:border-red-200 disabled:opacity-50"
+                >
+                  {deleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                  Удалить
+                </button>
               </div>
             </div>
 
