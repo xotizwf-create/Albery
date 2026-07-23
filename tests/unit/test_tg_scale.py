@@ -207,6 +207,34 @@ def test_next_stage_moves_through_http_mcp(tg, monkeypatch):
     assert moved[0][1]["deal_id"] == 86 and moved[0][1]["stage"] == "C16:FINAL_INVOICE"
 
 
+def test_task_status_is_plain_http_without_risky_imports(tg, monkeypatch):
+    """Прод 23.07.2026: `from bitrix import BitrixClient` в процессе tg-агента упал циклическим
+    импортом, и сторож не смог узнать статус НИ ОДНОЙ задачи. Статус обязан браться голым HTTP —
+    как mcp_call, и с фолбэком на B24_TESTBOT_WEBHOOK_BASE (BITRIX_WEBHOOK_BASE на боксе пуст)."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "bitrix", None)   # любой импорт bitrix здесь — ошибка
+    monkeypatch.delenv("BITRIX_WEBHOOK_BASE", raising=False)
+    monkeypatch.setenv("B24_TESTBOT_WEBHOOK_BASE", "https://portal/rest/1/key")
+
+    class R:
+        status_code = 200
+        text = '{"result": {"task": {"id": 2006, "status": "5"}}}'
+
+        def json(self):
+            import json as j
+            return j.loads(self.text)
+
+    seen = {}
+    monkeypatch.setattr(tg.requests, "get",
+                        lambda url, params=None, timeout=0: seen.update(url=url) or R())
+
+    st = tg._task_status(2006)
+
+    assert st == {"status": "5"}
+    assert "tasks.task.get" in seen["url"] and seen["url"].startswith("https://portal/")
+
+
 def _fake_db(rows, updates):
     """БД-заглушка: выдаёт ожидания и запоминает изменения."""
     import contextlib

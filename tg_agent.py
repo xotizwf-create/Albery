@@ -1180,11 +1180,28 @@ _TASK_DONE_STATUSES = {"4", "5"}
 
 
 def _task_status(task_id: int) -> dict:
-    """Статус задачи напрямую через REST — на случай, если инструмента чтения задач нет."""
-    from bitrix import BitrixClient
-    cli = BitrixClient(os.getenv("BITRIX_WEBHOOK_BASE", "").strip())
-    res = cli.call("tasks.task.get", {"taskId": int(task_id), "select": ["ID", "STATUS"]})
-    task = (((res or {}).get("result") or {}).get("task")) or {}
+    """Статус задачи голым HTTP к вебхуку Битрикса.
+
+    Никаких импортов bitrix/context_server: в процессе tg-агента импорт bitrix циклится
+    («partially initialized module» — поймано сторожем на проде 23.07.2026), а context_server
+    запускает живые планировщики. На этом боксе BITRIX_WEBHOOK_BASE пуст, рабочий вебхук —
+    B24_TESTBOT_WEBHOOK_BASE (тот же, которым ходит _b24_webhook_call в MCP)."""
+    base = ""
+    for env_name in ("BITRIX_WEBHOOK_BASE", "B24_TESTBOT_WEBHOOK_BASE"):
+        base = (os.getenv(env_name) or "").strip().rstrip("/")
+        if base:
+            break
+    if not base:
+        raise RuntimeError("ни BITRIX_WEBHOOK_BASE, ни B24_TESTBOT_WEBHOOK_BASE не заданы")
+    resp = requests.get(f"{base}/tasks.task.get.json", params={"taskId": int(task_id)},
+                        timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"tasks.task.get: HTTP {resp.status_code} {resp.text[:200]}")
+    data = resp.json() if (resp.text or "").strip() else {}
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(f"tasks.task.get: {data.get('error')} "
+                           f"{data.get('error_description') or ''}".strip())
+    task = (((data or {}).get("result") or {}).get("task")) or {}
     return {"status": str(task.get("status") or "")}
 
 
