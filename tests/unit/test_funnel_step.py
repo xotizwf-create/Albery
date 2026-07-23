@@ -64,13 +64,17 @@ def test_deal_id_is_read_from_any_of_the_crm_shapes():
         assert "deal_id=86" in st["action"], key
 
 
-def test_after_the_method_is_chosen_the_task_must_exist():
+def test_after_the_method_is_chosen_the_task_must_exist(monkeypatch):
+    monkeypatch.setattr("mcp.context_server._crm_enum_items",
+                        lambda: {SIGNING_FIELD: {"эдо": "84", "бумага": "86"}})
     st = funnel_next_step(_deal("C16:NDA", **{CONTRACT_REQUISITES_FIELD: "ИНН",
                                               CONTRACT_NUMBER_FIELD: "23.07.2026",
-                                              SIGNING_FIELD: "ЭДО"}))
+                                              SIGNING_FIELD: "84"}))
 
     assert st["step"] == "Договор на подписании"
     assert "не поставлена" in st["action"], "страховка на случай, если задачу всё же забыли"
+    assert "(ЭДО)" in st["action"], "агент не должен говорить клиенту «способ подписания 84»"
+    assert "84" not in st["action"]
 
 
 def test_payment_is_confirmed_only_by_the_accountant():

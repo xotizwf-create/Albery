@@ -750,6 +750,23 @@ def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "
 SIGNING_FIELD = os.getenv("CRM_SIGNING_FIELD", "UF_CRM_F84751395").strip()
 
 
+def _enum_label(field: str, value) -> str:
+    """Название варианта вместо его id.
+
+    В сделке поле-список хранит id («84»), и агент сказал бы клиенту «способ подписания 84»."""
+    if not _filled(value):
+        return ""
+    try:
+        from mcp import context_server as cs
+        items = cs._crm_enum_items().get(field.upper()) or {}
+        for label, item_id in items.items():
+            if str(item_id) == str(value).strip():
+                return label.upper() if len(label) <= 4 else label.capitalize()
+    except Exception:  # noqa: BLE001 — без словаря покажем как есть
+        pass
+    return str(value).strip()
+
+
 def _filled(value) -> bool:
     """Заполнено ли поле сделки.
 
@@ -769,7 +786,7 @@ def funnel_next_step(deal: dict) -> dict:
     deal_id = deal.get("deal_id") or deal.get("id") or deal.get("ID")
     has_req = _filled(uf.get(CONTRACT_REQUISITES_FIELD))
     has_contract = _filled(uf.get(CONTRACT_NUMBER_FIELD))
-    signing = uf.get(SIGNING_FIELD) if _filled(uf.get(SIGNING_FIELD)) else ""
+    signing = _enum_label(SIGNING_FIELD, uf.get(SIGNING_FIELD))
 
     if stage in ("C16:NEW", "C16:CONTACTED"):
         return {"step": "Сверка анкеты и согласие",
