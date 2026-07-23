@@ -749,6 +749,15 @@ def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "
 
 SIGNING_FIELD = os.getenv("CRM_SIGNING_FIELD", "UF_CRM_F84751395").strip()
 
+
+def _filled(value) -> bool:
+    """Заполнено ли поле сделки.
+
+    Незаполненный список Битрикса приходит НУЛЁМ, а не пустотой: строка «0» правдива, и агент
+    счёл бы способ подписания выбранным, хотя клиент его не называл (23.07.2026)."""
+    text = str(value if value is not None else "").strip()
+    return bool(text) and text not in {"0", "None", "[]", "{}"}
+
 # Маршрут воронки: стадия → что уже должно быть сделано и что делать дальше. Считается по
 # ФАКТАМ сделки, а не по памяти агента: 23.07.2026 клиент спросил «а что такое ЭДО?», агент
 # ответил — и забыл, что за ответом «давайте ЭДО» должна была идти задача на отправку. Любое
@@ -756,11 +765,11 @@ SIGNING_FIELD = os.getenv("CRM_SIGNING_FIELD", "UF_CRM_F84751395").strip()
 def funnel_next_step(deal: dict) -> dict:
     """Что агент обязан сделать на текущем шаге сделки."""
     uf = deal.get("custom_fields") or {}
-    stage = str(deal.get("stage") or deal.get("stage_id") or "")
-    deal_id = deal.get("id") or deal.get("ID")
-    has_req = bool(str(uf.get(CONTRACT_REQUISITES_FIELD) or "").strip())
-    has_contract = bool(str(uf.get(CONTRACT_NUMBER_FIELD) or "").strip())
-    signing = str(uf.get(SIGNING_FIELD) or "").strip()
+    stage = str(deal.get("stage_id") or deal.get("stage") or "")
+    deal_id = deal.get("deal_id") or deal.get("id") or deal.get("ID")
+    has_req = _filled(uf.get(CONTRACT_REQUISITES_FIELD))
+    has_contract = _filled(uf.get(CONTRACT_NUMBER_FIELD))
+    signing = uf.get(SIGNING_FIELD) if _filled(uf.get(SIGNING_FIELD)) else ""
 
     if stage in ("C16:NEW", "C16:CONTACTED"):
         return {"step": "Сверка анкеты и согласие",

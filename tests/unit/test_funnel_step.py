@@ -47,6 +47,23 @@ def test_signing_method_is_the_pending_step_until_it_is_recorded():
     assert "вопросы" in st["action"], "агент предупреждён, что вопросы по дороге не отменяют шаг"
 
 
+def test_unset_enumeration_field_is_not_a_choice():
+    """Незаполненный список Битрикса приходит нулём — «0» это НЕ выбранный способ подписания."""
+    st = funnel_next_step(_deal("C16:NDA", **{CONTRACT_REQUISITES_FIELD: "ИНН",
+                                              CONTRACT_NUMBER_FIELD: "23.07.2026",
+                                              SIGNING_FIELD: "0"}))
+
+    assert st["step"] == "Выбор способа подписания", "иначе шаг считался бы пройденным"
+
+
+def test_deal_id_is_read_from_any_of_the_crm_shapes():
+    """list_crm_deals отдаёт deal_id, get_crm_deal — id: шаг не должен зависеть от формы ответа."""
+    for key in ("deal_id", "id", "ID"):
+        st = funnel_next_step({key: 86, "stage_id": "C16:S84294149",
+                               "custom_fields": {CONTRACT_REQUISITES_FIELD: "ИНН"}})
+        assert "deal_id=86" in st["action"], key
+
+
 def test_after_the_method_is_chosen_the_task_must_exist():
     st = funnel_next_step(_deal("C16:NDA", **{CONTRACT_REQUISITES_FIELD: "ИНН",
                                               CONTRACT_NUMBER_FIELD: "23.07.2026",
