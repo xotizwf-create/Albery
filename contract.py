@@ -133,15 +133,46 @@ CLIENT_PLACEHOLDERS = {
 CLIENT_DEFAULTS = {"position": "Генеральный директор", "basis": "Устава"}
 
 
-def load_template(fetch_text=None) -> str:
+TEMPLATE_NAME = os.getenv("CONTRACT_TEMPLATE_NAME", "Шаблон договора ИУ").strip()
+
+
+def find_template_id(list_files=None) -> str:
+    """id документа шаблона — СНАЧАЛА по имени, и лишь потом жёстко прошитый.
+
+    Владелец подгружает новый шаблон в ту же папку, и у нового файла другой id. Привязка
+    только к id означала бы, что агент молча продолжит собирать договор по старому документу."""
+    if list_files is None:
+        from mcp import context_server as cs
+
+        def list_files() -> list[dict]:
+            res = cs.TOOLS["list_company_files"]["handler"]({"limit": 300})
+            return list(res.get("files") or res.get("items") or [])
+    try:
+        wanted = TEMPLATE_NAME.casefold()
+        matches = [f for f in list_files()
+                   if wanted in str(f.get("name") or "").casefold()
+                   and f.get("google_file_id")]
+        if matches:
+            # Несколько подходящих — берём самый свежий: это и есть «подгрузил новый шаблон».
+            matches.sort(key=lambda f: str(f.get("updated_at") or f.get("modified_at") or ""),
+                         reverse=True)
+            return str(matches[0]["google_file_id"])
+    except Exception:  # noqa: BLE001 — поиск по имени не должен ронять сборку договора
+        import logging
+        logging.warning("шаблон договора по имени не найден, беру прошитый id", exc_info=True)
+    return TEMPLATE_DOC_ID
+
+
+def load_template(fetch_text=None, doc_id: str | None = None) -> str:
     """Текст шаблона договора из базы знаний. fetch_text — для тестов без Drive."""
     if fetch_text is None:
         from mcp import context_server as cs
 
-        def fetch_text(doc_id: str) -> str:
-            res = cs.TOOLS["get_company_file"]["handler"]({"google_file_id": doc_id})
+        def fetch_text(d_id: str) -> str:
+            res = cs.TOOLS["get_company_file"]["handler"]({"google_file_id": d_id})
             return str(res.get("content") or res.get("text") or "")
-    text = fetch_text(TEMPLATE_DOC_ID)
+        doc_id = doc_id or find_template_id()
+    text = fetch_text(doc_id or TEMPLATE_DOC_ID)
     if not text.strip():
         raise RuntimeError(f"Шаблон договора ({TEMPLATE_DOC_ID}) пуст или недоступен.")
     return _SOURCE_HEADER_RE.sub("", text).strip()
@@ -196,6 +227,33 @@ EXECUTOR_DEFAULTS = {
 
 CR, NL = chr(13), chr(10)
 
+_APPENDIX_RE = re.compile(r"^(?:Приложение|ПРИЛОЖЕНИЕ)\s*(?:№|N)", re.I)
+# Маркеры списка из Google Docs: ●, •, ‒ и таб/пробел после них.
+_BULLET_RE = re.compile(r"^[●•‣◦▪·]\s*(.+)$")
+# Заголовок раздела с одноуровневым номером: «1. Предмет договора». Двухуровневый («1.1.») —
+# это пункт, а не заголовок, и точка в конце тоже выдаёт обычный текст.
+_SECTION_RE = re.compile(r"^\d{1,2}\.?\s+\S")
+_CLAUSE_RE = re.compile(r"^\d{1,2}\.\d")
+_TITLE_RE = re.compile(r"^(?:договор|контракт|соглашение)\b", re.I)
+
+
+def _line_kind(line: str, seen_any: bool) -> str:
+    """Заголовок, титул или обычный абзац.
+
+    Капс — не единственный признак: в чужом шаблоне заголовки бывают обычным регистром
+    («1. Предмет договора»), и раньше они уезжали в текст (проверено 23.07.2026)."""
+    letters = [c for c in line if c.isalpha()]
+    all_caps = bool(letters) and all(c.isupper() for c in letters)
+    if _TITLE_RE.match(line) and not seen_any and len(line) < 120:
+        return "title"
+    if all_caps and len(line) < 120:
+        return "head"
+    # Короткая строка с одноуровневым номером и без точки в конце — заголовок раздела.
+    if (_SECTION_RE.match(line) and not _CLAUSE_RE.match(line)
+            and len(line) < 90 and not line.rstrip().endswith(".")):
+        return "head"
+    return "body"
+
 
 def parse_blocks(text: str) -> list[tuple[str, Any]]:
     """Текст шаблона → блоки для вёрстки: заголовок, абзац, таблица, разрыв страницы.
@@ -217,15 +275,15 @@ def parse_blocks(text: str) -> list[tuple[str, Any]]:
                 blocks.append(("table", [c.replace(CR, NL).strip() for c in cells]))
             continue
         line = line.lstrip("#").strip()
-        if line.startswith("Приложение №"):
+        if _APPENDIX_RE.match(line):
             blocks.append(("pagebreak", ""))
             blocks.append(("head", line))
             continue
-        letters = [c for c in line if c.isalpha()]
-        if letters and all(c.isupper() for c in letters) and len(line) < 120:
-            blocks.append(("title" if "ДОГОВОР ВОЗМЕЗДНОГО" in line else "head", line))
-        else:
-            blocks.append(("body", line))
+        bullet = _BULLET_RE.match(line)
+        if bullet:
+            blocks.append(("bullet", bullet.group(1).strip()))
+            continue
+        blocks.append((_line_kind(line, bool(blocks)), line))
     return blocks
 
 
@@ -247,6 +305,10 @@ def build_styles() -> dict[str, Any]:
                                 alignment=TA_CENTER, firstLineIndent=0, spaceAfter=12),
         "cell": ParagraphStyle("cell", parent=base, firstLineIndent=0, alignment=0,
                                fontSize=10, leading=13, spaceAfter=0),
+        # Пункт списка: маркер рисует reportlab, из текста он убран — иначе «●» с табом
+        # уезжал в PDF как есть.
+        "bullet": ParagraphStyle("bullet", parent=base, firstLineIndent=0,
+                                 leftIndent=1.25 * cm, bulletIndent=0.5 * cm, spaceAfter=3),
     }
 
 
@@ -304,6 +366,8 @@ def render_contract_pdf(number: str, date: str, client: dict[str, str],
             ]))
             story.append(table if short else KeepTogether(table))
             story.append(Spacer(1, 8))
+        elif kind == "bullet":
+            story.append(Paragraph(escape(value), styles["bullet"], bulletText="—"))
         else:
             story.append(Paragraph(escape(value), styles[kind]))
     doc.build(story)

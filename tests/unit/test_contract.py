@@ -216,6 +216,96 @@ def test_section_headings_are_recognised():
     assert blocks[0][0] == "head" and blocks[1][0] == "body"
 
 
+# --- другой шаблон: заголовки не капсом, маркированные списки -------------------------------
+
+def test_headings_without_caps_are_recognised():
+    """Владелец может подгрузить шаблон, где разделы названы обычным регистром."""
+    from contract import parse_blocks
+
+    blocks = parse_blocks("1. Предмет договора\n"
+                          "1.1. Исполнитель оказывает услуги по подключению.\n"
+                          "2. Стоимость и порядок расчётов")
+
+    kinds = [k for k, _ in blocks]
+    assert kinds == ["head", "body", "head"], "пункт «1.1.» — текст, а «1.»/«2.» — заголовки"
+
+
+def test_clause_is_never_mistaken_for_a_heading():
+    """Иначе каждый пункт договора печатался бы жирным по центру."""
+    from contract import parse_blocks
+
+    blocks = parse_blocks("5.2. Стороны признают юридическую силу документов")
+
+    assert blocks[0][0] == "body"
+
+
+def test_title_is_recognised_in_any_case():
+    from contract import parse_blocks
+
+    for line in ("Договор оказания услуг № 24.07.2026",
+                 "ДОГОВОР ВОЗМЕЗДНОГО ОКАЗАНИЯ УСЛУГ № 1"):
+        assert parse_blocks(line)[0][0] == "title", line
+
+
+def test_bullet_markers_do_not_leak_into_the_pdf():
+    """Маркеры ● из Google Docs раньше уходили клиенту как символы в тексте."""
+    from contract import parse_blocks
+
+    blocks = parse_blocks("●\tпервый пункт\n• второй пункт")
+
+    assert blocks == [("bullet", "первый пункт"), ("bullet", "второй пункт")]
+
+
+def test_a_foreign_template_renders_without_losing_structure():
+    """Сквозная проверка: чужой шаблон должен собраться со всеми видами блоков."""
+    from contract import parse_blocks, render_contract_pdf
+
+    other = ("Договор оказания услуг № {НОМЕР ДОГОВОРА}\n\n"
+             "| г. {ГОРОД} | {ДАТА ДОГОВОРА} |\n\n"
+             "1. Предмет договора\n\n"
+             "1.1. Исполнитель оказывает услуги.\n\n"
+             "●\tпервый пункт\n\n"
+             "Приложение № 1 к договору\n\n"
+             "| Исполнитель\rИНН 1 | Заказчик\rИНН {ИНН} |")
+
+    kinds = [k for k, _ in parse_blocks(other)]
+    assert kinds == ["title", "table", "head", "body", "bullet", "pagebreak", "head", "table"]
+
+    pdf = render_contract_pdf("24.07.2026", "24 июля 2026 г.", parse_requisites(REAL),
+                              template=other)
+    assert pdf.startswith(b"%PDF")
+
+
+def test_template_is_found_by_name_not_only_by_id():
+    """Подгружённый заново шаблон получает НОВЫЙ id — иначе агент собирал бы старый договор."""
+    from contract import find_template_id
+
+    files = [{"name": "Что отвечать лидам", "google_file_id": "old-1"},
+             {"name": "Шаблон договора ИУ", "google_file_id": "new-42",
+              "updated_at": "2026-07-24T10:00:00Z"}]
+
+    assert find_template_id(list_files=lambda: files) == "new-42"
+
+
+def test_newest_template_wins_when_several_match():
+    from contract import find_template_id
+
+    files = [{"name": "Шаблон договора ИУ", "google_file_id": "a", "updated_at": "2026-07-01"},
+             {"name": "Шаблон договора ИУ (новый)", "google_file_id": "b",
+              "updated_at": "2026-07-24"}]
+
+    assert find_template_id(list_files=lambda: files) == "b"
+
+
+def test_missing_template_falls_back_to_the_pinned_id():
+    """Сбой поиска не должен ронять сборку договора."""
+    from contract import TEMPLATE_DOC_ID, find_template_id
+
+    assert find_template_id(list_files=lambda: []) == TEMPLATE_DOC_ID
+    assert find_template_id(
+        list_files=lambda: (_ for _ in ()).throw(RuntimeError("нет связи"))) == TEMPLATE_DOC_ID
+
+
 def test_pdf_fails_loudly_without_a_cyrillic_font(monkeypatch):
     """Молчаливая подмена шрифта дала бы клиенту договор из кракозябр."""
     import contract
