@@ -7866,7 +7866,55 @@ def _crm_custom_fields_arg(args: dict[str, Any]) -> dict[str, Any]:
     if bad:
         raise McpError(-32602, "custom_fields: коды должны начинаться с UF_ (получены: %s). "
                                "Реальные коды — list_crm_deal_fields." % ", ".join(map(str, bad)))
-    return {str(k).upper(): v for k, v in custom.items()}
+    return _crm_resolve_enum_values({str(k).upper(): v for k, v in custom.items()})
+
+
+_CRM_ENUM_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
+
+
+def _crm_enum_items() -> dict[str, dict[str, str]]:
+    """Поля-списки сделок: код поля → {название варианта в нижнем регистре: его id}."""
+    now = time.time()
+    if now - float(_CRM_ENUM_CACHE["at"] or 0) < 300 and _CRM_ENUM_CACHE["map"]:
+        return _CRM_ENUM_CACHE["map"]
+    out: dict[str, dict[str, str]] = {}
+    try:
+        rows = _crm_call("crm.deal.userfield.list", {}).get("result") or []
+        for f in rows:
+            if str(f.get("USER_TYPE_ID") or "") != "enumeration":
+                continue
+            code = str(f.get("FIELD_NAME") or "").upper()
+            out[code] = {str(i.get("VALUE") or "").strip().lower(): str(i.get("ID"))
+                         for i in (f.get("LIST") or []) if i.get("ID")}
+    except Exception:  # noqa: BLE001 — без словаря значение уйдёт как есть, как и раньше
+        logging.warning("crm: список вариантов полей не получен", exc_info=True)
+        return _CRM_ENUM_CACHE["map"] or {}
+    _CRM_ENUM_CACHE.update({"at": now, "map": out})
+    return out
+
+
+def _crm_resolve_enum_values(fields: dict[str, Any]) -> dict[str, Any]:
+    """Подменить НАЗВАНИЕ варианта списка на его id.
+
+    Битрикс принимает в поле-списке только числовой id варианта: строка «ЭДО» молча не
+    сохранялась, поле оставалось пустым, и шаг воронки считался невыполненным вечно —
+    на каждое сообщение клиента ставилась бы новая задача (23.07.2026)."""
+    enums = _crm_enum_items()
+    if not enums:
+        return fields
+    out = dict(fields)
+    for code, value in fields.items():
+        items = enums.get(code)
+        if not items or not isinstance(value, str):
+            continue
+        key = value.strip().lower()
+        if key in items:
+            out[code] = items[key]
+        elif value.strip() and not value.strip().isdigit():
+            raise McpError(-32602,
+                           f"Поле {code} — список; «{value}» не входит в его варианты: "
+                           + ", ".join(sorted(items)) + ".")
+    return out
 
 
 def _crm_deal_brief(row: dict[str, Any], names: dict[str, Any] | None = None) -> dict[str, Any]:
