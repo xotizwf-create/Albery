@@ -25,6 +25,17 @@ os.environ.setdefault("MCP_SHARED_SECRET", "test-mcp-secret")
 os.environ.setdefault("MCP_FAQ_SHARED_SECRET", "test-faq-secret")
 
 
+@pytest.fixture(autouse=True)
+def _fast_reply_debounce(monkeypatch):
+    """Пауза-добор пачки сообщений в tg-агенте — символическая.
+
+    Боевые 8 секунд на каждый вызов maybe_autoreply растянули бы прогон на минуты:
+    только test_tg_lead_invite зовёт его ~30 раз."""
+    import tg_agent
+
+    monkeypatch.setattr(tg_agent, "_REPLY_DEBOUNCE_S", 0.02, raising=False)
+
+
 @pytest.fixture(scope="session")
 def ctx():
     """The MCP context server module (full tool registry + dispatch)."""

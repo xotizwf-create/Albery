@@ -29,6 +29,8 @@ def tg(monkeypatch, tmp_path):
     # Отвечаем только лидам воронки — здесь проверяется сам механизм автоответа, поэтому
     # собеседник считается лидом. Сам белый список проверяется в test_tg_lead_whitelist.
     monkeypatch.setattr(tg_agent, "crm_lead_usernames", lambda force=False: {"lead": 82})
+    # Пауза-добор пачки в тестах — символическая, иначе каждый тест ждал бы живые секунды.
+    monkeypatch.setattr(tg_agent, "_REPLY_DEBOUNCE_S", 0.02)
     return tg_agent
 
 
@@ -196,3 +198,115 @@ def test_plain_answer_without_a_tool_is_still_sent(tg, monkeypatch):
     tg.maybe_autoreply(_incoming(text="Здравствуйте"))
 
     assert any("оборот" in t for t in outbox), "обычный ответ модели должен дойти до клиента"
+
+
+# --- пачка сообщений подряд = один человечный ответ (владелец, 23.07.2026) --------------------
+
+def test_burst_of_messages_gets_one_combined_answer(tg, monkeypatch):
+    """Диалог 23.07.2026, записи 218–225: клиент писал быстрее, чем агент отвечал, каждое
+    сообщение уходило в отдельный ход — вопросы накладывались, реквизиты просились дважды.
+    Несколько сообщений подряд обязаны попасть В ОДИН ход и получить ОДИН ответ."""
+    import threading
+    import time as _time
+
+    prompts, outbox = [], []
+    monkeypatch.setattr(tg, "_REPLY_DEBOUNCE_S", 0.15)
+    monkeypatch.setattr(tg, "hermes_answer",
+                        lambda p, s, toolsets=None: prompts.append(p) or "Отвечаю на всё сразу")
+    monkeypatch.setattr(tg, "send_as_account",
+                        lambda uid, t, parse_mode="": (outbox.append(t), (True, ""))[1])
+
+    msgs = [_incoming(text="Нет, вопросов нет"), _incoming(text="Да, давайте начинать"),
+            _incoming(text="Да, подходят")]
+    threads = []
+    for m in msgs:
+        threads.append(threading.Thread(target=tg.maybe_autoreply, args=(m,)))
+        threads[-1].start()
+        _time.sleep(0.02)      # клиент «печатает» следующие сообщения во время паузы-добора
+    for t in threads:
+        t.join(timeout=5)
+
+    assert len(prompts) == 1, "три сообщения подряд — это ОДИН ход, а не три"
+    assert all(m["text"] in prompts[0] for m in msgs), "в промпте должна быть вся пачка"
+    assert "одним сообщением" in prompts[0], "модели явно сказано ответить на всё разом"
+    assert len(outbox) == 1, "клиент получает один ответ на пачку"
+
+
+def test_message_after_the_turn_starts_goes_to_the_next_turn(tg, monkeypatch):
+    """Сообщение, пришедшее когда пачка уже забрана, не теряется — его берёт следующий ход."""
+    import threading
+    import time as _time
+
+    prompts = []
+
+    def slow_brain(p, s, toolsets=None):
+        prompts.append(p)
+        _time.sleep(0.2)       # ход «думает» — в это время клиент пишет ещё
+        return "ответ"
+
+    monkeypatch.setattr(tg, "_REPLY_DEBOUNCE_S", 0.02)
+    monkeypatch.setattr(tg, "hermes_answer", slow_brain)
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
+
+    t1 = threading.Thread(target=tg.maybe_autoreply, args=(_incoming(text="первое"),))
+    t1.start()
+    _time.sleep(0.12)          # пауза-добор прошла, ход уже думает
+    t2 = threading.Thread(target=tg.maybe_autoreply, args=(_incoming(text="второе"),))
+    t2.start()
+    t1.join(timeout=5); t2.join(timeout=5)
+
+    assert len(prompts) == 2, "второе сообщение обязано получить свой ход"
+    assert "первое" in prompts[0] and "второе" in prompts[1]
+
+
+def test_style_rules_reach_the_model(tg, monkeypatch):
+    """Владелец 23.07.2026: «не надо каждый раз Александр, Александр». Правила живого тона
+    обязаны попадать в каждый промпт лида."""
+    prompts = []
+    monkeypatch.setattr(tg, "hermes_answer",
+                        lambda p, s, toolsets=None: prompts.append(p) or "ок")
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
+
+    tg.maybe_autoreply(_incoming(text="Здравствуйте"))
+
+    assert prompts and "НЕ начинай сообщение с имени клиента" in prompts[0]
+
+
+def test_fresh_deal_is_picked_up_without_waiting_for_cache(tg, monkeypatch):
+    """Клиент заполнил анкету — сделка появилась сию секунду, а кэш лидов живёт 5 минут.
+    23.07.2026 агент из-за этого говорил с готовым лидом как с незнакомцем. При промахе и
+    несвежем кэше список обязан перечитаться из CRM немедленно."""
+    import time as _time
+
+    calls = []
+
+    def fake_leads(force=False):
+        calls.append(force)
+        return {"newlead": 95} if force else {}
+
+    monkeypatch.setattr(tg, "crm_lead_usernames", fake_leads)
+    monkeypatch.setitem(tg._LEADS_CACHE, "at", _time.time() - 120)   # кэш старше минуты
+
+    assert tg.lead_deal_for_username("newlead") == 95
+    assert True in calls, "при промахе обязан быть force-перечит CRM"
+
+
+def test_stranger_incoming_is_journaled_even_when_narration_suppressed(tg, monkeypatch):
+    """23.07.2026: инструмент отправил условия, реплика модели погашена — и сообщение клиента
+    ИСЧЕЗЛО из журнала: в кабинете условия выглядели отправленными «из ниоткуда»."""
+    ledger = _shared_journal(tg, monkeypatch)
+    monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {})   # в воронке нет
+    monkeypatch.setattr(tg, "crm_leads_reachable", lambda: True)
+    monkeypatch.setenv("TG_LEAD_INVITE", "1")
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
+
+    def brain(prompt, session, toolsets=None):
+        tg.journal(tg.MANAGER_CHANNEL, 1451982360, "out", "Условия дословно… Есть вопросы?",
+                   meta={"terms": True})
+        return "Условия отправили вам сюда."
+
+    monkeypatch.setattr(tg, "hermes_answer", brain)
+    tg.maybe_autoreply(_incoming(text="Да, всё верно, присылайте"))
+
+    ins = [r for r in ledger if r["direction"] == "in"]
+    assert ins, "входящее клиента обязано остаться в журнале, даже когда реплика погашена"

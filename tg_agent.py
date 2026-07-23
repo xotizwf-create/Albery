@@ -172,7 +172,7 @@ def journal(bot: str, dialog_id, direction: str, text: str, *, kind: str = "bot_
         log.warning("журнал Telegram недоступен", exc_info=True)
 
 
-def chat_history(bot: str, dialog_id, current_text: str = "", limit: int = 12) -> str:
+def chat_history(bot: str, dialog_id, current_text: str | list = "", limit: int = 12) -> str:
     """Последние сообщения этого диалога — чтобы агент помнил, о чём уже говорили.
 
     Без истории каждый ход был чистым листом: клиент здоровался, агент отвечал «Здравствуйте!»,
@@ -195,9 +195,11 @@ def chat_history(bot: str, dialog_id, current_text: str = "", limit: int = 12) -
     except Exception:  # noqa: BLE001 — без истории агент ответит хуже, но ответит
         log.warning("история диалога %s недоступна", dialog_id, exc_info=True)
         return ""
-    # Текущее сообщение уже могло попасть в журнал — в промпте оно идёт отдельно, дублировать
-    # его в истории значит показать агенту, будто клиент написал это дважды.
-    while rows and rows[-1]["direction"] == "in" and (rows[-1]["text"] or "").strip() == (current_text or "").strip():
+    # Текущие сообщения (одно или пачка) уже могли попасть в журнал — в промпте они идут
+    # отдельно, дублировать их в истории значит показать агенту, будто клиент написал дважды.
+    current = ([current_text] if isinstance(current_text, str) else list(current_text or []))
+    current_set = {t.strip() for t in current if t and t.strip()}
+    while rows and rows[-1]["direction"] == "in" and (rows[-1]["text"] or "").strip() in current_set:
         rows.pop()
     if not rows:
         return ""
@@ -1597,18 +1599,31 @@ def crm_leads_reachable() -> bool:
     return bool(_LEADS_CACHE.get("ok"))
 
 
-def lead_deal_for_username(username: str) -> int | None:
-    """Номер сделки, если этот человек — лид воронки. Иначе None (значит не отвечаем)."""
-    uname = _norm_username(username)
-    if not uname:
-        return None
-    leads = crm_lead_usernames()
+def _find_lead(uname: str, leads: dict[str, int]) -> int | None:
     if uname in leads:
         return leads[uname]
     squashed = _squash(uname)
     for known, deal_id in leads.items():
         if _squash(known) == squashed:
             return deal_id
+    return None
+
+
+def lead_deal_for_username(username: str) -> int | None:
+    """Номер сделки, если этот человек — лид воронки. Иначе None (значит не отвечаем).
+
+    Промах перепроверяется свежим чтением CRM: клиент заполняет анкету, сделка появляется
+    сию секунду, а кэш живёт 5 минут — 23.07.2026 агент ещё несколько минут говорил с уже
+    существующим лидом как с незнакомцем, и ходы прыгали между ветками (записи 211–221).
+    Перечитываем не чаще раза в минуту, чтобы сообщения поставщиков не долбили CRM."""
+    uname = _norm_username(username)
+    if not uname:
+        return None
+    found = _find_lead(uname, crm_lead_usernames())
+    if found is not None:
+        return found
+    if time.time() - float(_LEADS_CACHE.get("at") or 0) > 60:
+        return _find_lead(uname, crm_lead_usernames(force=True))
     return None
 
 
@@ -1677,6 +1692,19 @@ ESCALATION_MARKER = "НУЖЕН_ЧЕЛОВЕК"
 # остался бы совсем без ответа. Тогда агент отвечает клиенту И отдельной строкой просит людей
 # дать недостающее. Строка клиенту не уходит.
 SIDE_ESCALATION_MARKER = "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ"
+
+# Правила живого тона. Родились из разбора диалога 23.07.2026: агент начинал КАЖДОЕ сообщение
+# с «Александр, …» и переспрашивал уже отвеченное — выглядело как автоответчик.
+STYLE_RULES = (
+    "Стиль (обязательно):\n"
+    "- НЕ начинай сообщение с имени клиента и не вставляй имя в каждый ответ. По имени можно "
+    "обратиться изредка, в важный момент; в остальном просто разговаривай, как живой менеджер.\n"
+    "- Если клиент прислал несколько сообщений подряд — прочитай все и ответь на всё ОДНИМ "
+    "сообщением, ничего не пропуская.\n"
+    "- Смотри историю: не задавай вопрос, на который клиент уже ответил, и не повторяй свой "
+    "прошлый вопрос другими словами.\n"
+    "- Коротко и тепло, без канцелярита. Один встречный вопрос за раз."
+)
 
 STRANGER_PROMPT = (
     "Ты — менеджер компании Albery, отвечаешь в Telegram от лица аккаунта компании. Пишет "
@@ -1819,12 +1847,16 @@ def escalated(author: dict, answer: str, client_text: str) -> bool:
     return True
 
 
-def reply_to_stranger(author: dict, text: str) -> bool:
+def reply_to_stranger(author: dict, texts: list[str] | str) -> bool:
     """Живой ответ незнакомцу: по базе знаний, с анкетой при первом контакте.
 
     Вопросы без ответа в базе уходят человеку — выдуманный ответ клиенту хуже паузы."""
     if not lead_invite_enabled():
         return False
+    texts = [texts] if isinstance(texts, str) else [t for t in texts if (t or "").strip()]
+    if not texts:
+        return False
+    text = "\n".join(texts)     # для эскалации — весь смысл пачки целиком
     author_id = author.get("id")
     name = (author.get("first_name") or "").strip()
     # Роль из карточки ЗАМЕНЯЕТ встроенный сценарий, а не дополняет его. Склейка давала
@@ -1833,12 +1865,12 @@ def reply_to_stranger(author: dict, text: str) -> bool:
     # продолжим» вместо разговора (22.07.2026).
     role = channel_role_prompt(MANAGER_CHANNEL)
     uname = author.get("username") or "без username"
-    base = (f"{role}\n\nСобеседник: {name or 'клиент'} (@{uname})\n"
-            f"\nЕго сообщение:\n{text}") if role else STRANGER_PROMPT.format(
-                name=name or "клиент", text=text)
+    base = (f"{role}\n\n{STYLE_RULES}\n\nСобеседник: {name or 'клиент'} (@{uname})\n"
+            f"\n{_shown_messages(texts)}") if role else (
+        STRANGER_PROMPT.format(name=name or "клиент", text=text) + "\n\n" + STYLE_RULES)
     # История добавляется к ЛЮБОМУ промпту, в том числе к запасному: помнить разговор агент
     # обязан и тогда, когда карточка недоступна.
-    base = _with_history(base, author_id, text)
+    base = _with_history(base, author_id, texts)
     # Отметка ДО хода: см. _autoreply_turn — если инструмент сам напишет клиенту, реплику
     # модели не дублируем.
     out_watermark = _dialog_out_watermark(author_id)
@@ -1855,7 +1887,8 @@ def reply_to_stranger(author: dict, text: str) -> bool:
     if escalated(author, answer, text):
         # В чате — тишина: обещать ответ, которого у агента нет, хуже паузы. Но переписку в
         # журнал пишем, иначе в кабинете вопрос клиента исчезнет вместе с ответом.
-        journal(MANAGER_CHANNEL, author_id, "in", text, kind="lead_chat", user=author)
+        for t in texts:
+            journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author)
         journal(MANAGER_CHANNEL, author_id, "out", "вопрос без ответа в базе — унесён людям "
                 "в группу «Работа с ИУ», клиенту не отвечено", kind="lead_chat", user=author,
                 status="ok", meta={"stranger": True, "escalated": True})
@@ -1865,8 +1898,12 @@ def reply_to_stranger(author: dict, text: str) -> bool:
     if not answer:
         return False
 
-    # Инструмент уже написал клиенту сам в этом ходе — реплику модели не дублируем.
+    # Инструмент уже написал клиенту сам в этом ходе — реплику модели не дублируем. Но входящее
+    # ОБЯЗАНО попасть в журнал: 23.07.2026 сообщение клиента перед отправкой условий исчезло из
+    # переписки, и в кабинете условия выглядели отправленными «из ниоткуда».
     if _out_messages_after(author_id, out_watermark):
+        for t in texts:
+            journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author)
         log.info("незнакомец %s: инструмент уже ответил клиенту — реплику модели не дублируем",
                  author_id)
         return False
@@ -1884,7 +1921,8 @@ def reply_to_stranger(author: dict, text: str) -> bool:
         _mark_invited(author_id)    # отмечаем только фактически доставленное
     # Незнакомец попадает в журнал только теперь: агент с ним заговорил. Пока он молчал, это была
     # обычная личная переписка аккаунта, которой в кабинете не место.
-    journal(MANAGER_CHANNEL, author_id, "in", text, kind="lead_chat", user=author)
+    for t in texts:
+        journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author)
     journal(MANAGER_CHANNEL, author_id, "out", answer if ok else f"{answer}\n\n[не доставлено: {err}]",
             kind="lead_chat", user=author, status="ok" if ok else "error",
             meta={"stranger": True, "invited": bool(invite_now and ok)})
@@ -1901,35 +1939,68 @@ def _business_owner_id() -> int | None:
     return None
 
 
+_inbox_lock = threading.Lock()
+_inbox: dict[Any, list[dict]] = {}
+_REPLY_DEBOUNCE_S = float(os.getenv("TG_REPLY_DEBOUNCE_S", "8") or 8)
+
+
 def maybe_autoreply(msg: dict) -> None:
     """Ответить лиду в личке ОТ ЛИЦА аккаунта компании.
 
     Отвечаем ТОЛЬКО на входящие от живых людей. Свои же исходящие тоже приходят этим
     апдейтом, и без фильтра агент отвечал бы сам себе бесконечно.
 
-    Разговоры разных людей идут параллельно, сообщения одного — строго по очереди."""
+    Люди пишут мысль несколькими сообщениями подряд. Раньше каждое уходило в отдельный ход,
+    ходы не видели ответов друг друга — агент спрашивал «Давайте начнём?» и тут же «Условия
+    вам подходят?», дважды просил реквизиты (диалог 23.07.2026, записи 218–225). Теперь
+    сообщения человека копятся в буфере, ход забирает всё накопившееся и отвечает одним
+    сообщением на всё сразу.
+
+    Разговоры разных людей идут параллельно, ходы одного — строго по очереди."""
     uid = (msg.get("from") or {}).get("id")
     if uid is None:
         return
+    with _inbox_lock:
+        _inbox.setdefault(uid, []).append(msg)
     with dialog_lock(uid):
-        _autoreply_turn(msg)
+        with _inbox_lock:
+            if not _inbox.get(uid):
+                return      # сообщение уже забрал предыдущий ход
+        # Пауза-добор: человек часто дописывает мысль следующим сообщением. Ответ чуть позже —
+        # это ещё и по-человечески: живой менеджер не отвечает за секунду.
+        time.sleep(_REPLY_DEBOUNCE_S)
+        with _inbox_lock:
+            batch = _inbox.pop(uid, [])
+        if batch:
+            _autoreply_turn(batch)
 
 
-def _autoreply_turn(msg: dict) -> None:
-    author = msg.get("from") or {}
-    chat = msg.get("chat") or {}
-    author_id = author.get("id")
-    text = (msg.get("text") or msg.get("caption") or "").strip()
-    if not author_id or not text:
+def _shown_messages(texts: list[str]) -> str:
+    """Блок «что написал клиент» для промпта: одно сообщение или пачка подряд."""
+    if len(texts) == 1:
+        return f"Его сообщение:\n{texts[0]}"
+    return ("Его сообщения — пришли подряд, ответь на ВСЁ одним сообщением:\n"
+            + "\n".join(f"— {t}" for t in texts))
+
+
+def _autoreply_turn(msgs: list[dict] | dict) -> None:
+    msgs = [msgs] if isinstance(msgs, dict) else list(msgs)
+    texts = [t for m in msgs if (t := (m.get("text") or m.get("caption") or "").strip())]
+    if not texts:
         return
-    if author.get("is_bot"):
+    last = msgs[-1]
+    author = last.get("from") or {}
+    chat = last.get("chat") or {}
+    author_id = author.get("id")
+    text = "\n".join(texts)     # для эскалации и истории — весь смысл пачки целиком
+    if not author_id or author.get("is_bot"):
         return
     owner_id = _business_owner_id()
     if owner_id and author_id == owner_id:
         return  # это исходящее самого владельца, а не входящее от клиента
     if str(chat.get("type") or "private") != "private":
         return  # phase 2: только личные переписки
-    conn_id = msg.get("business_connection_id") or ""
+    conn_id = last.get("business_connection_id") or ""
     if not conn_id:
         return
 
@@ -1942,23 +2013,26 @@ def _autoreply_turn(msg: dict) -> None:
             log.warning("CRM недоступна — не пишем %s: лида не отличить от незнакомца", author_id)
             return
         # Человека в воронке нет: разговариваем как менеджер и даём анкету, чтобы он стал лидом.
-        reply_to_stranger(author, text)
+        reply_to_stranger(author, texts)
         return
 
     # В журнал попадают только переписки, где участвует агент: у лида воронки он ведёт разговор.
-    journal(MANAGER_CHANNEL, author_id, "in", text, kind="lead_chat", user=author,
-            tg_message_id=msg.get("message_id"), meta={"deal_id": deal_id})
-    conn_id_react = msg.get("business_connection_id") or ""
-    react(author_id, msg.get("message_id"), "👀", conn_id_react)
+    # Каждое сообщение пачки — своей записью: журнал должен отражать переписку как она была.
+    for m in msgs:
+        t = (m.get("text") or m.get("caption") or "").strip()
+        if t:
+            journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author,
+                    tg_message_id=m.get("message_id"), meta={"deal_id": deal_id})
+    react(author_id, last.get("message_id"), "👀", conn_id)
 
     name = (author.get("first_name") or "").strip()
     role = channel_role_prompt(MANAGER_CHANNEL)
     prompt = (
-        f"{role}\n\n"
+        f"{role}\n\n{STYLE_RULES}\n\n"
         f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
         f"Собеседник: {name or 'клиент'} (@{username or 'без username'})\n"
         f"\n{funnel_step_block(deal_id)}\n"
-        f"\nЕго сообщение:\n{text}"
+        f"\n{_shown_messages(texts)}"
     ) if role else (
         "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
         "Пишет ЛИД по партнёрской программе Wildberries — он оставил заявку на индивидуальные "
@@ -1967,15 +2041,16 @@ def _autoreply_turn(msg: dict) -> None:
         "ИИ. Если для ответа не хватает данных, задай один уточняющий вопрос. Если вопрос вне "
         "твоей компетенции или требует решения человека — скажи, что уточнишь у коллег и "
         "вернёшься с ответом.\n\n"
+        f"{STYLE_RULES}\n\n"
         f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
         f"Собеседник: {name or 'клиент'}\n"
-        f"Его сообщение:\n{text}"
+        f"{_shown_messages(texts)}"
     )
     # Отметка ДО хода: по ней потом видно, отправил ли инструмент (условия/договор) сообщение
     # клиенту сам — тогда финальную реплику модели слать нельзя, это был бы дубль того же посыла.
     out_watermark = _dialog_out_watermark(author_id)
     try:
-        answer = hermes_answer(_with_instructions(_with_history(prompt, author_id, text),
+        answer = hermes_answer(_with_instructions(_with_history(prompt, author_id, texts),
                                                   MANAGER_CHANNEL), f"tg-biz-{author_id}",
                                toolsets=channel_toolsets(MANAGER_CHANNEL))
     except Exception as exc:  # noqa: BLE001

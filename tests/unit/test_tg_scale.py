@@ -55,26 +55,30 @@ def test_parallelism_is_capped(tg):
     assert tg._hermes_slots._initial_value == tg._HERMES_PARALLEL
 
 
-def test_messages_of_one_person_are_serialised(tg, monkeypatch):
-    """Иначе два сообщения подряд уходят в два хода, и второй не видит ответа первого."""
+def test_messages_of_one_person_are_batched_not_interleaved(tg, monkeypatch):
+    """Два сообщения подряд — ОДИН ход с обоими текстами (23.07.2026: раньше каждое уходило
+    в свой ход, и вопросы агента накладывались друг на друга). Ходы не перекрываются."""
     order = []
 
-    def turn(msg):
-        order.append(("start", msg["text"]))
+    def turn(batch):
+        order.append(("start", [m["text"] for m in batch]))
         time.sleep(0.1)
-        order.append(("end", msg["text"]))
+        order.append(("end", [m["text"] for m in batch]))
 
     monkeypatch.setattr(tg, "_autoreply_turn", turn)
+    monkeypatch.setattr(tg, "_REPLY_DEBOUNCE_S", 0.05)
     msgs = [{"from": {"id": 555}, "text": "первое"}, {"from": {"id": 555}, "text": "второе"}]
-    threads = [threading.Thread(target=tg.maybe_autoreply, args=(m,)) for m in msgs]
-    for t in threads:
-        t.start()
+    threads = []
+    for m in msgs:
+        threads.append(threading.Thread(target=tg.maybe_autoreply, args=(m,)))
+        threads[-1].start()
+        time.sleep(0.01)
     for t in threads:
         t.join(timeout=5)
 
-    # Ходы одного человека не перекрываются: каждый «start» закрыт своим «end».
-    assert order[0][0] == "start" and order[1][0] == "end"
-    assert order[2][0] == "start" and order[3][0] == "end"
+    assert order[0][0] == "start" and order[1][0] == "end", "ходы не перекрываются"
+    assert order[0][1] == ["первое", "второе"], "пачка обязана уйти в один ход целиком"
+    assert len(order) == 2, "второго хода для уже забранных сообщений быть не должно"
 
 
 def test_different_people_get_their_own_lock(tg):
