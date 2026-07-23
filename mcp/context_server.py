@@ -7514,6 +7514,33 @@ def tool_set_telegram_access(args: dict[str, Any]) -> dict[str, Any]:
                      "человек напишет агенту.")}
 
 
+def tool_get_telegram_dialog(args: dict[str, Any]) -> dict[str, Any]:
+    """Переписка агента с клиентом в Telegram — по telegram id или @username."""
+    who = str(args.get("telegram_id") or args.get("username") or args.get("to") or "").strip()
+    if not who:
+        raise McpError(-32602, "Укажи telegram_id или username клиента.")
+    limit = min(int(args.get("limit") or 30), 100)
+    key = who.lstrip("@").lower()
+    with pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT direction, text, status, meta, created_at FROM telegram_bot_messages"
+                " WHERE (dialog_id = %s OR username = %s) AND status = 'ok'"
+                " ORDER BY id DESC LIMIT %s", (who.lstrip("@"), key, limit))
+            rows = list(cur.fetchall())[::-1]
+    messages = [{
+        "from": "клиент" if r["direction"] == "in" else "агент",
+        "text": (r["text"] or "").strip(),
+        "at": str(r["created_at"])[:19],
+        # Служебные записи об эскалации клиенту НЕ отправлялись — иначе читающий решит,
+        # что ответ уже дан, и оставит человека без ответа второй раз.
+        "delivered_to_client": not ((r["meta"] or {}).get("escalated")),
+    } for r in rows if (r["text"] or "").strip()]
+    return {"count": len(messages), "client": who, "messages": messages,
+            "note": ("Это переписка в Telegram. Данные, которые клиент прислал сюда (реквизиты, "
+                     "согласия, уточнения), уже есть здесь — не проси их повторно.")}
+
+
 def tool_send_telegram_message(args: dict[str, Any]) -> dict[str, Any]:
     """Написать человеку в Telegram ОТ ЛИЦА аккаунта компании."""
     who = str(args.get("to") or args.get("username") or args.get("user_id") or "").strip()
@@ -8842,6 +8869,24 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_notify_iu_group,
+    },
+    "get_telegram_dialog": {
+        "description": (
+            "ПЕРЕПИСКА С КЛИЕНТОМ в Telegram по telegram_id или username. Читай ЕЁ, прежде чем "
+            "спрашивать у клиента или у коллег то, что он мог уже прислать (реквизиты, согласия, "
+            "данные магазина). Служебные записи об эскалации помечены delivered_to_client=false — "
+            "их клиент НЕ видел."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "telegram_id": {"type": "string", "description": "Числовой id клиента."},
+                "username": {"type": "string", "description": "@username клиента."},
+                "limit": {"type": "integer", "description": "Сколько последних сообщений (до 100)."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_get_telegram_dialog,
     },
     "send_telegram_message": {
         "description": (
@@ -11386,6 +11431,7 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
     # Письмо от лица личного аккаунта компании — только доверенным агентам.
     "send_telegram_message",
     "list_telegram_contacts",
+    "get_telegram_dialog",
     # Employee dossiers are internal management data — never on the public scoped connectors.
     "get_employee_dossier",
     "update_employee_dossier",

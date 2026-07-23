@@ -1121,6 +1121,18 @@ def _mark_invited(user_id: int) -> None:
 IU_AGENT_NAME = os.getenv("IU_AGENT_NAME", "Агент по работе с ИУ").strip()
 
 
+def _card_conversation(uid, client_text: str, limit: int = 8) -> str:
+    """Кусок переписки в карточку для группы.
+
+    Без него сотрудник (и агент группы) видят голый вопрос и переспрашивают то, что клиент уже
+    написал: 23.07.2026 клиент прислал реквизиты в Telegram, а агент группы ответил «реквизитов
+    в истории диалога нет» — они были, просто в другом чате."""
+    history = chat_history(MANAGER_CHANNEL, uid, client_text, limit=limit)
+    if not history:
+        return ""
+    return f"[b]О чём говорили в чате с клиентом[/b]\n{history}\n\n"
+
+
 def escalate_to_human(author: dict, question: str, client_text: str,
                       answered: bool = False) -> None:
     """Принести вопрос лида живым людям в группу Битрикса «Работа с ИУ».
@@ -1147,7 +1159,8 @@ def escalate_to_human(author: dict, question: str, client_text: str,
             f"[b]В базе знаний не нашлось[/b]\n"
             f"{question}\n"
             f"\n"
-            f"———\n"
+            + _card_conversation(uid, client_text)
+            + f"———\n"
             f"\n"
             f"Скажите мне здесь: «{IU_AGENT_NAME}, ответь, что …» — и я передам ответ клиенту "
             f"в Telegram.")

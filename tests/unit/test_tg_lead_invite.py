@@ -224,6 +224,20 @@ def test_lead_question_also_goes_to_people_silently(tg, sent, to_group, monkeypa
     assert len(to_group) == 1 and "Какая комиссия?" in to_group[0]["text"]
 
 
+def test_escalation_card_carries_the_conversation(tg, sent, to_group, monkeypatch):
+    """23.07.2026: клиент прислал реквизиты в Telegram, а агент группы ответил «реквизитов в
+    истории диалога нет» — они были, просто в другом чате. Карточка обязана нести переписку."""
+    _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: что отвечать про договор")
+    _journal_rows(tg, monkeypatch, [("in", "ИНН 7704123456, ООО «Альфа Трейд»"),
+                                    ("out", "Реквизиты получил")])
+
+    tg.maybe_autoreply(_msg(text="Вы пришлёте мне договор сюда?"))
+
+    card = to_group[0]["text"]
+    assert "О чём говорили в чате с клиентом" in card
+    assert "7704123456" in card, "сотрудник должен видеть присланные реквизиты, а не просить их снова"
+
+
 def test_escalation_card_says_the_client_is_still_waiting(tg, sent, to_group, monkeypatch):
     """Сотрудник должен с первой строки понять, что человек сидит без ответа."""
     _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про сроки")
