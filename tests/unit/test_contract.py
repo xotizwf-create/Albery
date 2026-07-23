@@ -156,6 +156,53 @@ def test_pdf_is_built_from_the_template():
     assert len(pdf) > 3000
 
 
+# Блок реквизитов сторон в шаблоне — двухколоночная таблица, переносы внутри ячейки идут как \r.
+PARTIES = ("15. АДРЕСА, РЕКВИЗИТЫ И ПОДПИСИ СТОРОН\n\n"
+           "| ИСПОЛНИТЕЛЬ\r {ИСПОЛНИТЕЛЬ — НАЗВАНИЕ}\r ИНН {ИСПОЛНИТЕЛЬ — ИНН}\r\r "
+           "_______________ / {ИСПОЛНИТЕЛЬ — ФИО} /\r М.П. "
+           "| ЗАКАЗЧИК\r ООО «{НАЗВАНИЕ}»\r ИНН {ИНН}\r\r "
+           "_______________ / {ФИО} /\r М.П. |")
+
+
+def test_party_table_stays_a_two_column_table():
+    """Раньше ячейки склеивались в один абзац и блок реквизитов превращался в кашу."""
+    from contract import parse_blocks
+
+    blocks = parse_blocks(PARTIES)
+    tables = [v for kind, v in blocks if kind == "table"]
+
+    assert len(tables) == 1, "блок подписей должен остаться таблицей"
+    left, right = tables[0]
+    assert left.startswith("ИСПОЛНИТЕЛЬ") and right.startswith("ЗАКАЗЧИК")
+    assert "\n" in left, "переносы внутри ячейки (\\r) должны стать переносами строк"
+    assert "ИНН" in right and "М.П." in right
+
+
+def test_city_and_date_row_is_a_table_too():
+    from contract import parse_blocks
+
+    blocks = parse_blocks("| г. Москва | 23 июля 2026 г. |")
+
+    assert blocks == [("table", ["г. Москва", "23 июля 2026 г."])]
+
+
+def test_appendix_starts_on_a_new_page():
+    """Приложение № 1 в договоре печатается с новой страницы."""
+    from contract import parse_blocks
+
+    kinds = [k for k, _ in parse_blocks("Приложение № 1 к Договору № 23.07.2026")]
+
+    assert kinds == ["pagebreak", "head"]
+
+
+def test_section_headings_are_recognised():
+    from contract import parse_blocks
+
+    blocks = parse_blocks("1. ТЕРМИНЫ И ОПРЕДЕЛЕНИЯ\n1.1. Маркетплейс — торговая площадка.")
+
+    assert blocks[0][0] == "head" and blocks[1][0] == "body"
+
+
 def test_pdf_fails_loudly_without_a_cyrillic_font(monkeypatch):
     """Молчаливая подмена шрифта дала бы клиенту договор из кракозябр."""
     import contract

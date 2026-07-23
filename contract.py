@@ -194,30 +194,45 @@ EXECUTOR_DEFAULTS = {
     "city": os.getenv("CONTRACT_CITY", "Москва"),
 }
 
-def _pdf_lines(text: str) -> list[tuple[str, str]]:
-    """Текст шаблона → (вид строки, содержимое) для вёрстки.
+CR, NL = chr(13), chr(10)
 
-    Шаблон приходит из Google Docs как markdown-подобный текст, поэтому заголовки узнаём по
-    форме строки: «1. ПРЕДМЕТ...» или строка целиком заглавными."""
-    out: list[tuple[str, str]] = []
-    for raw in text.splitlines():
+
+def parse_blocks(text: str) -> list[tuple[str, Any]]:
+    """Текст шаблона → блоки для вёрстки: заголовок, абзац, таблица, разрыв страницы.
+
+    Google Docs отдаёт таблицы строками «| ячейка | ячейка |», а переносы внутри ячейки — как
+    возврат каретки. Раньше ячейки просто склеивались в один абзац, и блок реквизитов сторон превращался в
+    нечитаемую кашу (владелец, 23.07.2026). Теперь это настоящие таблицы."""
+    blocks: list[tuple[str, Any]] = []
+    # Делим ТОЛЬКО по переводу строки: splitlines() режет ещё и по \r, а \r внутри ячейки —
+    # это перенос внутри неё, а не конец строки таблицы. Из-за этого блок реквизитов
+    # рассыпался на куски и переставал быть таблицей.
+    for raw in text.replace("\r\n", NL).split(NL):
         line = raw.strip()
         if not line:
             continue
         if line.startswith("|"):
-            # Строка таблицы из markdown: показываем её ячейки как обычный текст.
-            cells = [c.strip() for c in line.strip("|").split("|") if c.strip()]
-            if cells:
-                out.append(("row", "   ".join(cells)))
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if any(cells):
+                blocks.append(("table", [c.replace(CR, NL).strip() for c in cells]))
             continue
         line = line.lstrip("#").strip()
+        if line.startswith("Приложение №"):
+            blocks.append(("pagebreak", ""))
+            blocks.append(("head", line))
+            continue
         letters = [c for c in line if c.isalpha()]
-        is_upper = bool(letters) and all(c.isupper() for c in letters)
-        if is_upper and len(line) < 120:
-            out.append(("title" if "ДОГОВОР ВОЗМЕЗДНОГО" in line else "head", line))
+        if letters and all(c.isupper() for c in letters) and len(line) < 120:
+            blocks.append(("title" if "ДОГОВОР ВОЗМЕЗДНОГО" in line else "head", line))
         else:
-            out.append(("body", line))
-    return out
+            blocks.append(("body", line))
+    return blocks
+
+
+def _cell(text: str, style) -> Any:
+    """Ячейка таблицы: переносы строк внутри неё должны остаться переносами."""
+    from reportlab.platypus import Paragraph
+    return Paragraph("<br/>".join(escape(part) for part in text.split(NL)), style)
 
 
 def render_contract_pdf(number: str, date: str, client: dict[str, str],
@@ -228,7 +243,8 @@ def render_contract_pdf(number: str, date: str, client: dict[str, str],
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import cm
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+    from reportlab.platypus import (KeepTogether, PageBreak, Paragraph, SimpleDocTemplate,
+                                    Spacer, Table, TableStyle)
 
     if not _register_fonts():
         raise RuntimeError("В системе нет кириллического шрифта для PDF "
@@ -239,21 +255,42 @@ def render_contract_pdf(number: str, date: str, client: dict[str, str],
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=2 * cm, bottomMargin=2 * cm,
-                            leftMargin=3 * cm, rightMargin=1.5 * cm,
+                            leftMargin=2.5 * cm, rightMargin=1.5 * cm,
                             title=f"Договор № {number}", author=str(ex.get("name") or ""))
-    base = ParagraphStyle("base", fontName=FONT_MAIN, fontSize=11, leading=16,
-                          alignment=TA_JUSTIFY, firstLineIndent=1.25 * cm, spaceAfter=4)
+    width = doc.width
+    base = ParagraphStyle("base", fontName=FONT_MAIN, fontSize=11, leading=15.5,
+                          alignment=TA_JUSTIFY, firstLineIndent=1.25 * cm, spaceAfter=5)
     head = ParagraphStyle("head", parent=base, fontName=FONT_BOLD, fontSize=11.5,
-                          firstLineIndent=0, spaceBefore=10, spaceAfter=6, alignment=0)
-    title = ParagraphStyle("title", parent=base, fontName=FONT_BOLD, fontSize=13,
-                           alignment=TA_CENTER, firstLineIndent=0, spaceAfter=10)
-    plain = ParagraphStyle("plain", parent=base, firstLineIndent=0, alignment=0)
-    styles = {"title": title, "head": head, "body": base, "row": plain}
+                          firstLineIndent=0, spaceBefore=12, spaceAfter=7, alignment=0)
+    title = ParagraphStyle("title", parent=base, fontName=FONT_BOLD, fontSize=13.5,
+                           alignment=TA_CENTER, firstLineIndent=0, spaceAfter=12)
+    cell = ParagraphStyle("cell", parent=base, firstLineIndent=0, alignment=0, fontSize=10,
+                          leading=13, spaceAfter=0)
+    styles = {"title": title, "head": head, "body": base}
 
     story: list[Any] = []
-    for kind, line in _pdf_lines(body_text):
-        story.append(Paragraph(escape(line), styles[kind]))
-        if kind == "title":
-            story.append(Spacer(1, 6))
+    for kind, value in parse_blocks(body_text):
+        if kind == "pagebreak":
+            story.append(PageBreak())
+        elif kind == "table":
+            cols = len(value) or 1
+            # Строка «город — дата»: одна короткая строка на две колонки, дату прижимаем вправо.
+            short = cols == 2 and all(len(c) < 60 and NL not in c for c in value)
+            right = ParagraphStyle("right", parent=cell, alignment=2)
+            cells = [_cell(value[0], cell),
+                     _cell(value[1], right if short else cell)] if cols == 2 else [
+                _cell(v, cell) for v in value]
+            table = Table([cells], colWidths=[width / cols] * cols)
+            table.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (0, -1), 0),
+                ("RIGHTPADDING", (-1, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]))
+            story.append(table if short else KeepTogether(table))
+            story.append(Spacer(1, 8))
+        else:
+            story.append(Paragraph(escape(value), styles[kind]))
     doc.build(story)
     return buf.getvalue()
