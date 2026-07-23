@@ -206,6 +206,49 @@ def chat_history(bot: str, dialog_id, current_text: str = "", limit: int = 12) -
     return "\n".join(lines)
 
 
+def _dialog_out_watermark(dialog_id) -> int:
+    """Наибольший id исходящего в этом диалоге — отметка «до хода мозга».
+
+    Инструменты, которые сами пишут клиенту (send_terms, send_contract), выполняются в ДРУГОМ
+    процессе — MCP приложения, а не в службе tg-агента. Поэтому факт их отправки виден отсюда
+    только через общий журнал. По этой отметке после хода видно, отправил ли инструмент
+    сообщение клиенту сам."""
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS m FROM telegram_bot_messages"
+                    " WHERE bot = %s AND dialog_id = %s AND direction = 'out'",
+                    (MANAGER_CHANNEL, str(dialog_id)))
+                return int((cur.fetchone() or {}).get("m") or 0)
+    except Exception:  # noqa: BLE001 — журнал недоступен: отметки нет, гасить нечем
+        log.warning("отметка журнала для %s недоступна", dialog_id, exc_info=True)
+        return -1
+
+
+def _out_messages_after(dialog_id, since_id: int) -> int:
+    """Сколько сообщений КЛИЕНТУ реально ушло в этом диалоге после отметки.
+
+    0 — законная отметка «до хода исходящих не было»: значит любой исходящий id>0 сделан этим
+    ходом. Отрицательная отметка — отметку снять не удалось, тогда судить нельзя и не гасим.
+    Служебная запись об эскалации (meta.escalated) клиенту не отправлялась — её не считаем."""
+    if since_id < 0:       # отметку снять не удалось — судить не можем, не гасим
+        return 0
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM telegram_bot_messages"
+                    " WHERE bot = %s AND dialog_id = %s AND direction = 'out'"
+                    "   AND status = 'ok' AND id > %s"
+                    "   AND COALESCE(meta->>'escalated', '') <> 'true'",
+                    (MANAGER_CHANNEL, str(dialog_id), int(since_id)))
+                return int((cur.fetchone() or {}).get("n") or 0)
+    except Exception:  # noqa: BLE001
+        log.warning("проверка журнала на дубль для %s недоступна", dialog_id, exc_info=True)
+        return 0
+
+
 def access_usernames(bot: str) -> set[str]:
     """Кому разрешено писать этому агенту. Пустое множество = список не задан/БД недоступна."""
     now = time.time()
@@ -1693,6 +1736,9 @@ def reply_to_stranger(author: dict, text: str) -> bool:
     # История добавляется к ЛЮБОМУ промпту, в том числе к запасному: помнить разговор агент
     # обязан и тогда, когда карточка недоступна.
     base = _with_history(base, author_id, text)
+    # Отметка ДО хода: см. _autoreply_turn — если инструмент сам напишет клиенту, реплику
+    # модели не дублируем.
+    out_watermark = _dialog_out_watermark(author_id)
     try:
         answer = hermes_answer(_with_instructions(base, MANAGER_CHANNEL), f"tg-new-{author_id}",
                                toolsets=channel_toolsets(MANAGER_CHANNEL))
@@ -1714,6 +1760,12 @@ def reply_to_stranger(author: dict, text: str) -> bool:
 
     answer = split_side_question(author, answer, text)
     if not answer:
+        return False
+
+    # Инструмент уже написал клиенту сам в этом ходе — реплику модели не дублируем.
+    if _out_messages_after(author_id, out_watermark):
+        log.info("незнакомец %s: инструмент уже ответил клиенту — реплику модели не дублируем",
+                 author_id)
         return False
 
     # Анкета — хвостом к первому ответу, один раз: это приглашение, а не подпись под каждым словом.
@@ -1816,6 +1868,9 @@ def _autoreply_turn(msg: dict) -> None:
         f"Собеседник: {name or 'клиент'}\n"
         f"Его сообщение:\n{text}"
     )
+    # Отметка ДО хода: по ней потом видно, отправил ли инструмент (условия/договор) сообщение
+    # клиенту сам — тогда финальную реплику модели слать нельзя, это был бы дубль того же посыла.
+    out_watermark = _dialog_out_watermark(author_id)
     try:
         answer = hermes_answer(_with_instructions(_with_history(prompt, author_id, text),
                                                   MANAGER_CHANNEL), f"tg-biz-{author_id}",
@@ -1835,6 +1890,13 @@ def _autoreply_turn(msg: dict) -> None:
         return
     answer = split_side_question(author, answer, text)
     if not answer:
+        return
+    # Инструмент (условия/договор) уже написал клиенту в этом ходе — его сообщение полное и с
+    # вопросом внутри. Реплика модели «условия отправили вам сюда»/«договор направил вам сюда»
+    # повторила бы тот же посыл ВТОРЫМ сообщением (жалоба владельца 23.07.2026). Гасим её.
+    if _out_messages_after(author_id, out_watermark):
+        log.info("лид %s: инструмент уже ответил клиенту в этом ходе — реплику модели не дублируем",
+                 author_id)
         return
     ok, err = send_html(author_id, as_html(answer), answer)
     journal(MANAGER_CHANNEL, author_id, "out", answer if ok else f"{answer}\n\n[не доставлено: {err}]",

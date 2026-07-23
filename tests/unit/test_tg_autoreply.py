@@ -126,3 +126,73 @@ def test_answer_is_sent_as_plain_text(tg, monkeypatch):
     tg.maybe_autoreply(_incoming())
 
     assert "**" not in sent["text"]
+
+
+def _shared_journal(tg, monkeypatch):
+    """Общий журнал на оба процесса: инструмент (в MCP приложения) и tg-агент видят одно и то же.
+
+    В телах модели-заглушки инструмент имитируется записью 'out' в этот же журнал — ровно как
+    send_terms/send_contract пишут в telegram_bot_messages в соседнем процессе."""
+    ledger: list[dict] = []
+
+    def fake_journal(bot, dialog_id, direction, text, **kw):
+        ledger.append({"id": len(ledger) + 1, "dialog_id": str(dialog_id),
+                       "direction": direction, "status": kw.get("status", "ok"),
+                       "meta": kw.get("meta") or {}})
+
+    def watermark(dialog_id):
+        ids = [r["id"] for r in ledger
+               if r["dialog_id"] == str(dialog_id) and r["direction"] == "out"]
+        return max(ids) if ids else 0
+
+    def out_after(dialog_id, since_id):
+        if since_id < 0:
+            return 0
+        return sum(1 for r in ledger
+                   if r["dialog_id"] == str(dialog_id) and r["direction"] == "out"
+                   and r["status"] == "ok" and r["id"] > since_id
+                   and str(r["meta"].get("escalated") or "") != "true")
+
+    monkeypatch.setattr(tg, "journal", fake_journal)
+    monkeypatch.setattr(tg, "_dialog_out_watermark", watermark)
+    monkeypatch.setattr(tg, "_out_messages_after", out_after)
+    return ledger
+
+
+def test_narration_after_a_send_tool_is_not_duplicated(tg, monkeypatch):
+    """Жалоба владельца 23.07.2026: агент дублирует сообщения с одним и тем же посылом.
+
+    Инструмент send_terms сам шлёт клиенту условия и вопрос «есть ли вопросы», а следом модель
+    отправляет «Условия отправили вам сюда…» — тот же посыл вторым сообщением. Так быть не
+    должно: клиент получает РОВНО одно сообщение — то, что отправил инструмент."""
+    _shared_journal(tg, monkeypatch)
+    outbox: list[str] = []
+    monkeypatch.setattr(tg, "send_as_account",
+                        lambda uid, t, parse_mode="": (outbox.append(t), (True, ""))[1])
+
+    def brain(prompt, session, toolsets=None):
+        # Инструмент в соседнем процессе уже отправил клиенту условия и записал их в журнал.
+        tg.journal(tg.MANAGER_CHANNEL, 1451982360, "out",
+                   "Комиссия WB снижена до 35%… Есть вопросы?", meta={"terms": True})
+        return "Условия отправили вам сюда. Если появятся вопросы — разберём их здесь."
+
+    monkeypatch.setattr(tg, "hermes_answer", brain)
+    tg.maybe_autoreply(_incoming(text="Всё верно"))
+
+    assert not any("отправили вам сюда" in t for t in outbox), \
+        "нарратив модели продублировал посыл инструмента вторым сообщением"
+    assert outbox == [], "клиенту слать нечего — сообщение уже отправил инструмент"
+
+
+def test_plain_answer_without_a_tool_is_still_sent(tg, monkeypatch):
+    """Обратная сторона: если инструмент НИЧЕГО не отправлял, ответ модели уходит как обычно."""
+    _shared_journal(tg, monkeypatch)
+    outbox: list[str] = []
+    monkeypatch.setattr(tg, "send_as_account",
+                        lambda uid, t, parse_mode="": (outbox.append(t), (True, ""))[1])
+    monkeypatch.setattr(tg, "hermes_answer",
+                        lambda p, s, toolsets=None: "Расскажите про ваш оборот на WB?")
+
+    tg.maybe_autoreply(_incoming(text="Здравствуйте"))
+
+    assert any("оборот" in t for t in outbox), "обычный ответ модели должен дойти до клиента"
