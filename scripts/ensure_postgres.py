@@ -25,6 +25,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "ai_instruction_folders": "015_ai_instruction_folders.sql",
     "chat_day_syncs": "016_chat_day_syncs.sql",
     "bitrix_task_events": "018_bitrix_task_events.sql",
+    "funnel_task_watch": "063_funnel_task_watch.sql",
     "zoom_recording_events": "019_zoom_recording_events.sql",
     "owner_recommendation_events": "020_recommendation_feedback_events.sql",
     "company_drive_folders": "021_company_drive_folders.sql",

@@ -198,9 +198,41 @@ def fill_template(template: str, client: dict[str, str], number: str, date: str,
     for ph, field in sorted(CLIENT_PLACEHOLDERS.items(), key=lambda kv: -len(kv[0])):
         ex_ph = ph.replace("{", "{ИСПОЛНИТЕЛЬ — ")
         out = out.replace(ex_ph, str(ex.get(field) or "").strip())
-    for ph, field in sorted(CLIENT_PLACEHOLDERS.items(), key=lambda kv: -len(kv[0])):
-        value = str(client.get(field) or CLIENT_DEFAULTS.get(field) or "").strip()
+    values = {ph: str(client.get(field) or CLIENT_DEFAULTS.get(field) or "").strip()
+              for ph, field in CLIENT_PLACEHOLDERS.items()}
+    # Пустые убираем ДО подстановки: после неё от «E-mail: {EMAIL}» осталось бы «E-mail: »,
+    # и понять, что строка была про незаполненное поле, уже нельзя.
+    out = _drop_empty_placeholders(out, {ph for ph, v in values.items() if not v})
+    for ph, value in sorted(values.items(), key=lambda kv: -len(kv[0])):
         out = out.replace(ph, value)
+    return out
+
+
+# Строки-подписи вида «E-mail: {EMAIL}» при пустом значении убираем целиком: клиент не должен
+# видеть в договоре «{EMAIL}» (владелец, 23.07.2026). Если же плейсхолдер стоит в середине
+# предложения, вырезаем только его — предложение остаётся связным.
+_LABELLED_EMPTY_RE = re.compile(
+    r"^[ \t]*[^\n|]{0,40}?:?[ \t]*\{[^}\n]{2,60}\}[ \t]*$", re.MULTILINE)
+
+
+def _drop_empty_placeholders(text: str, empty: set[str]) -> str:
+    """Убрать из договора то, что осталось незаполненным по стороне Заказчика."""
+    if not empty:
+        return text
+    lines = []
+    for line in text.split(NL):
+        # Строка целиком состоит из подписи и незаполненного плейсхолдера — убираем её.
+        if (_LABELLED_EMPTY_RE.match(line) and not line.strip().startswith("|")
+                and any(ph in line for ph in empty)):
+            continue
+        for ph in empty:
+            if ph in line:
+                line = line.replace(ph, "")
+        lines.append(line)
+    out = NL.join(lines)
+    # После выкидывания значения могли остаться «ИНН ,» и двойные пробелы.
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"(?:,\s*)+(?=[,.\n]|$)", "", out)
     return out
 
 

@@ -28,6 +28,7 @@ import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -41,7 +42,27 @@ APP_ROOT = Path(__file__).resolve().parent
 STATE_PATH = APP_ROOT / ".tg_agent_state.json"
 BUSINESS_LOG_PATH = APP_ROOT / ".tg_business_log.jsonl"
 _state_lock = threading.Lock()
-_hermes_lock = threading.Lock()
+# Сколько ходов мозга идёт одновременно. Не «сколько влезет»: на боксе 2 ГБ, каждый ход — это
+# отдельный процесс hermes, и без предела поток лидов положил бы службу целиком.
+_HERMES_PARALLEL = max(1, int(os.getenv("TG_AGENT_PARALLEL_TURNS", "3") or 3))
+_hermes_slots = threading.BoundedSemaphore(_HERMES_PARALLEL)
+# Сообщения ОДНОГО человека обрабатываются строго по очереди: иначе два его сообщения подряд
+# уходят в два параллельных хода, и второй не видит, что ответил первый.
+_dialog_locks: dict[str, threading.Lock] = {}
+_dialog_locks_guard = threading.Lock()
+# Пул обработчиков апдейтов. Больше слотов мозга: пока один разговор ждёт очереди на ход,
+# остальные потоки успевают сделать лёгкую работу (журнал, справочник контактов, реакции).
+_workers = ThreadPoolExecutor(max_workers=_HERMES_PARALLEL * 4,
+                              thread_name_prefix="tg-update")
+
+
+def dialog_lock(dialog_id) -> threading.Lock:
+    key = str(dialog_id)
+    with _dialog_locks_guard:
+        lock = _dialog_locks.get(key)
+        if lock is None:
+            lock = _dialog_locks[key] = threading.Lock()
+        return lock
 
 
 def _load_env_file() -> None:
@@ -432,7 +453,16 @@ def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
     # Fresh session per run (hermes >=0.17 resumes --continue sessions; memory is prompt-injected)
     run_session = f"{session_prefix}-r{uuid.uuid4().hex[:8]}"
     cmd = ["hermes", "-z", prompt, "--continue", run_session, "-t", toolsets, "--yolo"]
-    with _hermes_lock:  # a 2GB box: never run two brain turns from this service at once
+    # Раньше здесь был ОДИН замок на всю службу: пока агент думал над одним клиентом (а ход
+    # занимает десятки секунд), все остальные стояли в очереди. При потоке лидов десятый ждал
+    # бы минуты. Теперь параллельно идут несколько ходов; предел держим осознанно — на боксе
+    # 2 ГБ памяти, и неограниченный параллелизм убил бы службу вместе с ответами всем.
+    waited = time.monotonic()
+    with _hermes_slots:
+        queued = time.monotonic() - waited
+        if queued > 5:
+            log.info("ход ждал очереди %.0f c (занято %s из %s слотов)",
+                     queued, _HERMES_PARALLEL - _hermes_slots._value, _HERMES_PARALLEL)
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     answer = (proc.stdout or "").strip()
     if proc.returncode != 0 or not answer or _HERMES_ERROR_RE.match(answer):
@@ -715,6 +745,95 @@ def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "
                      "подписание.")
                     + (f" ВНИМАНИЕ: в шаблоне не заполнено {len(gaps)} мест — скажи об этом "
                        f"владельцу." if gaps else "")}
+
+
+def watch_task_for_client(bitrix_task_id: int, telegram_id: int, client_message: str,
+                          deal_id: int | None = None, kind: str = "other",
+                          next_stage: str = "") -> dict:
+    """Поставить ожидание: задача закроется — клиенту уйдёт сообщение.
+
+    Агент отвечает только на входящие, поэтому событие «сотрудник выполнил задачу» до него не
+    доходило вовсе: 23.07.2026 договор ушёл в ЭДО, а клиент об этом не узнал."""
+    if not str(client_message or "").strip():
+        raise ValueError("Нужен текст, который получит клиент после закрытия задачи.")
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO funnel_task_watch (bitrix_task_id, deal_id, telegram_id, kind,"
+                " client_message, next_stage) VALUES (%s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (bitrix_task_id) WHERE notified_at IS NULL AND cancelled_at IS NULL"
+                " DO UPDATE SET client_message = EXCLUDED.client_message,"
+                "               next_stage = EXCLUDED.next_stage"
+                " RETURNING id",
+                (int(bitrix_task_id), int(deal_id) if deal_id else None, int(telegram_id),
+                 kind, client_message.strip(), next_stage or None))
+            row = cur.fetchone()
+    log.info("ожидание закрытия задачи %s для клиента %s поставлено", bitrix_task_id, telegram_id)
+    return {"watch_id": int(row["id"]), "bitrix_task_id": int(bitrix_task_id),
+            "note": "Как только задачу закроют, клиент получит сообщение автоматически."}
+
+
+def check_finished_tasks(limit: int = 50) -> dict:
+    """Пройтись по ожиданиям: закрытые задачи → сообщение клиенту. Вызывается сторожем.
+
+    Идемпотентно: отметка notified_at ставится в той же транзакции, поэтому повторный проход
+    не отправит клиенту то же самое второй раз."""
+    from mcp import context_server as cs
+
+    sent, still_open, failed = [], 0, []
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, bitrix_task_id, deal_id, telegram_id, kind, client_message, next_stage"
+                " FROM funnel_task_watch WHERE notified_at IS NULL AND cancelled_at IS NULL"
+                " ORDER BY id LIMIT %s", (int(limit),))
+            watches = list(cur.fetchall())
+    for w in watches:
+        try:
+            info = cs.TOOLS["get_bitrix_task"]["handler"]({"bitrix_task_id": w["bitrix_task_id"]}) \
+                if "get_bitrix_task" in cs.TOOLS else _task_status(w["bitrix_task_id"])
+            status = str((info or {}).get("status") or "")
+        except Exception as exc:  # noqa: BLE001 — одна недоступная задача не должна ронять проход
+            failed.append({"task": w["bitrix_task_id"], "error": str(exc)[:150]})
+            continue
+        if status not in _TASK_DONE_STATUSES:
+            still_open += 1
+            continue
+        ok, err = send_html(w["telegram_id"], as_html(w["client_message"]), w["client_message"])
+        if not ok:
+            failed.append({"task": w["bitrix_task_id"], "error": f"не доставлено: {err}"})
+            continue
+        journal(MANAGER_CHANNEL, w["telegram_id"], "out", w["client_message"], kind="lead_chat",
+                meta={"task_closed": w["bitrix_task_id"], "deal_id": w["deal_id"]})
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE funnel_task_watch SET notified_at = now() WHERE id = %s",
+                            (w["id"],))
+        if w["deal_id"] and w["next_stage"]:
+            try:
+                cs.TOOLS["update_crm_deal"]["handler"](
+                    {"deal_id": int(w["deal_id"]), "stage": w["next_stage"],
+                     "comments": f"Задача {w['bitrix_task_id']} выполнена, клиенту сообщено."})
+            except Exception:  # noqa: BLE001 — сообщение клиенту важнее записи в CRM
+                log.warning("стадия сделки %s не сдвинулась", w["deal_id"], exc_info=True)
+        sent.append({"task": w["bitrix_task_id"], "client": w["telegram_id"]})
+        log.info("задача %s закрыта — клиенту %s отправлено уведомление",
+                 w["bitrix_task_id"], w["telegram_id"])
+    return {"checked": len(watches), "notified": len(sent), "still_open": still_open,
+            "failed": failed}
+
+
+# Статусы Битрикса, при которых работа считается выполненной: 4 — «завершена», 5 — «закрыта».
+_TASK_DONE_STATUSES = {"4", "5"}
+
+
+def _task_status(task_id: int) -> dict:
+    """Статус задачи напрямую через REST — на случай, если инструмента чтения задач нет."""
+    from bitrix import BitrixClient
+    cli = BitrixClient(os.getenv("BITRIX_WEBHOOK_BASE", "").strip())
+    res = cli.call("tasks.task.get", {"taskId": int(task_id), "select": ["ID", "STATUS"]})
+    task = (((res or {}).get("result") or {}).get("task")) or {}
+    return {"status": str(task.get("status") or "")}
 
 
 def telegram_contacts_list() -> dict:
@@ -1408,7 +1527,17 @@ def maybe_autoreply(msg: dict) -> None:
     """Ответить лиду в личке ОТ ЛИЦА аккаунта компании.
 
     Отвечаем ТОЛЬКО на входящие от живых людей. Свои же исходящие тоже приходят этим
-    апдейтом, и без фильтра агент отвечал бы сам себе бесконечно."""
+    апдейтом, и без фильтра агент отвечал бы сам себе бесконечно.
+
+    Разговоры разных людей идут параллельно, сообщения одного — строго по очереди."""
+    uid = (msg.get("from") or {}).get("id")
+    if uid is None:
+        return
+    with dialog_lock(uid):
+        _autoreply_turn(msg)
+
+
+def _autoreply_turn(msg: dict) -> None:
     author = msg.get("from") or {}
     chat = msg.get("chat") or {}
     author_id = author.get("id")
@@ -1490,6 +1619,19 @@ def maybe_autoreply(msg: dict) -> None:
     log.info("автоответ лиду %s: %s", author_id, "отправлен" if ok else f"не отправлен ({err})")
 
 
+def _handle_update_safely(upd: dict) -> None:
+    """Один апдейт в отдельном потоке. Сбой на одном клиенте не должен ронять остальных."""
+    try:
+        if upd.get("message"):
+            handle_message(upd["message"])
+        elif upd.get("business_connection"):
+            handle_business_connection(upd["business_connection"])
+        elif upd.get("business_message"):
+            handle_business_message(upd["business_message"])
+    except Exception:  # noqa: BLE001
+        log.exception("update handling failed")
+
+
 def poll_forever() -> None:
     log.info("tg agent starting; owner ids=%s usernames=%s",
              sorted(owner_ids()), sorted(owner_usernames()))
@@ -1513,15 +1655,10 @@ def poll_forever() -> None:
             continue
         for upd in updates or []:
             offset = max(offset, int(upd.get("update_id", 0)) + 1)
-            try:
-                if upd.get("message"):
-                    handle_message(upd["message"])
-                elif upd.get("business_connection"):
-                    handle_business_connection(upd["business_connection"])
-                elif upd.get("business_message"):
-                    handle_business_message(upd["business_message"])
-            except Exception:  # noqa: BLE001
-                log.exception("update handling failed")
+            # Обработка уходит в пул: ход мозга занимает десятки секунд, и раньше цикл стоял
+            # на нём целиком — десятый написавший ждал бы минуты. Порядок сообщений ОДНОГО
+            # человека держит dialog_lock, число одновременных ходов — _hermes_slots.
+            _workers.submit(_handle_update_safely, upd)
         with _state_lock:
             state = load_state()
             state["offset"] = offset

@@ -137,6 +137,33 @@ def test_executor_placeholders_are_not_eaten_by_client_ones():
     assert "ИНН 7704123456" in out, "ИНН заказчика тоже должен остаться на своём месте"
 
 
+def test_client_placeholder_left_empty_never_reaches_the_document():
+    """Владелец 23.07.2026: клиент не прислал e-mail, и в договоре осталось «{EMAIL}»."""
+    from contract import fill_template
+
+    tpl = ("Юридический адрес: {АДРЕС}\n"
+           "E-mail: {EMAIL}\n"
+           "Тел.: {ТЕЛЕФОН}\n"
+           "ООО «{НАЗВАНИЕ}», ИНН {ИНН}, КПП {КПП}")
+    out = fill_template(tpl, parse_requisites(REAL), "23.07.2026", "23 июля 2026 г.")
+
+    assert "{EMAIL}" not in out and "{ТЕЛЕФОН}" not in out
+    assert "E-mail:" not in out, "строка с пустым значением убирается целиком"
+    assert "Тверская" in out and "ИНН 7704123456" in out, "заполненное на месте"
+
+
+def test_empty_placeholder_inside_a_sentence_leaves_it_readable():
+    from contract import fill_template
+
+    out = fill_template("Заказчик, ИНН {ИНН}, КПП {КПП}, ОГРН {ОГРН}, адрес {АДРЕС}.",
+                        {"inn": "7704123456", "address": "г. Москва"},
+                        "23.07.2026", "23 июля 2026 г.")
+
+    assert "{" not in out
+    assert "ИНН 7704123456" in out and "адрес г. Москва" in out
+    assert ", ," not in out, "лишние запятые от пустых значений убраны"
+
+
 def test_unfilled_placeholders_are_reported():
     """Владелец должен видеть, что в договоре осталось незаполненным."""
     from contract import fill_template, unfilled_placeholders

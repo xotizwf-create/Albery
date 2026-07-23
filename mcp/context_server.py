@@ -7514,6 +7514,24 @@ def tool_set_telegram_access(args: dict[str, Any]) -> dict[str, Any]:
                      "человек напишет агенту.")}
 
 
+def tool_notify_client_when_task_done(args: dict[str, Any]) -> dict[str, Any]:
+    """Сообщить клиенту, как только сотрудник закроет задачу."""
+    task_id = args.get("bitrix_task_id")
+    telegram_id = args.get("telegram_id")
+    text = str(args.get("client_message") or "").strip()
+    if not task_id or not telegram_id or not text:
+        raise McpError(-32602, "Нужны bitrix_task_id, telegram_id и client_message.")
+    try:
+        return app_workflow_function("watch_task_for_client")(
+            int(task_id), int(telegram_id), text,
+            int(args["deal_id"]) if args.get("deal_id") else None,
+            str(args.get("kind") or "other"), str(args.get("next_stage") or ""))
+    except ValueError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"notify_client_when_task_done failed: {exc}") from exc
+
+
 def tool_delete_dialog(args: dict[str, Any]) -> dict[str, Any]:
     """Удалить переписку из журнала НАВСЕГДА."""
     if args.get("confirm") is not True:
@@ -8904,6 +8922,28 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_notify_iu_group,
+    },
+    "notify_client_when_task_done": {
+        "description": (
+            "СКАЗАТЬ КЛИЕНТУ, КОГДА ЗАДАЧА ВЫПОЛНЕНА. Ставь СРАЗУ после create_bitrix_task, если "
+            "клиент ждёт результата этой задачи (договор в ЭДО, счёт, подключение). Как только "
+            "сотрудник закроет задачу, клиент получит client_message автоматически — тебе "
+            "ничего делать не нужно и проверять задачу не нужно."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Задача, которую ждём."},
+                "telegram_id": {"type": "integer", "description": "Telegram id клиента."},
+                "client_message": {"type": "string", "description": "Текст клиенту после закрытия задачи."},
+                "deal_id": {"type": "integer", "description": "Сделка (для сдвига стадии)."},
+                "next_stage": {"type": "string", "description": "Стадия сделки после закрытия задачи."},
+                "kind": {"type": "string", "description": "edo | invoice | paper | other."},
+            },
+            "required": ["bitrix_task_id", "telegram_id", "client_message"],
+            "additionalProperties": False,
+        },
+        "handler": tool_notify_client_when_task_done,
     },
     "delete_dialog": {
         "description": (
