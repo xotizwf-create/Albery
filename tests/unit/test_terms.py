@@ -69,6 +69,35 @@ def test_document_without_the_marker_is_never_sent(tg, monkeypatch):
         tg.terms_text()
 
 
+def test_marker_with_em_dash_from_google_docs_still_works(tg, monkeypatch):
+    """Живой сбой 24.07.2026: Google Docs автозаменой превратил хвост «---» в «—»
+    («--- ТЕКСТ КЛИЕНТУ —»), точное сравнение сломалось, и клиент получил «техническая
+    заминка по условиям» вместо условий. Маркер должен узнаваться по смыслу."""
+    from mcp import context_server as cs
+
+    doc = ("Условия ИУ — текст для клиента\n\n"
+           "Всё, что ниже строки «--- ТЕКСТ КЛИЕНТУ ---», отправляется дословно.\n\n"
+           "--- ТЕКСТ КЛИЕНТУ —\n\n"          # ровно как в документе владельца на проде
+           "Комиссия WB снижена до 35%.")
+    monkeypatch.setitem(cs.TOOLS, "get_company_file", {"handler": lambda a: {"content": doc}})
+
+    assert tg.terms_text() == "Комиссия WB снижена до 35%."
+
+
+def test_marker_survives_any_dashes_and_spacing(tg):
+    """Разные тире и лишние пробелы вокруг — всё это по-прежнему маркер."""
+    for marker in ("--- ТЕКСТ КЛИЕНТУ ---", "— ТЕКСТ КЛИЕНТУ —", "–ТЕКСТ КЛИЕНТУ–",
+                   "---   ТЕКСТ  КЛИЕНТУ   ", "ТЕКСТ КЛИЕНТУ", "«--- текст клиенту ---»"):
+        assert tg._is_terms_marker(marker), f"должно распознаваться: {marker!r}"
+
+
+def test_instruction_line_is_not_mistaken_for_the_marker(tg):
+    """Упоминание маркера внутри длинной фразы шапки — не маркер."""
+    assert not tg._is_terms_marker(
+        "Всё, что ниже строки «--- ТЕКСТ КЛИЕНТУ ---», отправляется дословно.")
+    assert not tg._is_terms_marker("Здесь будет ТЕКСТ КЛИЕНТУ и ещё что-то")
+
+
 def test_only_the_client_part_is_taken(tg):
     """Инструкция для владельца в начале документа клиенту уходить не должна."""
     body = tg.terms_text()

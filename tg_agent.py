@@ -893,6 +893,23 @@ TERMS_DOC_NAME = os.getenv("TERMS_DOC_NAME", "Условия ИУ — текст
 TERMS_MARKER = "--- ТЕКСТ КЛИЕНТУ ---"
 TERMS_QUESTION = "Есть вопросы по условиям?"
 
+# Все виды тире, в которые Google Docs «улучшает» дефисы: -, ‐, ‑, ‒, –, —, ―, − (минус).
+_DASHES = "-‐‑‒–—―−"
+_TERMS_MARKER_CORE = "ТЕКСТ КЛИЕНТУ"
+
+
+def _is_terms_marker(line: str) -> bool:
+    """Строка — это маркер начала клиентской части?
+
+    Узнаём по СМЫСЛУ, а не по точному виду: Google Docs автозаменой превратил хвост «---» в
+    длинное тире «—» («--- ТЕКСТ КЛИЕНТУ —»), точное сравнение сломалось, и агент говорил
+    клиенту «техническая заминка по условиям» вместо самих условий (владелец, 24.07.2026).
+    Теперь маркер — это строка, которая после снятия любых тире/кавычек/пробелов с краёв
+    равна ровно «ТЕКСТ КЛИЕНТУ». Упоминание маркера внутри длинной фразы-инструкции в шапке
+    так не свернётся и маркером не считается."""
+    core = line.strip().strip("«»\"'").strip(_DASHES + " \t").strip()
+    return re.sub(r"\s+", " ", core).casefold() == _TERMS_MARKER_CORE.casefold()
+
 
 def _after_terms_marker(raw: str) -> str:
     """Взять из документа ТОЛЬКО текст клиенту — часть после строки-маркера.
@@ -907,7 +924,7 @@ def _after_terms_marker(raw: str) -> str:
     lines = raw.replace("\r\n", "\n").split("\n")
     marker_at = -1
     for i, line in enumerate(lines):
-        if line.strip().strip("«»\"'").strip() == TERMS_MARKER:
+        if _is_terms_marker(line):
             marker_at = i          # берём ПОСЛЕДНЮЮ такую строку
     if marker_at < 0:
         return ""
