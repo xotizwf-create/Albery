@@ -46,11 +46,18 @@ def sent(tg, monkeypatch):
 
 @pytest.fixture
 def to_group(tg, monkeypatch):
-    """Перехват сообщений в группу Битрикса «Работа с ИУ»."""
+    """Перехват сообщений в группу Битрикса «Работа с ИУ».
+
+    Ловим только notify_iu_group: через mcp_call идут и другие инструменты (напр.
+    add_deal_comment — зеркалирование переписки в ленту сделки), и им тут не место."""
     box = []
-    monkeypatch.setattr(tg, "mcp_call",
-                        lambda tool, args: box.append({"tool": tool, **args})
-                        or {"sent": True, "message_id": 27698})
+
+    def fake(tool, args):
+        if tool == "notify_iu_group":
+            box.append({"tool": tool, **args})
+        return {"sent": True, "message_id": 27698}
+
+    monkeypatch.setattr(tg, "mcp_call", fake)
     return box
 
 

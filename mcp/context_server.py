@@ -8450,6 +8450,23 @@ def tool_get_crm_deal(args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def tool_add_deal_comment(args: dict[str, Any]) -> dict[str, Any]:
+    """Добавить запись в ленту (таймлайн) сделки — так переписка с клиентом видна в карточке.
+
+    Родной чат-виджет Битрикса (Открытые линии) закрыт правами приложения (нет imopenlines/
+    imconnector), поэтому переписку зеркалим в таймлайн — встроенную ленту сделки (24.07.2026)."""
+    try:
+        deal_id = int(args.get("deal_id"))
+    except (TypeError, ValueError) as exc:
+        raise McpError(-32602, "deal_id must be an integer.") from exc
+    comment = str(args.get("comment") or "").strip()
+    if not comment:
+        raise McpError(-32602, "comment is required.")
+    res = _crm_call("crm.timeline.comment.add", {"fields": {
+        "ENTITY_ID": deal_id, "ENTITY_TYPE": "deal", "COMMENT": comment[:10000]}})
+    return {"added": True, "comment_id": res.get("result")}
+
+
 def _crm_deal_common_fields(args: dict[str, Any]) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     if args.get("amount") not in (None, ""):
@@ -9066,6 +9083,22 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_send_contract,
+    },
+    "add_deal_comment": {
+        "description": (
+            "Добавить запись в ленту (таймлайн) сделки CRM. Через него переписка с клиентом "
+            "видна прямо в карточке сделки. Обычно вызывается автоматически, вручную не нужен."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "deal_id": {"type": "integer", "description": "Номер сделки."},
+                "comment": {"type": "string", "description": "Текст записи (можно BB-разметку)."},
+            },
+            "required": ["deal_id", "comment"],
+            "additionalProperties": False,
+        },
+        "handler": tool_add_deal_comment,
     },
     "get_telegram_dialog": {
         "description": (

@@ -170,6 +170,80 @@ def journal(bot: str, dialog_id, direction: str, text: str, *, kind: str = "bot_
                 )
     except Exception:  # noqa: BLE001
         log.warning("журнал Telegram недоступен", exc_info=True)
+    # Зеркалим сообщение в ленту сделки Битрикса — родная «переписка в карточке» (владелец,
+    # 24.07.2026). Только реальные сообщения клиента и агента: служебные записи об эскалации
+    # клиенту не отправлялись и в переписке не место. Best-effort — журнал важнее ленты.
+    if kind == "lead_chat" and (text or "").strip() and status == "ok":
+        m = meta or {}
+        # escalated в оперативном meta — это bool True; в БД он станет строкой "true". Здесь
+        # читаем dict, поэтому проверяем истинность, а не сравниваем со строкой.
+        if m.get("deal_id") and not m.get("escalated"):
+            _mirror_to_deal(m["deal_id"], direction, text)
+
+
+_MIRROR_TO_DEAL = str(os.getenv("TG_MIRROR_TO_DEAL", "1")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _deal_comment_text(direction: str, text: str) -> str:
+    """Одна реплика для ленты сделки: кто сказал + текст, с BB-разметкой Битрикса."""
+    who = "Клиент" if direction == "in" else "Агент"
+    return f"[B]{who}:[/B] {(text or '').strip()}"[:10000]
+
+
+def _mirror_to_deal(deal_id, direction: str, text: str) -> None:
+    """Отразить одно сообщение в ленту сделки. В фоне и best-effort: лента не должна ни
+    тормозить ответ клиенту, ни ронять журнал, если CRM недоступна."""
+    if not _MIRROR_TO_DEAL:
+        return
+    comment = _deal_comment_text(direction, text)
+
+    def _post():
+        try:
+            mcp_call("add_deal_comment", {"deal_id": int(deal_id), "comment": comment})
+        except Exception:  # noqa: BLE001 — лента сделки не критична для клиента
+            log.warning("сообщение не отражено в ленте сделки %s", deal_id, exc_info=True)
+
+    threading.Thread(target=_post, name="deal-mirror", daemon=True).start()
+
+
+def backfill_deal_timeline(deal_id: int, force: bool = False) -> dict:
+    """Один раз отразить всю уже накопленную переписку сделки в её ленту.
+
+    Для существующих сделок, у которых переписка накопилась до включения зеркалирования.
+    Идемпотентно: отметка в state.mirrored_deals, повтор не задваивает."""
+    deal_id = int(deal_id)
+    if not force and str(deal_id) in (load_state().get("mirrored_deals") or {}):
+        return {"deal_id": deal_id, "posted": 0, "note": "лента уже заполнена"}
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT direction, text FROM telegram_bot_messages"
+                    " WHERE bot = %s AND kind = 'lead_chat' AND status = 'ok'"
+                    "   AND meta->>'deal_id' = %s"
+                    "   AND COALESCE(meta->>'escalated', '') <> 'true'"
+                    " ORDER BY id", (MANAGER_CHANNEL, str(deal_id)))
+                rows = list(cur.fetchall())
+    except Exception:  # noqa: BLE001
+        log.warning("бэкфилл ленты: журнал недоступен (сделка %s)", deal_id, exc_info=True)
+        return {"deal_id": deal_id, "posted": 0, "error": "журнал недоступен"}
+    posted = 0
+    for r in rows:
+        if not (r["text"] or "").strip():
+            continue
+        try:
+            mcp_call("add_deal_comment",
+                     {"deal_id": deal_id, "comment": _deal_comment_text(r["direction"], r["text"])})
+            posted += 1
+        except Exception:  # noqa: BLE001 — CRM недоступна: не долбим, вернёмся в другой раз
+            log.warning("бэкфилл ленты: запись не отражена (сделка %s)", deal_id, exc_info=True)
+            return {"deal_id": deal_id, "posted": posted, "error": "CRM недоступна"}
+    with _state_lock:
+        st = load_state()
+        st.setdefault("mirrored_deals", {})[str(deal_id)] = \
+            datetime.now(timezone.utc).isoformat()
+        save_state(st)
+    return {"deal_id": deal_id, "posted": posted, "total": len(rows)}
 
 
 def chat_history(bot: str, dialog_id, current_text: str | list = "", limit: int = 12) -> str:
