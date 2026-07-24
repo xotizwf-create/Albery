@@ -232,6 +232,30 @@ def test_burst_of_messages_gets_one_combined_answer(tg, monkeypatch):
     assert len(outbox) == 1, "клиент получает один ответ на пачку"
 
 
+def test_debounce_window_slides_from_the_last_message(tg, monkeypatch):
+    """Владелец 24.07.2026: отсчёт паузы — от ПОСЛЕДНЕГО сообщения. Клиент пишет с паузами
+    меньше окна дольше самого окна — агент молчит и потом отвечает на всё разом."""
+    import threading
+    import time as _time
+
+    prompts = []
+    monkeypatch.setattr(tg, "_REPLY_DEBOUNCE_S", 0.1)
+    monkeypatch.setattr(tg, "hermes_answer",
+                        lambda p, s, toolsets=None: prompts.append(p) or "ок")
+    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
+
+    threads = []
+    for txt in ("раз", "два", "три"):
+        threads.append(threading.Thread(target=tg.maybe_autoreply, args=(_incoming(text=txt),)))
+        threads[-1].start()
+        _time.sleep(0.07)      # паузы меньше окна, суммарно (0.14) дольше окна (0.1)
+    for t in threads:
+        t.join(timeout=5)
+
+    assert len(prompts) == 1, "окно должно сдвигаться каждым сообщением — ход один"
+    assert all(w in prompts[0] for w in ("раз", "два", "три"))
+
+
 def test_message_after_the_turn_starts_goes_to_the_next_turn(tg, monkeypatch):
     """Сообщение, пришедшее когда пачка уже забрана, не теряется — его берёт следующий ход."""
     import threading

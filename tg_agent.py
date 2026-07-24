@@ -905,6 +905,73 @@ def _filled(value) -> bool:
 
 # Маршрут воронки: стадия → что уже должно быть сделано и что делать дальше. Считается по
 # ФАКТАМ сделки, а не по памяти агента: 23.07.2026 клиент спросил «а что такое ЭДО?», агент
+# --- сверка анкеты: строго из живых полей воронки -----------------------------------------------
+# Поля анкеты (значения приходят из CRM-формы «Индивидуальная настройка»). Telegram сюда не
+# входит: это контакт, а не данные магазина, которые клиент должен подтвердить.
+FORM_FIELDS = [c.strip() for c in os.getenv(
+    "CRM_FORM_FIELDS",
+    "UF_CRM_1784297026,UF_CRM_1784297137,UF_CRM_1784297181,UF_CRM_1784297221").split(",")
+    if c.strip()]
+_FIELD_LABELS_CACHE: dict[str, Any] = {"at": 0.0, "labels": {}}
+
+
+def _deal_field_labels() -> dict[str, str]:
+    """Живые названия полей сделки из CRM (кэш 10 мин).
+
+    Владелец 24.07.2026: «если поля изменяются, нужно чтобы и сообщение автоматически
+    изменилось». Поэтому названия НЕ зашиты в код: переименовали поле в воронке — сверка
+    анкеты меняется сама, без деплоя."""
+    now = time.time()
+    if _FIELD_LABELS_CACHE["labels"] and now - float(_FIELD_LABELS_CACHE["at"]) < 600:
+        return dict(_FIELD_LABELS_CACHE["labels"])
+    try:
+        from mcp import context_server as cs
+        data = cs._crm_call("crm.deal.fields", {}).get("result") or {}
+        labels = {}
+        for code, meta in data.items():
+            label = str((meta or {}).get("formLabel") or (meta or {}).get("listLabel") or "")
+            if label:
+                labels[code] = label
+        if labels:
+            _FIELD_LABELS_CACHE.update({"at": now, "labels": labels})
+    except Exception:  # noqa: BLE001 — без названий покажем коды, но не упадём
+        log.warning("названия полей сделки недоступны", exc_info=True)
+    return dict(_FIELD_LABELS_CACHE["labels"])
+
+
+def _fmt_form_value(value) -> str:
+    """Числа анкеты — по-человечески: 5000000 → «5 млн», 1500000 → «1.5 млн»."""
+    s = str(value).strip()
+    try:
+        n = float(s.replace(" ", "").replace(",", "."))
+    except ValueError:
+        return s
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:g} млн"
+    if n == int(n):
+        return f"{int(n):,}".replace(",", " ")
+    return s
+
+
+def anketa_block(deal: dict) -> str:
+    """Готовое сообщение сверки анкеты — данные из сделки, названия из воронки.
+
+    Формат задан владельцем 24.07.2026: «Вижу анкету: • <поле> — <значение> … Всё верно?».
+    Пустые поля не показываем. Текст собирает код, а не модель: сверка обязана быть
+    дословной и одинаковой у сторожа анкеты и у обычного хода."""
+    uf = deal.get("custom_fields") or {}
+    labels = _deal_field_labels()
+    lines = []
+    for code in FORM_FIELDS:
+        value = uf.get(code)
+        if not _filled(value):
+            continue
+        lines.append(f"• {labels.get(code, code)} — {_fmt_form_value(value)}")
+    if not lines:
+        return ""
+    return "Вижу анкету:\n\n" + "\n".join(lines) + "\n\nВсё верно?"
+
+
 # ответил — и забыл, что за ответом «давайте ЭДО» должна была идти задача на отправку. Любое
 # число вопросов между шагами теперь ничего не ломает: шаг приходит в каждом сообщении.
 def funnel_next_step(deal: dict) -> dict:
@@ -920,9 +987,14 @@ def funnel_next_step(deal: dict) -> dict:
     terms_sent = _filled(uf.get(TERMS_SENT_FIELD)) if TERMS_SENT_FIELD else has_req
 
     if stage in ("C16:NEW", "C16:CONTACTED"):
+        block = anketa_block(deal)
+        show = (f"Если сверка анкеты ещё не отправлялась (посмотри историю) — отправь клиенту "
+                f"РОВНО это сообщение, слово в слово, ничего не добавляя:\n{block}\n\n"
+                if block else "")
         return {"step": "Сверка анкеты",
                 "need": "подтверждение данных анкеты",
-                "action": (f"Как только клиент подтвердил данные — переведи сделку {deal_id} на "
+                "action": (show
+                           + f"Как только клиент подтвердил данные — переведи сделку {deal_id} на "
                            f"стадию C16:S84294149 (update_crm_deal) и СРАЗУ вызови "
                            f"send_terms(deal_id={deal_id}, telegram_id=<id клиента>). Условия "
                            f"НЕ пересказывай своими словами: инструмент отправит их дословно из "
@@ -1152,13 +1224,103 @@ def check_finished_tasks(limit: int = 50) -> dict:
 _TASK_WATCH_INTERVAL_S = float(os.getenv("TG_TASK_WATCH_INTERVAL_S", "20") or 20)
 
 
+def _username_for_uid(uid) -> str:
+    """@username из справочника контактов по числовому id."""
+    target = to_int_safe(uid)
+    for entry in contacts().values():
+        if isinstance(entry, dict) and to_int_safe(entry.get("id")) == target:
+            return str(entry.get("username") or "")
+    return ""
+
+
+def _agent_already_spoke_on_deal(dialog_id, deal_id: int) -> bool:
+    """Агент уже писал этому человеку ПО ЭТОЙ сделке? Тогда сверку начинать не надо."""
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM telegram_bot_messages WHERE bot = %s AND dialog_id = %s"
+                    "   AND direction = 'out' AND meta->>'deal_id' = %s LIMIT 1",
+                    (MANAGER_CHANNEL, str(dialog_id), str(int(deal_id))))
+                return cur.fetchone() is not None
+    except Exception:  # noqa: BLE001 — журнал недоступен: лучше промолчать, чем задвоить
+        log.warning("журнал недоступен для проверки сделки %s", deal_id, exc_info=True)
+        return True
+
+
+def _deal_for_watch(deal_id: int) -> dict:
+    """Сделка для сторожа анкеты (тем же инструментом, что и ходы агента)."""
+    from mcp import context_server as cs
+    deal = cs.TOOLS["get_crm_deal"]["handler"]({"deal_id": int(deal_id)})
+    return deal.get("deal") or deal
+
+
+def _check_new_forms() -> None:
+    """Сторож анкеты: клиент заполнил форму — агент НАЧИНАЕТ сверку сам, не ждёт сообщения.
+
+    Владелец 24.07.2026: «агент должен не просто ждать пока человек напишет, а сам
+    отслеживать, появилась ли анкета». Отслеживаем тех, кому агент сам отправил ссылку на
+    анкету (state.invited): появилась сделка → шлём сверку (anketa_block, дословно из полей
+    воронки). Одна сделка обрабатывается один раз (state.form_surveyed[uid] = deal_id) —
+    повторная анкета того же человека создаст НОВУЮ сделку, и сторож сработает снова."""
+    state = load_state()
+    invited = state.get("invited") or {}
+    surveyed = state.get("form_surveyed") or {}
+    if not invited:
+        return
+    for uid_str in list(invited):
+        username = _username_for_uid(uid_str)
+        if not username:
+            continue
+        deal_id = lead_deal_for_username(username)
+        if not deal_id or str(surveyed.get(uid_str)) == str(deal_id):
+            continue
+        lock = dialog_lock(to_int_safe(uid_str))
+        if not lock.acquire(blocking=False):
+            continue        # идёт ход с этим человеком — он сам увидит шаг воронки
+        try:
+            if _agent_already_spoke_on_deal(uid_str, deal_id):
+                pass        # разговор по сделке уже идёт — просто запоминаем её
+            else:
+                deal = _deal_for_watch(deal_id)
+                stage = str(deal.get("stage_id") or deal.get("stage") or "")
+                if stage not in ("C16:NEW", "C16:CONTACTED"):
+                    pass    # сделка уже дальше сверки — не лезем
+                else:
+                    block = anketa_block(deal)
+                    if not block:
+                        continue    # поля ещё пустые — попробуем в следующий проход
+                    ok, err = send_html(to_int_safe(uid_str), as_html(block), block)
+                    if not ok:
+                        log.warning("сверка анкеты не доставлена %s: %s", uid_str, err[:150])
+                        continue
+                    journal(MANAGER_CHANNEL, uid_str, "out", block, kind="lead_chat",
+                            meta={"deal_id": deal_id, "anketa": True})
+                    log.info("анкета сделки %s замечена — сверка отправлена клиенту %s",
+                             deal_id, uid_str)
+            with _state_lock:
+                fresh = load_state()
+                fresh.setdefault("form_surveyed", {})[uid_str] = deal_id
+                save_state(fresh)
+        except Exception:  # noqa: BLE001 — один человек не должен ронять весь проход
+            log.warning("сторож анкеты: сбой на %s", uid_str, exc_info=True)
+        finally:
+            lock.release()
+
+
+_FORM_WATCH_EVERY_TICKS = max(1, int(os.getenv("TG_FORM_WATCH_EVERY_TICKS", "3") or 3))
+
+
 def _task_watch_loop() -> None:
     """Сторож ожиданий: сотрудник закрыл задачу — клиент узнаёт в пределах интервала.
 
     Живёт отдельным потоком в службе tg-агента: Битрикс не шлёт сюда событий о закрытии
     задач, а агент отвечает только на входящие — без сторожа механизм ожиданий не работал
     вовсе (23.07.2026 владелец закрыл задачу, клиенту не ушло ничего). Когда ожиданий нет,
-    Битрикс не дёргается: проход обходится одним запросом к своей БД."""
+    Битрикс не дёргается: проход обходится одним запросом к своей БД.
+
+    Тем же потоком, раз в несколько тиков, работает сторож анкеты (_check_new_forms)."""
+    tick = 0
     while True:
         try:
             res = check_finished_tasks()
@@ -1166,6 +1328,12 @@ def _task_watch_loop() -> None:
                 log.info("сторож задач: %s", res)
         except Exception:  # noqa: BLE001 — сторож не имеет права умереть от одного сбоя
             log.warning("сторож задач: проход не удался", exc_info=True)
+        tick += 1
+        if tick % _FORM_WATCH_EVERY_TICKS == 0:
+            try:
+                _check_new_forms()
+            except Exception:  # noqa: BLE001
+                log.warning("сторож анкеты: проход не удался", exc_info=True)
         time.sleep(_TASK_WATCH_INTERVAL_S)
 
 
@@ -1941,7 +2109,8 @@ def _business_owner_id() -> int | None:
 
 _inbox_lock = threading.Lock()
 _inbox: dict[Any, list[dict]] = {}
-_REPLY_DEBOUNCE_S = float(os.getenv("TG_REPLY_DEBOUNCE_S", "8") or 8)
+_inbox_last: dict[Any, float] = {}      # когда человек написал в последний раз (monotonic)
+_REPLY_DEBOUNCE_S = float(os.getenv("TG_REPLY_DEBOUNCE_S", "30") or 30)
 
 
 def maybe_autoreply(msg: dict) -> None:
@@ -1962,13 +2131,21 @@ def maybe_autoreply(msg: dict) -> None:
         return
     with _inbox_lock:
         _inbox.setdefault(uid, []).append(msg)
+        _inbox_last[uid] = time.monotonic()
     with dialog_lock(uid):
         with _inbox_lock:
             if not _inbox.get(uid):
                 return      # сообщение уже забрал предыдущий ход
-        # Пауза-добор: человек часто дописывает мысль следующим сообщением. Ответ чуть позже —
-        # это ещё и по-человечески: живой менеджер не отвечает за секунду.
-        time.sleep(_REPLY_DEBOUNCE_S)
+        # Пауза-добор СКОЛЬЗЯЩАЯ: отсчёт от ПОСЛЕДНЕГО сообщения (владелец, 24.07.2026).
+        # Человек пишет 7 сообщений подряд — агент молчит, пока тот не выговорится, и отвечает
+        # на всё разом, как живой менеджер. Каждое новое сообщение сдвигает окно.
+        while True:
+            with _inbox_lock:
+                last = _inbox_last.get(uid) or 0.0
+            wait = _REPLY_DEBOUNCE_S - (time.monotonic() - last)
+            if wait <= 0:
+                break
+            time.sleep(wait)
         with _inbox_lock:
             batch = _inbox.pop(uid, [])
         if batch:
