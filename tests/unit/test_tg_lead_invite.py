@@ -224,9 +224,11 @@ def test_lead_question_also_goes_to_people_silently(tg, sent, to_group, monkeypa
     assert len(to_group) == 1 and "Какая комиссия?" in to_group[0]["text"]
 
 
-def test_escalation_card_carries_the_conversation(tg, sent, to_group, monkeypatch):
-    """23.07.2026: клиент прислал реквизиты в Telegram, а агент группы ответил «реквизитов в
-    истории диалога нет» — они были, просто в другом чате. Карточка обязана нести переписку."""
+def test_escalation_card_is_short_without_the_chat_dump(tg, sent, to_group, monkeypatch):
+    """Владелец 24.07.2026: карточки с простынёй «О чём говорили» превратились во флуд —
+    полезна только верхняя часть. Переписку агент группы достаёт сам (get_telegram_dialog,
+    подключён 23.07.2026), поэтому в карточке остаются: вопрос, клиент, чего нет в базе,
+    и как ответить."""
     _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: что отвечать про договор")
     _journal_rows(tg, monkeypatch, [("in", "ИНН 7704123456, ООО «Альфа Трейд»"),
                                     ("out", "Реквизиты получил")])
@@ -234,8 +236,10 @@ def test_escalation_card_carries_the_conversation(tg, sent, to_group, monkeypatc
     tg.maybe_autoreply(_msg(text="Вы пришлёте мне договор сюда?"))
 
     card = to_group[0]["text"]
-    assert "О чём говорили в чате с клиентом" in card
-    assert "7704123456" in card, "сотрудник должен видеть присланные реквизиты, а не просить их снова"
+    assert "О чём говорили в чате с клиентом" not in card, "простыня переписки — флуд"
+    assert "Вы пришлёте мне договор сюда?" in card, "суть вопроса остаётся"
+    assert "Скажите мне здесь" in card, "инструкция, как ответить клиенту, остаётся"
+    assert "———" not in card
 
 
 def test_escalation_card_says_the_client_is_still_waiting(tg, sent, to_group, monkeypatch):

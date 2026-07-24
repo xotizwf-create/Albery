@@ -711,6 +711,85 @@ _MONTHS = ("января", "февраля", "марта", "апреля", "ма
            "сентября", "октября", "ноября", "декабря")
 
 
+def _requisites_already_forwarded(dialog_id, deal_id) -> bool:
+    """Уже говорили клиенту «передал менеджеру» по этой сделке? Второй раз нельзя."""
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM telegram_bot_messages WHERE bot = %s AND dialog_id = %s"
+                    "   AND direction = 'out' AND meta->>'requisites_forwarded' = 'true'"
+                    "   AND meta->>'deal_id' = %s LIMIT 1",
+                    (MANAGER_CHANNEL, str(dialog_id), str(int(deal_id))))
+                return cur.fetchone() is not None
+    except Exception:  # noqa: BLE001 — журнал недоступен: лучше промолчать, чем задвоить
+        log.warning("журнал недоступен (реквизиты, сделка %s)", deal_id, exc_info=True)
+        return True
+
+
+def _requisites_to_manager(cs, deal_id, telegram_id, raw: str, reason,
+                           requisites_written: bool = False) -> dict:
+    """Шаблона договора нет в базе — реквизиты уходят людям, клиент ждёт обратной связи.
+
+    Владелец 24.07.2026 (шаблон временно удалён из базы знаний): реквизиты записать, клиенту —
+    «передал информацию ответственному менеджеру, вернусь с обратной связью», в группу —
+    «Человек отправил реквизиты, нужен следующий шаг». Без повторов при следующих ходах."""
+    deal_id = int(deal_id)
+    if _requisites_already_forwarded(telegram_id, deal_id):
+        return {"sent": False, "forwarded": True,
+                "note": ("Реквизиты уже переданы менеджеру, клиент предупреждён. Повторно об "
+                         "этом НЕ пиши и договор собрать не пытайся — жди ответа людей в "
+                         "группе «Работа с ИУ».")}
+    msg = ("Реквизиты получил, спасибо. Передал информацию ответственному менеджеру — "
+           "вернусь к вам с обратной связью.")
+    ok, err = send_html(int(telegram_id), as_html(msg), msg)
+    if ok:
+        journal(MANAGER_CHANNEL, telegram_id, "out", msg, kind="lead_chat",
+                meta={"deal_id": deal_id, "requisites_forwarded": True})
+    else:
+        log.warning("«передал менеджеру» не доставлено клиенту %s: %s", telegram_id, err[:150])
+    who = next((e for e in contacts().values()
+                if isinstance(e, dict) and to_int_safe(e.get("id")) == to_int_safe(telegram_id)),
+               {})
+    card = (f"[b]Человек отправил реквизиты, нужен следующий шаг[/b]\n"
+            f"\n"
+            f"[b]Клиент[/b]\n"
+            f"{who.get('name') or 'без имени'}"
+            + (f", @{who['username']}" if who.get("username") else "")
+            + f", telegram id {telegram_id}, сделка №{deal_id}\n"
+            f"\n"
+            f"[b]Реквизиты[/b]\n{raw[:900]}\n"
+            f"\n"
+            f"Шаблона договора нет в базе знаний, договор не собирался. Клиенту сказано: "
+            f"«передал менеджеру, вернусь с обратной связью».\n"
+            f"\n"
+            f"Скажите мне здесь: «{IU_AGENT_NAME}, ответь, что …» — и я передам ответ клиенту "
+            f"в Telegram.")
+    try:
+        res = cs.TOOLS["notify_iu_group"]["handler"]({"text": card})
+        if not res.get("sent"):
+            raise RuntimeError(str(res)[:150])
+    except Exception:  # noqa: BLE001 — карточка важна, но клиент уже предупреждён
+        log.warning("карточка о реквизитах не дошла до группы (сделка %s)", deal_id,
+                    exc_info=True)
+    try:
+        updates: dict = {"deal_id": deal_id,
+                         "comments": "Реквизиты получены. Шаблона договора нет в базе знаний — "
+                                     "передано менеджеру в группу «Работа с ИУ»."}
+        if requisites_written and raw:
+            updates["custom_fields"] = {CONTRACT_REQUISITES_FIELD: raw}
+        cs.TOOLS["update_crm_deal"]["handler"](updates)
+    except Exception:  # noqa: BLE001
+        log.warning("сделка %s не обновлена после передачи реквизитов", deal_id, exc_info=True)
+    log.info("реквизиты сделки %s переданы менеджеру (шаблона нет: %s)",
+             deal_id, str(reason)[:120])
+    return {"sent": False, "forwarded": True,
+            "note": ("Шаблона договора нет в базе знаний. Реквизиты записаны и переданы "
+                     "менеджеру в группу «Работа с ИУ»; клиенту уже сказано, что вернёмся с "
+                     "обратной связью. Повторно об этом не пиши и договор не пытайся собрать "
+                     "— жди людей.")}
+
+
 def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "",
                   number: str = "") -> dict:
     """Собрать договор по реквизитам сделки и отправить клиенту PDF на согласование.
@@ -745,6 +824,14 @@ def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "
                          + ". Скажи клиенту ПРЯМО, что именно не так, и попроси карточку "
                            "компании из банка или 1С. Договор не собран.")}
 
+    # Шаблон читаем ДО номера и PDF: владелец может временно убрать его из базы знаний
+    # (24.07.2026 — убрал). Тогда договор не собираем, а реквизиты передаём людям.
+    try:
+        template = contract_mod.load_template()
+    except Exception as exc:  # noqa: BLE001 — нет шаблона/Drive недоступен: людям виднее
+        return _requisites_to_manager(cs, deal_id, telegram_id, raw, exc,
+                                      requisites_written=bool(requisites_text))
+
     number = (number or uf.get(CONTRACT_NUMBER_FIELD) or "").strip()
     if not number:
         number = cs.TOOLS["next_contract_number"]["handler"](
@@ -752,7 +839,7 @@ def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "
     now = datetime.now(timezone.utc) + timedelta(hours=3)
     human_date = f"«{now.day:02d}» {_MONTHS[now.month - 1]} {now.year} г."
 
-    pdf = contract_mod.render_contract_pdf(number, human_date, fields)
+    pdf = contract_mod.render_contract_pdf(number, human_date, fields, template=template)
     filename = f"Договор {number}.pdf"
     ok, err = send_document_as_account(
         int(telegram_id), pdf, filename,
@@ -789,7 +876,7 @@ def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "
     journal(MANAGER_CHANNEL, telegram_id, "out", f"[файл] {filename} — на согласование",
             kind="lead_chat", meta={"contract": number, "deal_id": int(deal_id)})
     gaps = contract_mod.unfilled_placeholders(
-        contract_mod.fill_template(contract_mod.load_template(), fields, number, human_date))
+        contract_mod.fill_template(template, fields, number, human_date))
     return {"sent": True, "number": number, "file": filename, "size_bytes": len(pdf),
             "client_name": fields.get("name"), "stage": CONTRACT_STAGE,
             "attached_to_deal": True, "unfilled_in_template": gaps,
@@ -1952,24 +2039,16 @@ def _mark_invited(user_id: int) -> None:
 IU_AGENT_NAME = os.getenv("IU_AGENT_NAME", "Агент по работе с ИУ").strip()
 
 
-def _card_conversation(uid, client_text: str, limit: int = 8) -> str:
-    """Кусок переписки в карточку для группы.
-
-    Без него сотрудник (и агент группы) видят голый вопрос и переспрашивают то, что клиент уже
-    написал: 23.07.2026 клиент прислал реквизиты в Telegram, а агент группы ответил «реквизитов
-    в истории диалога нет» — они были, просто в другом чате."""
-    history = chat_history(MANAGER_CHANNEL, uid, client_text, limit=limit)
-    if not history:
-        return ""
-    return f"[b]О чём говорили в чате с клиентом[/b]\n{history}\n\n"
-
-
 def escalate_to_human(author: dict, question: str, client_text: str,
                       answered: bool = False) -> None:
     """Принести вопрос лида живым людям в группу Битрикса «Работа с ИУ».
 
     Ответ сотрудника в той же группе агент передаёт клиенту сам — поэтому в карточке есть
-    telegram id: без него передать ответ будет некому."""
+    telegram id: без него передать ответ будет некому.
+
+    Карточка КОРОТКАЯ (владелец, 24.07.2026): суть вопроса, клиент, чего нет в базе — и всё.
+    Простыня «О чём говорили в чате» убрана: она превращала уведомления во флуд, а переписку
+    агент группы и так достаёт инструментом get_telegram_dialog."""
     uid = author.get("id")
     uname = author.get("username") or ""
     name = " ".join(x for x in (author.get("first_name"), author.get("last_name")) if x).strip()
@@ -1989,9 +2068,6 @@ def escalate_to_human(author: dict, question: str, client_text: str,
             f"\n"
             f"[b]В базе знаний не нашлось[/b]\n"
             f"{question}\n"
-            f"\n"
-            + _card_conversation(uid, client_text)
-            + f"———\n"
             f"\n"
             f"Скажите мне здесь: «{IU_AGENT_NAME}, ответь, что …» — и я передам ответ клиенту "
             f"в Telegram.")
