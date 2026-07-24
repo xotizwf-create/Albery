@@ -90,6 +90,8 @@ def _wire_watch(tg, monkeypatch, deal=DEAL):
     """Сторож с подменёнными внешними вызовами."""
     sent, journaled = [], []
     monkeypatch.setattr(tg, "lead_deal_for_username", lambda u: 82)
+    # Разговор уже идёт — приветствие проверяется отдельно, в test_client_message.py
+    monkeypatch.setattr(tg, "_dialog_out_watermark", lambda uid: 407)
     monkeypatch.setattr(tg, "_deal_for_watch", lambda i: dict(deal))
     monkeypatch.setattr(tg, "merge_form_duplicate", lambda u: {"merged": False})
     monkeypatch.setattr(tg, "send_html",
@@ -106,7 +108,8 @@ def test_watch_starts_the_survey_without_waiting_for_a_message(tg, monkeypatch):
     tg._check_new_forms()
 
     assert len(sent) == 1 and sent[0][0] == 555
-    assert sent[0][1].startswith("Вижу анкету:") and sent[0][1].endswith("Всё верно?")
+    assert "Вижу анкету:" in sent[0][1] and sent[0][1].endswith("Всё верно?")
+    assert sent[0][1].startswith("Спасибо, анкету получил"), "живая подводка, а не голый блок"
     assert journaled and journaled[0]["meta"] == {"deal_id": 82, "anketa": True}
 
     tg._check_new_forms()      # второй проход — тишина
@@ -127,7 +130,7 @@ def test_survey_fires_on_the_deal_the_agent_opened_himself(tg, monkeypatch):
     tg._check_new_forms()
 
     assert len(sent) == 1, "сверка обязана уйти САМА, не дожидаясь сообщения клиента"
-    assert sent[0][1].startswith("Вижу анкету:")
+    assert "Вижу анкету:" in sent[0][1]
 
 
 def test_refilled_anketa_is_surveyed_again(tg, monkeypatch):

@@ -157,7 +157,9 @@ def funnel(monkeypatch, tmp_path):
     monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
     monkeypatch.setattr(tg, "react", lambda *a, **k: None)
     monkeypatch.setattr(tg, "chat_history", lambda *a, **k: "")
-    monkeypatch.setattr(tg, "_dialog_out_watermark", lambda d: 0)
+    # Отметка исходящих — по реально отправленному: тогда «первый контакт» в стенде
+    # означает ровно то же, что на проде.
+    monkeypatch.setattr(tg, "_dialog_out_watermark", lambda d: len(chat.messages))
     monkeypatch.setattr(tg, "_out_messages_after", lambda d, s: 0)
 
     said: list[str] = []
@@ -227,19 +229,19 @@ def test_lead_journey_from_hello_to_a_question_beyond_the_terms(funnel):
     assert survived[0]["stage_id"] == tg.STAGE_FORM_DONE, "этап догнал факт: «Анкета заполнена»"
     assert survived[0]["custom_fields"]["UF_CRM_1784297137"] == "одежда", "данные анкеты перенесены"
     assert len(chat.messages) == before + 1, "сверка ушла сама, ровно одна"
-    assert chat.last.startswith("Вижу анкету:") and chat.last.endswith("Всё верно?")
+    assert "Вижу анкету:" in chat.last and chat.last.endswith("Всё верно?")
     assert "30 млн" in chat.last, "цифры — из живых полей воронки"
 
     # 6. Повторный проход сторожа — тишина: те же данные второй раз не сверяем.
     tg._check_new_forms()
-    assert chat.last.startswith("Вижу анкету:") and len(chat.messages) == before + 1
+    assert "Вижу анкету:" in chat.last and len(chat.messages) == before + 1
 
     # 7. Клиент подтвердил анкету — разговор обязан идти дальше, а не встать в тупик.
     #    Живой случай Александра (сделка 148): на «Все верно» пришло «Уточню это у команды».
     before = len(chat.messages)
     funnel.says("Все верно")
     assert len(chat.messages) == before + 1, "на подтверждение отвечаем"
-    assert chat.last != tg.TERMS_ASK_HUMAN_REPLY, "подтверждение — не повод дёргать людей"
+    assert tg.TERMS_ASK_HUMAN_REPLY not in chat.last, "подтверждение — не повод дёргать людей"
     assert "вопрос" in chat.last.lower(), "менеджер спрашивает, остались ли вопросы по условиям"
     assert "Индивидуальные условия снижают комиссию" not in chat.last, "документ второй раз не шлём"
     assert not portal.escalations, "людей на подтверждении не беспокоим"
@@ -253,7 +255,7 @@ def test_lead_journey_from_hello_to_a_question_beyond_the_terms(funnel):
     # 8. Вопрос ПОВЕРХ условий (в документе такого нет) — людям, клиенту одна строка.
     before = len(chat.messages)
     funnel.says("Какой ДРР держать и как происходит управление?")
-    assert chat.last == tg.TERMS_ASK_HUMAN_REPLY, "второй документ клиенту не дублируем"
+    assert tg.TERMS_ASK_HUMAN_REPLY in chat.last, "второй документ клиенту не дублируем"
     assert len(chat.messages) == before + 1
     assert portal.escalations, "вопрос обязан уйти живым людям"
     assert "дрр" in portal.escalations[-1].lower()
@@ -297,3 +299,26 @@ def test_survey_waits_for_the_anketa_itself(funnel):
     tg._check_new_forms()
 
     assert len(chat.messages) == before, "без данных анкеты сторож молчит"
+
+
+def test_person_who_only_filled_the_form_is_greeted(funnel):
+    """Живой случай (диалог 256942600, 25.07.2026): человек заполнил анкету, в чат не писал —
+    и первым сообщением от компании получил голое «Вижу анкету: • Ссылка на магазин…».
+
+    Инвариант вежливости: ПЕРВОЕ сообщение человеку всегда начинается с приветствия, кем бы оно
+    ни было отправлено — моделью или кодом."""
+    tg, portal, chat = funnel.tg, funnel.portal, funnel.chat
+    # Человек в воронке (пришёл из анкеты), агент ему ещё ни разу не писал.
+    portal.fill_the_form(LEAD["username"], {"UF_CRM_1784297137": "одежда",
+                                            "UF_CRM_1784297181": "30000000"})
+    state = json.loads(tg.STATE_PATH.read_text(encoding="utf-8"))
+    state["invited"] = {str(LEAD["id"]): "2026-07-25T09:00:00+00:00"}
+    tg.STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    tg._check_new_forms()
+
+    assert chat.messages, "сверка должна уйти"
+    assert chat.messages[0].startswith("Здравствуйте, Сергей!"), \
+        "первое сообщение человеку — с приветствием и по имени"
+    assert "Вижу анкету:" in chat.messages[0], "и с самой сверкой, слово в слово"
+    assert chat.messages[0].rstrip().endswith("Всё верно?")

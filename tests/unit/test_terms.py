@@ -325,7 +325,7 @@ def test_question_on_top_of_sent_terms_goes_to_humans_not_a_second_document(tg, 
     assert sent, "клиент не должен остаться в тишине"
     assert "Индивидуальные условия снижают комиссию" not in sent[0], \
         "второй раз документ условий не дублируем"
-    assert sent[0] == tg.TERMS_ASK_HUMAN_REPLY, "клиенту — одна короткая строка"
+    assert tg.TERMS_ASK_HUMAN_REPLY in sent[0], "клиенту — одна короткая строка"
     assert to_humans, "вопрос обязан уйти живым людям"
     assert "дрр" in to_humans[0].lower(), "людям уходит именно вопрос клиента"
 
@@ -367,7 +367,7 @@ def test_confirming_the_anketa_is_not_a_terms_question(tg, monkeypatch):
         state_extra={"terms_sent": {"764181402": "2026-07-24T18:52:48+00:00"}})
 
     assert sent, "клиент не должен остаться без ответа"
-    assert sent[0] != tg.TERMS_ASK_HUMAN_REPLY, "это не вопрос — людям не уносим"
+    assert tg.TERMS_ASK_HUMAN_REPLY not in sent[0], "это не вопрос — людям не уносим"
     assert not to_humans, "живых людей дёргать не за чем"
     assert "вопрос" in sent[0].lower(), "менеджер спрашивает, остались ли вопросы по условиям"
     assert "Индивидуальные условия снижают комиссию" not in sent[0], "документ второй раз не шлём"

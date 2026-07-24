@@ -35,6 +35,8 @@ from pathlib import Path
 
 import requests
 
+import client_message      # единственная сборка сообщений, которые отправляет код
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tg_agent")
@@ -1039,9 +1041,15 @@ def terms_text() -> str:
 
 
 def send_terms(deal_id: int, telegram_id: int) -> dict:
-    """Отправить клиенту условия дословно и спросить, есть ли вопросы."""
+    """Отправить клиенту условия дословно — в человеческой оболочке, а не голым дампом."""
     body = terms_text()
-    message = f"{body}\n\n{TERMS_QUESTION}"
+    # Документ остаётся слово в слово; вокруг — то, что сказал бы живой менеджер.
+    message = client_message.compose(body, name=_name_for_uid(telegram_id),
+                                     greet=_first_contact(telegram_id),
+                                     lead_in=client_message.LEAD_IN_TERMS,
+                                     follow_up=TERMS_QUESTION)
+    if not client_message.verbatim_intact(message, body):
+        raise RuntimeError("Условия не отправлены: текст документа изменился при сборке")
     ok, err = send_html(int(telegram_id), as_html(message), message)
     if not ok:
         raise RuntimeError(f"Условия не отправлены: {err}")
@@ -1462,6 +1470,22 @@ def check_finished_tasks(limit: int = 50) -> dict:
 _TASK_WATCH_INTERVAL_S = float(os.getenv("TG_TASK_WATCH_INTERVAL_S", "20") or 20)
 
 
+def _name_for_uid(uid) -> str:
+    """Имя человека из справочника контактов — чтобы обращаться по имени, а не «клиент»."""
+    target = to_int_safe(uid)
+    for entry in contacts().values():
+        if isinstance(entry, dict) and to_int_safe(entry.get("id")) == target:
+            return str(entry.get("name") or entry.get("first_name") or "")
+    return ""
+
+
+def _first_contact(uid) -> bool:
+    """Агент ещё ни разу не писал этому человеку — значит надо поздороваться.
+
+    Отметка живёт в общем журнале, поэтому видит и сообщения инструментов из другого процесса."""
+    return _dialog_out_watermark(uid) == 0
+
+
 def _username_for_uid(uid) -> str:
     """@username из справочника контактов по числовому id."""
     target = to_int_safe(uid)
@@ -1602,6 +1626,11 @@ def _check_new_forms() -> None:
             # не было (сделку создала только форма), этап так и оставался «Связались».
             if stage in (STAGE_NEW, STAGE_CONTACTED):
                 _move_deal_stage(deal_id, STAGE_FORM_DONE, "Клиент заполнил анкету.")
+            # Сверка — тоже сообщение живого человека: с приветствием при первом контакте и
+            # подводкой. Раньше клиент получал голое «Вижу анкету:» (диалог 256942600).
+            block = client_message.compose(block, name=_name_for_uid(uid_str),
+                                           greet=_first_contact(uid_str),
+                                           lead_in=client_message.LEAD_IN_ANKETA)
             ok, err = send_html(to_int_safe(uid_str), as_html(block), block)
             if not ok:
                 log.warning("сверка анкеты не доставлена %s: %s", uid_str, err[:150])
@@ -2288,11 +2317,13 @@ def _terms_question_to_humans(author: dict, client_text: str,
                       f"условия клиент уже получил, в документе ответа на это нет; ему написано "
                       f"«{TERMS_ASK_HUMAN_REPLY}». Нужен ваш ответ на: {client_text[:150]}",
                       client_text, answered=True)
-    ok, err = send_html(uid, as_html(TERMS_ASK_HUMAN_REPLY), TERMS_ASK_HUMAN_REPLY)
+    reply = client_message.compose(TERMS_ASK_HUMAN_REPLY, name=_name_for_uid(uid),
+                                   greet=_first_contact(uid))
+    ok, err = send_html(uid, as_html(reply), reply)
     for t in texts_to_journal or []:
         journal(MANAGER_CHANNEL, uid, "in", t, kind="lead_chat", user=author)
     journal(MANAGER_CHANNEL, uid, "out",
-            TERMS_ASK_HUMAN_REPLY if ok else f"{TERMS_ASK_HUMAN_REPLY}\n\n[не доставлено: {err}]",
+            reply if ok else f"{reply}\n\n[не доставлено: {err}]",
             kind="lead_chat", user=author, status="ok" if ok else "error",
             meta={"escalated": True, **(meta or {})})
     log.info("вопрос поверх уже отправленных условий от %s унесён людям", uid)
