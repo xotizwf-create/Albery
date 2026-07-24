@@ -91,9 +91,14 @@ def test_payment_is_confirmed_only_by_the_accountant():
 
 
 def test_unknown_stage_does_not_invent_actions():
+    """Незнакомый этап не даёт агенту выдумывать обещания и самому двигать сделку.
+
+    Формулировка запасного сценария изменена 24.07.2026: раньше он ещё и молчал о том, ЧТО
+    делать, из-за чего агент вставал в тупик (см. тест ниже)."""
     st = funnel_next_step(_deal("C16:SOMETHING_NEW"))
 
-    assert "не двигай без факта" in st["action"]
+    assert "Стадию сам не двигай" in st["action"]
+    assert "не выдумывай" in st["action"].lower()
 
 
 def test_step_block_tells_the_agent_to_come_back_after_questions(monkeypatch):
@@ -161,3 +166,15 @@ def test_after_anketa_without_terms_agent_sends_them():
     st = funnel_next_step(ANKETA_DEAL)
 
     assert "send_terms" in st["action"]
+
+
+def test_unknown_stage_never_leaves_the_agent_without_instructions():
+    """Класс сбоя, а не один случай: в воронку добавили этап, а шаг в коде не написали.
+
+    Так вышло с «Анкета заполнена» 24.07.2026 — агент получал «ждёшь: — / веди разговор по
+    маршруту» и вставал в тупик. Запасной сценарий обязан говорить, что делать."""
+    st = funnel_next_step(_deal("C16:СОВСЕМ_НОВЫЙ_ЭТАП"))
+
+    assert st["need"] != "—", "агент обязан знать, чего ждёт от клиента"
+    assert "вопрос" in st["action"].lower(), "минимум — ответить и спросить про вопросы"
+    assert "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ" in st["action"], "не понимает — зовёт людей, а не молчит"
