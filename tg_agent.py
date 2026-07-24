@@ -2079,6 +2079,11 @@ STYLE_RULES = (
     "- Не принимай данные на веру: если присланное не похоже на то, что ты просил (случайные "
     "цифры, обрывок, не тот документ) — скажи об этом прямо и попроси нормальный вариант. "
     "Не додумывай за клиента.\n"
+    "- Ссылку на анкету НЕ вставляй сам: её добавляет система один раз. Второе приглашение в "
+    "том же сообщении выглядит как сбой (случай 24.07.2026).\n"
+    "- Не спрашивай в чате то, что человек указывает в анкете (магазин, категория товара, "
+    "обороты): он заполнит её сам. Сказал «ок»/«хорошо» — не переспрашивай то же самое, просто "
+    "дождись анкеты.\n"
     "- Коротко и тепло, без канцелярита. Один встречный вопрос за раз."
 )
 
@@ -2274,7 +2279,10 @@ def reply_to_stranger(author: dict, texts: list[str] | str) -> bool:
         return False
 
     # Анкета — хвостом к первому ответу, один раз: это приглашение, а не подпись под каждым словом.
-    invite_now = LEAD_FORM_URL and not _invite_already_sent(author_id)
+    # И НЕ приклеиваем хвост, если модель уже позвала в анкету сама: 24.07.2026 клиент получил
+    # ссылку на анкету дважды в одном сообщении — свою вставку модели плюс наш хвост.
+    invite_now = (LEAD_FORM_URL and not _invite_already_sent(author_id)
+                  and LEAD_FORM_URL not in answer)
     body = as_html(answer)
     plain = answer
     if invite_now:
@@ -2361,6 +2369,22 @@ def maybe_autoreply(msg: dict) -> None:
             _autoreply_turn(batch)
 
 
+# Автоответы Открытой линии (Wazzup) прилетают в тот же чат и попадали к нам КАК СООБЩЕНИЯ
+# КЛИЕНТА: 24.07.2026 в диалоге 980579939 агент «услышал» от клиента «Добро пожаловать в
+# Открытую линию компании». Это не человек — это робот соседнего канала; в разговор такое
+# брать нельзя.
+_OPENLINE_NOISE = (
+    "добро пожаловать в открытую линию",
+    "вам ответит первый освободившийся оператор",
+    "спасибо, что написали. мы скоро ответим",
+)
+
+
+def _is_openline_noise(text: str) -> bool:
+    low = " ".join((text or "").lower().split())
+    return any(marker in low for marker in _OPENLINE_NOISE)
+
+
 def _shown_messages(texts: list[str]) -> str:
     """Блок «что написал клиент» для промпта: одно сообщение или пачка подряд."""
     if len(texts) == 1:
@@ -2371,6 +2395,8 @@ def _shown_messages(texts: list[str]) -> str:
 
 def _autoreply_turn(msgs: list[dict] | dict) -> None:
     msgs = [msgs] if isinstance(msgs, dict) else list(msgs)
+    msgs = [m for m in msgs
+            if not _is_openline_noise((m.get("text") or m.get("caption") or ""))]
     texts = [t for m in msgs if (t := (m.get("text") or m.get("caption") or "").strip())]
     if not texts:
         return

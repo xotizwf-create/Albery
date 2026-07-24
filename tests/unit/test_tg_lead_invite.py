@@ -416,3 +416,47 @@ def test_reply_is_plain_text_without_markup(tg, sent, monkeypatch):
     tg.maybe_autoreply(_msg())
 
     assert "**" not in sent[0]["text"]
+
+
+# --- разбор сбоя 24.07.2026 (живой клиент 5195962532) ----------------------------------------
+
+def test_invite_tail_is_not_added_when_the_model_already_linked_the_form(tg, sent, monkeypatch):
+    """Клиент получил приглашение в анкету ДВАЖДЫ в одном сообщении: модель вставила ссылку
+    сама, а код приклеил свой хвост. Хвост нужен только если модель про анкету промолчала."""
+    _brain(tg, monkeypatch,
+           "Условия такие-то. [Заполнить анкету](https://b24-9qcm4m.bitrix24site.ru/) — "
+           "после этого посчитаем экономику")
+
+    tg.maybe_autoreply(_msg(text="какие условия подключения?"))
+
+    text = sent[0]["text"]
+    assert text.count("b24-9qcm4m.bitrix24site.ru") == 1, "анкета предлагается один раз"
+    assert "Как заполните, возвращайтесь сюда" not in text, "наш хвост тут лишний"
+
+
+def test_invite_tail_still_added_when_the_model_says_nothing_about_the_form(tg, sent, monkeypatch):
+    """Обратная сторона: если модель про анкету не сказала, приглашение всё равно уходит."""
+    _brain(tg, monkeypatch, "Условия такие-то, работаем через ИУ-кабинет")
+
+    tg.maybe_autoreply(_msg(text="какие условия подключения?"))
+
+    assert "b24-9qcm4m.bitrix24site.ru" in sent[0]["text"]
+
+
+def test_openline_service_messages_are_not_treated_as_client_words(tg, sent, monkeypatch):
+    """Автоответы Открытой линии (Wazzup) прилетают в тот же чат. 24.07.2026 агент «услышал»
+    от клиента «Добро пожаловать в Открытую линию» и отвечал роботу соседнего канала."""
+    seen = _brain(tg, monkeypatch, "ответ")
+
+    tg.maybe_autoreply(_msg(username="griaznov.d", uid=555,
+                            text="Добро пожаловать в Открытую линию компании !\n"
+                                 "Вам ответит первый освободившийся оператор."))
+
+    assert seen == [], "на служебное сообщение чужого канала ход не запускается"
+    assert sent == []
+
+
+def test_openline_noise_is_recognised(tg):
+    assert tg._is_openline_noise("Здравствуйте! Спасибо, что написали. Мы скоро ответим.")
+    assert tg._is_openline_noise("Добро пожаловать в Открытую линию компании !")
+    assert not tg._is_openline_noise("Здравствуйте, какие условия подключения к ИУ?")
