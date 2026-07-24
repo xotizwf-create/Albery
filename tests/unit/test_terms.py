@@ -277,3 +277,81 @@ def test_terms_marker_rule_reaches_both_branches(tg):
     """Правило про дословные условия лежит в общих правилах тона — значит и лид, и незнакомец."""
     assert tg.TERMS_REQUEST_MARKER in tg.STYLE_RULES
     assert "не пересказывай" in tg.STYLE_RULES.lower()
+
+
+# --- документ условий ОДИН раз, вопрос поверх него — людям (владелец, 24.07.2026) --------------
+
+def _lead_turn(tg, monkeypatch, client_text, state_extra=None, answer=None):
+    """Ход лида воронки; возвращаем (что ушло клиенту, что унесли людям)."""
+    sent, to_humans = [], []
+    state = {"business": {"C1": {"user_id": 871}}, **(state_extra or {})}
+    monkeypatch.setenv("TG_BUSINESS_AUTOREPLY", "1")
+    monkeypatch.setattr(tg, "load_state", lambda: state)
+    monkeypatch.setattr(tg, "save_state", lambda s: None)
+    monkeypatch.setattr(tg, "lead_deal_for_username", lambda u: 120)
+    monkeypatch.setattr(tg, "funnel_step_block", lambda d: "Шаг: вопросы по условиям")
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "react", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "chat_history", lambda *a, **k: "")
+    monkeypatch.setattr(tg, "_dialog_out_watermark", lambda d: 0)
+    monkeypatch.setattr(tg, "_out_messages_after", lambda d, s: 0)
+    monkeypatch.setattr(tg, "hermes_answer",
+                        lambda p, s, toolsets=None: answer or tg.TERMS_REQUEST_MARKER)
+    monkeypatch.setattr(tg, "escalate_to_human",
+                        lambda author, q, ctext, answered=False: to_humans.append(q))
+    monkeypatch.setattr(tg, "send_html",
+                        lambda uid, html, plain: sent.append(plain) or (True, ""))
+    # Отметку в сделке подменяем: проверяем поведение с клиентом, а не поход в Битрикс.
+    from mcp import context_server as cs
+    monkeypatch.setitem(cs.TOOLS, "update_crm_deal", {"handler": lambda a: {"ok": True}})
+
+    tg.maybe_autoreply({"business_connection_id": "C1", "chat": {"id": 764181402, "type": "private"},
+                        "from": {"id": 764181402, "username": "lead200", "first_name": "Сергей"},
+                        "text": client_text})
+    return sent, to_humans
+
+
+def test_question_on_top_of_sent_terms_goes_to_humans_not_a_second_document(tg, monkeypatch):
+    """Живой сбой 24.07.2026, диалог 764181402: условия клиент уже получил (запись 394), затем
+    спросил «Какой дрр нужно держать и как происходит управление? +какая комиссия ваша по
+    партнерской этой программе?» — и агент ВТОРОЙ раз выслал весь документ (запись 402), на
+    вопрос не ответил и людям не передал. Слов «ДРР» и «управление» в документе нет."""
+    sent, to_humans = _lead_turn(
+        tg, monkeypatch,
+        "Какой дрр нужно держать и как происходит управление?\n"
+        "+какая комиссия ваша по партнерской этой программе?",
+        state_extra={"terms_sent": {"764181402": "2026-07-24T16:03:49+00:00"}})
+
+    assert sent, "клиент не должен остаться в тишине"
+    assert "Индивидуальные условия снижают комиссию" not in sent[0], \
+        "второй раз документ условий не дублируем"
+    assert sent[0] == tg.TERMS_ASK_HUMAN_REPLY, "клиенту — одна короткая строка"
+    assert to_humans, "вопрос обязан уйти живым людям"
+    assert "дрр" in to_humans[0].lower(), "людям уходит именно вопрос клиента"
+
+
+def test_first_terms_question_still_sends_the_document(tg, monkeypatch):
+    """Правило не должно ломать основное: первый вопрос про условия — документ дословно."""
+    sent, to_humans = _lead_turn(tg, monkeypatch, "какие условия подключения к ИУ?")
+
+    assert sent and "Индивидуальные условия снижают комиссию" in sent[0]
+    assert not to_humans, "людей по первому вопросу не беспокоим"
+
+
+def test_asking_to_resend_gets_the_document_again(tg, monkeypatch):
+    """«Пришлите ещё раз» — это просьба о документе, а не вопрос поверх него."""
+    sent, to_humans = _lead_turn(
+        tg, monkeypatch, "Условия не пришли, пришлите ещё раз пожалуйста",
+        state_extra={"terms_sent": {"764181402": "2026-07-24T16:03:49+00:00"}})
+
+    assert sent and "Индивидуальные условия снижают комиссию" in sent[0]
+    assert not to_humans
+
+
+def test_resend_detector_tells_a_repeat_request_from_a_new_question(tg):
+    """Границу решает один разбор текста — проверяем обе стороны на живых формулировках."""
+    assert tg._wants_terms_again("пришлите ещё раз")
+    assert tg._wants_terms_again("не получил документ")
+    assert tg._wants_terms_again("продублируйте условия")
+    assert not tg._wants_terms_again("Какой дрр нужно держать и как происходит управление?")
+    assert not tg._wants_terms_again("а какая комиссия ваша по этой программе?")

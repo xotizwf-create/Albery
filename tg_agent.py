@@ -1046,6 +1046,8 @@ def send_terms(deal_id: int, telegram_id: int) -> dict:
         raise RuntimeError(f"Условия не отправлены: {err}")
     journal(MANAGER_CHANNEL, telegram_id, "out", message, kind="lead_chat",
             meta={"terms": True, "deal_id": int(deal_id) if deal_id else None})
+    # Документ у человека есть: второй раз его не дублируем, вопросы поверх условий идут людям.
+    _mark_terms_sent(telegram_id)
     if deal_id:
         fields = {TERMS_SENT_FIELD: datetime.now(timezone.utc).strftime("%Y-%m-%d")} \
             if TERMS_SENT_FIELD else {}
@@ -2182,6 +2184,55 @@ SIDE_ESCALATION_MARKER = "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ"
 # До этого модель сочиняла их сама, и цифры гуляли от диалога к диалогу.
 TERMS_REQUEST_MARKER = "ПОКАЖИ_УСЛОВИЯ"
 
+# Документ условий уходит клиенту ОДИН раз. 24.07.2026 (диалог 764181402) клиент, уже получивший
+# условия, спросил «какой дрр нужно держать и как происходит управление?» — слов «ДРР»,
+# «управление», «реклама» в документе нет, — и агент второй раз выслал весь документ: на вопрос
+# не ответил и людям его не передал. Решение владельца: документ один раз; вопрос, ответа на
+# который в документе нет, уносим людям И пишем клиенту одну строку, чтобы он не сидел в тишине
+# (тот же случай, что был с Георгием: молчание оставляет клиента без понимания, ответят ли ему).
+TERMS_ASK_HUMAN_REPLY = "Уточню это у команды и вернусь с ответом."
+# Просьба выслать условия заново — тогда документ отправляем снова, это не «вопрос вне документа».
+_TERMS_RESEND_RE = re.compile(
+    r"ещ[её]\s+раз|повтор\w*|продублир\w*|снова|заново|не\s+приш\w*|не\s+получ\w*|"
+    r"не\s+открыв\w*|не\s+вид\w*\s+(файл|документ|сообщ)", re.I)
+
+
+def _terms_already_sent(user_id: int) -> bool:
+    """Уходил ли этому человеку документ условий (в любой из ветвей — лида или незнакомца)."""
+    return bool((load_state().get("terms_sent") or {}).get(str(user_id)))
+
+
+def _mark_terms_sent(user_id: int) -> None:
+    """Отметить фактически доставленный документ, чтобы второй раз его не дублировать."""
+    with _state_lock:
+        state = load_state()
+        state.setdefault("terms_sent", {})[str(user_id)] = datetime.now(timezone.utc).isoformat()
+        save_state(state)
+
+
+def _wants_terms_again(text: str) -> bool:
+    """Человек просит именно ПРИСЛАТЬ условия заново, а не спрашивает что-то поверх них."""
+    return bool(_TERMS_RESEND_RE.search(text or ""))
+
+
+def _terms_question_to_humans(author: dict, client_text: str,
+                              texts_to_journal: list[str] | None = None,
+                              meta: dict | None = None) -> None:
+    """Условия уже высылали, человек спрашивает дальше — вопрос людям, клиенту одна строка."""
+    uid = author.get("id")
+    escalate_to_human(author,
+                      f"условия клиент уже получил, в документе ответа на это нет; ему написано "
+                      f"«{TERMS_ASK_HUMAN_REPLY}». Нужен ваш ответ на: {client_text[:150]}",
+                      client_text, answered=True)
+    ok, err = send_html(uid, as_html(TERMS_ASK_HUMAN_REPLY), TERMS_ASK_HUMAN_REPLY)
+    for t in texts_to_journal or []:
+        journal(MANAGER_CHANNEL, uid, "in", t, kind="lead_chat", user=author)
+    journal(MANAGER_CHANNEL, uid, "out",
+            TERMS_ASK_HUMAN_REPLY if ok else f"{TERMS_ASK_HUMAN_REPLY}\n\n[не доставлено: {err}]",
+            kind="lead_chat", user=author, status="ok" if ok else "error",
+            meta={"escalated": True, **(meta or {})})
+    log.info("вопрос поверх уже отправленных условий от %s унесён людям", uid)
+
 # Правила для разговора с тем, кого ещё нет в воронке. У лида шаг задаёт сделка, а у
 # незнакомца сценария не было вовсе — отсюда импровизация и обещания, которых агент не
 # выполнит (клиент с оборотом 200 млн, диалог 764181402: «посмотрим экономику по артикулу»).
@@ -2396,6 +2447,11 @@ def reply_to_stranger(author: dict, texts: list[str] | str) -> bool:
 
     # Спросили про условия — берём их ДОСЛОВНО из документа владельца, без пересказа моделью.
     show_terms = TERMS_REQUEST_MARKER in answer
+    if show_terms and _terms_already_sent(author_id) and not _wants_terms_again(text):
+        # Условия у человека уже есть — второй документ не шлём, вопрос уносим людям.
+        _terms_question_to_humans(author, text, texts_to_journal=texts,
+                                  meta={"stranger": True})
+        return False
     if show_terms:
         try:
             answer = terms_text()
@@ -2447,6 +2503,8 @@ def reply_to_stranger(author: dict, texts: list[str] | str) -> bool:
     answer = plain
     if ok and invite_now:
         _mark_invited(author_id)    # отмечаем только фактически доставленное
+    if ok and show_terms:
+        _mark_terms_sent(author_id)  # документ у человека есть — второй раз не дублируем
     if ok and new_deal:
         # Ответили — значит связались. Этап двигаем только по факту доставки.
         _move_deal_stage(new_deal, STAGE_CONTACTED, "Агент ответил клиенту в Telegram.")
@@ -2667,13 +2725,17 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
     # 24.07.2026 у лида такого механизма не было (маркер работал только у незнакомца), и
     # клиент получил самодельную выжимку вместо условий.
     if TERMS_REQUEST_MARKER in answer:
+        # Второй раз документ не дублируем: вопрос поверх условий — людям (решение владельца).
+        if _terms_already_sent(author_id) and not _wants_terms_again(text):
+            _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
+            return
         try:
             send_terms(deal_id, author_id)      # шлёт дословно, журналит и метит сделку
         except Exception as exc:  # noqa: BLE001 — документ не готов: решают люди
             log.warning("условия лиду %s не собраны: %s", author_id, str(exc)[:200])
             escalate_to_human(author, f"клиент спросил про условия, документ не готов: "
                                       f"{str(exc)[:150]}", text)
-        return
+        return      # send_terms сам метит доставленный документ
 
     if escalated(author, answer, text):
         journal(MANAGER_CHANNEL, author_id, "out", "вопрос без ответа в базе — унесён людям "
