@@ -114,6 +114,74 @@ def missing_fields(requisites: dict[str, str]) -> list[str]:
     return [FIELD_LABELS[f] for f in REQUIRED_FIELDS if not str(requisites.get(f) or "").strip()]
 
 
+# --- адекватность реквизитов -----------------------------------------------------------------
+# Владелец 24.07.2026: клиент прислал «188 4884 4838», и агент чуть не принял это за ИНН.
+# У ИНН и ОГРН есть НАСТОЯЩИЕ контрольные суммы — случайные цифры их не проходят никогда.
+# Проверяем математикой, а не «на глаз» модели.
+
+def _inn_valid(value: str) -> bool:
+    """Контрольная сумма ИНН: 10 цифр — организация, 12 — ИП."""
+    s = re.sub(r"\D", "", value or "")
+
+    def control(digits: str, coeffs: list[int]) -> int:
+        return sum(int(d) * c for d, c in zip(digits, coeffs)) % 11 % 10
+
+    if len(s) == 10:
+        return control(s[:9], [2, 4, 10, 3, 5, 9, 4, 6, 8]) == int(s[9])
+    if len(s) == 12:
+        return (control(s[:10], [7, 2, 4, 10, 3, 5, 9, 4, 6, 8]) == int(s[10])
+                and control(s[:11], [3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]) == int(s[11]))
+    return False
+
+
+def _ogrn_valid(value: str) -> bool:
+    """Контрольная цифра ОГРН: 13 цифр — организация (mod 11), 15 — ИП (mod 13)."""
+    s = re.sub(r"\D", "", value or "")
+    if len(s) == 13:
+        return int(s[:12]) % 11 % 10 == int(s[12])
+    if len(s) == 15:
+        return int(s[:14]) % 13 % 10 == int(s[14])
+    return False
+
+
+def validate_requisites(requisites: dict[str, str]) -> list[str]:
+    """Что в реквизитах НЕ похоже на правду — по-русски, чтобы сказать клиенту прямо.
+
+    Договор с кривыми реквизитами юридически пуст, а клиент теряет доверие. Контрольные
+    суммы (ИНН, ОГРН) ловят и опечатки, и «фигню вместо реквизитов»; форматные проверки —
+    остальное. Счета проверяем только по форме: их контрольная сумма зависит от пары
+    счёт+БИК, и честные тестовые данные ломались бы об неё."""
+    problems: list[str] = []
+
+    def digits(field: str) -> str:
+        return re.sub(r"\D", "", str(requisites.get(field) or ""))
+
+    inn = digits("inn")
+    if inn and not _inn_valid(inn):
+        problems.append(f"ИНН «{requisites.get('inn')}» не проходит проверку контрольной "
+                        f"суммы — это не настоящий ИНН")
+    ogrn = digits("ogrn")
+    if ogrn and not _ogrn_valid(ogrn):
+        problems.append(f"ОГРН «{requisites.get('ogrn')}» не проходит проверку контрольной "
+                        f"цифры — это не настоящий ОГРН")
+    kpp = digits("kpp")
+    if kpp and len(kpp) != 9:
+        problems.append(f"КПП «{requisites.get('kpp')}» должен состоять из 9 цифр")
+    bik = digits("bik")
+    if bik and (len(bik) != 9 or not bik.startswith("04")):
+        problems.append(f"БИК «{requisites.get('bik')}» должен состоять из 9 цифр и "
+                        f"начинаться с 04")
+    for field, label in (("account", "Расчётный счёт"), ("corr_account", "Корр. счёт")):
+        val = digits(field)
+        if val and len(val) != 20:
+            problems.append(f"{label} «{requisites.get(field)}» должен состоять из 20 цифр")
+    name = str(requisites.get("name") or "").strip()
+    if name and not re.match(r"^(ООО|ЗАО|ПАО|АО|ИП)\b", name):
+        problems.append(f"Название «{name}» не похоже на название организации "
+                        f"(нет формы собственности: ООО, АО, ИП…)")
+    return problems
+
+
 # --- шаблон владельца ----------------------------------------------------------------------
 TEMPLATE_DOC_ID = os.getenv("CONTRACT_TEMPLATE_DOC_ID",
                             "1fZbcGZtEyXDJzZjxDidWh_Q5jo2G4i_pdovA8pJA5eA").strip()

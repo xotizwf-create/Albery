@@ -341,3 +341,60 @@ def test_pdf_fails_loudly_without_a_cyrillic_font(monkeypatch):
     with pytest.raises(RuntimeError, match="шрифт"):
         render_contract_pdf("23.07.2026", "23 июля 2026 г.", parse_requisites(REAL),
                             template=TEMPLATE)
+
+
+# --- адекватность реквизитов (владелец, 24.07.2026) -------------------------------------------
+# Живой случай: клиент прислал «188 4884 4838», и агент чуть не принял это за ИНН.
+
+def test_random_digits_do_not_pass_as_inn():
+    from contract import _inn_valid
+
+    assert not _inn_valid("18848844838"), "фигня из диалога 24.07.2026 — не ИНН"
+    assert not _inn_valid("7704123456"), "правдоподобный, но с неверной контрольной суммой"
+    assert not _inn_valid("123")
+
+
+def test_real_inn_checksums_pass():
+    from contract import _inn_valid
+
+    assert _inn_valid("7707083893"), "ИНН Сбербанка (10 цифр, организация)"
+    assert _inn_valid("500100732259"), "валидный 12-значный ИНН физлица/ИП"
+
+
+def test_ogrn_checksum():
+    from contract import _ogrn_valid
+
+    assert _ogrn_valid("1027700132195"), "ОГРН Сбербанка"
+    assert not _ogrn_valid("1207700123456"), "тестовая заглушка не проходит контрольную цифру"
+    assert not _ogrn_valid("188")
+
+
+def test_validate_requisites_names_each_problem_in_russian():
+    from contract import validate_requisites
+
+    problems = validate_requisites({"inn": "18848844838", "kpp": "77", "bik": "123456789",
+                                    "name": "просто слова", "account": "40702810"})
+
+    text = " ".join(problems)
+    assert "ИНН" in text and "контрольной" in text
+    assert "КПП" in text and "9 цифр" in text
+    assert "БИК" in text and "04" in text
+    assert "Название" in text
+    assert "Расчётный счёт" in text and "20 цифр" in text
+
+
+def test_valid_requisites_pass_clean():
+    from contract import validate_requisites
+
+    assert validate_requisites({
+        "name": "ООО «Настоящая фирма»", "inn": "7707083893", "kpp": "773601001",
+        "ogrn": "1027700132195", "bik": "044525225",
+        "account": "40702810912345678901", "corr_account": "30101810400000000225",
+    }) == []
+
+
+def test_empty_fields_are_not_flagged_as_invalid():
+    """Пустое поле — забота missing_fields, а не validate_requisites."""
+    from contract import validate_requisites
+
+    assert validate_requisites({}) == []

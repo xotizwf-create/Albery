@@ -283,6 +283,42 @@ def test_message_after_the_turn_starts_goes_to_the_next_turn(tg, monkeypatch):
     assert "первое" in prompts[0] and "второе" in prompts[1]
 
 
+def test_client_typing_during_the_turn_restarts_thinking(tg, monkeypatch):
+    """Владелец 24.07.2026: клиент написал, пока ИИ думал — цикл начинается заново, и ИИ
+    отвечает уже на старое И новое сообщение. Прежний, устаревший ответ не отправляется."""
+    import threading
+    import time as _time
+
+    prompts, outbox = [], []
+    started = threading.Event()
+
+    def brain(p, s, toolsets=None):
+        prompts.append(p)
+        if len(prompts) == 1:
+            started.set()
+            _time.sleep(0.25)      # думаем; в это время клиент дописывает
+            return "УСТАРЕВШИЙ ответ только на первое"
+        return "Свежий ответ на всё сразу"
+
+    monkeypatch.setattr(tg, "_REPLY_DEBOUNCE_S", 0.02)
+    monkeypatch.setattr(tg, "hermes_answer", brain)
+    monkeypatch.setattr(tg, "send_as_account",
+                        lambda uid, t, parse_mode="": (outbox.append(t), (True, ""))[1])
+
+    t1 = threading.Thread(target=tg.maybe_autoreply, args=(_incoming(text="хочу договор"),))
+    t1.start()
+    started.wait(timeout=5)
+    _time.sleep(0.05)              # ход уже думает — клиент пишет второе
+    t2 = threading.Thread(target=tg.maybe_autoreply, args=(_incoming(text="и ещё вопрос про сроки"),))
+    t2.start()
+    t1.join(timeout=5); t2.join(timeout=5)
+
+    assert len(prompts) == 2, "ход обязан перезапуститься из-за нового сообщения"
+    assert "хочу договор" in prompts[1] and "и ещё вопрос про сроки" in prompts[1], \
+        "перезапуск думает над старым И новым сообщением вместе"
+    assert outbox == ["Свежий ответ на всё сразу"], "устаревший ответ клиенту не уходит"
+
+
 def test_style_rules_reach_the_model(tg, monkeypatch):
     """Владелец 23.07.2026: «не надо каждый раз Александр, Александр». Правила живого тона
     обязаны попадать в каждый промпт лида."""

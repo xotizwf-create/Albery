@@ -736,6 +736,14 @@ def contract_send(deal_id: int, telegram_id: int | str, requisites_text: str = "
         return {"sent": False, "missing": gaps,
                 "note": ("Не хватает реквизитов: " + ", ".join(gaps)
                          + ". Спроси у клиента ИМЕННО их, не проси прислать всё заново.")}
+    problems = contract_mod.validate_requisites(fields)
+    if problems:
+        # Клиент прислал «фигню» или опечатался: контрольные суммы ИНН/ОГРН это ловят
+        # математикой (владелец, 24.07.2026). Договор с такими реквизитами юридически пуст.
+        return {"sent": False, "invalid": problems,
+                "note": ("Реквизиты не проходят проверку: " + "; ".join(problems)
+                         + ". Скажи клиенту ПРЯМО, что именно не так, и попроси карточку "
+                           "компании из банка или 1С. Договор не собран.")}
 
     number = (number or uf.get(CONTRACT_NUMBER_FIELD) or "").strip()
     if not number:
@@ -1022,7 +1030,12 @@ def funnel_next_step(deal: dict) -> dict:
                 "action": (f"Как только реквизиты пришли — запиши их в поле "
                            f"{CONTRACT_REQUISITES_FIELD} сделки {deal_id} и СРАЗУ вызови "
                            f"send_contract(deal_id={deal_id}, telegram_id=<id клиента>). "
-                           f"Не хватает части реквизитов — спроси именно недостающее.")}
+                           f"Не хватает части реквизитов — спроси именно недостающее. "
+                           f"Если присланное НЕ похоже на реквизиты (случайные цифры, шутка, "
+                           f"не тот документ) — не гадай и ничего не записывай в сделку: скажи "
+                           f"прямо, что это не реквизиты, и попроси карточку компании. "
+                           f"send_contract сам проверяет ИНН/ОГРН контрольными суммами и "
+                           f"вернёт список проблем — передай их клиенту дословно.")}
     if stage == "C16:S84294149" or (stage == "C16:NDA" and not has_contract):
         return {"step": "Отправка договора",
                 "need": "ничего — договор отправляешь ты",
@@ -1885,6 +1898,9 @@ STYLE_RULES = (
     "сообщением, ничего не пропуская.\n"
     "- Смотри историю: не задавай вопрос, на который клиент уже ответил, и не повторяй свой "
     "прошлый вопрос другими словами.\n"
+    "- Не принимай данные на веру: если присланное не похоже на то, что ты просил (случайные "
+    "цифры, обрывок, не тот документ) — скажи об этом прямо и попроси нормальный вариант. "
+    "Не додумывай за клиента.\n"
     "- Коротко и тепло, без канцелярита. Один встречный вопрос за раз."
 )
 
@@ -2124,7 +2140,25 @@ def _business_owner_id() -> int | None:
 _inbox_lock = threading.Lock()
 _inbox: dict[Any, list[dict]] = {}
 _inbox_last: dict[Any, float] = {}      # когда человек написал в последний раз (monotonic)
-_REPLY_DEBOUNCE_S = float(os.getenv("TG_REPLY_DEBOUNCE_S", "30") or 30)
+_REPLY_DEBOUNCE_S = float(os.getenv("TG_REPLY_DEBOUNCE_S", "15") or 15)
+
+
+# Сколько раз ход может перезапуститься из-за «клиент дописал, пока агент думал».
+# Ограничение обязательно: очень разговорчивый клиент иначе не получил бы ответа никогда.
+_RETHINK_MAX = max(0, int(os.getenv("TG_RETHINK_MAX", "3") or 3))
+
+
+def _wait_for_quiet(uid) -> None:
+    """Подождать, пока человек выговорится: окно тишины отсчитывается от ПОСЛЕДНЕГО сообщения.
+
+    30 секунд владелец счёл слишком долгими (24.07.2026) — теперь 15."""
+    while True:
+        with _inbox_lock:
+            last = _inbox_last.get(uid) or 0.0
+        wait = _REPLY_DEBOUNCE_S - (time.monotonic() - last)
+        if wait <= 0:
+            return
+        time.sleep(wait)
 
 
 def maybe_autoreply(msg: dict) -> None:
@@ -2153,13 +2187,7 @@ def maybe_autoreply(msg: dict) -> None:
         # Пауза-добор СКОЛЬЗЯЩАЯ: отсчёт от ПОСЛЕДНЕГО сообщения (владелец, 24.07.2026).
         # Человек пишет 7 сообщений подряд — агент молчит, пока тот не выговорится, и отвечает
         # на всё разом, как живой менеджер. Каждое новое сообщение сдвигает окно.
-        while True:
-            with _inbox_lock:
-                last = _inbox_last.get(uid) or 0.0
-            wait = _REPLY_DEBOUNCE_S - (time.monotonic() - last)
-            if wait <= 0:
-                break
-            time.sleep(wait)
+        _wait_for_quiet(uid)
         with _inbox_lock:
             batch = _inbox.pop(uid, [])
         if batch:
@@ -2218,37 +2246,68 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
 
     name = (author.get("first_name") or "").strip()
     role = channel_role_prompt(MANAGER_CHANNEL)
-    prompt = (
-        f"{role}\n\n{STYLE_RULES}\n\n"
-        f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
-        f"Собеседник: {name or 'клиент'} (@{username or 'без username'})\n"
-        f"\n{funnel_step_block(deal_id)}\n"
-        f"\n{_shown_messages(texts)}"
-    ) if role else (
-        "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
-        "Пишет ЛИД по партнёрской программе Wildberries — он оставил заявку на индивидуальные "
-        "условия. Отвечай по-русски, коротко и по-человечески, обычным текстом без разметки, "
-        "как менеджер в мессенджере — 1-3 предложения. Не представляйся ботом и не пиши, что ты "
-        "ИИ. Если для ответа не хватает данных, задай один уточняющий вопрос. Если вопрос вне "
-        "твоей компетенции или требует решения человека — скажи, что уточнишь у коллег и "
-        "вернёшься с ответом.\n\n"
-        f"{STYLE_RULES}\n\n"
-        f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
-        f"Собеседник: {name or 'клиент'}\n"
-        f"{_shown_messages(texts)}"
-    )
+
+    def build_prompt() -> str:
+        # Промпт собирается заново на каждый заход: шаг воронки перечитывается из сделки,
+        # блок сообщений — из всей накопленной пачки.
+        return (
+            f"{role}\n\n{STYLE_RULES}\n\n"
+            f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
+            f"Собеседник: {name or 'клиент'} (@{username or 'без username'})\n"
+            f"\n{funnel_step_block(deal_id)}\n"
+            f"\n{_shown_messages(texts)}"
+        ) if role else (
+            "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
+            "Пишет ЛИД по партнёрской программе Wildberries — он оставил заявку на индивидуальные "
+            "условия. Отвечай по-русски, коротко и по-человечески, обычным текстом без разметки, "
+            "как менеджер в мессенджере — 1-3 предложения. Не представляйся ботом и не пиши, что ты "
+            "ИИ. Если для ответа не хватает данных, задай один уточняющий вопрос. Если вопрос вне "
+            "твоей компетенции или требует решения человека — скажи, что уточнишь у коллег и "
+            "вернёшься с ответом.\n\n"
+            f"{STYLE_RULES}\n\n"
+            f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
+            f"Собеседник: {name or 'клиент'}\n"
+            f"{_shown_messages(texts)}"
+        )
+
     # Отметка ДО хода: по ней потом видно, отправил ли инструмент (условия/договор) сообщение
     # клиенту сам — тогда финальную реплику модели слать нельзя, это был бы дубль того же посыла.
     out_watermark = _dialog_out_watermark(author_id)
-    try:
-        answer = hermes_answer(_with_instructions(_with_history(prompt, author_id, texts),
-                                                  MANAGER_CHANNEL), f"tg-biz-{author_id}",
-                               toolsets=channel_toolsets(MANAGER_CHANNEL))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("мозг не ответил лиду %s: %s", author_id, str(exc)[:200])
-        journal(MANAGER_CHANNEL, author_id, "out", f"мозг не ответил: {str(exc)[:200]}",
-                kind="lead_chat", user=author, status="error", meta={"deal_id": deal_id})
-        return
+    answer = ""
+    for attempt in range(1 + _RETHINK_MAX):
+        try:
+            answer = hermes_answer(_with_instructions(_with_history(build_prompt(), author_id,
+                                                                    texts), MANAGER_CHANNEL),
+                                   f"tg-biz-{author_id}",
+                                   toolsets=channel_toolsets(MANAGER_CHANNEL))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("мозг не ответил лиду %s: %s", author_id, str(exc)[:200])
+            journal(MANAGER_CHANNEL, author_id, "out", f"мозг не ответил: {str(exc)[:200]}",
+                    kind="lead_chat", user=author, status="error", meta={"deal_id": deal_id})
+            return
+        # Клиент дописал, пока агент думал? Прежний ответ устарел, не глядя на него: думаем
+        # заново над ВСЕЙ пачкой — старые сообщения плюс новые (владелец, 24.07.2026:
+        # «цикл должен начаться заново, максимально человеческое поведение»).
+        with _inbox_lock:
+            has_fresh = bool(_inbox.get(author_id))
+        if not has_fresh or attempt == _RETHINK_MAX:
+            break       # лимит исчерпан — остаток пачки заберёт следующий ход
+        _wait_for_quiet(author_id)
+        with _inbox_lock:
+            fresh = _inbox.pop(author_id, [])
+        if not fresh:
+            break
+        for m in fresh:
+            t = (m.get("text") or m.get("caption") or "").strip()
+            if t:
+                texts.append(t)
+                journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author,
+                        tg_message_id=m.get("message_id"), meta={"deal_id": deal_id})
+        msgs += fresh
+        react(author_id, fresh[-1].get("message_id"), "👀", conn_id)
+        log.info("лид %s дописал во время хода — думаем заново над %d сообщениями",
+                 author_id, len(texts))
+    text = "\n".join(texts)     # пачка могла вырасти, пока агент думал
     answer = _strip_markup((answer or "").strip())
     if not answer:
         return
