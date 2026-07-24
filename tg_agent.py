@@ -1096,6 +1096,12 @@ def watch_task_for_client(bitrix_task_id: int, telegram_id: int, client_message:
     доходило вовсе: 23.07.2026 договор ушёл в ЭДО, а клиент об этом не узнал."""
     if not str(client_message or "").strip():
         raise ValueError("Нужен текст, который получит клиент после закрытия задачи.")
+    # 23.07.2026, ожидание задачи 2018: модель передала telegram_id=18 — Bitrix-id сотрудника,
+    # а не Telegram-id клиента. Доставка билась в PEER_ID_INVALID каждые 20 секунд. Telegram-id
+    # людей — большие числа; маленькое значение здесь всегда чужой идентификатор.
+    if to_int_safe(telegram_id) is None or int(telegram_id) < 100000:
+        raise ValueError(f"telegram_id={telegram_id} не похож на Telegram id клиента (это "
+                         f"Bitrix-id?). Возьми числовой id из диалога или поля сделки.")
     with _db() as conn:
         with conn.cursor() as cur:
             # Новое ожидание того же смысла ЗАМЕНЯЕТ старое: если по сделке пересоздали задачу
@@ -1196,6 +1202,14 @@ def check_finished_tasks(limit: int = 50) -> dict:
             continue
         ok, err = send_html(w["telegram_id"], as_html(w["client_message"]), w["client_message"])
         if not ok:
+            if "PEER_ID_INVALID" in str(err):
+                # Адрес недоставим в принципе (в ожидании чужой id, не Telegram) — повторять
+                # каждые 20 секунд бессмысленно, а владелец получает бесконечный шум в логе.
+                _cancel_watch(w["id"], f"адрес недоставим (PEER_ID_INVALID: "
+                                       f"telegram_id={w['telegram_id']})")
+                log.warning("ожидание задачи %s снято: telegram_id=%s недоставим",
+                            w["bitrix_task_id"], w["telegram_id"])
+                continue
             failed.append({"task": w["bitrix_task_id"], "error": f"не доставлено: {err}"})
             continue
         journal(MANAGER_CHANNEL, w["telegram_id"], "out", w["client_message"], kind="lead_chat",

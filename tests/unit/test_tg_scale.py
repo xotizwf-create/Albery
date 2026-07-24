@@ -211,6 +211,34 @@ def test_next_stage_moves_through_http_mcp(tg, monkeypatch):
     assert moved[0][1]["deal_id"] == 86 and moved[0][1]["stage"] == "C16:FINAL_INVOICE"
 
 
+def test_watch_rejects_a_non_telegram_id(tg):
+    """Прод 23.07.2026, ожидание задачи 2018: модель передала telegram_id=18 (Bitrix-id
+    сотрудника) — доставка билась в PEER_ID_INVALID каждые 20 секунд. Такое ожидание нельзя
+    даже регистрировать."""
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="не похож на Telegram id"):
+        tg.watch_task_for_client(2018, 18, "Договор отправили")
+
+
+def test_undeliverable_watch_is_cancelled_not_retried_forever(tg, monkeypatch):
+    """Адрес недоставим (PEER_ID_INVALID) — ожидание снимается, а не молотит вечно."""
+    watch = {"id": 7, "bitrix_task_id": 2018, "deal_id": 96, "telegram_id": 18,
+             "kind": "edo", "client_message": "готово", "next_stage": ""}
+    updates = []
+    monkeypatch.setattr(tg, "_db", _fake_db([watch], updates))
+    monkeypatch.setattr(tg, "_task_status", lambda tid: {"status": "5"})
+    monkeypatch.setattr(tg, "send_html",
+                        lambda *a: (False, "sendMessage: {'error_code': 400, 'description': "
+                                           "'Bad Request: PEER_ID_INVALID'}"))
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+
+    res = tg.check_finished_tasks()
+
+    assert res["failed"] == [], "недоставимый адрес — не «ошибка на повтор», а снятие"
+    assert any("cancelled_at" in sql for sql, _ in updates), "ожидание должно сняться"
+
+
 def test_task_status_is_plain_http_without_risky_imports(tg, monkeypatch):
     """Прод 23.07.2026: `from bitrix import BitrixClient` в процессе tg-агента упал циклическим
     импортом, и сторож не смог узнать статус НИ ОДНОЙ задачи. Статус обязан браться голым HTTP —
