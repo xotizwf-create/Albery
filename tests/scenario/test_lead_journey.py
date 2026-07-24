@@ -170,6 +170,10 @@ def funnel(monkeypatch, tmp_path):
         text = (said[-1] if said else "").lower()
         if any(w in text for w in ("услови", "комисси", "тариф", "дрр", "цен")):
             return tg.TERMS_REQUEST_MARKER
+        if any(w in text for w in ("верно", "да", "ок")):
+            # Худший случай, ровно как на проде 24.07.2026 у Александра: на подтверждение
+            # анкеты модель ТОЖЕ вернула маркер условий. Скелет обязан это пережить.
+            return tg.TERMS_REQUEST_MARKER
         return "Здравствуйте! Чем помочь?"
 
     monkeypatch.setattr(tg, "hermes_answer", model)
@@ -230,7 +234,23 @@ def test_lead_journey_from_hello_to_a_question_beyond_the_terms(funnel):
     tg._check_new_forms()
     assert chat.last.startswith("Вижу анкету:") and len(chat.messages) == before + 1
 
-    # 7. Вопрос ПОВЕРХ условий (в документе такого нет) — людям, клиенту одна строка.
+    # 7. Клиент подтвердил анкету — разговор обязан идти дальше, а не встать в тупик.
+    #    Живой случай Александра (сделка 148): на «Все верно» пришло «Уточню это у команды».
+    before = len(chat.messages)
+    funnel.says("Все верно")
+    assert len(chat.messages) == before + 1, "на подтверждение отвечаем"
+    assert chat.last != tg.TERMS_ASK_HUMAN_REPLY, "подтверждение — не повод дёргать людей"
+    assert "вопрос" in chat.last.lower(), "менеджер спрашивает, остались ли вопросы по условиям"
+    assert "Индивидуальные условия снижают комиссию" not in chat.last, "документ второй раз не шлём"
+    assert not portal.escalations, "людей на подтверждении не беспокоим"
+
+    # И у самого этапа «Анкета заполнена» есть ЖИВОЙ шаг: без него агент вставал в тупик,
+    # получая в промпт заглушку «Стадия C16:UC_ANKETA / ждёшь: — ».
+    step = tg.funnel_step_block(deal["deal_id"], LEAD["id"])
+    assert "Стадия C16:UC_ANKETA" not in step, "этап без шага — это тупик"
+    assert "Сверка анкеты" in step
+
+    # 8. Вопрос ПОВЕРХ условий (в документе такого нет) — людям, клиенту одна строка.
     before = len(chat.messages)
     funnel.says("Какой ДРР держать и как происходит управление?")
     assert chat.last == tg.TERMS_ASK_HUMAN_REPLY, "второй документ клиенту не дублируем"
@@ -238,7 +258,7 @@ def test_lead_journey_from_hello_to_a_question_beyond_the_terms(funnel):
     assert portal.escalations, "вопрос обязан уйти живым людям"
     assert "дрр" in portal.escalations[-1].lower()
 
-    # 8. Инвариант всего пути: в воронке ровно одна сделка этого человека.
+    # 9. Инвариант всего пути: в воронке ровно одна сделка этого человека.
     assert len(portal.deals_of(LEAD["username"])) == 1
 
 

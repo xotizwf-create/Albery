@@ -355,3 +355,29 @@ def test_resend_detector_tells_a_repeat_request_from_a_new_question(tg):
     assert tg._wants_terms_again("продублируйте условия")
     assert not tg._wants_terms_again("Какой дрр нужно держать и как происходит управление?")
     assert not tg._wants_terms_again("а какая комиссия ваша по этой программе?")
+
+
+def test_confirming_the_anketa_is_not_a_terms_question(tg, monkeypatch):
+    """Живой тупик 24.07.2026 (Александр, сделка 148): клиент написал «Все верно», модель
+    вернула маркер условий, а условия ему уже отправляли — и клиент получил «Уточню это у
+    команды и вернусь с ответом». Он ничего не спрашивал: людей дёргать не за чем, а разговор
+    надо вести дальше."""
+    sent, to_humans = _lead_turn(
+        tg, monkeypatch, "Все верно",
+        state_extra={"terms_sent": {"764181402": "2026-07-24T18:52:48+00:00"}})
+
+    assert sent, "клиент не должен остаться без ответа"
+    assert sent[0] != tg.TERMS_ASK_HUMAN_REPLY, "это не вопрос — людям не уносим"
+    assert not to_humans, "живых людей дёргать не за чем"
+    assert "вопрос" in sent[0].lower(), "менеджер спрашивает, остались ли вопросы по условиям"
+    assert "Индивидуальные условия снижают комиссию" not in sent[0], "документ второй раз не шлём"
+
+
+def test_question_words_are_told_apart_from_confirmations(tg):
+    """Граница «вопрос / подтверждение» решается одним разбором — проверяем обе стороны."""
+    assert tg._looks_like_question("Какой дрр нужно держать?")
+    assert tg._looks_like_question("а что по срокам")
+    assert tg._looks_like_question("сколько это стоит")
+    assert not tg._looks_like_question("Все верно")
+    assert not tg._looks_like_question("да")
+    assert not tg._looks_like_question("Заполнил")

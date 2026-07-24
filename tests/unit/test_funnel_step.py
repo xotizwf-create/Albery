@@ -102,8 +102,9 @@ def test_step_block_tells_the_agent_to_come_back_after_questions(monkeypatch):
 
     monkeypatch.setattr(
         tg_agent, "funnel_next_step",
-        lambda deal: {"step": "Выбор способа подписания", "need": "ЭДО или бумага",
-                      "action": "поставь задачу"})
+        lambda deal, terms_sent_to_client=False: {"step": "Выбор способа подписания",
+                                                  "need": "ЭДО или бумага",
+                                                  "action": "поставь задачу"})
     monkeypatch.setitem(
         __import__("mcp.context_server", fromlist=["TOOLS"]).TOOLS, "get_crm_deal",
         {"handler": lambda a: {"deal": _deal("C16:NDA")}})
@@ -124,3 +125,39 @@ def test_step_block_survives_crm_failure(monkeypatch):
         {"handler": lambda a: (_ for _ in ()).throw(RuntimeError("CRM недоступна"))})
 
     assert tg_agent.funnel_step_block(86) == ""
+
+
+# --- тупик после анкеты (владелец, 24.07.2026: «агент словил тупик и не знает что сказать») ---
+
+ANKETA_DEAL = {
+    "deal_id": 148, "stage_id": "C16:UC_ANKETA",
+    "custom_fields": {"UF_CRM_1784297026": "Test", "UF_CRM_1784297137": "Одежда"},
+}
+
+
+def test_anketa_stage_has_a_real_step():
+    """Живой случай (Александр, сделка 148): склейка поставила «Анкета заполнена», а этого
+    этапа не было ни в одной ветке — шаг сваливался в заглушку «Стадия C16:UC_ANKETA / ждёшь:
+    — / веди разговор по маршруту». Агенту было буквально нечего делать, и он завис."""
+    st = funnel_next_step(ANKETA_DEAL)
+
+    assert st["step"] != "Стадия C16:UC_ANKETA", "этап без шага = тупик"
+    assert st["need"] != "—", "агент обязан знать, чего ждёт от клиента"
+    assert "148" in st["action"], "в шаге есть конкретное действие со сделкой"
+
+
+def test_after_anketa_with_terms_already_sent_agent_asks_about_questions():
+    """Условия человек получил ещё до анкеты (так было у Александра). Значит после подтверждения
+    анкеты менеджер спрашивает про вопросы по условиям, а не шлёт их заново."""
+    st = funnel_next_step(ANKETA_DEAL, terms_sent_to_client=True)
+
+    assert "вопрос" in st["action"].lower(), "спросить про вопросы по условиям"
+    assert "C16:S84294149" in st["action"], "и перевести сделку на согласование условий"
+    assert "send_terms" not in st["action"], "второй раз условия не отправляем"
+
+
+def test_after_anketa_without_terms_agent_sends_them():
+    """Если условия ещё НЕ отправляли — после подтверждения анкеты их надо отправить."""
+    st = funnel_next_step(ANKETA_DEAL)
+
+    assert "send_terms" in st["action"]

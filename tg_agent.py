@@ -1163,8 +1163,12 @@ def anketa_block(deal: dict) -> str:
 
 # ответил — и забыл, что за ответом «давайте ЭДО» должна была идти задача на отправку. Любое
 # число вопросов между шагами теперь ничего не ломает: шаг приходит в каждом сообщении.
-def funnel_next_step(deal: dict) -> dict:
-    """Что агент обязан сделать на текущем шаге сделки."""
+def funnel_next_step(deal: dict, terms_sent_to_client: bool = False) -> dict:
+    """Что агент обязан сделать на текущем шаге сделки.
+
+    `terms_sent_to_client` — документ условий этому человеку уже уходил (отметка в состоянии
+    агента). Условия часто отправляются ДО анкеты, ещё когда человек не был лидом, и в полях
+    сделки этого следа нет: без флага агент предлагал бы их второй раз."""
     uf = deal.get("custom_fields") or {}
     stage = str(deal.get("stage_id") or deal.get("stage") or "")
     deal_id = deal.get("deal_id") or deal.get("id") or deal.get("ID")
@@ -1173,13 +1177,28 @@ def funnel_next_step(deal: dict) -> dict:
     signing = _enum_label(SIGNING_FIELD, uf.get(SIGNING_FIELD))
     # Отметку об отправке условий держим в поле сделки, если оно заведено; пока поля нет —
     # признаком служат уже собранные реквизиты (значит, условия давно позади).
-    terms_sent = _filled(uf.get(TERMS_SENT_FIELD)) if TERMS_SENT_FIELD else has_req
+    terms_sent = (_filled(uf.get(TERMS_SENT_FIELD)) if TERMS_SENT_FIELD else has_req) \
+        or terms_sent_to_client
 
-    if stage in ("C16:NEW", "C16:CONTACTED"):
+    # «Анкета заполнена» — этап сверки, как и первые два. Без него шаг сваливался в заглушку, и
+    # агент вставал в тупик сразу после «Всё верно» (случай Александра, сделка 148, 24.07.2026).
+    if stage in (STAGE_NEW, STAGE_CONTACTED, STAGE_FORM_DONE):
         block = anketa_block(deal)
         show = (f"Если сверка анкеты ещё не отправлялась (посмотри историю) — отправь клиенту "
                 f"РОВНО это сообщение, слово в слово, ничего не добавляя:\n{block}\n\n"
                 if block else "")
+        if terms_sent:
+            # Условия человек получил ещё до анкеты — второй раз их слать нельзя, но и молчать
+            # после «Всё верно» тоже: живой менеджер спрашивает, остались ли вопросы.
+            return {"step": "Сверка анкеты",
+                    "need": "подтверждение данных анкеты",
+                    "action": (show
+                               + f"Условия клиент УЖЕ получил дословно из документа — заново их "
+                               f"НЕ отправляй и не пересказывай. Как только он подтвердил данные "
+                               f"(«всё верно», «да») — переведи сделку {deal_id} на стадию "
+                               f"C16:S84294149 (update_crm_deal) и спроси, остались ли вопросы по "
+                               f"условиям. Вопросы кончились — попроси реквизиты организации для "
+                               f"договора.")}
         return {"step": "Сверка анкеты",
                 "need": "подтверждение данных анкеты",
                 "action": (show
@@ -1262,7 +1281,7 @@ def funnel_next_step(deal: dict) -> dict:
             "action": "Веди разговор по маршруту воронки; стадию не двигай без факта."}
 
 
-def funnel_step_block(deal_id: int) -> str:
+def funnel_step_block(deal_id: int, telegram_id=None) -> str:
     """Текущий шаг воронки текстом — уходит в промпт КАЖДОГО сообщения."""
     try:
         from mcp import context_server as cs
@@ -1271,7 +1290,8 @@ def funnel_step_block(deal_id: int) -> str:
     except Exception:  # noqa: BLE001 — без шага агент ответит хуже, но ответит
         log.warning("шаг воронки для сделки %s не определён", deal_id, exc_info=True)
         return ""
-    st = funnel_next_step(deal)
+    st = funnel_next_step(deal, terms_sent_to_client=bool(
+        telegram_id and _terms_already_sent(telegram_id)))
     return ("ТЕКУЩИЙ ШАГ ВОРОНКИ (считан из сделки прямо сейчас — это важнее твоей памяти о "
             f"разговоре):\n"
             f"- этап: {st['step']}\n"
@@ -2210,6 +2230,21 @@ TERMS_REQUEST_MARKER = "ПОКАЖИ_УСЛОВИЯ"
 # который в документе нет, уносим людям И пишем клиенту одну строку, чтобы он не сидел в тишине
 # (тот же случай, что был с Георгием: молчание оставляет клиента без понимания, ответят ли ему).
 TERMS_ASK_HUMAN_REPLY = "Уточню это у команды и вернусь с ответом."
+# А это — на случай, когда маркер условий сработал вхолостую: человек НИЧЕГО не спросил, он
+# просто подтвердил анкету («Все верно»), а модель всё равно вернула маркер. 24.07.2026 Александр
+# получил на «Все верно» ответ «Уточню это у команды» — тупик вместо разговора. Живой менеджер в
+# этот момент спрашивает про вопросы по условиям и ведёт к договору.
+TERMS_FOLLOWUP_REPLY = ("Отлично, спасибо! Условия я отправлял выше — остались по ним вопросы? "
+                        "Если всё понятно, пришлите реквизиты организации, и я подготовлю договор.")
+# Вопрос ли это. Нужен, чтобы людям уходили именно ВОПРОСЫ, а не «ок», «да», «все верно».
+_QUESTION_RE = re.compile(
+    r"\?|\bкак(ой|ая|ие|ое|ов|to)?\b|\bсколько\b|\bчто\b|\bпочему\b|\bзачем\b|\bкогда\b|"
+    r"\bгде\b|\bкуда\b|\bчем\b|\bможно ли\b|\bа если\b|\bнасколько\b|\bкакова\b", re.I)
+
+
+def _looks_like_question(text: str) -> bool:
+    """Клиент о чём-то спрашивает, а не просто подтверждает?"""
+    return bool(_QUESTION_RE.search(text or ""))
 # Просьба выслать условия заново — тогда документ отправляем снова, это не «вопрос вне документа».
 _TERMS_RESEND_RE = re.compile(
     r"ещ[её]\s+раз|повтор\w*|продублир\w*|снова|заново|не\s+приш\w*|не\s+получ\w*|"
@@ -2683,7 +2718,7 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
             f"{role}\n\n{STYLE_RULES}\n\n"
             f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
             f"Собеседник: {name or 'клиент'} (@{username or 'без username'})\n"
-            f"\n{funnel_step_block(deal_id)}\n"
+            f"\n{funnel_step_block(deal_id, author_id)}\n"
             f"\n{_shown_messages(texts)}"
         ) if role else (
             "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
@@ -2746,15 +2781,22 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
     if TERMS_REQUEST_MARKER in answer:
         # Второй раз документ не дублируем: вопрос поверх условий — людям (решение владельца).
         if _terms_already_sent(author_id) and not _wants_terms_again(text):
-            _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
-            return
-        try:
-            send_terms(deal_id, author_id)      # шлёт дословно, журналит и метит сделку
-        except Exception as exc:  # noqa: BLE001 — документ не готов: решают люди
-            log.warning("условия лиду %s не собраны: %s", author_id, str(exc)[:200])
-            escalate_to_human(author, f"клиент спросил про условия, документ не готов: "
-                                      f"{str(exc)[:150]}", text)
-        return      # send_terms сам метит доставленный документ
+            if _looks_like_question(text):
+                _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
+                return
+            # Человек ничего не спросил — просто подтвердил анкету. Маркер сработал вхолостую:
+            # людей не дёргаем и в тупик не встаём, а ведём разговор дальше по шагу воронки.
+            log.info("лид %s: маркер условий на подтверждении «%s» — отвечаем по шагу воронки",
+                     author_id, text[:40])
+            answer = TERMS_FOLLOWUP_REPLY      # дальше идём обычным путём ответа клиенту
+        else:
+            try:
+                send_terms(deal_id, author_id)  # шлёт дословно, журналит и метит сделку
+            except Exception as exc:  # noqa: BLE001 — документ не готов: решают люди
+                log.warning("условия лиду %s не собраны: %s", author_id, str(exc)[:200])
+                escalate_to_human(author, f"клиент спросил про условия, документ не готов: "
+                                          f"{str(exc)[:150]}", text)
+            return      # send_terms сам метит доставленный документ
 
     if escalated(author, answer, text):
         journal(MANAGER_CHANNEL, author_id, "out", "вопрос без ответа в базе — унесён людям "
