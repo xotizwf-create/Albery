@@ -240,3 +240,40 @@ def test_stranger_rules_forbid_promises_and_article_questions(tg):
     assert "не проси артикул" in rules
     assert "посчитать экономику" in rules
     assert tg.TERMS_REQUEST_MARKER in tg.STRANGER_RULES
+
+
+def test_lead_asking_about_conditions_gets_the_file_word_for_word(tg, monkeypatch):
+    """Живой сбой 24.07.2026 (диалог 1451982360, сделка 110): лид спросил «какие условия» и
+    получил самодельную выжимку — маркер работал только у незнакомца. У лида он обязан
+    работать тоже: условия уходят дословно через send_terms."""
+    sent, called = [], []
+    monkeypatch.setenv("TG_BUSINESS_AUTOREPLY", "1")
+    monkeypatch.setattr(tg, "load_state", lambda: {"business": {"C1": {"user_id": 871}}})
+    monkeypatch.setattr(tg, "save_state", lambda s: None)
+    monkeypatch.setattr(tg, "lead_deal_for_username", lambda u: 110)
+    monkeypatch.setattr(tg, "funnel_step_block", lambda d: "Шаг: вопросы по условиям")
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "react", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "chat_history", lambda *a, **k: "")
+    monkeypatch.setattr(tg, "_dialog_out_watermark", lambda d: 0)
+    monkeypatch.setattr(tg, "_out_messages_after", lambda d, s: 0)
+    monkeypatch.setattr(tg, "hermes_answer",
+                        lambda p, s, toolsets=None: tg.TERMS_REQUEST_MARKER)
+    monkeypatch.setattr(tg, "send_html",
+                        lambda uid, html, plain: sent.append(plain) or (True, ""))
+    monkeypatch.setattr(tg, "send_as_account",
+                        lambda uid, t, parse_mode="": called.append(t) or (True, ""))
+
+    tg.maybe_autoreply({"business_connection_id": "C1", "chat": {"id": 555, "type": "private"},
+                        "from": {"id": 555, "username": "lead", "first_name": "Пётр"},
+                        "text": "Евгений передал контакт, какие условия подключения к ИУ"})
+
+    assert sent, "лиду должны уйти условия"
+    assert "Индивидуальные условия снижают комиссию" in sent[0], "текст ровно из документа"
+    assert tg.TERMS_REQUEST_MARKER not in sent[0], "служебный маркер клиенту не показываем"
+
+
+def test_terms_marker_rule_reaches_both_branches(tg):
+    """Правило про дословные условия лежит в общих правилах тона — значит и лид, и незнакомец."""
+    assert tg.TERMS_REQUEST_MARKER in tg.STYLE_RULES
+    assert "не пересказывай" in tg.STYLE_RULES.lower()
