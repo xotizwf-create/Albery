@@ -1454,19 +1454,31 @@ def _agent_already_spoke_on_deal(dialog_id, deal_id: int) -> bool:
 
 
 def _deals_for_username(uname: str) -> list[dict]:
-    """Все сделки воронки с этим @username, от старой к новой."""
-    try:
-        res = mcp_call("list_crm_deals", {"category_id": CRM_LEAD_CATEGORY_ID, "limit": 100})
-        deals = res.get("deals") or res.get("items") or []
-    except Exception:  # noqa: BLE001
-        log.warning("не удалось прочитать сделки воронки", exc_info=True)
+    """Все сделки воронки с этим @username, от старой к новой.
+
+    Список берём из list_crm_lead_contacts: он отдаёт ОТДЕЛЬНУЮ строку на каждую сделку, а
+    list_crm_deals пользовательские поля не возвращает вовсе — из-за этого склейка сначала
+    не находила дубль (проверено на проде 24.07.2026). Поля читаем точечно по каждой сделке."""
+    target = _norm_username(uname)
+    if not target:
         return []
-    mine = []
-    for d in deals:
-        uf = d.get("custom_fields") or {}
-        if _norm_username(str(uf.get(CRM_TELEGRAM_FIELD) or "")) == _norm_username(uname):
-            mine.append(d)
-    return sorted(mine, key=lambda d: int(d.get("deal_id") or d.get("id") or 0))
+    try:
+        rows = mcp_call("list_crm_lead_contacts", {}).get("contacts") or []
+    except Exception:  # noqa: BLE001
+        log.warning("не удалось прочитать лидов воронки", exc_info=True)
+        return []
+    ids = sorted({int(r["deal_id"]) for r in rows if r.get("deal_id")
+                  and _norm_username(str(r.get("username") or "")) == target})
+    out: list[dict] = []
+    for did in ids:
+        try:
+            deal = mcp_call("get_crm_deal", {"deal_id": did})
+            deal = deal.get("deal") or deal
+            deal["deal_id"] = did       # id несём сами: ответ инструмента его может не содержать
+            out.append(deal)
+        except Exception:  # noqa: BLE001
+            log.warning("сделка %s недоступна при склейке", did, exc_info=True)
+    return out
 
 
 def merge_form_duplicate(uname: str) -> dict:

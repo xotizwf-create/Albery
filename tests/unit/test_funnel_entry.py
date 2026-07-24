@@ -97,14 +97,17 @@ def test_form_duplicate_is_merged_into_the_original_deal(tg, monkeypatch):
     """Анкета создаёт свою сделку — её данные переносим в исходную, дубль удаляем."""
     calls = []
 
+    fields = {500: {tg.CRM_TELEGRAM_FIELD: "novichok"},
+              520: {tg.CRM_TELEGRAM_FIELD: "novichok", "UF_CRM_1784297137": "Одежда"}}
+
     def fake_mcp(tool, args):
         calls.append((tool, args))
-        if tool == "list_crm_deals":
-            return {"deals": [
-                {"deal_id": 500, "custom_fields": {tg.CRM_TELEGRAM_FIELD: "novichok"}},
-                {"deal_id": 520, "custom_fields": {tg.CRM_TELEGRAM_FIELD: "novichok",
-                                                   "UF_CRM_1784297137": "Одежда"}},
-            ]}
+        if tool == "list_crm_lead_contacts":
+            # Реальный формат: отдельная строка на КАЖДУЮ сделку с этим username.
+            return {"contacts": [{"username": "novichok", "deal_id": 500},
+                                 {"username": "novichok", "deal_id": 520}]}
+        if tool == "get_crm_deal":
+            return {"deal": {"custom_fields": fields[args["deal_id"]]}}
         return {}
 
     monkeypatch.setattr(tg, "mcp_call", fake_mcp)
@@ -119,8 +122,13 @@ def test_form_duplicate_is_merged_into_the_original_deal(tg, monkeypatch):
 
 
 def test_nothing_to_merge_when_there_is_one_deal(tg, monkeypatch):
-    monkeypatch.setattr(tg, "mcp_call", lambda tool, args: (
-        {"deals": [{"deal_id": 500, "custom_fields": {tg.CRM_TELEGRAM_FIELD: "novichok"}}]}
-        if tool == "list_crm_deals" else {}))
+    def fake_mcp(tool, args):
+        if tool == "list_crm_lead_contacts":
+            return {"contacts": [{"username": "novichok", "deal_id": 500}]}
+        if tool == "get_crm_deal":
+            return {"deal": {"custom_fields": {tg.CRM_TELEGRAM_FIELD: "novichok"}}}
+        return {}
+
+    monkeypatch.setattr(tg, "mcp_call", fake_mcp)
 
     assert tg.merge_form_duplicate("novichok")["merged"] is False
