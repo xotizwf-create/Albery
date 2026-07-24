@@ -1453,6 +1453,51 @@ def _agent_already_spoke_on_deal(dialog_id, deal_id: int) -> bool:
         return True
 
 
+def _deals_for_username(uname: str) -> list[dict]:
+    """Все сделки воронки с этим @username, от старой к новой."""
+    try:
+        res = mcp_call("list_crm_deals", {"category_id": CRM_LEAD_CATEGORY_ID, "limit": 100})
+        deals = res.get("deals") or res.get("items") or []
+    except Exception:  # noqa: BLE001
+        log.warning("не удалось прочитать сделки воронки", exc_info=True)
+        return []
+    mine = []
+    for d in deals:
+        uf = d.get("custom_fields") or {}
+        if _norm_username(str(uf.get(CRM_TELEGRAM_FIELD) or "")) == _norm_username(uname):
+            mine.append(d)
+    return sorted(mine, key=lambda d: int(d.get("deal_id") or d.get("id") or 0))
+
+
+def merge_form_duplicate(uname: str) -> dict:
+    """Склеить сделку от CRM-формы с той, что агент завёл при первом сообщении.
+
+    Владелец 24.07.2026: анкета создаёт СВОЮ сделку, а у нас уже есть своя — «не надо плодить».
+    Держим САМУЮ СТАРУЮ (её вёл агент с первого сообщения), переносим в неё заполненные поля
+    анкеты и удаляем дубль."""
+    deals = _deals_for_username(uname)
+    if len(deals) < 2:
+        return {"merged": False, "reason": "дублей нет"}
+    keep, dup = deals[0], deals[-1]
+    keep_id = int(keep.get("deal_id") or keep.get("id"))
+    dup_id = int(dup.get("deal_id") or dup.get("id"))
+    moved = {k: v for k, v in (dup.get("custom_fields") or {}).items()
+             if _filled(v) and not _filled((keep.get("custom_fields") or {}).get(k))}
+    try:
+        mcp_call("update_crm_deal", {
+            "deal_id": keep_id, "stage": STAGE_FORM_DONE,
+            **({"custom_fields": moved} if moved else {}),
+            "comments": f"Анкета заполнена — данные перенесены из сделки {dup_id}, дубль удалён."})
+        mcp_call("delete_crm_deal", {"deal_id": dup_id, "confirm": True})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("склейка сделок @%s не удалась: %s", uname, str(exc)[:200])
+        return {"merged": False, "error": str(exc)[:200]}
+    _LEADS_CACHE.setdefault("map", {})[_norm_username(uname)] = keep_id
+    log.info("склеены сделки @%s: оставлена %s, удалён дубль %s, перенесено полей %d",
+             uname, keep_id, dup_id, len(moved))
+    return {"merged": True, "kept": keep_id, "deleted": dup_id, "fields": len(moved)}
+
+
 def _deal_for_watch(deal_id: int) -> dict:
     """Сделка для сторожа анкеты (тем же инструментом, что и ходы агента)."""
     from mcp import context_server as cs
@@ -1484,6 +1529,11 @@ def _check_new_forms() -> None:
         if not lock.acquire(blocking=False):
             continue        # идёт ход с этим человеком — он сам увидит шаг воронки
         try:
+            # Анкета создала свою сделку, а агент уже вёл свою — склеиваем в одну и
+            # ставим «Анкета заполнена» (владелец, 24.07.2026).
+            merged = merge_form_duplicate(username)
+            if merged.get("merged"):
+                deal_id = merged["kept"]
             if _agent_already_spoke_on_deal(uid_str, deal_id):
                 pass        # разговор по сделке уже идёт — просто запоминаем её
             else:
@@ -1889,6 +1939,56 @@ def business_autoreply_enabled() -> bool:
 # WB — индивидуальные условия» (требование владельца 22.07.2026).
 CRM_LEAD_CATEGORY_ID = int(os.getenv("CRM_LEAD_CATEGORY_ID", "16") or 16)
 CRM_TELEGRAM_FIELD = os.getenv("CRM_TELEGRAM_FIELD", "UF_CRM_1784296997").strip()
+
+# Первые этапы воронки (владелец, 24.07.2026): написал про ИУ → «Новый лид», ответили →
+# «Связались», заполнил анкету → «Анкета заполнена». Дальше — согласование условий и т.д.
+STAGE_NEW = os.getenv("CRM_STAGE_NEW", "C16:NEW").strip()
+STAGE_CONTACTED = os.getenv("CRM_STAGE_CONTACTED", "C16:CONTACTED").strip()
+STAGE_FORM_DONE = os.getenv("CRM_STAGE_FORM_DONE", "C16:UC_ANKETA").strip()
+
+# Сделку заводим ТОЛЬКО тем, кто спрашивает про ИУ (решение владельца): на аккаунт пишут и
+# поставщики, и знакомые — им в воронке не место.
+_IU_INTENT_RE = re.compile(
+    r"\bи\.?у\b|индивидуальн\w* услови|подключ\w*|присоедин\w*|услови\w*|комисси\w*|"
+    r"тариф\w*|сотрудничеств\w*|сколько стоит|цен[аыу]\b|прайс", re.I)
+
+
+def _iu_intent(texts: list[str]) -> bool:
+    """Человек интересуется подключением к ИУ, а не просто болтает?"""
+    return bool(_IU_INTENT_RE.search(" ".join(texts or [])))
+
+
+def _open_lead_deal(username: str, telegram_id, name: str = "") -> int | None:
+    """Завести сделку на первом этапе воронки и запомнить её за этим @username."""
+    uname = _norm_username(username)
+    if not uname:
+        return None      # без username сделку не с чем связать — писать всё равно можем
+    title = f"Лид Telegram @{uname}" + (f" — {name}" if name else "")
+    try:
+        res = mcp_call("create_crm_deal", {
+            "title": title, "category_id": CRM_LEAD_CATEGORY_ID, "stage": STAGE_NEW,
+            "custom_fields": {CRM_TELEGRAM_FIELD: uname},
+            "comments": f"Написал в Telegram (id {telegram_id}). Сделка заведена агентом.",
+        })
+    except Exception:  # noqa: BLE001 — без сделки разговор всё равно продолжается
+        log.warning("не удалось завести сделку для @%s", uname, exc_info=True)
+        return None
+    deal_id = to_int_safe(res.get("deal_id") or res.get("id") or res.get("ID"))
+    if deal_id:
+        # Кэш лидов должен сразу знать про новую сделку, иначе следующий ход снова сочтёт
+        # человека незнакомцем и заведёт вторую.
+        _LEADS_CACHE.setdefault("map", {})[uname] = int(deal_id)
+        log.info("заведена сделка %s на этапе «Новый лид» для @%s", deal_id, uname)
+    return deal_id
+
+
+def _move_deal_stage(deal_id, stage: str, comment: str = "") -> None:
+    """Передвинуть сделку по воронке. Тихо: движение стадии не должно ломать ответ клиенту."""
+    try:
+        mcp_call("update_crm_deal", {"deal_id": int(deal_id), "stage": stage,
+                                     **({"comments": comment} if comment else {})})
+    except Exception:  # noqa: BLE001
+        log.warning("сделка %s не сдвинулась на %s", deal_id, stage, exc_info=True)
 _LEADS_CACHE: dict[str, Any] = {"at": 0.0, "map": {}, "ok": False}
 _LEADS_TTL_S = float(os.getenv("CRM_LEADS_TTL_S", "300") or 300)
 
@@ -2251,6 +2351,10 @@ def reply_to_stranger(author: dict, texts: list[str] | str) -> bool:
     text = "\n".join(texts)     # для эскалации — весь смысл пачки целиком
     author_id = author.get("id")
     name = (author.get("first_name") or "").strip()
+    # Спросил про ИУ — сразу заводим сделку на «Новом лиде», ещё до ответа (владелец,
+    # 24.07.2026: «как только лид пишет на линию — сразу создаётся сделка с его юзернеймом»).
+    new_deal = _open_lead_deal(author.get("username") or "", author_id, name) \
+        if _iu_intent(texts) else None
     # Роль из карточки ЗАМЕНЯЕТ встроенный сценарий, а не дополняет его. Склейка давала
     # противоречивый промпт: роль велит сперва проверить воронку, а встроенный текст — сразу
     # слать анкету. Агент шёл по встроенному, и владелец получал «после обработки анкеты
@@ -2331,13 +2435,17 @@ def reply_to_stranger(author: dict, texts: list[str] | str) -> bool:
     answer = plain
     if ok and invite_now:
         _mark_invited(author_id)    # отмечаем только фактически доставленное
+    if ok and new_deal:
+        # Ответили — значит связались. Этап двигаем только по факту доставки.
+        _move_deal_stage(new_deal, STAGE_CONTACTED, "Агент ответил клиенту в Telegram.")
     # Незнакомец попадает в журнал только теперь: агент с ним заговорил. Пока он молчал, это была
     # обычная личная переписка аккаунта, которой в кабинете не место.
     for t in texts:
         journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author)
     journal(MANAGER_CHANNEL, author_id, "out", answer if ok else f"{answer}\n\n[не доставлено: {err}]",
             kind="lead_chat", user=author, status="ok" if ok else "error",
-            meta={"stranger": True, "invited": bool(invite_now and ok)})
+            meta={"stranger": True, "invited": bool(invite_now and ok),
+                  **({"deal_id": new_deal} if new_deal else {})})
     log.info("ответ незнакомцу %s: %s%s", author_id, "отправлен" if ok else f"не ушёл ({err})",
              " (+анкета)" if invite_now and ok else "")
     return ok
