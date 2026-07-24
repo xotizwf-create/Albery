@@ -187,3 +187,56 @@ def test_requisites_already_collected_means_terms_are_behind(tg):
                               "custom_fields": {tg.CONTRACT_REQUISITES_FIELD: "ИНН 7704123456"}})
 
     assert st["step"] == "Отправка договора"
+
+
+# --- условия незнакомцу: дословно из файла (владелец, 24.07.2026) -----------------------------
+
+def _stranger(tg, monkeypatch, answer):
+    """Незнакомец пишет в личку; ловим, что уйдёт клиенту."""
+    import json as _json
+
+    box = []
+    monkeypatch.setenv("TG_BUSINESS_AUTOREPLY", "1")
+    monkeypatch.setenv("TG_LEAD_INVITE", "1")
+    monkeypatch.setattr(tg, "load_state", lambda: {"business": {"C1": {"user_id": 871}}})
+    monkeypatch.setattr(tg, "save_state", lambda s: None)
+    monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {})
+    monkeypatch.setattr(tg, "crm_leads_reachable", lambda: True)
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: answer)
+    monkeypatch.setattr(tg, "send_as_account",
+                        lambda uid, t, parse_mode="": box.append(t) or (True, ""))
+    tg.maybe_autoreply({"business_connection_id": "C1", "chat": {"id": 777, "type": "private"},
+                        "from": {"id": 777, "username": "novy", "first_name": "Иван"},
+                        "text": "какие условия подключения?"})
+    return box
+
+
+def test_conditions_are_sent_word_for_word_from_the_file(tg, monkeypatch):
+    """Модель НЕ пересказывает условия: до этого цифры гуляли от диалога к диалогу
+    («200 000 ₽ вместо 500 000» в одном чате, «комиссия 44%» в другом)."""
+    box = _stranger(tg, monkeypatch, tg.TERMS_REQUEST_MARKER)
+
+    assert box, "клиенту должны уйти условия"
+    text = box[0]
+    assert "Индивидуальные условия снижают комиссию" in text, "текст ровно из документа"
+    assert "30 000 ₽ в месяц" in text
+    assert tg.TERMS_REQUEST_MARKER not in text, "служебный маркер клиенту не показываем"
+
+
+def test_form_invite_follows_the_conditions(tg, monkeypatch):
+    """Цель — анкета: после условий приглашение идёт в конце того же сообщения."""
+    box = _stranger(tg, monkeypatch, tg.TERMS_REQUEST_MARKER)
+
+    assert tg.LEAD_FORM_URL in box[0]
+    assert box[0].index("Индивидуальные условия") < box[0].index(tg.LEAD_FORM_URL), \
+        "сначала условия, анкета — в конце"
+
+
+def test_stranger_rules_forbid_promises_and_article_questions(tg):
+    """Живой сбой: клиенту с оборотом 200 млн агент пообещал «посмотрим экономику по артикулу»."""
+    rules = tg.STRANGER_RULES.lower()
+
+    assert "не проси артикул" in rules
+    assert "посчитать экономику" in rules
+    assert tg.TERMS_REQUEST_MARKER in tg.STRANGER_RULES
