@@ -19,6 +19,7 @@ Secrets: TG_AGENT_BOT_TOKEN lives only in /var/www/albery/.env (never in git).
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import logging
@@ -1440,21 +1441,6 @@ def _username_for_uid(uid) -> str:
     return ""
 
 
-def _agent_already_spoke_on_deal(dialog_id, deal_id: int) -> bool:
-    """Агент уже писал этому человеку ПО ЭТОЙ сделке? Тогда сверку начинать не надо."""
-    try:
-        with _db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT 1 FROM telegram_bot_messages WHERE bot = %s AND dialog_id = %s"
-                    "   AND direction = 'out' AND meta->>'deal_id' = %s LIMIT 1",
-                    (MANAGER_CHANNEL, str(dialog_id), str(int(deal_id))))
-                return cur.fetchone() is not None
-    except Exception:  # noqa: BLE001 — журнал недоступен: лучше промолчать, чем задвоить
-        log.warning("журнал недоступен для проверки сделки %s", deal_id, exc_info=True)
-        return True
-
-
 def _deals_for_username(uname: str) -> list[dict]:
     """Все сделки воронки с этим @username, от старой к новой.
 
@@ -1519,17 +1505,33 @@ def _deal_for_watch(deal_id: int) -> dict:
     return deal.get("deal") or deal
 
 
+def _survey_stages() -> tuple[str, ...]:
+    """Этапы, на которых сверка анкеты ещё уместна.
+
+    «Анкета заполнена» входит обязательно: именно на него склейка ставит сделку, и без него
+    сторож молчал (регрессия 24.07.2026). Считаем при вызове — константы этапов объявлены ниже."""
+    return (STAGE_NEW, STAGE_CONTACTED, STAGE_FORM_DONE)
+
+
+def _anketa_fingerprint(block: str) -> str:
+    """Отпечаток содержимого анкеты — по нему видно, сверяли эти данные или ещё нет."""
+    return hashlib.sha1(block.encode("utf-8")).hexdigest()[:12]
+
+
 def _check_new_forms() -> None:
     """Сторож анкеты: клиент заполнил форму — агент НАЧИНАЕТ сверку сам, не ждёт сообщения.
 
     Владелец 24.07.2026: «агент должен не просто ждать пока человек напишет, а сам
-    отслеживать, появилась ли анкета». Отслеживаем тех, кому агент сам отправил ссылку на
-    анкету (state.invited): появилась сделка → шлём сверку (anketa_block, дословно из полей
-    воронки). Одна сделка обрабатывается один раз (state.form_surveyed[uid] = deal_id) —
-    повторная анкета того же человека создаст НОВУЮ сделку, и сторож сработает снова."""
+    отслеживать, появилась ли анкета».
+
+    Признак «анкета появилась» — САМИ ДАННЫЕ анкеты в сделке, а не факт её появления. Раньше
+    сторож срабатывал на новую сделку, потому что сделку создавала только CRM-форма. С 24.07.2026
+    сделку заводит агент с первого сообщения, и тот признак сломался: сделка уже есть, агент по
+    ней говорит, склейка переносит анкету в неё же — клиент не получал сверку, пока не писал
+    «Заполнил» сам. Теперь помним отпечаток сверенных данных (state.anketa_seen[uid]):
+    перезаполнил анкету — отпечаток другой — сверяем заново."""
     state = load_state()
     invited = state.get("invited") or {}
-    surveyed = state.get("form_surveyed") or {}
     if not invited:
         return
     for uid_str in list(invited):
@@ -1537,7 +1539,7 @@ def _check_new_forms() -> None:
         if not username:
             continue
         deal_id = lead_deal_for_username(username)
-        if not deal_id or str(surveyed.get(uid_str)) == str(deal_id):
+        if not deal_id:
             continue
         lock = dialog_lock(to_int_safe(uid_str))
         if not lock.acquire(blocking=False):
@@ -1548,33 +1550,50 @@ def _check_new_forms() -> None:
             merged = merge_form_duplicate(username)
             if merged.get("merged"):
                 deal_id = merged["kept"]
-            if _agent_already_spoke_on_deal(uid_str, deal_id):
-                pass        # разговор по сделке уже идёт — просто запоминаем её
-            else:
-                deal = _deal_for_watch(deal_id)
-                stage = str(deal.get("stage_id") or deal.get("stage") or "")
-                if stage not in ("C16:NEW", "C16:CONTACTED"):
-                    pass    # сделка уже дальше сверки — не лезем
-                else:
-                    block = anketa_block(deal)
-                    if not block:
-                        continue    # поля ещё пустые — попробуем в следующий проход
-                    ok, err = send_html(to_int_safe(uid_str), as_html(block), block)
-                    if not ok:
-                        log.warning("сверка анкеты не доставлена %s: %s", uid_str, err[:150])
-                        continue
-                    journal(MANAGER_CHANNEL, uid_str, "out", block, kind="lead_chat",
-                            meta={"deal_id": deal_id, "anketa": True})
-                    log.info("анкета сделки %s замечена — сверка отправлена клиенту %s",
-                             deal_id, uid_str)
-            with _state_lock:
-                fresh = load_state()
-                fresh.setdefault("form_surveyed", {})[uid_str] = deal_id
-                save_state(fresh)
+            deal = _deal_for_watch(deal_id)
+            block = anketa_block(deal)
+            if not block:
+                continue        # анкеты ещё нет — сверять нечего
+            fingerprint = _anketa_fingerprint(block)
+            fresh = load_state()
+            seen = fresh.get("anketa_seen") or {}
+            if seen.get(uid_str) == fingerprint:
+                continue        # эти данные уже сверяли
+            # Уважаем прежнюю отметку: тем, кому сверку уже отправляли ДО перехода на отпечатки,
+            # второй раз её не шлём — просто запоминаем данные. Только для тех, у кого отпечатка
+            # ещё нет: иначе правило съело бы и честное перезаполнение анкеты.
+            legacy_done = (uid_str not in seen
+                           and str((fresh.get("form_surveyed") or {}).get(uid_str)) == str(deal_id))
+            stage = str(deal.get("stage_id") or deal.get("stage") or "")
+            if legacy_done or stage not in _survey_stages():
+                _remember_anketa(uid_str, deal_id, fingerprint)
+                continue
+            # Анкета есть — этап обязан это показывать. Склейка ставит его сама, но когда дубля
+            # не было (сделку создала только форма), этап так и оставался «Связались».
+            if stage in (STAGE_NEW, STAGE_CONTACTED):
+                _move_deal_stage(deal_id, STAGE_FORM_DONE, "Клиент заполнил анкету.")
+            ok, err = send_html(to_int_safe(uid_str), as_html(block), block)
+            if not ok:
+                log.warning("сверка анкеты не доставлена %s: %s", uid_str, err[:150])
+                continue
+            journal(MANAGER_CHANNEL, uid_str, "out", block, kind="lead_chat",
+                    meta={"deal_id": deal_id, "anketa": True})
+            _remember_anketa(uid_str, deal_id, fingerprint)
+            log.info("анкета сделки %s замечена — сверка отправлена клиенту %s",
+                     deal_id, uid_str)
         except Exception:  # noqa: BLE001 — один человек не должен ронять весь проход
             log.warning("сторож анкеты: сбой на %s", uid_str, exc_info=True)
         finally:
             lock.release()
+
+
+def _remember_anketa(uid_str: str, deal_id: int, fingerprint: str) -> None:
+    """Запомнить сверенные данные анкеты этого человека."""
+    with _state_lock:
+        fresh = load_state()
+        fresh.setdefault("anketa_seen", {})[uid_str] = fingerprint
+        fresh.setdefault("form_surveyed", {})[uid_str] = deal_id   # для совместимости и отчётов
+        save_state(fresh)
 
 
 _FORM_WATCH_EVERY_TICKS = max(1, int(os.getenv("TG_FORM_WATCH_EVERY_TICKS", "3") or 3))

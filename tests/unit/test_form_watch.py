@@ -86,11 +86,12 @@ def test_funnel_new_stage_carries_the_exact_block(tg):
     assert "РОВНО это сообщение" in st["action"]
 
 
-def _wire_watch(tg, monkeypatch, deal=DEAL, spoke=False):
+def _wire_watch(tg, monkeypatch, deal=DEAL):
+    """Сторож с подменёнными внешними вызовами."""
     sent, journaled = [], []
     monkeypatch.setattr(tg, "lead_deal_for_username", lambda u: 82)
-    monkeypatch.setattr(tg, "_agent_already_spoke_on_deal", lambda d, i: spoke)
     monkeypatch.setattr(tg, "_deal_for_watch", lambda i: dict(deal))
+    monkeypatch.setattr(tg, "merge_form_duplicate", lambda u: {"merged": False})
     monkeypatch.setattr(tg, "send_html",
                         lambda uid, html, plain: sent.append((uid, plain)) or (True, ""))
     monkeypatch.setattr(tg, "journal",
@@ -99,7 +100,7 @@ def _wire_watch(tg, monkeypatch, deal=DEAL, spoke=False):
 
 
 def test_watch_starts_the_survey_without_waiting_for_a_message(tg, monkeypatch):
-    """Анкета появилась — агент пишет сверку САМ. Ровно один раз на сделку."""
+    """Анкета появилась — агент пишет сверку САМ. Ровно один раз на анкету."""
     sent, journaled = _wire_watch(tg, monkeypatch)
 
     tg._check_new_forms()
@@ -107,30 +108,63 @@ def test_watch_starts_the_survey_without_waiting_for_a_message(tg, monkeypatch):
     assert len(sent) == 1 and sent[0][0] == 555
     assert sent[0][1].startswith("Вижу анкету:") and sent[0][1].endswith("Всё верно?")
     assert journaled and journaled[0]["meta"] == {"deal_id": 82, "anketa": True}
-    assert tg.load_state()["form_surveyed"]["555"] == 82
 
     tg._check_new_forms()      # второй проход — тишина
-    assert len(sent) == 1, "одна сделка = одна сверка"
+    assert len(sent) == 1, "одна анкета = одна сверка"
 
 
-def test_new_deal_of_same_person_fires_again(tg, monkeypatch):
-    """Человек заполнил анкету повторно (новая сделка) — сторож работает снова."""
+def test_survey_fires_on_the_deal_the_agent_opened_himself(tg, monkeypatch):
+    """Регрессия 24.07.2026 (владелец: «лид заполнил анкету, а агент не прислал сверку»).
+
+    Живой случай — диалог 1451982360: агент завёл сделку 148 с первого сообщения про ИУ,
+    разговаривал по ней, затем клиент заполнил анкету; склейка перенесла поля в ТУ ЖЕ сделку и
+    поставила «Анкета заполнена». Сторож молчал по двум причинам: (1) «агент уже писал по этой
+    сделке» — теперь это всегда так; (2) этап C16:UC_ANKETA не входил в список допустимых.
+    Клиент получил сверку, только когда сам написал «Заполнил»."""
+    deal = dict(DEAL, stage_id="C16:UC_ANKETA")     # состояние после склейки
+    sent, _ = _wire_watch(tg, monkeypatch, deal=deal)
+
+    tg._check_new_forms()
+
+    assert len(sent) == 1, "сверка обязана уйти САМА, не дожидаясь сообщения клиента"
+    assert sent[0][1].startswith("Вижу анкету:")
+
+
+def test_refilled_anketa_is_surveyed_again(tg, monkeypatch):
+    """Клиент перезаполнил анкету — данные другие, значит сверяем заново."""
     sent, _ = _wire_watch(tg, monkeypatch)
-    st = tg.load_state(); st["form_surveyed"] = {"555": 77}; tg.save_state(st)
+    tg._check_new_forms()
+    assert len(sent) == 1
+
+    changed = dict(DEAL, custom_fields=dict(DEAL["custom_fields"],
+                                            UF_CRM_1784297181="9000000"))
+    monkeypatch.setattr(tg, "_deal_for_watch", lambda i: dict(changed))
+    tg._check_new_forms()
+
+    assert len(sent) == 2, "изменившаяся анкета обязана получить новую сверку"
+    assert "9 млн" in sent[1][1]
+
+
+def test_empty_anketa_is_not_surveyed(tg, monkeypatch):
+    """Сделка агента заведена, но анкеты ещё нет — сверять нечего, молчим."""
+    sent, _ = _wire_watch(tg, monkeypatch, deal={"deal_id": 82, "stage_id": "C16:NEW",
+                                                 "custom_fields": {}})
 
     tg._check_new_forms()
 
-    assert len(sent) == 1, "новая сделка (82 ≠ 77) обязана получить сверку"
+    assert sent == [], "сверка без данных анкеты — это сообщение ни о чём"
 
 
-def test_watch_is_silent_when_agent_already_talks_on_the_deal(tg, monkeypatch):
-    """Клиент написал сам раньше сторожа — разговор уже идёт, дублировать сверку нельзя."""
-    sent, _ = _wire_watch(tg, monkeypatch, spoke=True)
+def test_already_surveyed_lead_is_not_spammed_after_the_change(tg, monkeypatch):
+    """Переход на новую отметку не должен заново сверять тех, кому сверку уже отправляли."""
+    sent, _ = _wire_watch(tg, monkeypatch)
+    st = tg.load_state(); st["form_surveyed"] = {"555": 82}; tg.save_state(st)
 
     tg._check_new_forms()
 
+    assert sent == [], "старая отметка о сверке этой сделки уважается"
+    tg._check_new_forms()
     assert sent == []
-    assert tg.load_state()["form_surveyed"]["555"] == 82, "сделка запоминается без отправки"
 
 
 def test_watch_does_not_touch_deals_past_the_survey_stage(tg, monkeypatch):
@@ -141,4 +175,31 @@ def test_watch_does_not_touch_deals_past_the_survey_stage(tg, monkeypatch):
     tg._check_new_forms()
 
     assert sent == []
-    assert tg.load_state()["form_surveyed"]["555"] == 82
+
+
+def test_anketa_moves_the_deal_to_its_stage(tg, monkeypatch):
+    """Синхронность (владелец 24.07.2026): анкета пришла — этап «Анкета заполнена».
+
+    Склейка ставит этап сама, но когда дубля не было (сделку создала только форма), сделка
+    оставалась на «Связались», хотя анкета уже заполнена."""
+    moves = []
+    sent, _ = _wire_watch(tg, monkeypatch, deal=dict(DEAL, stage_id="C16:CONTACTED"))
+    monkeypatch.setattr(tg, "_move_deal_stage",
+                        lambda did, stage, note="": moves.append((did, stage)))
+
+    tg._check_new_forms()
+
+    assert moves == [(82, tg.STAGE_FORM_DONE)], "этап обязан догнать факт заполнения анкеты"
+    assert len(sent) == 1
+
+
+def test_stage_is_not_touched_when_merge_already_set_it(tg, monkeypatch):
+    """Склейка уже поставила «Анкета заполнена» — второй раз этап не двигаем."""
+    moves = []
+    _wire_watch(tg, monkeypatch, deal=dict(DEAL, stage_id="C16:UC_ANKETA"))
+    monkeypatch.setattr(tg, "_move_deal_stage",
+                        lambda did, stage, note="": moves.append((did, stage)))
+
+    tg._check_new_forms()
+
+    assert moves == []
