@@ -2638,13 +2638,32 @@ MANDATORY_AGENT_TOOLS: set[str] = {
 }
 
 
+def _agent_manifest_tool_cap(agent: dict[str, Any]) -> set[str] | None:
+    """Versioned connector cap, or ``None`` for a legacy uncapped manifest."""
+    slug = str(agent.get("slug") or "").strip()
+    if not slug:
+        return None
+    from agent_knowledge import load_manifest
+    manifest = load_manifest(slug)
+    if "tools" not in manifest:
+        return None
+    return set(manifest["tools"])
+
+
 def _agent_allowed_pool(agent: dict[str, Any]) -> set[str]:
-    """The tools an agent may be given. There is no separate access-level gate any more —
-    an agent's power is simply defined by which tools are enabled (owner asked to drop the
-    level concept, 2026-07-03). Any tool from the full registry can be enabled, including
-    dangerous admin ones (those still carry the 'admin' chip + a confirm in the UI)."""
+    """The tools an agent may be given.
+
+    A versioned manifest ``tools`` list is a hard upper bound when present. The
+    operational DB whitelist can narrow that cap, never expand it. Manifests that
+    predate the field keep the legacy full registry pool; customer-facing strict
+    agents are made fail-closed by :func:`agent_knowledge.load_manifest`.
+    """
     from mcp.context_server import TOOLS
-    return set(TOOLS)
+    pool = set(TOOLS)
+    cap = _agent_manifest_tool_cap(agent)
+    if cap is None:
+        return pool
+    return pool & cap
 
 
 def _agent_preset_default(agent: dict[str, Any]) -> set[str]:
@@ -2662,16 +2681,22 @@ def _agent_preset_default(agent: dict[str, Any]) -> set[str]:
 def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
     """Tools the agent's connector actually serves. Selection is from the FULL registry
     (legacy tier is only a creation/default preset, not an access gate), intersected with
-    the registry so stale names disappear, and the mandatory baseline is always forced on.
-    Default (never customized) = the preset chosen at creation time.
+    the registry and an optional manifest cap so stale/forbidden names disappear. The
+    mandatory baseline is forced on only inside that security cap. Default (never
+    customized) = the preset chosen at creation time.
     This is the hard gate: tools/list over the connector returns exactly this set, so a
     disabled tool is invisible and uncallable regardless of the prompt."""
     pool = _agent_allowed_pool(agent)
     fixed = MANDATORY_AGENT_TOOLS & pool
     if agent.get("tools_customized"):
         whitelist = {t for t in (agent.get("tools") or []) if t}
+        if _agent_manifest_tool_cap(agent) is not None:
+            return whitelist & pool
         return fixed | (whitelist & pool)
-    return (_agent_preset_default(agent) & pool) | fixed
+    preset = _agent_preset_default(agent) & pool
+    if _agent_manifest_tool_cap(agent) is not None:
+        return preset
+    return preset | fixed
 
 
 def _mcp_agent_auth(slug: str, path_token: str | None) -> dict[str, Any] | None:
@@ -2682,6 +2707,19 @@ def _mcp_agent_auth(slug: str, path_token: str | None) -> dict[str, Any] | None:
     if not _hmac.compare_digest(str(path_token), str(agent["mcp_token"])):
         return None
     return agent
+
+
+def _agent_self_tool_names(agent: dict[str, Any]) -> set[str]:
+    """Self-learning/automation tools visible through this agent connector.
+
+    Historically these bypassed the normal registry whitelist. A manifest tool
+    cap must cover the whole connector, so strict customer agents get none unless
+    a self-tool is named explicitly. Legacy agents retain their previous surface.
+    """
+    cap = _agent_manifest_tool_cap(agent)
+    if cap is None:
+        return set(_SELF_TOOL_SPECS)
+    return set(_SELF_TOOL_SPECS) & cap
 
 
 @app.get("/mcp-agent/<slug>/<path:path_token>")
@@ -2695,7 +2733,7 @@ def mcp_agent_info(slug: str, path_token: str | None = None):
         "endpoint": f"/mcp-agent/{slug}",
         "scope": f"персональный набор инструментов агента «{agent['name']}» + личное самообучение",
         "methods": ["initialize", "tools/list", "tools/call"],
-        "tools": sorted(_agent_tool_names(agent) | set(_SELF_TOOL_SPECS)),
+        "tools": sorted(_agent_tool_names(agent) | _agent_self_tool_names(agent)),
     })
 
 
@@ -2716,10 +2754,11 @@ def mcp_agent_http(slug: str, path_token: str | None = None):
     method = str(payload.get("method") or "")
     req_id = payload.get("id")
     tool_names = _agent_tool_names(agent)
+    self_tool_names = _agent_self_tool_names(agent)
 
     if method == "tools/call":
         tool = str(((payload.get("params") or {}).get("name")) or "")
-        if tool in _SELF_TOOL_SPECS:
+        if tool in self_tool_names:
             args = ((payload.get("params") or {}).get("arguments")) or {}
             try:
                 result = _agent_self_tool_call(agent, tool, args)
@@ -2751,7 +2790,8 @@ def mcp_agent_http(slug: str, path_token: str | None = None):
     if method == "tools/list" and isinstance(response, dict):
         tools_list = ((response.get("result") or {}).get("tools"))
         if isinstance(tools_list, list):
-            for name, spec in _SELF_TOOL_SPECS.items():
+            for name in sorted(self_tool_names):
+                spec = _SELF_TOOL_SPECS[name]
                 tools_list.append({"name": name, "description": spec["description"],
                                    "inputSchema": spec["inputSchema"]})
     from app import mcp_status_code
@@ -3066,3 +3106,7 @@ _SELF_TOOL_SPECS.update(_agent_automations.AUTOMATION_SELF_TOOL_SPECS)
 # so Bitrix's own recurring-task templates never spawn. Kill-switch: RECURRING_TASKS_SCHEDULER=0.
 import recurring_scheduler as _recurring_scheduler  # noqa: E402,F401
 import task_checkin as _task_checkin  # noqa: E402,F401  (daily 12:00 offers + dossiers)
+
+# Imports above intentionally start their background schedulers; retain explicit
+# references so standalone pyflakes validates this module without suppressions.
+_SIDE_EFFECT_MODULES = (_recurring_scheduler, _task_checkin)

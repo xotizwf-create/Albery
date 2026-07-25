@@ -105,6 +105,49 @@ def test_manifest_roundtrip(tmp_path, monkeypatch):
     assert got["skills"] == ["skill:tg-access"]
 
 
+def test_manifest_save_preserves_versioned_tool_cap(tmp_path, monkeypatch):
+    reg = tmp_path / "reg"
+    _base_registry(reg)
+    _write(
+        reg,
+        "agents/sales.yaml",
+        "slug: sales\ninstructions: []\nskills: []\n"
+        "tools:\n- get_crm_deal\n- search_company_knowledge\n",
+    )
+    k = _reload_with(reg, monkeypatch)
+
+    k.save_manifest("sales", ["Отдел / Продажи"], ["skill:tg-access"])
+
+    got = k.load_manifest("sales")
+    assert got["instructions"] == ["Отдел / Продажи"]
+    assert got["skills"] == ["skill:tg-access"]
+    assert got["tools"] == ["get_crm_deal", "search_company_knowledge"]
+
+
+def test_strict_customer_manifest_is_fail_closed(tmp_path, monkeypatch):
+    k = _reload_with(tmp_path / "empty-registry", monkeypatch)
+
+    assert k.load_manifest("albery-ai-bot") == {
+        "instructions": [],
+        "skills": [],
+        "tools": [],
+    }
+    # Legacy/internal agents keep the old DB-driven tool policy when no cap exists.
+    assert k.load_manifest("sales") == {"instructions": [], "skills": []}
+
+
+def test_strict_customer_manifest_rejects_non_list_tool_cap(tmp_path, monkeypatch):
+    reg = tmp_path / "reg"
+    _write(
+        reg,
+        "agents/albery-ai-bot.yaml",
+        "slug: albery-ai-bot\ninstructions: []\nskills: []\ntools: all\n",
+    )
+    k = _reload_with(reg, monkeypatch)
+
+    assert k.load_manifest("albery-ai-bot")["tools"] == []
+
+
 def test_allowed_instruction_paths_is_universal_plus_connected(tmp_path, monkeypatch):
     reg = tmp_path / "reg"
     _base_registry(reg)

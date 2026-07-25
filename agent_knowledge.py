@@ -233,42 +233,78 @@ def load_skill_content(skill_id: str) -> str | None:
 
 # --- per-agent manifests ---------------------------------------------------------
 # agent_knowledge/agents/<slug>.yaml lists the OPTIONAL instructions and skills an
-# agent is connected to. Universal instructions are always on regardless. This file
-# is the source of truth for the capability panel and for enforcement, so a doc an
-# agent is not connected to is neither injected nor returned by start_here.
+# agent is connected to. It may also contain a security ``tools`` upper bound:
+# the operational DB whitelist may narrow it, but can never add tools outside it.
+# Universal instructions are always on regardless. This file is the source of truth
+# for the capability panel and for enforcement, so a doc an agent is not connected
+# to is neither injected nor returned by start_here.
+
+# Customer input is untrusted. These agents must never fall back to the broad DB
+# whitelist merely because their versioned manifest is missing or malformed.
+STRICT_TOOL_MANIFEST_SLUGS: frozenset[str] = frozenset({"albery-ai-bot"})
 
 def _manifest_path(slug: str) -> Path:
     return AGENTS_DIR / f"{slug}.yaml"
 
 
+def _empty_manifest(slug: str) -> dict[str, list[str]]:
+    manifest: dict[str, list[str]] = {"instructions": [], "skills": []}
+    if slug in STRICT_TOOL_MANIFEST_SLUGS:
+        manifest["tools"] = []
+    return manifest
+
+
 def load_manifest(slug: str) -> dict[str, list[str]]:
-    """Connected instructions/skills for one agent. Missing file -> empty lists."""
+    """Connected knowledge and optional tool cap for one agent.
+
+    Legacy manifests without ``tools`` keep their DB-driven behaviour. Strict
+    customer agents are fail-closed: a missing, malformed or invalid manifest
+    means an empty tool cap, never the broad operational preset.
+    """
     path = _manifest_path(slug)
     if not path.is_file():
-        return {"instructions": [], "skills": []}
+        return _empty_manifest(slug)
     try:
         import yaml
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(data, dict):
+            raise ValueError("agent manifest root must be a mapping")
     except Exception:  # noqa: BLE001
         import logging
         logging.exception("agent_knowledge: manifest load failed for %s", slug)
-        return {"instructions": [], "skills": []}
+        return _empty_manifest(slug)
     instr = [str(x) for x in (data.get("instructions") or []) if str(x).strip()]
     skills = [str(x) for x in (data.get("skills") or []) if str(x).strip()]
-    return {"instructions": instr, "skills": skills}
+    manifest = {"instructions": instr, "skills": skills}
+    if "tools" in data:
+        raw_tools = data["tools"]
+        if not isinstance(raw_tools, list):
+            # A typo in a security cap must remove power, not restore the DB list.
+            raw_tools = []
+        manifest["tools"] = [str(x) for x in raw_tools if str(x).strip()]
+    elif slug in STRICT_TOOL_MANIFEST_SLUGS:
+        manifest["tools"] = []
+    return manifest
 
 
 def save_manifest(slug: str, instructions: list[str], skills: list[str]) -> Path:
     """Persist an agent's connected instructions/skills as a readable yaml manifest.
-    Written to the working tree; a watchdog commits+pushes it to GitHub (history)."""
+    Written to the working tree; a watchdog commits+pushes it to GitHub (history).
+
+    The capability UI edits knowledge only, so an existing security ``tools`` cap
+    must survive its round-trip unchanged.
+    """
     import yaml
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     path = _manifest_path(slug)
+    existing = load_manifest(slug)
     payload = {
         "slug": slug,
         "instructions": sorted(set(instructions)),
         "skills": sorted(set(skills)),
     }
+    if "tools" in existing:
+        payload["tools"] = sorted(set(existing["tools"]))
     path.write_text(
         yaml.safe_dump(payload, allow_unicode=True, sort_keys=False, default_flow_style=False),
         encoding="utf-8",

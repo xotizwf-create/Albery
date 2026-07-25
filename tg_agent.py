@@ -32,6 +32,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import requests
 
@@ -107,6 +108,14 @@ def owner_ids() -> set[int]:
 BOT_CHANNEL = "albery-ai-bot"
 # Оставлено как псевдоним: бизнес-переписки ведёт тот же бот, отдельным агентом они не являются.
 MANAGER_CHANNEL = BOT_CHANNEL
+
+
+def owner_toolsets() -> str:
+    """Trusted owner toolsets, structurally separate from the customer connector."""
+    for value in (os.getenv("TG_AGENT_OWNER_TOOLSETS"), os.getenv("TG_AGENT_TOOLSETS")):
+        if str(value or "").strip():
+            return str(value).strip()
+    return "albery,web"
 
 
 def owner_usernames() -> set[str]:
@@ -490,8 +499,12 @@ def channel_toolsets(channel: str) -> str | None:
     """Личный коннектор канала agent-<slug>, если он настроен в кабинете.
 
     Через него применяются набор MCP-инструментов, инструкции и знания, выбранные владельцем
-    для этого агента, — то же самое, что у субагентов Битрикса. Пока агента нет (или он
-    выключен), работает прежний общий набор из .env, чтобы бот не остался без инструментов."""
+    для этого агента, — то же самое, что у субагентов Битрикса. Если connector не найден,
+    возвращается ``None``; customer runner всё равно выбирает узкий fail-closed connector.
+
+    This helper is customer-safe by construction: it never appends broad toolsets
+    such as ``web``. Trusted owner turns use :func:`owner_toolsets` instead.
+    """
     try:
         with _db() as conn:
             with conn.cursor() as cur:
@@ -500,8 +513,7 @@ def channel_toolsets(channel: str) -> str | None:
                     return None
     except Exception:  # noqa: BLE001
         return None
-    extra = os.getenv("TG_AGENT_EXTRA_TOOLSETS", "web").strip().strip(",")
-    return f"agent-{channel},{extra}" if extra else f"agent-{channel}"
+    return f"agent-{channel}"
 
 
 def channel_role_prompt(channel: str) -> str:
@@ -573,12 +585,22 @@ def _with_instructions(prompt: str, channel: str) -> str:
 
 
 def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
-                  timeout_s: int | None = None) -> str:
-    toolsets = toolsets or os.getenv("TG_AGENT_TOOLSETS", "albery,web")
+                  timeout_s: int | None = None, max_turns: int | None = None) -> str:
+    customer_turn_budget = _customer_turn_budget(session_prefix)
+    if toolsets is None:
+        # A database/connector lookup failure must not restore the broad default
+        # for untrusted customer turns. The narrow connector may fail visibly,
+        # but the customer can never inherit ``albery,web``.
+        toolsets = (f"agent-{MANAGER_CHANNEL}" if customer_turn_budget is not None
+                    else os.getenv("TG_AGENT_TOOLSETS", "albery,web"))
     timeout_s = timeout_s or int(os.getenv("TG_AGENT_HERMES_TIMEOUT", "420"))
     # Fresh session per run (hermes >=0.17 resumes --continue sessions; memory is prompt-injected)
     run_session = f"{session_prefix}-r{uuid.uuid4().hex[:8]}"
     cmd = ["hermes", "-z", prompt, "--continue", run_session, "-t", toolsets, "--yolo"]
+    if max_turns is None:
+        max_turns = customer_turn_budget
+    if max_turns is not None:
+        cmd.extend(["--max-turns", str(max(1, int(max_turns)))])
     # Раньше здесь был ОДИН замок на всю службу: пока агент думал над одним клиентом (а ход
     # занимает десятки секунд), все остальные стояли в очереди. При потоке лидов десятый ждал
     # бы минуты. Теперь параллельно идут несколько ходов; предел держим осознанно — на боксе
@@ -595,6 +617,24 @@ def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
         raise RuntimeError(f"hermes turn failed rc={proc.returncode}: "
                            f"{(answer or proc.stderr or '')[:300]}")
     return answer
+
+
+_CUSTOMER_MAX_TURNS = max(1, min(int(os.getenv("TG_CUSTOMER_MAX_TURNS", "6") or 6), 12))
+
+
+def _customer_turn_budget(session_prefix: str) -> int | None:
+    return _CUSTOMER_MAX_TURNS if str(session_prefix).startswith(
+        ("tg-new-", "tg-biz-", "answering-")
+    ) else None
+
+
+def customer_hermes_answer(prompt: str, session_prefix: str, *,
+                           timeout_s: int | None = None) -> str:
+    """One untrusted customer turn with a narrow connector and a bounded tool loop."""
+    kwargs = {"toolsets": channel_toolsets(MANAGER_CHANNEL)}
+    if timeout_s is not None:
+        kwargs["timeout_s"] = timeout_s
+    return hermes_answer(prompt, session_prefix, **kwargs)
 
 
 def _history(chat_id) -> list[list[str]]:
@@ -621,9 +661,10 @@ def owner_turn(chat_id, user_text: str) -> str:
         convo = "\n".join(f"Владелец: {q}\nАссистент: {a}" for q, a in hist)
         parts.append("История диалога (помни её):\n" + convo)
     parts.append("Сообщение владельца:\n" + user_text)
-    # Инструменты, инструкции и знания — из карточки этого агента в кабинете.
-    answer = hermes_answer("\n\n".join(parts), f"tg-{chat_id}",
-                           toolsets=channel_toolsets(BOT_CHANNEL))
+    # Клиенты и владелец используют один Telegram-бот, но разные trust boundaries:
+    # customer connector fail-closed, owner toolsets — доверенный внутренний контур.
+    answer = hermes_answer("\n\n".join(parts), f"tg-owner-{chat_id}",
+                           toolsets=owner_toolsets())
     _remember(chat_id, user_text, answer)
     return answer
 
@@ -2580,9 +2621,9 @@ def escalate_to_human(author: dict, question: str, client_text: str,
     # Оформление — по стандарту компании: блоки через пустую строку, заголовки [b]…[/b].
     # Клиент в этот момент СИДИТ БЕЗ ОТВЕТА, поэтому карточка начинается со срочности: сотрудник
     # должен понять это с первой строки, а не вычитать из середины.
-    card = ((f"[b]Клиенту отвечено по существу, но нужна конкретика от вас[/b]\n"
+    card = (("[b]Клиенту отвечено по существу, но нужна конкретика от вас[/b]\n"
              if answered else
-             f"[b]⚠️ Клиент ждёт ответа — ему пока НИЧЕГО не отвечено[/b]\n")
+             "[b]⚠️ Клиент ждёт ответа — ему пока НИЧЕГО не отвечено[/b]\n")
             + f"\n"
             f"Пользователь задал вопрос: «{client_text[:600]}»\n"
             f"Что мне на него ответить?\n"
