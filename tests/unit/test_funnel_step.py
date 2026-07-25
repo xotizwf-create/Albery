@@ -178,3 +178,14 @@ def test_unknown_stage_never_leaves_the_agent_without_instructions():
     assert st["need"] != "—", "агент обязан знать, чего ждёт от клиента"
     assert "вопрос" in st["action"].lower(), "минимум — ответить и спросить про вопросы"
     assert "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ" in st["action"], "не понимает — зовёт людей, а не молчит"
+
+
+def test_connected_client_gets_support_not_silence():
+    """Найдено страницей воронки в кабинете (25.07.2026): у этапа «Подключён» не было шага, и
+    агент работал по запасному сценарию. Клиент уже платит — бросать его нельзя."""
+    st = funnel_next_step(_deal("C16:CONNECTED"))
+
+    assert st["step"] == "Подключён — сопровождение"
+    assert "ничего не продавай" in st["action"]
+    assert "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ" in st["action"], "чего нет в базе — к живым людям"
+    assert "Стадию не двигай" in st["action"]

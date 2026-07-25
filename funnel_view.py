@@ -47,7 +47,9 @@ def _steps_by_stage() -> dict[str, dict]:
 
     out: dict[str, dict] = {}
     for stage_id, _title, _trigger in CHAIN:
-        deal = {"deal_id": 0, "stage_id": stage_id, "custom_fields": {}}
+        # Номер сделки в тексте шага — заглушка: страница показывает шаг ЭТАПА, а не конкретной
+        # сделки. Без заглушки в текст подставлялось «сделку None».
+        deal = {"deal_id": "<номер сделки>", "stage_id": stage_id, "custom_fields": {}}
         try:
             step = tg_agent.funnel_next_step(deal)
         except Exception:  # noqa: BLE001 — страница не должна падать из-за одного этапа
