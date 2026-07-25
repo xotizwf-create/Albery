@@ -37,6 +37,7 @@ import requests
 
 import answering           # разбор вопросов клиента и ответы строго по источникам
 import client_message      # единственная сборка сообщений, которые отправляет код
+import decision_log        # трасса решений: что решили, по какому правилу и на каких фактах
 import funnel_rules        # правила воронки как данные: факты → решение + его причина
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -1642,6 +1643,7 @@ def _check_new_forms() -> None:
             block, fingerprint = facts.anketa, facts.anketa_fingerprint
             if decision.action != funnel_rules.SEND_SURVEY:
                 log.debug("сторож анкеты %s: %s", uid_str, funnel_rules.explain(decision))
+                decision_log.record(_db, decision, slot="watch", outcome="ничего не отправлено")
                 if block:
                     # Данные есть, но сверять их не надо (уже сверяли / сделка ушла дальше) —
                     # запоминаем, чтобы не возвращаться к ним каждый проход.
@@ -1664,6 +1666,7 @@ def _check_new_forms() -> None:
             journal(MANAGER_CHANNEL, uid_str, "out", block, kind="lead_chat",
                     meta={"deal_id": deal_id, "anketa": True})
             _remember_anketa(uid_str, deal_id, fingerprint)
+            decision_log.record(_db, decision, slot="watch", outcome="сверка анкеты отправлена")
             log.info("анкета сделки %s замечена — сверка отправлена клиенту %s",
                      deal_id, uid_str)
         except Exception:  # noqa: BLE001 — один человек не должен ронять весь проход
@@ -2577,6 +2580,7 @@ def reply_to_stranger(author: dict, texts: list[str] | str) -> bool:
         if entry.action == funnel_rules.OPEN_DEAL else None
     if new_deal:
         log.info("незнакомец %s: %s", author_id, funnel_rules.explain(entry))
+        decision_log.record(_db, entry, slot="message", outcome=f"заведена сделка {new_deal}")
     # Роль из карточки ЗАМЕНЯЕТ встроенный сценарий, а не дополняет его. Склейка давала
     # противоречивый промпт: роль велит сперва проверить воронку, а встроенный текст — сразу
     # слать анкету. Агент шёл по встроенному, и владелец получал «после обработки анкеты
@@ -2891,12 +2895,21 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
             # Сначала пробуем ответить по источникам; получилось — людям уходит только то,
             # чего в источниках нет. Не получилось ничего — обычная передача людям.
             if _answer_from_sources(author, text, deal_id):
+                decision_log.record(_db, decision, slot="message",
+                                    outcome="ответ по источникам, нерешённое — людям")
                 return
             _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
+            decision_log.record(_db, decision, slot="message",
+                                outcome="ответить было нечем — вопрос ушёл людям")
             return
         if decision.action == funnel_rules.TERMS_TO_HUMANS:
             _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
+            decision_log.record(_db, decision, slot="message", outcome="вопрос ушёл людям")
             return
+        decision_log.record(_db, decision, slot="message",
+                            outcome=("условия отправлены дословно"
+                                     if decision.action == funnel_rules.SEND_TERMS
+                                     else "разговор продолжен по шагу воронки"))
         if decision.action == funnel_rules.CONTINUE_STEP:
             # Человек ничего не спросил — просто подтвердил анкету. Маркер сработал вхолостую:
             # людей не дёргаем и в тупик не встаём, а ведём разговор дальше по шагу воронки.

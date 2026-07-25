@@ -7608,6 +7608,41 @@ def tool_get_telegram_dialog(args: dict[str, Any]) -> dict[str, Any]:
                      "согласия, уточнения), уже есть здесь — не проси их повторно.")}
 
 
+def tool_get_agent_decisions(args: dict[str, Any]) -> dict[str, Any]:
+    """Трасса решений агента воронки: что решил, по какому правилу и на каких фактах.
+
+    Владелец 25.07.2026: «нужно аккуратно отслеживать логику». Разбор жалобы «агент тупит»
+    начинается отсюда, а не с чтения кода."""
+    limit = min(int(args.get("limit") or 20), 100)
+    who = str(args.get("telegram_id") or args.get("dialog_id") or "").strip().lstrip("@")
+    sql = ("SELECT created_at, dialog_id, deal_id, slot, rule, action, origin, facts, outcome"
+           " FROM agent_decisions")
+    params: list[Any] = []
+    if who.isdigit():
+        sql += " WHERE dialog_id = %s"
+        params.append(int(who))
+    sql += " ORDER BY id DESC LIMIT %s"
+    params.append(limit)
+    with pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = list(cur.fetchall())[::-1]
+    return {"count": len(rows), "client": who or "все диалоги", "decisions": [{
+        "at": str(r["created_at"])[:19],
+        "клиент": r["dialog_id"],
+        "сделка": r["deal_id"],
+        "слой": "ход по сообщению" if r["slot"] == "message" else "сторож анкеты",
+        "правило": r["rule"],
+        "решение": r["action"],
+        "почему правило существует": r["origin"],
+        "факты": r["facts"],
+        "что вышло": r["outcome"],
+    } for r in rows], "note": ("Каждая строка — одно решение агента. «Правило» и «почему» взяты из "
+                              "реестра funnel_rules: по ним видно, ПОЧЕМУ агент поступил так, а не "
+                              "иначе. Если решение выглядит неверным — менять надо правило, а не "
+                              "уговаривать модель.")}
+
+
 def tool_send_telegram_message(args: dict[str, Any]) -> dict[str, Any]:
     """Написать человеку в Telegram ОТ ЛИЦА аккаунта компании."""
     who = str(args.get("to") or args.get("username") or args.get("user_id") or "").strip()
@@ -9117,6 +9152,23 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_get_telegram_dialog,
+    },
+    "get_agent_decisions": {
+        "description": (
+            "ТРАССА РЕШЕНИЙ агента воронки: что он решил, по какому правилу реестра, на каких "
+            "фактах и что из этого вышло. С этого начинается разбор любой жалобы вида «агент "
+            "тупит»/«почему он так ответил» — вместо догадок. Можно по конкретному клиенту "
+            "(telegram_id) или последние решения по всем диалогам."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "telegram_id": {"type": "string", "description": "Числовой id клиента (необязательно)."},
+                "limit": {"type": "integer", "description": "Сколько последних решений (до 100)."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_get_agent_decisions,
     },
     "send_telegram_message": {
         "description": (
