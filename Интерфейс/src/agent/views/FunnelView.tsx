@@ -496,7 +496,7 @@ export function FunnelView() {
             Условия и приоритеты живут в коде и закрыты тестами — здесь только чтение. Менять
             формулировки можно выше, в сценарии этапов.
           </p>
-          {Object.entries(bySlot).map(([slot, slotRules]) => (
+          {(Object.entries(bySlot) as Array<[string, Rule[]]>).map(([slot, slotRules]) => (
             <div key={slot} className="mb-5 last:mb-0">
               <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-400">
                 {slot}
