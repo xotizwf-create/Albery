@@ -341,3 +341,77 @@ def test_person_who_only_filled_the_form_is_greeted(funnel):
         "первое сообщение человеку — с приветствием и по имени"
     assert "Вижу анкету:" in chat.messages[0], "и с самой сверкой, слово в слово"
     assert chat.messages[0].rstrip().endswith("Всё верно?")
+
+
+# --- путь до денег: реквизиты → договор → подписание → счёт → подключение --------------------
+
+def test_money_path_never_loses_the_next_step(funnel):
+    """Владелец 25.07.2026: логика уже в бою, значит путь до денег обязан быть под тестом.
+
+    Проверяем не отдельные шаги, а ЦЕПОЧКУ: на каждом этапе агент знает, чего ждёт и что делает,
+    называет конкретное действие или инструмент, и нигде не сваливается в запасной сценарий.
+    Считается настоящим funnel_next_step — тем же, что уходит агенту в промпт."""
+    tg = funnel.tg
+    R, N, S = tg.CONTRACT_REQUISITES_FIELD, tg.CONTRACT_NUMBER_FIELD, tg.SIGNING_FIELD
+
+    # (этап, что уже собрано в сделке, что обязано прозвучать в шаге)
+    path = [
+        ("C16:S84294149", {}, "send_terms"),                       # условия ещё не отправляли
+        ("C16:S84294149", {R: "ИНН 7704123456, ООО «Ромашка»"}, "send_contract"),
+        ("C16:NDA", {R: "ИНН 7704123456", N: "25.07.2026"}, "create_bitrix_task"),
+        ("C16:UC_SGZRVS", {R: "ИНН", N: "25.07.2026"}, "notify_client_when_task_done"),
+        ("C16:PREPAYMENT_INVOIC", {R: "ИНН", N: "25.07.2026"}, "бухгалтер"),
+        ("C16:EXECUTING", {R: "ИНН", N: "25.07.2026"}, "C16:S84294150"),
+        ("C16:UC_YA6VN0", {R: "ИНН", N: "25.07.2026"}, "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ"),
+        ("C16:S84294150", {R: "ИНН", N: "25.07.2026"}, "C16:CONNECTED"),
+        ("C16:CONNECTED", {R: "ИНН", N: "25.07.2026"}, "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ"),
+    ]
+
+    for stage, fields, expected in path:
+        step = tg.funnel_next_step({"deal_id": 200, "stage_id": stage, "custom_fields": fields})
+
+        assert "шаг не описан" not in step["step"], f"{stage}: этап без шага — это тупик"
+        assert step["need"] and step["need"] != "—", f"{stage}: агент не знает, чего ждёт"
+        assert expected in step["action"], (
+            f"{stage}: в шаге нет «{expected}» — действие потеряно. Шаг: {step['action'][:120]}")
+
+
+def test_payment_is_never_confirmed_by_the_client_alone(funnel):
+    """Деньги подтверждает бухгалтер. «Я оплатил» — не деньги на счету, и стадию это не двигает."""
+    tg = funnel.tg
+    step = tg.funnel_next_step({"deal_id": 200, "stage_id": "C16:PREPAYMENT_INVOIC",
+                                "custom_fields": {}})
+
+    assert "не деньги на счету" in step["action"]
+    assert "бухгалтер" in step["need"].lower()
+
+
+def test_contract_step_demands_requisites_first(funnel):
+    """Договор не собирается из воздуха: сначала реквизиты, и агент об этом сказан прямо."""
+    tg = funnel.tg
+    without = tg.funnel_next_step({"deal_id": 200, "stage_id": "C16:S84294149",
+                                   "custom_fields": {}}, terms_sent_to_client=True)
+
+    assert "реквизит" in without["action"].lower(), "агент обязан сначала попросить реквизиты"
+
+    with_req = tg.funnel_next_step({"deal_id": 200, "stage_id": "C16:S84294149",
+                                    "custom_fields": {tg.CONTRACT_REQUISITES_FIELD: "ИНН"}})
+    assert "send_contract" in with_req["action"], "реквизиты есть — собираем договор"
+
+
+def test_every_live_stage_of_the_funnel_has_a_step(funnel):
+    """Инвариант охвата: ни один этап живой воронки не оставляет агента без инструкций.
+
+    Список этапов — тот же, что в Битриксе на 25.07.2026. Добавили этап в CRM и не описали шаг —
+    падает здесь, а не у клиента."""
+    tg = funnel.tg
+    stages = ("C16:NEW", "C16:CONTACTED", "C16:UC_ANKETA", "C16:S84294149", "C16:NDA",
+              "C16:UC_SGZRVS", "C16:PREPAYMENT_INVOIC", "C16:EXECUTING", "C16:UC_YA6VN0",
+              "C16:S84294150", "C16:CONNECTED")
+    fallback = []
+    for stage in stages:
+        step = tg.funnel_next_step({"deal_id": 200, "stage_id": stage, "custom_fields": {}})
+        if "шаг не описан" in step["step"]:
+            fallback.append(stage)
+
+    assert fallback == [], f"этапы без шага: {fallback}"
