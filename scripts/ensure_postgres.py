@@ -51,8 +51,6 @@ ALWAYS_APPLY_MIGRATIONS = [
     "054_wb_sync_state_v2.sql",
     "055_wb_async_reports.sql",
     "056_wb_finance_pagination.sql",
-    # Idempotent: system_key on kind='system' automation rows (executor mapping).
-    "057_system_automation_keys.sql",
     "059_interaction_error_resolution.sql",
     "022_chats_personal_dialog_types.sql",
     "024_chat_report_hot_path_indexes.sql",
@@ -73,6 +71,9 @@ ALWAYS_APPLY_MIGRATIONS = [
     "040_agent_position.sql",
     # Idempotent: per-agent scheduled automations + seed of the legacy Hermes crons.
     "041_agent_automations.sql",
+    # Depends on agent_automations created by 041; keep it after that migration
+    # so a fresh CI/production database can bootstrap from zero.
+    "057_system_automation_keys.sql",
     # Idempotent: agent_slug on bitrix_error_reports (per-agent monitoring feed).
     "042_error_report_agent.sql",
     # Idempotent: durable in-flight turn registry (restart/crash recovery net).
