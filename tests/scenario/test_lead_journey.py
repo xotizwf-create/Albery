@@ -407,7 +407,8 @@ def test_every_live_stage_of_the_funnel_has_a_step(funnel):
     tg = funnel.tg
     stages = ("C16:NEW", "C16:CONTACTED", "C16:UC_ANKETA", "C16:S84294149", "C16:NDA",
               "C16:UC_SGZRVS", "C16:PREPAYMENT_INVOIC", "C16:EXECUTING", "C16:UC_YA6VN0",
-              "C16:S84294150", "C16:CONNECTED")
+              "C16:S84294150", "C16:CONNECTED", "C16:WON", "C16:NOT_FIT", "C16:LOSE",
+              "C16:APOLOGY")
     fallback = []
     for stage in stages:
         step = tg.funnel_next_step({"deal_id": 200, "stage_id": stage, "custom_fields": {}})
@@ -415,3 +416,21 @@ def test_every_live_stage_of_the_funnel_has_a_step(funnel):
             fallback.append(stage)
 
     assert fallback == [], f"этапы без шага: {fallback}"
+
+
+def test_closed_deals_are_not_pushed_further(funnel):
+    """Клиент отказался — агент не дожимает. Это про репутацию: навязчивость дороже сделки.
+
+    Все четыре закрывающих этапа работали по запасному сценарию до 25.07.2026."""
+    tg = funnel.tg
+    for stage in ("C16:NOT_FIT", "C16:LOSE"):
+        step = tg.funnel_next_step({"deal_id": 200, "stage_id": stage, "custom_fields": {}})
+        assert "НЕ дожимай" in step["action"], stage
+        assert "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ" in step["action"], f"{stage}: вернуть в работу решают люди"
+
+    won = tg.funnel_next_step({"deal_id": 200, "stage_id": "C16:WON", "custom_fields": {}})
+    assert "ничего не продавай" in won["action"]
+
+    apology = tg.funnel_next_step({"deal_id": 200, "stage_id": "C16:APOLOGY",
+                                   "custom_fields": {}})
+    assert "по своей инициативе не пишем" in apology["action"]
