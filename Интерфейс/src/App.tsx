@@ -327,7 +327,7 @@ const HIDDEN_MAIN_MENU_LABELS = new Set(["Бухгалтерия", "Склад",
 const VISIBLE_MENU_ITEMS = MENU_ITEMS.filter((item) => !HIDDEN_MAIN_MENU_LABELS.has(item.label));
 const AGENT_MENU_ITEMS = [
   { label: "Диалоги", icon: MessageSquare },
-  { label: "Воронка ИУ", icon: GitBranch },
+  { label: "Работа с воронками", icon: GitBranch },
   { label: "Агенты", icon: Bot },
   { label: "База знаний", icon: BookOpen },
   { label: "Мониторинг", icon: Activity },
@@ -338,7 +338,7 @@ const AGENT_MENU_ITEMS = [
 const AGENT_TAB_ROUTES: Record<string, string> = {
   "Агенты": "/agent",
   "Диалоги": "/agent-dialogs",
-  "Воронка ИУ": "/agent-funnel",
+  "Работа с воронками": "/agent-funnels",
   "База знаний": "/agent-knowledge",
   "Мониторинг": "/agent-monitoring",
   "Использование": "/agent-usage",
@@ -6268,7 +6268,7 @@ export default function App() {
       );
     }
 
-    if (activeTab === "Воронка ИУ") {
+    if (activeTab === "Работа с воронками") {
       return (
         <div className="animate-in fade-in duration-200">
           <FunnelView />

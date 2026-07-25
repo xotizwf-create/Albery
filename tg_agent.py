@@ -39,6 +39,7 @@ import answering           # разбор вопросов клиента и о�
 import client_message      # единственная сборка сообщений, которые отправляет код
 import decision_log        # трасса решений: что решили, по какому правилу и на каких фактах
 import funnel_rules        # правила воронки как данные: факты → решение + его причина
+import funnel_scenario     # настроенный владельцем сценарий воронки (кабинет)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -1323,6 +1324,13 @@ def funnel_step_block(deal_id: int, telegram_id=None) -> str:
         return ""
     st = funnel_next_step(deal, terms_sent_to_client=bool(
         telegram_id and _terms_already_sent(telegram_id)))
+    # Владелец мог настроить текст шага в кабинете («Работа с воронками») — он главнее кода:
+    # формулировки для своих клиентов он знает лучше. Условия правил при этом не меняются.
+    stage = str(deal.get("stage_id") or deal.get("stage") or "")
+    custom = funnel_scenario.step_override(_db, stage)
+    if custom:
+        st = {**st, **custom}
+        log.debug("шаг этапа %s взят из настроек кабинета", stage)
     return ("ТЕКУЩИЙ ШАГ ВОРОНКИ (считан из сделки прямо сейчас — это важнее твоей памяти о "
             f"разговоре):\n"
             f"- этап: {st['step']}\n"
@@ -2804,6 +2812,13 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
         return  # phase 2: только личные переписки
     conn_id = last.get("business_connection_id") or ""
     if not conn_id:
+        return
+
+    # Выключатель воронки из кабинета («Работа с воронками»): владелец должен иметь возможность
+    # остановить агента сам, не дожидаясь инженера. Выключен — молчим совсем, разговор ведут люди.
+    if not funnel_scenario.agent_enabled(_db, CRM_LEAD_CATEGORY_ID):
+        log.info("агент на воронке %s выключен в кабинете — %s отвечают люди",
+                 CRM_LEAD_CATEGORY_ID, author_id)
         return
 
     # Отвечаем ТОЛЬКО лидам воронки. Аккаунт живой: поставщикам и знакомым агент писать не

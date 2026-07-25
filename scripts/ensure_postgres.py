@@ -27,6 +27,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "bitrix_task_events": "018_bitrix_task_events.sql",
     "funnel_task_watch": "063_funnel_task_watch.sql",
     "agent_decisions": "064_agent_decisions.sql",
+    "funnel_scenarios": "065_funnel_scenarios.sql",
     "zoom_recording_events": "019_zoom_recording_events.sql",
     "owner_recommendation_events": "020_recommendation_feedback_events.sql",
     "company_drive_folders": "021_company_drive_folders.sql",

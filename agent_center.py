@@ -52,6 +52,8 @@ _MESSAGES_LIMIT_DEFAULT = 200
 @app.get("/agent-knowledge")
 @app.get("/agent-monitoring")
 @app.get("/agent-usage")
+@app.get("/agent-funnels")
+@app.get("/agent-funnels/<path:sub>")
 def agent_center_spa(sub: str = ""):
     from app import index
     return index()
