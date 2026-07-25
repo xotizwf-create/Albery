@@ -56,7 +56,7 @@ def test_owner_turn_uses_distinct_trusted_connector(monkeypatch):
     assert seen["session_prefix"] == "tg-owner-7"
 
 
-def test_customer_turn_has_bounded_tool_iterations(monkeypatch):
+def test_customer_turn_has_fail_closed_session_classification(monkeypatch):
     seen = {}
 
     def fake(prompt, session_prefix, toolsets=None, timeout_s=None):
@@ -69,14 +69,13 @@ def test_customer_turn_has_bounded_tool_iterations(monkeypatch):
 
     monkeypatch.setattr(tg, "hermes_answer", fake)
     monkeypatch.setattr(tg, "channel_toolsets", lambda _channel: "agent-albery-ai-bot")
-    monkeypatch.setattr(tg, "_CUSTOMER_MAX_TURNS", 6)
 
     assert tg.customer_hermes_answer("hello", "tg-biz-1") == "ok"
     assert seen["toolsets"] == "agent-albery-ai-bot"
-    assert tg._customer_turn_budget("tg-biz-1") == 6
-    assert tg._customer_turn_budget("tg-new-1") == 6
-    assert tg._customer_turn_budget("answering-1") == 6
-    assert tg._customer_turn_budget("tg-owner-1") is None
+    assert tg._is_customer_session("tg-biz-1") is True
+    assert tg._is_customer_session("tg-new-1") is True
+    assert tg._is_customer_session("answering-1") is True
+    assert tg._is_customer_session("tg-owner-1") is False
 
 
 def test_customer_turn_fails_closed_when_connector_lookup_returns_none(monkeypatch):
@@ -93,4 +92,4 @@ def test_customer_turn_fails_closed_when_connector_lookup_returns_none(monkeypat
     command = seen["command"]
     assert command[command.index("-t") + 1] == f"agent-{tg.MANAGER_CHANNEL}"
     assert "web" not in command
-    assert command[command.index("--max-turns") + 1] == "6"
+    assert "--max-turns" not in command

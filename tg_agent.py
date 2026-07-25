@@ -585,22 +585,21 @@ def _with_instructions(prompt: str, channel: str) -> str:
 
 
 def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
-                  timeout_s: int | None = None, max_turns: int | None = None) -> str:
-    customer_turn_budget = _customer_turn_budget(session_prefix)
+                  timeout_s: int | None = None) -> str:
+    customer_turn = _is_customer_session(session_prefix)
     if toolsets is None:
         # A database/connector lookup failure must not restore the broad default
         # for untrusted customer turns. The narrow connector may fail visibly,
         # but the customer can never inherit ``albery,web``.
-        toolsets = (f"agent-{MANAGER_CHANNEL}" if customer_turn_budget is not None
+        toolsets = (f"agent-{MANAGER_CHANNEL}" if customer_turn
                     else os.getenv("TG_AGENT_TOOLSETS", "albery,web"))
     timeout_s = timeout_s or int(os.getenv("TG_AGENT_HERMES_TIMEOUT", "420"))
     # Fresh session per run (hermes >=0.17 resumes --continue sessions; memory is prompt-injected)
     run_session = f"{session_prefix}-r{uuid.uuid4().hex[:8]}"
     cmd = ["hermes", "-z", prompt, "--continue", run_session, "-t", toolsets, "--yolo"]
-    if max_turns is None:
-        max_turns = customer_turn_budget
-    if max_turns is not None:
-        cmd.extend(["--max-turns", str(max(1, int(max_turns)))])
+    # Hermes v0.17 top-level oneshot (``-z``) does not accept ``--max-turns``.
+    # Customer connectors have zero tools at P0, so a tool loop is structurally
+    # impossible without passing an unsupported flag that would kill every turn.
     # Раньше здесь был ОДИН замок на всю службу: пока агент думал над одним клиентом (а ход
     # занимает десятки секунд), все остальные стояли в очереди. При потоке лидов десятый ждал
     # бы минуты. Теперь параллельно идут несколько ходов; предел держим осознанно — на боксе
@@ -619,18 +618,15 @@ def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
     return answer
 
 
-_CUSTOMER_MAX_TURNS = max(1, min(int(os.getenv("TG_CUSTOMER_MAX_TURNS", "6") or 6), 12))
-
-
-def _customer_turn_budget(session_prefix: str) -> int | None:
-    return _CUSTOMER_MAX_TURNS if str(session_prefix).startswith(
+def _is_customer_session(session_prefix: str) -> bool:
+    return str(session_prefix).startswith(
         ("tg-new-", "tg-biz-", "answering-")
-    ) else None
+    )
 
 
 def customer_hermes_answer(prompt: str, session_prefix: str, *,
                            timeout_s: int | None = None) -> str:
-    """One untrusted customer turn with a narrow connector and a bounded tool loop."""
+    """One untrusted customer turn through the zero-tool fail-closed connector."""
     kwargs = {"toolsets": channel_toolsets(MANAGER_CHANNEL)}
     if timeout_s is not None:
         kwargs["timeout_s"] = timeout_s
