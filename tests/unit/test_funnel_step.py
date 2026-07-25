@@ -15,22 +15,26 @@ def _deal(stage, **uf):
     return {"id": 86, "stage": stage, "custom_fields": uf}
 
 
-def test_confirmed_form_leads_to_terms():
-    """С 23.07.2026 между сверкой анкеты и реквизитами стоит отправка условий."""
+def test_first_contact_leads_to_terms():
+    """С 25.07.2026 условия идут ПЕРВЫМ шагом, до анкеты (решение владельца).
+
+    Было наоборот: на первом контакте отправлялась сверка анкеты, а условия — только после
+    её подтверждения. Порядок переставлен, потому что во всех живых диалогах первый вопрос
+    клиента — про условия."""
     st = funnel_next_step(_deal("C16:CONTACTED"))
 
-    assert "C16:S84294149" in st["action"]
+    assert st["step"] == "Ответ и условия"
     assert "send_terms" in st["action"]
 
 
-def test_requisites_are_asked_after_the_terms_are_discussed(monkeypatch):
-    """Реквизиты идут после условий и ответов на вопросы, а не сразу после анкеты."""
+def test_requisites_are_asked_after_the_form_is_verified(monkeypatch):
+    """Реквизиты идут после анкеты: вопросы по условиям разобраны ещё до неё."""
     import tg_agent
 
     monkeypatch.setattr(tg_agent, "TERMS_SENT_FIELD", "UF_CRM_TERMS")
     st = funnel_next_step(_deal("C16:S84294149", **{"UF_CRM_TERMS": "2026-07-23"}))
 
-    assert st["step"] == "Вопросы по условиям"
+    assert st["step"] == "Сбор реквизитов"
     assert "реквизиты" in st["action"].lower()
     assert "send_contract" in st["action"], "как придут — сразу собрать договор"
 
@@ -151,13 +155,14 @@ def test_anketa_stage_has_a_real_step():
     assert "148" in st["action"], "в шаге есть конкретное действие со сделкой"
 
 
-def test_after_anketa_with_terms_already_sent_agent_asks_about_questions():
-    """Условия человек получил ещё до анкеты (так было у Александра). Значит после подтверждения
-    анкеты менеджер спрашивает про вопросы по условиям, а не шлёт их заново."""
+def test_after_anketa_with_terms_already_sent_the_deal_moves_on_without_resending():
+    """С новым порядком условия человек читает ДО анкеты — значит к моменту сверки они у него
+    всегда есть. Сверив данные, агент двигает сделку дальше и второй раз документ не шлёт.
+    Оставшиеся вопросы разбирает следующий шаг («Сбор реквизитов» начинается именно с них)."""
     st = funnel_next_step(ANKETA_DEAL, terms_sent_to_client=True)
 
-    assert "вопрос" in st["action"].lower(), "спросить про вопросы по условиям"
-    assert "C16:S84294149" in st["action"], "и перевести сделку на согласование условий"
+    assert st["step"] == "Сверка анкеты"
+    assert "C16:S84294149" in st["action"], "перевести сделку на согласование условий"
     assert "send_terms" not in st["action"], "второй раз условия не отправляем"
 
 

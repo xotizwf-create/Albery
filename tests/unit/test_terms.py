@@ -222,14 +222,15 @@ def test_terms_step_forbids_retelling(tg):
     assert "своими словами" in st["action"].lower()
 
 
-def test_after_terms_the_agent_answers_questions_and_then_asks_requisites(tg, monkeypatch):
+def test_on_the_terms_stage_questions_are_answered_before_requisites(tg, monkeypatch):
+    """С 25.07.2026 вопросы по условиям разбираются до анкеты, а на этап согласования сделка
+    приходит уже готовой к реквизитам. Отвечать на оставшиеся вопросы агент обязан и здесь."""
     monkeypatch.setattr(tg, "TERMS_SENT_FIELD", "UF_CRM_TERMS")
     st = tg.funnel_next_step({"deal_id": 86, "stage_id": "C16:S84294149",
                               "custom_fields": {"UF_CRM_TERMS": "2026-07-23"}})
 
-    assert st["step"] == "Вопросы по условиям"
+    assert st["step"] == "Сбор реквизитов"
     assert "search_company_knowledge" in st["action"]
-    assert "помня весь разговор" in st["action"], "контекст предыдущих шагов не теряется"
     assert "реквизиты" in st["action"].lower(), "следующий шаг назван прямо"
 
 
