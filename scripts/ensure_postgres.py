@@ -51,7 +51,6 @@ ALWAYS_APPLY_MIGRATIONS = [
     "054_wb_sync_state_v2.sql",
     "055_wb_async_reports.sql",
     "056_wb_finance_pagination.sql",
-    "059_interaction_error_resolution.sql",
     "022_chats_personal_dialog_types.sql",
     "024_chat_report_hot_path_indexes.sql",
     "025_mcp_search_indexes.sql",
@@ -62,6 +61,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Fully idempotent (IF NOT EXISTS everywhere) — covers both the subagent
     # tables and the agent_slug column on bitrix_bot_interactions.
     "037_agents.sql",
+    # Depends on agent_slug added to bitrix_bot_interactions by 037.
+    "059_interaction_error_resolution.sql",
     # Idempotent: per-agent tool/instruction/skill config (tools_customized flag
     # + agent_knowledge_links link table).
     "038_agent_config.sql",
