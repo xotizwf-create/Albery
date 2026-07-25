@@ -114,3 +114,43 @@ def test_migration_is_registered_so_prod_gets_the_table():
     assert (root / "database/migrations/064_agent_decisions.sql").exists()
     runner = (root / "scripts/ensure_postgres.py").read_text(encoding="utf-8")
     assert '"agent_decisions": "064_agent_decisions.sql"' in runner
+
+
+def test_same_decision_is_not_written_again():
+    """25.07.2026: сторож писал одинаковое «ничего не отправлять» каждую минуту — за сутки 708
+    записей по двум диалогам, и лента решений в кабинете стала бесполезной."""
+    decision_log._last.clear()
+    sink = []
+    decision = fr.decide(fr.Facts(uid=42, deal_id=120, stage="C16:S84294149",
+                                  anketa="Вижу анкету: …", anketa_fingerprint="a"), slot="watch")
+
+    for _ in range(5):
+        decision_log.record(fake_db(sink), decision, slot="watch", outcome="ничего не отправлено")
+
+    assert len(sink) == 1, "повтор того же решения в трассу не пишем"
+
+
+def test_changed_decision_is_written():
+    """А вот изменение решения по тому же человеку — это событие, его писать обязательно."""
+    decision_log._last.clear()
+    sink = []
+    silent = fr.decide(fr.Facts(uid=42, anketa="Вижу анкету: …", anketa_fingerprint="a",
+                                anketa_seen="a", stage="C16:UC_ANKETA"), slot="watch")
+    survey = fr.decide(fr.Facts(uid=42, anketa="Вижу анкету: …", anketa_fingerprint="b",
+                                stage="C16:UC_ANKETA"), slot="watch")
+
+    decision_log.record(fake_db(sink), silent, slot="watch", outcome="ничего не отправлено")
+    decision_log.record(fake_db(sink), survey, slot="watch", outcome="сверка анкеты отправлена")
+
+    assert len(sink) == 2
+    assert sink[1][1][4] == fr.SEND_SURVEY
+
+
+def test_different_people_are_tracked_separately():
+    decision_log._last.clear()
+    sink = []
+    for uid in (1, 2, 3):
+        decision_log.record(fake_db(sink), fr.decide(fr.Facts(uid=uid), slot="watch"),
+                            slot="watch", outcome="ничего не отправлено")
+
+    assert len(sink) == 3, "дедуп не должен глотать решения по другим клиентам"

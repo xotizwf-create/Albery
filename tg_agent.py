@@ -2389,6 +2389,36 @@ def _ask_model(prompt: str) -> str:
     return hermes_answer(prompt, f"answering-{uuid.uuid4().hex[:8]}")
 
 
+# Пауза перед повтором после сбоя провайдера модели: 500/503 обычно живут секунды.
+_MODEL_RETRY_PAUSE_S = float(os.getenv("TG_MODEL_RETRY_PAUSE_S", "8") or 8)
+
+
+def _retry_after_model_failure(call) -> str:
+    """Один повтор хода после сбоя модели. Пусто — значит не вышло, дальше решают люди."""
+    time.sleep(_MODEL_RETRY_PAUSE_S)
+    try:
+        return (call() or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("повтор хода тоже не удался: %s", str(exc)[:200])
+        return ""
+
+
+def _model_failure_to_humans(author: dict, text: str, deal_id: int | None, exc) -> None:
+    """Модель недоступна — вопрос клиента уносим людям, а не оставляем тишину.
+
+    Клиенту при этом НЕ пишем: обещать ответ, которого агент дать не может, владелец запретил
+    (22.07.2026). Но человек в группе видит карточку и отвечает сам — именно этого не хватило
+    25.07.2026, когда три хода упали на 500/503 и клиент ждал впустую."""
+    uid = author.get("id")
+    escalate_to_human(author, f"модель недоступна ({str(exc)[:80]}) — ответьте клиенту сами",
+                      text)
+    journal(MANAGER_CHANNEL, uid, "out",
+            f"мозг не ответил ({str(exc)[:120]}) — вопрос унесён людям в группу «Работа с ИУ»",
+            kind="lead_chat", user=author, status="error",
+            meta={"deal_id": deal_id, "escalated": True, "model_down": True})
+    log.warning("сбой модели по лиду %s унесён людям", uid)
+
+
 def _terms_question_to_humans(author: dict, client_text: str,
                               texts_to_journal: list[str] | None = None,
                               meta: dict | None = None) -> None:
@@ -2879,10 +2909,18 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
                                    f"tg-biz-{author_id}",
                                    toolsets=channel_toolsets(MANAGER_CHANNEL))
         except Exception as exc:  # noqa: BLE001
+            # Провайдер модели отдаёт 500/503 — это бывает. 25.07.2026 так упали три хода, и
+            # клиент 377640060 остался БЕЗ ОТВЕТА совсем («Но вы какие-то супер не торопливые..»).
+            # Сбой модели не имеет права означать тишину: пауза и один повтор, потом — люди.
             log.warning("мозг не ответил лиду %s: %s", author_id, str(exc)[:200])
-            journal(MANAGER_CHANNEL, author_id, "out", f"мозг не ответил: {str(exc)[:200]}",
-                    kind="lead_chat", user=author, status="error", meta={"deal_id": deal_id})
-            return
+            answer = _retry_after_model_failure(
+                lambda: hermes_answer(
+                    _with_instructions(_with_history(build_prompt(), author_id, texts),
+                                       MANAGER_CHANNEL),
+                    f"tg-biz-{author_id}", toolsets=channel_toolsets(MANAGER_CHANNEL)))
+            if not answer:
+                _model_failure_to_humans(author, text, deal_id, exc)
+                return
         # Клиент дописал, пока агент думал? Прежний ответ устарел, не глядя на него: думаем
         # заново над ВСЕЙ пачкой — старые сообщения плюс новые (владелец, 24.07.2026:
         # «цикл должен начаться заново, максимально человеческое поведение»).

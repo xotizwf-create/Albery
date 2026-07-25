@@ -184,3 +184,29 @@ def test_text_recognition_is_not_duplicated_in_the_agent():
         src = inspect.getsource(func)
         assert "funnel_rules." in src, f"{func.__name__} обязан спрашивать реестр"
         assert "re.compile" not in src, f"{func.__name__} завёл свою копию разбора"
+
+
+def test_dispute_about_numbers_goes_to_people_not_to_the_document():
+    """Живой случай 25.07.2026, диалог 256942600: «Вы не правильно пишите, вычитаете 44% не с
+    „к перечислению WB“, а от продаж -44%» — агент в ответ выслал весь документ условий."""
+    d = fr.decide(facts(text="Вы не правильно пишите, вычитаете 44% не с «к перечислению WB» "
+                             "а от продаж -44%", wants_terms=True))
+
+    assert d.action == fr.TERMS_TO_HUMANS
+    assert d.rule == "спорит с расчётом или цифрами"
+    assert "256942600" in d.origin
+
+
+def test_dispute_wins_over_sending_terms_even_at_first_ask():
+    """Приоритет: спор о цифрах важнее «условия ещё не отправляли» — документ тут не поможет."""
+    for text in ("это не так, вы неправильно считаете",
+                 "вы путаете, комиссия считается иначе",
+                 "у вас ошибка в расчёте"):
+        d = fr.decide(facts(text=text, wants_terms=True))
+        assert d.action == fr.TERMS_TO_HUMANS, text
+
+
+def test_normal_question_is_not_mistaken_for_a_dispute():
+    d = fr.decide(facts(text="а какая комиссия по программе?", wants_terms=True, terms_sent=True))
+
+    assert d.action == fr.ANSWER_QUESTIONS

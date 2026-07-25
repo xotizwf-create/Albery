@@ -31,11 +31,22 @@ def _facts_json(facts) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
+# Одно и то же «ничего не отправлять» сторож принимает каждую минуту по каждому приглашённому:
+# 25.07.2026 за сутки так набежало 708 записей по ДВУМ диалогам, и лента решений в кабинете стала
+# бесполезной. Повтор того же решения не пишем — только изменение.
+_last: dict[tuple[int, str], str] = {}
+
+
 def record(db, decision, *, slot: str, outcome: str = "") -> None:
     """Записать решение. `db` — контекстный менеджер соединения (передаём, чтобы не тащить БД сюда)."""
     facts = getattr(decision, "facts", None)
     if facts is None:
         return
+    key = (int(getattr(facts, "uid", 0) or 0), slot)
+    fingerprint = f"{decision.rule}|{decision.action}|{outcome}"
+    if _last.get(key) == fingerprint:
+        return          # решение не изменилось — в трассе такая строка уже есть
+    _last[key] = fingerprint
     try:
         with db() as conn:
             with conn.cursor() as cur:
