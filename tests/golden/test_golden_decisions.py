@@ -24,7 +24,8 @@ CASES = GOLDEN["случаи"]
 def test_golden_decision(case):
     facts = fr.Facts(uid=1, text=case["текст"],
                      terms_sent=case["условия_отправлены"],
-                     wants_terms=case["модель_просит_условия"])
+                     wants_terms=case["модель_просит_условия"],
+                     deal_status_unknown=case.get("CRM_статус_неизвестен", False))
 
     decision = fr.decide(facts)
 

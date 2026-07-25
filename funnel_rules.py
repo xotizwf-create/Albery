@@ -23,6 +23,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable
 
+import iu_turn_policy
+
 # Этапы воронки — ЗДЕСЬ единственное место, где они заданы: и правила, и код отправки берут их
 # отсюда. Раньше список этапов сверки жил отдельно от констант, и они разошлись (24.07.2026:
 # склейка ставила «Анкета заполнена», а сторож этот этап не считал этапом сверки).
@@ -44,10 +46,6 @@ STAY_SILENT = "ничего не отправлять"
 # него склейка ставит сделку (без него сторож молчал — регрессия 24.07.2026).
 SURVEY_STAGES = (STAGE_NEW, STAGE_CONTACTED, STAGE_FORM_DONE)
 
-# Человек интересуется подключением к ИУ, а не просто пишет на аккаунт.
-IU_INTENT_RE = re.compile(
-    r"\bи\.?у\b|индивидуальн\w* услови|подключ\w*|присоедин\w*|услови\w*|комисси\w*|"
-    r"тариф\w*|сотрудничеств\w*|сколько стоит|цен[аыу]\b|прайс", re.I)
 # Просьба выслать документ заново — это не вопрос поверх условий.
 RESEND_RE = re.compile(
     r"ещ[её]\s+раз|повтор\w*|продублир\w*|снова|заново|не\s+приш\w*|не\s+получ\w*|"
@@ -93,13 +91,14 @@ class Facts:
     anketa_seen: str = ""             # отпечаток уже сверенных данных
     legacy_surveyed: bool = False     # сверку отправляли до перехода на отпечатки
     terms_sent: bool = False
+    deal_status_unknown: bool = False  # CRM не ответила: повторять asset вслепую нельзя
     first_contact: bool = True
     wants_terms: bool = False         # модель вернула маркер ПОКАЖИ_УСЛОВИЯ
 
     # --- производные признаки: считаются из текста один раз и читаются по имени ---------------
     @property
     def iu_intent(self) -> bool:
-        return bool(IU_INTENT_RE.search(self.text or ""))
+        return iu_turn_policy.has_iu_interest(self.text or "")
 
     @property
     def asks_to_resend(self) -> bool:
@@ -152,13 +151,20 @@ class Decision:
 # соседних.
 RULES: tuple[Rule, ...] = (
     # --- ход по сообщению клиента ------------------------------------------------------------
+    Rule("CRM недоступна: статус условий неизвестен", "message", TERMS_TO_HUMANS,
+         lambda f: f.wants_terms and f.deal_status_unknown,
+         "25.07.2026: локальная отметка может исчезнуть после сбоя; если CRM не прочитана, "
+         "повторная отправка полного документа вслепую отпугивает клиента. Fail-closed: "
+         "asset не отправляем, запрос видит живой менеджер",
+         priority=2),
     Rule("условия ещё не отправляли", "message", SEND_TERMS,
-         lambda f: f.wants_terms and not f.terms_sent,
+         lambda f: f.wants_terms and not f.terms_sent and not f.deal_status_unknown,
          "23.07.2026: модель пересказывала условия своими словами, цифры гуляли от диалога к "
          "диалогу («200 000 ₽ вместо 500 000» в одном чате, «комиссия 44%» в другом)",
          priority=10),
     Rule("просят выслать условия заново", "message", SEND_TERMS,
-         lambda f: f.wants_terms and f.terms_sent and f.asks_to_resend,
+         lambda f: (f.wants_terms and f.terms_sent and f.asks_to_resend
+                    and not f.deal_status_unknown),
          "24.07.2026: «пришлите ещё раз» — это просьба о документе, а не вопрос поверх него",
          priority=20),
     Rule("вопросы поверх отправленных условий", "message", ANSWER_QUESTIONS,

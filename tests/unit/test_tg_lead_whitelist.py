@@ -36,12 +36,19 @@ def _msg(username="griaznov.d", uid=555, text="Здравствуйте, инт�
 def test_lead_from_the_funnel_gets_an_answer(tg, monkeypatch):
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
     sent = {}
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Уточните оборот, пожалуйста.")
+    monkeypatch.setattr(
+        tg,
+        "hermes_answer",
+        lambda p, s, toolsets=None: (
+            "Здравствуйте! ИУ доступно продавцам WB. Уточните оборот, пожалуйста."
+        ),
+    )
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (sent.update(uid=uid, text=t), (True, ""))[1])
 
     tg.maybe_autoreply(_msg())
 
-    assert sent["uid"] == 555 and "оборот" in sent["text"]
+    assert sent["uid"] == 555 and "ИУ доступно" in sent["text"]
+    assert "оборот" not in sent["text"].lower(), "поля анкеты повторно в чате не спрашиваем"
 
 
 def test_stranger_never_gets_a_generated_reply(tg, monkeypatch):

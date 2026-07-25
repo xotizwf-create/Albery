@@ -120,6 +120,58 @@ def test_text_goes_to_the_client_word_for_word(tg, monkeypatch):
     assert text.endswith("Есть вопросы по условиям?"), "вопрос агент добавляет сам"
 
 
+def test_terms_plus_explicit_join_use_the_form_as_the_only_next_step(tg, monkeypatch):
+    sent, invited = [], []
+    monkeypatch.setattr(tg, "send_html",
+                        lambda uid, html, plain: sent.append(plain) or (True, ""))
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "_invite_already_sent", lambda uid: False)
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+    monkeypatch.setattr(tg, "_mark_terms_sent", lambda uid: None)
+
+    tg.send_terms(0, 555, offer_form=True)
+
+    assert sent[0].index("Индивидуальные условия") < sent[0].index(tg.LEAD_FORM_URL)
+    assert sent[0].count(tg.LEAD_FORM_URL) == 1
+    assert tg.TERMS_QUESTION not in sent[0], "вопрос и CTA анкеты рядом запрещены"
+    assert invited == [555]
+
+
+def test_long_terms_split_the_form_and_mark_only_delivered_assets(tg, monkeypatch):
+    sent, terms_marked, invited = [], [], []
+    monkeypatch.setattr(tg, "terms_text", lambda: "X" * 3300)
+    monkeypatch.setattr(tg, "send_html",
+                        lambda uid, html, plain: sent.append(plain) or (True, ""))
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "_invite_already_sent", lambda uid: False)
+    monkeypatch.setattr(tg, "_mark_terms_sent", lambda uid: terms_marked.append(uid))
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+
+    tg.send_terms(0, 555, offer_form=True)
+
+    assert len(sent) == 2
+    assert "X" * 3300 in sent[0] and tg.LEAD_FORM_URL not in sent[0]
+    assert sent[1].count(tg.LEAD_FORM_URL) == 1
+    assert terms_marked == [555] and invited == [555]
+
+
+def test_oversized_terms_are_not_truncated_or_marked_as_sent(tg, monkeypatch):
+    sent, terms_marked, invited = [], [], []
+    monkeypatch.setattr(tg, "terms_text", lambda: "X" * 3490)
+    monkeypatch.setattr(tg, "send_html",
+                        lambda uid, html, plain: sent.append(plain) or (True, ""))
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "_invite_already_sent", lambda uid: False)
+    monkeypatch.setattr(tg, "_mark_terms_sent", lambda uid: terms_marked.append(uid))
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+
+    with pytest.raises(RuntimeError, match="превышает безопасный размер"):
+        tg.send_terms(0, 555, offer_form=True)
+
+    assert sent == []
+    assert terms_marked == [] and invited == []
+
+
 def test_unfilled_document_is_never_sent(tg, monkeypatch):
     """Неполные условия у клиента хуже паузы."""
     from mcp import context_server as cs
@@ -189,9 +241,52 @@ def test_requisites_already_collected_means_terms_are_behind(tg):
     assert st["step"] == "Отправка договора"
 
 
+def test_turn_facts_restore_terms_dedup_from_the_crm_field(tg, monkeypatch):
+    monkeypatch.setattr(tg, "TERMS_SENT_FIELD", "UF_CRM_TERMS")
+    monkeypatch.setattr(tg, "load_state", lambda: {})
+    deal = {
+        "deal_id": 86,
+        "stage_id": "C16:S84294149",
+        "custom_fields": {"UF_CRM_TERMS": "2026-07-25"},
+    }
+
+    facts = tg._facts_for_turn({"id": 555}, "Какие условия?", 86, deal=deal)
+
+    assert facts.terms_sent
+
+
+def test_turn_facts_use_requisites_as_terms_evidence_when_field_is_unset(tg, monkeypatch):
+    monkeypatch.setattr(tg, "TERMS_SENT_FIELD", "")
+    monkeypatch.setattr(tg, "load_state", lambda: {})
+    deal = {
+        "deal_id": 86,
+        "stage_id": "C16:S84294149",
+        "custom_fields": {tg.CONTRACT_REQUISITES_FIELD: "ИНН 7704123456"},
+    }
+
+    facts = tg._facts_for_turn({"id": 555}, "Какие условия?", 86, deal=deal)
+
+    assert facts.terms_sent
+
+
+def test_requisites_remain_terms_evidence_after_explicit_field_is_configured(tg, monkeypatch):
+    """Миграция поля не должна повторно отправить условия старым/идущим сделкам."""
+    monkeypatch.setattr(tg, "TERMS_SENT_FIELD", "UF_CRM_TERMS")
+    monkeypatch.setattr(tg, "load_state", lambda: {})
+    deal = {
+        "deal_id": 86,
+        "stage_id": "C16:S84294149",
+        "custom_fields": {tg.CONTRACT_REQUISITES_FIELD: "ИНН 7704123456"},
+    }
+
+    facts = tg._facts_for_turn({"id": 555}, "Какие условия?", 86, deal=deal)
+
+    assert facts.terms_sent
+
+
 # --- условия незнакомцу: дословно из файла (владелец, 24.07.2026) -----------------------------
 
-def _stranger(tg, monkeypatch, answer):
+def _stranger(tg, monkeypatch, answer, client_text="какие условия подключения?"):
     """Незнакомец пишет в личку; ловим, что уйдёт клиенту."""
     import json as _json
 
@@ -208,7 +303,7 @@ def _stranger(tg, monkeypatch, answer):
                         lambda uid, t, parse_mode="": box.append(t) or (True, ""))
     tg.maybe_autoreply({"business_connection_id": "C1", "chat": {"id": 777, "type": "private"},
                         "from": {"id": 777, "username": "novy", "first_name": "Иван"},
-                        "text": "какие условия подключения?"})
+                        "text": client_text})
     return box
 
 
@@ -224,13 +319,51 @@ def test_conditions_are_sent_word_for_word_from_the_file(tg, monkeypatch):
     assert tg.TERMS_REQUEST_MARKER not in text, "служебный маркер клиенту не показываем"
 
 
-def test_form_invite_follows_the_conditions(tg, monkeypatch):
-    """Цель — анкета: после условий приглашение идёт в конце того же сообщения."""
+def test_conditions_alone_do_not_force_the_form(tg, monkeypatch):
+    """Интерес к условиям — ещё не согласие клиента отдавать данные через анкету."""
     box = _stranger(tg, monkeypatch, tg.TERMS_REQUEST_MARKER)
 
+    assert tg.LEAD_FORM_URL not in box[0]
+
+
+def test_multi_intent_gets_terms_first_and_then_one_form_cta(tg, monkeypatch):
+    box = _stranger(
+        tg, monkeypatch, tg.TERMS_REQUEST_MARKER,
+        client_text="Какие условия? Если подходят — хочу подключиться к ИУ",
+    )
+
     assert tg.LEAD_FORM_URL in box[0]
-    assert box[0].index("Индивидуальные условия") < box[0].index(tg.LEAD_FORM_URL), \
-        "сначала условия, анкета — в конце"
+    assert box[0].index("Индивидуальные условия") < box[0].index(tg.LEAD_FORM_URL)
+    assert box[0].count(tg.LEAD_FORM_URL) == 1
+
+
+def test_stranger_long_terms_split_the_form_without_false_marks(tg, monkeypatch):
+    terms_marked, invited = [], []
+    monkeypatch.setattr(tg, "terms_text", lambda: "X" * 3400)
+    monkeypatch.setattr(tg, "_mark_terms_sent", lambda uid: terms_marked.append(uid))
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+
+    box = _stranger(
+        tg, monkeypatch, tg.TERMS_REQUEST_MARKER,
+        client_text="Какие условия? Хочу подключиться к ИУ",
+    )
+
+    assert len(box) == 2
+    assert "X" * 3400 in box[0] and tg.LEAD_FORM_URL not in box[0]
+    assert box[1].count(tg.LEAD_FORM_URL) == 1
+    assert terms_marked == [777] and invited == [777]
+
+
+def test_stranger_oversized_terms_are_never_truncated_or_marked(tg, monkeypatch):
+    terms_marked, invited = [], []
+    monkeypatch.setattr(tg, "terms_text", lambda: "X" * 3600)
+    monkeypatch.setattr(tg, "_mark_terms_sent", lambda uid: terms_marked.append(uid))
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+
+    box = _stranger(tg, monkeypatch, tg.TERMS_REQUEST_MARKER)
+
+    assert box == []
+    assert terms_marked == [] and invited == []
 
 
 def test_stranger_rules_forbid_promises_and_article_questions(tg):
@@ -251,6 +384,15 @@ def test_lead_asking_about_conditions_gets_the_file_word_for_word(tg, monkeypatc
     monkeypatch.setattr(tg, "load_state", lambda: {"business": {"C1": {"user_id": 871}}})
     monkeypatch.setattr(tg, "save_state", lambda s: None)
     monkeypatch.setattr(tg, "lead_deal_for_username", lambda u: 110)
+    monkeypatch.setattr(
+        tg,
+        "_deal_for_watch",
+        lambda deal_id: {
+            "id": deal_id,
+            "stage_id": "C16:S84294149",
+            "custom_fields": {},
+        },
+    )
     monkeypatch.setattr(tg, "funnel_step_block", lambda d: "Шаг: вопросы по условиям")
     monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
     monkeypatch.setattr(tg, "react", lambda *a, **k: None)
@@ -281,7 +423,8 @@ def test_terms_marker_rule_reaches_both_branches(tg):
 
 # --- документ условий ОДИН раз, вопрос поверх него — людям (владелец, 24.07.2026) --------------
 
-def _lead_turn(tg, monkeypatch, client_text, state_extra=None, answer=None):
+def _lead_turn(tg, monkeypatch, client_text, state_extra=None, answer=None,
+               *, deal_fetch_error=False):
     """Ход лида воронки; возвращаем (что ушло клиенту, что унесли людям)."""
     sent, to_humans = [], []
     state = {"business": {"C1": {"user_id": 871}}, **(state_extra or {})}
@@ -289,6 +432,20 @@ def _lead_turn(tg, monkeypatch, client_text, state_extra=None, answer=None):
     monkeypatch.setattr(tg, "load_state", lambda: state)
     monkeypatch.setattr(tg, "save_state", lambda s: None)
     monkeypatch.setattr(tg, "lead_deal_for_username", lambda u: 120)
+    if deal_fetch_error:
+        def unavailable_deal(_deal_id):
+            raise RuntimeError("CRM unavailable")
+        monkeypatch.setattr(tg, "_deal_for_watch", unavailable_deal)
+    else:
+        monkeypatch.setattr(
+            tg,
+            "_deal_for_watch",
+            lambda deal_id: {
+                "id": deal_id,
+                "stage_id": "C16:S84294149",
+                "custom_fields": {},
+            },
+        )
     monkeypatch.setattr(tg, "funnel_step_block", lambda d: "Шаг: вопросы по условиям")
     monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
     monkeypatch.setattr(tg, "react", lambda *a, **k: None)
@@ -336,6 +493,42 @@ def test_first_terms_question_still_sends_the_document(tg, monkeypatch):
 
     assert sent and "Индивидуальные условия снижают комиссию" in sent[0]
     assert not to_humans, "людей по первому вопросу не беспокоим"
+
+
+def test_first_terms_multi_intent_routes_the_other_question_to_humans(tg, monkeypatch):
+    sent, to_humans = _lead_turn(
+        tg, monkeypatch,
+        "Какие условия ИУ и сколько стоит доставка?",
+    )
+
+    assert sent and "Индивидуальные условия снижают комиссию" in sent[0]
+    assert tg.TERMS_QUESTION not in sent[0], "generic question must not replace the side answer"
+    assert any(tg.TERMS_ASK_HUMAN_REPLY in message for message in sent[1:])
+    assert to_humans and "достав" in to_humans[0].lower()
+
+
+def test_first_terms_multi_question_inside_iu_routes_unanswered_parts(tg, monkeypatch):
+    sent, to_humans = _lead_turn(
+        tg, monkeypatch,
+        "Какой ДРР нужно держать и как происходит управление? Какая комиссия по ИУ?",
+    )
+
+    assert sent and "Индивидуальные условия снижают комиссию" in sent[0]
+    assert tg.TERMS_QUESTION not in sent[0], "generic follow-up must not hide other questions"
+    assert any(tg.TERMS_ASK_HUMAN_REPLY in message for message in sent[1:])
+    assert to_humans and "дрр" in to_humans[0].lower()
+
+
+def test_crm_fetch_failure_with_empty_local_state_does_not_resend_terms(tg, monkeypatch):
+    sent, to_humans = _lead_turn(
+        tg, monkeypatch,
+        "Какие условия подключения к ИУ?",
+        deal_fetch_error=True,
+    )
+
+    assert sent and tg.TERMS_ASK_HUMAN_REPLY in sent[0]
+    assert not any("Индивидуальные условия снижают комиссию" in message for message in sent)
+    assert to_humans, "неизвестное CRM-состояние обязан увидеть живой менеджер"
 
 
 def test_asking_to_resend_gets_the_document_again(tg, monkeypatch):

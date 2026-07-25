@@ -29,6 +29,15 @@ def tg(monkeypatch, tmp_path):
     # Отвечаем только лидам воронки — здесь проверяется сам механизм автоответа, поэтому
     # собеседник считается лидом. Сам белый список проверяется в test_tg_lead_whitelist.
     monkeypatch.setattr(tg_agent, "crm_lead_usernames", lambda force=False: {"lead": 82})
+    monkeypatch.setattr(
+        tg_agent,
+        "_deal_for_watch",
+        lambda deal_id: {
+            "id": deal_id,
+            "stage_id": "C16:S84294149",
+            "custom_fields": {},
+        },
+    )
     # Пауза-добор пачки в тестах — символическая, иначе каждый тест ждал бы живые секунды.
     monkeypatch.setattr(tg_agent, "_REPLY_DEBOUNCE_S", 0.02)
     return tg_agent
@@ -49,7 +58,67 @@ def test_lead_gets_an_answer_from_the_company_account(tg, monkeypatch):
     tg.maybe_autoreply(_incoming())
 
     assert sent["uid"] == 1451982360
-    assert "оборот" in sent["text"]
+    assert "Здравствуйте" in sent["text"]
+    assert "оборот" not in sent["text"].lower(), "поля анкеты в чате повторно не спрашиваем"
+
+
+def test_long_lead_answer_sends_the_form_separately_before_marking(tg, monkeypatch):
+    sent, invited = [], []
+    answer = "X" * 3400
+    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: answer)
+    monkeypatch.setattr(tg, "_deal_has_form", lambda deal_id: False)
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tg, "send_as_account",
+        lambda uid, text, parse_mode="": sent.append(text) or (True, ""),
+    )
+
+    tg.maybe_autoreply(_incoming(text="Хочу подключиться к ИУ"))
+
+    assert len(sent) == 2
+    assert sent[0] == answer and tg.LEAD_FORM_URL not in sent[0]
+    assert sent[1].count(tg.LEAD_FORM_URL) == 1
+    assert invited == [1451982360]
+
+
+def test_failed_separate_form_does_not_burn_the_lead_invite(tg, monkeypatch):
+    calls, invited = [], []
+    monkeypatch.setattr(tg, "hermes_answer",
+                        lambda p, s, toolsets=None: "X" * 3400)
+    monkeypatch.setattr(tg, "_deal_has_form", lambda deal_id: False)
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+
+    def deliver(uid, text, parse_mode=""):
+        calls.append(text)
+        return (True, "") if len(calls) == 1 else (False, "сеть")
+
+    monkeypatch.setattr(tg, "send_as_account", deliver)
+
+    tg.maybe_autoreply(_incoming(text="Хочу подключиться к ИУ"))
+
+    assert calls[0] == "X" * 3400
+    assert any(tg.LEAD_FORM_URL in text for text in calls[1:])
+    assert invited == []
+
+
+def test_crm_form_status_outage_suppresses_the_form_fail_closed(tg, monkeypatch):
+    sent, invited = [], []
+    monkeypatch.setattr(tg, "hermes_answer",
+                        lambda p, s, toolsets=None: "Помогу подключиться.")
+    monkeypatch.setattr(tg, "_deal_has_form", lambda deal_id: None)
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tg, "send_as_account",
+        lambda uid, text, parse_mode="": sent.append(text) or (True, ""),
+    )
+
+    tg.maybe_autoreply(_incoming(text="Хочу подключиться к ИУ"))
+
+    assert sent and all(tg.LEAD_FORM_URL not in text for text in sent)
+    assert invited == []
 
 
 def test_own_outgoing_messages_never_trigger_a_reply(tg, monkeypatch):
@@ -193,11 +262,11 @@ def test_plain_answer_without_a_tool_is_still_sent(tg, monkeypatch):
     monkeypatch.setattr(tg, "send_as_account",
                         lambda uid, t, parse_mode="": (outbox.append(t), (True, ""))[1])
     monkeypatch.setattr(tg, "hermes_answer",
-                        lambda p, s, toolsets=None: "Расскажите про ваш оборот на WB?")
+                        lambda p, s, toolsets=None: "ИУ доступно продавцам Wildberries.")
 
     tg.maybe_autoreply(_incoming(text="Здравствуйте"))
 
-    assert any("оборот" in t for t in outbox), "обычный ответ модели должен дойти до клиента"
+    assert any("ИУ доступно" in t for t in outbox), "обычный ответ модели должен дойти до клиента"
 
 
 # --- пачка сообщений подряд = один человечный ответ (владелец, 23.07.2026) --------------------
@@ -330,6 +399,26 @@ def test_style_rules_reach_the_model(tg, monkeypatch):
     tg.maybe_autoreply(_incoming(text="Здравствуйте"))
 
     assert prompts and "НЕ начинай сообщение с имени клиента" in prompts[0]
+    assert "ИЛИ один вопрос, ИЛИ один CTA" in prompts[0]
+    assert "Стадия — контекст, а не реплика скрипта" in prompts[0]
+
+
+def test_lead_off_topic_with_false_terms_marker_gets_no_iu_document(tg, monkeypatch):
+    """Наличие сделки не превращает любой вопрос о цене в запрос коммерческих условий ИУ."""
+    sent = []
+    monkeypatch.setattr(tg, "hermes_answer",
+                        lambda p, s, toolsets=None: tg.TERMS_REQUEST_MARKER)
+    monkeypatch.setattr(
+        tg, "terms_text",
+        lambda: (_ for _ in ()).throw(AssertionError("документ ИУ здесь запрещён")),
+    )
+    monkeypatch.setattr(tg, "send_as_account",
+                        lambda uid, text, parse_mode="": sent.append(text) or (True, ""))
+
+    tg.maybe_autoreply(_incoming(text="Сколько стоит доставка документов?"))
+
+    assert sent and "индивидуальным условиям" in sent[0].lower()
+    assert tg.LEAD_FORM_URL not in sent[0]
 
 
 def test_fresh_deal_is_picked_up_without_waiting_for_cache(tg, monkeypatch):

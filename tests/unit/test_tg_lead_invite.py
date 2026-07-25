@@ -1,9 +1,9 @@
 """Разговор с незнакомцем в личке аккаунта компании.
 
-Требование владельца 22.07.2026: агент должен вести себя как живой человек. Здороваются —
-здоровается в ответ. Спрашивают — отвечает по базе знаний воронки (папка Google Drive «База
-знаний — Партнёрская программа WB»). Ответа в базе нет — НЕ выдумывает, а передаёт вопрос
-живому менеджеру. Плюс при первом контакте даёт ссылку на анкету, чтобы человек стал лидом.
+Требование владельца: агент должен вести себя как живой консультант. Здороваются — здоровается
+в ответ. Спрашивают — сначала отвечает по утверждённым данным. Ответа нет — не выдумывает, а
+передаёт вопрос менеджеру. Анкета появляется только после явной готовности клиента, а не как
+обязательная подпись под первым сообщением.
 
 Две главные опасности:
 1. выдуманные условия и цены — клиенту пообещают то, чего компания не даёт;
@@ -90,35 +90,135 @@ def test_greeting_gets_a_human_greeting_back(tg, sent, monkeypatch):
 
     assert len(sent) == 1
     assert "Чем могу помочь" in sent[0]["text"]
+    assert tg.LEAD_FORM_URL not in sent[0]["text"]
 
 
-def test_first_reply_carries_the_form_link(tg, sent, monkeypatch):
-    _brain(tg, monkeypatch)
+def test_conditions_question_gets_the_answer_without_a_forced_form(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch, tg.TERMS_REQUEST_MARKER)
+    monkeypatch.setattr(tg, "terms_text", lambda: "Подключение стоит 30 000 ₽ в месяц.")
 
-    tg.maybe_autoreply(_msg())
+    tg.maybe_autoreply(_msg(text="Какие условия подключения к ИУ?"))
+
+    assert "30 000 ₽" in sent[0]["text"], "сначала клиент получает прямой ответ"
+    assert tg.LEAD_FORM_URL not in sent[0]["text"], "вопрос об условиях ещё не согласие на анкету"
+
+
+def test_false_terms_marker_on_off_topic_sends_neither_document_nor_form(
+        tg, sent, monkeypatch):
+    _brain(tg, monkeypatch, tg.TERMS_REQUEST_MARKER)
+    monkeypatch.setattr(
+        tg, "terms_text",
+        lambda: (_ for _ in ()).throw(AssertionError("документ ИУ здесь открывать нельзя")),
+    )
+
+    tg.maybe_autoreply(_msg(text="Сколько стоит доставка документов?"))
+
+    assert sent, "ошибка классификации модели не должна оставлять человека без ответа"
+    assert "30 000 ₽" not in sent[0]["text"]
+    assert tg.LEAD_FORM_URL not in sent[0]["text"]
+
+
+def test_explicit_connection_intent_gets_answer_then_one_form_cta(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch, "Помогу подключиться.")
+
+    tg.maybe_autoreply(_msg(text="Хочу подключиться к ИУ"))
+
+    text = sent[0]["text"]
+    assert text.index("Помогу подключиться") < text.index(tg.LEAD_FORM_URL)
+    assert text.count(tg.LEAD_FORM_URL) == 1
+    assert "возвращайтесь сюда" not in text.lower(), "в хвосте должно быть одно действие"
+
+
+def test_long_stranger_answer_sends_the_form_separately_before_marking(tg, sent, monkeypatch):
+    answer = "X" * 3400
+    invited = []
+    _brain(tg, monkeypatch, answer)
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+
+    tg.maybe_autoreply(_msg(text="Хочу подключиться к ИУ"))
+
+    assert len(sent) == 2
+    assert sent[0]["text"] == answer and tg.LEAD_FORM_URL not in sent[0]["text"]
+    assert sent[1]["text"].count(tg.LEAD_FORM_URL) == 1
+    assert invited == [999]
+
+
+def test_failed_separate_form_does_not_burn_the_stranger_invite(tg, monkeypatch):
+    calls, invited = [], []
+    _brain(tg, monkeypatch, "X" * 3400)
+
+    def deliver(uid, text, parse_mode=""):
+        calls.append(text)
+        return (True, "") if len(calls) == 1 else (False, "сеть")
+
+    monkeypatch.setattr(tg, "send_as_account", deliver)
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+
+    tg.maybe_autoreply(_msg(text="Хочу подключиться к ИУ"))
+
+    assert calls[0] == "X" * 3400
+    assert any(tg.LEAD_FORM_URL in text for text in calls[1:])
+    assert invited == []
+
+
+def test_direct_form_request_gets_the_form(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch, "Конечно — вот короткая анкета.")
+
+    tg.maybe_autoreply(_msg(text="Пришлите анкету, пожалуйста"))
 
     assert tg.LEAD_FORM_URL in sent[0]["text"]
 
 
+def test_explicit_form_intent_replaces_the_models_competing_question(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch, "Помогу. Что именно хотите уточнить?")
+
+    tg.maybe_autoreply(_msg(text="Хочу подключиться к ИУ"))
+
+    assert "Помогу." in sent[0]["text"]
+    assert "?" not in sent[0]["text"]
+    assert sent[0]["text"].count(tg.LEAD_FORM_URL) == 1
+
+
+def test_extra_model_question_is_removed_at_runtime(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch,
+           "ИУ подходит продавцам WB. Что хотите уточнить? Какой у вас оборот?")
+
+    tg.maybe_autoreply(_msg(text="Расскажите про ИУ"))
+
+    assert "ИУ подходит продавцам WB." in sent[0]["text"]
+    assert sent[0]["text"].count("?") == 1
+    assert "оборот" not in sent[0]["text"]
+
+
 def test_form_link_is_offered_only_once(tg, sent, monkeypatch):
     """Анкета — приглашение, а не подпись под каждым сообщением."""
-    _brain(tg, monkeypatch)
+    _brain(tg, monkeypatch, "Помогу подключиться.")
 
-    tg.maybe_autoreply(_msg(text="Здравствуйте"))
-    tg.maybe_autoreply(_msg(text="а сколько стоит?"))
+    tg.maybe_autoreply(_msg(text="Хочу подключиться к ИУ"))
+    tg.maybe_autoreply(_msg(text="Хочу подключиться к ИУ"))
     tg.maybe_autoreply(_msg(text="ну что там?"))
 
     assert len(sent) == 3, "разговор продолжается"
     assert sum(tg.LEAD_FORM_URL in m["text"] for m in sent) == 1
 
 
-def test_agent_is_told_to_use_the_knowledge_base(tg, sent, monkeypatch):
+def test_explicit_form_resend_bypasses_cooldown_once(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch, "Продублирую ссылку.")
+    tg._mark_invited(999)
+
+    tg.maybe_autoreply(_msg(text="Анкета не пришла, пришлите ещё раз"))
+
+    assert len(sent) == 1
+    assert sent[0]["text"].count(tg.LEAD_FORM_URL) == 1
+
+
+def test_agent_is_not_told_to_call_an_unavailable_customer_tool(tg, sent, monkeypatch):
     seen = _brain(tg, monkeypatch)
 
     tg.maybe_autoreply(_msg(text="какие у вас условия?"))
 
-    assert "search_company_knowledge" in seen[0]
-    assert "Партнёрская программа WB" in seen[0]
+    assert "утверждённые сведения" in seen[0]
+    assert "недоступный инструмент не обещай" in seen[0]
 
 
 def test_unknown_question_goes_to_the_iu_group(tg, sent, to_group, monkeypatch):
@@ -170,9 +270,9 @@ def test_client_link_is_the_public_site(tg):
 
 def test_form_invite_is_a_clickable_link(tg, sent, monkeypatch):
     """В Битриксе ссылка приходит подписью [URL=…]…[/URL]; в Telegram должно быть так же."""
-    _brain(tg, monkeypatch)
+    _brain(tg, monkeypatch, "Помогу подключиться.")
 
-    tg.maybe_autoreply(_msg(text="Здравствуйте"))
+    tg.maybe_autoreply(_msg(text="Хочу подключиться к ИУ"))
 
     assert sent[0]["mode"] == "HTML", "без parse_mode ссылка останется голым адресом"
     assert f'<a href="{tg.LEAD_FORM_URL}">Заполнить анкету</a>' in sent[0]["text"]
@@ -284,6 +384,8 @@ def test_formatting_rules_are_delivered_to_the_agent(tg, sent, monkeypatch):
     assert "Оформление сообщений клиенту в Telegram" in seen[0]
     assert "ПУСТАЯ строка" in seen[0], "правило про воздух между блоками должно дойти дословно"
     assert "Анкета — не пропуск в разговор" in seen[0], "правила общения тоже обязаны дойти"
+    assert "максимум один следующий шаг" in seen[0].lower()
+    assert "явно хочет подключиться" in seen[0].lower()
     # К агенту подключены и объёмные инструкции по работе в системе: разговорные обязаны
     # стоять раньше них, иначе лимит промпта обрежет именно их.
     block = seen[0].split("ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА ОФОРМЛЕНИЯ", 1)[-1]
@@ -325,6 +427,17 @@ def _journal_rows(tg, monkeypatch, rows):
                         "\n".join(f"{'Клиент' if d == 'in' else 'Ты'}: {t}" for d, t in rows))
 
 
+def test_short_confirmation_uses_the_previous_agent_question(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch, "Тогда перейдём к подключению.")
+    _journal_rows(tg, monkeypatch, [
+        ("out", "Готовы заполнить анкету для подключения к ИУ?"),
+    ])
+
+    tg.maybe_autoreply(_msg(text="Да, давайте"))
+
+    assert tg.LEAD_FORM_URL in sent[0]["text"]
+
+
 def test_agent_sees_what_was_already_said(tg, sent, monkeypatch):
     """Жалоба владельца 22.07.2026: агент поздоровался ВТОРОЙ раз, будто видит человека впервые.
 
@@ -356,6 +469,7 @@ def test_lead_is_answered_as_a_lead_not_as_a_stranger(tg, sent, monkeypatch):
     tg.maybe_autoreply(_msg(username="griaznov.d", uid=555, text="привет"))
 
     assert tg.LEAD_FORM_URL not in sent[0]["text"]
+    assert "оборот" not in sent[0]["text"].lower(), "поля анкеты повторно в чате не спрашиваем"
     assert "№82" in seen[0], "агент должен знать номер сделки"
 
 
@@ -390,10 +504,10 @@ def test_bots_and_groups_get_nothing(tg, sent, monkeypatch):
 
 def test_undelivered_reply_does_not_burn_the_invite(tg, monkeypatch):
     """Сетевая ошибка не должна молча лишить человека анкеты навсегда."""
-    _brain(tg, monkeypatch)
+    _brain(tg, monkeypatch, "Помогу подключиться.")
     monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (False, "сеть"))
 
-    tg.maybe_autoreply(_msg())
+    tg.maybe_autoreply(_msg(text="Хочу подключиться к ИУ"))
 
     assert tg._invite_already_sent(999) is False
 
@@ -421,13 +535,12 @@ def test_reply_is_plain_text_without_markup(tg, sent, monkeypatch):
 # --- разбор сбоя 24.07.2026 (живой клиент 5195962532) ----------------------------------------
 
 def test_invite_tail_is_not_added_when_the_model_already_linked_the_form(tg, sent, monkeypatch):
-    """Клиент получил приглашение в анкету ДВАЖДЫ в одном сообщении: модель вставила ссылку
-    сама, а код приклеил свой хвост. Хвост нужен только если модель про анкету промолчала."""
+    """Модельная ссылка не считается разрешением: assembler заменяет её одной канонической."""
     _brain(tg, monkeypatch,
            "Условия такие-то. [Заполнить анкету](https://b24-9qcm4m.bitrix24site.ru/) — "
            "после этого посчитаем экономику")
 
-    tg.maybe_autoreply(_msg(text="какие условия подключения?"))
+    tg.maybe_autoreply(_msg(text="Хочу подключиться к ИУ"))
 
     text = sent[0]["text"]
     assert text.count("b24-9qcm4m.bitrix24site.ru") == 1, "анкета предлагается один раз"
@@ -435,12 +548,61 @@ def test_invite_tail_is_not_added_when_the_model_already_linked_the_form(tg, sen
 
 
 def test_invite_tail_still_added_when_the_model_says_nothing_about_the_form(tg, sent, monkeypatch):
-    """Обратная сторона: если модель про анкету не сказала, приглашение всё равно уходит."""
+    """При явной готовности система добавляет анкету, даже если модель про неё промолчала."""
     _brain(tg, monkeypatch, "Условия такие-то, работаем через ИУ-кабинет")
 
-    tg.maybe_autoreply(_msg(text="какие условия подключения?"))
+    tg.maybe_autoreply(_msg(text="Хочу подключиться к ИУ"))
 
     assert "b24-9qcm4m.bitrix24site.ru" in sent[0]["text"]
+
+
+def test_model_form_link_is_removed_without_customer_consent(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch,
+           "Здравствуйте! [Заполнить анкету](https://b24-9qcm4m.bitrix24site.ru/)")
+
+    tg.maybe_autoreply(_msg(text="Здравствуйте"))
+
+    assert "b24-9qcm4m.bitrix24site.ru" not in sent[0]["text"]
+    assert "анкет" not in sent[0]["text"].lower()
+
+
+def test_model_form_wording_is_removed_without_customer_consent(tg, sent, monkeypatch):
+    _brain(tg, monkeypatch, "Здравствуйте! Я предлагаю заполнить анкету.")
+
+    tg.maybe_autoreply(_msg(text="Здравствуйте"))
+
+    assert "Здравствуйте!" in sent[0]["text"]
+    assert "анкет" not in sent[0]["text"].lower()
+
+
+@pytest.mark.parametrize(
+    "model_answer",
+    [
+        "Вы можете подключиться и заполнить анкету.",
+        "Для подключения можно использовать анкету.",
+        "Начать можно с анкеты.",
+        "Доступна анкета для подключения.",
+    ],
+)
+def test_model_form_offer_bypasses_are_removed_on_a_greeting(
+        tg, sent, monkeypatch, model_answer):
+    _brain(tg, monkeypatch, model_answer)
+
+    tg.maybe_autoreply(_msg(text="Здравствуйте"))
+
+    assert sent
+    assert "анкет" not in sent[0]["text"].lower()
+    assert tg.LEAD_FORM_URL not in sent[0]["text"]
+
+
+def test_foreign_form_answer_is_preserved_without_sending_the_iu_questionnaire(
+        tg, sent, monkeypatch):
+    _brain(tg, monkeypatch, "Форма оплаты доступна в личном кабинете.")
+
+    tg.maybe_autoreply(_msg(text="Где форма оплаты?"))
+
+    assert sent and sent[0]["text"] == "Форма оплаты доступна в личном кабинете."
+    assert tg.LEAD_FORM_URL not in sent[0]["text"]
 
 
 def test_openline_service_messages_are_not_treated_as_client_words(tg, sent, monkeypatch):

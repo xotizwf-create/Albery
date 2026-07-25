@@ -35,8 +35,11 @@ def tg(monkeypatch, tmp_path):
 def test_iu_intent_recognised_but_smalltalk_ignored(tg):
     assert tg._iu_intent(["Здравствуйте какие условия подключения к иу?"])
     assert tg._iu_intent(["хочу подключиться"])
-    assert tg._iu_intent(["сколько стоит?"])
+    assert tg._iu_intent(["пришлите анкету"])
     assert not tg._iu_intent(["Привет"])
+    assert not tg._iu_intent(["сколько стоит?"])
+    assert not tg._iu_intent(["Не хочу подключаться к ИУ"])
+    assert not tg._iu_intent(["Какие условия поставки тканей?"])
     assert not tg._iu_intent(["Отгрузили паллеты вчера, накладную пришлю"])
 
 

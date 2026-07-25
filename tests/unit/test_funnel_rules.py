@@ -22,6 +22,18 @@ def test_first_terms_question_sends_the_document():
     assert d.rule == "условия ещё не отправляли"
 
 
+def test_unknown_crm_status_never_resends_terms_blindly():
+    d = fr.decide(facts(
+        text="какие условия подключения к иу?",
+        deal_id=120,
+        wants_terms=True,
+        deal_status_unknown=True,
+    ))
+
+    assert d.action == fr.TERMS_TO_HUMANS
+    assert d.rule == "CRM недоступна: статус условий неизвестен"
+
+
 def test_resend_request_sends_the_document_again():
     d = fr.decide(facts(text="условия не пришли, пришлите ещё раз", wants_terms=True,
                         terms_sent=True))

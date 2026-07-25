@@ -25,12 +25,12 @@ import logging
 import re
 from dataclasses import dataclass
 
+import iu_turn_policy
+
 log = logging.getLogger("answering")
 
 NO_ANSWER = "НЕТ_ОТВЕТА"
 
-# Разделители вопросов внутри одного сообщения: перевод строки, «+» в начале мысли, знак вопроса.
-_SPLIT_RE = re.compile(r"[\n\r]+|(?<=\?)\s+|\s+\+(?=\S)")
 # Числа и проценты, которые нельзя выдумывать: 44%, 30 000 ₽, 3 дней, 12.5.
 _NUMBER_RE = re.compile(r"\d[\d\s.,]*")
 
@@ -52,8 +52,7 @@ def split_questions(text: str) -> list[str]:
 
     Клиенты пишут по три вопроса в одной строке через «+» и без знаков препинания — поэтому
     режем и по переводам строк, и по «+», и после знака вопроса."""
-    parts = [p.strip(" \t-–—•") for p in _SPLIT_RE.split(text or "") if p and p.strip()]
-    return [p for p in parts if len(p) > 2]
+    return iu_turn_policy.question_clauses(text)
 
 
 def _numbers(text: str) -> set[str]:
@@ -82,6 +81,7 @@ _PROMPT = """Ты отвечаешь клиенту от лица компани
 - отвечай ТОЛЬКО тем, что есть в источниках; ничего не добавляй от себя;
 - нет ответа в источниках — верни для этого вопроса строку {no_answer};
 - ответ короткий, 1-2 предложения, по-человечески, без канцелярита;
+- в ответе только факт: не задавай встречных вопросов, не давай ссылок и не добавляй CTA;
 - цифры бери из источников буква в букву, не пересчитывай и не округляй.
 
 ИСТОЧНИКИ:
@@ -133,6 +133,12 @@ def answer_questions(questions: list[str], sources: str, ask) -> list[Answered]:
             # Ответ не опирается на источники — считаем, что ответа нет. Лучше отдать людям,
             # чем сказать клиенту выдуманную цифру.
             log.info("ответ на «%s» отброшен: числа не подтверждены источниками", question[:60])
+            out.append(Answered(question))
+            continue
+        if iu_turn_policy.has_next_step(answer):
+            # answering-* возвращает только факт по источнику. Вопрос, ссылка или призыв из
+            # вложенного model output обошли бы общий контракт одного CTA в Telegram.
+            log.info("ответ на «%s» отброшен: модель добавила следующий шаг", question[:60])
             out.append(Answered(question))
             continue
         out.append(Answered(question, answer=answer, source=source))

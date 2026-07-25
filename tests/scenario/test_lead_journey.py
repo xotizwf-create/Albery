@@ -182,6 +182,8 @@ def funnel(monkeypatch, tmp_path):
         Решение принимаем по СЛОВАМ КЛИЕНТА, а не по промпту: в промпт входят правила, где
         слово «условия» встречается всегда."""
         text = (said[-1] if said else "").lower()
+        if "хочу подключ" in text:
+            return "Помогу подключиться."
         if any(w in text for w in ("услови", "комисси", "тариф", "дрр", "цен")):
             return tg.TERMS_REQUEST_MARKER
         if any(w in text for w in ("верно", "да", "ок")):
@@ -210,6 +212,7 @@ def test_lead_journey_from_hello_to_a_question_beyond_the_terms(funnel):
     funnel.says("Здравствуйте")
     assert chat.messages, "человеку отвечаем в любом случае"
     assert portal.deals == {}, "сделку по «здравствуйте» не заводим"
+    assert tg.LEAD_FORM_URL not in chat.last, "приветствие не является согласием на анкету"
 
     # 2. Спросил про ИУ — сделка появляется СРАЗУ, до ответа, с его @username.
     funnel.says("Какие условия подключения к ИУ?")
@@ -218,21 +221,25 @@ def test_lead_journey_from_hello_to_a_question_beyond_the_terms(funnel):
     deal = deals[0]
     assert deal["stage_id"] == tg.STAGE_CONTACTED, "ответили — значит «Связались»"
 
-    # 3. Условия ушли ДОСЛОВНО из документа, анкета — в конце того же сообщения.
+    # 3. Условия ушли ДОСЛОВНО из документа, но вопрос ещё не превращён в согласие на анкету.
     answer = chat.last
     assert "Индивидуальные условия снижают комиссию до 12%" in answer, "текст ровно из документа"
     assert "ДОСЛОВНО" not in answer, "служебная шапка документа клиенту не уходит"
-    assert tg.LEAD_FORM_URL in answer, "цель — анкета"
-    assert answer.index("Индивидуальные условия") < answer.index(tg.LEAD_FORM_URL), \
-        "сначала условия, приглашение — в конце"
+    assert tg.LEAD_FORM_URL not in answer, "условия сначала, без принуждения к анкете"
 
-    # 4. Клиент заполнил анкету: форма создала ВТОРУЮ сделку.
+    # 4. На отдельное явное решение клиента tg-biz добавляет ровно один CTA с анкетой.
+    funnel.says("Хочу подключиться к ИУ")
+    assert tg.LEAD_FORM_URL in chat.last
+    assert chat.last.index("Помогу подключиться") < chat.last.index(tg.LEAD_FORM_URL)
+    assert chat.last.count(tg.LEAD_FORM_URL) == 1
+
+    # 5. Клиент заполнил анкету: форма создала ВТОРУЮ сделку.
     portal.fill_the_form(LEAD["username"], {"UF_CRM_1784297026": "shop.wb.ru/seller",
                                             "UF_CRM_1784297137": "одежда",
                                             "UF_CRM_1784297181": "30000000"})
     assert len(portal.deals_of(LEAD["username"])) == 2, "дубль от формы — это факт жизни CRM"
 
-    # 5. Сторож замечает анкету САМ: склеивает дубль и начинает сверку без сообщения клиента.
+    # 6. Сторож замечает анкету САМ: склеивает дубль и начинает сверку без сообщения клиента.
     before = len(chat.messages)
     tg._check_new_forms()
     survived = portal.deals_of(LEAD["username"])
@@ -244,11 +251,11 @@ def test_lead_journey_from_hello_to_a_question_beyond_the_terms(funnel):
     assert "Вижу анкету:" in chat.last and chat.last.endswith("Всё верно?")
     assert "30 млн" in chat.last, "цифры — из живых полей воронки"
 
-    # 6. Повторный проход сторожа — тишина: те же данные второй раз не сверяем.
+    # 7. Повторный проход сторожа — тишина: те же данные второй раз не сверяем.
     tg._check_new_forms()
     assert "Вижу анкету:" in chat.last and len(chat.messages) == before + 1
 
-    # 7. Клиент подтвердил анкету — разговор обязан идти дальше, а не встать в тупик.
+    # 8. Клиент подтвердил анкету — разговор обязан идти дальше, а не встать в тупик.
     #    Живой случай Александра (сделка 148): на «Все верно» пришло «Уточню это у команды».
     before = len(chat.messages)
     funnel.says("Все верно")
@@ -264,7 +271,7 @@ def test_lead_journey_from_hello_to_a_question_beyond_the_terms(funnel):
     assert "Стадия C16:UC_ANKETA" not in step, "этап без шага — это тупик"
     assert "Сверка анкеты" in step
 
-    # 8. Три вопроса в одном сообщении: на что есть ответ в документе — отвечаем, остальное
+    # 9. Три вопроса в одном сообщении: на что есть ответ в документе — отвечаем, остальное
     #    уносим людям. Живой случай диалога 764181402.
     before = len(chat.messages)
     funnel.says("Какой ДРР держать и как происходит управление?\n"
@@ -279,7 +286,7 @@ def test_lead_journey_from_hello_to_a_question_beyond_the_terms(funnel):
     assert "комисси" not in card.split("нет:")[-1], \
         "людям уходит ТОЛЬКО то, на что агент не ответил"
 
-    # 9. Инвариант всего пути: в воронке ровно одна сделка этого человека.
+    # 10. Инвариант всего пути: в воронке ровно одна сделка этого человека.
     assert len(portal.deals_of(LEAD["username"])) == 1
 
 
@@ -297,6 +304,7 @@ def test_refilled_anketa_is_surveyed_again(funnel):
     """Клиент исправил анкету — сверяем заново: иначе агент подтвердит устаревшие данные."""
     tg, portal, chat = funnel.tg, funnel.portal, funnel.chat
     funnel.says("Какие условия подключения к ИУ?")
+    funnel.says("Хочу подключиться к ИУ")
     portal.fill_the_form(LEAD["username"], {"UF_CRM_1784297137": "одежда",
                                             "UF_CRM_1784297181": "30000000"})
     tg._check_new_forms()
