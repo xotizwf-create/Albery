@@ -59,6 +59,7 @@ import {
   BookOpen,
   Activity,
   MessageSquare,
+  GitBranch,
   BarChart3,
 } from "lucide-react";
 import { WbCabinet } from "./wbcab/WbCabinet";
@@ -66,6 +67,7 @@ import { DialogsView } from "./agent/views/DialogsView";
 import { AgentsView } from "./agent/views/AgentsView";
 import { KnowledgeBaseView } from "./agent/views/KnowledgeBaseView";
 import { MonitoringView } from "./agent/views/MonitoringView";
+import { FunnelView } from "./agent/views/FunnelView";
 import { UsageView } from "./agent/views/UsageView";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -325,6 +327,7 @@ const HIDDEN_MAIN_MENU_LABELS = new Set(["Бухгалтерия", "Склад",
 const VISIBLE_MENU_ITEMS = MENU_ITEMS.filter((item) => !HIDDEN_MAIN_MENU_LABELS.has(item.label));
 const AGENT_MENU_ITEMS = [
   { label: "Диалоги", icon: MessageSquare },
+  { label: "Воронка ИУ", icon: GitBranch },
   { label: "Агенты", icon: Bot },
   { label: "База знаний", icon: BookOpen },
   { label: "Мониторинг", icon: Activity },
@@ -335,6 +338,7 @@ const AGENT_MENU_ITEMS = [
 const AGENT_TAB_ROUTES: Record<string, string> = {
   "Агенты": "/agent",
   "Диалоги": "/agent-dialogs",
+  "Воронка ИУ": "/agent-funnel",
   "База знаний": "/agent-knowledge",
   "Мониторинг": "/agent-monitoring",
   "Использование": "/agent-usage",
@@ -6260,6 +6264,14 @@ export default function App() {
       return (
         <div className="animate-in fade-in duration-200">
           <KnowledgeBaseView />
+        </div>
+      );
+    }
+
+    if (activeTab === "Воронка ИУ") {
+      return (
+        <div className="animate-in fade-in duration-200">
+          <FunnelView />
         </div>
       );
     }
