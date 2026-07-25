@@ -35,17 +35,20 @@ def _funnel_of_stage(stage: str) -> int | None:
 def _load(db) -> None:
     """Перечитать настройки. Сбой базы не имеет права влиять на разговор с клиентом."""
     stages: dict[tuple[int, str], dict] = {}
-    funnels: dict[int, bool] = {}
+    funnels: dict[int, dict] = {}
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT funnel_id, stage_id, trigger, need, action, enabled"
+                cur.execute("SELECT funnel_id, stage_id, trigger, need, action, enabled, testing"
                             " FROM funnel_scenarios")
                 for row in cur.fetchall():
                     fid = int(row["funnel_id"])
                     stage_id = str(row["stage_id"] or "")
                     if not stage_id:
-                        funnels[fid] = bool(row["enabled"])
+                        # `testing` читаем мягко: колонка появилась миграцией 067, и строка из
+                        # более старого кода (или теста) не обязана её содержать.
+                        funnels[fid] = {"enabled": bool(row["enabled"]),
+                                        "testing": bool(row.get("testing", False))}
                         continue
                     stages[(fid, stage_id)] = {
                         "trigger": str(row["trigger"] or ""),
@@ -79,7 +82,18 @@ def step_override(db, stage: str) -> dict:
 def agent_enabled(db, funnel_id: int) -> bool:
     """Работает ли агент на этой воронке. По умолчанию — да (как было до инструмента)."""
     _fresh(db)
-    return bool((_cache["funnels"] or {}).get(int(funnel_id), True))
+    row = (_cache["funnels"] or {}).get(int(funnel_id))
+    return bool(row.get("enabled", True)) if row else True
+
+
+def testing_mode(db, funnel_id: int) -> bool:
+    """Идёт ли тестирование воронки: эскалации уходят в тестовую группу, а не в рабочую.
+
+    По умолчанию — НЕТ. Сбой базы тоже читается как «нет»: молча увести вопросы живых клиентов
+    в тестовую группу опаснее, чем лишний раз потревожить рабочую."""
+    _fresh(db)
+    row = (_cache["funnels"] or {}).get(int(funnel_id))
+    return bool(row.get("testing", False)) if row else False
 
 
 def invalidate() -> None:

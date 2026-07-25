@@ -24,6 +24,8 @@ from psycopg.types.json import Jsonb
 
 from shared.db import connect as pg_connection, load_env_value as shared_load_env_value, normalize_postgres_url as shared_normalize_postgres_url
 
+import funnel_scenario
+
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -7386,14 +7388,37 @@ def tool_list_crm_lead_contacts(args: dict[str, Any]) -> dict[str, Any]:
 # в базе знаний нет ответа: агент спрашивает живых людей, что ответить.
 IU_GROUP_DIALOG_ID = os.getenv("IU_GROUP_DIALOG_ID", "chat2424").strip()
 IU_AGENT_BOT_ID = int(os.getenv("IU_AGENT_BOT_ID", "86") or 86)
+# Тестовая группа «Тестирование Агента по ИУ» (чат 2714). Пока владелец держит во вкладке воронки
+# галочку «Идёт тестирование», эскалации уходят сюда: база знаний по ИУ ещё не наполнена, агент
+# часто не находит ответ, и этот поток не должен сыпаться в рабочую группу вперемешку с реальными
+# вопросами клиентов (владелец, 25.07.2026).
+IU_TEST_GROUP_DIALOG_ID = os.getenv("IU_TEST_GROUP_DIALOG_ID", "chat2714").strip()
+IU_FUNNEL_ID = int(os.getenv("IU_FUNNEL_ID", "16") or 16)
+
+
+def iu_group_dialog_id() -> str:
+    """Куда уносить вопрос: рабочая группа или тестовая.
+
+    Признак — флаг в настройках воронки (`funnel_scenarios`, stage_id=''), тот же, где живёт
+    выключатель агента. Сбой базы читается как «тестирования нет»: увести вопрос живого клиента
+    в тестовую группу молча хуже, чем лишний раз потревожить рабочую."""
+    try:
+        if funnel_scenario.testing_mode(connect, IU_FUNNEL_ID):
+            return IU_TEST_GROUP_DIALOG_ID
+    except Exception:  # noqa: BLE001 — вопрос клиента важнее флага
+        logger.warning("режим тестирования не прочитан — эскалация идёт в рабочую группу",
+                       exc_info=True)
+    return IU_GROUP_DIALOG_ID
 
 
 def tool_notify_iu_group(args: dict[str, Any]) -> dict[str, Any]:
-    """Написать в группу «Работа с ИУ» от лица Агента по работе с ИУ."""
+    """Написать в группу «Работа с ИУ» от лица Агента по работе с ИУ.
+
+    Явно переданный `dialog_id` сильнее флага тестирования — им пользуются служебные вызовы."""
     text = str(args.get("text") or "").strip()
     if not text:
         raise McpError(-32602, "text обязателен.")
-    dialog_id = str(args.get("dialog_id") or IU_GROUP_DIALOG_ID).strip()
+    dialog_id = str(args.get("dialog_id") or iu_group_dialog_id()).strip()
     bot_id = int(args.get("bot_id") or IU_AGENT_BOT_ID)
     res = _crm_call("imbot.message.add", {
         "BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text[:20000]})

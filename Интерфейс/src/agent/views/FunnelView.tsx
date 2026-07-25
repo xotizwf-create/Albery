@@ -31,6 +31,7 @@ interface Funnel {
   agent: boolean;
   customized_stages: number;
   enabled: boolean;
+  testing: boolean;
 }
 
 interface ChainStage {
@@ -82,12 +83,14 @@ const FIELD_LABEL: Record<string, string> = {
   action: "что делает агент",
   trigger: "когда наступает этап",
   enabled: "агент на воронке",
+  testing: "режим тестирования",
 };
 
 export function FunnelView() {
   const [funnels, setFunnels] = useState<Funnel[]>([]);
   const [funnelId, setFunnelId] = useState<number | null>(null);
   const [enabled, setEnabled] = useState(true);
+  const [testing, setTesting] = useState(false);
   const [isAgentFunnel, setIsAgentFunnel] = useState(false);
   const [chain, setChain] = useState<ChainStage[]>([]);
   const [rules, setRules] = useState<Rule[]>([]);
@@ -125,6 +128,7 @@ export function FunnelView() {
         setRules(map.rules || []);
         setInvariants(map.invariants || []);
         setEnabled(!!map.enabled);
+        setTesting(!!map.testing);
         setIsAgentFunnel(!!map.agent);
         setDecisions(trace.decisions || []);
         setError("");
@@ -212,6 +216,30 @@ export function FunnelView() {
       );
       setEnabled(next);
       setNotice(next ? "Агент включён на воронке." : "Агент остановлен: отвечают только люди.");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const toggleTesting = async () => {
+    if (funnelId === null) return;
+    const next = !testing;
+    try {
+      await fetchJsonSafe(
+        `/api/agent-center/funnel/${funnelId}/testing`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ testing: next }),
+        },
+        60000,
+      );
+      setTesting(next);
+      setNotice(
+        next
+          ? "Идёт тестирование: вопросы без ответа уходят в группу «Тестирование Агента по ИУ»."
+          : "Тестирование выключено: вопросы без ответа снова уходят в «Работа с ИУ».",
+      );
     } catch (e) {
       setError((e as Error).message);
     }
@@ -325,6 +353,30 @@ export function FunnelView() {
             {enabled ? "Остановить агента" : "Включить агента"}
           </button>
         </div>
+      )}
+
+      {/* Режим тестирования: эскалации уходят в тестовую группу, а не в рабочую */}
+      {isAgentFunnel && (
+        <label
+          className={cn(
+            "flex cursor-pointer items-start gap-3 rounded-xl border p-4",
+            testing ? "border-amber-300 bg-amber-50" : "border-gray-200 bg-white",
+          )}
+        >
+          <input
+            type="checkbox"
+            checked={testing}
+            onChange={toggleTesting}
+            className="mt-0.5 h-4 w-4 cursor-pointer accent-amber-500"
+          />
+          <div>
+            <div className="text-sm font-medium text-gray-900">Идёт тестирование</div>
+            <div className="text-xs text-gray-500">
+              Вопросы клиентов, на которые у агента нет ответа в базе знаний, уходят в группу
+              «Тестирование Агента по ИУ». Снимите галочку — вернутся в «Работа с ИУ».
+            </div>
+          </div>
+        </label>
       )}
 
       {showHistory && (

@@ -151,6 +151,7 @@ def funnels_list():
         "agent": f["id"] == AGENT_FUNNEL_ID,
         "customized_stages": saved.get(f["id"], 0),
         "enabled": funnel_scenario.agent_enabled(pg_connect, f["id"]),
+        "testing": funnel_scenario.testing_mode(pg_connect, f["id"]),
     } for f in funnels]})
 
 
@@ -189,6 +190,7 @@ def funnel_map(funnel_id: int):
             "funnel_id": funnel_id,
             "agent": funnel_id == AGENT_FUNNEL_ID,
             "enabled": funnel_scenario.agent_enabled(pg_connect, funnel_id),
+            "testing": funnel_scenario.testing_mode(pg_connect, funnel_id),
             "chain": chain,
             "rules": rules if funnel_id == AGENT_FUNNEL_ID else [],
             "invariants": list(INVARIANTS) if funnel_id == AGENT_FUNNEL_ID else [],
@@ -263,6 +265,38 @@ def funnel_toggle(funnel_id: int):
     log.info("агент на воронке %s %s из кабинета (%s)", funnel_id,
              "включён" if enabled else "ОСТАНОВЛЕН", author)
     return jsonify({"enabled": enabled})
+
+
+@app.post("/api/agent-center/funnel/<int:funnel_id>/testing")
+def funnel_testing_toggle(funnel_id: int):
+    """Идёт тестирование: эскалации агента уходят в тестовую группу, а не в рабочую.
+
+    Владелец 25.07.2026 — пока база знаний по ИУ не наполнена, агент часто не находит ответ и
+    уносит вопрос людям; на время наладки этот поток не должен смешиваться с реальными вопросами
+    клиентов в группе «Работа с ИУ»."""
+    body = request.get_json(silent=True) or {}
+    testing = bool(body.get("testing"))
+    author = _author()
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO funnel_scenarios (funnel_id, stage_id, testing, updated_by)"
+                    " VALUES (%s, '', %s, %s)"
+                    " ON CONFLICT (funnel_id, stage_id) DO UPDATE SET testing = EXCLUDED.testing,"
+                    " updated_at = now(), updated_by = EXCLUDED.updated_by",
+                    (funnel_id, testing, author))
+                cur.execute(
+                    "INSERT INTO funnel_scenario_history (funnel_id, stage_id, field, old_value,"
+                    " new_value, author) VALUES (%s, '', 'testing', %s, %s, %s)",
+                    (funnel_id, str(not testing), str(testing), author))
+    except Exception:  # noqa: BLE001
+        log.exception("режим тестирования воронки %s не сохранён", funnel_id)
+        return jsonify({"error": "Не удалось переключить режим тестирования."}), 500
+    funnel_scenario.invalidate()
+    log.info("режим тестирования воронки %s %s из кабинета (%s)", funnel_id,
+             "ВКЛЮЧЁН — эскалации в тестовую группу" if testing else "выключен", author)
+    return jsonify({"testing": testing})
 
 
 @app.get("/api/agent-center/funnel/<int:funnel_id>/history")
