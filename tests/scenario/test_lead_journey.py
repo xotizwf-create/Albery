@@ -165,6 +165,18 @@ def funnel(monkeypatch, tmp_path):
     said: list[str] = []
 
     def model(prompt, session, toolsets=None):
+        if "ИСТОЧНИКИ" in prompt and "ВОПРОСЫ" in prompt:
+            # Разбор вопросов по источникам: про комиссию в документе есть, про ДРР — нет.
+            rows = []
+            for line in prompt.split("ВОПРОСЫ:")[1].strip().splitlines():
+                q = line.split(".", 1)[-1].strip()
+                if "комисси" in q.lower():
+                    rows.append({"вопрос": q, "ответ": "Комиссия 12% — и в неё уже входит "
+                                                       "приоритет в выдаче.", "источник": "условия"})
+                else:
+                    rows.append({"вопрос": q, "ответ": "НЕТ_ОТВЕТА", "источник": ""})
+            import json as _json
+            return _json.dumps(rows, ensure_ascii=False)
         """Модель, которая СОБЛЮДАЕТ правила: проверяем свой скелет, а не сочинительство LLM.
 
         Решение принимаем по СЛОВАМ КЛИЕНТА, а не по промпту: в промпт входят правила, где
@@ -252,13 +264,20 @@ def test_lead_journey_from_hello_to_a_question_beyond_the_terms(funnel):
     assert "Стадия C16:UC_ANKETA" not in step, "этап без шага — это тупик"
     assert "Сверка анкеты" in step
 
-    # 8. Вопрос ПОВЕРХ условий (в документе такого нет) — людям, клиенту одна строка.
+    # 8. Три вопроса в одном сообщении: на что есть ответ в документе — отвечаем, остальное
+    #    уносим людям. Живой случай диалога 764181402.
     before = len(chat.messages)
-    funnel.says("Какой ДРР держать и как происходит управление?")
-    assert tg.TERMS_ASK_HUMAN_REPLY in chat.last, "второй документ клиенту не дублируем"
-    assert len(chat.messages) == before + 1
-    assert portal.escalations, "вопрос обязан уйти живым людям"
-    assert "дрр" in portal.escalations[-1].lower()
+    funnel.says("Какой ДРР держать и как происходит управление?\n"
+                "+какая комиссия ваша по партнерской этой программе?")
+    assert len(chat.messages) == before + 1, "один ответ одним сообщением"
+    assert "Комиссия 12%" in chat.last, "на известный вопрос агент ответил сам"
+    assert "Индивидуальные условия снижают комиссию" not in chat.last, "документ не дублируем"
+    assert tg.TERMS_PENDING_NOTE in chat.last, "про остальное клиент предупреждён честно"
+    assert portal.escalations, "нерешённое обязано уйти живым людям"
+    card = portal.escalations[-1].lower()
+    assert "дрр" in card
+    assert "комисси" not in card.split("нет:")[-1], \
+        "людям уходит ТОЛЬКО то, на что агент не ответил"
 
     # 9. Инвариант всего пути: в воронке ровно одна сделка этого человека.
     assert len(portal.deals_of(LEAD["username"])) == 1

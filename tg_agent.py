@@ -35,6 +35,7 @@ from pathlib import Path
 
 import requests
 
+import answering           # разбор вопросов клиента и ответы строго по источникам
 import client_message      # единственная сборка сообщений, которые отправляет код
 import funnel_rules        # правила воронки как данные: факты → решение + его причина
 
@@ -2290,6 +2291,8 @@ TERMS_REQUEST_MARKER = "ПОКАЖИ_УСЛОВИЯ"
 # который в документе нет, уносим людям И пишем клиенту одну строку, чтобы он не сидел в тишине
 # (тот же случай, что был с Георгием: молчание оставляет клиента без понимания, ответят ли ему).
 TERMS_ASK_HUMAN_REPLY = "Уточню это у команды и вернусь с ответом."
+# Часть вопросов агент ответил сам, часть ушла людям — клиент должен об этом знать честно.
+TERMS_PENDING_NOTE = "По остальному уточню у команды и вернусь с ответом."
 # А это — на случай, когда маркер условий сработал вхолостую: человек НИЧЕГО не спросил, он
 # просто подтвердил анкету («Все верно»), а модель всё равно вернула маркер. 24.07.2026 Александр
 # получил на «Все верно» ответ «Уточню это у команды» — тупик вместо разговора. Живой менеджер в
@@ -2321,6 +2324,48 @@ def _mark_terms_sent(user_id: int) -> None:
 def _wants_terms_again(text: str) -> bool:
     """Человек просит именно ПРИСЛАТЬ условия заново, а не спрашивает что-то поверх них."""
     return bool(funnel_rules.RESEND_RE.search(text or ""))
+
+
+def _answer_from_sources(author: dict, text: str, deal_id: int | None,
+                         texts_to_journal: list[str] | None = None) -> bool:
+    """Ответить на вопросы клиента по источникам; что осталось — унести людям.
+
+    Владелец 25.07.2026: «если он знает ответ на несколько вопросов, пусть отвечает на них, а на
+    то что не знает — пусть эскалирует менеджеру». Источник фактов — документ условий: именно по
+    нему клиент задаёт вопросы после его получения."""
+    uid = author.get("id")
+    questions = answering.split_questions(text)
+    try:
+        sources = terms_text()
+    except Exception as exc:  # noqa: BLE001 — без источника отвечать нечем, решают люди
+        log.warning("источники для ответа недоступны: %s", str(exc)[:200])
+        sources = ""
+    results = answering.answer_questions(questions, sources, _ask_model) if sources else []
+    known = [r for r in results if r.known]
+    pending = answering.unknown(results) if results else questions
+
+    if not known:
+        return False        # ответить нечем — обычная передача людям
+    note = TERMS_PENDING_NOTE if pending else ""
+    body = answering.client_text(results, pending_note=note)
+    message = client_message.compose(body, name=_name_for_uid(uid), greet=_first_contact(uid))
+    ok, err = send_html(uid, as_html(message), message)
+    if pending:
+        escalate_to_human(author, "клиент спросил, а в источниках этого нет: "
+                                  + "; ".join(pending)[:200], text, answered=True)
+    for t in texts_to_journal or []:
+        journal(MANAGER_CHANNEL, uid, "in", t, kind="lead_chat", user=author)
+    journal(MANAGER_CHANNEL, uid, "out", message if ok else f"{message}\n\n[не доставлено: {err}]",
+            kind="lead_chat", user=author, status="ok" if ok else "error",
+            meta={"deal_id": deal_id, "answered": len(known), "escalated": bool(pending)})
+    log.info("лид %s: ответил на %d из %d вопросов, людям ушло %d",
+             uid, len(known), len(results), len(pending))
+    return ok
+
+
+def _ask_model(prompt: str) -> str:
+    """Один вопрос модели без инструментов — для разбора ответов по источникам."""
+    return hermes_answer(prompt, f"answering-{uuid.uuid4().hex[:8]}")
 
 
 def _terms_question_to_humans(author: dict, client_text: str,
@@ -2842,6 +2887,13 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
         # Что делать — решает реестр правил (funnel_rules), а не цепочка условий здесь.
         decision = funnel_rules.decide(_facts_for_turn(author, text, deal_id, wants_terms=True))
         log.info("лид %s: %s", author_id, funnel_rules.explain(decision))
+        if decision.action == funnel_rules.ANSWER_QUESTIONS:
+            # Сначала пробуем ответить по источникам; получилось — людям уходит только то,
+            # чего в источниках нет. Не получилось ничего — обычная передача людям.
+            if _answer_from_sources(author, text, deal_id):
+                return
+            _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
+            return
         if decision.action == funnel_rules.TERMS_TO_HUMANS:
             _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
             return

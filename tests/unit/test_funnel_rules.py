@@ -30,13 +30,24 @@ def test_resend_request_sends_the_document_again():
     assert d.rule == "просят выслать условия заново"
 
 
-def test_question_on_top_of_terms_goes_to_humans():
-    """Диалог 764181402: «Какой дрр нужно держать и как происходит управление?»"""
+def test_questions_on_top_of_terms_are_answered_from_sources():
+    """Диалог 764181402: «Какой дрр нужно держать и как происходит управление?»
+
+    С фазы 2 агент не молчит и не вываливает документ второй раз: он отвечает на то, что есть в
+    источниках, а остальное уносит людям."""
     d = fr.decide(facts(text="Какой дрр нужно держать и как происходит управление?",
                         wants_terms=True, terms_sent=True))
 
-    assert d.action == fr.TERMS_TO_HUMANS
+    assert d.action == fr.ANSWER_QUESTIONS
     assert "764181402" in d.origin, "правило несёт причину появления"
+
+
+def test_thanks_without_a_question_does_not_dump_the_document():
+    """Живой случай 25.07.2026: на «Поняла, спасибо» реестр был готов выслать условия."""
+    d = fr.decide(facts(text="Поняла, спасибо", wants_terms=True))
+
+    assert d.action == fr.CONTINUE_STEP
+    assert d.rule == "подтверждение без интереса к ИУ"
 
 
 def test_confirmation_continues_the_conversation():
