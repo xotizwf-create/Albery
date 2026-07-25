@@ -36,6 +36,7 @@ from pathlib import Path
 import requests
 
 import client_message      # единственная сборка сообщений, которые отправляет код
+import funnel_rules        # правила воронки как данные: факты → решение + его причина
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -1559,12 +1560,41 @@ def _deal_for_watch(deal_id: int) -> dict:
     return deal.get("deal") or deal
 
 
-def _survey_stages() -> tuple[str, ...]:
-    """Этапы, на которых сверка анкеты ещё уместна.
+def _facts_for_turn(author: dict, text: str, deal_id: int | None = None, *,
+                    wants_terms: bool = False, deal: dict | None = None) -> funnel_rules.Facts:
+    """Снимок состояния на один ход: собирается ОДИН раз, дальше решения читают только его.
 
-    «Анкета заполнена» входит обязательно: именно на него склейка ставит сделку, и без него
-    сторож молчал (регрессия 24.07.2026). Считаем при вызове — константы этапов объявлены ниже."""
-    return (STAGE_NEW, STAGE_CONTACTED, STAGE_FORM_DONE)
+    Раньше каждая проверка сама лазила в CRM, состояние и журнал — и разные части одного хода
+    могли видеть разную картину."""
+    uid = to_int_safe(author.get("id"))
+    state = load_state()
+    stage, anketa = "", ""
+    if deal is None and deal_id:
+        try:
+            deal = _deal_for_watch(deal_id)
+        except Exception:  # noqa: BLE001 — без сделки решение всё равно нужно принять
+            log.warning("факты хода: сделка %s недоступна", deal_id, exc_info=True)
+            deal = None
+    if deal:
+        stage = str(deal.get("stage_id") or deal.get("stage") or "")
+        anketa = anketa_block(deal)
+    fingerprint = _anketa_fingerprint(anketa) if anketa else ""
+    return funnel_rules.Facts(
+        uid=uid,
+        name=(author.get("first_name") or _name_for_uid(uid) or "").strip(),
+        username=str(author.get("username") or ""),
+        text=text or "",
+        deal_id=deal_id,
+        stage=stage,
+        anketa=anketa,
+        anketa_fingerprint=fingerprint,
+        anketa_seen=str((state.get("anketa_seen") or {}).get(str(uid)) or ""),
+        legacy_surveyed=(str(uid) not in (state.get("anketa_seen") or {})
+                         and str((state.get("form_surveyed") or {}).get(str(uid))) == str(deal_id)),
+        terms_sent=bool((state.get("terms_sent") or {}).get(str(uid))),
+        first_contact=_first_contact(uid),
+        wants_terms=wants_terms,
+    )
 
 
 def _anketa_fingerprint(block: str) -> str:
@@ -1605,23 +1635,18 @@ def _check_new_forms() -> None:
             if merged.get("merged"):
                 deal_id = merged["kept"]
             deal = _deal_for_watch(deal_id)
-            block = anketa_block(deal)
-            if not block:
-                continue        # анкеты ещё нет — сверять нечего
-            fingerprint = _anketa_fingerprint(block)
-            fresh = load_state()
-            seen = fresh.get("anketa_seen") or {}
-            if seen.get(uid_str) == fingerprint:
-                continue        # эти данные уже сверяли
-            # Уважаем прежнюю отметку: тем, кому сверку уже отправляли ДО перехода на отпечатки,
-            # второй раз её не шлём — просто запоминаем данные. Только для тех, у кого отпечатка
-            # ещё нет: иначе правило съело бы и честное перезаполнение анкеты.
-            legacy_done = (uid_str not in seen
-                           and str((fresh.get("form_surveyed") or {}).get(uid_str)) == str(deal_id))
-            stage = str(deal.get("stage_id") or deal.get("stage") or "")
-            if legacy_done or stage not in _survey_stages():
-                _remember_anketa(uid_str, deal_id, fingerprint)
+            author = {"id": to_int_safe(uid_str), "username": username}
+            facts = _facts_for_turn(author, "", deal_id, deal=deal)
+            decision = funnel_rules.decide(facts, slot="watch")
+            block, fingerprint = facts.anketa, facts.anketa_fingerprint
+            if decision.action != funnel_rules.SEND_SURVEY:
+                log.debug("сторож анкеты %s: %s", uid_str, funnel_rules.explain(decision))
+                if block:
+                    # Данные есть, но сверять их не надо (уже сверяли / сделка ушла дальше) —
+                    # запоминаем, чтобы не возвращаться к ним каждый проход.
+                    _remember_anketa(uid_str, deal_id, fingerprint)
                 continue
+            stage = facts.stage
             # Анкета есть — этап обязан это показывать. Склейка ставит его сама, но когда дубля
             # не было (сделку создала только форма), этап так и оставался «Связались».
             if stage in (STAGE_NEW, STAGE_CONTACTED):
@@ -2034,20 +2059,16 @@ CRM_TELEGRAM_FIELD = os.getenv("CRM_TELEGRAM_FIELD", "UF_CRM_1784296997").strip(
 
 # Первые этапы воронки (владелец, 24.07.2026): написал про ИУ → «Новый лид», ответили →
 # «Связались», заполнил анкету → «Анкета заполнена». Дальше — согласование условий и т.д.
-STAGE_NEW = os.getenv("CRM_STAGE_NEW", "C16:NEW").strip()
-STAGE_CONTACTED = os.getenv("CRM_STAGE_CONTACTED", "C16:CONTACTED").strip()
-STAGE_FORM_DONE = os.getenv("CRM_STAGE_FORM_DONE", "C16:UC_ANKETA").strip()
-
-# Сделку заводим ТОЛЬКО тем, кто спрашивает про ИУ (решение владельца): на аккаунт пишут и
-# поставщики, и знакомые — им в воронке не место.
-_IU_INTENT_RE = re.compile(
-    r"\bи\.?у\b|индивидуальн\w* услови|подключ\w*|присоедин\w*|услови\w*|комисси\w*|"
-    r"тариф\w*|сотрудничеств\w*|сколько стоит|цен[аыу]\b|прайс", re.I)
+# Заданы в funnel_rules — там же, где правила, которые на них смотрят: список этапов сверки и
+# сами константы однажды разошлись, и сторож анкеты замолчал.
+STAGE_NEW = funnel_rules.STAGE_NEW
+STAGE_CONTACTED = funnel_rules.STAGE_CONTACTED
+STAGE_FORM_DONE = funnel_rules.STAGE_FORM_DONE
 
 
 def _iu_intent(texts: list[str]) -> bool:
     """Человек интересуется подключением к ИУ, а не просто болтает?"""
-    return bool(_IU_INTENT_RE.search(" ".join(texts or [])))
+    return bool(funnel_rules.IU_INTENT_RE.search(" ".join(texts or [])))
 
 
 def _open_lead_deal(username: str, telegram_id, name: str = "") -> int | None:
@@ -2275,19 +2296,13 @@ TERMS_ASK_HUMAN_REPLY = "Уточню это у команды и вернусь
 # этот момент спрашивает про вопросы по условиям и ведёт к договору.
 TERMS_FOLLOWUP_REPLY = ("Отлично, спасибо! Условия я отправлял выше — остались по ним вопросы? "
                         "Если всё понятно, пришлите реквизиты организации, и я подготовлю договор.")
-# Вопрос ли это. Нужен, чтобы людям уходили именно ВОПРОСЫ, а не «ок», «да», «все верно».
-_QUESTION_RE = re.compile(
-    r"\?|\bкак(ой|ая|ие|ое|ов|to)?\b|\bсколько\b|\bчто\b|\bпочему\b|\bзачем\b|\bкогда\b|"
-    r"\bгде\b|\bкуда\b|\bчем\b|\bможно ли\b|\bа если\b|\bнасколько\b|\bкакова\b", re.I)
+# Разбор текста (вопрос ли это, просьба выслать заново, интерес к ИУ) живёт в funnel_rules —
+# там же, где правила, которые на него смотрят.
 
 
 def _looks_like_question(text: str) -> bool:
     """Клиент о чём-то спрашивает, а не просто подтверждает?"""
-    return bool(_QUESTION_RE.search(text or ""))
-# Просьба выслать условия заново — тогда документ отправляем снова, это не «вопрос вне документа».
-_TERMS_RESEND_RE = re.compile(
-    r"ещ[её]\s+раз|повтор\w*|продублир\w*|снова|заново|не\s+приш\w*|не\s+получ\w*|"
-    r"не\s+открыв\w*|не\s+вид\w*\s+(файл|документ|сообщ)", re.I)
+    return bool(funnel_rules.QUESTION_RE.search(text or ""))
 
 
 def _terms_already_sent(user_id: int) -> bool:
@@ -2305,7 +2320,7 @@ def _mark_terms_sent(user_id: int) -> None:
 
 def _wants_terms_again(text: str) -> bool:
     """Человек просит именно ПРИСЛАТЬ условия заново, а не спрашивает что-то поверх них."""
-    return bool(_TERMS_RESEND_RE.search(text or ""))
+    return bool(funnel_rules.RESEND_RE.search(text or ""))
 
 
 def _terms_question_to_humans(author: dict, client_text: str,
@@ -2511,8 +2526,12 @@ def reply_to_stranger(author: dict, texts: list[str] | str) -> bool:
     name = (author.get("first_name") or "").strip()
     # Спросил про ИУ — сразу заводим сделку на «Новом лиде», ещё до ответа (владелец,
     # 24.07.2026: «как только лид пишет на линию — сразу создаётся сделка с его юзернеймом»).
+    # Заводить ли сделку — решает реестр правил на снимке фактов, а не условие по месту.
+    entry = funnel_rules.decide(_facts_for_turn(author, text))
     new_deal = _open_lead_deal(author.get("username") or "", author_id, name) \
-        if _iu_intent(texts) else None
+        if entry.action == funnel_rules.OPEN_DEAL else None
+    if new_deal:
+        log.info("незнакомец %s: %s", author_id, funnel_rules.explain(entry))
     # Роль из карточки ЗАМЕНЯЕТ встроенный сценарий, а не дополняет его. Склейка давала
     # противоречивый промпт: роль велит сперва проверить воронку, а встроенный текст — сразу
     # слать анкету. Агент шёл по встроенному, и владелец получал «после обработки анкеты
@@ -2820,15 +2839,15 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
     # 24.07.2026 у лида такого механизма не было (маркер работал только у незнакомца), и
     # клиент получил самодельную выжимку вместо условий.
     if TERMS_REQUEST_MARKER in answer:
-        # Второй раз документ не дублируем: вопрос поверх условий — людям (решение владельца).
-        if _terms_already_sent(author_id) and not _wants_terms_again(text):
-            if _looks_like_question(text):
-                _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
-                return
+        # Что делать — решает реестр правил (funnel_rules), а не цепочка условий здесь.
+        decision = funnel_rules.decide(_facts_for_turn(author, text, deal_id, wants_terms=True))
+        log.info("лид %s: %s", author_id, funnel_rules.explain(decision))
+        if decision.action == funnel_rules.TERMS_TO_HUMANS:
+            _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
+            return
+        if decision.action == funnel_rules.CONTINUE_STEP:
             # Человек ничего не спросил — просто подтвердил анкету. Маркер сработал вхолостую:
             # людей не дёргаем и в тупик не встаём, а ведём разговор дальше по шагу воронки.
-            log.info("лид %s: маркер условий на подтверждении «%s» — отвечаем по шагу воронки",
-                     author_id, text[:40])
             answer = TERMS_FOLLOWUP_REPLY      # дальше идём обычным путём ответа клиенту
         else:
             try:
