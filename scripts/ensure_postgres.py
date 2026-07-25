@@ -46,6 +46,9 @@ REQUIRED_FUNCTION_MIGRATIONS = {
 }
 
 ALWAYS_APPLY_MIGRATIONS = [
+    # Колонка в уже существующей таблице: проверка «нет таблицы — накатить» её не поймает,
+    # поэтому идемпотентный ADD COLUMN IF NOT EXISTS применяется каждый раз.
+    "067_funnel_testing_mode.sql",
     # Idempotent WB resumable sync state. 055 also covers catalogue columns
     # that older, already-created WB schemas could otherwise silently miss.
     "054_wb_sync_state_v2.sql",
