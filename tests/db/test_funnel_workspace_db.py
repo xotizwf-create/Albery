@@ -529,3 +529,61 @@ def test_waiting_client_is_listed_first_and_reports_its_wait():
                     "DELETE FROM funnel_workspace_sources WHERE source_key = %s",
                     (source_key,),
                 )
+
+
+def test_operator_can_move_the_stage_without_a_sent_message():
+    """Живой случай 26.07.2026: смена этапа из рабочего окна отвергалась проверкой
+    таблицы — строка move_stage требовала ссылку на отправленное сообщение, которой при
+    ручной смене нет."""
+    suffix = uuid4().hex
+    source_key = f"test-operator-stage-{suffix}"
+    conversation_id: int | None = None
+    try:
+        store.ensure_source(source_key, source_type="test", display_name="Stage DB test")
+        conversation = store.ensure_conversation(
+            source_key=source_key,
+            external_chat_id=f"chat-{suffix}",
+            business_connection_id=f"connection-{suffix}",
+            external_user_id=9_000_000_103,
+            display_name="Смена этапа",
+        )
+        conversation_id = int(conversation["id"])
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO funnel_workspace_messages (
+                        conversation_id, external_message_id, author_type,
+                        direction, text, delivery_status
+                    )
+                    VALUES (%s, %s, 'client', 'inbound', 'Здравствуйте', 'sent')
+                    """,
+                    (conversation_id, f"m-{suffix}"),
+                )
+
+        result = store.enqueue_operator_stage_change(
+            conversation_id,
+            target_stage="C16:NDA",
+            expected_version=conversation["state_version"],
+            operator_name="Юлия",
+        )
+
+        # Этап виден оператору сразу, а в Битрикс его переставит очередь.
+        assert result["conversation"]["stage_id"] == "C16:NDA"
+        action = result["crm_action"]
+        assert action["action_type"] == "move_stage"
+        assert action["outbox_id"] is None
+        assert action["processing_status"] == "pending"
+        assert store.get_conversation(conversation_id)["stage_id"] == "C16:NDA"
+    finally:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                if conversation_id is not None:
+                    cur.execute(
+                        "DELETE FROM funnel_workspace_conversations WHERE id = %s",
+                        (conversation_id,),
+                    )
+                cur.execute(
+                    "DELETE FROM funnel_workspace_sources WHERE source_key = %s",
+                    (source_key,),
+                )

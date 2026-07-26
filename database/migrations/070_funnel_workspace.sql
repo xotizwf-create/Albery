@@ -379,8 +379,9 @@ CREATE TABLE IF NOT EXISTS funnel_workspace_crm_actions (
             AND target_stage IS NULL
         )
         OR (
+            -- ``outbox_id`` заполнен, когда этап двигает доставка сообщения, и пуст,
+            -- когда этап меняет оператор из рабочего окна.  Обязателен только сам этап.
             action_type = 'move_stage'
-            AND outbox_id IS NOT NULL
             AND target_stage IS NOT NULL
             AND char_length(btrim(target_stage)) BETWEEN 1 AND 200
         )

@@ -1133,6 +1133,21 @@ def test_operator_stage_change_is_shown_at_once_and_queued_for_bitrix():
     assert any(sql.startswith("INSERT INTO funnel_workspace_crm_actions") for sql in statements)
 
 
+def test_migration_allows_a_stage_move_without_a_sent_message():
+    migration = (
+        Path(__file__).resolve().parents[2]
+        / "database"
+        / "migrations"
+        / "071_workspace_operator_stage.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "funnel_workspace_crm_actions" in migration
+    assert "move_stage" in migration
+    assert "VALIDATE CONSTRAINT" in migration
+    # Требование к самому этапу обязано сохраниться — иначе в CRM уедет мусор.
+    assert "char_length(btrim(target_stage)) BETWEEN 1 AND 200" in migration
+
+
 def test_operator_stage_change_respects_the_expected_version():
     def respond(sql, _params):
         if sql.startswith("SELECT * FROM funnel_workspace_conversations"):

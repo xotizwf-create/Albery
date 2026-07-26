@@ -113,6 +113,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Idempotent: standalone funnel workspace (durable Telegram inbox/outbox, conversations,
     # control leases and audit trail). It intentionally does not import legacy personal chats.
     "070_funnel_workspace.sql",
+    # Idempotent: operator-initiated stage moves have no outbox row behind them.
+    "071_workspace_operator_stage.sql",
 ]
 
 
