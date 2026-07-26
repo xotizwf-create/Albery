@@ -66,6 +66,11 @@ export interface Conversation {
   stage_id: string | null;
   /** С какого момента клиент ждёт ответа; null — ответ уже дан. */
   awaiting_reply_since?: string | null;
+  /** «urgent» — клиент ждёт ответа дольше порога; считает сервер. */
+  urgency?: "urgent" | "working" | string;
+  waiting_minutes?: number | null;
+  /** Постоянный адрес обращения: /agent-funnels/<id>. */
+  url?: string;
   stage_name: string | null;
   assigned_to: string | null;
 }

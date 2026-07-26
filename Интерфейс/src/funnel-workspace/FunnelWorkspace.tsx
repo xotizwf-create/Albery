@@ -95,6 +95,15 @@ const formatWaiting = (minutes: number) => {
 const stageColor = (index: number) =>
   STAGE_COLORS[Math.min(Math.max(index, 0), STAGE_COLORS.length - 1)];
 
+const WORKSPACE_PATH = "/agent-funnels";
+
+/** Идентификатор обращения из адреса: /agent-funnels/12 → 12. */
+const conversationIdFromPath = (): number | null => {
+  if (typeof window === "undefined") return null;
+  const match = window.location.pathname.match(/^\/agent-funnels\/(\d+)\/?$/);
+  return match ? Number(match[1]) : null;
+};
+
 const stringId = (id: Conversation["id"] | null | undefined) =>
   id === null || id === undefined ? "" : String(id);
 
@@ -926,10 +935,12 @@ function ConversationList({
   stageOptions,
   stageLabels,
   stageColors,
+  urgency,
   urgentAfterMinutes,
   now,
   onQueryChange,
   onStageChange,
+  onUrgencyChange,
   onSelect,
   onRefresh,
   onLoadMore,
@@ -945,10 +956,12 @@ function ConversationList({
   stageOptions: Array<{ value: string; label: string; color?: string }>;
   stageLabels: Record<string, string>;
   stageColors: Record<string, string>;
+  urgency: string;
   urgentAfterMinutes: number;
   now: number;
   onQueryChange: (value: string) => void;
   onStageChange: (value: string) => void;
+  onUrgencyChange: (value: string) => void;
   onSelect: (conversation: Conversation) => void;
   onRefresh: () => void;
   onLoadMore: () => void;
@@ -1043,13 +1056,24 @@ function ConversationList({
           )}
         </div>
 
-        <SelectMenu
-          className="mt-2"
-          ariaLabel="Фильтр по этапу воронки"
-          value={stage}
-          onChange={onStageChange}
-          options={[{ value: "all", label: "Все этапы" }, ...stageOptions]}
-        />
+        <div className="mt-2 grid grid-cols-2 gap-2">
+          <SelectMenu
+            ariaLabel="Фильтр по срочности"
+            value={urgency}
+            onChange={onUrgencyChange}
+            options={[
+              { value: "all", label: "Вся срочность" },
+              { value: "urgent", label: "Очень срочные", color: "#dc2626" },
+              { value: "working", label: "В работе", color: "#059669" },
+            ]}
+          />
+          <SelectMenu
+            ariaLabel="Фильтр по этапу воронки"
+            value={stage}
+            onChange={onStageChange}
+            options={[{ value: "all", label: "Все этапы" }, ...stageOptions]}
+          />
+        </div>
 
         {exportOpen && (
           <div className="mt-3 rounded-2xl border border-violet-100 bg-violet-50/55 p-3">
@@ -2176,6 +2200,7 @@ function OperatorWorkspace({
   const [queryInput, setQueryInput] = useState("");
   const [query, setQuery] = useState("");
   const [stage, setStage] = useState("all");
+  const [urgency, setUrgency] = useState("all");
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -2304,6 +2329,7 @@ function OperatorWorkspace({
         const payload = await funnelWorkspaceApi.getConversations({
           q: query,
           stage,
+          urgency,
           limit: 100,
           offset: 0,
         });
@@ -2334,7 +2360,7 @@ function OperatorWorkspace({
         if (!quiet) setListLoading(false);
       }
     },
-    [query, reportError, stage],
+    [query, reportError, stage, urgency],
   );
 
   const loadMoreConversations = useCallback(async () => {
@@ -2345,6 +2371,7 @@ function OperatorWorkspace({
       const payload = await funnelWorkspaceApi.getConversations({
         q: query,
         stage,
+        urgency,
         limit: 100,
         offset: conversations.length,
       });
@@ -2368,6 +2395,7 @@ function OperatorWorkspace({
     query,
     reportError,
     stage,
+    urgency,
   ]);
 
   const fetchMessages = useCallback(
@@ -2520,6 +2548,9 @@ function OperatorWorkspace({
     const alreadySelected =
       stringId(selectedIdRef.current) === stringId(conversation.id);
     setSelectedId(conversation.id);
+    if (typeof window !== "undefined") {
+      window.history.replaceState(null, "", `${WORKSPACE_PATH}/${conversation.id}`);
+    }
     mobilePaneRef.current = "chat";
     setMobilePane("chat");
     if (alreadySelected) void fetchMessages(conversation.id);
@@ -2530,6 +2561,37 @@ function OperatorWorkspace({
     const id = selectedIdRef.current;
     if (id !== null) await fetchMessages(id);
   }, [fetchMessages, loadConversations]);
+
+  // Ссылка вида /agent-funnels/12 обязана открывать именно это обращение: её
+  // присылает напоминание, и оператор должен попасть в нужный разговор сразу, даже
+  // если тот не попал в первую страницу списка (например, отфильтрован).
+  const openedFromLinkRef = useRef(false);
+  useEffect(() => {
+    if (openedFromLinkRef.current) return;
+    const linkedId = conversationIdFromPath();
+    if (linkedId === null) {
+      openedFromLinkRef.current = true;
+      return;
+    }
+    openedFromLinkRef.current = true;
+    setSelectedId(linkedId);
+    mobilePaneRef.current = "chat";
+    setMobilePane("chat");
+    void (async () => {
+      try {
+        const payload = await funnelWorkspaceApi.getConversation(linkedId);
+        const linked = payload.conversation;
+        if (!linked) return;
+        setConversations((current) =>
+          current.some((item) => stringId(item.id) === stringId(linked.id))
+            ? current
+            : [linked, ...current],
+        );
+      } catch (error) {
+        reportError(error);
+      }
+    })();
+  }, [reportError]);
 
   const sendMessage = async (text: string, retryMessage?: ConversationMessage) => {
     const conversation = selectedConversation;
@@ -2753,10 +2815,12 @@ function OperatorWorkspace({
               stageOptions={stageOptions}
               stageLabels={stageLabels}
               stageColors={stageColors}
+              urgency={urgency}
               urgentAfterMinutes={urgentAfterMinutes}
               now={now}
               onQueryChange={setQueryInput}
               onStageChange={setStage}
+              onUrgencyChange={setUrgency}
               onSelect={chooseConversation}
               onRefresh={() => void loadConversations(false)}
               onLoadMore={() => void loadMoreConversations()}

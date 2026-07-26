@@ -188,7 +188,7 @@ def _auth_session_days() -> int:
     return min(90, max(1, days))
 
 
-def _funnel_stages() -> list[dict[str, Any]]:
+def funnel_stages() -> list[dict[str, Any]]:
     """Этапы воронки ИУ в том же порядке и с теми же названиями, что видит владелец."""
     import iu_funnel
 
@@ -397,13 +397,36 @@ def register_funnel_workspace(app: Any) -> None:
         app.register_blueprint(funnel_workspace_bp)
 
 
+@funnel_workspace_bp.get(f"{PAGE_PREFIX}/<int:conversation_id>")
 @funnel_workspace_bp.get(PAGE_PREFIX)
 @funnel_workspace_bp.get(f"{PAGE_PREFIX}/")
-def workspace_page() -> Response:
+def workspace_page(conversation_id: int | None = None) -> Response:
+    """Страница рабочего окна; с id открывает сразу нужный диалог.
+
+    Ссылка вида /agent-funnels/12 нужна напоминаниям: бот присылает оператору не
+    «зайдите и найдите», а точный адрес обращения, на которое надо ответить.
+    """
+    del conversation_id  # адрес разбирает сам интерфейс
     index_view = current_app.view_functions.get("index")
     if index_view is None:
         return Response("Frontend route is not registered.", status=503, mimetype="text/plain")
     return index_view()
+
+
+def conversation_url(conversation_id: Any) -> str:
+    """Постоянный адрес диалога — его печатают в напоминаниях и задачах.
+
+    Хост берётся только из ``CANONICAL_WEB_HOST``: MCP-инструменты вызываются на
+    служебном домене, и его адрес в напоминании привёл бы оператора не туда. Если
+    хост не задан, отдаём относительный путь — он всё равно верен внутри сайта.
+    """
+    host = os.getenv("CANONICAL_WEB_HOST", "").strip().rstrip("/")
+    path = f"{PAGE_PREFIX}/{int(conversation_id)}"
+    if not host:
+        return path
+    if "://" not in host:
+        host = f"https://{host}"
+    return f"{host}{path}"
 
 
 def _session_payload() -> dict[str, Any]:
@@ -610,7 +633,7 @@ def workspace_meta() -> tuple[Response, int]:
             "sources": store.list_sources(),
             # Этапы берутся из самой воронки ИУ (iu_funnel.CHAIN), а не дублируются
             # списком: поменяют воронку — рабочее окно покажет ровно то же самое.
-            "funnel_stages": _funnel_stages(),
+            "funnel_stages": funnel_stages(),
             "statuses": [
                 {"key": "new", "value": "new", "label": "Новая"},
                 {"key": "open", "value": "open", "label": "В работе"},
@@ -661,6 +684,28 @@ def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
     payload["ai_available"] = (
         reply_open and _workspace_ai_allowed(payload.get("external_user_id"))
     )
+    payload["url"] = conversation_url(payload["id"])
+    waiting = payload.get("awaiting_reply_since")
+    if isinstance(waiting, str):
+        try:
+            waiting = datetime.fromisoformat(waiting.replace("Z", "+00:00"))
+        except ValueError:
+            waiting = None
+    if isinstance(waiting, datetime):
+        if waiting.tzinfo is None:
+            waiting = waiting.replace(tzinfo=timezone.utc)
+        waiting_minutes = int(
+            (datetime.now(timezone.utc) - waiting).total_seconds() // 60
+        )
+        payload["waiting_minutes"] = max(0, waiting_minutes)
+        payload["urgency"] = (
+            "urgent"
+            if payload["waiting_minutes"] >= store.urgent_after_minutes()
+            else "working"
+        )
+    else:
+        payload["waiting_minutes"] = None
+        payload["urgency"] = "working"
     return payload
 
 
@@ -709,6 +754,7 @@ def conversations_list() -> tuple[Response, int]:
         q=request.args.get("q", ""),
         status=request.args.get("status", ""),
         stage=request.args.get("stage", ""),
+        urgency=request.args.get("urgency", ""),
         source=request.args.get("source", ""),
         limit=_int_arg("limit", 100, minimum=1, maximum=250),
         offset=_int_arg("offset", 0, minimum=0, maximum=10_000_000),
@@ -846,7 +892,7 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
 def conversation_stage(conversation_id: int) -> tuple[Response, int]:
     """Перевести сделку на другой этап прямо из рабочего окна."""
     body = _json_body()
-    known = {stage["value"] for stage in _funnel_stages()}
+    known = {stage["value"] for stage in funnel_stages()}
     target_stage = str(body.get("stage") or "").strip()
     if target_stage not in known:
         return _error(

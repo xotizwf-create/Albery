@@ -1133,6 +1133,34 @@ def test_operator_stage_change_is_shown_at_once_and_queued_for_bitrix():
     assert any(sql.startswith("INSERT INTO funnel_workspace_crm_actions") for sql in statements)
 
 
+def test_urgency_filter_uses_the_same_threshold_as_the_badge():
+    def respond(sql, _params):
+        if sql.startswith("SELECT c.*, s.source_type"):
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    store.list_conversations(urgency="urgent", connect=connect)
+    urgent_sql, _params = connection.cursor_instance.executed[0]
+
+    connect, connection = connect_factory(respond)
+    store.list_conversations(urgency="working", connect=connect)
+    working_sql, _params = connection.cursor_instance.executed[0]
+
+    minutes = store.urgent_after_minutes()
+    assert f"interval '{minutes} minutes'" in urgent_sql
+    # «В работе» — это и отвеченные диалоги, и те, кто ждёт меньше порога.
+    assert "IS NULL OR" in working_sql
+    assert f"interval '{minutes} minutes'" in working_sql
+
+
+def test_unknown_urgency_is_refused():
+    connect, _connection = connect_factory(lambda sql, params: [])
+
+    with pytest.raises(store.WorkspaceValidationError):
+        store.list_conversations(urgency="очень-очень", connect=connect)
+
+
 def test_migration_allows_a_stage_move_without_a_sent_message():
     migration = (
         Path(__file__).resolve().parents[2]

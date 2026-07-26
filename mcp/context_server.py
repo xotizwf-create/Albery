@@ -506,6 +506,34 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "tables": ["bitrix_tasks", "bitrix_task_members", "bitrix_task_snapshots"],
                 "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments", "adding Bitrix task comments", "creating Bitrix tasks with required title/responsible/deadline", "reopening completed tasks with reason/comment", "deleting Bitrix tasks only after exact id lookup and explicit confirmation"],
             },
+            "funnel_workspace": {
+                "tools": [
+                    "workspace_list_conversations",
+                    "workspace_list_urgent",
+                    "workspace_get_conversation",
+                    "workspace_reply",
+                    "workspace_set_stage",
+                    "workspace_set_status",
+                    "workspace_set_control",
+                ],
+                "tables": [
+                    "funnel_workspace_conversations",
+                    "funnel_workspace_messages",
+                    "funnel_workspace_outbox",
+                ],
+                "use_for": [
+                    "клиентские обращения из Telegram в рабочем окне «Работа с воронками»",
+                    "кто ждёт ответа дольше порога и кому напомнить",
+                    "переписка с клиентом и состояние доставки ответов",
+                    "этап воронки ИУ по обращению и его смена",
+                    "передача разговора человеку и возврат агенту",
+                ],
+                "rules": [
+                    "В напоминании оператору всегда давай ссылку url из карточки обращения — по ней открывается нужный разговор.",
+                    "Отвечать клиенту можно только когда разговор ведёт агент; если диалог у человека, сообщи это, а не пытайся отправить.",
+                    "Этап воронки меняется только по фактам сделки: не двигай его «на всякий случай».",
+                ],
+            },
             "bitrix_chats": {
                 "tools": ["get_report_readiness", "list_chats", "search_messages", "get_chat_transcript", "get_chat_ocr_status", "process_chat_ocr"],
                 "tables": ["chats", "chat_messages", "chat_message_files", "chat_file_ocr"],
@@ -8956,7 +8984,152 @@ def tool_get_latest_news_digest(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _workspace_tool(handler_name: str):
+    """Обёртка над инструментами рабочего окна.
+
+    Модуль импортируется лениво: MCP-сервер поднимается и там, где рабочее окно
+    выключено, и падать на импорте из-за него нельзя. Понятная ошибка инструмента
+    показывается человеку как есть, а не превращается в «внутреннюю ошибку».
+    """
+
+    def call(args: dict[str, Any] | None = None) -> dict[str, Any]:
+        import funnel_workspace_tools as workspace_tools
+
+        try:
+            return getattr(workspace_tools, handler_name)(args or {})
+        except workspace_tools.WorkspaceToolError as exc:
+            raise McpError(-32602, str(exc)) from exc
+
+    return call
+
+
+WORKSPACE_TOOLS: dict[str, dict[str, Any]] = {
+    "workspace_list_conversations": {
+        "description": (
+            "Обращения клиентов в рабочем окне «Работа с воронками» (Telegram). Показывает, "
+            "кто написал, на каком этапе воронки, кто ведёт разговор, сколько клиент ждёт "
+            "ответа, и даёт постоянную ссылку на обращение. Фильтры: urgency=urgent — только "
+            "те, где ответа нет дольше порога; stage — этап воронки; query — поиск по имени, "
+            "@username и всей переписке."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Поиск по имени, @username, номеру чата, сделке и тексту переписки."},
+                "urgency": {"type": "string", "enum": ["urgent", "working"], "description": "urgent — клиент ждёт ответа дольше порога; working — остальные."},
+                "stage": {"type": "string", "description": "Код этапа воронки, например C16:NDA."},
+                "status": {"type": "string", "description": "Операционный статус обращения (new, open, waiting, closed, spam, expired)."},
+                "limit": {"type": "integer", "description": "Сколько обращений вернуть, по умолчанию 20, максимум 100."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": _workspace_tool("list_conversations"),
+    },
+    "workspace_list_urgent": {
+        "description": (
+            "Обращения, на которые никто не ответил дольше порога (по умолчанию 10 минут). "
+            "Используй для напоминаний оператору: в напоминании обязательно дай ссылку url "
+            "и имя клиента, чтобы человек открыл нужный разговор в один клик."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Сколько обращений вернуть, по умолчанию 20."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": _workspace_tool("list_urgent"),
+    },
+    "workspace_get_conversation": {
+        "description": (
+            "Карточка одного обращения и его переписка: кто клиент, этап воронки, кто ведёт "
+            "разговор, сколько ждёт ответа, и последние сообщения с состоянием доставки."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {"type": "integer", "description": "Идентификатор обращения (он же в ссылке /agent-funnels/<id>)."},
+                "messages_limit": {"type": "integer", "description": "Сколько последних сообщений показать, по умолчанию 30."},
+            },
+            "required": ["conversation_id"],
+            "additionalProperties": False,
+        },
+        "handler": _workspace_tool("get_conversation"),
+    },
+    "workspace_reply": {
+        "description": (
+            "Отправить клиенту ответ в обращении. Работает, ТОЛЬКО когда разговор ведёт агент: "
+            "если диалог забрал человек, инструмент откажет — двух ответов одному клиенту быть "
+            "не должно. Сообщение уходит через очередь доставки и появляется в окне у оператора."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {"type": "integer", "description": "Идентификатор обращения."},
+                "text": {"type": "string", "description": "Текст ответа клиенту."},
+            },
+            "required": ["conversation_id", "text"],
+            "additionalProperties": False,
+        },
+        "handler": _workspace_tool("reply"),
+    },
+    "workspace_set_stage": {
+        "description": (
+            "Перевести сделку обращения на другой этап воронки ИУ. Этап сразу виден в рабочем "
+            "окне, а в сделку Битрикса уходит очередью. Коды этапов бери из карточки обращения."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {"type": "integer", "description": "Идентификатор обращения."},
+                "stage": {"type": "string", "description": "Код этапа, например C16:S84294149."},
+                "actor_name": {"type": "string", "description": "Кто меняет этап; по умолчанию «ИИ-агент»."},
+            },
+            "required": ["conversation_id", "stage"],
+            "additionalProperties": False,
+        },
+        "handler": _workspace_tool("set_stage"),
+    },
+    "workspace_set_status": {
+        "description": (
+            "Закрыть обращение, вернуть его в работу или пометить спамом. Закрытое обращение "
+            "не принимает ответы, пока его не вернут в работу."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {"type": "integer", "description": "Идентификатор обращения."},
+                "status": {"type": "string", "enum": ["new", "open", "waiting", "closed", "spam", "expired"]},
+                "actor_name": {"type": "string", "description": "Кто меняет статус; по умолчанию «ИИ-агент»."},
+            },
+            "required": ["conversation_id", "status"],
+            "additionalProperties": False,
+        },
+        "handler": _workspace_tool("set_status"),
+    },
+    "workspace_set_control": {
+        "description": (
+            "Передать разговор человеку (mode=human), вернуть агенту (mode=ai) или приостановить "
+            "ответы (mode=paused). Передавай человеку, когда вопрос выходит за рамки сценария."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {"type": "integer", "description": "Идентификатор обращения."},
+                "mode": {"type": "string", "enum": ["ai", "human", "paused"]},
+                "reason": {"type": "string", "description": "Причина переключения — попадёт в журнал обращения."},
+                "actor_name": {"type": "string", "description": "Кто переключает; по умолчанию «ИИ-агент»."},
+            },
+            "required": ["conversation_id", "mode"],
+            "additionalProperties": False,
+        },
+        "handler": _workspace_tool("set_control"),
+    },
+}
+
+
 TOOLS: dict[str, dict[str, Any]] = {
+    **WORKSPACE_TOOLS,
     "list_crm_lead_contacts": {
         "description": (
             "Telegram-контакты лидов воронки «Партнёрская программа WB — индивидуальные условия»: "

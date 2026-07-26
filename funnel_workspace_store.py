@@ -591,11 +591,15 @@ def get_conversation(
             return row
 
 
+VALID_URGENCY = frozenset({"urgent", "working"})
+
+
 def list_conversations(
     *,
     q: str = "",
     status: str = "",
     stage: str = "",
+    urgency: str = "",
     source: str = "",
     limit: int = 100,
     offset: int = 0,
@@ -606,9 +610,15 @@ def list_conversations(
     # Этап воронки — это код сделки в Битриксе, а не наш перечень: проверять его по
     # белому списку нельзя, иначе новый этап у владельца перестанет фильтроваться.
     clean_stage = str(stage or "").strip()[:200]
+    clean_urgency = str(urgency or "").strip().lower()
     clean_source = str(source or "").strip()[:100]
     if clean_status and clean_status not in VALID_STATUSES:
         raise WorkspaceValidationError("Неизвестный статус.", details={"status": clean_status})
+    if clean_urgency and clean_urgency not in VALID_URGENCY:
+        raise WorkspaceValidationError(
+            "Неизвестная срочность.",
+            details={"urgency": clean_urgency},
+        )
     limit = min(250, max(1, int(limit or 100)))
     offset = max(0, int(offset or 0))
 
@@ -620,6 +630,16 @@ def list_conversations(
     if clean_stage:
         clauses.append("c.stage_id = %s")
         params.append(clean_stage)
+    if clean_urgency:
+        # Порог считается на стороне БД от текущего времени: фильтр обязан совпадать
+        # с бейджем в списке, а тот пересчитывается у оператора каждую секунду.
+        threshold = f"now() - interval '{urgent_after_minutes()} minutes'"
+        if clean_urgency == "urgent":
+            clauses.append(f"{AWAITING_REPLY_SQL} <= {threshold}")
+        else:
+            clauses.append(
+                f"({AWAITING_REPLY_SQL} IS NULL OR {AWAITING_REPLY_SQL} > {threshold})"
+            )
     if clean_source:
         clauses.append("c.source_key = %s")
         params.append(clean_source)

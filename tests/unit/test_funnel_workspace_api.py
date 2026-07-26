@@ -433,6 +433,56 @@ def test_meta_publishes_the_iu_funnel_stages_in_owner_order(client, monkeypatch)
     assert stages[0]["label"] == "Новый клиент"
 
 
+def test_conversation_page_opens_by_its_own_link(client, monkeypatch):
+    """Ссылку /agent-funnels/12 присылает напоминание — она обязана открывать страницу,
+    а не отдавать 404."""
+    client.application.add_url_rule("/", "index", lambda: "ok")
+    with client.session_transaction() as browser_session:
+        browser_session["admin_authenticated"] = True
+
+    assert client.get("/agent-funnels/12").status_code == 200
+    assert client.get("/agent-funnels").status_code == 200
+
+
+def test_conversation_payload_carries_its_link_and_urgency(client, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("CANONICAL_WEB_HOST", "www.m4s.ru")
+    waiting = datetime.now(timezone.utc) - timedelta(minutes=40)
+    monkeypatch.setattr(
+        workspace.store,
+        "list_conversations",
+        lambda **kwargs: {
+            "items": [
+                {
+                    "id": 12,
+                    "source_key": "telegram",
+                    "external_chat_id": "9001",
+                    "display_name": "Иван",
+                    "username": "ivan",
+                    "status": "open",
+                    "control_mode": "ai",
+                    "state_version": 3,
+                    "unread_count": 1,
+                    "reply_deadline_at": None,
+                    "awaiting_reply_since": waiting,
+                }
+            ],
+            "total": 1,
+            "limit": 100,
+            "offset": 0,
+        },
+    )
+    login(client)
+
+    payload = client.get("/api/funnel-workspace/conversations").get_json()
+    conversation = payload["conversations"][0]
+
+    assert conversation["url"] == "https://www.m4s.ru/agent-funnels/12"
+    assert conversation["urgency"] == "urgent"
+    assert conversation["waiting_minutes"] >= 40
+
+
 def test_session_always_carries_a_csrf_token_for_the_bootstrap_form(client):
     # Страницу открывают до входа: форма первичной установки пароля обязана получить токен,
     # иначе отправка упирается в «CSRF-токен отсутствует или устарел».
