@@ -114,7 +114,7 @@ def _state_block(ctx: Context) -> str:
     if ctx.repeated_question:
         lines.append("Клиент переспрашивает то же самое — прежнее объяснение не зашло.")
     if ctx.human_required:
-        lines.append(f"По этой теме отвечать самому нельзя: {ctx.human_required}")
+        lines.append(f"Условие владельца по этой теме: {ctx.human_required}")
     return "\n".join(lines)
 
 
@@ -126,7 +126,8 @@ def _task_block(ctx: Context) -> str:
         if hint:
             lines.append(hint)
     if ctx.human_required:
-        lines.append("Условие владельца выше требует next_action = handoff.")
+        lines.append("Если условие владельца из СОСТОЯНИЯ выполняется прямо сейчас — "
+                     "next_action = handoff. Сам реши, выполняется ли оно.")
     if not ctx.offered_ids:
         lines.append(
             "В ЗНАНИЯХ ничего не нашлось. Если клиент спрашивает о фактах — next_action = "

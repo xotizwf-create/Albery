@@ -95,12 +95,15 @@ def test_empty_knowledge_forces_handoff_for_factual_questions():
     assert "handoff" in built and "ничего не нашлось" in built
 
 
-def test_human_required_condition_forces_handoff():
+def test_human_required_condition_is_given_to_the_model_to_judge():
+    """Условие «если клиент спорит с расчётом» условное: выполнено ли оно, видно из сообщения.
+
+    Принуждать его кодом нельзя — тогда любой вопрос про комиссию уводил бы к людям."""
     built = p.build(p.Context(message="вы неправильно посчитали",
                               human_required="если клиент спорит с расчётом"))
 
-    assert "отвечать самому нельзя" in built
-    assert "требует next_action = handoff" in built
+    assert "Условие владельца по этой теме: если клиент спорит с расчётом" in built
+    assert "Сам реши, выполняется ли оно" in built
 
 
 def test_only_allowed_actions_are_offered():

@@ -244,6 +244,16 @@ def _numbers(text: str) -> set[str]:
     return out
 
 
+def unbacked_numbers(plan: TurnPlan, sources_text: str) -> set[str]:
+    """Числа ответа, которых нет в источниках.
+
+    Это ВЕТО, а не слагаемое оценки. Средневзвешенный скор позволял высокому поиску и бодрой
+    само-оценке модели перевесить проваленную проверку цифр: ответ «для вас сделаем 20%» при
+    источнике с 44% набирал 0.81 и уходил клиенту. Цифра, взятая из воздуха, — самая дорогая
+    ошибка агента, и она не может компенсироваться ничем."""
+    return _numbers(plan.reply) - _numbers(sources_text)
+
+
 def grounding_score(plan: TurnPlan, sources_text: str) -> tuple[float, tuple[str, ...]]:
     """Насколько текст ответа опирается на показанные карточки.
 
@@ -292,6 +302,12 @@ def assess(plan: TurnPlan, *, retrieval: float, sources_text: str = "",
 
     grounding, reasons = grounding_score(plan, sources_text)
     score = W_RETRIEVAL * retrieval + W_GROUNDING * grounding + W_SELF * plan.confidence
+
+    invented = unbacked_numbers(plan, sources_text)
+    if invented:
+        return Verdict(False, score, retrieval, grounding, plan.confidence,
+                       reasons + (f"вето: числа не подтверждены источником "
+                                  f"({', '.join(sorted(invented))})",))
     if score < limit:
         reasons = reasons + (f"уверенность {score:.2f} ниже порога {limit:.2f}",)
         return Verdict(False, score, retrieval, grounding, plan.confidence, reasons)

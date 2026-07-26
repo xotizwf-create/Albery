@@ -125,6 +125,20 @@ def test_weak_retrieval_escalates_even_when_model_is_sure():
     assert any("ниже порога" in r for r in verdict.reasons)
 
 
+def test_unbacked_number_is_a_veto_not_a_penalty():
+    """Высокий поиск и бодрая само-оценка не имеют права перевесить выдуманную цифру.
+
+    До вето ответ «для вас сделаем 20%» при источнике с 44% набирал 0.81 и уходил клиенту."""
+    plan = c.parse(plan_json(reply="Для вас сделаем 20%.", confidence=0.99),
+                   offered_sources=OFFERED)
+
+    verdict = c.assess(plan, retrieval=0.95, sources_text=SOURCES)
+
+    assert verdict.escalate
+    assert verdict.score > c.THRESHOLD, "скор высокий — эскалация именно из-за вето"
+    assert any("вето" in r for r in verdict.reasons)
+
+
 def test_number_absent_from_sources_lowers_grounding():
     """Цифры условий гуляли от диалога к диалогу — теперь это стоит трети оценки."""
     plan = c.parse(plan_json(reply="Комиссия всего 22%."), offered_sources=OFFERED)
