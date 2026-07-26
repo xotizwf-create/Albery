@@ -316,6 +316,7 @@ def unlink_conversation_deal(
     После снятия штатный backfill создаст связь заново — он ищет сделку по стабильному
     маркеру `[tg:<id>]`, поэтому дубль не появится, если сделка на самом деле жива.
     """
+    item_id = _positive_int(conversation_id, "conversation_id")
     with _connection(connect) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -327,9 +328,21 @@ def unlink_conversation_deal(
                  WHERE id = %s
              RETURNING *
                 """,
-                (_positive_int(conversation_id, "conversation_id"),),
+                (item_id,),
             )
             row = _record(cur.fetchone())
+            # Завершённое действие «создать сделку» указывает на удалённую сделку, а
+            # backfill пропускает диалог, пока такая запись существует. Без её удаления
+            # диалог остался бы без карточки CRM навсегда.
+            cur.execute(
+                """
+                DELETE FROM funnel_workspace_crm_actions
+                 WHERE conversation_id = %s
+                   AND action_type = 'ensure_deal'
+                   AND processing_status IN ('done', 'dead_letter')
+                """,
+                (item_id,),
+            )
     if row is None:
         raise WorkspaceNotFoundError(
             "Диалог не найден.",

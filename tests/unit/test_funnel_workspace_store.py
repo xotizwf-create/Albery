@@ -1081,6 +1081,28 @@ def test_conversation_search_looks_through_the_whole_retained_history():
     assert params.count("%договор%") == 6
 
 
+def test_unlinking_a_dead_deal_lets_the_backfill_create_a_new_one():
+    """Backfill пропускает диалог, пока существует запись ensure_deal. Если её оставить,
+    диалог с удалённой сделкой навсегда останется без карточки CRM."""
+    statements: list[str] = []
+
+    def respond(sql, _params):
+        statements.append(sql)
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            return {"id": 1, "deal_id": None, "stage_id": None}
+        if sql.startswith("DELETE FROM funnel_workspace_crm_actions"):
+            return None
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    row = store.unlink_conversation_deal(1, connect=connect)
+
+    assert row["deal_id"] is None
+    deletion = next(sql for sql in statements if sql.startswith("DELETE FROM funnel_workspace_crm_actions"))
+    assert "action_type = 'ensure_deal'" in deletion
+    assert "processing_status IN ('done', 'dead_letter')" in deletion
+
+
 def test_conversation_list_filters_by_funnel_stage():
     # Этап — код сделки в Битриксе, а не наш перечень: белого списка тут быть не должно,
     # иначе новый этап у владельца молча перестанет фильтроваться.
