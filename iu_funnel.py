@@ -50,10 +50,12 @@ STAGE_NEW = os.getenv("CRM_STAGE_NEW", "C16:NEW").strip()
 STAGE_CONTACTED_LEGACY = os.getenv("CRM_STAGE_CONTACTED", "C16:CONTACTED").strip()
 STAGE_TERMS = os.getenv("CRM_STAGE_TERMS", "C16:S84294149").strip()
 STAGE_FORM = os.getenv("CRM_STAGE_FORM_DONE", "C16:UC_ANKETA").strip()
-# Идентификаторы двух последних этапов ОБЯЗАНЫ быть проверены по живому Битриксу до деплоя:
-# значения ниже — заготовка, а не факт.
-STAGE_SIGNING = os.getenv("CRM_STAGE_SIGNING", "C16:UC_SIGNING").strip()
-STAGE_SIGNED = os.getenv("CRM_STAGE_SIGNED", "C16:UC_SIGNED").strip()
+# Сверено с живым Битриксом 26.07.2026 (crm.status.list, ENTITY_ID=DEAL_STAGE_16):
+# C16:NDA — «Документы и подписание», C16:UC_SGZRVS — «Документы подписаны». Владелец
+# переименовывает их в «Подписание договора» и «Договор подписан»; коды при переименовании
+# сохраняются, поэтому здесь именно они.
+STAGE_SIGNING = os.getenv("CRM_STAGE_SIGNING", "C16:NDA").strip()
+STAGE_SIGNED = os.getenv("CRM_STAGE_SIGNED", "C16:UC_SGZRVS").strip()
 
 
 @dataclass(frozen=True)
