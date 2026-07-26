@@ -56,9 +56,13 @@ class FakeCursor:
 class FakeConnection:
     def __init__(self, responder):
         self.cursor_instance = FakeCursor(responder)
+        self.commits = 0
 
     def cursor(self):
         return self.cursor_instance
+
+    def commit(self):
+        self.commits += 1
 
 
 def connect_factory(responder):
@@ -1061,3 +1065,87 @@ def test_crm_action_claim_serializes_stage_sets_per_conversation():
     assert "earlier.conversation_id = a.conversation_id" in claim
     assert "earlier.id < a.id" in claim
     assert "'pending', 'leased', 'retry'" in claim
+
+
+def test_conversation_search_looks_through_the_whole_retained_history():
+    def respond(sql, _params):
+        if sql.startswith("SELECT c.*, s.source_type"):
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    store.list_conversations(q="договор", connect=connect)
+
+    sql, params = connection.cursor_instance.executed[0]
+    assert "FROM funnel_workspace_messages" in sql
+    assert params.count("%договор%") == 6
+
+
+def test_retention_drains_the_backlog_instead_of_one_batch_per_run():
+    remaining = {"messages": 2500}
+
+    def respond(sql, _params):
+        if "DELETE FROM funnel_workspace_messages" in sql:
+            batch = min(1000, remaining["messages"])
+            remaining["messages"] -= batch
+            return [{"conversation_id": 41}] * batch
+        if sql.startswith("DELETE FROM") or "DELETE FROM" in sql:
+            return []
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    result = store.retention_cleanup(days=30, batch_size=1000, now=NOW, connect=connect)
+
+    assert remaining["messages"] == 0
+    assert result["messages"] == 2500
+    # Каждая партия — своя транзакция, иначе чистка держит блокировки целиком.
+    assert connection.commits >= 3
+
+
+def test_retention_never_deletes_a_message_the_live_queues_still_need():
+    source = Path(store.__file__).read_text(encoding="utf-8")
+    cleanup = source[
+        source.index("def retention_cleanup("):
+        source.index("def message_export_rows(")
+    ]
+
+    assert "NOT EXISTS" in cleanup
+    assert "funnel_workspace_outbox" in cleanup
+    assert "delivery_status NOT IN ('sent', 'cancelled')" in cleanup
+    assert "funnel_workspace_crm_actions" in cleanup
+    assert "funnel_workspace_ai_jobs" in cleanup
+    assert "processing_status IN ('pending', 'leased', 'retry')" in cleanup
+
+
+def test_retention_rebuilds_conversation_counters_after_deleting_history():
+    passes = {"messages": 1}
+
+    def respond(sql, _params):
+        if "DELETE FROM funnel_workspace_messages" in sql:
+            if passes["messages"]:
+                passes["messages"] = 0
+                return [{"conversation_id": 41}, {"conversation_id": 41}]
+            return []
+        if "DELETE FROM" in sql:
+            return []
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    store.retention_cleanup(days=30, batch_size=1000, now=NOW, connect=connect)
+
+    refresh = [
+        (sql, params)
+        for sql, params in connection.cursor_instance.executed
+        if sql.startswith("UPDATE funnel_workspace_conversations")
+    ]
+    assert refresh, "счётчики диалога не пересобраны после удаления истории"
+    sql, params = refresh[0]
+    assert "unread_count =" in sql
+    assert "last_message_id =" in sql
+    assert "last_message_text =" in sql
+    assert "last_read_message_id =" in sql
+    assert params[-1] == [41]

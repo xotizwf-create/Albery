@@ -330,3 +330,125 @@ def test_confirmed_outbox_delivery_drives_durable_crm_action_lifecycle():
                     "DELETE FROM funnel_workspace_sources WHERE source_key = %s",
                     (source_key,),
                 )
+
+
+def test_search_finds_old_history_and_retention_spares_queued_work():
+    suffix = uuid4().hex
+    source_key = f"test-retention-{suffix}"
+    conversation_id: int | None = None
+    try:
+        store.ensure_source(
+            source_key,
+            source_type="test",
+            display_name="Retention DB test",
+        )
+        conversation = store.ensure_conversation(
+            source_key=source_key,
+            external_chat_id=f"chat-{suffix}",
+            business_connection_id=f"connection-{suffix}",
+            external_user_id=9_000_000_002,
+            display_name="Retention test",
+        )
+        conversation_id = int(conversation["id"])
+        buried = f"договор-{suffix}"
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO funnel_workspace_messages (
+                        conversation_id, external_message_id, author_type,
+                        direction, text, delivery_status, occurred_at
+                    )
+                    VALUES
+                        (%s, %s, 'client', 'inbound', %s, 'sent',
+                         now() - interval '400 days'),
+                        (%s, %s, 'client', 'inbound', 'свежий вопрос', 'sent',
+                         now() - interval '399 days')
+                 RETURNING id
+                    """,
+                    (
+                        conversation_id, f"old-{suffix}", buried,
+                        conversation_id, f"newer-{suffix}",
+                    ),
+                )
+                stale_ids = [int(row["id"]) for row in cur.fetchall()]
+                cur.execute(
+                    """
+                    UPDATE funnel_workspace_conversations
+                       SET unread_count = 2,
+                           last_read_message_id = 0,
+                           last_message_id = %s,
+                           last_message_at = now() - interval '399 days',
+                           last_message_text = 'свежий вопрос',
+                           last_author_type = 'client'
+                     WHERE id = %s
+                    """,
+                    (stale_ids[-1], conversation_id),
+                )
+
+        # Совпадение лежит только в глубине переписки, а не в кэше последнего
+        # сообщения — именно так менеджер ищет старую заявку.
+        found = store.list_conversations(q=buried)
+        assert conversation_id in {int(row["id"]) for row in found["items"]}
+
+        current = store.get_conversation(conversation_id)
+        queued = store.enqueue_outgoing_operator(
+            conversation_id,
+            text="ответ, который ещё не ушёл в Telegram",
+            expected_version=current["state_version"],
+            operator_name="Тест",
+            idempotency_key=f"retention-{suffix}",
+        )
+        protected_id = int(queued["message"]["id"])
+        outbox_id = int(queued["outbox"]["id"])
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE funnel_workspace_messages
+                       SET occurred_at = now() - interval '398 days'
+                     WHERE id = %s
+                    """,
+                    (protected_id,),
+                )
+
+        store.retention_cleanup(days=30, batch_size=500)
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM funnel_workspace_messages WHERE conversation_id = %s",
+                    (conversation_id,),
+                )
+                surviving = {int(row["id"]) for row in cur.fetchall()}
+                cur.execute(
+                    "SELECT delivery_status FROM funnel_workspace_outbox WHERE id = %s",
+                    (outbox_id,),
+                )
+                outbox_row = cur.fetchone()
+
+        # Неотправленный ответ и его сообщение переживают чистку: внешний ключ
+        # стоит на CASCADE и унёс бы очередь вместе с историей.
+        assert surviving == {protected_id}
+        assert outbox_row is not None
+        assert outbox_row["delivery_status"] == "pending"
+
+        refreshed = store.get_conversation(conversation_id)
+        assert int(refreshed["last_message_id"]) == protected_id
+        assert refreshed["last_message_text"] == "ответ, который ещё не ушёл в Telegram"
+        assert refreshed["last_author_type"] == "operator"
+        assert int(refreshed["unread_count"]) == 0
+        assert int(refreshed["last_read_message_id"]) <= protected_id
+    finally:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                if conversation_id is not None:
+                    cur.execute(
+                        "DELETE FROM funnel_workspace_conversations WHERE id = %s",
+                        (conversation_id,),
+                    )
+                cur.execute(
+                    "DELETE FROM funnel_workspace_sources WHERE source_key = %s",
+                    (source_key,),
+                )

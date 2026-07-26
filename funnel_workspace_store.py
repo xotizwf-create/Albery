@@ -393,6 +393,10 @@ def list_conversations(
         clauses.append("c.source_key = %s")
         params.append(clean_source)
     if clean_q:
+        # ``last_message_text`` is only the cached preview of the newest message, so a
+        # search restricted to it silently hides conversations whose match is deeper in
+        # the retained history.  EXISTS keeps one row per conversation, which a JOIN over
+        # messages would break together with LIMIT/OFFSET paging.
         clauses.append(
             """(
                 COALESCE(c.display_name, '') ILIKE %s
@@ -400,10 +404,16 @@ def list_conversations(
                 OR c.external_chat_id ILIKE %s
                 OR COALESCE(c.last_message_text, '') ILIKE %s
                 OR COALESCE(c.deal_id::text, '') ILIKE %s
+                OR EXISTS (
+                    SELECT 1
+                      FROM funnel_workspace_messages sm
+                     WHERE sm.conversation_id = c.id
+                       AND sm.text ILIKE %s
+                )
             )"""
         )
         pattern = f"%{clean_q}%"
-        params.extend([pattern] * 5)
+        params.extend([pattern] * 6)
     params.extend([limit, offset])
 
     with _connection(connect) as conn:
@@ -3940,11 +3950,21 @@ def retention_cleanup(
     *,
     days: int | None = None,
     batch_size: int = 1000,
+    max_batches: int = 50,
     now: datetime | None = None,
     connect: ConnectFactory | None = None,
 ) -> dict[str, int]:
+    """Удалить историю старше срока хранения, не тронув живую работу.
+
+    Чистка идёт партиями: одна партия за запуск не разгребает накопленное, поэтому
+    цикл повторяется, пока партия не окажется неполной, но не больше ``max_batches``
+    раз — чтобы ночная чистка не держала таблицы часами. Сообщение, на которое ещё
+    ссылается неотправленная очередь или незавершённое CRM-действие, не удаляется:
+    внешние ключи стоят на ``ON DELETE CASCADE`` и унесли бы эту работу с собой.
+    """
     keep_days = retention_days() if days is None else min(90, max(7, int(days)))
     batch_size = min(10_000, max(1, int(batch_size or 1000)))
+    max_batches = min(1000, max(1, int(max_batches or 50)))
     cutoff = _now(now) - timedelta(days=keep_days)
     deleted: dict[str, int] = {}
     with _connection(connect) as conn:
@@ -3994,24 +4014,106 @@ def retention_cleanup(
                      WHERE id IN (SELECT id FROM doomed)
                     """,
                 ),
-                (
-                    "messages",
+            )
+            commit = getattr(conn, "commit", None)
+            for name, sql in statements:
+                removed_total = 0
+                for _ in range(max_batches):
+                    cur.execute(sql, (cutoff, batch_size))
+                    removed = int(cur.rowcount or 0)
+                    removed_total += removed
+                    # Партия имеет смысл только как отдельная транзакция: иначе
+                    # блокировки держатся до конца всей чистки.
+                    if callable(commit):
+                        commit()
+                    if removed < batch_size:
+                        break
+                deleted[name] = removed_total
+
+            # Сообщения удаляются последними: очереди выше уже освободили свои
+            # завершённые строки, а те, что остались живыми, держат своё сообщение.
+            touched: set[int] = set()
+            removed_total = 0
+            for _ in range(max_batches):
+                cur.execute(
                     """
                     WITH doomed AS (
-                        SELECT id
-                          FROM funnel_workspace_messages
-                         WHERE occurred_at < %s
-                         ORDER BY id
+                        SELECT m.id
+                          FROM funnel_workspace_messages m
+                         WHERE m.occurred_at < %s
+                           AND NOT EXISTS (
+                                   SELECT 1
+                                     FROM funnel_workspace_outbox o
+                                    WHERE o.message_id = m.id
+                                      AND o.delivery_status NOT IN ('sent', 'cancelled')
+                               )
+                           AND NOT EXISTS (
+                                   SELECT 1
+                                     FROM funnel_workspace_crm_actions a
+                                    WHERE a.message_id = m.id
+                                      AND a.processing_status IN ('pending', 'leased', 'retry')
+                               )
+                           AND NOT EXISTS (
+                                   SELECT 1
+                                     FROM funnel_workspace_ai_jobs j
+                                    WHERE j.trigger_message_id = m.id
+                                      AND j.processing_status IN ('pending', 'leased')
+                               )
+                         ORDER BY m.id
                          LIMIT %s
                     )
                     DELETE FROM funnel_workspace_messages
                      WHERE id IN (SELECT id FROM doomed)
+                 RETURNING conversation_id
                     """,
-                ),
-            )
-            for name, sql in statements:
-                cur.execute(sql, (cutoff, batch_size))
-                deleted[name] = int(cur.rowcount or 0)
+                    (cutoff, batch_size),
+                )
+                rows = cur.fetchall()
+                removed = len(rows)
+                removed_total += removed
+                touched.update(int(dict(row)["conversation_id"]) for row in rows)
+                if callable(commit):
+                    commit()
+                if removed < batch_size:
+                    break
+            deleted["messages"] = removed_total
+
+            if touched:
+                # Превью последнего сообщения, счётчик непрочитанного и метка
+                # прочтения остались бы от удалённой истории и разъехались бы со
+                # списком диалогов.
+                cur.execute(
+                    """
+                    UPDATE funnel_workspace_conversations c
+                       SET last_message_id = n.id,
+                           last_message_at = n.occurred_at,
+                           last_message_text = n.text,
+                           last_author_type = n.author_type,
+                           last_read_message_id = LEAST(
+                               c.last_read_message_id, COALESCE(n.id, 0)
+                           ),
+                           unread_count = (
+                               SELECT count(*)
+                                 FROM funnel_workspace_messages m
+                                WHERE m.conversation_id = c.id
+                                  AND m.author_type = 'client'
+                                  AND m.id > LEAST(
+                                          c.last_read_message_id, COALESCE(n.id, 0)
+                                      )
+                           ),
+                           updated_at = %s
+                      FROM unnest(%s::bigint[]) AS t(conversation_id)
+                      LEFT JOIN LATERAL (
+                               SELECT m.id, m.occurred_at, m.text, m.author_type
+                                 FROM funnel_workspace_messages m
+                                WHERE m.conversation_id = t.conversation_id
+                                ORDER BY m.id DESC
+                                LIMIT 1
+                           ) n ON true
+                     WHERE c.id = t.conversation_id
+                    """,
+                    (_now(now), sorted(touched)),
+                )
     deleted["retention_days"] = keep_days
     return deleted
 
