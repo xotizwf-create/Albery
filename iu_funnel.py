@@ -22,9 +22,26 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 import iu_contract
+
+# Просьба выслать ЗАНОВО. Единственная текстовая проверка, оставшаяся в слое воронки, и она тут
+# необходима: без неё «ссылка не пришла, продублируйте» упирается в защиту от повторной отправки
+# и клиент не получает ничего вообще. Отличать повтор от нового вопроса по смыслу нельзя — здесь
+# важны именно слова «ещё раз», «не пришло», «продублируйте».
+_RESEND_RE = re.compile(
+    r"ещ[её]\s+раз|повтор\w*|продублир\w*|дублир\w*|снова|заново|"
+    r"не\s+(?:приш\w*|получ\w*|дош\w*|вид\w*|открыв\w*)|"
+    r"потерял\w*|пропал\w*",
+    re.I,
+)
+
+
+def resend_requested(text: str) -> bool:
+    """Просит ли клиент прислать то же самое ещё раз."""
+    return bool(_RESEND_RE.search(str(text or "")))
 
 # --- этапы -------------------------------------------------------------------------------
 # «Связались» (C16:CONTACTED) владелец убрал 26.07.2026. Пока сделки с него не перенесены в
@@ -144,17 +161,22 @@ def next_stage(facts: DealFacts) -> str:
     return earned.id if _ORDER[earned.id] > max(current, -1) else ""
 
 
-def allowed_actions(facts: DealFacts) -> tuple[str, ...]:
+def allowed_actions(facts: DealFacts, *, resend: bool = False) -> tuple[str, ...]:
     """Что модели разрешено предложить на текущем этапе.
 
     Список сужается фактами: если условия уже доставлены, отправлять их снова незачем —
-    повторная отправка того же документа была одной из главных жалоб."""
+    повторная отправка того же документа была одной из главных жалоб.
+
+    `resend=True` снимает это сужение: клиент прямо просит прислать заново («не пришло»,
+    «продублируйте»). Без этого защита от дублей превращается в отказ выслать документ, который
+    до человека не дошёл, — и клиент остаётся вообще ни с чем."""
     stage = stage_of(facts.stage) or earned_stage(facts)
     actions = list(stage.actions)
-    if facts.terms_delivered and iu_contract.SEND_TERMS in actions:
-        actions.remove(iu_contract.SEND_TERMS)
-    if facts.form_filled and iu_contract.SEND_FORM in actions:
-        actions.remove(iu_contract.SEND_FORM)
+    if not resend:
+        if facts.terms_delivered and iu_contract.SEND_TERMS in actions:
+            actions.remove(iu_contract.SEND_TERMS)
+        if facts.form_filled and iu_contract.SEND_FORM in actions:
+            actions.remove(iu_contract.SEND_FORM)
     if facts.contract_sent and iu_contract.SEND_CONTRACT in actions:
         actions.remove(iu_contract.SEND_CONTRACT)
     return tuple(actions)
@@ -171,6 +193,6 @@ def title_of(facts: DealFacts) -> str:
     return stage.title
 
 
-def may(action: str, facts: DealFacts) -> bool:
+def may(action: str, facts: DealFacts, *, resend: bool = False) -> bool:
     """Разрешено ли действие. Последний рубеж перед исполнением: промпт не граница безопасности."""
-    return action in allowed_actions(facts)
+    return action in allowed_actions(facts, resend=resend)

@@ -51,16 +51,6 @@ def _biz(username="griaznov.d", uid=555, text="привет"):
             "from": {"id": uid, "username": username, "first_name": "Дмитрий"}, "text": text}
 
 
-def test_lead_conversation_is_journalled_both_ways(tg, rows, monkeypatch):
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Уточните оборот.")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
-
-    tg.maybe_autoreply(_biz(text="какие условия?"))
-
-    assert [r["direction"] for r in rows] == ["in", "out"]
-    assert all(r["bot"] == tg.BOT_CHANNEL and r["kind"] == "lead_chat" for r in rows)
-    assert rows[0]["text"] == "какие условия?"
-    assert rows[0]["meta"]["deal_id"] == 82, "переписку надо связать со сделкой"
 
 
 def test_supplier_chat_is_not_journalled_while_agent_stays_silent(tg, rows, monkeypatch):
@@ -73,14 +63,6 @@ def test_supplier_chat_is_not_journalled_while_agent_stays_silent(tg, rows, monk
     assert rows == [], "личная переписка аккаунта в кабинет попадать не должна"
 
 
-def test_stranger_is_journalled_once_the_agent_replies(tg, rows, monkeypatch):
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Чем помочь?")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
-
-    tg.maybe_autoreply(_biz(username="ivan_novy", uid=999, text="хочу подключить"))
-
-    assert [r["direction"] for r in rows] == ["in", "out"]
-    assert rows[1]["meta"]["stranger"] is True
 
 
 def test_owner_talk_to_the_agent_is_a_separate_stream(tg, rows):

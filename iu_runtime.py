@@ -232,9 +232,12 @@ def _execute(author: dict, texts: list[str], deal_id, facts, outcome) -> bool:
     elif outcome.action == iu_contract.SEND_FORM:
         # Кулдаун приглашения: одну и ту же ссылку нельзя слать каждый ход. Проверяем ДО
         # отправки, иначе анкета превращается в навязчивую рассылку.
+        # Просьба «пришлите ещё раз» снимает кулдаун: иначе защита от навязчивости превращается
+        # в отказ выслать ссылку, которая до клиента не дошла.
+        resend = bool(outcome.trace.get("resend"))
         if not tg_agent.LEAD_FORM_URL:
             log.warning("анкета не отправлена: адрес формы не задан")
-        elif tg_agent._invite_already_sent(uid):
+        elif tg_agent._invite_already_sent(uid) and not resend:
             log.info("анкету %s уже приглашали недавно — второй раз не шлём", uid)
         else:
             tail = tg_agent.FORM_TAIL.format(url=tg_agent.LEAD_FORM_URL)
@@ -271,7 +274,7 @@ def _execute(author: dict, texts: list[str], deal_id, facts, outcome) -> bool:
 
     if outcome.escalate:
         tg_agent.escalate_to_human(author, outcome.reason or "нужен ответ человека", message,
-                                   answered=not outcome.silent)
+                                   answered=outcome.answered_client)
 
     # Этап двигаем только по фактам и только после доставки: «отправили» — это факт, а
     # «собирались отправить» — нет.

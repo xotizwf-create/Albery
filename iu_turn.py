@@ -73,6 +73,11 @@ class Outcome:
     stage_move: str = ""
     sources: tuple[str, ...] = ()
     trace: dict = field(default_factory=dict)
+    # Ответили ли клиенту ПО СУЩЕСТВУ. Это не то же самое, что «отправили непустой текст»:
+    # «Уточню это у команды» и отказ фильтра — тоже текст, но вопрос остался открытым. Карточка
+    # людям начинается именно с этого признака, и ошибка здесь означает, что сотрудник увидит
+    # «клиенту отвечено» там, где клиент по-прежнему ждёт.
+    answered_client: bool = False
 
     @property
     def silent(self) -> bool:
@@ -122,7 +127,10 @@ def handle(request: Request, deps: Deps) -> Outcome:
     facts = request.facts
     # Этап мог отстать от реальности между ходами (анкета пришла, пока агент молчал).
     stage_move = iu_funnel.next_stage(facts)
-    trace: dict = {"stage": facts.stage, "stage_move": stage_move}
+    # «Не пришло, продублируйте» снимает защиту от повторной отправки: иначе она превращается
+    # в отказ выслать документ, который до клиента не дошёл.
+    resend = iu_funnel.resend_requested(request.message)
+    trace: dict = {"stage": facts.stage, "stage_move": stage_move, "resend": resend}
 
     # 1. Фильтр входа. Совпало — модель не зовём вовсе: дешевле и надёжнее, чем надеяться,
     # что она откажется сама.
@@ -163,7 +171,7 @@ def handle(request: Request, deps: Deps) -> Outcome:
         history=request.history,
         repeated_question=repeated,
         human_required=human_when,
-        allowed_actions=iu_funnel.allowed_actions(facts),
+        allowed_actions=iu_funnel.allowed_actions(facts, resend=resend),
     ))
 
     # 4. Модель. Её падение — не тишина клиенту, а передача человеку.
@@ -191,7 +199,7 @@ def handle(request: Request, deps: Deps) -> Outcome:
                          trace=trace, stage_move=stage_move)
 
     # 6. Разрешение действия. Промпт не граница безопасности: последнее слово за воронкой.
-    if not iu_funnel.may(plan.next_action, facts):
+    if not iu_funnel.may(plan.next_action, facts, resend=resend):
         trace["action_denied"] = plan.next_action
         claimed = iu_filters.claims_action(plan.reply)
         if claimed:
@@ -256,6 +264,7 @@ def handle(request: Request, deps: Deps) -> Outcome:
         trace["trimmed_steps"] = True
 
     return Outcome(
+        answered_client=True,
         reply=reply,
         action=plan.next_action,
         escalate=bool(plan.unresolved),

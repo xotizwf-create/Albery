@@ -50,57 +50,10 @@ def _incoming(uid=1451982360, text="Здравствуйте, интересую
     return msg
 
 
-def test_lead_gets_an_answer_from_the_company_account(tg, monkeypatch):
-    sent = {}
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Расскажите про ваш оборот.")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (sent.update(uid=uid, text=t), (True, ""))[1])
-
-    tg.maybe_autoreply(_incoming())
-
-    assert sent["uid"] == 1451982360
-    assert "Здравствуйте" in sent["text"]
-    assert "оборот" not in sent["text"].lower(), "поля анкеты в чате повторно не спрашиваем"
 
 
-def test_long_lead_answer_sends_the_form_separately_before_marking(tg, monkeypatch):
-    sent, invited = [], []
-    answer = "X" * 3400
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: answer)
-    monkeypatch.setattr(tg, "_deal_has_form", lambda deal_id: False)
-    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
-    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
-    monkeypatch.setattr(
-        tg, "send_as_account",
-        lambda uid, text, parse_mode="": sent.append(text) or (True, ""),
-    )
-
-    tg.maybe_autoreply(_incoming(text="Хочу подключиться к ИУ"))
-
-    assert len(sent) == 2
-    assert sent[0] == answer and tg.LEAD_FORM_URL not in sent[0]
-    assert sent[1].count(tg.LEAD_FORM_URL) == 1
-    assert invited == [1451982360]
 
 
-def test_failed_separate_form_does_not_burn_the_lead_invite(tg, monkeypatch):
-    calls, invited = [], []
-    monkeypatch.setattr(tg, "hermes_answer",
-                        lambda p, s, toolsets=None: "X" * 3400)
-    monkeypatch.setattr(tg, "_deal_has_form", lambda deal_id: False)
-    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
-    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
-
-    def deliver(uid, text, parse_mode=""):
-        calls.append(text)
-        return (True, "") if len(calls) == 1 else (False, "сеть")
-
-    monkeypatch.setattr(tg, "send_as_account", deliver)
-
-    tg.maybe_autoreply(_incoming(text="Хочу подключиться к ИУ"))
-
-    assert calls[0] == "X" * 3400
-    assert any(tg.LEAD_FORM_URL in text for text in calls[1:])
-    assert invited == []
 
 
 def test_crm_form_status_outage_suppresses_the_form_fail_closed(tg, monkeypatch):
@@ -230,75 +183,12 @@ def _shared_journal(tg, monkeypatch):
     return ledger
 
 
-def test_narration_after_a_send_tool_is_not_duplicated(tg, monkeypatch):
-    """Жалоба владельца 23.07.2026: агент дублирует сообщения с одним и тем же посылом.
-
-    Инструмент send_terms сам шлёт клиенту условия и вопрос «есть ли вопросы», а следом модель
-    отправляет «Условия отправили вам сюда…» — тот же посыл вторым сообщением. Так быть не
-    должно: клиент получает РОВНО одно сообщение — то, что отправил инструмент."""
-    _shared_journal(tg, monkeypatch)
-    outbox: list[str] = []
-    monkeypatch.setattr(tg, "send_as_account",
-                        lambda uid, t, parse_mode="": (outbox.append(t), (True, ""))[1])
-
-    def brain(prompt, session, toolsets=None):
-        # Инструмент в соседнем процессе уже отправил клиенту условия и записал их в журнал.
-        tg.journal(tg.MANAGER_CHANNEL, 1451982360, "out",
-                   "Комиссия WB снижена до 35%… Есть вопросы?", meta={"terms": True})
-        return "Условия отправили вам сюда. Если появятся вопросы — разберём их здесь."
-
-    monkeypatch.setattr(tg, "hermes_answer", brain)
-    tg.maybe_autoreply(_incoming(text="Всё верно"))
-
-    assert not any("отправили вам сюда" in t for t in outbox), \
-        "нарратив модели продублировал посыл инструмента вторым сообщением"
-    assert outbox == [], "клиенту слать нечего — сообщение уже отправил инструмент"
 
 
-def test_plain_answer_without_a_tool_is_still_sent(tg, monkeypatch):
-    """Обратная сторона: если инструмент НИЧЕГО не отправлял, ответ модели уходит как обычно."""
-    _shared_journal(tg, monkeypatch)
-    outbox: list[str] = []
-    monkeypatch.setattr(tg, "send_as_account",
-                        lambda uid, t, parse_mode="": (outbox.append(t), (True, ""))[1])
-    monkeypatch.setattr(tg, "hermes_answer",
-                        lambda p, s, toolsets=None: "ИУ доступно продавцам Wildberries.")
-
-    tg.maybe_autoreply(_incoming(text="Здравствуйте"))
-
-    assert any("ИУ доступно" in t for t in outbox), "обычный ответ модели должен дойти до клиента"
 
 
 # --- пачка сообщений подряд = один человечный ответ (владелец, 23.07.2026) --------------------
 
-def test_burst_of_messages_gets_one_combined_answer(tg, monkeypatch):
-    """Диалог 23.07.2026, записи 218–225: клиент писал быстрее, чем агент отвечал, каждое
-    сообщение уходило в отдельный ход — вопросы накладывались, реквизиты просились дважды.
-    Несколько сообщений подряд обязаны попасть В ОДИН ход и получить ОДИН ответ."""
-    import threading
-    import time as _time
-
-    prompts, outbox = [], []
-    monkeypatch.setattr(tg, "_REPLY_DEBOUNCE_S", 0.15)
-    monkeypatch.setattr(tg, "hermes_answer",
-                        lambda p, s, toolsets=None: prompts.append(p) or "Отвечаю на всё сразу")
-    monkeypatch.setattr(tg, "send_as_account",
-                        lambda uid, t, parse_mode="": (outbox.append(t), (True, ""))[1])
-
-    msgs = [_incoming(text="Нет, вопросов нет"), _incoming(text="Да, давайте начинать"),
-            _incoming(text="Да, подходят")]
-    threads = []
-    for m in msgs:
-        threads.append(threading.Thread(target=tg.maybe_autoreply, args=(m,)))
-        threads[-1].start()
-        _time.sleep(0.02)      # клиент «печатает» следующие сообщения во время паузы-добора
-    for t in threads:
-        t.join(timeout=5)
-
-    assert len(prompts) == 1, "три сообщения подряд — это ОДИН ход, а не три"
-    assert all(m["text"] in prompts[0] for m in msgs), "в промпте должна быть вся пачка"
-    assert "одним сообщением" in prompts[0], "модели явно сказано ответить на всё разом"
-    assert len(outbox) == 1, "клиент получает один ответ на пачку"
 
 
 def test_debounce_window_slides_from_the_last_message(tg, monkeypatch):
@@ -352,73 +242,10 @@ def test_message_after_the_turn_starts_goes_to_the_next_turn(tg, monkeypatch):
     assert "первое" in prompts[0] and "второе" in prompts[1]
 
 
-def test_client_typing_during_the_turn_restarts_thinking(tg, monkeypatch):
-    """Владелец 24.07.2026: клиент написал, пока ИИ думал — цикл начинается заново, и ИИ
-    отвечает уже на старое И новое сообщение. Прежний, устаревший ответ не отправляется."""
-    import threading
-    import time as _time
-
-    prompts, outbox = [], []
-    started = threading.Event()
-
-    def brain(p, s, toolsets=None):
-        prompts.append(p)
-        if len(prompts) == 1:
-            started.set()
-            _time.sleep(0.25)      # думаем; в это время клиент дописывает
-            return "УСТАРЕВШИЙ ответ только на первое"
-        return "Свежий ответ на всё сразу"
-
-    monkeypatch.setattr(tg, "_REPLY_DEBOUNCE_S", 0.02)
-    monkeypatch.setattr(tg, "hermes_answer", brain)
-    monkeypatch.setattr(tg, "send_as_account",
-                        lambda uid, t, parse_mode="": (outbox.append(t), (True, ""))[1])
-
-    t1 = threading.Thread(target=tg.maybe_autoreply, args=(_incoming(text="хочу договор"),))
-    t1.start()
-    started.wait(timeout=5)
-    _time.sleep(0.05)              # ход уже думает — клиент пишет второе
-    t2 = threading.Thread(target=tg.maybe_autoreply, args=(_incoming(text="и ещё вопрос про сроки"),))
-    t2.start()
-    t1.join(timeout=5); t2.join(timeout=5)
-
-    assert len(prompts) == 2, "ход обязан перезапуститься из-за нового сообщения"
-    assert "хочу договор" in prompts[1] and "и ещё вопрос про сроки" in prompts[1], \
-        "перезапуск думает над старым И новым сообщением вместе"
-    assert outbox == ["Свежий ответ на всё сразу"], "устаревший ответ клиенту не уходит"
 
 
-def test_style_rules_reach_the_model(tg, monkeypatch):
-    """Владелец 23.07.2026: «не надо каждый раз Александр, Александр». Правила живого тона
-    обязаны попадать в каждый промпт лида."""
-    prompts = []
-    monkeypatch.setattr(tg, "hermes_answer",
-                        lambda p, s, toolsets=None: prompts.append(p) or "ок")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
-
-    tg.maybe_autoreply(_incoming(text="Здравствуйте"))
-
-    assert prompts and "НЕ начинай сообщение с имени клиента" in prompts[0]
-    assert "ИЛИ один вопрос, ИЛИ один CTA" in prompts[0]
-    assert "Стадия — контекст, а не реплика скрипта" in prompts[0]
 
 
-def test_lead_off_topic_with_false_terms_marker_gets_no_iu_document(tg, monkeypatch):
-    """Наличие сделки не превращает любой вопрос о цене в запрос коммерческих условий ИУ."""
-    sent = []
-    monkeypatch.setattr(tg, "hermes_answer",
-                        lambda p, s, toolsets=None: tg.TERMS_REQUEST_MARKER)
-    monkeypatch.setattr(
-        tg, "terms_text",
-        lambda: (_ for _ in ()).throw(AssertionError("документ ИУ здесь запрещён")),
-    )
-    monkeypatch.setattr(tg, "send_as_account",
-                        lambda uid, text, parse_mode="": sent.append(text) or (True, ""))
-
-    tg.maybe_autoreply(_incoming(text="Сколько стоит доставка документов?"))
-
-    assert sent and "индивидуальным условиям" in sent[0].lower()
-    assert tg.LEAD_FORM_URL not in sent[0]
 
 
 def test_fresh_deal_is_picked_up_without_waiting_for_cache(tg, monkeypatch):

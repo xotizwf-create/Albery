@@ -381,6 +381,72 @@ def test_terms_are_not_sent_twice():
     assert out.action != iu_contract.SEND_TERMS
 
 
+# --- повторная отправка -------------------------------------------------------------------------
+
+def test_client_who_did_not_get_the_document_gets_it_again():
+    """Защита от дублей не имеет права стать отказом выслать то, что до клиента не дошло."""
+    out = run("извините, условия не пришли — продублируйте, пожалуйста", ask=model(
+        reply="Конечно, дублирую.", next_action=iu_contract.SEND_TERMS), facts=AFTER_TERMS)
+
+    assert out.action == iu_contract.SEND_TERMS
+    assert out.trace["resend"] is True
+
+
+def test_client_who_lost_the_form_link_gets_it_again():
+    facts = iu_funnel.DealFacts(stage=iu_funnel.STAGE_TERMS, terms_delivered=True,
+                                form_filled=True)
+
+    out = run("ссылка на анкету потерялась, пришлите ещё раз", ask=model(
+        reply="Конечно, вот она.", next_action=iu_contract.SEND_FORM), facts=facts)
+
+    assert out.action == iu_contract.SEND_FORM
+
+
+def test_a_new_question_is_not_a_resend_request():
+    """Обычный вопрос поверх уже отправленных условий вторым документом не закрывается."""
+    out = run("а что входит в услугу?", ask=model(
+        reply="Ведение кабинета и работа с карточками.", next_action=iu_contract.SEND_TERMS,
+        source_ids=["что-входит-в-услугу"], answered=["что входит"]), facts=AFTER_TERMS)
+
+    assert out.action != iu_contract.SEND_TERMS
+
+
+# --- честность карточки людям ---------------------------------------------------------------------
+
+def test_escalation_card_knows_the_client_was_not_answered():
+    """Сотрудник должен видеть «клиент ждёт», а не «отвечено по существу»."""
+    out = run("какой у вас НДС?", ask=model(
+        reply="", next_action=iu_contract.HANDOFF, handoff_reason="нет карточки про налоги"))
+
+    assert out.escalate and out.answered_client is False
+
+
+def test_partial_answer_marks_the_client_as_answered():
+    out = run("Какая комиссия и нужна ли ЭЦП?", ask=model(
+        reply="Комиссия 44%.", source_ids=["комиссия"], answered=["комиссия"],
+        unresolved=["ЭЦП"]))
+
+    assert out.escalate and out.answered_client is True
+
+
+def test_filter_refusal_is_not_an_answer_either():
+    out = run("да вы охуели с такими условиями", ask=model(reply="не вызовется"))
+
+    assert out.answered_client is False
+
+
+# --- один следующий шаг ---------------------------------------------------------------------------
+
+def test_second_question_from_the_model_is_removed():
+    """Два вопроса подряд превращают консультацию в допрос."""
+    out = run("расскажите про подключение", ask=model(
+        reply="Подключение занимает 3 рабочих дня. Какой у вас оборот? Что продаёте?",
+        source_ids=["сроки-подключения"], answered=["сроки"]))
+
+    assert out.reply.count("?") == 1, out.reply
+    assert "3 рабочих дня" in out.reply
+
+
 # --- трасса ---------------------------------------------------------------------------------------
 
 def test_every_turn_leaves_a_readable_trace():

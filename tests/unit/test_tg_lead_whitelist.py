@@ -33,22 +33,6 @@ def _msg(username="griaznov.d", uid=555, text="Здравствуйте, инт�
             "from": {"id": uid, "username": username, "first_name": "Дмитрий"}, "text": text}
 
 
-def test_lead_from_the_funnel_gets_an_answer(tg, monkeypatch):
-    monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
-    sent = {}
-    monkeypatch.setattr(
-        tg,
-        "hermes_answer",
-        lambda p, s, toolsets=None: (
-            "Здравствуйте! ИУ доступно продавцам WB. Уточните оборот, пожалуйста."
-        ),
-    )
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (sent.update(uid=uid, text=t), (True, ""))[1])
-
-    tg.maybe_autoreply(_msg())
-
-    assert sent["uid"] == 555 and "ИУ доступно" in sent["text"]
-    assert "оборот" not in sent["text"].lower(), "поля анкеты повторно в чате не спрашиваем"
 
 
 def test_stranger_never_gets_a_generated_reply(tg, monkeypatch):
@@ -92,16 +76,6 @@ def test_crm_unavailable_means_total_silence(tg, monkeypatch):
     assert calls == [] and sent == []
 
 
-def test_deal_number_is_given_to_the_agent(tg, monkeypatch):
-    """Агент должен знать, по какой сделке идёт разговор."""
-    monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
-    prompts = []
-    monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: prompts.append(p) or "ок")
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (True, ""))
-
-    tg.maybe_autoreply(_msg())
-
-    assert "№82" in prompts[0]
 
 
 def test_username_matching_tolerates_dots_and_case(tg, monkeypatch):

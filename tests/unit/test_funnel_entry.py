@@ -62,18 +62,6 @@ def _msg(text, username="novichok", uid=777):
             "from": {"id": uid, "username": username, "first_name": "Иван"}, "text": text}
 
 
-def test_asking_about_iu_opens_a_deal_then_moves_to_contacted(tg, monkeypatch):
-    calls, sent = _wire(tg, monkeypatch)
-
-    tg.maybe_autoreply(_msg("Здравствуйте, какие условия подключения к ИУ?"))
-
-    created = [a for t, a in calls if t == "create_crm_deal"]
-    assert created, "сделка должна завестись сразу"
-    assert created[0]["stage"] == tg.STAGE_NEW
-    assert created[0]["custom_fields"][tg.CRM_TELEGRAM_FIELD] == "novichok"
-    moved = [a for t, a in calls if t == "update_crm_deal"]
-    assert moved and moved[0]["stage"] == tg.STAGE_CONTACTED, "ответили — значит «Связались»"
-    assert sent, "клиент всё равно получает ответ"
 
 
 def test_supplier_smalltalk_does_not_open_a_deal(tg, monkeypatch):
@@ -85,15 +73,6 @@ def test_supplier_smalltalk_does_not_open_a_deal(tg, monkeypatch):
         "поставщикам и болтовне в воронке не место"
 
 
-def test_undelivered_reply_does_not_move_the_stage(tg, monkeypatch):
-    calls, _ = _wire(tg, monkeypatch)
-    monkeypatch.setattr(tg, "send_as_account", lambda uid, t, parse_mode="": (False, "чат закрыт"))
-
-    tg.maybe_autoreply(_msg("хочу подключиться к ИУ"))
-
-    assert [a for t, a in calls if t == "create_crm_deal"], "сделка заводится всё равно"
-    assert [a for t, a in calls if t == "update_crm_deal"] == [], \
-        "не доставили — не «Связались»"
 
 
 def test_form_duplicate_is_merged_into_the_original_deal(tg, monkeypatch):

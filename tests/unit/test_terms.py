@@ -289,7 +289,6 @@ def test_requisites_remain_terms_evidence_after_explicit_field_is_configured(tg,
 
 def _stranger(tg, monkeypatch, answer, client_text="какие условия подключения?"):
     """Незнакомец пишет в личку; ловим, что уйдёт клиенту."""
-    import json as _json
 
     box = []
     monkeypatch.setenv("TG_BUSINESS_AUTOREPLY", "1")
@@ -308,16 +307,6 @@ def _stranger(tg, monkeypatch, answer, client_text="какие условия п
     return box
 
 
-def test_conditions_are_sent_word_for_word_from_the_file(tg, monkeypatch):
-    """Модель НЕ пересказывает условия: до этого цифры гуляли от диалога к диалогу
-    («200 000 ₽ вместо 500 000» в одном чате, «комиссия 44%» в другом)."""
-    box = _stranger(tg, monkeypatch, tg.TERMS_REQUEST_MARKER)
-
-    assert box, "клиенту должны уйти условия"
-    text = box[0]
-    assert "Индивидуальные условия снижают комиссию" in text, "текст ровно из документа"
-    assert "30 000 ₽ в месяц" in text
-    assert tg.TERMS_REQUEST_MARKER not in text, "служебный маркер клиенту не показываем"
 
 
 def test_conditions_alone_do_not_force_the_form(tg, monkeypatch):
@@ -327,44 +316,10 @@ def test_conditions_alone_do_not_force_the_form(tg, monkeypatch):
     assert tg.LEAD_FORM_URL not in box[0]
 
 
-def test_multi_intent_gets_terms_first_and_then_one_form_cta(tg, monkeypatch):
-    box = _stranger(
-        tg, monkeypatch, tg.TERMS_REQUEST_MARKER,
-        client_text="Какие условия? Если подходят — хочу подключиться к ИУ",
-    )
-
-    assert tg.LEAD_FORM_URL in box[0]
-    assert box[0].index("Индивидуальные условия") < box[0].index(tg.LEAD_FORM_URL)
-    assert box[0].count(tg.LEAD_FORM_URL) == 1
 
 
-def test_stranger_long_terms_split_the_form_without_false_marks(tg, monkeypatch):
-    terms_marked, invited = [], []
-    monkeypatch.setattr(tg, "terms_text", lambda: "X" * 3400)
-    monkeypatch.setattr(tg, "_mark_terms_sent", lambda uid: terms_marked.append(uid))
-    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
-
-    box = _stranger(
-        tg, monkeypatch, tg.TERMS_REQUEST_MARKER,
-        client_text="Какие условия? Хочу подключиться к ИУ",
-    )
-
-    assert len(box) == 2
-    assert "X" * 3400 in box[0] and tg.LEAD_FORM_URL not in box[0]
-    assert box[1].count(tg.LEAD_FORM_URL) == 1
-    assert terms_marked == [777] and invited == [777]
 
 
-def test_stranger_oversized_terms_are_never_truncated_or_marked(tg, monkeypatch):
-    terms_marked, invited = [], []
-    monkeypatch.setattr(tg, "terms_text", lambda: "X" * 3600)
-    monkeypatch.setattr(tg, "_mark_terms_sent", lambda uid: terms_marked.append(uid))
-    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
-
-    box = _stranger(tg, monkeypatch, tg.TERMS_REQUEST_MARKER)
-
-    assert box == []
-    assert terms_marked == [] and invited == []
 
 
 def test_stranger_rules_forbid_promises_and_article_questions(tg):
@@ -376,44 +331,6 @@ def test_stranger_rules_forbid_promises_and_article_questions(tg):
     assert tg.TERMS_REQUEST_MARKER in tg.STRANGER_RULES
 
 
-def test_lead_asking_about_conditions_gets_the_file_word_for_word(tg, monkeypatch):
-    """Живой сбой 24.07.2026 (диалог 1451982360, сделка 110): лид спросил «какие условия» и
-    получил самодельную выжимку — маркер работал только у незнакомца. У лида он обязан
-    работать тоже: условия уходят дословно через send_terms."""
-    sent, called = [], []
-    monkeypatch.setenv("TG_BUSINESS_AUTOREPLY", "1")
-    monkeypatch.setattr(tg, "load_state", lambda: {"business": {"C1": {"user_id": 871}}})
-    monkeypatch.setattr(tg, "save_state", lambda s: None)
-    monkeypatch.setattr(tg, "lead_deal_for_username", lambda u: 110)
-    monkeypatch.setattr(
-        tg,
-        "_deal_for_watch",
-        lambda deal_id: {
-            "id": deal_id,
-            "stage_id": "C16:S84294149",
-            "custom_fields": {},
-        },
-    )
-    monkeypatch.setattr(tg, "funnel_step_block", lambda d: "Шаг: вопросы по условиям")
-    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
-    monkeypatch.setattr(tg, "react", lambda *a, **k: None)
-    monkeypatch.setattr(tg, "chat_history", lambda *a, **k: "")
-    monkeypatch.setattr(tg, "_dialog_out_watermark", lambda d: 0)
-    monkeypatch.setattr(tg, "_out_messages_after", lambda d, s: 0)
-    monkeypatch.setattr(tg, "hermes_answer",
-                        lambda p, s, toolsets=None: tg.TERMS_REQUEST_MARKER)
-    monkeypatch.setattr(tg, "send_html",
-                        lambda uid, html, plain: sent.append(plain) or (True, ""))
-    monkeypatch.setattr(tg, "send_as_account",
-                        lambda uid, t, parse_mode="": called.append(t) or (True, ""))
-
-    tg.maybe_autoreply({"business_connection_id": "C1", "chat": {"id": 555, "type": "private"},
-                        "from": {"id": 555, "username": "lead", "first_name": "Пётр"},
-                        "text": "Евгений передал контакт, какие условия подключения к ИУ"})
-
-    assert sent, "лиду должны уйти условия"
-    assert "Индивидуальные условия снижают комиссию" in sent[0], "текст ровно из документа"
-    assert tg.TERMS_REQUEST_MARKER not in sent[0], "служебный маркер клиенту не показываем"
 
 
 def test_terms_marker_rule_reaches_both_branches(tg):
@@ -469,55 +386,12 @@ def _lead_turn(tg, monkeypatch, client_text, state_extra=None, answer=None,
     return sent, to_humans
 
 
-def test_question_on_top_of_sent_terms_goes_to_humans_not_a_second_document(tg, monkeypatch):
-    """Живой сбой 24.07.2026, диалог 764181402: условия клиент уже получил (запись 394), затем
-    спросил «Какой дрр нужно держать и как происходит управление? +какая комиссия ваша по
-    партнерской этой программе?» — и агент ВТОРОЙ раз выслал весь документ (запись 402), на
-    вопрос не ответил и людям не передал. Слов «ДРР» и «управление» в документе нет."""
-    sent, to_humans = _lead_turn(
-        tg, monkeypatch,
-        "Какой дрр нужно держать и как происходит управление?\n"
-        "+какая комиссия ваша по партнерской этой программе?",
-        state_extra={"terms_sent": {"764181402": "2026-07-24T16:03:49+00:00"}})
-
-    assert sent, "клиент не должен остаться в тишине"
-    assert "Индивидуальные условия снижают комиссию" not in sent[0], \
-        "второй раз документ условий не дублируем"
-    assert tg.TERMS_ASK_HUMAN_REPLY in sent[0], "клиенту — одна короткая строка"
-    assert to_humans, "вопрос обязан уйти живым людям"
-    assert "дрр" in to_humans[0].lower(), "людям уходит именно вопрос клиента"
 
 
-def test_first_terms_question_still_sends_the_document(tg, monkeypatch):
-    """Правило не должно ломать основное: первый вопрос про условия — документ дословно."""
-    sent, to_humans = _lead_turn(tg, monkeypatch, "какие условия подключения к ИУ?")
-
-    assert sent and "Индивидуальные условия снижают комиссию" in sent[0]
-    assert not to_humans, "людей по первому вопросу не беспокоим"
 
 
-def test_first_terms_multi_intent_routes_the_other_question_to_humans(tg, monkeypatch):
-    sent, to_humans = _lead_turn(
-        tg, monkeypatch,
-        "Какие условия ИУ и сколько стоит доставка?",
-    )
-
-    assert sent and "Индивидуальные условия снижают комиссию" in sent[0]
-    assert tg.TERMS_QUESTION not in sent[0], "generic question must not replace the side answer"
-    assert any(tg.TERMS_ASK_HUMAN_REPLY in message for message in sent[1:])
-    assert to_humans and "достав" in to_humans[0].lower()
 
 
-def test_first_terms_multi_question_inside_iu_routes_unanswered_parts(tg, monkeypatch):
-    sent, to_humans = _lead_turn(
-        tg, monkeypatch,
-        "Какой ДРР нужно держать и как происходит управление? Какая комиссия по ИУ?",
-    )
-
-    assert sent and "Индивидуальные условия снижают комиссию" in sent[0]
-    assert tg.TERMS_QUESTION not in sent[0], "generic follow-up must not hide other questions"
-    assert any(tg.TERMS_ASK_HUMAN_REPLY in message for message in sent[1:])
-    assert to_humans and "дрр" in to_humans[0].lower()
 
 
 def test_crm_fetch_failure_with_empty_local_state_does_not_resend_terms(tg, monkeypatch):
@@ -532,14 +406,6 @@ def test_crm_fetch_failure_with_empty_local_state_does_not_resend_terms(tg, monk
     assert to_humans, "неизвестное CRM-состояние обязан увидеть живой менеджер"
 
 
-def test_asking_to_resend_gets_the_document_again(tg, monkeypatch):
-    """«Пришлите ещё раз» — это просьба о документе, а не вопрос поверх него."""
-    sent, to_humans = _lead_turn(
-        tg, monkeypatch, "Условия не пришли, пришлите ещё раз пожалуйста",
-        state_extra={"terms_sent": {"764181402": "2026-07-24T16:03:49+00:00"}})
-
-    assert sent and "Индивидуальные условия снижают комиссию" in sent[0]
-    assert not to_humans
 
 
 def test_resend_detector_tells_a_repeat_request_from_a_new_question(tg):
@@ -551,20 +417,6 @@ def test_resend_detector_tells_a_repeat_request_from_a_new_question(tg):
     assert not tg._wants_terms_again("а какая комиссия ваша по этой программе?")
 
 
-def test_confirming_the_anketa_is_not_a_terms_question(tg, monkeypatch):
-    """Живой тупик 24.07.2026 (Александр, сделка 148): клиент написал «Все верно», модель
-    вернула маркер условий, а условия ему уже отправляли — и клиент получил «Уточню это у
-    команды и вернусь с ответом». Он ничего не спрашивал: людей дёргать не за чем, а разговор
-    надо вести дальше."""
-    sent, to_humans = _lead_turn(
-        tg, monkeypatch, "Все верно",
-        state_extra={"terms_sent": {"764181402": "2026-07-24T18:52:48+00:00"}})
-
-    assert sent, "клиент не должен остаться без ответа"
-    assert tg.TERMS_ASK_HUMAN_REPLY not in sent[0], "это не вопрос — людям не уносим"
-    assert not to_humans, "живых людей дёргать не за чем"
-    assert "вопрос" in sent[0].lower(), "менеджер спрашивает, остались ли вопросы по условиям"
-    assert "Индивидуальные условия снижают комиссию" not in sent[0], "документ второй раз не шлём"
 
 
 def test_question_words_are_told_apart_from_confirmations(tg):

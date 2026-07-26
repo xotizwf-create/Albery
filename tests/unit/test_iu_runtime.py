@@ -135,6 +135,19 @@ def test_form_is_not_sent_twice(monkeypatch):
     assert not tg.marked_invite
 
 
+def test_resend_request_bypasses_the_form_cooldown(monkeypatch):
+    """«Ссылка не пришла» не должно упираться в защиту от навязчивости."""
+    tg = FakeTG()
+    tg.invited_recently = True
+    out = iu_turn.Outcome(reply="Конечно, дублирую.", action=iu_contract.SEND_FORM,
+                          trace={"resend": True})
+
+    ok, tg = run(monkeypatch, out, tg)
+
+    assert "Заполните анкету" in tg.sent[0]
+    assert tg.marked_invite
+
+
 def test_first_form_invite_goes_through(monkeypatch):
     ok, tg = run(monkeypatch, outcome(iu_contract.SEND_FORM, reply="Давайте оформим."))
 
