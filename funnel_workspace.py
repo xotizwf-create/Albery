@@ -626,6 +626,7 @@ def workspace_meta() -> tuple[Response, int]:
             ],
             "human_lease_seconds": store.human_lease_seconds(),
             "reply_window_hours": store.reply_window_hours(),
+            "urgent_after_minutes": store.urgent_after_minutes(),
             "retention_days": store.retention_days(),
             "max_message_length": store.MAX_MESSAGE_LENGTH,
         }
@@ -837,6 +838,30 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
         ),
     )
     return _json({"conversation": conversation})
+
+
+@funnel_workspace_bp.post(
+    f"{API_PREFIX}/conversations/<int:conversation_id>/stage"
+)
+def conversation_stage(conversation_id: int) -> tuple[Response, int]:
+    """Перевести сделку на другой этап прямо из рабочего окна."""
+    body = _json_body()
+    known = {stage["value"] for stage in _funnel_stages()}
+    target_stage = str(body.get("stage") or "").strip()
+    if target_stage not in known:
+        return _error(
+            "Неизвестный этап воронки.",
+            400,
+            "unknown_stage",
+            details={"stage": target_stage},
+        )
+    result = store.enqueue_operator_stage_change(
+        conversation_id,
+        target_stage=target_stage,
+        expected_version=body.get("expected_version"),
+        operator_name=workspace_operator_name(),
+    )
+    return _json({"conversation": result["conversation"]})
 
 
 @funnel_workspace_bp.patch(

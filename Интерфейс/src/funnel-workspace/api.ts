@@ -235,6 +235,23 @@ export const funnelWorkspaceApi = {
       },
     ),
 
+  setStage: (
+    conversationId: Conversation["id"],
+    payload: {
+      stage: string;
+      expected_version: number;
+      csrf_token: string;
+    },
+  ) =>
+    request<{ conversation: Conversation }>(
+      `/conversations/${encodeURIComponent(String(conversationId))}/stage`,
+      {
+        method: "POST",
+        headers: csrfHeaders(payload.csrf_token),
+        body: JSON.stringify(payload),
+      },
+    ),
+
   setControl: (
     conversationId: Conversation["id"],
     payload: {

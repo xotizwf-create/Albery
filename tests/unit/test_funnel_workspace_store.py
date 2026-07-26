@@ -1081,6 +1081,74 @@ def test_conversation_search_looks_through_the_whole_retained_history():
     assert params.count("%договор%") == 6
 
 
+def test_conversation_list_reports_how_long_the_client_waits_for_an_answer():
+    """Срочность считается по переписке, а не по отдельному полю: вопрос без ответа —
+    это клиентское сообщение новее последнего исходящего."""
+    def respond(sql, _params):
+        if sql.startswith("SELECT c.*, s.source_type"):
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    store.list_conversations(connect=connect)
+
+    sql, _params = connection.cursor_instance.executed[0]
+    assert "awaiting_reply_since" in sql
+    assert "author_type IN ('agent', 'operator')" in sql
+    assert "delivery_status <> 'cancelled'" in sql
+    # Дольше всех ждущий клиент обязан быть вверху списка.
+    assert "(awaiting_reply_since IS NOT NULL) DESC" in sql
+    assert "awaiting_reply_since ASC" in sql
+
+
+def test_operator_stage_change_is_shown_at_once_and_queued_for_bitrix():
+    """Сайт и Битрикс — одно целое: этап виден сразу, а в CRM его переставляет та же
+    durable-очередь, что и после доставки сообщения."""
+    def respond(sql, _params):
+        if sql.startswith("SELECT * FROM funnel_workspace_conversations"):
+            return conversation(stage_id="C16:NEW")
+        if sql.startswith("SELECT id FROM funnel_workspace_messages"):
+            return {"id": 55}
+        if sql.startswith("INSERT INTO funnel_workspace_crm_actions"):
+            assert "'move_stage'" in sql
+            return {"id": 8, "action_type": "move_stage", "target_stage": "C16:NDA"}
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            assert "stage_id = %s" in sql
+            return conversation(stage_id="C16:NDA")
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    result = store.enqueue_operator_stage_change(
+        41,
+        target_stage="C16:NDA",
+        expected_version=7,
+        operator_name="Юлия",
+        now=NOW,
+        connect=connect,
+    )
+
+    assert result["conversation"]["stage_id"] == "C16:NDA"
+    assert result["crm_action"]["action_type"] == "move_stage"
+    statements = [sql for sql, _ in connection.cursor_instance.executed]
+    assert any(sql.startswith("INSERT INTO funnel_workspace_crm_actions") for sql in statements)
+
+
+def test_operator_stage_change_respects_the_expected_version():
+    def respond(sql, _params):
+        if sql.startswith("SELECT * FROM funnel_workspace_conversations"):
+            return conversation(state_version=9)
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    with pytest.raises(store.WorkspaceConflictError):
+        store.enqueue_operator_stage_change(
+            41,
+            target_stage="C16:NDA",
+            expected_version=7,
+            connect=connect,
+        )
+
+
 def test_unlinking_a_dead_deal_lets_the_backfill_create_a_new_one():
     """Backfill пропускает диалог, пока существует запись ensure_deal. Если её оставить,
     диалог с удалённой сделкой навсегда останется без карточки CRM."""

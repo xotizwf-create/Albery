@@ -4,11 +4,29 @@ import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterator, Mapping
+from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
 from shared.db import connect as pg_connect
 
+
+# Момент, с которого клиент ждёт ответа: время самого раннего его сообщения, после
+# которого ни агент, ни оператор ничего не отправили. NULL — ответ уже дан. Считается
+# запросом, а не хранится в колонке: любое расхождение с перепиской здесь невозможно.
+AWAITING_REPLY_SQL = """(
+    SELECT min(client.occurred_at)
+      FROM funnel_workspace_messages client
+     WHERE client.conversation_id = c.id
+       AND client.author_type = 'client'
+       AND client.id > COALESCE((
+               SELECT max(answer.id)
+                 FROM funnel_workspace_messages answer
+                WHERE answer.conversation_id = c.id
+                  AND answer.author_type IN ('agent', 'operator')
+                  AND answer.delivery_status <> 'cancelled'
+           ), 0)
+)"""
 
 VALID_STATUSES = frozenset({"new", "open", "waiting", "closed", "spam", "expired"})
 VALID_CONTROL_MODES = frozenset({"ai", "human", "paused"})
@@ -81,6 +99,11 @@ def human_lease_seconds() -> int:
 
 def reply_window_hours() -> int:
     return _bounded_env_int("FUNNEL_WORKSPACE_REPLY_WINDOW_HOURS", 24, 1, 48)
+
+
+def urgent_after_minutes() -> int:
+    """Сколько минут вопрос клиента может висеть без ответа, прежде чем станет срочным."""
+    return _bounded_env_int("FUNNEL_WORKSPACE_URGENT_AFTER_MINUTES", 10, 1, 1440)
 
 
 def ai_debounce_milliseconds() -> int:
@@ -304,6 +327,82 @@ def set_workspace_operator_name(
     return clean_name
 
 
+def enqueue_operator_stage_change(
+    conversation_id: Any,
+    *,
+    target_stage: str,
+    expected_version: Any = None,
+    operator_name: str | None = None,
+    now: datetime | None = None,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    """Перевести сделку на другой этап по действию оператора.
+
+    Сайт и Битрикс должны быть одним целым, поэтому этап меняется не «где-то потом»:
+    в диалоге он виден сразу, а в CRM его переставляет та же durable-очередь, что и
+    после доставки сообщения. Если Битрикс откажет, ежеминутная синхронизация вернёт
+    в интерфейс настоящее значение — расхождение не может остаться незамеченным.
+    """
+    stage = _required_text(target_stage, "target_stage", 200)
+    timestamp = _now(now)
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            row = _load_conversation_locked(cur, conversation_id)
+            if expected_version is not None:
+                _require_version(row, expected_version)
+            cur.execute(
+                """
+                SELECT id
+                  FROM funnel_workspace_messages
+                 WHERE conversation_id = %s
+                 ORDER BY id DESC
+                 LIMIT 1
+                """,
+                (row["id"],),
+            )
+            last_message = _record(cur.fetchone())
+            if last_message is None:
+                raise WorkspaceValidationError(
+                    "В диалоге ещё нет сообщений — этап менять не от чего.",
+                    details={"conversation_id": row["id"]},
+                )
+            cur.execute(
+                """
+                INSERT INTO funnel_workspace_crm_actions (
+                    conversation_id, message_id, action_type,
+                    target_stage, payload, idempotency_key
+                )
+                VALUES (%s, %s, 'move_stage', %s, %s, %s)
+             RETURNING *
+                """,
+                (
+                    row["id"],
+                    last_message["id"],
+                    stage,
+                    Jsonb(
+                        {
+                            "trigger": "operator",
+                            "operator_name": _clean_optional(operator_name, 200),
+                            "previous_stage": _clean_optional(row.get("stage_id"), 200),
+                        }
+                    ),
+                    f"crm-stage:operator:{row['id']}:{stage}:{uuid4().hex}",
+                ),
+            )
+            action = dict(cur.fetchone())
+            cur.execute(
+                """
+                UPDATE funnel_workspace_conversations
+                   SET stage_id = %s,
+                       updated_at = %s
+                 WHERE id = %s
+             RETURNING *
+                """,
+                (stage, timestamp, row["id"]),
+            )
+            return {"conversation": dict(cur.fetchone()), "crm_action": action}
+
+
 def unlink_conversation_deal(
     conversation_id: Any,
     *,
@@ -474,8 +573,9 @@ def get_conversation(
     with _connection(connect) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT c.*, s.source_type, s.display_name AS source_name
+                f"""
+                SELECT c.*, s.source_type, s.display_name AS source_name,
+                       {AWAITING_REPLY_SQL} AS awaiting_reply_since
                   FROM funnel_workspace_conversations c
                   JOIN funnel_workspace_sources s ON s.source_key = c.source_key
                  WHERE c.id = %s
@@ -552,12 +652,16 @@ def list_conversations(
             cur.execute(
                 f"""
                 SELECT c.*, s.source_type, s.display_name AS source_name,
+                       {AWAITING_REPLY_SQL} AS awaiting_reply_since,
                        count(*) OVER () AS filtered_total
                   FROM funnel_workspace_conversations c
                   JOIN funnel_workspace_sources s ON s.source_key = c.source_key
                  WHERE {' AND '.join(clauses)}
                  ORDER BY
-                       (c.status = 'new') DESC,
+                       -- Дольше всех ждущий клиент — вверху списка: срочность важнее
+                       -- новизны, иначе просроченный вопрос уезжает вниз под свежими.
+                       (awaiting_reply_since IS NOT NULL) DESC,
+                       awaiting_reply_since ASC,
                        (c.unread_count > 0) DESC,
                        c.last_message_at DESC NULLS LAST,
                        c.id DESC

@@ -36,6 +36,8 @@ export interface WorkspaceMeta {
   ai_enabled?: boolean;
   ai_rollout_limited?: boolean;
   human_lease_seconds?: number;
+  /** Через сколько минут без ответа обращение считается срочным. */
+  urgent_after_minutes?: number;
   statuses?: WorkspaceStatusOption[];
   /** Этапы воронки ИУ в порядке владельца — приходят из iu_funnel.CHAIN. */
   funnel_stages?: Array<{ value: string; label: string; goal?: string; order?: number }>;
@@ -62,6 +64,8 @@ export interface Conversation {
   deal_id: number | null;
   deal_title: string | null;
   stage_id: string | null;
+  /** С какого момента клиент ждёт ответа; null — ответ уже дан. */
+  awaiting_reply_since?: string | null;
   stage_name: string | null;
   assigned_to: string | null;
 }

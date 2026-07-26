@@ -80,6 +80,18 @@ const FALLBACK_STAGES = [
 // Цвет по месту в воронке: от «только пришёл» к «договор подписан».
 const STAGE_COLORS = ["#7c3aed", "#2563eb", "#0891b2", "#d97706", "#16a34a"];
 
+// Состояния доставки, при которых судьба сообщения ещё не решена.
+const IN_FLIGHT_DELIVERY = new Set(["pending", "queued", "sending", "leased"]);
+
+const URGENT_AFTER_MINUTES_DEFAULT = 10;
+
+const formatWaiting = (minutes: number) => {
+  if (minutes < 60) return `${minutes} мин`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} ч`;
+  return `${Math.floor(hours / 24)} дн`;
+};
+
 const stageColor = (index: number) =>
   STAGE_COLORS[Math.min(Math.max(index, 0), STAGE_COLORS.length - 1)];
 
@@ -791,6 +803,53 @@ function StatusPill({
   );
 }
 
+/** «Очень срочно», если вопрос клиента висит без ответа дольше порога, иначе «В работе». */
+function WorkBadge({
+  conversation,
+  now,
+  urgentAfterMinutes,
+  compact = false,
+}: {
+  conversation: Conversation;
+  now: number;
+  urgentAfterMinutes: number;
+  compact?: boolean;
+}) {
+  const waitingSince = parseTimestamp(conversation.awaiting_reply_since);
+  const waitingMinutes = waitingSince
+    ? Math.max(0, Math.floor((now - waitingSince) / 60_000))
+    : 0;
+  const urgent = Boolean(waitingSince) && waitingMinutes >= urgentAfterMinutes;
+  const size = compact ? "px-2 py-1 text-[10px]" : "px-2.5 py-1.5 text-[11px]";
+  const icon = compact ? "h-3 w-3" : "h-3.5 w-3.5";
+
+  if (urgent) {
+    return (
+      <span
+        className={cn(
+          "inline-flex items-center gap-1.5 rounded-full bg-red-50 font-black text-red-700 ring-1 ring-inset ring-red-200",
+          size,
+        )}
+      >
+        <AlertCircle className={icon} />
+        Очень срочно · {formatWaiting(waitingMinutes)}
+      </span>
+    );
+  }
+
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-full bg-emerald-50 font-bold text-emerald-700",
+        size,
+      )}
+    >
+      <MessageCircleMore className={icon} />
+      В работе
+    </span>
+  );
+}
+
 function ControlBadge({
   conversation,
   now,
@@ -867,6 +926,7 @@ function ConversationList({
   stageOptions,
   stageLabels,
   stageColors,
+  urgentAfterMinutes,
   now,
   onQueryChange,
   onStageChange,
@@ -885,6 +945,7 @@ function ConversationList({
   stageOptions: Array<{ value: string; label: string; color?: string }>;
   stageLabels: Record<string, string>;
   stageColors: Record<string, string>;
+  urgentAfterMinutes: number;
   now: number;
   onQueryChange: (value: string) => void;
   onStageChange: (value: string) => void;
@@ -1190,6 +1251,12 @@ function ConversationList({
                             (conversation.stage_id ? conversation.stage_id : "Без сделки")
                           }
                           color={stageColors[conversation.stage_id || ""] || "#94a3b8"}
+                          compact
+                        />
+                        <WorkBadge
+                          conversation={conversation}
+                          now={now}
+                          urgentAfterMinutes={urgentAfterMinutes}
                           compact
                         />
                         <ControlBadge conversation={conversation} now={now} compact />
@@ -1786,27 +1853,29 @@ function ChatPanel({
 function ConversationDetails({
   conversation,
   meta,
-  statusOptions,
+  stageOptions,
   stageLabels,
   stageColors,
+  urgentAfterMinutes,
   now,
   controlBusy,
-  statusBusy,
+  stageBusy,
   onClose,
   onControl,
-  onStatus,
+  onStage,
 }: {
   conversation: Conversation;
   meta: WorkspaceMeta | null;
-  statusOptions: Array<{ value: string; label: string; color?: string }>;
+  stageOptions: Array<{ value: string; label: string; color?: string }>;
   stageLabels: Record<string, string>;
   stageColors: Record<string, string>;
+  urgentAfterMinutes: number;
   now: number;
   controlBusy: boolean;
-  statusBusy: boolean;
+  stageBusy: boolean;
   onClose?: () => void;
   onControl: (mode: "human" | "ai") => void;
-  onStatus: (status: ConversationStatus) => void;
+  onStage: (stage: string) => void;
 }) {
   const lease = formatLease(conversation.resume_at, now);
   const canReply = conversation.can_reply !== false;
@@ -1883,49 +1952,44 @@ function ConversationDetails({
         </div>
 
         <section className="mt-6">
-          <div className="mb-2 text-[10px] font-black uppercase tracking-[0.12em] text-slate-400">
-            Этап воронки ИУ
-          </div>
-          <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50/70 px-3 py-2.5">
-            <StatusPill
-              status={conversation.stage_id || ""}
-              label={
-                stageLabels[conversation.stage_id || ""] ||
-                (conversation.stage_id ? conversation.stage_id : "Сделка ещё не создана")
-              }
-              color={stageColors[conversation.stage_id || ""] || "#94a3b8"}
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <span className="text-[10px] font-black uppercase tracking-[0.12em] text-slate-400">
+              Этап воронки
+            </span>
+            <WorkBadge
+              conversation={conversation}
+              now={now}
+              urgentAfterMinutes={urgentAfterMinutes}
+              compact
             />
           </div>
-          <div className="mt-1.5 text-[10px] font-medium leading-4 text-slate-400">
-            Этап двигается сам по фактам сделки и догоняет изменения в CRM.
-          </div>
-        </section>
-
-        <section className="mt-6">
-          <label className="mb-2 block text-[10px] font-black uppercase tracking-[0.12em] text-slate-400">
-            Операционный статус обращения
-          </label>
           <div className="relative">
             <SelectMenu
-              ariaLabel="Операционный статус обращения"
-              value={conversation.status}
-              onChange={onStatus}
+              ariaLabel="Этап воронки"
+              value={conversation.stage_id || ""}
+              onChange={onStage}
+              placeholder="Сделка ещё не создана"
               options={
-                statusOptions.some((option) => option.value === conversation.status)
-                  ? statusOptions
-                  : [
+                conversation.stage_id &&
+                !stageOptions.some((option) => option.value === conversation.stage_id)
+                  ? [
                       {
-                        value: conversation.status,
-                        label:
-                          STATUS_LABELS[conversation.status] || conversation.status,
+                        value: conversation.stage_id,
+                        label: stageLabels[conversation.stage_id] || conversation.stage_id,
+                        color: stageColors[conversation.stage_id],
                       },
-                      ...statusOptions,
+                      ...stageOptions,
                     ]
+                  : stageOptions
               }
             />
-            {statusBusy && (
+            {stageBusy && (
               <Loader2 className="pointer-events-none absolute right-9 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-slate-400" />
             )}
+          </div>
+          <div className="mt-1.5 text-[10px] font-medium leading-4 text-slate-400">
+            Смена этапа здесь сразу уходит в сделку Битрикса; обратные изменения в CRM
+            подтягиваются в течение минуты.
           </div>
         </section>
 
@@ -2111,7 +2175,6 @@ function OperatorWorkspace({
   const [hasOlderMessages, setHasOlderMessages] = useState(false);
   const [queryInput, setQueryInput] = useState("");
   const [query, setQuery] = useState("");
-  const [status, setStatus] = useState("all");
   const [stage, setStage] = useState("all");
   const [contextMenu, setContextMenu] = useState<{
     x: number;
@@ -2124,7 +2187,7 @@ function OperatorWorkspace({
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [sending, setSending] = useState(false);
   const [controlBusy, setControlBusy] = useState(false);
-  const [statusBusy, setStatusBusy] = useState(false);
+  const [stageBusy, setStageBusy] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [mobilePane, setMobilePane] = useState<MobilePane>("list");
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -2161,6 +2224,13 @@ function OperatorWorkspace({
     return base.map((item, index) => ({ ...item, color: stageColor(index) }));
   }, [meta]);
 
+  const urgentAfterMinutes = useMemo(() => {
+    const configured = Number(meta?.urgent_after_minutes);
+    return Number.isFinite(configured) && configured > 0
+      ? configured
+      : URGENT_AFTER_MINUTES_DEFAULT;
+  }, [meta]);
+
   const stageLabels = useMemo(
     () =>
       Object.fromEntries(
@@ -2176,27 +2246,6 @@ function OperatorWorkspace({
       ) as Record<string, string>,
     [stageOptions],
   );
-
-  const statusOptions = useMemo(() => {
-    const fromMeta = Array.isArray(meta?.statuses)
-      ? meta.statuses
-          .map((item) => ({
-            value: String(item.value || item.id || "").trim(),
-            label: String(item.label || item.name || item.value || item.id || "").trim(),
-            color: item.color,
-          }))
-          .filter((item) => item.value && item.label)
-      : [];
-    const base = fromMeta.length ? fromMeta : FALLBACK_STATUSES;
-    const values = new Set(base.map((item) => item.value));
-    const discovered = conversations
-      .filter((conversation) => conversation.status && !values.has(conversation.status))
-      .map((conversation) => ({
-        value: conversation.status,
-        label: STATUS_LABELS[conversation.status] || conversation.status,
-      }));
-    return [...base, ...discovered];
-  }, [meta, conversations]);
 
   const reportError = useCallback(
     (error: unknown) => {
@@ -2254,7 +2303,6 @@ function OperatorWorkspace({
       try {
         const payload = await funnelWorkspaceApi.getConversations({
           q: query,
-          status,
           stage,
           limit: 100,
           offset: 0,
@@ -2286,7 +2334,7 @@ function OperatorWorkspace({
         if (!quiet) setListLoading(false);
       }
     },
-    [query, reportError, stage, status],
+    [query, reportError, stage],
   );
 
   const loadMoreConversations = useCallback(async () => {
@@ -2296,7 +2344,6 @@ function OperatorWorkspace({
     try {
       const payload = await funnelWorkspaceApi.getConversations({
         q: query,
-        status,
         stage,
         limit: 100,
         offset: conversations.length,
@@ -2320,7 +2367,7 @@ function OperatorWorkspace({
     listLoadingMore,
     query,
     reportError,
-    status,
+    stage,
   ]);
 
   const fetchMessages = useCallback(
@@ -2334,9 +2381,17 @@ function OperatorWorkspace({
       if (options.showLoading) setMessagesLoading(true);
       try {
         const existing = reset ? [] : messagesRef.current.filter((message) => !message.optimistic && message.id > 0);
-        const afterId = existing.length
-          ? Math.max(...existing.map((message) => message.id))
-          : undefined;
+        // Инкрементальный опрос по after_id приносит только НОВЫЕ сообщения, поэтому
+        // статус уже показанного письма («Отправляется») никогда не перечитывался и
+        // висел до переключения диалога. Пока хоть одно сообщение в пути, перечитываем
+        // окно целиком — сервер отмечает доставку меньше чем за секунду.
+        const deliveryInFlight = existing.some((message) =>
+          IN_FLIGHT_DELIVERY.has(String(message.delivery_status || "")),
+        );
+        const afterId =
+          existing.length && !deliveryInFlight
+            ? Math.max(...existing.map((message) => message.id))
+            : undefined;
         const payload = await funnelWorkspaceApi.getMessages(
           conversationId,
           options.beforeId
@@ -2592,25 +2647,28 @@ function OperatorWorkspace({
     }
   };
 
-  const setConversationStatus = async (nextStatus: ConversationStatus) => {
+  const changeStage = async (nextStage: string) => {
     const conversation = selectedConversation;
-    if (!conversation || statusBusy || nextStatus === conversation.status) return;
-    setStatusBusy(true);
+    if (!conversation || stageBusy || nextStage === conversation.stage_id) return;
+    setStageBusy(true);
     try {
-      await funnelWorkspaceApi.setStatus(conversation.id, {
-        status: nextStatus,
+      await funnelWorkspaceApi.setStage(conversation.id, {
+        stage: nextStage,
         expected_version: conversation.state_version,
         csrf_token: csrfToken(),
       });
       await loadConversations(true);
-      setToast({ message: "Статус заявки обновлён.", tone: "success" });
+      setToast({
+        message: "Этап изменён — сделка в Битриксе обновляется.",
+        tone: "success",
+      });
     } catch (error) {
       if (error instanceof FunnelWorkspaceApiError && error.status === 409) {
         await loadConversations(true);
       }
       reportError(error);
     } finally {
-      setStatusBusy(false);
+      setStageBusy(false);
     }
   };
 
@@ -2695,6 +2753,7 @@ function OperatorWorkspace({
               stageOptions={stageOptions}
               stageLabels={stageLabels}
               stageColors={stageColors}
+              urgentAfterMinutes={urgentAfterMinutes}
               now={now}
               onQueryChange={setQueryInput}
               onStageChange={setStage}
@@ -2747,14 +2806,15 @@ function OperatorWorkspace({
               <ConversationDetails
                 conversation={selectedConversation}
                 meta={meta}
-                statusOptions={statusOptions}
+                stageOptions={stageOptions}
                 stageLabels={stageLabels}
                 stageColors={stageColors}
+                urgentAfterMinutes={urgentAfterMinutes}
                 now={now}
                 controlBusy={controlBusy}
-                statusBusy={statusBusy}
+                stageBusy={stageBusy}
                 onControl={(mode) => void setControl(mode)}
-                onStatus={(nextStatus) => void setConversationStatus(nextStatus)}
+                onStage={(nextStage) => void changeStage(nextStage)}
               />
             ) : (
               <div className="flex h-full items-center justify-center bg-white px-8 text-center text-xs font-semibold leading-5 text-slate-400">
@@ -2776,15 +2836,16 @@ function OperatorWorkspace({
             <ConversationDetails
               conversation={selectedConversation}
               meta={meta}
-              statusOptions={statusOptions}
+              stageOptions={stageOptions}
               stageLabels={stageLabels}
               stageColors={stageColors}
+              urgentAfterMinutes={urgentAfterMinutes}
               now={now}
               controlBusy={controlBusy}
-              statusBusy={statusBusy}
+              stageBusy={stageBusy}
               onClose={() => setDetailsOpen(false)}
               onControl={(mode) => void setControl(mode)}
-              onStatus={(nextStatus) => void setConversationStatus(nextStatus)}
+              onStage={(nextStage) => void changeStage(nextStage)}
             />
           </aside>
         </div>
