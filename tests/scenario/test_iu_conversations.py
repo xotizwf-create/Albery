@@ -107,12 +107,13 @@ def test_unknown_question_goes_to_humans_without_silence():
 
 def test_partial_answer_keeps_the_known_part_and_flags_the_rest():
     """Владелец: «на что знает — отвечает, что не знает — эскалирует»."""
-    out = run("Какая комиссия и какой ДРР держать?", ask=model(
+    out = run("Какая комиссия и нужна ли электронная подпись?", ask=model(
         reply="Комиссия 44%, в неё входят логистика, хранение и приёмка.",
-        source_ids=["комиссия"], answered=["комиссия"], unresolved=["ДРР"]))
+        source_ids=["комиссия"], answered=["комиссия"],
+        unresolved=["электронная подпись"]))
 
     assert "44%" in out.reply
-    assert out.escalate and "ДРР" in out.reason
+    assert out.escalate and "подпись" in out.reason
 
 
 def test_repeated_question_gets_the_simpler_wording():
@@ -252,6 +253,69 @@ def test_confident_model_with_empty_knowledge_still_escalates():
         reply="НДС не облагается, работаем по упрощёнке.", confidence=1.0))
 
     assert out.escalate
+
+
+# --- деньги и уступки ------------------------------------------------------------------------------
+
+def test_haggling_client_gets_no_invented_discount():
+    """Владелец: «нельзя самостоятельно предлагать скидки и тд ни в коем случае»."""
+    out = run("дорого, дайте скидку 10% и я подключусь", ask=model(
+        reply="Хорошо, сделаем для вас скидку на первый месяц.",
+        source_ids=["комиссия"], answered=["комиссия"]))
+
+    assert out.escalate
+    assert "скидк" not in out.reply.casefold()
+
+
+def test_persistent_client_gets_no_sweetener_either():
+    for sweetener in ("Могу дать рассрочку на три месяца.",
+                      "Первый месяц сделаем бесплатно.",
+                      "Пойдём навстречу и снизим комиссию."):
+        out = run("ну хоть что-нибудь предложите", ask=model(reply=sweetener))
+        assert out.escalate, sweetener
+
+
+def test_concession_written_by_the_owner_is_allowed():
+    """Если владелец сам написал про рассрочку — агент про неё расскажет."""
+    cards = iu_knowledge.parse_cards(
+        "### Оплата\nОтвет: Оплата помесячная. Возможна рассрочка на три месяца.")
+
+    out = run("как устроена оплата?", cards=cards, rerank=None, ask=model(
+        reply="Да, возможна рассрочка на три месяца.", source_ids=["оплата"],
+        answered=["оплата"], confidence=0.95))
+
+    assert not out.escalate
+    assert "рассрочка" in out.reply
+
+
+def test_calculation_request_needs_near_certainty():
+    """«Когда дело касается расчётов — модель должна быть уверена на 95%+»."""
+    out = run("посчитайте мою экономику при обороте 4 млн", ask=model(
+        reply="Комиссия 44%, значит останется примерно 2 240 000 ₽.",
+        source_ids=["комиссия"], answered=["комиссия"], confidence=0.9))
+
+    assert out.escalate
+    assert "2 240 000" not in out.reply
+
+
+def test_dispute_about_how_the_percent_is_counted_goes_to_a_human():
+    """Живой случай 25.07.2026: «вычитаете 44% не с к перечислению, а от продаж»."""
+    out = run("вы неправильно считаете, 44% вычитается от продаж", ask=model(
+        reply="44% вычитается от суммы к перечислению.",
+        source_ids=["комиссия"], answered=["комиссия"], confidence=0.9))
+
+    assert out.escalate
+
+
+def test_quoting_the_rate_still_works_normally():
+    """Строгость расчётов не должна ломать самый частый вопрос воронки."""
+    out = run("а сколько вы берёте?", ask=model(
+        reply="Единая комиссия 44% — в неё уже входят логистика, хранение и приёмка.",
+        source_ids=["комиссия"], answered=["комиссия"]))
+
+    assert not out.escalate
+    assert "44%" in out.reply
+    assert out.trace["threshold"] == 0.65
 
 
 # --- сбои ---------------------------------------------------------------------------------------

@@ -144,6 +144,55 @@ def test_ordinary_answer_passes_outgoing():
         "Комиссия 44%, в неё входят логистика, хранение и приёмка.", RULES) is None
 
 
+# --- уступки от себя -------------------------------------------------------------------------
+
+SOURCES = "Единая комиссия 44%. Подключение занимает 3 рабочих дня."
+
+
+def test_invented_discount_is_caught():
+    """Владелец 26.07.2026: «нельзя самостоятельно предлагать скидки и тд ни в коем случае»."""
+    hit = f.concession("Могу предложить вам скидку 10% на первый месяц.", SOURCES)
+
+    assert hit and hit.category == f.CONCESSION
+
+
+def test_all_invented_sweeteners_are_caught():
+    for reply in (
+        "Первый месяц бесплатно.",
+        "Сделаем для вас особые условия.",
+        "Могу дать рассрочку.",
+        "Дадим отсрочку платежа.",
+        "Пойдём навстречу и снизим тариф.",
+        "Добавим бонус к подключению.",
+        "Дам пробный период на две недели.",
+    ):
+        assert f.concession(reply, SOURCES), reply
+
+
+def test_concession_written_by_the_owner_is_allowed():
+    """Если владелец сам написал про рассрочку — агент про неё расскажет."""
+    sources = SOURCES + " Возможна рассрочка на три месяца по согласованию."
+
+    assert f.concession("Да, рассрочка на три месяца возможна.", sources) is None
+
+
+def test_denial_of_a_discount_is_allowed_when_grounded():
+    """«Скидок нет» опирается на базу так же, как «скидка есть»."""
+    sources = SOURCES + " Скидок по программе не предусмотрено."
+
+    assert f.concession("К сожалению, скидок по программе нет.", sources) is None
+
+
+def test_product_name_is_not_a_concession():
+    """«Индивидуальные условия» — название продукта, а не подарок клиенту."""
+    assert f.concession(
+        "Индивидуальные условия подключаются после подписания договора.", SOURCES) is None
+
+
+def test_ordinary_answer_offers_nothing():
+    assert f.concession("Комиссия 44%, подключение занимает 3 рабочих дня.", SOURCES) is None
+
+
 # --- обещания действий ---------------------------------------------------------------------
 
 def test_claimed_action_is_detected():

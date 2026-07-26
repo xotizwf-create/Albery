@@ -108,9 +108,11 @@ def test_handoff_keeps_reason_and_needs_no_reply():
 # --- порог уверенности --------------------------------------------------------------------
 
 def test_confident_grounded_answer_passes():
-    plan = c.parse(plan_json(), offered_sources=OFFERED)
+    plan = c.parse(plan_json(reply="Выплаты приходят в течение трёх рабочих дней.",
+                             answered=["выплаты"]), offered_sources=OFFERED)
 
-    verdict = c.assess(plan, retrieval=0.9, sources_text=SOURCES)
+    verdict = c.assess(plan, retrieval=0.9, sources_text=SOURCES,
+                       message="когда приходят выплаты?")
 
     assert verdict.allowed and verdict.score >= 0.65
 
@@ -187,6 +189,56 @@ def test_model_asking_for_human_always_escalates():
 
 def test_threshold_is_the_owner_number():
     assert c.THRESHOLD == pytest.approx(0.65)
+    assert c.CALC_THRESHOLD == pytest.approx(0.95)
+
+
+# --- строгий порог для денег ------------------------------------------------------------------
+
+def test_calculation_request_uses_the_strict_threshold():
+    """Владелец 26.07.2026: «когда дело касается расчётов — уверенность 95%+»."""
+    plan = c.parse(plan_json(reply="Расскажу, как это устроено.", answered=[]),
+                   offered_sources=OFFERED)
+
+    for message in ("посчитайте мою экономику", "какая будет прибыль?",
+                    "от чего считается процент?", "а выручка какая выйдет?"):
+        assert c.threshold_for(plan, message) == pytest.approx(0.95), message
+
+
+def test_models_own_calculation_wording_also_triggers_it():
+    """Клиент мог не просить расчёт — модель начала считать сама."""
+    plan = c.parse(plan_json(reply="44% вычитается от суммы к перечислению."),
+                   offered_sources=OFFERED)
+
+    assert c.threshold_for(plan, "а как это работает?") == pytest.approx(0.95)
+
+
+def test_quoting_a_rate_is_not_a_calculation():
+    """«Комиссия 44%» новых чисел не выводит, и её защищает вето на неподтверждённые числа.
+
+    Иначе строгий порог требовал бы почти идеального поиска на самый частый вопрос воронки, и
+    «сколько вы берёте» всегда уходило бы человеку."""
+    plan = c.parse(plan_json(reply="Комиссия 44%."), offered_sources=OFFERED)
+
+    assert c.threshold_for(plan, "а сколько вы берёте?") == pytest.approx(0.65)
+
+
+def test_ordinary_talk_keeps_the_normal_threshold():
+    plan = c.parse(plan_json(reply="Подключение занимает три рабочих дня.", answered=["сроки"]),
+                   offered_sources=OFFERED)
+
+    assert c.threshold_for(plan, "как быстро подключите?") == pytest.approx(0.65)
+
+
+def test_calculation_that_would_pass_normally_still_escalates():
+    """Ход, проходящий обычный порог, на расчёте уходит человеку."""
+    plan = c.parse(plan_json(reply="Выходит около 3 дней ожидания.", confidence=0.9),
+                   offered_sources=OFFERED)
+
+    verdict = c.assess(plan, retrieval=0.85, sources_text=SOURCES,
+                       message="посчитайте, сколько получится")
+
+    assert 0.65 < verdict.score < 0.95
+    assert verdict.escalate
 
 
 def test_score_is_dominated_by_checkable_parts():

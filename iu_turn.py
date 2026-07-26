@@ -216,10 +216,12 @@ def handle(request: Request, deps: Deps) -> Outcome:
         return _escalate(f"правило карточки знаний: {always}", trace=trace,
                          stage_move=stage_move)
 
-    # 8. Порог уверенности.
-    verdict = iu_contract.assess(plan, retrieval=retrieval, sources_text=sources)
+    # 8. Порог уверенности. Разговор о деньгах судится строже — 0.95 вместо 0.65.
+    verdict = iu_contract.assess(plan, retrieval=retrieval, sources_text=sources,
+                                 message=request.message)
     trace.update({"score": round(verdict.score, 3), "checked": verdict.checked,
-                  "grounding": round(verdict.grounding, 3)})
+                  "grounding": round(verdict.grounding, 3),
+                  "threshold": iu_contract.threshold_for(plan, request.message)})
     if verdict.escalate:
         return _escalate("; ".join(verdict.reasons) or "уверенность ниже порога",
                          trace=trace, stage_move=stage_move)
@@ -231,7 +233,16 @@ def handle(request: Request, deps: Deps) -> Outcome:
         return _escalate(f"ответ модели не прошёл фильтр ({out_hit.category}: "
                          f"{out_hit.matched})", trace=trace, stage_move=stage_move)
 
-    # 10. «Действие, потом слова»: обещание сделанного без исполненного действия.
+    # 10. Уступки. Владелец 26.07.2026: «нельзя самостоятельно предлагать скидки и тд ни в коем
+    # случае, только то, что прописано в базе». Проверяем по источникам, а не по словарю: если
+    # владелец сам написал про рассрочку — можно, если модель придумала — нельзя.
+    gift = iu_filters.concession(plan.reply, sources)
+    if gift:
+        trace["concession"] = gift.matched
+        return _escalate(f"модель предложила от себя «{gift.matched}» — в базе этого нет",
+                         trace=trace, stage_move=stage_move)
+
+    # 11. «Действие, потом слова»: обещание сделанного без исполненного действия.
     claimed = iu_filters.claims_action(plan.reply)
     if claimed and plan.next_action == iu_contract.REPLY_ONLY:
         trace["false_promise"] = claimed
