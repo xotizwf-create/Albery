@@ -242,6 +242,19 @@ export const funnelWorkspaceApi = {
       },
     ),
 
+  deleteConversation: (
+    conversationId: Conversation["id"],
+    csrfToken: string,
+  ) =>
+    request<{ deleted: boolean; messages: number; client: string }>(
+      `/conversations/${encodeURIComponent(String(conversationId))}`,
+      {
+        method: "DELETE",
+        headers: csrfHeaders(csrfToken),
+        body: JSON.stringify({ csrf_token: csrfToken }),
+      },
+    ),
+
   setStage: (
     conversationId: Conversation["id"],
     payload: {

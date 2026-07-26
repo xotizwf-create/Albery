@@ -30,6 +30,7 @@ import {
   Search,
   SendHorizontal,
   ShieldCheck,
+  Trash2,
   Sparkles,
   UserRound,
   Wifi,
@@ -779,6 +780,63 @@ function ContextMenu({
           <span className="min-w-0 flex-1 truncate">{item.label}</span>
         </button>
       ))}
+    </div>
+  );
+}
+
+/** Подтверждение внутри приложения: системный confirm() выглядит чужеродно и
+    не даёт показать, что именно будет удалено. */
+function ConfirmDialog({
+  title,
+  description,
+  confirmLabel,
+  busy = false,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  description: ReactNode;
+  confirmLabel: string;
+  busy?: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onCancel();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [busy, onCancel]);
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/40 p-5 backdrop-blur-sm">
+      <div className="w-full max-w-[420px] rounded-3xl border border-white/80 bg-white p-6 shadow-2xl shadow-slate-900/25">
+        <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-red-50 text-red-600">
+          <AlertCircle className="h-5 w-5" />
+        </span>
+        <h2 className="mt-4 text-lg font-black tracking-tight text-slate-950">{title}</h2>
+        <div className="mt-2 text-sm leading-6 text-slate-500">{description}</div>
+        <div className="mt-6 flex gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            className="h-11 flex-1 rounded-xl border border-slate-200 text-sm font-bold text-slate-600 transition hover:bg-slate-50 disabled:opacity-60"
+          >
+            Отмена
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={busy}
+            className="inline-flex h-11 flex-1 items-center justify-center gap-2 rounded-xl bg-red-600 text-sm font-black text-white transition hover:bg-red-700 disabled:opacity-60"
+          >
+            {busy && <Loader2 className="h-4 w-4 animate-spin" />}
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -2206,6 +2264,8 @@ function OperatorWorkspace({
     y: number;
     conversation: Conversation;
   } | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Conversation | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [listLoading, setListLoading] = useState(true);
   const [listLoadingMore, setListLoadingMore] = useState(false);
   const [messagesLoading, setMessagesLoading] = useState(false);
@@ -2709,6 +2769,39 @@ function OperatorWorkspace({
     }
   };
 
+  const deleteConversation = async (conversation: Conversation) => {
+    if (deleting) return;
+    setDeleting(true);
+    try {
+      const result = await funnelWorkspaceApi.deleteConversation(
+        conversation.id,
+        csrfToken(),
+      );
+      setPendingDelete(null);
+      setConversations((current) =>
+        current.filter((item) => stringId(item.id) !== stringId(conversation.id)),
+      );
+      if (stringId(selectedIdRef.current) === stringId(conversation.id)) {
+        setSelectedId(null);
+        setMessages([]);
+        mobilePaneRef.current = "list";
+        setMobilePane("list");
+        if (typeof window !== "undefined") {
+          window.history.replaceState(null, "", WORKSPACE_PATH);
+        }
+      }
+      await loadConversations(true);
+      setToast({
+        message: `Диалог удалён вместе с перепиской (${result.messages} сообщ.).`,
+        tone: "success",
+      });
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const changeStage = async (nextStage: string) => {
     const conversation = selectedConversation;
     if (!conversation || stageBusy || nextStage === conversation.stage_id) return;
@@ -2939,12 +3032,32 @@ function OperatorWorkspace({
                   onSelect: () => void setControl("ai"),
                 },
             {
-              key: "details",
-              label: "Карточка обращения",
-              icon: <PanelRight className="h-3.5 w-3.5" />,
-              onSelect: () => setDetailsOpen(true),
+              key: "delete",
+              label: "Удалить диалог",
+              icon: <Trash2 className="h-3.5 w-3.5" />,
+              onSelect: () => setPendingDelete(contextMenu.conversation),
             },
           ]}
+        />
+      )}
+
+      {pendingDelete && (
+        <ConfirmDialog
+          title="Удалить диалог?"
+          description={
+            <>
+              Обращение{" "}
+              <span className="font-bold text-slate-800">
+                {pendingDelete.display_name || pendingDelete.username || "клиента"}
+              </span>{" "}
+              будет удалено вместе со всей перепиской. Это действие нельзя отменить.
+              Сделка в Битриксе останется на месте.
+            </>
+          }
+          confirmLabel="Удалить"
+          busy={deleting}
+          onConfirm={() => void deleteConversation(pendingDelete)}
+          onCancel={() => setPendingDelete(null)}
         />
       )}
 

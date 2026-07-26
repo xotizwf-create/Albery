@@ -403,6 +403,59 @@ def enqueue_operator_stage_change(
             return {"conversation": dict(cur.fetchone()), "crm_action": action}
 
 
+def delete_conversation(
+    conversation_id: Any,
+    *,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    """Удалить обращение вместе со всей его историей.
+
+    Действие необратимое, поэтому подтверждение спрашивается в интерфейсе. Сделка в
+    Битриксе НЕ трогается: обращение — это наш журнал переписки, а карточка клиента
+    живёт в CRM своей жизнью, и удалять её заодно никто не просил.
+
+    Неотправленные ответы в очереди удаляются вместе с диалогом: держать их после
+    удаления бессмысленно — отправлять их станет некуда.
+    """
+    item_id = _positive_int(conversation_id, "conversation_id")
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.id, c.display_name, c.username, c.external_chat_id, c.deal_id,
+                       (SELECT count(*) FROM funnel_workspace_messages m
+                         WHERE m.conversation_id = c.id) AS messages
+                  FROM funnel_workspace_conversations c
+                 WHERE c.id = %s
+                 FOR UPDATE
+                """,
+                (item_id,),
+            )
+            row = _record(cur.fetchone())
+            if row is None:
+                raise WorkspaceNotFoundError(
+                    "Диалог не найден.",
+                    details={"conversation_id": item_id},
+                )
+            # Очереди ссылаются на диалог с ON DELETE CASCADE, поэтому отдельного
+            # прохода по ним не нужно — но обновления Telegram ссылаются мягко и
+            # остались бы висеть с пустой ссылкой, их убираем явно.
+            cur.execute(
+                "DELETE FROM funnel_workspace_updates WHERE conversation_id = %s",
+                (item_id,),
+            )
+            cur.execute(
+                "DELETE FROM funnel_workspace_conversations WHERE id = %s",
+                (item_id,),
+            )
+    return {
+        "deleted": True,
+        "conversation_id": item_id,
+        "messages": int(row.get("messages") or 0),
+        "client": row.get("display_name") or row.get("username") or row.get("external_chat_id"),
+    }
+
+
 def unlink_conversation_deal(
     conversation_id: Any,
     *,

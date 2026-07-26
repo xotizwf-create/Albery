@@ -892,6 +892,21 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
     return _json({"conversation": conversation})
 
 
+@funnel_workspace_bp.delete(
+    f"{API_PREFIX}/conversations/<int:conversation_id>"
+)
+def conversation_delete(conversation_id: int) -> tuple[Response, int]:
+    """Удалить обращение вместе с перепиской. Подтверждение спрашивает интерфейс."""
+    result = store.delete_conversation(conversation_id)
+    logger.warning(
+        "workspace conversation %s deleted by %s (%s messages)",
+        conversation_id,
+        workspace_operator_name() or "неизвестный оператор",
+        result.get("messages"),
+    )
+    return _json(result)
+
+
 @funnel_workspace_bp.post(
     f"{API_PREFIX}/conversations/<int:conversation_id>/stage"
 )

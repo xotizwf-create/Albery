@@ -1133,6 +1133,51 @@ def test_operator_stage_change_is_shown_at_once_and_queued_for_bitrix():
     assert any(sql.startswith("INSERT INTO funnel_workspace_crm_actions") for sql in statements)
 
 
+def test_deleting_a_conversation_removes_its_history_but_not_the_deal():
+    """Сделка в Битриксе — карточка клиента, она живёт своей жизнью; удалять её вместе
+    с журналом переписки никто не просил."""
+    statements: list[str] = []
+
+    def respond(sql, _params):
+        statements.append(sql)
+        if sql.startswith("SELECT c.id, c.display_name"):
+            return {
+                "id": 5,
+                "display_name": "Иван",
+                "username": "ivan",
+                "external_chat_id": "9001",
+                "deal_id": 188,
+                "messages": 12,
+            }
+        if sql.startswith("DELETE FROM"):
+            return None
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    result = store.delete_conversation(5, connect=connect)
+
+    assert result == {
+        "deleted": True,
+        "conversation_id": 5,
+        "messages": 12,
+        "client": "Иван",
+    }
+    assert any(sql.startswith("DELETE FROM funnel_workspace_conversations") for sql in statements)
+    # Ничего в CRM и ничего в сделках.
+    assert not any("crm" in sql.lower() and sql.startswith("DELETE") for sql in statements)
+
+
+def test_deleting_a_missing_conversation_is_reported_not_silent():
+    def respond(sql, _params):
+        if sql.startswith("SELECT c.id, c.display_name"):
+            return None
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    with pytest.raises(store.WorkspaceNotFoundError):
+        store.delete_conversation(404, connect=connect)
+
+
 def test_urgency_filter_uses_the_same_threshold_as_the_badge():
     def respond(sql, _params):
         if sql.startswith("SELECT c.*, s.source_type"):
