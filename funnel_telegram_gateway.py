@@ -252,6 +252,7 @@ def _crm_action_loop() -> None:
 
 def _maintenance_loop() -> None:
     last_crm = 0.0
+    last_stage_sync = 0.0
     last_retention = 0.0
     while not _stop_event.is_set():
         now = time.monotonic()
@@ -278,6 +279,9 @@ def _maintenance_loop() -> None:
             if now - last_crm >= 30:
                 sync_missing_crm_deals_once(limit=50)
                 last_crm = now
+            if now - last_stage_sync >= 60:
+                sync_conversation_stages_once(limit=50)
+                last_stage_sync = now
             if now - last_retention >= 86_400:
                 store.retention_cleanup()
                 last_retention = now
@@ -610,6 +614,34 @@ def sync_missing_crm_deals_once(*, limit: int = 50) -> int:
     return _store().backfill_missing_deal_actions(
         limit=min(250, max(1, limit)),
     )
+
+
+def sync_conversation_stages_once(*, limit: int = 50) -> int:
+    """Догнать этап сделки, который подвинули на стороне Битрикса.
+
+    Оператор видит этап воронки ИУ как статус обращения, а двигать сделку могут и
+    люди в CRM, и наш собственный конвейер. Читаем только чтение сделки: ни одного
+    записывающего вызова, поэтому ошибка Битрикса не может испортить состояние.
+    """
+
+    store = _store()
+    import funnel_workspace_crm as crm
+
+    updated = 0
+    for row in store.conversations_for_stage_sync(limit=limit):
+        deal_id = row.get("deal_id")
+        if not deal_id:
+            continue
+        try:
+            stage = crm.read_deal_stage(deal_id)
+        except Exception:  # noqa: BLE001
+            log.exception("stage sync failed for conversation %s", row.get("id"))
+            continue
+        if not stage or stage == str(row.get("stage_id") or ""):
+            continue
+        store.update_crm_link(row["id"], stage_id=stage)
+        updated += 1
+    return updated
 
 
 @dataclass(frozen=True)

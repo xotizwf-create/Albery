@@ -254,6 +254,83 @@ def set_workspace_password_hash(
             )
 
 
+def get_workspace_operator_name(
+    *,
+    connect: ConnectFactory | None = None,
+) -> str:
+    """Имя сотрудника, закреплённое за паролем рабочего окна.
+
+    Вход общий для смены, поэтому имя задаётся один раз вместе с паролем, а не
+    вводится руками при каждом входе: иначе в переписке появляются «Юля», «юлия»
+    и пустое поле, и потом не понять, кто отвечал клиенту.
+    """
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT setting_value
+                  FROM funnel_workspace_settings
+                 WHERE setting_key = 'operator_name'
+                """
+            )
+            row = _record(cur.fetchone())
+    if row is None:
+        return ""
+    value = row.get("setting_value")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def set_workspace_operator_name(
+    operator_name: Any,
+    *,
+    connect: ConnectFactory | None = None,
+) -> str:
+    clean_name = _required_text(operator_name, "operator_name", 200)
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO funnel_workspace_settings (
+                    setting_key, setting_value, updated_at
+                )
+                VALUES ('operator_name', %s, now())
+                ON CONFLICT (setting_key)
+                DO UPDATE SET
+                    setting_value = EXCLUDED.setting_value,
+                    updated_at = now()
+                """,
+                (Jsonb(clean_name),),
+            )
+    return clean_name
+
+
+def conversations_for_stage_sync(
+    *,
+    limit: int = 50,
+    connect: ConnectFactory | None = None,
+) -> list[dict[str, Any]]:
+    """Активные диалоги со сделкой — у них этап в CRM могли подвинуть люди.
+
+    Этап показывается оператору как статус обращения, поэтому он обязан догонять
+    сделку сам: иначе список показывает «Новый клиент» на давно подписанном договоре.
+    """
+    limit = min(500, max(1, int(limit or 50)))
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, deal_id, stage_id
+                  FROM funnel_workspace_conversations
+                 WHERE deal_id IS NOT NULL
+                   AND status IN ('new', 'open', 'waiting')
+                 ORDER BY updated_at
+                 LIMIT %s
+                """,
+                (limit,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
 def ensure_conversation(
     *,
     external_chat_id: Any,
@@ -371,6 +448,7 @@ def list_conversations(
     *,
     q: str = "",
     status: str = "",
+    stage: str = "",
     source: str = "",
     limit: int = 100,
     offset: int = 0,
@@ -378,6 +456,9 @@ def list_conversations(
 ) -> dict[str, Any]:
     clean_q = str(q or "").strip()[:200]
     clean_status = str(status or "").strip().lower()
+    # Этап воронки — это код сделки в Битриксе, а не наш перечень: проверять его по
+    # белому списку нельзя, иначе новый этап у владельца перестанет фильтроваться.
+    clean_stage = str(stage or "").strip()[:200]
     clean_source = str(source or "").strip()[:100]
     if clean_status and clean_status not in VALID_STATUSES:
         raise WorkspaceValidationError("Неизвестный статус.", details={"status": clean_status})
@@ -389,6 +470,9 @@ def list_conversations(
     if clean_status:
         clauses.append("c.status = %s")
         params.append(clean_status)
+    if clean_stage:
+        clauses.append("c.stage_id = %s")
+        params.append(clean_stage)
     if clean_source:
         clauses.append("c.source_key = %s")
         params.append(clean_source)
@@ -4122,6 +4206,7 @@ def message_export_rows(
     *,
     q: str = "",
     status: str = "",
+    stage: str = "",
     source: str = "",
     author_type: str = "",
     date_from: datetime | None = None,
@@ -4130,6 +4215,7 @@ def message_export_rows(
     connect: ConnectFactory | None = None,
 ) -> list[dict[str, Any]]:
     clean_status = str(status or "").strip().lower()
+    clean_stage = str(stage or "").strip()[:200]
     clean_author = str(author_type or "").strip().lower()
     clean_source = str(source or "").strip()[:100]
     clean_q = str(q or "").strip()[:200]
@@ -4146,6 +4232,9 @@ def message_export_rows(
     if clean_status:
         clauses.append("c.status = %s")
         params.append(clean_status)
+    if clean_stage:
+        clauses.append("c.stage_id = %s")
+        params.append(clean_stage)
     if clean_source:
         clauses.append("c.source_key = %s")
         params.append(clean_source)

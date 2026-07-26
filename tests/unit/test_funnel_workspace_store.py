@@ -1081,6 +1081,22 @@ def test_conversation_search_looks_through_the_whole_retained_history():
     assert params.count("%договор%") == 6
 
 
+def test_conversation_list_filters_by_funnel_stage():
+    # Этап — код сделки в Битриксе, а не наш перечень: белого списка тут быть не должно,
+    # иначе новый этап у владельца молча перестанет фильтроваться.
+    def respond(sql, _params):
+        if sql.startswith("SELECT c.*, s.source_type"):
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    store.list_conversations(stage="C16:NDA", connect=connect)
+
+    sql, params = connection.cursor_instance.executed[0]
+    assert "c.stage_id = %s" in sql
+    assert "C16:NDA" in params
+
+
 def test_retention_drains_the_backlog_instead_of_one_batch_per_run():
     remaining = {"messages": 2500}
 

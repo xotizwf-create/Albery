@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Синхронизация этапа: статус обращения обязан догонять сделку, которую двигают в CRM.
+
 import sys
 from types import SimpleNamespace
 
@@ -729,3 +731,57 @@ def test_delivery_effects_replay_terms_and_escalation_idempotently(monkeypatch):
         (7, {"expected_version": 9, "reason": "Нужен менеджер"}),
         (7, {"expected_version": 9, "reason": "Нужен менеджер"}),
     ]
+
+
+def test_stage_sync_pulls_a_stage_moved_by_people_in_crm(monkeypatch):
+    """Этап двигают и люди в CRM: список обращений обязан это догонять сам,
+    иначе на подписанном договоре висит «Новый клиент»."""
+    updates: list[tuple[int, str]] = []
+
+    class FakeStore:
+        WorkspaceConflictError = RuntimeError
+
+        def conversations_for_stage_sync(self, *, limit):
+            assert limit == 50
+            return [
+                {"id": 7, "deal_id": 555, "stage_id": "C16:NEW"},
+                {"id": 8, "deal_id": 556, "stage_id": "C16:NDA"},
+                {"id": 9, "deal_id": None, "stage_id": ""},
+            ]
+
+        def update_crm_link(self, conversation_id, *, stage_id):
+            updates.append((conversation_id, stage_id))
+
+    monkeypatch.setattr(gateway, "_store", lambda: FakeStore())
+    import funnel_workspace_crm as crm
+
+    monkeypatch.setattr(
+        crm,
+        "read_deal_stage",
+        lambda deal_id: "C16:UC_SGZRVS" if int(deal_id) == 555 else "C16:NDA",
+    )
+
+    changed = gateway.sync_conversation_stages_once(limit=50)
+
+    # Диалог 8 уже на своём этапе, у диалога 9 нет сделки — трогаем только 7.
+    assert updates == [(7, "C16:UC_SGZRVS")]
+    assert changed == 1
+
+
+def test_stage_sync_survives_a_broken_crm_answer(monkeypatch):
+    class FakeStore:
+        def conversations_for_stage_sync(self, *, limit):
+            return [{"id": 7, "deal_id": 555, "stage_id": "C16:NEW"}]
+
+        def update_crm_link(self, conversation_id, *, stage_id):
+            raise AssertionError("этап не должен меняться при ошибке CRM")
+
+    monkeypatch.setattr(gateway, "_store", lambda: FakeStore())
+    import funnel_workspace_crm as crm
+
+    def explode(deal_id):
+        raise RuntimeError("Bitrix недоступен")
+
+    monkeypatch.setattr(crm, "read_deal_stage", explode)
+
+    assert gateway.sync_conversation_stages_once(limit=10) == 0

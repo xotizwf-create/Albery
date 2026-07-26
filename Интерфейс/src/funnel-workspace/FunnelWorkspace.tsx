@@ -1,6 +1,7 @@
 import {
   type FormEvent,
   type KeyboardEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -64,6 +65,23 @@ const STATUS_LABELS: Record<string, string> = Object.fromEntries(
 const STATUS_COLORS: Record<string, string> = Object.fromEntries(
   FALLBACK_STATUSES.map((item) => [item.value, item.color]),
 );
+
+// Этапы воронки ИУ. Настоящий список приходит из /meta — там он собран из самой воронки
+// (iu_funnel.CHAIN), поэтому переименование этапа у владельца доезжает сюда само. Этот
+// список — только заглушка на время загрузки.
+const FALLBACK_STAGES = [
+  { value: "C16:NEW", label: "Новый клиент" },
+  { value: "C16:S84294149", label: "Согласование условий" },
+  { value: "C16:UC_ANKETA", label: "Анкета" },
+  { value: "C16:NDA", label: "Подписание договора" },
+  { value: "C16:UC_SGZRVS", label: "Договор подписан" },
+];
+
+// Цвет по месту в воронке: от «только пришёл» к «договор подписан».
+const STAGE_COLORS = ["#7c3aed", "#2563eb", "#0891b2", "#d97706", "#16a34a"];
+
+const stageColor = (index: number) =>
+  STAGE_COLORS[Math.min(Math.max(index, 0), STAGE_COLORS.length - 1)];
 
 const stringId = (id: Conversation["id"] | null | undefined) =>
   id === null || id === undefined ? "" : String(id);
@@ -249,9 +267,11 @@ function WorkspaceDisabled({
 
 function WorkspaceLogin({
   configured,
+  configuredOperatorName,
   onAuthenticated,
 }: {
   configured: boolean;
+  configuredOperatorName?: string | null;
   onAuthenticated: (session: WorkspaceSession) => void;
 }) {
   const [operatorName, setOperatorName] = useState("");
@@ -261,11 +281,12 @@ function WorkspaceLogin({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!operatorName.trim() || !password || submitting || !configured) return;
+    const name = configuredOperatorName || operatorName.trim();
+    if (!name || !password || submitting || !configured) return;
     setSubmitting(true);
     setError("");
     try {
-      const nextSession = await funnelWorkspaceApi.login(password, operatorName.trim());
+      const nextSession = await funnelWorkspaceApi.login(password, name);
       if (!nextSession.authenticated) {
         setError("Неверный пароль.");
         return;
@@ -322,21 +343,38 @@ function WorkspaceLogin({
             </div>
           ) : (
             <>
-              <label className="mt-6 block">
-                <span className="mb-2 block text-xs font-bold uppercase tracking-[0.12em] text-slate-400">
-                  Ваше имя
-                </span>
-                <input
-                  type="text"
-                  value={operatorName}
-                  onChange={(event) => setOperatorName(event.target.value)}
-                  autoComplete="name"
-                  autoFocus
-                  maxLength={80}
-                  placeholder="Например, Александр"
-                  className="h-12 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 text-[15px] font-medium text-slate-900 transition placeholder:text-slate-400 focus:border-violet-300 focus:bg-white"
-                />
-              </label>
+              {configuredOperatorName ? (
+                // Имя закреплено за паролем на сервере — вводить его при каждом входе
+                // не нужно, и подпись в переписке всегда одинаковая.
+                <div className="mt-6 flex items-center gap-3 rounded-2xl border border-violet-100 bg-violet-50/70 px-4 py-3">
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white text-[#5B50EA] shadow-sm">
+                    <UserRound className="h-4.5 w-4.5" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-[10px] font-black uppercase tracking-[0.12em] text-violet-400">
+                      Вы войдёте как
+                    </div>
+                    <div className="truncate text-sm font-black text-slate-900">
+                      {configuredOperatorName}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <label className="mt-6 block">
+                  <span className="mb-2 block text-xs font-bold uppercase tracking-[0.12em] text-slate-400">
+                    Ваше имя
+                  </span>
+                  <input
+                    type="text"
+                    value={operatorName}
+                    onChange={(event) => setOperatorName(event.target.value)}
+                    autoComplete="name"
+                    maxLength={80}
+                    placeholder="Например, Александр"
+                    className="h-12 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 text-[15px] font-medium text-slate-900 transition placeholder:text-slate-400 focus:border-violet-300 focus:bg-white"
+                  />
+                </label>
+              )}
 
               <label className="mt-4 block">
                 <span className="mb-2 block text-xs font-bold uppercase tracking-[0.12em] text-slate-400">
@@ -526,6 +564,204 @@ function WorkspacePasswordSetup({
   );
 }
 
+type SelectOption = { value: string; label: string; color?: string };
+
+/** Выпадающий список приложения: системный select нельзя оформить и он выглядит чужеродно. */
+function SelectMenu({
+  value,
+  options,
+  onChange,
+  placeholder = "Выберите",
+  size = "md",
+  className,
+  ariaLabel,
+}: {
+  value: string;
+  options: SelectOption[];
+  onChange: (value: string) => void;
+  placeholder?: string;
+  size?: "sm" | "md";
+  className?: string;
+  ariaLabel?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const selected = options.find((option) => option.value === value);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutside = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", closeOnOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  const compact = size === "sm";
+
+  return (
+    <div ref={rootRef} className={cn("relative", className)}>
+      <button
+        type="button"
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+        className={cn(
+          "flex w-full items-center gap-2 rounded-xl border bg-white text-left font-bold text-slate-700 transition",
+          "border-slate-200 hover:border-slate-300",
+          open && "border-violet-300 ring-4 ring-violet-100",
+          compact ? "h-9 px-2.5 text-[11px]" : "h-10 px-3 text-xs",
+        )}
+      >
+        {selected?.color && (
+          <span
+            className="h-2 w-2 shrink-0 rounded-full"
+            style={{ backgroundColor: selected.color }}
+          />
+        )}
+        <span className={cn("min-w-0 flex-1 truncate", !selected && "text-slate-400")}>
+          {selected?.label || placeholder}
+        </span>
+        <ChevronDown
+          className={cn(
+            "h-4 w-4 shrink-0 text-slate-400 transition-transform",
+            open && "rotate-180",
+          )}
+        />
+      </button>
+
+      {open && (
+        <div
+          role="listbox"
+          className="absolute left-0 right-0 z-40 mt-1.5 max-h-72 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-1.5 shadow-xl shadow-slate-900/10"
+        >
+          {options.map((option) => {
+            const active = option.value === value;
+            return (
+              <button
+                key={option.value || "__empty"}
+                type="button"
+                role="option"
+                aria-selected={active}
+                onClick={() => {
+                  onChange(option.value);
+                  setOpen(false);
+                }}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-xl px-2.5 py-2 text-left text-xs font-bold transition",
+                  active ? "bg-violet-50 text-violet-700" : "text-slate-600 hover:bg-slate-50",
+                )}
+              >
+                {option.color ? (
+                  <span
+                    className="h-2 w-2 shrink-0 rounded-full"
+                    style={{ backgroundColor: option.color }}
+                  />
+                ) : (
+                  <span className="h-2 w-2 shrink-0" />
+                )}
+                <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                {active && <Check className="h-3.5 w-3.5 shrink-0" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+type ContextMenuItem = {
+  key: string;
+  label: string;
+  icon?: ReactNode;
+  disabled?: boolean;
+  onSelect: () => void;
+};
+
+/** Меню по правой кнопке на списке обращений. */
+function ContextMenu({
+  x,
+  y,
+  items,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  items: ContextMenuItem[];
+  onClose: () => void;
+}) {
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [position, setPosition] = useState({ left: x, top: y });
+
+  useEffect(() => {
+    // Меню открывают у нижнего края списка — разворачиваем его внутрь окна.
+    const element = menuRef.current;
+    if (!element) return;
+    const { width, height } = element.getBoundingClientRect();
+    setPosition({
+      left: Math.min(x, window.innerWidth - width - 8),
+      top: Math.min(y, window.innerHeight - height - 8),
+    });
+  }, [x, y]);
+
+  useEffect(() => {
+    const close = () => onClose();
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      ref={menuRef}
+      style={{ left: position.left, top: position.top }}
+      onMouseDown={(event) => event.stopPropagation()}
+      onContextMenu={(event) => event.preventDefault()}
+      className="fixed z-50 min-w-[208px] rounded-2xl border border-slate-200 bg-white p-1.5 shadow-2xl shadow-slate-900/15"
+    >
+      {items.map((item) => (
+        <button
+          key={item.key}
+          type="button"
+          disabled={item.disabled}
+          onClick={() => {
+            item.onSelect();
+            onClose();
+          }}
+          className={cn(
+            "flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-xs font-bold transition",
+            item.disabled
+              ? "cursor-not-allowed text-slate-300"
+              : "text-slate-600 hover:bg-slate-50 hover:text-slate-900",
+          )}
+        >
+          {item.icon}
+          <span className="min-w-0 flex-1 truncate">{item.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function StatusPill({
   status,
   label,
@@ -627,14 +863,17 @@ function ConversationList({
   loadingMore,
   total,
   query,
-  status,
-  statusOptions,
+  stage,
+  stageOptions,
+  stageLabels,
+  stageColors,
   now,
   onQueryChange,
-  onStatusChange,
+  onStageChange,
   onSelect,
   onRefresh,
   onLoadMore,
+  onConversationContextMenu,
 }: {
   conversations: Conversation[];
   selectedId: Conversation["id"] | null;
@@ -642,14 +881,20 @@ function ConversationList({
   loadingMore: boolean;
   total: number;
   query: string;
-  status: string;
-  statusOptions: Array<{ value: string; label: string; color?: string }>;
+  stage: string;
+  stageOptions: Array<{ value: string; label: string; color?: string }>;
+  stageLabels: Record<string, string>;
+  stageColors: Record<string, string>;
   now: number;
   onQueryChange: (value: string) => void;
-  onStatusChange: (value: string) => void;
+  onStageChange: (value: string) => void;
   onSelect: (conversation: Conversation) => void;
   onRefresh: () => void;
   onLoadMore: () => void;
+  onConversationContextMenu: (
+    conversation: Conversation,
+    position: { x: number; y: number },
+  ) => void;
 }) {
   const [exportOpen, setExportOpen] = useState(false);
   const [exportDateFrom, setExportDateFrom] = useState("");
@@ -667,13 +912,13 @@ function ConversationList({
     () =>
       funnelWorkspaceApi.exportUrl({
         q: query,
-        status,
+        stage,
         authorType: exportAuthor,
         dateFrom: exportDateFrom,
         dateTo: exportDateTo,
         limit: 20_000,
       }),
-    [exportAuthor, exportDateFrom, exportDateTo, query, status],
+    [exportAuthor, exportDateFrom, exportDateTo, query, stage],
   );
 
   return (
@@ -737,21 +982,13 @@ function ConversationList({
           )}
         </div>
 
-        <div className="relative mt-2">
-          <select
-            value={status}
-            onChange={(event) => onStatusChange(event.target.value)}
-            className="h-10 w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 pr-9 text-xs font-bold text-slate-600"
-          >
-            <option value="all">Все статусы</option>
-            {statusOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-        </div>
+        <SelectMenu
+          className="mt-2"
+          ariaLabel="Фильтр по этапу воронки"
+          value={stage}
+          onChange={onStageChange}
+          options={[{ value: "all", label: "Все этапы" }, ...stageOptions]}
+        />
 
         {exportOpen && (
           <div className="mt-3 rounded-2xl border border-violet-100 bg-violet-50/55 p-3">
@@ -759,7 +996,7 @@ function ConversationList({
               <div>
                 <div className="text-[11px] font-black text-slate-800">CSV-журнал сообщений</div>
                 <div className="mt-0.5 text-[10px] font-medium text-slate-500">
-                  Поиск и статус выше тоже учитываются
+                  Поиск и этап выше тоже учитываются
                 </div>
               </div>
               {hasExportFilters && (
@@ -808,20 +1045,19 @@ function ConversationList({
               <span className="mb-1 block text-[9px] font-black uppercase tracking-[0.08em] text-slate-400">
                 Автор сообщения
               </span>
-              <div className="relative">
-                <select
-                  value={exportAuthor}
-                  onChange={(event) => setExportAuthor(event.target.value as ExportAuthor)}
-                  className="h-9 w-full appearance-none rounded-xl border border-slate-200 bg-white px-2.5 pr-8 text-[11px] font-bold text-slate-700"
-                >
-                  <option value="">Все типы</option>
-                  <option value="client">Клиент</option>
-                  <option value="agent">ИИ-агент</option>
-                  <option value="operator">Менеджер</option>
-                  <option value="system">Система</option>
-                </select>
-                <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-              </div>
+              <SelectMenu
+                size="sm"
+                ariaLabel="Автор сообщения"
+                value={exportAuthor}
+                onChange={(value) => setExportAuthor(value as ExportAuthor)}
+                options={[
+                  { value: "", label: "Все типы" },
+                  { value: "client", label: "Клиент" },
+                  { value: "agent", label: "ИИ-агент" },
+                  { value: "operator", label: "Менеджер" },
+                  { value: "system", label: "Система" },
+                ]}
+              />
             </label>
 
             {invalidExportRange && (
@@ -887,6 +1123,14 @@ function ConversationList({
                   type="button"
                   key={conversation.id}
                   onClick={() => onSelect(conversation)}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    onSelect(conversation);
+                    onConversationContextMenu(conversation, {
+                      x: event.clientX,
+                      y: event.clientY,
+                    });
+                  }}
                   className={cn(
                     "mb-1 w-full rounded-2xl border px-3 py-3 text-left transition",
                     active
@@ -939,7 +1183,15 @@ function ConversationList({
                         )}
                       </span>
                       <span className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
-                        <StatusPill status={conversation.status} compact />
+                        <StatusPill
+                          status={conversation.stage_id || ""}
+                          label={
+                            stageLabels[conversation.stage_id || ""] ||
+                            (conversation.stage_id ? conversation.stage_id : "Без сделки")
+                          }
+                          color={stageColors[conversation.stage_id || ""] || "#94a3b8"}
+                          compact
+                        />
                         <ControlBadge conversation={conversation} now={now} compact />
                       </span>
                     </span>
@@ -1499,14 +1751,16 @@ function ChatPanel({
           </div>
         ) : (
           <>
-            <div className="flex items-end gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-2 transition focus-within:border-violet-300 focus-within:bg-white">
+            {/* Мягкое кольцо фокуса вокруг всего поля вместо системной прямоугольной
+                обводки: браузерный outline на textarea рисует квадрат поверх скруглений. */}
+            <div className="flex items-end gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-2 shadow-sm transition-all duration-150 focus-within:border-violet-400 focus-within:bg-white focus-within:shadow-md focus-within:shadow-violet-100 focus-within:ring-4 focus-within:ring-violet-100">
               <textarea
                 value={draft}
                 onChange={(event) => setDraft(event.target.value.slice(0, 4096))}
                 onKeyDown={onDraftKeyDown}
                 rows={1}
                 placeholder="Напишите клиенту…"
-                className="max-h-32 min-h-10 flex-1 resize-none bg-transparent px-2 py-2 text-sm leading-5 text-slate-900 placeholder:text-slate-400"
+                className="max-h-32 min-h-10 flex-1 resize-none rounded-xl bg-transparent px-2 py-2 text-sm leading-5 text-slate-900 outline-none ring-0 placeholder:text-slate-400 focus:outline-none focus:ring-0"
               />
               <button
                 type="button"
@@ -1533,6 +1787,8 @@ function ConversationDetails({
   conversation,
   meta,
   statusOptions,
+  stageLabels,
+  stageColors,
   now,
   controlBusy,
   statusBusy,
@@ -1543,6 +1799,8 @@ function ConversationDetails({
   conversation: Conversation;
   meta: WorkspaceMeta | null;
   statusOptions: Array<{ value: string; label: string; color?: string }>;
+  stageLabels: Record<string, string>;
+  stageColors: Record<string, string>;
   now: number;
   controlBusy: boolean;
   statusBusy: boolean;
@@ -1625,29 +1883,48 @@ function ConversationDetails({
         </div>
 
         <section className="mt-6">
+          <div className="mb-2 text-[10px] font-black uppercase tracking-[0.12em] text-slate-400">
+            Этап воронки ИУ
+          </div>
+          <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50/70 px-3 py-2.5">
+            <StatusPill
+              status={conversation.stage_id || ""}
+              label={
+                stageLabels[conversation.stage_id || ""] ||
+                (conversation.stage_id ? conversation.stage_id : "Сделка ещё не создана")
+              }
+              color={stageColors[conversation.stage_id || ""] || "#94a3b8"}
+            />
+          </div>
+          <div className="mt-1.5 text-[10px] font-medium leading-4 text-slate-400">
+            Этап двигается сам по фактам сделки и догоняет изменения в CRM.
+          </div>
+        </section>
+
+        <section className="mt-6">
           <label className="mb-2 block text-[10px] font-black uppercase tracking-[0.12em] text-slate-400">
             Операционный статус обращения
           </label>
           <div className="relative">
-            <select
+            <SelectMenu
+              ariaLabel="Операционный статус обращения"
               value={conversation.status}
-              disabled={statusBusy}
-              onChange={(event) => onStatus(event.target.value)}
-              className="h-11 w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 pr-10 text-xs font-bold text-slate-700 disabled:opacity-60"
-            >
-              {!statusOptions.some((option) => option.value === conversation.status) && (
-                <option value={conversation.status}>{STATUS_LABELS[conversation.status] || conversation.status}</option>
-              )}
-              {statusOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-            {statusBusy ? (
-              <Loader2 className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-slate-400" />
-            ) : (
-              <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              onChange={onStatus}
+              options={
+                statusOptions.some((option) => option.value === conversation.status)
+                  ? statusOptions
+                  : [
+                      {
+                        value: conversation.status,
+                        label:
+                          STATUS_LABELS[conversation.status] || conversation.status,
+                      },
+                      ...statusOptions,
+                    ]
+              }
+            />
+            {statusBusy && (
+              <Loader2 className="pointer-events-none absolute right-9 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-slate-400" />
             )}
           </div>
         </section>
@@ -1835,6 +2112,12 @@ function OperatorWorkspace({
   const [queryInput, setQueryInput] = useState("");
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("all");
+  const [stage, setStage] = useState("all");
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    conversation: Conversation;
+  } | null>(null);
   const [listLoading, setListLoading] = useState(true);
   const [listLoadingMore, setListLoadingMore] = useState(false);
   const [messagesLoading, setMessagesLoading] = useState(false);
@@ -1862,6 +2145,36 @@ function OperatorWorkspace({
         (conversation) => stringId(conversation.id) === stringId(selectedId),
       ) || null,
     [conversations, selectedId],
+  );
+
+  // Этапы воронки ИУ: и фильтр слева, и подпись в карточке берут их отсюда.
+  const stageOptions = useMemo(() => {
+    const fromMeta = Array.isArray(meta?.funnel_stages)
+      ? meta.funnel_stages
+          .map((item) => ({
+            value: String(item.value || "").trim(),
+            label: String(item.label || item.value || "").trim(),
+          }))
+          .filter((item) => item.value && item.label)
+      : [];
+    const base = fromMeta.length ? fromMeta : FALLBACK_STAGES;
+    return base.map((item, index) => ({ ...item, color: stageColor(index) }));
+  }, [meta]);
+
+  const stageLabels = useMemo(
+    () =>
+      Object.fromEntries(
+        stageOptions.map((option) => [option.value, option.label]),
+      ) as Record<string, string>,
+    [stageOptions],
+  );
+
+  const stageColors = useMemo(
+    () =>
+      Object.fromEntries(
+        stageOptions.map((option) => [option.value, option.color]),
+      ) as Record<string, string>,
+    [stageOptions],
   );
 
   const statusOptions = useMemo(() => {
@@ -1942,6 +2255,7 @@ function OperatorWorkspace({
         const payload = await funnelWorkspaceApi.getConversations({
           q: query,
           status,
+          stage,
           limit: 100,
           offset: 0,
         });
@@ -1972,7 +2286,7 @@ function OperatorWorkspace({
         if (!quiet) setListLoading(false);
       }
     },
-    [query, reportError, status],
+    [query, reportError, stage, status],
   );
 
   const loadMoreConversations = useCallback(async () => {
@@ -1983,6 +2297,7 @@ function OperatorWorkspace({
       const payload = await funnelWorkspaceApi.getConversations({
         q: query,
         status,
+        stage,
         limit: 100,
         offset: conversations.length,
       });
@@ -2376,14 +2691,19 @@ function OperatorWorkspace({
               loadingMore={listLoadingMore}
               total={conversationTotal}
               query={queryInput}
-              status={status}
-              statusOptions={statusOptions}
+              stage={stage}
+              stageOptions={stageOptions}
+              stageLabels={stageLabels}
+              stageColors={stageColors}
               now={now}
               onQueryChange={setQueryInput}
-              onStatusChange={setStatus}
+              onStageChange={setStage}
               onSelect={chooseConversation}
               onRefresh={() => void loadConversations(false)}
               onLoadMore={() => void loadMoreConversations()}
+              onConversationContextMenu={(conversation, position) =>
+                setContextMenu({ ...position, conversation })
+              }
             />
           </div>
 
@@ -2428,6 +2748,8 @@ function OperatorWorkspace({
                 conversation={selectedConversation}
                 meta={meta}
                 statusOptions={statusOptions}
+                stageLabels={stageLabels}
+                stageColors={stageColors}
                 now={now}
                 controlBusy={controlBusy}
                 statusBusy={statusBusy}
@@ -2455,6 +2777,8 @@ function OperatorWorkspace({
               conversation={selectedConversation}
               meta={meta}
               statusOptions={statusOptions}
+              stageLabels={stageLabels}
+              stageColors={stageColors}
               now={now}
               controlBusy={controlBusy}
               statusBusy={statusBusy}
@@ -2464,6 +2788,39 @@ function OperatorWorkspace({
             />
           </aside>
         </div>
+      )}
+
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onClose={() => setContextMenu(null)}
+          items={[
+            contextMenu.conversation.control_mode === "ai"
+              ? {
+                  key: "take",
+                  label: "Взять себе",
+                  icon: <UserRound className="h-3.5 w-3.5" />,
+                  disabled: contextMenu.conversation.can_reply === false,
+                  onSelect: () => void setControl("human"),
+                }
+              : {
+                  key: "give",
+                  label: "Передать ИИ",
+                  icon: <Bot className="h-3.5 w-3.5" />,
+                  disabled:
+                    contextMenu.conversation.can_reply === false ||
+                    !contextMenu.conversation.ai_available,
+                  onSelect: () => void setControl("ai"),
+                },
+            {
+              key: "details",
+              label: "Карточка обращения",
+              icon: <PanelRight className="h-3.5 w-3.5" />,
+              onSelect: () => setDetailsOpen(true),
+            },
+          ]}
+        />
       )}
 
       {toast && (
@@ -2532,6 +2889,7 @@ export function FunnelWorkspace() {
     return (
       <WorkspaceLogin
         configured={session?.configured !== false}
+        configuredOperatorName={session?.configured_operator_name}
         onAuthenticated={(nextSession) =>
           setSession({
             configured: nextSession.configured ?? session?.configured ?? true,

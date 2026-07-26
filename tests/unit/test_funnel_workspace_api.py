@@ -397,6 +397,42 @@ def test_failed_login_is_independently_rate_limited(client, monkeypatch):
     assert blocked.get_json()["error"]["code"] == "rate_limited"
 
 
+def test_operator_name_is_bound_to_the_password_not_typed_at_login(client, monkeypatch):
+    # Под одним входом работает один названный сотрудник: имя берётся из настройки,
+    # а не из поля формы, иначе в переписке будут «Юля», «юлия» и пустая подпись.
+    monkeypatch.setattr(workspace.store, "get_workspace_operator_name", lambda: "Юлия")
+
+    payload = client.post(
+        "/api/funnel-workspace/session",
+        json={"password": "correct horse battery staple", "operator_name": "кто угодно"},
+        headers={"Origin": ORIGIN},
+    ).get_json()
+
+    assert payload["operator_name"] == "Юлия"
+
+
+def test_session_reports_the_configured_operator_before_login(client, monkeypatch):
+    monkeypatch.setattr(workspace.store, "get_workspace_operator_name", lambda: "Юлия")
+
+    payload = client.get("/api/funnel-workspace/session").get_json()
+
+    assert payload["authenticated"] is False
+    assert payload["configured_operator_name"] == "Юлия"
+
+
+def test_meta_publishes_the_iu_funnel_stages_in_owner_order(client, monkeypatch):
+    monkeypatch.setattr(workspace.store, "list_sources", lambda: [])
+    login(client)
+
+    stages = client.get("/api/funnel-workspace/meta").get_json()["funnel_stages"]
+
+    import iu_funnel
+
+    assert [stage["value"] for stage in stages] == [item.id for item in iu_funnel.CHAIN]
+    assert [stage["label"] for stage in stages] == [item.title for item in iu_funnel.CHAIN]
+    assert stages[0]["label"] == "Новый клиент"
+
+
 def test_session_always_carries_a_csrf_token_for_the_bootstrap_form(client):
     # Страницу открывают до входа: форма первичной установки пароля обязана получить токен,
     # иначе отправка упирается в «CSRF-токен отсутствует или устарел».

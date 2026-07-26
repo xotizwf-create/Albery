@@ -188,6 +188,16 @@ def _auth_session_days() -> int:
     return min(90, max(1, days))
 
 
+def _funnel_stages() -> list[dict[str, Any]]:
+    """Этапы воронки ИУ в том же порядке и с теми же названиями, что видит владелец."""
+    import iu_funnel
+
+    return [
+        {"value": stage.id, "label": stage.title, "goal": stage.goal, "order": index}
+        for index, stage in enumerate(iu_funnel.CHAIN)
+    ]
+
+
 def _workspace_ai_allowed(external_user_id: Any) -> bool:
     import funnel_telegram_gateway
 
@@ -217,9 +227,22 @@ def workspace_authenticated() -> bool:
     return True
 
 
+def configured_operator_name() -> str:
+    """Имя, закреплённое за паролем рабочего окна (пусто — если не задано)."""
+    try:
+        return store.get_workspace_operator_name()
+    except Exception:  # noqa: BLE001
+        # Имя — украшение подписи, а не право доступа: недоступная настройка не
+        # должна ронять вход в рабочее окно.
+        return ""
+
+
 def workspace_operator_name() -> str:
     if session.get(SESSION_AUTH_KEY):
-        return str(session.get(SESSION_OPERATOR_KEY) or "Оператор")
+        return (
+            configured_operator_name()
+            or str(session.get(SESSION_OPERATOR_KEY) or "Оператор")
+        )
     if session.get("admin_authenticated"):
         return str(session.get("admin_name") or "Администратор")
     return ""
@@ -395,6 +418,7 @@ def _session_payload() -> dict[str, Any]:
             session.get("admin_authenticated")
             and not _password_managed_by_environment()
         ),
+        "configured_operator_name": configured_operator_name(),
     }
     # Токен выдаётся всегда, а не только вошедшему: первичная установка пароля происходит
     # ДО входа в рабочее окно, и без токена форму невозможно отправить. Это безопасно —
@@ -441,7 +465,13 @@ def create_workspace_session() -> tuple[Response, int]:
     if len(password) > 256:
         _record_failed_login(client_ip)
         return _error("Неверный пароль.", 401, "invalid_credentials")
-    operator_name = str(body.get("operator_name") or "Оператор").strip()[:80] or "Оператор"
+    # Имя закреплено за паролем: под одним входом работает один названный сотрудник,
+    # и в переписке всегда стоит его имя, а не то, что напечатали в поле при входе.
+    operator_name = (
+        configured_operator_name()
+        or str(body.get("operator_name") or "Оператор").strip()[:80]
+        or "Оператор"
+    )
     try:
         password_matches = check_password_hash(password_hash, password)
     except (TypeError, ValueError):
@@ -548,8 +578,17 @@ def configure_workspace_password() -> tuple[Response, int]:
     _clear_failed_logins(client_key)
     password_hash = generate_password_hash(new_password, method="scrypt")
     store.set_workspace_password_hash(password_hash)
+    operator_name = str(body.get("operator_name") or "").strip()[:80]
+    if operator_name:
+        store.set_workspace_operator_name(operator_name)
     # Never include either password or its hash in the response/logs.
-    return _json({"configured": True, "can_configure": True})
+    return _json(
+        {
+            "configured": True,
+            "can_configure": True,
+            "configured_operator_name": configured_operator_name(),
+        }
+    )
 
 
 @funnel_workspace_bp.get(f"{API_PREFIX}/meta")
@@ -569,6 +608,9 @@ def workspace_meta() -> tuple[Response, int]:
             "bitrix_base_url": os.getenv("BITRIX_PORTAL_URL", "").strip().rstrip("/"),
             "telegram_connected": funnel_telegram_gateway.telegram_connected(),
             "sources": store.list_sources(),
+            # Этапы берутся из самой воронки ИУ (iu_funnel.CHAIN), а не дублируются
+            # списком: поменяют воронку — рабочее окно покажет ровно то же самое.
+            "funnel_stages": _funnel_stages(),
             "statuses": [
                 {"key": "new", "value": "new", "label": "Новая"},
                 {"key": "open", "value": "open", "label": "В работе"},
@@ -665,6 +707,7 @@ def conversations_list() -> tuple[Response, int]:
     result = store.list_conversations(
         q=request.args.get("q", ""),
         status=request.args.get("status", ""),
+        stage=request.args.get("stage", ""),
         source=request.args.get("source", ""),
         limit=_int_arg("limit", 100, minimum=1, maximum=250),
         offset=_int_arg("offset", 0, minimum=0, maximum=10_000_000),
@@ -862,6 +905,7 @@ def messages_export() -> Response:
     rows = store.message_export_rows(
         q=request.args.get("q", ""),
         status=request.args.get("status", ""),
+        stage=request.args.get("stage", ""),
         source=request.args.get("source", ""),
         author_type=request.args.get("author_type", ""),
         date_from=_parse_export_datetime("date_from"),

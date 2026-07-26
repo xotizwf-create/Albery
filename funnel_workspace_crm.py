@@ -506,6 +506,18 @@ def _crm_deal_id(value: Mapping[str, Any]) -> int | None:
         return None
 
 
+def deal_stage(value: Mapping[str, Any]) -> str | None:
+    """Этап из ответа CRM — Битрикс отдаёт его под разными именами ключа."""
+    return _response_stage(value)
+
+
+def read_deal_stage(deal_id: Any, *, crm_call: CrmCall | None = None) -> str | None:
+    """Текущий этап сделки. Только чтение: ошибка CRM не может испортить состояние."""
+    call = crm_call or _tg_defaults()[0]
+    response = call("get_crm_deal", {"deal_id": _positive_int(deal_id)})
+    return deal_stage(response if isinstance(response, Mapping) else {})
+
+
 def _response_stage(value: Mapping[str, Any]) -> str | None:
     if not isinstance(value, Mapping):
         return None

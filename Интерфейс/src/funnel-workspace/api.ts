@@ -123,6 +123,7 @@ const csrfHeaders = (csrfToken: string): HeadersInit => ({
 export interface WorkspaceExportParams {
   q?: string;
   status?: string;
+  stage?: string;
   source?: string;
   authorType?: "client" | "agent" | "operator" | "system" | "";
   dateFrom?: string;
@@ -134,6 +135,7 @@ const exportUrl = (params: WorkspaceExportParams = {}) => {
   const search = new URLSearchParams();
   if (params.q?.trim()) search.set("q", params.q.trim());
   if (params.status && params.status !== "all") search.set("status", params.status);
+  if (params.stage && params.stage !== "all") search.set("stage", params.stage);
   if (params.source) search.set("source", params.source);
   if (params.authorType) search.set("author_type", params.authorType);
   if (params.dateFrom) search.set("date_from", params.dateFrom);
@@ -180,11 +182,18 @@ export const funnelWorkspaceApi = {
   exportUrl,
 
   getConversations: (
-    params: { q?: string; status?: string; limit?: number; offset?: number } = {},
+    params: {
+      q?: string;
+      status?: string;
+      stage?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
   ) => {
     const search = new URLSearchParams();
     if (params.q) search.set("q", params.q);
     if (params.status && params.status !== "all") search.set("status", params.status);
+    if (params.stage && params.stage !== "all") search.set("stage", params.stage);
     search.set("limit", String(params.limit || 100));
     search.set("offset", String(params.offset || 0));
     return request<ConversationsPayload>(`/conversations?${search.toString()}`);

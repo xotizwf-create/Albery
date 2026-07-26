@@ -16,6 +16,8 @@ export interface WorkspaceSession {
   can_configure?: boolean;
   admin_session?: boolean;
   operator_name?: string | null;
+  /** Имя, закреплённое за паролем рабочего окна: под ним и работает смена. */
+  configured_operator_name?: string | null;
   workspace_enabled?: boolean;
 }
 
@@ -35,6 +37,8 @@ export interface WorkspaceMeta {
   ai_rollout_limited?: boolean;
   human_lease_seconds?: number;
   statuses?: WorkspaceStatusOption[];
+  /** Этапы воронки ИУ в порядке владельца — приходят из iu_funnel.CHAIN. */
+  funnel_stages?: Array<{ value: string; label: string; goal?: string; order?: number }>;
   bitrix_base_url?: string;
 }
 
