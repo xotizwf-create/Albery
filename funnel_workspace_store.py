@@ -304,6 +304,40 @@ def set_workspace_operator_name(
     return clean_name
 
 
+def unlink_conversation_deal(
+    conversation_id: Any,
+    *,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    """Снять ссылку на сделку, которой больше нет в Битриксе.
+
+    Держать мёртвую ссылку хуже, чем не иметь её: оператор видит этап несуществующей
+    сделки, ссылка из карточки ведёт в никуда, а синхронизация каждую минуту падает.
+    После снятия штатный backfill создаст связь заново — он ищет сделку по стабильному
+    маркеру `[tg:<id>]`, поэтому дубль не появится, если сделка на самом деле жива.
+    """
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE funnel_workspace_conversations
+                   SET deal_id = NULL,
+                       stage_id = NULL,
+                       updated_at = now()
+                 WHERE id = %s
+             RETURNING *
+                """,
+                (_positive_int(conversation_id, "conversation_id"),),
+            )
+            row = _record(cur.fetchone())
+    if row is None:
+        raise WorkspaceNotFoundError(
+            "Диалог не найден.",
+            details={"conversation_id": conversation_id},
+        )
+    return row
+
+
 def conversations_for_stage_sync(
     *,
     limit: int = 50,

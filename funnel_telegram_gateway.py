@@ -616,6 +616,16 @@ def sync_missing_crm_deals_once(*, limit: int = 50) -> int:
     )
 
 
+def _deal_is_gone(error: Exception) -> bool:
+    """Отличить «сделки больше нет» от временной недоступности Битрикса.
+
+    Снимать связь можно только по первому: на сетевой ошибке или отказе доступа связь
+    обязана остаться, иначе один сбой портала отвяжет все сделки разом.
+    """
+    text = str(error).lower()
+    return "not found" in text and "crm.deal.get" in text
+
+
 def sync_conversation_stages_once(*, limit: int = 50) -> int:
     """Догнать этап сделки, который подвинули на стороне Битрикса.
 
@@ -634,7 +644,18 @@ def sync_conversation_stages_once(*, limit: int = 50) -> int:
             continue
         try:
             stage = crm.read_deal_stage(deal_id)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if _deal_is_gone(exc):
+                # Сделку удалили в Битриксе. Мёртвую ссылку снимаем: иначе оператор
+                # видит этап несуществующей сделки, а эта ошибка сыплется каждую минуту.
+                log.warning(
+                    "deal %s is gone in Bitrix; unlinking conversation %s",
+                    deal_id,
+                    row.get("id"),
+                )
+                store.unlink_conversation_deal(row["id"])
+                updated += 1
+                continue
             log.exception("stage sync failed for conversation %s", row.get("id"))
             continue
         if not stage or stage == str(row.get("stage_id") or ""):

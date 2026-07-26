@@ -785,3 +785,55 @@ def test_stage_sync_survives_a_broken_crm_answer(monkeypatch):
     monkeypatch.setattr(crm, "read_deal_stage", explode)
 
     assert gateway.sync_conversation_stages_once(limit=10) == 0
+
+
+def test_stage_sync_unlinks_a_deal_that_no_longer_exists(monkeypatch):
+    """Живой случай 26.07.2026: у диалога 1 в поле сделки лежал удалённый в Битриксе id,
+    синхронизация падала каждую минуту, а карточка вела в никуда."""
+    unlinked: list[int] = []
+
+    class FakeStore:
+        def conversations_for_stage_sync(self, *, limit):
+            return [{"id": 1, "deal_id": 909, "stage_id": "C16:NEW"}]
+
+        def update_crm_link(self, conversation_id, *, stage_id):
+            raise AssertionError("этап удалённой сделки не должен записываться")
+
+        def unlink_conversation_deal(self, conversation_id):
+            unlinked.append(conversation_id)
+
+    monkeypatch.setattr(gateway, "_store", lambda: FakeStore())
+    import funnel_workspace_crm as crm
+
+    def gone(deal_id):
+        raise RuntimeError(
+            "{'code': -32012, 'message': 'Bitrix CRM crm.deal.get: crm.deal.get: "
+            'HTTP 400 {"error":"","error_description":"Not found"}\'}'
+        )
+
+    monkeypatch.setattr(crm, "read_deal_stage", gone)
+
+    assert gateway.sync_conversation_stages_once(limit=10) == 1
+    assert unlinked == [1]
+
+
+def test_stage_sync_keeps_the_link_when_bitrix_is_merely_unavailable(monkeypatch):
+    class FakeStore:
+        def conversations_for_stage_sync(self, *, limit):
+            return [{"id": 1, "deal_id": 909, "stage_id": "C16:NEW"}]
+
+        def update_crm_link(self, conversation_id, *, stage_id):
+            raise AssertionError("этап не должен меняться при недоступности портала")
+
+        def unlink_conversation_deal(self, conversation_id):
+            raise AssertionError("связь нельзя снимать из-за временного сбоя портала")
+
+    monkeypatch.setattr(gateway, "_store", lambda: FakeStore())
+    import funnel_workspace_crm as crm
+
+    def unavailable(deal_id):
+        raise RuntimeError("HTTP 503 service unavailable")
+
+    monkeypatch.setattr(crm, "read_deal_stage", unavailable)
+
+    assert gateway.sync_conversation_stages_once(limit=10) == 0
