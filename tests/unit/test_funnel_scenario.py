@@ -147,3 +147,18 @@ def test_step_block_prefers_the_owner_text(monkeypatch):
 
     assert "Рад, что всё сошлось" in block
     assert "ТЕКУЩИЙ ШАГ ВОРОНКИ" in block, "оболочка шага остаётся на месте"
+
+
+def test_blocked_phrases_default_db_import_works():
+    """Живой прод 26.07.2026: blocked_phrases() импортировал несуществующее имя из shared.db,
+    и список запрещённых фраз владельца молча не загружался — фильтр падал на встроенные
+    категории. Тест держит сам импорт, который на локальных тестах не выполнялся ни разу."""
+    import inspect
+
+    import funnel_scenario
+
+    src = inspect.getsource(funnel_scenario.blocked_phrases)
+    assert "from shared.db import connect" in src
+
+    import shared.db
+    assert callable(shared.db.connect)

@@ -68,6 +68,15 @@ _FACTUAL_RE = re.compile(
     r"маркировк\w*|Честный\s+знак",
     re.I,
 )
+# Запрос информации от клиента. Нужен, чтобы отличить «Здравствуйте» от вопроса: порог
+# уверенности охраняет факты, а не приветствия.
+_QUESTION_WORD_RE = re.compile(
+    r"(?<![а-яё])(?:что|кто|где|когда|зачем|почему|как|каков\w*|кака\w*|каки\w*|какой|сколько)"
+    r"(?![а-яё])", re.I)
+_INFO_REQUEST_RE = re.compile(
+    r"(?<![а-яё])(?:расскаж\w*|подскаж\w*|объясн\w*|уточн\w*|интересу\w*|"
+    r"хочу\s+узнать|можно\s+узнать|пришл\w*|отправ\w*|покаж\w*|посчита\w*)", re.I)
+
 # Модель любит обрамлять JSON пояснениями и ограждениями ```json — это нормально и не должно
 # считаться сбоем.
 _FENCE_RE = re.compile(r"```(?:json)?\s*|\s*```", re.I)
@@ -246,16 +255,32 @@ def parse(raw: str, *, offered_sources: tuple[str, ...] | list[str] = ()) -> Tur
     )
 
 
-def states_facts(plan: TurnPlan) -> bool:
+def _asks_for_information(message: str) -> bool:
+    """Спросил ли клиент что-то, на что нужен факт. Приветствие — не спросил."""
+    value = str(message or "")
+    return bool(
+        "?" in value or "？" in value
+        or _QUESTION_WORD_RE.search(value)
+        or _INFO_REQUEST_RE.search(value)
+    )
+
+
+def states_facts(plan: TurnPlan, message: str = "") -> bool:
     """Утверждает ли ход что-то о деле, или это просто разговор.
 
     Порог охраняет ФАКТЫ, а не беседу. Без этого «Здравствуйте! Чем помочь?» пришлось бы
     отдавать человеку — у приветствия нет ни карточек знаний, ни источников, и любой порог оно
-    провалило бы. Живой консультант так себя не ведёт."""
-    if plan.answered:
-        return True
+    провалило бы. Живой консультант так себя не ведёт.
+
+    Поле `answered` НЕ является самостоятельным признаком факта: им управляет сама модель, и на
+    проде 26.07.2026 она пометила ответ на «Здравствуйте!» как ответ на вопрос — ход попал под
+    порог, не имея и не могущий иметь источников, и клиент получил «уточню у команды» вместо
+    приветствия. Поэтому `answered` учитывается только вместе с реальным запросом информации от
+    клиента, а числа и коммерческая лексика в тексте остаются самостоятельным признаком."""
     text = plan.reply
-    return bool(_NUMBER_RE.search(text) or _FACTUAL_RE.search(text))
+    if _NUMBER_RE.search(text) or _FACTUAL_RE.search(text):
+        return True
+    return bool(plan.answered and _asks_for_information(message))
 
 
 def is_calculation(plan: TurnPlan, message: str = "") -> bool:
@@ -339,7 +364,7 @@ def assess(plan: TurnPlan, *, retrieval: float, sources_text: str = "",
         return Verdict(False, 0.0, retrieval, 0.0, plan.confidence,
                        (f"модель сама попросила человека: {plan.handoff_reason}",))
 
-    if not states_facts(plan):
+    if not states_facts(plan, message):
         # Разговорный ход: здороваемся, уточняем, подтверждаем. Проверять нечего.
         return Verdict(True, 1.0, retrieval, 1.0, plan.confidence, (), checked=False)
 

@@ -111,9 +111,9 @@ def blocked_phrases(db=None, funnel_id: int | None = None) -> str:
     Пусто и при сбое базы: встроенные категории фильтра (брань, политика, jailbreak) работают
     всегда, а список владельца — дополнение к ним, а не замена."""
     if db is None:
-        from shared.db import db as default_db
+        from shared.db import connect
 
-        db = default_db
+        db = connect
     fid = int(funnel_id if funnel_id is not None else IU_FUNNEL_ID)
     _fresh(db)
     row = (_cache["funnels"] or {}).get(fid)

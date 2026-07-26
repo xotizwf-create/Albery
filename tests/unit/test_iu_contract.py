@@ -171,6 +171,30 @@ def test_greeting_is_not_measured_against_the_threshold():
     assert verdict.allowed and verdict.checked is False
 
 
+def test_greeting_stays_conversational_even_if_model_claims_it_answered():
+    """Живой прод 26.07.2026: на «Здравствуйте!» модель заполнила answered, ход попал под порог
+    без источников, и клиент получил «уточню у команды» вместо приветствия.
+
+    Поле answered контролирует сама модель — самостоятельным признаком факта оно быть не может."""
+    plan = c.parse(plan_json(reply="Здравствуйте! Чем могу помочь?",
+                             answered=["приветствие"], source_ids=[], confidence=0.5),
+                   offered_sources=OFFERED)
+
+    verdict = c.assess(plan, retrieval=0.0, sources_text="", message="Здравствуйте!")
+
+    assert verdict.allowed and verdict.checked is False
+
+
+def test_answered_still_counts_when_the_client_actually_asked():
+    plan = c.parse(plan_json(reply="Да, работаем с ИП и ООО.", answered=["форма собственности"],
+                             source_ids=[], confidence=0.9), offered_sources=OFFERED)
+
+    verdict = c.assess(plan, retrieval=0.1, sources_text="",
+                       message="вы с ИП работаете?")
+
+    assert verdict.escalate, "вопрос клиента без источника обязан уйти человеку"
+
+
 def test_clarifying_question_is_not_measured_either():
     plan = c.parse(plan_json(reply="Уточните, речь о продажах на Wildberries?",
                              answered=[], source_ids=[], confidence=0.4),
