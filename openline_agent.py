@@ -48,6 +48,22 @@ RETURN_COMMANDS = (
     "бот продолжай", "бот, продолжай", "включить бота", "бот на связь", "передать боту",
 )
 
+# Служебные маркеры мозга. В Telegram-ветке они ПЕРЕХВАТЫВАЮТСЯ и превращаются в действие:
+# «ПОКАЖИ_УСЛОВИЯ» — дословная отправка документа, «НУЖЕН_ЧЕЛОВЕК» — карточка людям. В открытой
+# линии этих действий пока нет, поэтому маркер означает «разговор людям», а НЕ текст клиенту.
+# Живой прогон 26.07.2026: клиент получил в чат голую строку «ПОКАЖИ_УСЛОВИЯ».
+INTERNAL_MARKERS = ("ПОКАЖИ_УСЛОВИЯ", "НУЖЕН_ЧЕЛОВЕК", "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ")
+
+
+def internal_marker(answer: str) -> str:
+    """Какой служебный маркер мозга попал в ответ (пусто — ответ чистый)."""
+    upper = str(answer or "").upper()
+    for marker in INTERNAL_MARKERS:
+        if marker in upper:
+            return marker
+    return ""
+
+
 # Служебные сообщения самой линии приходят от отправителя 0 («Создана новая сделка», «Обращение
 # направлено на …», приветствие, оценка). Это не человек и не клиент — в разговор их не берём.
 SYSTEM_SENDER_IDS = {0, "0", "", None}
@@ -391,6 +407,18 @@ def handle_event(event: Event, *, bitrix, db: Callable, brain: Callable,
                      "⚠️ Бот не смог ответить (пустой ответ) — разговор передан людям.")
         return Decision(TAKEOVER, "пустой ответ модели — разговор передан людям",
                         author=decision.author)
+
+    marker = internal_marker(answer)
+    if marker:
+        # Мозг просит действие, которого в этом канале ещё нет. Клиенту служебные слова слать
+        # нельзя — отдаём разговор людям молча, как при обычной эскалации.
+        set_control(db, dialog.chat_id, bot_active=False, by_user_id=None,
+                    reason=f"мозг запросил «{marker}» — действия в линии пока нет")
+        _system_note(bitrix, event, dialog,
+                     f"⚠️ Бот запросил действие «{marker}», которого в открытой линии пока нет — "
+                     "разговор передан людям.")
+        return Decision(TAKEOVER, f"служебный маркер «{marker}» — разговор передан людям",
+                        author=decision.author, meta={"marker": marker})
 
     bitrix.call("imbot.message.add", {
         "BOT_ID": event.bot_id, "DIALOG_ID": dialog.dialog_id, "MESSAGE": answer,

@@ -284,6 +284,41 @@ def test_both_sides_of_the_conversation_reach_the_journal():
     assert ("out", "bot") in directions
 
 
+def test_an_internal_marker_never_reaches_the_client():
+    """Живой прогон 26.07.2026: клиенту ушла голая строка «ПОКАЖИ_УСЛОВИЯ».
+
+    В Telegram-ветке маркер перехватывается и превращается в дословную отправку условий; в линии
+    такого действия ещё нет, значит разговор идёт людям, а не служебные слова клиенту."""
+    bitrix, db = FakeBitrix(), FakeDB()
+    decision = run(bitrix, db, event(CLIENT_ID, "покажите условия"),
+                   brain=lambda dialog, text, history: "ПОКАЖИ_УСЛОВИЯ")
+    assert decision.action == ol.TAKEOVER
+    assert db.bot_active() is False
+    assert bitrix.sent_to_client() == []
+    assert "ПОКАЖИ_УСЛОВИЯ" in bitrix.system_notes()[0]["MESSAGE"]
+
+
+@pytest.mark.parametrize("answer", [
+    "НУЖЕН_ЧЕЛОВЕК", "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ", "Конечно! ПОКАЖИ_УСЛОВИЯ",
+])
+def test_every_known_marker_is_held_back(answer):
+    bitrix, db = FakeBitrix(), FakeDB()
+    decision = run(bitrix, db, event(CLIENT_ID, "вопрос"),
+                   brain=lambda dialog, text, history: answer)
+    assert decision.action == ol.TAKEOVER
+    assert bitrix.sent_to_client() == []
+
+
+def test_the_marker_list_matches_the_brain():
+    """Маркеры заданы в мозге; расхождение списков означало бы, что новый маркер утечёт клиенту."""
+    import tg_agent
+
+    assert set(ol.INTERNAL_MARKERS) == {
+        tg_agent.TERMS_REQUEST_MARKER, tg_agent.ESCALATION_MARKER,
+        tg_agent.SIDE_ESCALATION_MARKER,
+    }
+
+
 def test_the_line_bot_id_comes_from_the_environment_not_from_the_shared_state_file(monkeypatch):
     """26.07.2026: id бота линии положили в общий state-файл приложения. Приложение переписывает
     его целиком на каждом событии — ключ пропал, приложение не нашло основного бота и подставило
