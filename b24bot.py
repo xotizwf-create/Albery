@@ -679,7 +679,10 @@ def _b24_app_register_openline_bot(client_endpoint: str, access_token: str) -> A
 
 
 def _openline_bot_id(state: dict[str, Any]) -> str:
-    return str(state.get("openline_bot_id") or os.getenv("B24_OPENLINE_BOT_ID", "") or "").strip()
+    """Один источник правды — openline_agent.bot_id (окружение главнее файла состояния)."""
+    import openline_agent as ol
+
+    return ol.bot_id(state)
 
 
 class _OpenlineBitrix:

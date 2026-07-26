@@ -435,3 +435,15 @@ def _safe_journal(journal: Callable, dialog: Dialog, decision: Decision, event: 
 def enabled() -> bool:
     """Канал включается флагом: выкатываем код молча, включаем осознанно."""
     return str(os.getenv("OPENLINE_AGENT_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def bot_id(state: dict[str, Any] | None = None) -> str:
+    """id бота открытой линии. ОКРУЖЕНИЕ ГЛАВНЕЕ файла состояния — и это не вкусовщина.
+
+    26.07.2026 id бота линии положили в общий `.b24_testbot_state.json`. Приложение переписывает
+    этот файл ЦЕЛИКОМ на каждом событии, поэтому запись извне живёт до первого же события: ключ
+    пропал, приложение не нашло основного бота и «самозалечилось» от события бота линии —
+    основным ботом сотрудников стал бот линии (в состоянии bot_id стал 116 вместо 24).
+    Окружение приложение не трогает никогда, поэтому канал опирается на него."""
+    from_env = str(os.getenv("B24_OPENLINE_BOT_ID", "") or "").strip()
+    return from_env or str((state or {}).get("openline_bot_id") or "").strip()

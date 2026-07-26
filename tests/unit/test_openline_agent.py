@@ -284,6 +284,18 @@ def test_both_sides_of_the_conversation_reach_the_journal():
     assert ("out", "bot") in directions
 
 
+def test_the_line_bot_id_comes_from_the_environment_not_from_the_shared_state_file(monkeypatch):
+    """26.07.2026: id бота линии положили в общий state-файл приложения. Приложение переписывает
+    его целиком на каждом событии — ключ пропал, приложение не нашло основного бота и подставило
+    себе бота линии (bot_id стал 116 вместо 24). Окружение обязано быть главнее."""
+    monkeypatch.setenv("B24_OPENLINE_BOT_ID", "116")
+    assert ol.bot_id({"openline_bot_id": "999"}) == "116"
+    assert ol.bot_id({}) == "116"
+    monkeypatch.delenv("B24_OPENLINE_BOT_ID")
+    assert ol.bot_id({"openline_bot_id": "999"}) == "999"
+    assert ol.bot_id({}) == ""
+
+
 def test_a_broken_journal_never_blocks_the_answer():
     def broken(**kwargs):
         raise RuntimeError("БД недоступна")
