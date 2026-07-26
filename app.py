@@ -15941,6 +15941,13 @@ def require_admin_auth():
         return redirect_response
 
     path = request.path
+    # The operator workspace is a separate authentication realm. Route it before the legacy
+    # /api kill switch and before the site's admin session gate; a workspace login never grants
+    # access to the rest of Albery.
+    from funnel_workspace import is_workspace_request, workspace_request_gate
+
+    if is_workspace_request(path):
+        return workspace_request_gate()
     if path == "/":
         return redirect("/main", code=302)
     if path.startswith("/api/") and not legacy_http_api_enabled():
@@ -18696,6 +18703,10 @@ from bitrix import (  # noqa: E402
     upsert_task_records,
 )
 import b24bot  # noqa: E402,F401
+from funnel_workspace import register_funnel_workspace  # noqa: E402
+
+register_funnel_workspace(app)
+
 import agent_center  # noqa: E402,F401
 import wb_cabinet  # noqa: E402,F401  — WB-кабинет: /api/wb-cab/*
 import funnel_view  # noqa: E402,F401  — воронка ИУ в кабинете: /api/agent-center/funnel/*

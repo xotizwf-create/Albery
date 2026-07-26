@@ -1,0 +1,103 @@
+export type ControlMode = "ai" | "human" | "paused";
+
+export type ConversationStatus =
+  | "new"
+  | "in_progress"
+  | "waiting"
+  | "qualified"
+  | "won"
+  | "lost"
+  | string;
+
+export interface WorkspaceSession {
+  authenticated: boolean;
+  configured: boolean;
+  csrf_token?: string;
+  can_configure?: boolean;
+  admin_session?: boolean;
+  operator_name?: string | null;
+  workspace_enabled?: boolean;
+}
+
+export interface WorkspaceStatusOption {
+  id?: string;
+  value?: string;
+  name?: string;
+  label?: string;
+  color?: string;
+}
+
+export interface WorkspaceMeta {
+  source?: string;
+  source_name?: string;
+  telegram_connected?: boolean;
+  ai_enabled?: boolean;
+  ai_rollout_limited?: boolean;
+  human_lease_seconds?: number;
+  statuses?: WorkspaceStatusOption[];
+  bitrix_base_url?: string;
+}
+
+export interface Conversation {
+  id: number | string;
+  external_user_id?: number | string | null;
+  display_name: string;
+  username: string | null;
+  source: string;
+  status: ConversationStatus;
+  control_mode: ControlMode;
+  control_mode_internal?: ControlMode;
+  resume_at: string | null;
+  reply_deadline_at?: string | null;
+  can_reply?: boolean;
+  ai_available?: boolean;
+  state_version: number;
+  unread_count: number;
+  last_message: string | null;
+  last_message_at: string | null;
+  deal_id: number | null;
+  deal_title: string | null;
+  stage_id: string | null;
+  stage_name: string | null;
+  assigned_to: string | null;
+}
+
+export type MessageAuthorType = "client" | "ai" | "human" | "system" | string;
+export type MessageDirection = "incoming" | "outgoing" | string;
+
+export interface ConversationAttachment {
+  media_type: string;
+  file_name: string;
+  mime_type: string;
+  file_size: number | null;
+  url: string;
+  download_url: string;
+}
+
+export interface ConversationMessage {
+  id: number;
+  created_at: string;
+  author_type: MessageAuthorType;
+  author_name: string | null;
+  direction: MessageDirection;
+  text: string;
+  delivery_status: string | null;
+  error: string | null;
+  idempotency_key?: string | null;
+  optimistic?: boolean;
+  attachment?: ConversationAttachment | null;
+}
+
+export interface ConversationsPayload {
+  conversations: Conversation[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface MessagesPayload {
+  messages: ConversationMessage[];
+  next_after_id?: number | null;
+  next_before_id?: number | null;
+  has_more_before?: boolean;
+}

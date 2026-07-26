@@ -68,17 +68,21 @@ def test_customer_turn_has_fail_closed_session_classification(monkeypatch):
         return "ok"
 
     monkeypatch.setattr(tg, "hermes_answer", fake)
-    monkeypatch.setattr(tg, "channel_toolsets", lambda _channel: "agent-albery-ai-bot")
+    monkeypatch.setattr(
+        tg,
+        "customer_toolsets",
+        lambda: "agent-iu-customer-runtime",
+    )
 
     assert tg.customer_hermes_answer("hello", "tg-biz-1") == "ok"
-    assert seen["toolsets"] == "agent-albery-ai-bot"
+    assert seen["toolsets"] == "agent-iu-customer-runtime"
     assert tg._is_customer_session("tg-biz-1") is True
     assert tg._is_customer_session("tg-new-1") is True
     assert tg._is_customer_session("answering-1") is True
     assert tg._is_customer_session("tg-owner-1") is False
 
 
-def test_customer_turn_fails_closed_when_connector_lookup_returns_none(monkeypatch):
+def test_customer_turn_fails_closed_to_dedicated_zero_tool_connector(monkeypatch):
     seen = {}
 
     def fake_run(command, **_kwargs):
@@ -86,10 +90,15 @@ def test_customer_turn_fails_closed_when_connector_lookup_returns_none(monkeypat
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setenv("TG_AGENT_TOOLSETS", "albery,web")
+    monkeypatch.setattr(
+        tg,
+        "customer_toolsets",
+        lambda: "agent-iu-customer-runtime",
+    )
     monkeypatch.setattr(tg.subprocess, "run", fake_run)
 
     assert tg.hermes_answer("hello", "tg-biz-7", toolsets=None) == "ok"
     command = seen["command"]
-    assert command[command.index("-t") + 1] == f"agent-{tg.MANAGER_CHANNEL}"
+    assert command[command.index("-t") + 1] == "agent-iu-customer-runtime"
     assert "web" not in command
     assert "--max-turns" not in command

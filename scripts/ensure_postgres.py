@@ -110,6 +110,9 @@ ALWAYS_APPLY_MIGRATIONS = [
     "061_telegram_agents.sql",
     # Idempotent: Telegram as a second bridge on a normal agent (same editor as Bitrix subagents).
     "062_agents_telegram_bridge.sql",
+    # Idempotent: standalone funnel workspace (durable Telegram inbox/outbox, conversations,
+    # control leases and audit trail). It intentionally does not import legacy personal chats.
+    "070_funnel_workspace.sql",
 ]
 
 

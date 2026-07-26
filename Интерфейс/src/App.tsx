@@ -67,7 +67,6 @@ import { DialogsView } from "./agent/views/DialogsView";
 import { AgentsView } from "./agent/views/AgentsView";
 import { KnowledgeBaseView } from "./agent/views/KnowledgeBaseView";
 import { MonitoringView } from "./agent/views/MonitoringView";
-import { FunnelView } from "./agent/views/FunnelView";
 import { UsageView } from "./agent/views/UsageView";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -6268,14 +6267,6 @@ export default function App() {
       );
     }
 
-    if (activeTab === "Работа с воронками") {
-      return (
-        <div className="animate-in fade-in duration-200">
-          <FunnelView />
-        </div>
-      );
-    }
-
     if (activeTab === "Мониторинг") {
       return (
         <div className="animate-in fade-in duration-200">
@@ -8028,7 +8019,15 @@ export default function App() {
                   return (
                     <button
                       key={item.label}
-                      onClick={() => item.label === "WB-кабинет" ? (window.location.href = "/analytics") : setActiveTab(item.label)}
+                      onClick={() => {
+                        if (item.label === "Работа с воронками") {
+                          window.location.assign("/agent-funnels");
+                        } else if (item.label === "WB-кабинет") {
+                          window.location.assign("/analytics");
+                        } else {
+                          setActiveTab(item.label);
+                        }
+                      }}
                       className={cn(
                         "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-[14px] font-bold transition-all duration-200 group",
                         isActive

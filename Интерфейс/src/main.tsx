@@ -1,10 +1,19 @@
 import {StrictMode} from 'react';
 import {createRoot} from 'react-dom/client';
-import App from './App.tsx';
 import './index.css';
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-);
+async function bootstrap() {
+  const pathname = window.location.pathname.replace(/\/+$/, '') || '/';
+  const RootComponent =
+    pathname === '/agent-funnels'
+      ? (await import('./funnel-workspace/FunnelWorkspace.tsx')).FunnelWorkspace
+      : (await import('./App.tsx')).default;
+
+  createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+      <RootComponent />
+    </StrictMode>,
+  );
+}
+
+void bootstrap();

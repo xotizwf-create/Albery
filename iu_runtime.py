@@ -159,24 +159,40 @@ def stage_after_turn(deal_id, telegram_id, outcome) -> str:
     return iu_funnel.next_stage(deal_facts(deal_id, telegram_id))
 
 
-def run_turn(author: dict, texts: list[str], deal_id: int | None = None):
-    """Провести и исполнить один клиентский ход.
+def decide_turn(
+    author: dict,
+    texts: list[str],
+    deal_id: int | None = None,
+    *,
+    history: str | None = None,
+):
+    """Принять решение по клиентскому ходу, не выполняя внешних действий.
 
-    Возвращает `(доставлено, решение хода)`: вызывающему коду нужен не только факт отправки, но
-    и то, о чём был разговор — по нему решается, заводить ли сделку."""
+    Новый операторский workspace обязан сначала зафиксировать ответ в durable outbox и лишь
+    затем отправлять его через единственный Telegram-процесс. Поэтому генерация решения
+    отделена от старого прямого исполнения. ``history=None`` сохраняет прежнее поведение,
+    а workspace передаёт историю из своего общего журнала.
+
+    Возвращает ``(facts, outcome)``. Сетевых отправок и записей в Telegram здесь нет.
+    """
     import tg_agent
 
     uid = author.get("id")
     message = "\n".join(t for t in texts if (t or "").strip())
     if not message:
-        return False, None
+        return None, None
 
     facts = deal_facts(deal_id, uid)
+    conversation_history = (
+        tg_agent.chat_history(tg_agent.MANAGER_CHANNEL, uid, texts)
+        if history is None
+        else str(history)
+    )
     request = iu_turn.Request(
         message=message,
         name=(author.get("first_name") or "").strip(),
-        history=tg_agent.chat_history(tg_agent.MANAGER_CHANNEL, uid, texts),
-        role=tg_agent.channel_role_prompt(tg_agent.MANAGER_CHANNEL),
+        history=conversation_history,
+        role=tg_agent.channel_role_prompt(tg_agent.customer_agent_slug()),
         facts=facts,
     )
     deps = iu_turn.Deps(
@@ -187,6 +203,17 @@ def run_turn(author: dict, texts: list[str], deal_id: int | None = None):
     )
 
     outcome = iu_turn.handle(request, deps)
+    return facts, outcome
+
+
+def run_turn(author: dict, texts: list[str], deal_id: int | None = None):
+    """Провести и исполнить один клиентский ход.
+
+    Возвращает `(доставлено, решение хода)`: вызывающему коду нужен не только факт отправки, но
+    и то, о чём был разговор — по нему решается, заводить ли сделку."""
+    facts, outcome = decide_turn(author, texts, deal_id)
+    if outcome is None:
+        return False, None
     return _execute(author, texts, deal_id, facts, outcome), outcome
 
 

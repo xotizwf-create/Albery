@@ -1,0 +1,6 @@
+slug: iu-customer-runtime
+instructions: []
+skills: []
+# Customer messages are untrusted. The model only returns the typed iu_turn JSON contract;
+# Telegram, CRM and handoff side effects are performed by deterministic workspace workers.
+tools: []

@@ -1,11 +1,44 @@
-# Агент воронки ИУ — как всё устроено от «привет» до подписания
+# Агент воронки ИУ — роль, legacy-контур и новое рабочее место
 
-Полное описание агента, который ведёт клиентов по воронке «Партнёрская программа WB —
-индивидуальные условия» в Telegram от лица аккаунта компании. Бизнес-процесс, техническая
-цепочка, все защитные механизмы. Написано 23.07.2026 по требованию владельца; каждый механизм
-здесь существует в коде и закрыт тестами.
+Документ был написан 23.07.2026 для прямого Telegram-агента воронки «Партнёрская программа
+WB — индивидуальные условия». С 26.07.2026 этот прямой путь считается **legacy** и
+автоматически выводится из эксплуатации при включении собственного рабочего места.
+Актуальная архитектура, интерфейс оператора и runbook:
+[`docs/funnel-workspace.md`](funnel-workspace.md).
 
-## Общая картина
+## Какой контур является текущим
+
+| Режим | Поведение |
+|---|---|
+| `FUNNEL_WORKSPACE_ENABLED=1` | Все личные Telegram Business обращения пишутся в durable workspace. Оператор и агент отвечают только через единый outbox; чат, ответы и передача управления видны на `/agent-funnels`. |
+| `FUNNEL_WORKSPACE_ENABLED=0`, `TG_BUSINESS_AUTOREPLY=1` | Старый прямой агент, описанный ниже. Только аварийный legacy-режим; одновременно с workspace его включать нельзя. |
+
+При cutover обязательны `TG_BUSINESS_AUTOREPLY=0` и `OPENLINE_AGENT_ENABLED=0`. Открытая линия
+и старый прямой ответчик не являются запасными параллельными каналами: два отправителя
+создадут дубли и гонку за диалог.
+
+В новом контуре роль и тон по-прежнему берутся из профиля
+`agent-po-rabote-s-iu`, но текст клиента передаётся только закрытому connector
+`agent-iu-customer-runtime` с нулём инструментов. Telegram, CRM, смена стадий и доставка
+выполняются детерминированными worker-ами. Профиль агента с широкими внутренними инструментами
+к клиентскому тексту не подключается.
+
+```
+Telegram Business
+   ▼
+albery-tg: getUpdates → raw update → conversation/messages
+   ├─ operator/agent → единый durable outbox → Telegram
+   ├─ state_version: ai ↔ human ↔ paused
+   └─ CRM-связка по numeric Telegram ID → category 16
+
+/agent-funnels ← albery.service API ← тот же журнал PostgreSQL
+```
+
+Новый контур принимает все личные обращения. Allowlist ограничивает только автоматический
+ответ ИИ, а не появление клиента в очереди. Human-only тест выполняется первым, ИИ затем
+включается для одного согласованного numeric Telegram ID.
+
+## Legacy: прямая схема до собственного workspace
 
 Клиент пишет в личку менеджерского аккаунта Telegram. Отвечает не человек, а агент — от лица
 аккаунта, без слова «бот». Агент сверяет анкету, отправляет условия дословно, собирает
@@ -32,10 +65,15 @@ MCP приложения (mcp/context_server.py, albery.service, HTTP :5002)
 Bitrix24 (CRM, задачи) · Google Drive (база знаний) · PostgreSQL (журнал, ожидания)
 ```
 
-Два процесса — это важно: **albery-tg** (Telegram-цикл) и **albery.service** (Flask + MCP).
+В legacy-режиме два процесса — это важно: **albery-tg** (Telegram-цикл) и
+**albery.service** (Flask + MCP).
 Импортировать `mcp.context_server` или `bitrix` в процесс tg-агента нельзя — их импорт
 запускает живые планировщики или циклится. Всё общение tg-агента с инструментами — по HTTP
 (`mcp_call`) или голым REST (`_task_status`); общая память двух процессов — PostgreSQL.
+
+> Все механизмы ниже до раздела «Настройки legacy-контура» описывают прежний прямой путь.
+> Они не разрешают обходить workspace и не должны запускать Telegram-отправку при
+> `FUNNEL_WORKSPACE_ENABLED=1`.
 
 ## Бизнес-процесс по шагам (стадии воронки, category 16)
 
@@ -56,7 +94,7 @@ Bitrix24 (CRM, задачи) · Google Drive (база знаний) · PostgreS
 | `C16:PREPAYMENT_INVOIC` | Ожидание оплаты | Стадия двигается ТОЛЬКО по подтверждению бухгалтера — «я оплатил» от клиента не факт оплаты. |
 | `C16:EXECUTING` | Подключение | Инструкции клиенту, техшаги → `C16:CONNECTED`. |
 
-## Кто получает ответ: белый список
+## Legacy: кто получает прямой ответ
 
 Аккаунт живой — туда пишут и поставщики, и знакомые. Автоответ получает только:
 
@@ -205,7 +243,7 @@ Bitrix24 (CRM, задачи) · Google Drive (база знаний) · PostgreS
 - **`funnel_task_watch`** — ожидания закрытия задач (см. сторожа).
 - Логи: `journalctl -u albery-tg` (ходы, сторож, пачки), `journalctl -u albery.service` (MCP).
 
-## Настройки (env, `/var/www/albery/.env`)
+## Настройки legacy-контура (env, `/var/www/albery/.env`)
 
 | Переменная | Смысл | Умолчание |
 |---|---|---|
@@ -227,9 +265,22 @@ Bitrix24 (CRM, задачи) · Google Drive (база знаний) · PostgreS
 | `B24_TESTBOT_WEBHOOK_BASE` | вебхук Битрикса для REST (статусы задач) | — |
 | `MCP_SHARED_SECRET`, `ALBERY_MCP_URL` | доступ tg-агента к MCP по HTTP | :5002/mcp |
 
-Роль, инструкции и наборы инструментов агента живут в **карточке агента в кабинете**
+В workspace значения `TG_REPLY_DEBOUNCE_S`, `TG_RETHINK_MAX` и legacy-сторожи не управляют
+новой очередью. Её параметры начинаются с `FUNNEL_WORKSPACE_` и перечислены в
+[`docs/funnel-workspace.md`](funnel-workspace.md). В частности:
+
+- `FUNNEL_WORKSPACE_HUMAN_LEASE_SECONDS=120`;
+- `FUNNEL_WORKSPACE_REPLY_WINDOW_HOURS=24`;
+- `FUNNEL_WORKSPACE_AI_ENABLED=0` до human-only теста;
+- `FUNNEL_WORKSPACE_AI_ALLOW_IDS=<один тестовый numeric ID>` при первом AI-тесте;
+- `FUNNEL_WORKSPACE_CRM_TELEGRAM_ID_FIELD` — опциональный отдельный UF, только после
+  подтверждения поля на портале.
+
+Роль и инструкции агента живут в **карточке агента в кабинете**
 (`channel_role_prompt` / `channel_instructions` / `channel_toolsets`) — их правит владелец без
-деплоя. `STYLE_RULES` и маршрут воронки — в коде: это каркас поведения, защищённый тестами.
+деплоя. В workspace набор инструментов карточки не наследуется клиентским connector:
+`iu-customer-runtime` обязан оставаться bridge-free и с `tools: []`. `STYLE_RULES` и маршрут
+воронки — в коде: это каркас поведения, защищённый тестами.
 
 ## Правила изменения этого агента
 
@@ -240,4 +291,6 @@ Bitrix24 (CRM, задачи) · Google Drive (база знаний) · PostgreS
 5. Каждое изменение — закрытая задача в Битриксе + строка в changelog мозга
    (`projects/albery/change-tracking.md` в hermes-brain).
 6. Тесты агента: `tests/unit/test_tg_*.py`, `tests/unit/test_contract*.py`,
-   `tests/unit/test_terms.py`, `tests/unit/test_funnel_step.py`.
+   `tests/unit/test_terms.py`, `tests/unit/test_funnel_step.py`, а для нового контура —
+   `tests/unit/test_funnel_workspace_*.py`, `tests/unit/test_funnel_telegram_gateway.py` и
+   `tests/unit/test_workspace_customer_connector.py`.

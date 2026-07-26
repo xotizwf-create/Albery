@@ -241,7 +241,10 @@ def load_skill_content(skill_id: str) -> str | None:
 
 # Customer input is untrusted. These agents must never fall back to the broad DB
 # whitelist merely because their versioned manifest is missing or malformed.
-STRICT_TOOL_MANIFEST_SLUGS: frozenset[str] = frozenset({"albery-ai-bot"})
+STRICT_TOOL_MANIFEST_SLUGS: frozenset[str] = frozenset({
+    "albery-ai-bot",
+    "iu-customer-runtime",
+})
 
 def _manifest_path(slug: str) -> Path:
     return AGENTS_DIR / f"{slug}.yaml"

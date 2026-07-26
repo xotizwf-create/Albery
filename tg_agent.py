@@ -100,6 +100,17 @@ def owner_ids() -> set[int]:
     return out
 
 
+def funnel_workspace_enabled() -> bool:
+    """The custom inbox owns every customer send when enabled."""
+
+    return str(os.getenv("FUNNEL_WORKSPACE_ENABLED", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 # АГЕНТ = БОТ. @AlberyAIManager — не бот, а обычный аккаунт Telegram: он лишь подключил бота
 # @Albery_AI2_Bot в «Telegram для бизнеса», и все ответы лидам физически шлёт бот, просто
 # Telegram показывает их от лица аккаунта. Поэтому агент здесь один — бот, а два его источника
@@ -107,6 +118,49 @@ def owner_ids() -> set[int]:
 BOT_CHANNEL = "albery-ai-bot"
 # Оставлено как псевдоним: бизнес-переписки ведёт тот же бот, отдельным агентом они не являются.
 MANAGER_CHANNEL = BOT_CHANNEL
+
+
+def customer_agent_slug() -> str:
+    """Agent profile that answers customer conversations in the funnel workspace.
+
+    The Telegram transport and the AI profile are deliberately different identities:
+    ``BOT_CHANNEL`` names the physical gateway, while this slug selects the existing Albery
+    agent's prompt, instructions and MCP boundary.  Changing the agent never creates a second
+    Telegram consumer.
+    """
+    default_slug = "agent-po-rabote-s-iu"
+    return (
+        os.getenv("FUNNEL_WORKSPACE_AGENT_SLUG") or default_slug
+    ).strip() or default_slug
+
+
+def customer_toolset_slug() -> str:
+    """Strict zero-tool connector used for untrusted customer text.
+
+    The role/profile and the capability boundary are intentionally separate.  The existing
+    ИУ agent supplies its role, while Telegram delivery, CRM writes and handoff are performed
+    by deterministic workspace code.  Giving a customer prompt the ИУ agent's broad connector
+    would expose owner-only mutation tools to prompt injection.
+    """
+    return (
+        os.getenv("FUNNEL_WORKSPACE_CUSTOMER_TOOLSET_SLUG") or "iu-customer-runtime"
+    ).strip() or "iu-customer-runtime"
+
+
+def customer_toolsets() -> str:
+    """Return only a manifest-capped, zero-tool connector or fail closed."""
+    slug = customer_toolset_slug()
+    try:
+        from agent_knowledge import load_manifest
+
+        manifest = load_manifest(slug)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("customer connector manifest is unavailable") from exc
+    if "tools" not in manifest or manifest.get("tools"):
+        raise RuntimeError(
+            f"customer connector agent-{slug} is not capped to zero tools"
+        )
+    return f"agent-{slug}"
 
 
 def owner_toolsets() -> str:
@@ -578,7 +632,7 @@ def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
         # A database/connector lookup failure must not restore the broad default
         # for untrusted customer turns. The narrow connector may fail visibly,
         # but the customer can never inherit ``albery,web``.
-        toolsets = (f"agent-{MANAGER_CHANNEL}" if customer_turn
+        toolsets = (customer_toolsets() if customer_turn
                     else os.getenv("TG_AGENT_TOOLSETS", "albery,web"))
     timeout_s = timeout_s or int(os.getenv("TG_AGENT_HERMES_TIMEOUT", "420"))
     # Fresh session per run (hermes >=0.17 resumes --continue sessions; memory is prompt-injected)
@@ -607,14 +661,14 @@ def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
 
 def _is_customer_session(session_prefix: str) -> bool:
     return str(session_prefix).startswith(
-        ("tg-new-", "tg-biz-", "answering-")
+        ("tg-new-", "tg-biz-", "tg-iu-", "answering-")
     )
 
 
 def customer_hermes_answer(prompt: str, session_prefix: str, *,
                            timeout_s: int | None = None) -> str:
     """One untrusted customer turn through the zero-tool fail-closed connector."""
-    kwargs = {"toolsets": channel_toolsets(MANAGER_CHANNEL)}
+    kwargs = {"toolsets": customer_toolsets()}
     if timeout_s is not None:
         kwargs["timeout_s"] = timeout_s
     return hermes_answer(prompt, session_prefix, **kwargs)
@@ -714,15 +768,45 @@ def find_contact(who: str) -> dict | None:
     return contacts().get(key)
 
 
-def send_as_account(user_id: int, text: str, parse_mode: str = "") -> tuple[bool, str]:
-    """Написать человеку ОТ ЛИЦА аккаунта владельца (Telegram Business), а не от бота."""
+def _business_connection_id(preferred: str = "") -> tuple[str, str]:
+    """Pick an enabled, reply-capable Business connection without exposing its id in logs.
+
+    A conversation stores the exact connection that received the message.  Callers should pass
+    it as ``preferred``; the fallback exists only for legacy proactive sends created before the
+    workspace stored that relationship.
+    """
     state = load_state()
-    conn_ids = list((state.get("business") or {}).keys())
-    if not conn_ids:
-        return False, "бизнес-подключение не настроено: подключите бота в Telegram → Настройки → Telegram для бизнеса → Чат-боты"
+    business = state.get("business") or {}
+    wanted = str(preferred or "").strip()
+    if wanted:
+        info = business.get(wanted) or {}
+        if not info:
+            return "", "бизнес-подключение этого диалога больше не существует"
+        if info.get("enabled") is False:
+            return "", "бизнес-подключение этого диалога выключено"
+        if info.get("can_reply") is False:
+            return "", "у бизнес-подключения нет права отвечать"
+        return wanted, ""
+    for connection_id, info in business.items():
+        info = info or {}
+        if info.get("enabled") is False or info.get("can_reply") is False:
+            continue
+        return str(connection_id), ""
+    return "", ("бизнес-подключение не настроено: подключите бота в Telegram → Настройки → "
+                "Telegram для бизнеса → Чат-боты")
+
+
+def send_as_account(user_id: int, text: str, parse_mode: str = "",
+                    business_connection_id: str = "") -> tuple[bool, str]:
+    """Написать человеку ОТ ЛИЦА аккаунта владельца (Telegram Business), а не от бота."""
+    if funnel_workspace_enabled():
+        return False, "прямая отправка отключена: используйте outbox рабочего пространства"
+    connection_id, error = _business_connection_id(business_connection_id)
+    if not connection_id:
+        return False, error
     extra = {"parse_mode": parse_mode} if parse_mode else {}
     try:
-        api("sendMessage", business_connection_id=conn_ids[0], chat_id=int(user_id), text=text,
+        api("sendMessage", business_connection_id=connection_id, chat_id=int(user_id), text=text,
             link_preview_options={"is_disabled": True}, **extra)
         return True, ""
     except Exception as exc:  # noqa: BLE001
@@ -781,19 +865,20 @@ def telegram_send_as_account(who: str, text: str) -> dict:
 
 
 def send_document_as_account(user_id: int, data: bytes, filename: str,
-                             caption: str = "") -> tuple[bool, str]:
+                             caption: str = "", business_connection_id: str = "") -> tuple[bool, str]:
     """Отправить файл человеку от лица аккаунта компании (договор, счёт).
 
     До 23.07.2026 агент умел только текст, поэтому договор клиенту отправить не мог —
     и вместо файла присылал обещание «направим»."""
-    state = load_state()
-    conn_ids = list((state.get("business") or {}).keys())
-    if not conn_ids:
-        return False, "бизнес-подключение не настроено"
+    if funnel_workspace_enabled():
+        return False, "прямая отправка отключена: используйте outbox рабочего пространства"
+    connection_id, error = _business_connection_id(business_connection_id)
+    if not connection_id:
+        return False, error
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{bot_token()}/sendDocument",
-            data={"business_connection_id": conn_ids[0], "chat_id": int(user_id),
+            data={"business_connection_id": connection_id, "chat_id": int(user_id),
                   "caption": caption[:1000]},
             files={"document": (filename, data)},
             timeout=120,
@@ -1311,14 +1396,14 @@ def funnel_next_step(deal: dict, terms_sent_to_client: bool = False) -> dict:
                                f"отправляй ничего, сообщи владельцу через ТАКЖЕ_СПРОСИ_ЛЮДЕЙ.")}
         return {"step": "Вопросы по условиям",
                 "need": "вопросы клиента по условиям — и его готовность идти дальше",
-                "action": (f"Условия клиент уже получил — второй раз их НЕ отправляй. Отвечай на "
-                           f"вопросы по базе знаний (search_company_knowledge), помня весь "
-                           f"разговор. Фактов в базе нет — унеси вопрос людям через "
-                           f"ТАКЖЕ_СПРОСИ_ЛЮДЕЙ, но клиенту всё равно скажи, что уточняешь и "
-                           f"вернёшься: не молчи, пауза без слов читается как игнор. Когда "
-                           f"вопросы закончились или человек спросил про подключение, сроки или "
-                           f"оплату — предложи заполнить анкету, чтобы посчитать экономику по "
-                           f"его магазину.")}
+                "action": ("Условия клиент уже получил — второй раз их НЕ отправляй. Отвечай на "
+                           "вопросы по базе знаний (search_company_knowledge), помня весь "
+                           "разговор. Фактов в базе нет — унеси вопрос людям через "
+                           "ТАКЖЕ_СПРОСИ_ЛЮДЕЙ, но клиенту всё равно скажи, что уточняешь и "
+                           "вернёшься: не молчи, пауза без слов читается как игнор. Когда "
+                           "вопросы закончились или человек спросил про подключение, сроки или "
+                           "оплату — предложи заполнить анкету, чтобы посчитать экономику по "
+                           "его магазину.")}
     if stage == "C16:S84294149" and not terms_sent and not has_req:
         return {"step": "Отправка условий",
                 "need": "ничего — условия отправляешь ты",
@@ -2209,6 +2294,8 @@ def handle_business_message(msg: dict) -> None:
 
 def business_autoreply_enabled() -> bool:
     """Отвечать ли самому на входящие в личных чатах аккаунта (TG_BUSINESS_AUTOREPLY=1)."""
+    if funnel_workspace_enabled():
+        return False
     return str(os.getenv("TG_BUSINESS_AUTOREPLY", "")).strip().lower() in {"1", "true", "yes"}
 
 
@@ -2732,9 +2819,23 @@ def reply_to_stranger(author: dict, texts: list[str] | str) -> bool:
     return ok
 
 
-def _business_owner_id() -> int | None:
-    """Числовой id владельца аккаунта, к которому подключён бот."""
-    for info in (load_state().get("business") or {}).values():
+def _business_owner_id(business_connection_id: str = "") -> int | None:
+    """Числовой id владельца конкретного Telegram Business подключения.
+
+    Без аргумента сохраняется legacy-поведение для внутренних уведомлений.
+    Входящие workspace-сообщения всегда передают точный connection id, чтобы
+    исходящее одного владельца не стало входящим клиента другого владельца.
+    """
+
+    business = load_state().get("business") or {}
+    preferred = str(business_connection_id or "").strip()
+    if preferred:
+        info = business.get(preferred) or {}
+        try:
+            return int(info["user_id"]) if info.get("user_id") else None
+        except (TypeError, ValueError):
+            return None
+    for info in business.values():
         if info.get("user_id"):
             return int(info["user_id"])
     return None
@@ -2880,6 +2981,13 @@ def _handle_update_safely(upd: dict) -> None:
         log.exception("update handling failed")
 
 
+def _capture_failure_delay(consecutive_failures: int) -> float:
+    """Bound polling pressure while PostgreSQL cannot durably accept updates."""
+
+    failures = max(1, int(consecutive_failures or 1))
+    return float(min(30, 2 ** min(failures - 1, 5)))
+
+
 def poll_forever() -> None:
     log.info("tg agent starting; owner ids=%s usernames=%s",
              sorted(owner_ids()), sorted(owner_usernames()))
@@ -2890,30 +2998,69 @@ def poll_forever() -> None:
         tg_multi.start_all()
     except Exception:  # noqa: BLE001
         log.exception("не удалось запустить дополнительных Telegram-агентов")
-    # Сторож ожиданий: без него «задача закрыта → сообщение клиенту» не срабатывало никогда —
-    # check_finished_tasks существовал, но его никто не вызывал (владелец, 23.07.2026).
-    start_task_watchdog()
+    workspace_mode = funnel_workspace_enabled()
+    if workspace_mode:
+        import funnel_telegram_gateway
+
+        funnel_telegram_gateway.start_workers()
+        log.info("custom funnel workspace owns Telegram Business traffic")
+    else:
+        # Сторож ожиданий: без него «задача закрыта → сообщение клиенту» не срабатывало никогда —
+        # check_finished_tasks существовал, но его никто не вызывал (владелец, 23.07.2026).
+        start_task_watchdog()
     me = api("getMe")
     log.info("bot: @%s (id %s)", me.get("username"), me.get("id"))
     offset = int(load_state().get("offset") or 0)
+    capture_failures = 0
     while True:
         try:
-            updates = api("getUpdates", http_timeout=65, timeout=55, offset=offset,
-                          allowed_updates=["message", "business_connection", "business_message"])
+            updates = api(
+                "getUpdates",
+                http_timeout=65,
+                timeout=55,
+                offset=offset,
+                allowed_updates=[
+                    "message",
+                    "business_connection",
+                    "business_message",
+                    "edited_business_message",
+                    "deleted_business_messages",
+                ],
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("getUpdates failed: %s", str(exc)[:200])
             time.sleep(5)
             continue
+        capture_failed = False
         for upd in updates or []:
-            offset = max(offset, int(upd.get("update_id", 0)) + 1)
-            # Обработка уходит в пул: ход мозга занимает десятки секунд, и раньше цикл стоял
-            # на нём целиком — десятый написавший ждал бы минуты. Порядок сообщений ОДНОГО
-            # человека держит dialog_lock, число одновременных ходов — _hermes_slots.
-            _workers.submit(_handle_update_safely, upd)
+            next_offset = int(upd.get("update_id", 0)) + 1
+            if workspace_mode:
+                try:
+                    # Commit first, acknowledge to Telegram second. A DB outage therefore causes
+                    # a replay, not a silently lost customer message.
+                    funnel_telegram_gateway.capture_poll_update(upd)
+                except Exception as exc:  # noqa: BLE001
+                    capture_failures += 1
+                    capture_failed = True
+                    log.warning(
+                        "workspace did not durably capture Telegram update; retrying after backoff: %s",
+                        str(exc)[:200],
+                    )
+                    break
+                capture_failures = 0
+                offset = max(offset, next_offset)
+            else:
+                offset = max(offset, next_offset)
+                # Обработка уходит в пул: ход мозга занимает десятки секунд, и раньше цикл стоял
+                # на нём целиком — десятый написавший ждал бы минуты. Порядок сообщений ОДНОГО
+                # человека держит dialog_lock, число одновременных ходов — _hermes_slots.
+                _workers.submit(_handle_update_safely, upd)
         with _state_lock:
             state = load_state()
             state["offset"] = offset
             save_state(state)
+        if capture_failed:
+            time.sleep(_capture_failure_delay(capture_failures))
 
 
 if __name__ == "__main__":
