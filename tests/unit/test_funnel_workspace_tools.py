@@ -8,7 +8,7 @@ import funnel_workspace_tools as tools
 
 @pytest.fixture(autouse=True)
 def canonical_host(monkeypatch):
-    monkeypatch.setenv("CANONICAL_WEB_HOST", "www.m4s.ru")
+    monkeypatch.setenv("FUNNEL_WORKSPACE_PUBLIC_BASE", "https://www.m4s.ru")
 
 
 def conversation(**overrides):
@@ -32,6 +32,16 @@ def conversation(**overrides):
     return base
 
 
+def test_link_setting_does_not_touch_request_routing(monkeypatch):
+    """CANONICAL_WEB_HOST включает 301 на канонический домен и рвёт локальные вызовы
+    (это уронило все MCP-эндпоинты на проде 26.07.2026). Ссылки настраиваются своей
+    переменной."""
+    monkeypatch.delenv("CANONICAL_WEB_HOST", raising=False)
+    monkeypatch.setenv("FUNNEL_WORKSPACE_PUBLIC_BASE", "https://www.m4s.ru")
+
+    assert funnel_workspace.conversation_url(5) == "https://www.m4s.ru/agent-funnels/5"
+
+
 def test_every_conversation_has_its_own_permanent_link():
     assert funnel_workspace.conversation_url(188) == "https://www.m4s.ru/agent-funnels/188"
 
@@ -39,6 +49,7 @@ def test_every_conversation_has_its_own_permanent_link():
 def test_link_stays_relative_when_the_public_host_is_unknown(monkeypatch):
     # Служебный домен MCP в напоминании увёл бы оператора не туда, поэтому чужой хост
     # не подставляется: относительный путь внутри сайта всё равно верен.
+    monkeypatch.delenv("FUNNEL_WORKSPACE_PUBLIC_BASE", raising=False)
     monkeypatch.delenv("CANONICAL_WEB_HOST", raising=False)
 
     assert funnel_workspace.conversation_url(7) == "/agent-funnels/7"

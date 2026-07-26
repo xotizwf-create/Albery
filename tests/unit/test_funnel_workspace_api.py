@@ -447,7 +447,7 @@ def test_conversation_page_opens_by_its_own_link(client, monkeypatch):
 def test_conversation_payload_carries_its_link_and_urgency(client, monkeypatch):
     from datetime import datetime, timedelta, timezone
 
-    monkeypatch.setenv("CANONICAL_WEB_HOST", "www.m4s.ru")
+    monkeypatch.setenv("FUNNEL_WORKSPACE_PUBLIC_BASE", "https://www.m4s.ru")
     waiting = datetime.now(timezone.utc) - timedelta(minutes=40)
     monkeypatch.setattr(
         workspace.store,

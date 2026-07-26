@@ -416,11 +416,17 @@ def workspace_page(conversation_id: int | None = None) -> Response:
 def conversation_url(conversation_id: Any) -> str:
     """Постоянный адрес диалога — его печатают в напоминаниях и задачах.
 
-    Хост берётся только из ``CANONICAL_WEB_HOST``: MCP-инструменты вызываются на
-    служебном домене, и его адрес в напоминании привёл бы оператора не туда. Если
-    хост не задан, отдаём относительный путь — он всё равно верен внутри сайта.
+    Адрес берётся из ``FUNNEL_WORKSPACE_PUBLIC_BASE`` — отдельной переменной только для
+    ссылок. ``CANONICAL_WEB_HOST`` для этого не годится: он включает перенаправление на
+    канонический домен, и любой локальный запрос (в том числе внутренние вызовы MCP по
+    127.0.0.1) начинает получать 301. Служебный домен MCP тоже не подходит: его адрес в
+    напоминании увёл бы оператора не туда. Если ничего не задано, отдаём относительный
+    путь — внутри сайта он всё равно верен.
     """
-    host = os.getenv("CANONICAL_WEB_HOST", "").strip().rstrip("/")
+    host = (
+        os.getenv("FUNNEL_WORKSPACE_PUBLIC_BASE", "").strip().rstrip("/")
+        or os.getenv("CANONICAL_WEB_HOST", "").strip().rstrip("/")
+    )
     path = f"{PAGE_PREFIX}/{int(conversation_id)}"
     if not host:
         return path
