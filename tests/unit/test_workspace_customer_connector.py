@@ -69,6 +69,26 @@ def test_connector_block_rejects_unsafe_or_implicit_public_base(public_base):
         )
 
 
+def test_public_base_is_read_from_the_env_file_not_only_the_process(monkeypatch, tmp_path):
+    # Скрипт запускают руками при деплое, без окружения приложения: значение живёт в .env.
+    monkeypatch.delenv("AGENT_MCP_PUBLIC_BASE", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "DATABASE_URL=postgresql://ignored/db\nAGENT_MCP_PUBLIC_BASE=https://mcp.example.test\n",
+        encoding="utf-8",
+    )
+
+    assert connector.public_base(env_file) == "https://mcp.example.test"
+
+
+def test_public_base_prefers_an_explicit_process_variable(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_MCP_PUBLIC_BASE", "https://explicit.example.test")
+    env_file = tmp_path / ".env"
+    env_file.write_text("AGENT_MCP_PUBLIC_BASE=https://from-file.example.test\n", encoding="utf-8")
+
+    assert connector.public_base(env_file) == "https://explicit.example.test"
+
+
 def test_committed_manifest_is_zero_tool():
     connector.assert_zero_tool_manifest("iu-customer-runtime")
 

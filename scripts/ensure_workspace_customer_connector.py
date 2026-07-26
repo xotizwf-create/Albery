@@ -18,6 +18,7 @@ import urllib.parse
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -120,6 +121,20 @@ def ensure_database_agent(slug: str) -> str:
             return token
 
 
+def public_base(env_path: Path | None = None) -> str:
+    """Публичный HTTPS-базис коннектора.
+
+    Скрипт запускают вручную при деплое, вне окружения приложения, поэтому значение
+    обычно есть только в `.env` — читаем его так же, как scripts/ensure_postgres.py.
+    Явная переменная процесса всё равно главнее файла.
+    """
+    value = os.getenv("AGENT_MCP_PUBLIC_BASE", "").strip()
+    if value:
+        return value
+    load_dotenv(env_path or REPO_ROOT / ".env")
+    return os.getenv("AGENT_MCP_PUBLIC_BASE", "").strip()
+
+
 def connector_block(slug: str, token: str, public_base: str) -> str:
     raw_base = str(public_base or "").strip()
     parsed = urllib.parse.urlparse(raw_base)
@@ -182,11 +197,10 @@ def ensure_hermes_config(slug: str, token: str) -> Path:
     if not config_path.is_file():
         raise RuntimeError(f"Hermes config does not exist: {config_path}")
     original = config_path.read_text(encoding="utf-8")
-    public_base = os.getenv("AGENT_MCP_PUBLIC_BASE", "").strip()
     updated = replace_connector_block(
         original,
         slug,
-        connector_block(slug, token, public_base),
+        connector_block(slug, token, public_base()),
     )
     yaml.safe_load(updated)
     if updated == original:
