@@ -1096,9 +1096,9 @@ def test_conversation_list_reports_how_long_the_client_waits_for_an_answer():
     assert "awaiting_reply_since" in sql
     assert "author_type IN ('agent', 'operator')" in sql
     assert "delivery_status <> 'cancelled'" in sql
-    # Дольше всех ждущий клиент обязан быть вверху списка.
-    assert "(awaiting_reply_since IS NOT NULL) DESC" in sql
-    assert "awaiting_reply_since ASC" in sql
+    # Дольше всех ждущий клиент обязан быть вверху списка. Псевдоним допустим только
+    # как самостоятельная ссылка — внутри выражения PostgreSQL его не видит.
+    assert "awaiting_reply_since ASC NULLS LAST" in sql
 
 
 def test_operator_stage_change_is_shown_at_once_and_queued_for_bitrix():

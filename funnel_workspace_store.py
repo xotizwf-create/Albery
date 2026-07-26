@@ -660,8 +660,10 @@ def list_conversations(
                  ORDER BY
                        -- Дольше всех ждущий клиент — вверху списка: срочность важнее
                        -- новизны, иначе просроченный вопрос уезжает вниз под свежими.
-                       (awaiting_reply_since IS NOT NULL) DESC,
-                       awaiting_reply_since ASC,
+                       -- Псевдоним допустим только как самостоятельная ссылка: внутри
+                       -- выражения PostgreSQL его не видит, поэтому NULLS LAST, а не
+                       -- отдельный признак «ждёт ли ответа».
+                       awaiting_reply_since ASC NULLS LAST,
                        (c.unread_count > 0) DESC,
                        c.last_message_at DESC NULLS LAST,
                        c.id DESC

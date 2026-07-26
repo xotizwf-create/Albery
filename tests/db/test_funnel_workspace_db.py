@@ -452,3 +452,80 @@ def test_search_finds_old_history_and_retention_spares_queued_work():
                     "DELETE FROM funnel_workspace_sources WHERE source_key = %s",
                     (source_key,),
                 )
+
+
+def test_waiting_client_is_listed_first_and_reports_its_wait():
+    """Живой случай 26.07.2026: сортировка по псевдониму внутри выражения роняла весь
+    список обращений («column awaiting_reply_since does not exist»). Проверка текста SQL
+    такое пропускает — нужен настоящий PostgreSQL."""
+    suffix = uuid4().hex
+    source_key = f"test-urgency-{suffix}"
+    waiting_id: int | None = None
+    answered_id: int | None = None
+    try:
+        store.ensure_source(source_key, source_type="test", display_name="Urgency DB test")
+        waiting = store.ensure_conversation(
+            source_key=source_key,
+            external_chat_id=f"waiting-{suffix}",
+            business_connection_id=f"connection-{suffix}",
+            external_user_id=9_000_000_101,
+            display_name="Ждёт ответа",
+        )
+        waiting_id = int(waiting["id"])
+        answered = store.ensure_conversation(
+            source_key=source_key,
+            external_chat_id=f"answered-{suffix}",
+            business_connection_id=f"connection-{suffix}",
+            external_user_id=9_000_000_102,
+            display_name="Ответ дан",
+        )
+        answered_id = int(answered["id"])
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO funnel_workspace_messages (
+                        conversation_id, external_message_id, author_type,
+                        direction, text, delivery_status, occurred_at
+                    )
+                    VALUES
+                        (%s, %s, 'client', 'inbound', 'Вопрос без ответа', 'sent',
+                         now() - interval '40 minutes'),
+                        (%s, %s, 'client', 'inbound', 'Вопрос', 'sent',
+                         now() - interval '30 minutes'),
+                        (%s, %s, 'operator', 'outbound', 'Ответ оператора', 'sent',
+                         now() - interval '20 minutes')
+                    """,
+                    (
+                        waiting_id, f"w-{suffix}",
+                        answered_id, f"a-{suffix}",
+                        answered_id, f"r-{suffix}",
+                    ),
+                )
+
+        listed = store.list_conversations(source=source_key, limit=50)
+        rows = {int(row["id"]): row for row in listed["items"]}
+
+        # Ждущий клиент обязан быть выше отвеченного.
+        order = [int(row["id"]) for row in listed["items"]]
+        assert order.index(waiting_id) < order.index(answered_id)
+        assert rows[waiting_id]["awaiting_reply_since"] is not None
+        assert rows[answered_id]["awaiting_reply_since"] is None
+
+        # Карточка обращения показывает то же самое.
+        assert store.get_conversation(waiting_id)["awaiting_reply_since"] is not None
+        assert store.get_conversation(answered_id)["awaiting_reply_since"] is None
+    finally:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                for item_id in (waiting_id, answered_id):
+                    if item_id is not None:
+                        cur.execute(
+                            "DELETE FROM funnel_workspace_conversations WHERE id = %s",
+                            (item_id,),
+                        )
+                cur.execute(
+                    "DELETE FROM funnel_workspace_sources WHERE source_key = %s",
+                    (source_key,),
+                )
