@@ -36,12 +36,10 @@ from typing import Any
 
 import requests
 
-import answering           # разбор вопросов клиента и ответы строго по источникам
 import client_message      # единственная сборка сообщений, которые отправляет код
 import decision_log        # трасса решений: что решили, по какому правилу и на каких фактах
 import funnel_rules        # правила воронки как данные: факты → решение + его причина
 import funnel_scenario     # настроенный владельцем сценарий воронки (кабинет)
-import iu_turn_policy      # тема ИУ != согласие на документ/анкету
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -569,20 +567,8 @@ def channel_instructions(channel: str) -> str:
     return text
 
 
-def _with_history(prompt: str, dialog_id, current_text: str) -> str:
-    history = chat_history(MANAGER_CHANNEL, dialog_id, current_text)
-    if not history:
-        return prompt
-    return f"{prompt}\n\nО чём вы уже говорили в этом чате:\n{history}"
 
 
-def _with_instructions(prompt: str, channel: str) -> str:
-    instr = channel_instructions(channel)
-    if not instr:
-        return prompt
-    return (f"{prompt}\n\n"
-            f"ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА ОФОРМЛЕНИЯ — подключены владельцем, следуй им буквально:\n"
-            f"{instr}")
 
 
 def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
@@ -2485,12 +2471,6 @@ TERMS_REQUEST_MARKER = "ПОКАЖИ_УСЛОВИЯ"
 TERMS_ASK_HUMAN_REPLY = "Уточню это у команды и вернусь с ответом."
 # Часть вопросов агент ответил сам, часть ушла людям — клиент должен об этом знать честно.
 TERMS_PENDING_NOTE = "По остальному уточню у команды и вернусь с ответом."
-# А это — на случай, когда маркер условий сработал вхолостую: человек НИЧЕГО не спросил, он
-# просто подтвердил анкету («Все верно»), а модель всё равно вернула маркер. 24.07.2026 Александр
-# получил на «Все верно» ответ «Уточню это у команды» — тупик вместо разговора. Живой менеджер в
-# этот момент спрашивает про вопросы по условиям и ведёт к договору.
-TERMS_FOLLOWUP_REPLY = ("Отлично, спасибо! Условия я отправлял выше — остались по ним вопросы? "
-                        "Если всё понятно, пришлите реквизиты организации, и я подготовлю договор.")
 # Разбор текста (вопрос ли это, просьба выслать заново, интерес к ИУ) живёт в funnel_rules —
 # там же, где правила, которые на него смотрят.
 
@@ -2518,41 +2498,6 @@ def _wants_terms_again(text: str) -> bool:
     return bool(funnel_rules.RESEND_RE.search(text or ""))
 
 
-def _answer_from_sources(author: dict, text: str, deal_id: int | None,
-                         texts_to_journal: list[str] | None = None) -> bool:
-    """Ответить на вопросы клиента по источникам; что осталось — унести людям.
-
-    Владелец 25.07.2026: «если он знает ответ на несколько вопросов, пусть отвечает на них, а на
-    то что не знает — пусть эскалирует менеджеру». Источник фактов — документ условий: именно по
-    нему клиент задаёт вопросы после его получения."""
-    uid = author.get("id")
-    questions = answering.split_questions(text)
-    try:
-        sources = terms_text()
-    except Exception as exc:  # noqa: BLE001 — без источника отвечать нечем, решают люди
-        log.warning("источники для ответа недоступны: %s", str(exc)[:200])
-        sources = ""
-    results = answering.answer_questions(questions, sources, _ask_model) if sources else []
-    known = [r for r in results if r.known]
-    pending = answering.unknown(results) if results else questions
-
-    if not known:
-        return False        # ответить нечем — обычная передача людям
-    note = TERMS_PENDING_NOTE if pending else ""
-    body = answering.client_text(results, pending_note=note)
-    message = client_message.compose(body, name=_name_for_uid(uid), greet=_first_contact(uid))
-    ok, err = send_html(uid, as_html(message), message)
-    if pending:
-        escalate_to_human(author, "клиент спросил, а в источниках этого нет: "
-                                  + "; ".join(pending)[:200], text, answered=True)
-    for t in texts_to_journal or []:
-        journal(MANAGER_CHANNEL, uid, "in", t, kind="lead_chat", user=author)
-    journal(MANAGER_CHANNEL, uid, "out", message if ok else f"{message}\n\n[не доставлено: {err}]",
-            kind="lead_chat", user=author, status="ok" if ok else "error",
-            meta={"deal_id": deal_id, "answered": len(known), "escalated": bool(pending)})
-    log.info("лид %s: ответил на %d из %d вопросов, людям ушло %d",
-             uid, len(known), len(results), len(pending))
-    return ok
 
 
 def _ask_model(prompt: str) -> str:
@@ -2564,30 +2509,8 @@ def _ask_model(prompt: str) -> str:
 _MODEL_RETRY_PAUSE_S = float(os.getenv("TG_MODEL_RETRY_PAUSE_S", "8") or 8)
 
 
-def _retry_after_model_failure(call) -> str:
-    """Один повтор хода после сбоя модели. Пусто — значит не вышло, дальше решают люди."""
-    time.sleep(_MODEL_RETRY_PAUSE_S)
-    try:
-        return (call() or "").strip()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("повтор хода тоже не удался: %s", str(exc)[:200])
-        return ""
 
 
-def _model_failure_to_humans(author: dict, text: str, deal_id: int | None, exc) -> None:
-    """Модель недоступна — вопрос клиента уносим людям, а не оставляем тишину.
-
-    Клиенту при этом НЕ пишем: обещать ответ, которого агент дать не может, владелец запретил
-    (22.07.2026). Но человек в группе видит карточку и отвечает сам — именно этого не хватило
-    25.07.2026, когда три хода упали на 500/503 и клиент ждал впустую."""
-    uid = author.get("id")
-    escalate_to_human(author, f"модель недоступна ({str(exc)[:80]}) — ответьте клиенту сами",
-                      text)
-    journal(MANAGER_CHANNEL, uid, "out",
-            f"мозг не ответил ({str(exc)[:120]}) — вопрос унесён людям в группу «Работа с ИУ»",
-            kind="lead_chat", user=author, status="error",
-            meta={"deal_id": deal_id, "escalated": True, "model_down": True})
-    log.warning("сбой модели по лиду %s унесён людям", uid)
 
 
 def _terms_question_to_humans(author: dict, client_text: str,
@@ -2661,25 +2584,6 @@ STYLE_RULES = (
     "- Коротко и тепло, без канцелярита."
 )
 
-STRANGER_PROMPT = (
-    "Ты — менеджер компании Albery, отвечаешь в Telegram от лица аккаунта компании. Пишет "
-    "человек, которого ещё нет в CRM. Веди себя как живой человек, а не как автоответчик.\n"
-    "\n"
-    "Как отвечать:\n"
-    "- по-русски, обычным текстом без разметки, 1-3 предложения, тепло и по-деловому;\n"
-    "- поздоровался — поздоровайся в ответ и спроси, чем можешь помочь;\n"
-    "- задал вопрос — сначала ответь по существу, но используй только утверждённые сведения, "
-    "которые уже даны тебе в контексте; недоступный инструмент не обещай и не выдумывай;\n"
-    "- никогда не представляйся ботом или ИИ и не упоминай, что смотришь какие-то документы.\n"
-    "\n"
-    "ЗАПРЕЩЕНО придумывать факты о компании: условия, цены, комиссии, сроки, гарантии. Если в базе "
-    "знаний ответа нет или он неполный — не сочиняй и не отвечай общими словами. Вместо этого "
-    f"верни РОВНО одну строку в формате: {ESCALATION_MARKER}: <суть вопроса клиента в 10 словах>. "
-    "Ничего больше в таком случае не пиши.\n"
-    "\n"
-    "Собеседник: {name}\n"
-    "Его сообщение:\n{text}"
-)
 
 
 def lead_invite_enabled() -> bool:
@@ -2724,103 +2628,8 @@ def _deal_has_form(deal_id: int | None) -> bool | None:
         return None
 
 
-def _prepare_form_reply(answer: str, client_text: str, history: str, user_id: int, *,
-                        known_lead: bool = False, deal_id: int | None = None) -> tuple[str, bool]:
-    """Убрать модельную ссылку и разрешить максимум одну системную CTA анкеты."""
-    clean = _without_model_form_link(answer)
-    intent = iu_turn_policy.classify(client_text, history, known_lead=known_lead)
-    if not clean:
-        clean = IU_CLARIFY_REPLY
-    if not intent.offer_form:
-        clean = iu_turn_policy.without_form_steps(clean)
-        return clean or "Чем могу помочь?", False
-    if not LEAD_FORM_URL:
-        clean = iu_turn_policy.without_form_steps(clean)
-        return clean or "Помогу с подключением, но сейчас не могу отправить анкету.", False
-    if _invite_already_sent(user_id) and not intent.resend_form:
-        clean = iu_turn_policy.without_form_steps(clean)
-        return clean or "Ссылка на анкету уже отправлена выше.", False
-    form_status = _deal_has_form(deal_id)
-    if form_status is not False:
-        clean = iu_turn_policy.without_form_steps(clean)
-        fallback = (
-            "Анкета уже получена — повторно заполнять её не нужно."
-            if form_status else
-            "Помогу с подключением, но сейчас не могу проверить статус анкеты."
-        )
-        return clean or fallback, False
-    # Явная просьба клиента важнее случайного вопроса/призыва модели. Сохраняем фактическую
-    # часть ответа, а единственным следующим шагом оставляем каноническую системную анкету.
-    clean = iu_turn_policy.without_next_steps(clean) or "Помогу перейти к подключению."
-    return clean, True
 
 
-def _deliver_answer_with_optional_form(user_id: int, answer: str, invite_now: bool) -> dict:
-    """Доставить ответ и CTA без обрезания и ложной отметки анкеты.
-
-    Короткая связка уходит одним сообщением. Если CTA не помещается, сначала полностью уходит
-    ответ, затем отдельной репликой — ровно одна анкета. Неудача второй отправки не сжигает
-    дедупликацию: следующий явный запрос клиента сможет повторить ссылку."""
-    answer_plain = str(answer or "").strip()
-    answer_html = as_html(answer_plain)
-    form_plain = FORM_TAIL_PLAIN.format(url=LEAD_FORM_URL).lstrip() if invite_now else ""
-    form_html = FORM_TAIL.format(url=LEAD_FORM_URL).lstrip() if invite_now else ""
-    combined_plain = answer_plain + (
-        FORM_TAIL_PLAIN.format(url=LEAD_FORM_URL) if invite_now else ""
-    )
-    combined_html = answer_html + (
-        FORM_TAIL.format(url=LEAD_FORM_URL) if invite_now else ""
-    )
-    result = {
-        "answer_sent": False,
-        "invite_sent": False,
-        "messages": [],
-        "failed_plain": "",
-        "error": "",
-    }
-
-    if not invite_now or _single_message_fits(combined_html, combined_plain):
-        if not _single_message_fits(combined_html, combined_plain):
-            result["failed_plain"] = answer_plain
-            result["error"] = "ответ превышает безопасный размер Telegram"
-            return result
-        ok, err = send_html(int(user_id), combined_html, combined_plain)
-        if not ok:
-            result["failed_plain"] = combined_plain
-            result["error"] = err
-            return result
-        result["answer_sent"] = True
-        result["invite_sent"] = bool(invite_now)
-        result["messages"].append(combined_plain)
-        if invite_now:
-            _mark_invited(user_id)
-        return result
-
-    if not _single_message_fits(answer_html, answer_plain):
-        result["failed_plain"] = answer_plain
-        result["error"] = "ответ превышает безопасный размер Telegram"
-        return result
-    ok, err = send_html(int(user_id), answer_html, answer_plain)
-    if not ok:
-        result["failed_plain"] = answer_plain
-        result["error"] = err
-        return result
-    result["answer_sent"] = True
-    result["messages"].append(answer_plain)
-
-    if not _single_message_fits(form_html, form_plain):
-        result["failed_plain"] = form_plain
-        result["error"] = "CTA анкеты превышает безопасный размер Telegram"
-        return result
-    ok, err = send_html(int(user_id), form_html, form_plain)
-    if not ok:
-        result["failed_plain"] = form_plain
-        result["error"] = err
-        return result
-    _mark_invited(user_id)
-    result["invite_sent"] = True
-    result["messages"].append(form_plain)
-    return result
 
 
 IU_AGENT_NAME = os.getenv("IU_AGENT_NAME", "Агент по работе с ИУ").strip()
@@ -2880,20 +2689,6 @@ def escalate_to_human(author: dict, question: str, client_text: str,
         log.warning("эскалация не доставлена вообще: %s", str(exc)[:200])
 
 
-def split_side_question(author: dict, answer: str, client_text: str) -> str:
-    """Вынуть из ответа строку «ТАКЖЕ_СПРОСИ_ЛЮДЕЙ: …», унести вопрос людям, вернуть чистый текст.
-
-    Клиент получает ответ по существу, а недостающую конкретику сотрудники досылают следом."""
-    if SIDE_ESCALATION_MARKER not in answer:
-        return answer
-    kept, question = [], ""
-    for line in answer.splitlines():
-        if line.strip().startswith(SIDE_ESCALATION_MARKER):
-            question = line.split(":", 1)[-1].strip()
-        else:
-            kept.append(line)
-    escalate_to_human(author, (question or client_text)[:200], client_text, answered=True)
-    return "\n".join(kept).strip()
 
 
 def escalated(author: dict, answer: str, client_text: str) -> bool:
@@ -2909,164 +2704,31 @@ def escalated(author: dict, answer: str, client_text: str) -> bool:
 
 
 def reply_to_stranger(author: dict, texts: list[str] | str) -> bool:
-    """Живой ответ незнакомцу: сначала по существу, анкета только по явному намерению.
+    """Ответ человеку, которого ещё нет в воронке — через общий конвейер ИУ.
 
-    Вопросы без ответа в базе уходят человеку — выдуманный ответ клиенту хуже паузы."""
+    Сделка заводится ПОСЛЕ хода и только по факту: если разговор действительно оказался про наш
+    продукт (нашлась карточка знаний или агент выслал условия/анкету). Раньше решение принимал
+    реестр regex-правил по тексту сообщения, и «сколько стоит доставка?» заводило сделку."""
     if not lead_invite_enabled():
         return False
     texts = [texts] if isinstance(texts, str) else [t for t in texts if (t or "").strip()]
     if not texts:
         return False
-    text = "\n".join(texts)     # для эскалации — весь смысл пачки целиком
+
+    import iu_runtime
+
     author_id = author.get("id")
-    name = (author.get("first_name") or "").strip()
-    policy_history = chat_history(MANAGER_CHANNEL, author_id, texts)
-    # Спросил про ИУ — сразу заводим сделку на «Новом лиде», ещё до ответа (владелец,
-    # 24.07.2026: «как только лид пишет на линию — сразу создаётся сделка с его юзернеймом»).
-    # Заводить ли сделку — решает реестр правил на снимке фактов, а не условие по месту.
-    entry = funnel_rules.decide(_facts_for_turn(author, text))
-    new_deal = _open_lead_deal(author.get("username") or "", author_id, name) \
-        if entry.action == funnel_rules.OPEN_DEAL else None
+    ok, outcome = iu_runtime.run_turn(author, texts, deal_id=None)
+    if not iu_runtime.about_our_product(outcome):
+        return ok
+
+    new_deal = _open_lead_deal(author.get("username") or "", author_id,
+                               (author.get("first_name") or "").strip())
     if new_deal:
-        log.info("незнакомец %s: %s", author_id, funnel_rules.explain(entry))
-        decision_log.record(_db, entry, slot="message", outcome=f"заведена сделка {new_deal}")
-    # Роль из карточки ЗАМЕНЯЕТ встроенный сценарий, а не дополняет его. Склейка давала
-    # противоречивый промпт: роль велит сперва проверить воронку, а встроенный текст — сразу
-    # слать анкету. Агент шёл по встроенному, и владелец получал «после обработки анкеты
-    # продолжим» вместо разговора (22.07.2026).
-    role = channel_role_prompt(MANAGER_CHANNEL)
-    uname = author.get("username") or "без username"
-    base = (f"{role}\n\n{STYLE_RULES}\n\n{STRANGER_RULES}\n\n"
-            f"Собеседник: {name or 'клиент'} (@{uname})\n"
-            f"\n{_shown_messages(texts)}") if role else (
-        STRANGER_PROMPT.format(name=name or "клиент", text=text)
-        + "\n\n" + STYLE_RULES + "\n\n" + STRANGER_RULES)
-    # История добавляется к ЛЮБОМУ промпту, в том числе к запасному: помнить разговор агент
-    # обязан и тогда, когда карточка недоступна.
-    if policy_history:
-        base = f"{base}\n\nО чём вы уже говорили в этом чате:\n{policy_history}"
-    # Отметка ДО хода: см. _autoreply_turn — если инструмент сам напишет клиенту, реплику
-    # модели не дублируем.
-    out_watermark = _dialog_out_watermark(author_id)
-    try:
-        answer = hermes_answer(_with_instructions(base, MANAGER_CHANNEL), f"tg-new-{author_id}",
-                               toolsets=channel_toolsets(MANAGER_CHANNEL))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("мозг не ответил незнакомцу %s: %s", author_id, str(exc)[:200])
-        return False
-    answer = _strip_markup((answer or "").strip())
-    if not answer:
-        return False
-
-    # Маркер модели — только предложение действия. Документ разрешает отдельный deterministic
-    # gate по словам клиента: false-positive на «сколько стоит доставка?» не должен вывалить ИУ.
-    marker_exact = answer == TERMS_REQUEST_MARKER
-    if TERMS_REQUEST_MARKER in answer and not marker_exact:
-        answer = answer.replace(TERMS_REQUEST_MARKER, "").strip() or IU_CLARIFY_REPLY
-    show_terms = bool(
-        marker_exact
-        and iu_turn_policy.asks_terms(text, policy_history, known_lead=False)
-    )
-    if marker_exact and not show_terms:
-        answer = IU_CLARIFY_REPLY
-    if show_terms and _terms_already_sent(author_id) and not _wants_terms_again(text):
-        # Условия у человека уже есть — второй документ не шлём, вопрос уносим людям.
-        _terms_question_to_humans(author, text, texts_to_journal=texts,
-                                  meta={"stranger": True})
-        return False
-    if escalated(author, answer, text):
-        # В чате — тишина: обещать ответ, которого у агента нет, хуже паузы. Но переписку в
-        # журнал пишем, иначе в кабинете вопрос клиента исчезнет вместе с ответом.
-        for t in texts:
-            journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author)
-        journal(MANAGER_CHANNEL, author_id, "out", "вопрос без ответа в базе — унесён людям "
-                "в группу «Работа с ИУ», клиенту не отвечено", kind="lead_chat", user=author,
-                status="ok", meta={"stranger": True, "escalated": True})
-        return False
-
-    answer = split_side_question(author, answer, text)
-    if not answer:
-        return False
-    if not show_terms:
-        answer = iu_turn_policy.keep_one_next_step(answer)
-
-    # Инструмент уже написал клиенту сам в этом ходе — реплику модели не дублируем. Но входящее
-    # ОБЯЗАНО попасть в журнал: 23.07.2026 сообщение клиента перед отправкой условий исчезло из
-    # переписки, и в кабинете условия выглядели отправленными «из ниоткуда».
-    if _out_messages_after(author_id, out_watermark):
-        for t in texts:
-            journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author)
-        log.info("незнакомец %s: инструмент уже ответил клиенту — реплику модели не дублируем",
-                 author_id)
-        return False
-
-    if show_terms:
-        # Один и тот же доставщик обслуживает tg-new и tg-biz: он проверяет лимит ДО отправки,
-        # безопасно отделяет длинную CTA и ставит marks только реально дошедшим assets.
-        for t in texts:
-            journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author)
-        turn_intent = iu_turn_policy.classify(
-            text, policy_history, known_lead=False,
-        )
-        side_question = iu_turn_policy.has_additional_question(text)
-        try:
-            result = send_terms(
-                new_deal or 0, author_id, offer_form=turn_intent.offer_form,
-                resend_form=turn_intent.resend_form,
-                ask_follow_up=not side_question,
-            )
-        except Exception as exc:  # noqa: BLE001 — документ/CTA не готовы: решают люди
-            log.warning("условия незнакомцу %s не доставлены: %s", author_id, str(exc)[:200])
-            escalate_to_human(
-                author,
-                f"клиент спросил про условия, а документ не доставлен: {str(exc)[:150]}",
-                text,
-            )
-            return False
-        if side_question and not _answer_from_sources(author, text, new_deal):
-            _terms_question_to_humans(
-                author, text, meta={"stranger": True,
-                                    **({"deal_id": new_deal} if new_deal else {})},
-            )
-        if new_deal:
-            _move_deal_stage(new_deal, STAGE_CONTACTED, "Агент ответил клиенту в Telegram.")
-        log.info("условия незнакомцу %s отправлены%s", author_id,
-                 " (+анкета)" if result.get("invited") else "")
-        return True
-
-    # Модель не может сама разрешить форму. Assembler сначала удаляет её ссылку из model output,
-    # затем добавляет одну CTA только по явной готовности и только если другого шага уже нет.
-    answer, invite_now = _prepare_form_reply(
-        answer, text, policy_history, author_id, known_lead=False, deal_id=new_deal,
-    )
-    delivery = _deliver_answer_with_optional_form(author_id, answer, invite_now)
-    ok = bool(delivery["answer_sent"])
-    if ok and show_terms:
-        _mark_terms_sent(author_id)  # документ у человека есть — второй раз не дублируем
-    if ok and new_deal:
-        # Ответили — значит связались. Этап двигаем только по факту доставки.
-        _move_deal_stage(new_deal, STAGE_CONTACTED, "Агент ответил клиенту в Telegram.")
-    # Незнакомец попадает в журнал только теперь: агент с ним заговорил. Пока он молчал, это была
-    # обычная личная переписка аккаунта, которой в кабинете не место.
-    for t in texts:
-        journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author)
-    for part in delivery["messages"]:
-        journal(MANAGER_CHANNEL, author_id, "out", part, kind="lead_chat", user=author,
-                status="ok",
-                meta={"stranger": True,
-                      "invited": bool(delivery["invite_sent"] and LEAD_FORM_URL in part),
-                      **({"deal_id": new_deal} if new_deal else {})})
-    if delivery["failed_plain"]:
-        journal(
-            MANAGER_CHANNEL, author_id, "out",
-            f"{delivery['failed_plain']}\n\n[не доставлено: {delivery['error']}]",
-            kind="lead_chat", user=author, status="error",
-            meta={"stranger": True, "invited": False,
-                  **({"deal_id": new_deal} if new_deal else {})},
-        )
-    log.info("ответ незнакомцу %s: %s%s", author_id,
-             "отправлен" if ok else f"не ушёл ({delivery['error']})",
-             " (+анкета)" if delivery["invite_sent"] else "")
+        log.info("незнакомец %s: разговор про ИУ — заведена сделка %s", author_id, new_deal)
+        move = iu_runtime.stage_after_turn(new_deal, author_id, outcome)
+        if move:
+            _move_deal_stage(new_deal, move, "Этап подтверждён фактами переписки.")
     return ok
 
 
@@ -3084,9 +2746,6 @@ _inbox_last: dict[Any, float] = {}      # когда человек написа
 _REPLY_DEBOUNCE_S = float(os.getenv("TG_REPLY_DEBOUNCE_S", "15") or 15)
 
 
-# Сколько раз ход может перезапуститься из-за «клиент дописал, пока агент думал».
-# Ограничение обязательно: очень разговорчивый клиент иначе не получил бы ответа никогда.
-_RETHINK_MAX = max(0, int(os.getenv("TG_RETHINK_MAX", "3") or 3))
 
 
 def _wait_for_quiet(uid) -> None:
@@ -3151,12 +2810,6 @@ def _is_openline_noise(text: str) -> bool:
     return any(marker in low for marker in _OPENLINE_NOISE)
 
 
-def _shown_messages(texts: list[str]) -> str:
-    """Блок «что написал клиент» для промпта: одно сообщение или пачка подряд."""
-    if len(texts) == 1:
-        return f"Его сообщение:\n{texts[0]}"
-    return ("Его сообщения — пришли подряд, ответь на ВСЁ одним сообщением:\n"
-            + "\n".join(f"— {t}" for t in texts))
 
 
 def _autoreply_turn(msgs: list[dict] | dict) -> None:
@@ -3170,7 +2823,6 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
     author = last.get("from") or {}
     chat = last.get("chat") or {}
     author_id = author.get("id")
-    text = "\n".join(texts)     # для эскалации и истории — весь смысл пачки целиком
     if not author_id or author.get("is_bot"):
         return
     owner_id = _business_owner_id()
@@ -3210,187 +2862,10 @@ def _autoreply_turn(msgs: list[dict] | dict) -> None:
                     tg_message_id=m.get("message_id"), meta={"deal_id": deal_id})
     react(author_id, last.get("message_id"), "👀", conn_id)
 
-    name = (author.get("first_name") or "").strip()
-    role = channel_role_prompt(MANAGER_CHANNEL)
+    import iu_runtime
 
-    def build_prompt() -> str:
-        # Промпт собирается заново на каждый заход: шаг воронки перечитывается из сделки,
-        # блок сообщений — из всей накопленной пачки.
-        return (
-            f"{role}\n\n{STYLE_RULES}\n\n"
-            f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
-            f"Собеседник: {name or 'клиент'} (@{username or 'без username'})\n"
-            f"\n{funnel_step_block(deal_id, author_id)}\n"
-            f"\n{_shown_messages(texts)}"
-        ) if role else (
-            "Ты ведёшь переписку в Telegram ОТ ЛИЦА компании Albery (аккаунт менеджера). "
-            "Пишет ЛИД по партнёрской программе Wildberries — он оставил заявку на индивидуальные "
-            "условия. Отвечай по-русски, коротко и по-человечески, обычным текстом без разметки, "
-            "как менеджер в мессенджере — 1-3 предложения. Не представляйся ботом и не пиши, что ты "
-            "ИИ. Если для ответа не хватает данных, задай один уточняющий вопрос. Если вопрос вне "
-            "твоей компетенции или требует решения человека — скажи, что уточнишь у коллег и "
-            "вернёшься с ответом.\n\n"
-            f"{STYLE_RULES}\n\n"
-            f"Сделка в CRM: №{deal_id} (воронка «Партнёрская программа WB — индивидуальные условия»)\n"
-            f"Собеседник: {name or 'клиент'}\n"
-            f"{_shown_messages(texts)}"
-        )
-
-    # Отметка ДО хода: по ней потом видно, отправил ли инструмент (условия/договор) сообщение
-    # клиенту сам — тогда финальную реплику модели слать нельзя, это был бы дубль того же посыла.
-    out_watermark = _dialog_out_watermark(author_id)
-    answer = ""
-    for attempt in range(1 + _RETHINK_MAX):
-        try:
-            answer = hermes_answer(_with_instructions(_with_history(build_prompt(), author_id,
-                                                                    texts), MANAGER_CHANNEL),
-                                   f"tg-biz-{author_id}",
-                                   toolsets=channel_toolsets(MANAGER_CHANNEL))
-        except Exception as exc:  # noqa: BLE001
-            # Провайдер модели отдаёт 500/503 — это бывает. 25.07.2026 так упали три хода, и
-            # клиент 377640060 остался БЕЗ ОТВЕТА совсем («Но вы какие-то супер не торопливые..»).
-            # Сбой модели не имеет права означать тишину: пауза и один повтор, потом — люди.
-            log.warning("мозг не ответил лиду %s: %s", author_id, str(exc)[:200])
-            answer = _retry_after_model_failure(
-                lambda: hermes_answer(
-                    _with_instructions(_with_history(build_prompt(), author_id, texts),
-                                       MANAGER_CHANNEL),
-                    f"tg-biz-{author_id}", toolsets=channel_toolsets(MANAGER_CHANNEL)))
-            if not answer:
-                _model_failure_to_humans(author, text, deal_id, exc)
-                return
-        # Клиент дописал, пока агент думал? Прежний ответ устарел, не глядя на него: думаем
-        # заново над ВСЕЙ пачкой — старые сообщения плюс новые (владелец, 24.07.2026:
-        # «цикл должен начаться заново, максимально человеческое поведение»).
-        with _inbox_lock:
-            has_fresh = bool(_inbox.get(author_id))
-        if not has_fresh or attempt == _RETHINK_MAX:
-            break       # лимит исчерпан — остаток пачки заберёт следующий ход
-        _wait_for_quiet(author_id)
-        with _inbox_lock:
-            fresh = _inbox.pop(author_id, [])
-        if not fresh:
-            break
-        for m in fresh:
-            t = (m.get("text") or m.get("caption") or "").strip()
-            if t:
-                texts.append(t)
-                journal(MANAGER_CHANNEL, author_id, "in", t, kind="lead_chat", user=author,
-                        tg_message_id=m.get("message_id"), meta={"deal_id": deal_id})
-        msgs += fresh
-        react(author_id, fresh[-1].get("message_id"), "👀", conn_id)
-        log.info("лид %s дописал во время хода — думаем заново над %d сообщениями",
-                 author_id, len(texts))
-    text = "\n".join(texts)     # пачка могла вырасти, пока агент думал
-    answer = _strip_markup((answer or "").strip())
-    if not answer:
-        return
-    policy_history = chat_history(MANAGER_CHANNEL, author_id, texts)
-    marker_exact = answer == TERMS_REQUEST_MARKER
-    if TERMS_REQUEST_MARKER in answer and not marker_exact:
-        answer = answer.replace(TERMS_REQUEST_MARKER, "").strip() or IU_CLARIFY_REPLY
-    # Лид спросил про условия — шлём их ДОСЛОВНО из документа, а не пересказом модели.
-    # 24.07.2026 у лида такого механизма не было (маркер работал только у незнакомца), и
-    # клиент получил самодельную выжимку вместо условий.
-    if marker_exact:
-        # Что делать — решает реестр правил (funnel_rules), а не цепочка условий здесь.
-        facts = _facts_for_turn(author, text, deal_id, wants_terms=True)
-        decision = funnel_rules.decide(facts)
-        turn_intent = iu_turn_policy.classify(
-            text, policy_history, known_lead=True,
-        )
-        log.info("лид %s: %s", author_id, funnel_rules.explain(decision))
-        # Вопрос про доставку с ошибочным marker не получает коммерческий документ ИУ. Исключение
-        # — подтверждённая заполненная анкета: там отправка условий является ожидаемым шагом.
-        document_allowed = bool(turn_intent.asks_terms or (
-            facts.anketa and not facts.is_question
-        ))
-        if not document_allowed:
-            answer = IU_CLARIFY_REPLY
-        elif decision.action == funnel_rules.ANSWER_QUESTIONS:
-            # Сначала пробуем ответить по источникам; получилось — людям уходит только то,
-            # чего в источниках нет. Не получилось ничего — обычная передача людям.
-            if _answer_from_sources(author, text, deal_id):
-                decision_log.record(_db, decision, slot="message",
-                                    outcome="ответ по источникам, нерешённое — людям")
-                return
-            _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
-            decision_log.record(_db, decision, slot="message",
-                                outcome="ответить было нечем — вопрос ушёл людям")
-            return
-        if decision.action == funnel_rules.TERMS_TO_HUMANS:
-            _terms_question_to_humans(author, text, meta={"deal_id": deal_id})
-            decision_log.record(_db, decision, slot="message", outcome="вопрос ушёл людям")
-            return
-        if decision.action != funnel_rules.SEND_TERMS or document_allowed:
-            decision_log.record(_db, decision, slot="message",
-                                outcome=("условия отправлены дословно"
-                                         if decision.action == funnel_rules.SEND_TERMS
-                                         else "разговор продолжен по шагу воронки"))
-        if decision.action == funnel_rules.CONTINUE_STEP:
-            # Человек ничего не спросил — просто подтвердил анкету. Маркер сработал вхолостую:
-            # людей не дёргаем и в тупик не встаём, а ведём разговор дальше по шагу воронки.
-            answer = ("Помогу перейти к подключению." if turn_intent.offer_form
-                      else TERMS_FOLLOWUP_REPLY)
-        elif decision.action == funnel_rules.SEND_TERMS and document_allowed:
-            side_question = iu_turn_policy.has_additional_question(text)
-            try:
-                send_terms(
-                    deal_id, author_id,
-                    offer_form=bool(turn_intent.offer_form and not facts.anketa),
-                    resend_form=turn_intent.resend_form,
-                    ask_follow_up=not side_question,
-                )  # шлёт дословно, журналит и метит сделку
-                if side_question and not _answer_from_sources(author, text, deal_id):
-                    _terms_question_to_humans(
-                        author, text, meta={"deal_id": deal_id, "multi_intent": True},
-                    )
-            except Exception as exc:  # noqa: BLE001 — документ не готов: решают люди
-                log.warning("условия лиду %s не собраны: %s", author_id, str(exc)[:200])
-                escalate_to_human(author, f"клиент спросил про условия, документ не готов: "
-                                          f"{str(exc)[:150]}", text)
-            return      # send_terms сам метит доставленный документ
-
-    if escalated(author, answer, text):
-        journal(MANAGER_CHANNEL, author_id, "out", "вопрос без ответа в базе — унесён людям "
-                "в группу «Работа с ИУ», клиенту не отвечено", kind="lead_chat", user=author,
-                status="ok", meta={"deal_id": deal_id, "escalated": True})
-        return
-    answer = split_side_question(author, answer, text)
-    if not answer:
-        return
-    answer = iu_turn_policy.keep_one_next_step(answer)
-    # Инструмент (условия/договор) уже написал клиенту в этом ходе — его сообщение полное и с
-    # вопросом внутри. Реплика модели «условия отправили вам сюда»/«договор направил вам сюда»
-    # повторила бы тот же посыл ВТОРЫМ сообщением (жалоба владельца 23.07.2026). Гасим её.
-    if _out_messages_after(author_id, out_watermark):
-        log.info("лид %s: инструмент уже ответил клиенту в этом ходе — реплику модели не дублируем",
-                 author_id)
-        return
-    answer, invite_now = _prepare_form_reply(
-        answer, text, policy_history, author_id, known_lead=True, deal_id=deal_id,
-    )
-    delivery = _deliver_answer_with_optional_form(author_id, answer, invite_now)
-    for part in delivery["messages"]:
-        journal(MANAGER_CHANNEL, author_id, "out", part, kind="lead_chat", user=author,
-                status="ok",
-                meta={"deal_id": deal_id,
-                      "invited": bool(delivery["invite_sent"] and LEAD_FORM_URL in part)})
-    if delivery["failed_plain"]:
-        journal(
-            MANAGER_CHANNEL, author_id, "out",
-            f"{delivery['failed_plain']}\n\n[не доставлено: {delivery['error']}]",
-            kind="lead_chat", user=author, status="error",
-            meta={"deal_id": deal_id, "invited": False},
-        )
-    log.info(
-        "автоответ лиду %s: %s%s",
-        author_id,
-        "отправлен" if delivery["answer_sent"] else
-        f"не отправлен ({delivery['error']})",
-        " (+анкета)" if delivery["invite_sent"] else "",
-    )
-
+    ok, _ = iu_runtime.run_turn(author, texts, deal_id=deal_id)
+    log.info("автоответ лиду %s: %s", author_id, "отправлен" if ok else "не отправлен")
 
 def _handle_update_safely(upd: dict) -> None:
     """Один апдейт в отдельном потоке. Сбой на одном клиенте не должен ронять остальных."""

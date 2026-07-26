@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # Закрытый список действий. Модель не может назвать инструмент, аргумент мутации или своё
 # собственное действие: она выбирает одну из этих строк, а исполняет её код.

@@ -249,8 +249,14 @@ def handle(request: Request, deps: Deps) -> Outcome:
         return _escalate(f"модель заявила «{claimed}», не выполнив действия", trace=trace,
                          stage_move=stage_move)
 
+    # 12. Ровно один следующий шаг. Правило есть и в промпте, но послушание модели — не гарантия:
+    # два вопроса подряд превращают консультацию в допрос.
+    reply = iu_filters.one_next_step(plan.reply)
+    if reply != plan.reply:
+        trace["trimmed_steps"] = True
+
     return Outcome(
-        reply=plan.reply,
+        reply=reply,
         action=plan.next_action,
         escalate=bool(plan.unresolved),
         reason=("остались без ответа: " + "; ".join(plan.unresolved)) if plan.unresolved else "",

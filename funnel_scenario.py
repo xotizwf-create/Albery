@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -22,6 +23,10 @@ log = logging.getLogger("funnel-scenario")
 
 _TTL_S = 60.0
 _cache: dict[str, Any] = {"at": 0.0, "stages": {}, "funnels": {}}
+
+# Воронка ИУ («Партнёрская программа WB — индивидуальные условия»). То же значение, что в
+# context_server: держим их согласованными через одну переменную окружения.
+IU_FUNNEL_ID = int(os.getenv("IU_FUNNEL_ID", "16") or 16)
 
 
 def _funnel_of_stage(stage: str) -> int | None:
@@ -39,16 +44,20 @@ def _load(db) -> None:
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT funnel_id, stage_id, trigger, need, action, enabled, testing"
-                            " FROM funnel_scenarios")
+                cur.execute("SELECT funnel_id, stage_id, trigger, need, action, enabled,"
+                            " testing, blocked_phrases FROM funnel_scenarios")
                 for row in cur.fetchall():
                     fid = int(row["funnel_id"])
                     stage_id = str(row["stage_id"] or "")
                     if not stage_id:
-                        # `testing` читаем мягко: колонка появилась миграцией 067, и строка из
-                        # более старого кода (или теста) не обязана её содержать.
-                        funnels[fid] = {"enabled": bool(row["enabled"]),
-                                        "testing": bool(row.get("testing", False))}
+                        # `testing` и `blocked_phrases` читаем мягко: колонки появились
+                        # миграциями 067 и 068, и строка из более старого кода (или теста) не
+                        # обязана их содержать.
+                        funnels[fid] = {
+                            "enabled": bool(row["enabled"]),
+                            "testing": bool(row.get("testing", False)),
+                            "blocked_phrases": str(row.get("blocked_phrases") or ""),
+                        }
                         continue
                     stages[(fid, stage_id)] = {
                         "trigger": str(row["trigger"] or ""),
@@ -94,6 +103,21 @@ def testing_mode(db, funnel_id: int) -> bool:
     _fresh(db)
     row = (_cache["funnels"] or {}).get(int(funnel_id))
     return bool(row.get("testing", False)) if row else False
+
+
+def blocked_phrases(db=None, funnel_id: int | None = None) -> str:
+    """Запрещённые фразы воронки, по одной на строку.
+
+    Пусто и при сбое базы: встроенные категории фильтра (брань, политика, jailbreak) работают
+    всегда, а список владельца — дополнение к ним, а не замена."""
+    if db is None:
+        from shared.db import db as default_db
+
+        db = default_db
+    fid = int(funnel_id if funnel_id is not None else IU_FUNNEL_ID)
+    _fresh(db)
+    row = (_cache["funnels"] or {}).get(fid)
+    return str(row.get("blocked_phrases") or "") if row else ""
 
 
 def invalidate() -> None:

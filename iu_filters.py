@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # --- категории ---------------------------------------------------------------------------
 PHRASE = "запрещённая фраза"
@@ -259,6 +259,40 @@ def concession(text: str, sources: str) -> Hit | None:
             continue
         return Hit(CONCESSION, word)
     return None
+
+
+# Следующий шаг в тексте: вопрос, ссылка или призыв к действию. Нужен, чтобы механически
+# оставить ровно один — промпт снижает вероятность лишних шагов, но не является границей.
+_URL_RE = re.compile(r"https?://\S+", re.I)
+_CTA_RE = re.compile(
+    r"(?<![а-яё])(?:пришл(?:и|ите)|отправ(?:ь|ьте)|скин(?:ь|ьте)|напиш(?:и|ите)|"
+    r"укаж(?:и|ите)|заполн(?:и|ите)|остав(?:ь|ьте)|перейд(?:и|ите)|выбер(?:и|ите)|"
+    r"подтверд(?:и|ите)|сообщ(?:и|ите)|да(?:й|йте)|скаж(?:и|ите)|прикреп(?:и|ите)|"
+    r"оплат(?:и|ите)|подпиш(?:и|ите)|нажм(?:и|ите)|открой(?:те)?|ознаком(?:ься|ьтесь)|"
+    r"обрат(?:ись|итесь)|оформ(?:и|ите)|провер(?:ь|ьте)|посмотр(?:и|ите)|"
+    r"дожд(?:ись|итесь)|уточн(?:и|ите)|расскаж(?:и|ите)|подскаж(?:и|ите))",
+    re.I,
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|\n+")
+
+
+def is_next_step(sentence: str) -> bool:
+    """Является ли предложение следующим шагом — вопросом, ссылкой или призывом."""
+    value = str(sentence or "")
+    return bool("?" in value or _URL_RE.search(value) or _CTA_RE.search(value))
+
+
+def one_next_step(text: str) -> str:
+    """Оставить содержательный ответ и не больше одного вопроса или призыва.
+
+    Правило «в сообщении максимум один следующий шаг» есть и в промпте, но полагаться только на
+    послушание модели нельзя: два вопроса подряд превращают консультацию в допрос, и владелец
+    жаловался ровно на это. Содержательные предложения сохраняются все — сначала ответ, потом
+    один шаг."""
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(str(text or "").strip()) if p.strip()]
+    informational = [p for p in parts if not is_next_step(p)]
+    steps = [p for p in parts if is_next_step(p)]
+    return " ".join(informational + steps[:1]).strip()
 
 
 def claims_action(text: str) -> str:
