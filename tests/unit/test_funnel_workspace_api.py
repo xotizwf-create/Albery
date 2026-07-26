@@ -397,6 +397,48 @@ def test_failed_login_is_independently_rate_limited(client, monkeypatch):
     assert blocked.get_json()["error"]["code"] == "rate_limited"
 
 
+def test_session_always_carries_a_csrf_token_for_the_bootstrap_form(client):
+    # Страницу открывают до входа: форма первичной установки пароля обязана получить токен,
+    # иначе отправка упирается в «CSRF-токен отсутствует или устарел».
+    payload = client.get("/api/funnel-workspace/session").get_json()
+
+    assert payload["authenticated"] is False
+    assert payload["csrf_token"]
+
+
+def test_password_bootstrap_works_when_the_page_was_opened_before_admin_login(
+    client,
+    monkeypatch,
+):
+    """Живой случай 26.07.2026: вкладка с /agent-funnels открыта заранее, вход в кабинет
+    произошёл позже, и отправка формы падала с csrf_failed."""
+    monkeypatch.delenv("FUNNEL_WORKSPACE_PASSWORD_HASH")
+    monkeypatch.setenv(
+        "ADMIN_PASSWORD_HASH",
+        generate_password_hash("current admin password"),
+    )
+    monkeypatch.setattr(workspace.store, "get_workspace_password_hash", lambda: "")
+    monkeypatch.setattr(workspace.store, "set_workspace_password_hash", lambda value: None)
+
+    opened_before_login = client.get("/api/funnel-workspace/session").get_json()
+    csrf_token = opened_before_login["csrf_token"]
+
+    with client.session_transaction() as browser_session:
+        browser_session["admin_authenticated"] = True
+
+    response = client.post(
+        "/api/funnel-workspace/configure-password",
+        json={
+            "admin_password": "current admin password",
+            "new_password": "separate workspace password",
+            "csrf_token": csrf_token,
+        },
+        headers={"Origin": ORIGIN, "X-CSRF-Token": csrf_token},
+    )
+
+    assert response.status_code == 200
+
+
 def test_admin_can_bootstrap_only_scrypt_hash_without_secret_in_response(
     client,
     monkeypatch,

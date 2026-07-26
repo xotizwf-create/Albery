@@ -399,10 +399,6 @@ function WorkspacePasswordSetup({
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (submitting) return;
-    if (!session.csrf_token) {
-      setError("Сессия настройки устарела. Обновите страницу.");
-      return;
-    }
     if (newPassword.length < 12) {
       setError("Новый пароль должен содержать не менее 12 символов.");
       return;
@@ -414,10 +410,19 @@ function WorkspacePasswordSetup({
     setSubmitting(true);
     setError("");
     try {
+      // Вкладку с этой формой держат открытой, а вход в кабинет мог произойти позже и
+      // пересоздать сессию. Токен из старого состояния к этому моменту уже не подходит,
+      // поэтому берём свежий прямо перед отправкой.
+      const fresh = await funnelWorkspaceApi.getSession();
+      const csrfToken = fresh.csrf_token ?? session.csrf_token;
+      if (!csrfToken) {
+        setError("Сессия настройки устарела. Обновите страницу.");
+        return;
+      }
       await funnelWorkspaceApi.configurePassword(
         adminPassword,
         newPassword,
-        session.csrf_token,
+        csrfToken,
       );
       setAdminPassword("");
       setNewPassword("");

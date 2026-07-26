@@ -396,8 +396,11 @@ def _session_payload() -> dict[str, Any]:
             and not _password_managed_by_environment()
         ),
     }
-    if authenticated:
-        payload["csrf_token"] = _ensure_csrf_token()
+    # Токен выдаётся всегда, а не только вошедшему: первичная установка пароля происходит
+    # ДО входа в рабочее окно, и без токена форму невозможно отправить. Это безопасно —
+    # значение живёт в подписанной cookie сессии и сверяется с присланным (double submit),
+    # прочитать его с чужого источника нельзя, а происхождение запроса проверяется отдельно.
+    payload["csrf_token"] = _ensure_csrf_token()
     return payload
 
 
