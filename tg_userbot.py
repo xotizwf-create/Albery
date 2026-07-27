@@ -77,6 +77,22 @@ def send_message(peer_id: int, text: str) -> int:
     return _run(go())
 
 
+def edit_message(peer_id: int, message_id: int, text: str) -> None:
+    """Изменить своё сообщение от имени аккаунта менеджера."""
+    async def go():
+        async with _client() as client:
+            await client.edit_message(int(peer_id), int(message_id), str(text or "")[:4096])
+    _run(go())
+
+
+def delete_message(peer_id: int, message_id: int) -> None:
+    """Удалить сообщение у обеих сторон от имени аккаунта менеджера."""
+    async def go():
+        async with _client() as client:
+            await client.delete_messages(int(peer_id), [int(message_id)], revoke=True)
+    _run(go())
+
+
 def list_dialogs(limit: int = 500) -> list[dict]:
     """Everything the account sees: channels, groups, private chats (id/name/type/unread)."""
     async def go():

@@ -642,12 +642,7 @@ def _send_as_manager_account(outbox: Mapping[str, Any], bot_error: Exception) ->
     import tg_userbot
 
     if not tg_userbot.session_ready():
-        raise RuntimeError(
-            "Telegram не даёт боту написать этому человеку: он ещё не писал в "
-            "бизнес-аккаунт после подключения бота. Отправка от аккаунта менеджера "
-            "недоступна — не настроена MTProto-сессия (TG_API_ID/TG_API_HASH и вход "
-            f"по коду). Исходная ошибка Telegram: {bot_error}"
-        )
+        raise RuntimeError(_no_peer_access_message(bot_error))
     message_id = tg_userbot.send_message(
         int(outbox["external_chat_id"]),
         str(outbox.get("text") or "")[:4096],
@@ -657,6 +652,96 @@ def _send_as_manager_account(outbox: Mapping[str, Any], bot_error: Exception) ->
         outbox.get("id"),
     )
     return str(message_id)
+
+
+def edit_delivered_message(payload: Mapping[str, Any]) -> str:
+    """Заменить текст уже доставленного сообщения в Telegram.
+
+    Возвращает, чем именно правка была сделана: ботом или аккаунтом менеджера. Порядок
+    важен — сначала Telegram, потом наша база: иначе оператор увидит новый текст там,
+    где у клиента остался старый.
+    """
+    import tg_agent
+
+    provider_message_id = payload.get("provider_message_id")
+    if not provider_message_id:
+        raise RuntimeError(
+            "У сообщения нет идентификатора в Telegram — менять нечего. "
+            "Так бывает у перенесённой истории: она не отправлялась через эту систему."
+        )
+    try:
+        tg_agent.api(
+            "editMessageText",
+            http_timeout=30,
+            business_connection_id=payload["business_connection_id"],
+            chat_id=int(payload["external_chat_id"]),
+            message_id=int(provider_message_id),
+            text=str(payload["text"])[:4096],
+        )
+        return "bot"
+    except RuntimeError as exc:
+        if not _peer_unknown_to_bot(exc):
+            raise
+        import tg_userbot
+
+        if not tg_userbot.session_ready():
+            raise RuntimeError(_no_peer_access_message(exc)) from exc
+        tg_userbot.edit_message(
+            int(payload["external_chat_id"]),
+            int(provider_message_id),
+            str(payload["text"])[:4096],
+        )
+        return "manager_account"
+
+
+def delete_delivered_message(payload: Mapping[str, Any]) -> str:
+    """Удалить сообщение у обеих сторон.
+
+    Бизнес-метод Telegram умеет удалять и наши сообщения, и сообщения клиента; обычный
+    deleteMessage — запасной путь для чатов вне бизнес-подключения.
+    """
+    import tg_agent
+
+    provider_message_id = payload.get("provider_message_id")
+    if not provider_message_id:
+        # Локальная запись всё равно помечена удалённой — но честно скажем, что в
+        # Telegram сообщения не тронули.
+        return "local_only"
+    try:
+        tg_agent.api(
+            "deleteBusinessMessages",
+            http_timeout=30,
+            business_connection_id=payload["business_connection_id"],
+            message_ids=[int(provider_message_id)],
+        )
+        return "bot"
+    except RuntimeError as exc:
+        if _peer_unknown_to_bot(exc):
+            import tg_userbot
+
+            if not tg_userbot.session_ready():
+                raise RuntimeError(_no_peer_access_message(exc)) from exc
+            tg_userbot.delete_message(
+                int(payload["external_chat_id"]),
+                int(provider_message_id),
+            )
+            return "manager_account"
+        tg_agent.api(
+            "deleteMessage",
+            http_timeout=30,
+            chat_id=int(payload["external_chat_id"]),
+            message_id=int(provider_message_id),
+        )
+        return "bot"
+
+
+def _no_peer_access_message(error: Exception) -> str:
+    return (
+        "Telegram не даёт боту доступ к этому собеседнику: он ещё не писал в "
+        "бизнес-аккаунт после подключения бота. Действие от аккаунта менеджера "
+        "недоступно — не настроена MTProto-сессия (TG_API_ID/TG_API_HASH и вход по "
+        f"коду). Исходная ошибка Telegram: {error}"
+    )
 
 
 def _deal_is_gone(error: Exception) -> bool:

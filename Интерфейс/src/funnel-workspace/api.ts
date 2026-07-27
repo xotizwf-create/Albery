@@ -1,5 +1,6 @@
 import type {
   Conversation,
+  ConversationMessage,
   ConversationStatus,
   ConversationsPayload,
   MessagesPayload,
@@ -248,6 +249,29 @@ export const funnelWorkspaceApi = {
   ) =>
     request<{ deleted: boolean; messages: number; client: string }>(
       `/conversations/${encodeURIComponent(String(conversationId))}`,
+      {
+        method: "DELETE",
+        headers: csrfHeaders(csrfToken),
+        body: JSON.stringify({ csrf_token: csrfToken }),
+      },
+    ),
+
+  editMessage: (
+    messageId: number,
+    payload: { text: string; csrf_token: string },
+  ) =>
+    request<{ message: ConversationMessage; applied_by: string }>(
+      `/messages/${messageId}`,
+      {
+        method: "PATCH",
+        headers: csrfHeaders(payload.csrf_token),
+        body: JSON.stringify(payload),
+      },
+    ),
+
+  deleteMessage: (messageId: number, csrfToken: string) =>
+    request<{ message: ConversationMessage; applied_by: string }>(
+      `/messages/${messageId}`,
       {
         method: "DELETE",
         headers: csrfHeaders(csrfToken),

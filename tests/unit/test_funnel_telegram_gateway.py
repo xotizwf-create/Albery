@@ -885,3 +885,53 @@ def test_manager_session_sends_when_the_bot_cannot(monkeypatch):
 
     assert provider_message_id == "4242"
     assert sent == {"peer_id": 212850563, "text": "Здравствуйте"}
+
+
+def test_edit_without_a_telegram_id_is_refused_with_the_reason():
+    """У перенесённой истории нет идентификатора сообщения в Telegram — менять там
+    нечего, и оператор должен это понять."""
+    try:
+        gateway.edit_delivered_message(
+            {"external_chat_id": "9001", "business_connection_id": "bc-1",
+             "provider_message_id": None, "text": "Новый"}
+        )
+    except RuntimeError as exc:
+        assert "нет идентификатора" in str(exc)
+    else:
+        raise AssertionError("ожидался отказ")
+
+
+def test_delete_without_a_telegram_id_only_marks_the_journal():
+    applied = gateway.delete_delivered_message(
+        {"external_chat_id": "9001", "business_connection_id": "bc-1",
+         "provider_message_id": None}
+    )
+
+    assert applied == "local_only"
+
+
+def test_edit_falls_back_to_the_manager_account_when_the_bot_has_no_access(monkeypatch):
+    import tg_agent
+    import tg_userbot
+
+    def bot_refuses(*args, **kwargs):
+        raise RuntimeError("Bad Request: PEER_ID_INVALID")
+
+    edited = {}
+    monkeypatch.setattr(tg_agent, "api", bot_refuses)
+    monkeypatch.setattr(tg_userbot, "session_ready", lambda: True)
+    monkeypatch.setattr(
+        tg_userbot,
+        "edit_message",
+        lambda peer_id, message_id, text: edited.update(
+            peer_id=peer_id, message_id=message_id, text=text
+        ),
+    )
+
+    applied = gateway.edit_delivered_message(
+        {"external_chat_id": "212850563", "business_connection_id": "bc-1",
+         "provider_message_id": "712", "text": "Новый текст"}
+    )
+
+    assert applied == "manager_account"
+    assert edited == {"peer_id": 212850563, "message_id": 712, "text": "Новый текст"}

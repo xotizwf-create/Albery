@@ -915,6 +915,70 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
     return _json({"conversation": conversation})
 
 
+@funnel_workspace_bp.patch(f"{API_PREFIX}/messages/<int:message_id>")
+def message_edit(message_id: int) -> tuple[Response, int]:
+    """Изменить наш ответ у клиента в Telegram и в журнале.
+
+    Сначала Telegram, потом база: иначе оператор увидит новый текст там, где у клиента
+    остался старый, и будет уверен, что исправил.
+    """
+    import funnel_telegram_gateway
+
+    body = _json_body()
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return _error("Пустой текст — нечего сохранять.", 400, "empty_text")
+
+    preview = store.message_delivery_target(message_id)
+    if str(preview.get("author_type")) not in {"agent", "operator"}:
+        return _error(
+            "Редактировать можно только наши сообщения.",
+            409,
+            "not_our_message",
+        )
+    try:
+        applied_by = funnel_telegram_gateway.edit_delivered_message({**preview, "text": text})
+    except RuntimeError as exc:
+        return _error(str(exc), 409, "telegram_edit_failed")
+
+    result = store.edit_outgoing_message(
+        message_id,
+        text=text,
+        actor_name=workspace_operator_name(),
+    )
+    logger.info(
+        "workspace message %s edited by %s (%s)",
+        message_id,
+        workspace_operator_name() or "неизвестный оператор",
+        applied_by,
+    )
+    return _json({"message": _message_payload(result["message"]), "applied_by": applied_by})
+
+
+@funnel_workspace_bp.delete(f"{API_PREFIX}/messages/<int:message_id>")
+def message_delete(message_id: int) -> tuple[Response, int]:
+    """Удалить сообщение у обеих сторон."""
+    import funnel_telegram_gateway
+
+    preview = store.message_delivery_target(message_id)
+    try:
+        applied_by = funnel_telegram_gateway.delete_delivered_message(preview)
+    except RuntimeError as exc:
+        return _error(str(exc), 409, "telegram_delete_failed")
+
+    result = store.delete_message_for_everyone(
+        message_id,
+        actor_name=workspace_operator_name(),
+    )
+    logger.warning(
+        "workspace message %s deleted by %s (%s)",
+        message_id,
+        workspace_operator_name() or "неизвестный оператор",
+        applied_by,
+    )
+    return _json({"message": _message_payload(result["message"]), "applied_by": applied_by})
+
+
 @funnel_workspace_bp.delete(
     f"{API_PREFIX}/conversations/<int:conversation_id>"
 )

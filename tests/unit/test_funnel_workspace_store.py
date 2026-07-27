@@ -1392,3 +1392,84 @@ def test_reopening_reply_windows_never_touches_spam():
     assert sql.startswith("UPDATE funnel_workspace_conversations")
     assert "reply_deadline_at = %s" in sql
     assert "status <> 'spam'" in sql
+
+
+def message_row(**overrides):
+    base = {
+        "id": 55,
+        "conversation_id": 41,
+        "author_type": "operator",
+        "delivery_status": "sent",
+        "text": "Старый текст",
+        "provider_message_id": "712",
+        "external_chat_id": "9001",
+        "business_connection_id": "bc-1",
+        "source_key": "telegram",
+        "conversation_last_message_id": 55,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_only_our_delivered_message_can_be_edited():
+    """Слова клиента не наши, а неотправленный ответ надо отменять, а не править:
+    иначе клиент увидит текст, которого оператор уже не писал."""
+    def respond_client(sql, _params):
+        if sql.startswith("SELECT m.*, c.external_chat_id"):
+            return message_row(author_type="client")
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond_client)
+    with pytest.raises(store.WorkspaceValidationError):
+        store.edit_outgoing_message(55, text="Новый", connect=connect)
+
+    def respond_pending(sql, _params):
+        if sql.startswith("SELECT m.*, c.external_chat_id"):
+            return message_row(delivery_status="pending")
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond_pending)
+    with pytest.raises(store.WorkspaceControlError):
+        store.edit_outgoing_message(55, text="Новый", connect=connect)
+
+
+def test_edit_updates_the_text_and_the_conversation_preview():
+    statements: list[str] = []
+
+    def respond(sql, _params):
+        statements.append(sql)
+        if sql.startswith("SELECT m.*, c.external_chat_id"):
+            return message_row()
+        if sql.startswith("UPDATE funnel_workspace_messages"):
+            return {**message_row(), "text": "Новый текст"}
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            return None
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    result = store.edit_outgoing_message(
+        55, text="Новый текст", actor_name="Юлия", now=NOW, connect=connect
+    )
+
+    assert result["message"]["text"] == "Новый текст"
+    assert result["provider_message_id"] == "712"
+    # Превью диалога тоже обязано обновиться — это было последнее сообщение.
+    assert any(sql.startswith("UPDATE funnel_workspace_conversations") for sql in statements)
+
+
+def test_deleted_message_uses_the_same_tombstone_as_a_client_delete():
+    """Формат надгробия один на всю систему: два разных вида удалённых сообщений в одной
+    переписке — верный способ запутать оператора."""
+    def respond(sql, _params):
+        if sql.startswith("SELECT m.*, c.external_chat_id"):
+            return message_row(author_type="client", conversation_last_message_id=0)
+        if sql.startswith("UPDATE funnel_workspace_messages"):
+            assert "'[Сообщение удалено]'" in sql
+            return {**message_row(), "text": "[Сообщение удалено]"}
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    result = store.delete_message_for_everyone(55, actor_name="Юлия", now=NOW, connect=connect)
+
+    assert result["message"]["text"] == "[Сообщение удалено]"
+    assert result["provider_message_id"] == "712"

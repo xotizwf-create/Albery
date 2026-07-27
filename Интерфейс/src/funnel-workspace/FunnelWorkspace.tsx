@@ -1626,6 +1626,7 @@ function ChatPanel({
   onSend,
   onRetry,
   onControl,
+  onMessageContextMenu,
 }: {
   conversation: Conversation | null;
   messages: ConversationMessage[];
@@ -1641,6 +1642,10 @@ function ChatPanel({
   onSend: (text: string) => void;
   onRetry: (message: ConversationMessage) => void;
   onControl: (mode: "human" | "ai") => void;
+  onMessageContextMenu: (
+    message: ConversationMessage,
+    position: { x: number; y: number },
+  ) => void;
 }) {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1824,7 +1829,14 @@ function ChatPanel({
               const showDay =
                 !previous || messageDayKey(previous.created_at) !== messageDayKey(message.created_at);
               return (
-                <div key={`${message.id}-${message.optimistic ? "local" : "server"}`}>
+                <div
+                  key={`${message.id}-${message.optimistic ? "local" : "server"}`}
+                  onContextMenu={(event) => {
+                    if (message.optimistic || message.id <= 0) return;
+                    event.preventDefault();
+                    onMessageContextMenu(message, { x: event.clientX, y: event.clientY });
+                  }}
+                >
                   {showDay && (
                     <div className="my-3 flex items-center justify-center">
                       <span className="rounded-full border border-slate-200 bg-white/90 px-3 py-1 text-[10px] font-bold text-slate-400 shadow-sm">
@@ -2278,6 +2290,15 @@ function OperatorWorkspace({
   } | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Conversation | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [messageMenu, setMessageMenu] = useState<{
+    x: number;
+    y: number;
+    message: ConversationMessage;
+  } | null>(null);
+  const [editingMessage, setEditingMessage] = useState<ConversationMessage | null>(null);
+  const [editingText, setEditingText] = useState("");
+  const [pendingMessageDelete, setPendingMessageDelete] = useState<ConversationMessage | null>(null);
+  const [messageBusy, setMessageBusy] = useState(false);
   const [listLoading, setListLoading] = useState(true);
   const [listLoadingMore, setListLoadingMore] = useState(false);
   const [messagesLoading, setMessagesLoading] = useState(false);
@@ -2814,6 +2835,52 @@ function OperatorWorkspace({
     }
   };
 
+  const applyMessageEdit = async () => {
+    const target = editingMessage;
+    const text = editingText.trim();
+    if (!target || !text || messageBusy) return;
+    setMessageBusy(true);
+    try {
+      await funnelWorkspaceApi.editMessage(Number(target.id), {
+        text,
+        csrf_token: csrfToken(),
+      });
+      setEditingMessage(null);
+      setEditingText("");
+      await refreshSelected();
+      setToast({ message: "Сообщение изменено у клиента.", tone: "success" });
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setMessageBusy(false);
+    }
+  };
+
+  const applyMessageDelete = async () => {
+    const target = pendingMessageDelete;
+    if (!target || messageBusy) return;
+    setMessageBusy(true);
+    try {
+      const result = await funnelWorkspaceApi.deleteMessage(
+        Number(target.id),
+        csrfToken(),
+      );
+      setPendingMessageDelete(null);
+      await refreshSelected();
+      setToast({
+        message:
+          result.applied_by === "local_only"
+            ? "Сообщение убрано из переписки, но в Telegram его удалить нечем: у записи нет идентификатора сообщения."
+            : "Сообщение удалено у обеих сторон.",
+        tone: result.applied_by === "local_only" ? "info" : "success",
+      });
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setMessageBusy(false);
+    }
+  };
+
   const changeStage = async (nextStage: string) => {
     const conversation = selectedConversation;
     if (!conversation || stageBusy || nextStage === conversation.stage_id) return;
@@ -2967,6 +3034,9 @@ function OperatorWorkspace({
               onSend={(text) => void sendMessage(text)}
               onRetry={(message) => void sendMessage(message.text, message)}
               onControl={(mode) => void setControl(mode)}
+              onMessageContextMenu={(message, position) =>
+                setMessageMenu({ ...position, message })
+              }
             />
           </div>
 
@@ -3050,6 +3120,91 @@ function OperatorWorkspace({
               onSelect: () => setPendingDelete(contextMenu.conversation),
             },
           ]}
+        />
+      )}
+
+      {messageMenu && (
+        <ContextMenu
+          x={messageMenu.x}
+          y={messageMenu.y}
+          onClose={() => setMessageMenu(null)}
+          items={[
+            {
+              key: "edit",
+              label: "Редактировать",
+              icon: <FileText className="h-3.5 w-3.5" />,
+              // Править можно только своё и только доставленное: слова клиента не наши,
+              // а неотправленное надо отменять, а не редактировать.
+              disabled:
+                messageMenu.message.author_type === "client" ||
+                (messageMenu.message.delivery_status || "").toLowerCase() !== "sent",
+              onSelect: () => {
+                setEditingMessage(messageMenu.message);
+                setEditingText(messageMenu.message.text || "");
+              },
+            },
+            {
+              key: "delete",
+              label: "Удалить у всех",
+              icon: <Trash2 className="h-3.5 w-3.5" />,
+              onSelect: () => setPendingMessageDelete(messageMenu.message),
+            },
+          ]}
+        />
+      )}
+
+      {editingMessage && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/40 p-5 backdrop-blur-sm">
+          <div className="w-full max-w-[520px] rounded-3xl border border-white/80 bg-white p-6 shadow-2xl shadow-slate-900/25">
+            <h2 className="text-lg font-black tracking-tight text-slate-950">
+              Редактировать сообщение
+            </h2>
+            <p className="mt-1.5 text-sm leading-6 text-slate-500">
+              Текст заменится и у клиента в Telegram, и в переписке.
+            </p>
+            <textarea
+              value={editingText}
+              onChange={(event) => setEditingText(event.target.value.slice(0, 4096))}
+              rows={5}
+              autoFocus
+              className="mt-4 w-full resize-none rounded-2xl border border-slate-200 bg-slate-50 p-3 text-sm leading-5 text-slate-900 outline-none transition-all focus:border-violet-400 focus:bg-white focus:ring-4 focus:ring-violet-100"
+            />
+            <div className="mt-5 flex gap-2">
+              <button
+                type="button"
+                onClick={() => setEditingMessage(null)}
+                disabled={messageBusy}
+                className="h-11 flex-1 rounded-xl border border-slate-200 text-sm font-bold text-slate-600 transition hover:bg-slate-50 disabled:opacity-60"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={() => void applyMessageEdit()}
+                disabled={messageBusy || !editingText.trim()}
+                className="inline-flex h-11 flex-1 items-center justify-center gap-2 rounded-xl bg-[#5B50EA] text-sm font-black text-white transition hover:bg-[#4F45DB] disabled:opacity-60"
+              >
+                {messageBusy && <Loader2 className="h-4 w-4 animate-spin" />}
+                Сохранить
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingMessageDelete && (
+        <ConfirmDialog
+          title="Удалить сообщение у всех?"
+          description={
+            <>
+              Сообщение исчезнет и у клиента в Telegram, и в переписке. Отменить это
+              нельзя.
+            </>
+          }
+          confirmLabel="Удалить у всех"
+          busy={messageBusy}
+          onConfirm={() => void applyMessageDelete()}
+          onCancel={() => setPendingMessageDelete(null)}
         />
       )}
 

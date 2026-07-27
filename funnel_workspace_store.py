@@ -434,6 +434,176 @@ def enqueue_operator_stage_change(
             return {"conversation": dict(cur.fetchone()), "crm_action": action}
 
 
+def _message_with_chat(cur: Any, message_id: int) -> dict[str, Any]:
+    """Сообщение вместе с адресом чата: без него нечего править в Telegram."""
+    cur.execute(
+        """
+        SELECT m.*, c.external_chat_id, c.business_connection_id, c.source_key,
+               c.last_message_id AS conversation_last_message_id
+          FROM funnel_workspace_messages m
+          JOIN funnel_workspace_conversations c ON c.id = m.conversation_id
+         WHERE m.id = %s
+         FOR UPDATE OF m
+        """,
+        (message_id,),
+    )
+    row = _record(cur.fetchone())
+    if row is None:
+        raise WorkspaceNotFoundError(
+            "Сообщение не найдено.",
+            details={"message_id": message_id},
+        )
+    return row
+
+
+def message_delivery_target(
+    message_id: Any,
+    *,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    """Куда и что менять в Telegram — до того, как трогать журнал."""
+    item_id = _positive_int(message_id, "message_id")
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            row = _message_with_chat(cur, item_id)
+    return {
+        "message_id": item_id,
+        "conversation_id": int(row["conversation_id"]),
+        "external_chat_id": row["external_chat_id"],
+        "business_connection_id": row["business_connection_id"],
+        "provider_message_id": row.get("provider_message_id"),
+        "author_type": row.get("author_type"),
+        "delivery_status": row.get("delivery_status"),
+    }
+
+
+def edit_outgoing_message(
+    message_id: Any,
+    *,
+    text: Any,
+    actor_name: str | None = None,
+    now: datetime | None = None,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    """Изменить наш уже отправленный ответ.
+
+    Править можно только своё и только доставленное: сообщение клиента — его слова, а
+    ещё не ушедший ответ надо отменять, а не редактировать, иначе клиент увидит текст,
+    которого оператор уже не писал.
+    """
+    item_id = _positive_int(message_id, "message_id")
+    clean_text = _required_text(text, "text", MAX_MESSAGE_LENGTH)
+    timestamp = _now(now)
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            row = _message_with_chat(cur, item_id)
+            if str(row.get("author_type")) not in {"agent", "operator"}:
+                raise WorkspaceValidationError(
+                    "Редактировать можно только наши сообщения.",
+                    details={"author_type": row.get("author_type")},
+                )
+            if str(row.get("delivery_status")) != "sent":
+                raise WorkspaceControlError(
+                    "Сообщение ещё не доставлено — его нельзя отредактировать.",
+                    details={"delivery_status": row.get("delivery_status")},
+                )
+            cur.execute(
+                """
+                UPDATE funnel_workspace_messages
+                   SET text = %s,
+                       metadata = metadata || %s
+                 WHERE id = %s
+             RETURNING *
+                """,
+                (
+                    clean_text,
+                    Jsonb(
+                        {
+                            "edited_at": timestamp.isoformat(),
+                            "edited_by": _clean_optional(actor_name, 200),
+                        }
+                    ),
+                    item_id,
+                ),
+            )
+            updated = dict(cur.fetchone())
+            if int(row.get("conversation_last_message_id") or 0) == item_id:
+                cur.execute(
+                    """
+                    UPDATE funnel_workspace_conversations
+                       SET last_message_text = %s,
+                           updated_at = %s
+                     WHERE id = %s
+                    """,
+                    (clean_text[:1000], timestamp, row["conversation_id"]),
+                )
+    return {
+        "message": updated,
+        "conversation_id": int(row["conversation_id"]),
+        "external_chat_id": row["external_chat_id"],
+        "business_connection_id": row["business_connection_id"],
+        "provider_message_id": row.get("provider_message_id"),
+        "text": clean_text,
+    }
+
+
+def delete_message_for_everyone(
+    message_id: Any,
+    *,
+    actor_name: str | None = None,
+    now: datetime | None = None,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    """Пометить сообщение удалённым тем же способом, что и удаление клиентом.
+
+    Формат надгробия один на всю систему: иначе в одной переписке появятся два разных
+    вида удалённых сообщений и оператор перестанет понимать, что произошло.
+    """
+    item_id = _positive_int(message_id, "message_id")
+    timestamp = _now(now)
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            row = _message_with_chat(cur, item_id)
+            cur.execute(
+                """
+                UPDATE funnel_workspace_messages
+                   SET text = '[Сообщение удалено]',
+                       metadata = metadata || %s
+                 WHERE id = %s
+             RETURNING *
+                """,
+                (
+                    Jsonb(
+                        {
+                            "telegram_deleted": True,
+                            "telegram_deleted_at": timestamp.isoformat(),
+                            "deleted_by": _clean_optional(actor_name, 200),
+                        }
+                    ),
+                    item_id,
+                ),
+            )
+            updated = dict(cur.fetchone())
+            if int(row.get("conversation_last_message_id") or 0) == item_id:
+                cur.execute(
+                    """
+                    UPDATE funnel_workspace_conversations
+                       SET last_message_text = '[Сообщение удалено]',
+                           updated_at = %s
+                     WHERE id = %s
+                    """,
+                    (timestamp, row["conversation_id"]),
+                )
+    return {
+        "message": updated,
+        "conversation_id": int(row["conversation_id"]),
+        "external_chat_id": row["external_chat_id"],
+        "business_connection_id": row["business_connection_id"],
+        "provider_message_id": row.get("provider_message_id"),
+        "author_type": row.get("author_type"),
+    }
+
+
 def reopen_reply_windows(
     *,
     conversation_ids: list[int] | None = None,
