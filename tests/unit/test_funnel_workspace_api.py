@@ -420,16 +420,47 @@ def test_session_reports_the_configured_operator_before_login(client, monkeypatc
     assert payload["configured_operator_name"] == "Юлия"
 
 
-def test_meta_publishes_the_iu_funnel_stages_in_owner_order(client, monkeypatch):
+def test_meta_publishes_every_stage_of_the_funnel_not_only_the_agent_route(client, monkeypatch):
+    """Оператор обязан видеть ВСЕ этапы воронки и уметь поставить любой: маршрут агента
+    (iu_funnel.CHAIN) короче воронки — «Счёт на оплату» и отказ в него не входят, а карточка
+    без них не даёт перевести лида (задача 2216)."""
+    import funnel_view
+
     monkeypatch.setattr(workspace.store, "list_sources", lambda: [])
+    monkeypatch.setattr(funnel_view, "_stages", lambda funnel_id: [
+        {"stage_id": "C16:NEW", "title": "Новый клиент"},
+        {"stage_id": "C16:S84294149", "title": "Согласование условий"},
+        {"stage_id": "C16:PREPAYMENT_INVOIC", "title": "Счёт на оплату"},
+        {"stage_id": "C16:WON", "title": "Сделка успешна"},
+    ])
     login(client)
 
     stages = client.get("/api/funnel-workspace/meta").get_json()["funnel_stages"]
 
+    assert [stage["value"] for stage in stages] == [
+        "C16:NEW", "C16:S84294149", "C16:PREPAYMENT_INVOIC", "C16:WON",
+    ]
+    assert [stage["label"] for stage in stages] == [
+        "Новый клиент", "Согласование условий", "Счёт на оплату", "Сделка успешна",
+    ]
+
+
+def test_meta_falls_back_to_the_agent_route_when_crm_is_unreachable(client, monkeypatch):
+    """CRM недоступна — карточка обязана остаться рабочей: пустой список этапов означал бы
+    для оператора «этап сменить нельзя»."""
+    import funnel_view
     import iu_funnel
 
+    def unreachable(funnel_id):
+        raise RuntimeError("CRM недоступна")
+
+    monkeypatch.setattr(workspace.store, "list_sources", lambda: [])
+    monkeypatch.setattr(funnel_view, "_stages", unreachable)
+    login(client)
+
+    stages = client.get("/api/funnel-workspace/meta").get_json()["funnel_stages"]
+
     assert [stage["value"] for stage in stages] == [item.id for item in iu_funnel.CHAIN]
-    assert [stage["label"] for stage in stages] == [item.title for item in iu_funnel.CHAIN]
     assert stages[0]["label"] == "Новый клиент"
 
 
@@ -700,34 +731,41 @@ def test_full_takeover_is_visible_as_a_separate_flag_not_a_fourth_badge():
 
 
 def test_queue_priority_matches_the_owner_order():
-    """Очень срочно → новый клиент → клиент ждёт ответа → ждём ответа от клиента."""
+    """Очень срочно → клиент ждёт ответа → ждём ответа от клиента (владелец, 27.07.2026)."""
     long_ago = datetime.now(timezone.utc) - timedelta(hours=5)
     just_now = datetime.now(timezone.utc)
 
     urgent = _payload(has_answer=True, awaiting_reply_since=long_ago)
-    new_client = _payload(has_answer=False, awaiting_reply_since=just_now)
     client_waiting = _payload(has_answer=True, awaiting_reply_since=just_now)
     waiting_client = _payload(has_answer=True, awaiting_reply_since=None)
 
     assert urgent["urgent"] is True
     assert [
         urgent["priority"],
-        new_client["priority"],
         client_waiting["priority"],
         waiting_client["priority"],
-    ] == [1, 2, 3, 4]
-    assert new_client["work_state_label"] == "Новый клиент"
+    ] == [1, 2, 3]
     assert client_waiting["work_state_label"] == "Клиент ждёт ответа"
     assert waiting_client["work_state_label"] == "Ждём ответа от клиента"
 
 
-def test_a_new_client_left_waiting_becomes_urgent_too():
-    """Незнакомец, которому не ответили полчаса, — самая горячая строка списка, а не
-    просто «новый»."""
+def test_a_client_without_a_single_answer_is_simply_waiting_for_one():
+    """Статуса «Новый клиент» больше нет (владелец, 27.07.2026): новизна — это ЭТАП воронки.
+    Клиент, которому мы ещё ни разу не ответили, — тот же «Клиент ждёт ответа»."""
+    just_now = datetime.now(timezone.utc)
+    row = _payload(has_answer=False, awaiting_reply_since=just_now)
+
+    assert row["work_state"] == workspace.store.WORK_STATE_CLIENT_WAITING
+    assert row["work_state_label"] == "Клиент ждёт ответа"
+    assert "new_client" not in workspace.store.VALID_WORK_STATES
+
+
+def test_a_client_without_an_answer_left_waiting_becomes_urgent_too():
+    """Незнакомец, которому не ответили полчаса, — самая горячая строка списка."""
     long_ago = datetime.now(timezone.utc) - timedelta(minutes=45)
     row = _payload(has_answer=False, awaiting_reply_since=long_ago)
 
-    assert row["work_state"] == workspace.store.WORK_STATE_NEW
+    assert row["work_state"] == workspace.store.WORK_STATE_CLIENT_WAITING
     assert row["urgent"] is True
     assert row["priority"] == 1
 

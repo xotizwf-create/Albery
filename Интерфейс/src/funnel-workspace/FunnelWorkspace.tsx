@@ -870,8 +870,9 @@ function StatusPill({
   );
 }
 
-/** Рабочий статус обращения: «Новый клиент» → «Клиент ждёт ответ» → «Ждём ответ клиента».
-    Срочность — отдельная пометка поверх: она про время, а не про очередь хода. */
+/** Рабочий статус обращения: «Клиент ждёт ответ» → «Ждём ответ клиента».
+    Срочность — отдельная пометка поверх: она про время, а не про очередь хода.
+    Статуса «Новый клиент» здесь нет — новизна это ЭТАП воронки, он рисуется своей плашкой. */
 function WorkBadge({
   conversation,
   now,
@@ -893,24 +894,15 @@ function WorkBadge({
   const icon = compact ? "h-3 w-3" : "h-3.5 w-3.5";
 
   const tone =
-    state === "new_client"
-      ? "bg-violet-50 text-violet-700"
-      : state === "client_waiting"
-        ? "bg-amber-50 text-amber-800"
-        : "bg-slate-100 text-slate-600";
-  const StateIcon =
-    state === "new_client" ? Sparkles : state === "client_waiting" ? Clock3 : CheckCheck;
+    state === "client_waiting" ? "bg-amber-50 text-amber-800" : "bg-slate-100 text-slate-600";
+  const StateIcon = state === "client_waiting" ? Clock3 : CheckCheck;
 
   return (
     <>
       <span className={cn("inline-flex items-center gap-1.5 rounded-full font-bold", tone, size)}>
         <StateIcon className={icon} />
         {conversation.work_state_label ||
-          (state === "new_client"
-            ? "Новый клиент"
-            : state === "client_waiting"
-              ? "Клиент ждёт ответ"
-              : "Ждём ответ клиента")}
+          (state === "client_waiting" ? "Клиент ждёт ответ" : "Ждём ответ клиента")}
       </span>
       {urgent && (
         <span
@@ -1138,7 +1130,6 @@ function ConversationList({
             onChange={onUrgencyChange}
             options={[
               { value: "all", label: "Все статусы" },
-              { value: "new_client", label: "Новый клиент", color: "#7c3aed" },
               { value: "client_waiting", label: "Клиент ждёт ответ", color: "#d97706" },
               { value: "waiting_client", label: "Ждём ответ клиента", color: "#64748b" },
               { value: "urgent", label: "Очень срочно", color: "#dc2626" },

@@ -6,6 +6,7 @@ import hmac
 import io
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -188,14 +189,52 @@ def _auth_session_days() -> int:
     return min(90, max(1, days))
 
 
-def funnel_stages() -> list[dict[str, Any]]:
-    """Этапы воронки ИУ в том же порядке и с теми же названиями, что видит владелец."""
+def _iu_category_id() -> int:
+    """Номер воронки ИУ — из кода её первого этапа («C16:NEW» → 16)."""
     import iu_funnel
 
-    return [
+    match = re.match(r"C(\d+):", str(iu_funnel.STAGE_NEW or ""))
+    return int(match.group(1)) if match else 0
+
+
+def funnel_stages() -> list[dict[str, Any]]:
+    """Этапы воронки ИУ — живой список из Битрикса, в порядке и с названиями воронки.
+
+    Цепочка агента (``iu_funnel.CHAIN``) — это его маршрут, а не перечень воронки: в самой
+    воронке есть этапы за пределами маршрута («Счёт на оплату», отказ, успех), и оператору
+    нужно уметь ставить их из карточки. Поэтому список берётся из CRM, а цепочка остаётся
+    страховкой на случай, когда CRM недоступна: пустой список означал бы для оператора
+    «этап сменить нельзя», а это хуже короткого списка.
+    """
+    import iu_funnel
+
+    chain = [
         {"value": stage.id, "label": stage.title, "goal": stage.goal, "order": index}
         for index, stage in enumerate(iu_funnel.CHAIN)
     ]
+    category_id = _iu_category_id()
+    if not category_id:
+        return chain
+
+    goals = {stage.id: stage.goal for stage in iu_funnel.CHAIN}
+    try:
+        import funnel_view
+
+        rows = funnel_view._stages(category_id)
+    except Exception:  # noqa: BLE001 — без CRM карточка обязана остаться рабочей
+        logger.warning("этапы воронки %s недоступны, показываем маршрут агента",
+                       category_id, exc_info=True)
+        return chain
+
+    stages = [
+        {"value": str(row.get("stage_id") or ""),
+         "label": str(row.get("title") or row.get("stage_id") or ""),
+         "goal": goals.get(str(row.get("stage_id") or ""), ""),
+         "order": index}
+        for index, row in enumerate(rows)
+        if str(row.get("stage_id") or "").strip()
+    ]
+    return stages or chain
 
 
 def _workspace_ai_allowed(external_user_id: Any) -> bool:
@@ -643,7 +682,6 @@ def workspace_meta() -> tuple[Response, int]:
             "work_states": [
                 {"value": value, "label": store.WORK_STATE_LABELS[value]}
                 for value in (
-                    store.WORK_STATE_NEW,
                     store.WORK_STATE_CLIENT_WAITING,
                     store.WORK_STATE_WAITING_CLIENT,
                     store.WORK_STATE_URGENT,
@@ -726,13 +764,11 @@ def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
         waiting_minutes = None
         payload["waiting_minutes"] = None
 
-    # Рабочий статус — факт переписки, а не отдельное поле: «Новый клиент», пока мы не
-    # ответили ни разу; «Клиент ждёт ответ», пока последнее слово за ним; иначе «Ждём
-    # ответ клиента». Срочность — отдельная пометка поверх, она про время.
-    has_answer = bool(payload.get("has_answer"))
-    if not has_answer:
-        payload["work_state"] = store.WORK_STATE_NEW
-    elif waiting_minutes is not None:
+    # Рабочий статус — факт переписки, а не отдельное поле: «Клиент ждёт ответа», пока
+    # последнее слово за клиентом (в том числе когда мы не отвечали ещё ни разу — это тот
+    # же ход за нами, а новизна живёт этапом воронки); иначе «Ждём ответа от клиента».
+    # Срочность — отдельная пометка поверх, она про время.
+    if waiting_minutes is not None:
         payload["work_state"] = store.WORK_STATE_CLIENT_WAITING
     else:
         payload["work_state"] = store.WORK_STATE_WAITING_CLIENT

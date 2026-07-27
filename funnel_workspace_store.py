@@ -47,32 +47,36 @@ HAS_ANSWER_SQL = f"""EXISTS (
 
 # Рабочие состояния обращения. Считаются по переписке, а не хранятся: любое хранимое
 # поле разъедется с реальностью при первом же сообщении, пришедшем мимо интерфейса.
-WORK_STATE_NEW = "new_client"          # мы ещё ничего не ответили
+# Статусов ровно три (владелец, 27.07.2026): ждёт ответа клиент — ждём ответа мы — срочно.
+# «Новый клиент» отсюда убран: новизна — это ЭТАП воронки (C16:NEW), и как статус она
+# дублировала этап на каждой карточке, ничего не добавляя. Клиент, которому мы ещё ни разу
+# не ответили, — это тот же «Клиент ждёт ответа», просто с самого начала переписки.
 WORK_STATE_CLIENT_WAITING = "client_waiting"  # клиент ждёт нашего ответа
 WORK_STATE_WAITING_CLIENT = "waiting_client"  # последнее слово за нами
-WORK_STATE_URGENT = "urgent"           # клиент ждёт дольше порога (дополняет первые два)
+WORK_STATE_URGENT = "urgent"           # клиент ждёт дольше порога (дополняет первый)
+
+# Ушедший статус: старые ссылки, сохранённые фильтры и вызовы инструментов агента с ним
+# приходят до сих пор — читаем как «клиент ждёт ответа», а не отвечаем ошибкой.
+WORK_STATE_NEW_LEGACY = "new_client"
 
 VALID_WORK_STATES = frozenset({
-    WORK_STATE_NEW,
     WORK_STATE_CLIENT_WAITING,
     WORK_STATE_WAITING_CLIENT,
     WORK_STATE_URGENT,
 })
 
 WORK_STATE_LABELS = {
-    WORK_STATE_NEW: "Новый клиент",
     WORK_STATE_CLIENT_WAITING: "Клиент ждёт ответа",
     WORK_STATE_WAITING_CLIENT: "Ждём ответа от клиента",
     WORK_STATE_URGENT: "Очень срочно",
 }
 
 # Порядок разбора очереди (владелец, 27.07.2026). Меньше число — выше в списке.
-# Срочность важнее новизны: просроченный вопрос не должен уезжать вниз под свежими.
+# Срочность важнее: просроченный вопрос не должен уезжать вниз под свежими.
 WORK_STATE_PRIORITY = {
     WORK_STATE_URGENT: 1,
-    WORK_STATE_NEW: 2,
-    WORK_STATE_CLIENT_WAITING: 3,
-    WORK_STATE_WAITING_CLIENT: 4,
+    WORK_STATE_CLIENT_WAITING: 2,
+    WORK_STATE_WAITING_CLIENT: 3,
 }
 
 # Кто ведёт разговор. Третий бейдж обращения — он про исполнителя, а не про очередь хода.
@@ -1074,6 +1078,10 @@ def list_conversations(
     clean_state = str(state or urgency or "").strip().lower()
     if clean_state == "working":
         clean_state = WORK_STATE_WAITING_CLIENT
+    if clean_state == WORK_STATE_NEW_LEGACY:
+        # Убранный статус: ссылка из старой вкладки или инструмент агента со старым
+        # значением обязаны показать список, а не ошибку.
+        clean_state = WORK_STATE_CLIENT_WAITING
     clean_source = str(source or "").strip()[:100]
     if clean_status and clean_status not in VALID_STATUSES:
         raise WorkspaceValidationError("Неизвестный статус.", details={"status": clean_status})
@@ -1097,12 +1105,12 @@ def list_conversations(
         # Порог считается на стороне БД от текущего времени: фильтр обязан совпадать
         # с подписью в списке, а она пересчитывается у оператора каждую секунду.
         threshold = f"now() - interval '{urgent_after_minutes()} minutes'"
-        if clean_state == WORK_STATE_NEW:
-            clauses.append(f"NOT {HAS_ANSWER_SQL}")
-        elif clean_state == WORK_STATE_CLIENT_WAITING:
-            clauses.append(f"{HAS_ANSWER_SQL} AND {AWAITING_REPLY_SQL} IS NOT NULL")
+        # Ход за нами — независимо от того, отвечали мы в этом диалоге раньше или нет:
+        # без этого клиент, которому ещё ни разу не ответили, выпадал из обоих фильтров.
+        if clean_state == WORK_STATE_CLIENT_WAITING:
+            clauses.append(f"{AWAITING_REPLY_SQL} IS NOT NULL")
         elif clean_state == WORK_STATE_WAITING_CLIENT:
-            clauses.append(f"{HAS_ANSWER_SQL} AND {AWAITING_REPLY_SQL} IS NULL")
+            clauses.append(f"{AWAITING_REPLY_SQL} IS NULL")
         else:
             clauses.append(f"{AWAITING_REPLY_SQL} <= {threshold}")
     if clean_source:

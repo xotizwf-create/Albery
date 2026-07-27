@@ -113,9 +113,9 @@ def test_a_failed_answer_never_counts_as_an_answer_to_the_client():
         _cleanup(source_key)
 
 
-def test_queue_order_is_urgent_then_new_then_client_waiting_then_us():
-    """Очередь разбора владельца: очень срочно → новый клиент → клиент ждёт ответа →
-    ждём ответа от клиента."""
+def test_queue_order_is_urgent_then_client_waiting_then_us():
+    """Очередь разбора владельца (27.07.2026): очень срочно → клиент ждёт ответа → ждём
+    ответа от клиента; внутри группы первым тот, кто ждёт дольше."""
     suffix = uuid4().hex[:12]
     source_key = f"test-queue-order-{suffix}"
     try:
@@ -131,9 +131,12 @@ def test_queue_order_is_urgent_then_new_then_client_waiting_then_us():
         urgent = _ingest(source_key, "700000101", author="client", text="Ну что там?",
                          message_id=f"{suffix}-a3", occurred_at=old)
 
-        # 2. Новый клиент: мы не отвечали ни разу, написал только что.
-        new_client = _ingest(source_key, "700000102", author="client", text="Здравствуйте",
-                             message_id=f"{suffix}-b1", occurred_at=fresh)
+        # 2. Клиент ждёт ответа, причём мы не отвечали ему ни разу: отдельного статуса
+        #    «Новый клиент» больше нет (владелец, 27.07.2026) — новизна живёт этапом
+        #    воронки. Ждёт он дольше следующего, поэтому идёт выше него.
+        never_answered = _ingest(source_key, "700000102", author="client", text="Здравствуйте",
+                                 message_id=f"{suffix}-b1",
+                                 occurred_at=fresh - timedelta(seconds=5))
 
         # 3. Клиент ждёт ответа: мы уже отвечали, он написал только что.
         _ingest(source_key, "700000103", author="client", text="Привет",
@@ -152,7 +155,7 @@ def test_queue_order_is_urgent_then_new_then_client_waiting_then_us():
         listing = store.list_conversations(source=source_key, limit=250)
         assert [int(row["id"]) for row in listing["items"]] == [
             int(urgent["conversation"]["id"]),
-            int(new_client["conversation"]["id"]),
+            int(never_answered["conversation"]["id"]),
             int(client_waiting["conversation"]["id"]),
             int(waiting_client["conversation"]["id"]),
         ]

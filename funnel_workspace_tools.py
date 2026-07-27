@@ -85,9 +85,9 @@ def _conversation_brief(row: Mapping[str, Any]) -> dict[str, Any]:
         waiting_minutes is not None
         and waiting_minutes >= store.urgent_after_minutes()
     )
-    if not row.get("has_answer"):
-        work_state = store.WORK_STATE_NEW
-    elif waiting_minutes is not None:
+    # Статуса «новый клиент» больше нет: пока последнее слово за клиентом — он ждёт
+    # ответа, отвечали мы ему раньше или нет. Новизна живёт этапом воронки.
+    if waiting_minutes is not None:
         work_state = store.WORK_STATE_CLIENT_WAITING
     else:
         work_state = store.WORK_STATE_WAITING_CLIENT

@@ -1356,31 +1356,60 @@ def test_retention_rebuilds_conversation_counters_after_deleting_history():
 
 
 def test_work_state_filters_use_the_answer_fact_not_a_stored_field():
-    """Четыре статуса считаются по переписке: «Новый клиент» — пока нет ни одного нашего
-    ответа, «Клиент ждёт ответ» — пока последнее слово за ним."""
+    """Три статуса считаются по переписке: «Клиент ждёт ответ» — пока последнее слово за
+    ним, «Ждём ответ клиента» — пока за нами, «Очень срочно» — по времени ожидания."""
     def respond(sql, _params):
         if "SELECT c.*, s.source_type" in sql:
             return []
         raise AssertionError(sql)
 
     captured = {}
-    for state in ("new_client", "client_waiting", "waiting_client", "urgent"):
+    for state in ("client_waiting", "waiting_client", "urgent"):
         connect, connection = connect_factory(respond)
         store.list_conversations(state=state, connect=connect)
         captured[state] = connection.cursor_instance.executed[0][0]
 
-    assert "NOT EXISTS" in captured["new_client"]
     assert "IS NOT NULL" in captured["client_waiting"]
     assert "IS NULL" in captured["waiting_client"]
     assert f"interval '{store.urgent_after_minutes()} minutes'" in captured["urgent"]
-    # Признак «отвечали ли мы» обязан считаться по ответам, которые клиент ВИДЕЛ:
-    # отменённое, неудавшееся и удалённое нами ответом не является.
-    assert "author_type IN ('agent', 'operator')" in captured["new_client"]
-    assert "delivery_status NOT IN ('cancelled', 'failed')" in captured["new_client"]
+    # Ответом считается только то, что клиент ВИДЕЛ: отменённое, неудавшееся и удалённое
+    # нами ответом не является — иначе ход считался бы сделанным, а клиент ничего не получил.
+    assert "author_type IN ('agent', 'operator')" in captured["client_waiting"]
+    assert "delivery_status NOT IN ('cancelled', 'failed')" in captured["client_waiting"]
     assert (
         "(answer.metadata ->> 'telegram_deleted') IS DISTINCT FROM 'true'"
-        in captured["new_client"]
+        in captured["client_waiting"]
     )
+
+
+def test_client_waiting_covers_a_dialog_where_we_never_answered():
+    """Клиент, которому мы ещё ни разу не ответили, обязан попадать в «Клиент ждёт ответа»:
+    после снятия статуса «Новый клиент» ему больше некуда деться, и потерять его нельзя."""
+    def respond(sql, _params):
+        if "SELECT c.*, s.source_type" in sql:
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    store.list_conversations(state="client_waiting", connect=connect)
+    sql = connection.cursor_instance.executed[0][0]
+
+    assert "NOT EXISTS" not in sql  # прежнее условие «мы уже отвечали» снято
+
+
+def test_the_removed_new_client_filter_still_answers_with_a_list():
+    """Убранный статус приходит из старых вкладок и вызовов инструментов агента — он обязан
+    показать список «клиент ждёт ответа», а не 400."""
+    def respond(sql, _params):
+        if "SELECT c.*, s.source_type" in sql:
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    store.list_conversations(state="new_client", connect=connect)
+    sql = connection.cursor_instance.executed[0][0]
+
+    assert "IS NOT NULL" in sql
 
 
 def test_unknown_work_state_is_refused():
