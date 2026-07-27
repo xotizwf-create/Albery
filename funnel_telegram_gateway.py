@@ -616,6 +616,49 @@ def sync_missing_crm_deals_once(*, limit: int = 50) -> int:
     )
 
 
+#: Ответы Telegram, означающие «бот не знает этого собеседника». Для бизнес-подключения
+#: это норма: доступ к человеку появляется только после его сообщения в аккаунт.
+_PEER_UNKNOWN_MARKERS = (
+    "peer_id_invalid",
+    "chat not found",
+    "user not found",
+    "bot can't initiate conversation",
+    "bot was blocked",
+)
+
+
+def _peer_unknown_to_bot(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in _PEER_UNKNOWN_MARKERS)
+
+
+def _send_as_manager_account(outbox: Mapping[str, Any], bot_error: Exception) -> str | None:
+    """Отправить сообщение от аккаунта менеджера, когда бот не может.
+
+    Сессия аккаунта — не запасной канал «на всякий случай», а единственный способ
+    написать человеку, который ещё не обращался в бизнес-аккаунт. Если сессии нет,
+    поднимаем понятную ошибку: оператор должен видеть причину, а не «Bad Request».
+    """
+    import tg_userbot
+
+    if not tg_userbot.session_ready():
+        raise RuntimeError(
+            "Telegram не даёт боту написать этому человеку: он ещё не писал в "
+            "бизнес-аккаунт после подключения бота. Отправка от аккаунта менеджера "
+            "недоступна — не настроена MTProto-сессия (TG_API_ID/TG_API_HASH и вход "
+            f"по коду). Исходная ошибка Telegram: {bot_error}"
+        )
+    message_id = tg_userbot.send_message(
+        int(outbox["external_chat_id"]),
+        str(outbox.get("text") or "")[:4096],
+    )
+    log.info(
+        "outbox %s delivered through the manager account (bot has no access to the peer)",
+        outbox.get("id"),
+    )
+    return str(message_id)
+
+
 def _deal_is_gone(error: Exception) -> bool:
     """Отличить «сделки больше нет» от временной недоступности Битрикса.
 
@@ -1035,19 +1078,27 @@ def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
     current = dict(boundary.get("outbox") or current)
 
     try:
-        sent = tg_agent.api(
-            "sendMessage",
-            http_timeout=45,
-            business_connection_id=connection_id,
-            chat_id=int(current["external_chat_id"]),
-            text=str(current.get("text") or "")[:4096],
-            link_preview_options={"is_disabled": True},
-        )
-        provider_message_id = (
-            str(sent.get("message_id"))
-            if isinstance(sent, Mapping) and sent.get("message_id") is not None
-            else None
-        )
+        try:
+            sent = tg_agent.api(
+                "sendMessage",
+                http_timeout=45,
+                business_connection_id=connection_id,
+                chat_id=int(current["external_chat_id"]),
+                text=str(current.get("text") or "")[:4096],
+                link_preview_options={"is_disabled": True},
+            )
+            provider_message_id = (
+                str(sent.get("message_id"))
+                if isinstance(sent, Mapping) and sent.get("message_id") is not None
+                else None
+            )
+        except RuntimeError as exc:
+            if not _peer_unknown_to_bot(exc):
+                raise
+            # Telegram отдаёт боту доступ только к тем собеседникам, кто написал в
+            # бизнес-аккаунт после подключения бота. Остальным бот написать не может
+            # вовсе — но у аккаунта менеджера диалог есть, и он может.
+            provider_message_id = _send_as_manager_account(current, exc)
         finished = store.finish_outbox(
             outbox_id,
             worker_id=worker_id,

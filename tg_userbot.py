@@ -60,6 +60,23 @@ def whoami() -> dict:
     return _run(go())
 
 
+def send_message(peer_id: int, text: str) -> int:
+    """Написать человеку от имени аккаунта менеджера.
+
+    Нужно там, где бот бессилен: Telegram отдаёт боту доступ только к тем собеседникам,
+    которые сами написали в бизнес-аккаунт после подключения бота. Всем остальным бот
+    получает PEER_ID_INVALID, а у аккаунта диалог есть, и он может написать.
+
+    Раньше запись через эту сессию была намеренно не реализована. Владелец 27.07.2026
+    прямо потребовал возможность писать всем, кто уже есть в базе, — это его решение.
+    """
+    async def go():
+        async with _client() as client:
+            sent = await client.send_message(int(peer_id), str(text or "")[:4096])
+            return int(sent.id)
+    return _run(go())
+
+
 def list_dialogs(limit: int = 500) -> list[dict]:
     """Everything the account sees: channels, groups, private chats (id/name/type/unread)."""
     async def go():

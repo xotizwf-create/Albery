@@ -837,3 +837,51 @@ def test_stage_sync_keeps_the_link_when_bitrix_is_merely_unavailable(monkeypatch
     monkeypatch.setattr(crm, "read_deal_stage", unavailable)
 
     assert gateway.sync_conversation_stages_once(limit=10) == 0
+
+
+def test_peer_unknown_is_told_apart_from_other_telegram_errors():
+    """Запасной путь включается только там, где бот бессилен по правилам Telegram, —
+    иначе мы начнём слать от аккаунта при любой временной ошибке."""
+    assert gateway._peer_unknown_to_bot(RuntimeError("Bad Request: PEER_ID_INVALID"))
+    assert gateway._peer_unknown_to_bot(RuntimeError("Bad Request: chat not found"))
+    assert not gateway._peer_unknown_to_bot(RuntimeError("Too Many Requests: retry after 5"))
+    assert not gateway._peer_unknown_to_bot(RuntimeError("Bad Gateway"))
+
+
+def test_without_a_manager_session_the_operator_gets_the_real_reason(monkeypatch):
+    import tg_userbot
+
+    monkeypatch.setattr(tg_userbot, "session_ready", lambda: False)
+
+    try:
+        gateway._send_as_manager_account(
+            {"id": 5, "external_chat_id": "212850563", "text": "Здравствуйте"},
+            RuntimeError("Bad Request: PEER_ID_INVALID"),
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("ожидалась понятная ошибка")
+
+    assert "не писал в бизнес-аккаунт" in message
+    assert "TG_API_ID" in message
+
+
+def test_manager_session_sends_when_the_bot_cannot(monkeypatch):
+    import tg_userbot
+
+    sent = {}
+    monkeypatch.setattr(tg_userbot, "session_ready", lambda: True)
+    monkeypatch.setattr(
+        tg_userbot,
+        "send_message",
+        lambda peer_id, text: sent.update(peer_id=peer_id, text=text) or 4242,
+    )
+
+    provider_message_id = gateway._send_as_manager_account(
+        {"id": 5, "external_chat_id": "212850563", "text": "Здравствуйте"},
+        RuntimeError("Bad Request: PEER_ID_INVALID"),
+    )
+
+    assert provider_message_id == "4242"
+    assert sent == {"peer_id": 212850563, "text": "Здравствуйте"}
