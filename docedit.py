@@ -44,9 +44,17 @@ def apply_edits(data: bytes, file_name: str, edits: list[tuple[str, str]],
         return _edit_docx(data, edits)
     if ext in _TEXT_EXTS:
         return _edit_text(data, edits)
+    if ext == "pdf":
+        # PDF правится на месте (pdfedit): фрагмент стирается и переписывается на той же
+        # строке, вёрстка остального документа не пересобирается.
+        import pdfedit
+        try:
+            return pdfedit.apply_edits(data, edits, file_name=file_name)
+        except pdfedit.PdfEditError as exc:
+            raise UnsupportedFormat(str(exc)) from exc
     raise UnsupportedFormat(
-        f"Файл .{ext or '?'} не поддерживает точечную правку (умею: xlsx/xlsm, docx, txt/csv/md/html). "
-        "Для PDF или скана попроси пользователя прислать исходный docx/xlsx."
+        f"Файл .{ext or '?'} не поддерживает точечную правку (умею: pdf, xlsx/xlsm, docx, txt/csv/md/html). "
+        "Скан (PDF без текстового слоя) править нельзя — попроси исходный документ."
     )
 
 

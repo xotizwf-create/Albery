@@ -2593,6 +2593,9 @@ def tool_edit_attachment_document(args: dict[str, Any]) -> dict[str, Any]:
         new_text = webread.extract_xlsx(new_data)
     elif ext == "docx":
         new_text = _extract_binary_document(new_data, "docx")
+    elif ext == "pdf":
+        import pdfedit
+        new_text = pdfedit.extract_text(new_data)
     else:
         new_text = new_data.decode("utf-8", "ignore")
     new_token = _att.store_attachment(
@@ -2616,6 +2619,81 @@ def tool_edit_attachment_document(args: dict[str, Any]) -> dict[str, Any]:
     if missed:
         result["missed_edits"] = missed
         result["note"] += " Часть правок не совпала (missed_edits) — сверь их с get_attachment_text."
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
+def tool_convert_document(args: dict[str, Any]) -> dict[str, Any]:
+    """PDF → редактируемый Word и Word → PDF для случаев, когда нужна СТРУКТУРНАЯ переработка.
+
+    Точечная правка сюда не относится: для «поменяй сумму» или «убери персональные данные»
+    есть edit_attachment_document, который меняет исходный PDF и сохраняет вёрстку. Круг
+    конвертации всегда перевёрстывает документ заново, и обещать «тот же файл» после него
+    нельзя — поэтому инструмент возвращает предупреждения о том, что именно не переносится.
+    """
+    import attachments as _att
+    import docconvert
+
+    token = str(args.get("attachment_id") or args.get("token") or "").strip()
+    if not token:
+        raise McpError(-32602, "Нужно указать attachment_id (токен вложения att_… из промпта).")
+    target = str(args.get("target") or "").strip().lower()
+    if target not in {"docx", "pdf"}:
+        raise McpError(-32602, "target обязателен: 'docx' (PDF → Word) или 'pdf' (Word → PDF).")
+    row = _att.get_attachment(token)
+    if not row:
+        raise McpError(-32602, f"Вложение {token} не найдено. Проверь attachment_id.")
+    blob = _att.attachment_bytes(token)
+    if not blob:
+        raise McpError(-32010, "Байты этого вложения не сохранились — попроси прислать файл ещё раз.")
+    data, file_name = blob
+    source_ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    stem = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
+
+    try:
+        if target == "docx":
+            if source_ext != "pdf":
+                raise McpError(-32602, f"В Word конвертируется только PDF, а прислан .{source_ext or '?'}.")
+            new_data, warnings = docconvert.pdf_to_docx(data, file_name=file_name)
+            new_name = f"{stem}.docx"
+            new_text = _extract_binary_document(new_data, "docx")
+        else:
+            if source_ext != "docx":
+                raise McpError(-32602, f"В PDF конвертируется только docx, а прислан .{source_ext or '?'}.")
+            new_data = docconvert.docx_to_pdf(data, file_name=file_name)
+            warnings = []
+            import pdfedit
+            new_text = pdfedit.extract_text(new_data)
+            new_name = f"{stem}.pdf"
+    except docconvert.ConvertError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"Не удалось преобразовать «{file_name}»: {exc}") from exc
+
+    new_token = _att.store_attachment(
+        data=new_data, file_name=new_name, kind="document", extracted_text=new_text,
+        agent_slug=row.get("agent_slug"), dialog_id=str(row.get("dialog_id") or ""),
+        bitrix_user_id=row.get("bitrix_user_id"),
+        mime=("application/pdf" if target == "pdf"
+              else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    )
+    from b24bot import _b24_save_export
+    url = _b24_save_export(new_data, new_name, target)
+    result = {
+        "ok": True,
+        "attachment_id": new_token,
+        "file_name": new_name,
+        "download_url": url,
+        "url_note": "Ссылка временная (~30 минут) — отправь её пользователю в этом же ответе.",
+        "note": (
+            "Документ свёрстан заново: текст, порядок, таблицы и начертания сохранены, "
+            "но расположение блоков и переносы строк будут своими. Для правки одного фрагмента "
+            "с сохранением исходной вёрстки используй edit_attachment_document по исходному файлу."
+        ),
+    }
     if warnings:
         result["warnings"] = warnings
     return result
@@ -10002,12 +10080,17 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "edit_attachment_document": {
         "description": (
-            "Внести ТОЧЕЧНЫЕ правки в присланный пользователем файл (xlsx/docx/txt/csv/md) по его attachment_id: "
+            "Внести ТОЧЕЧНЫЕ правки в присланный пользователем файл (pdf/xlsx/docx/txt/csv/md) по его attachment_id: "
             "заменяет только указанные фрагменты текста, всё остальное — структура, таблицы, ссылки, оформление — "
             "сохраняется из оригинала. Используй, когда просят изменить/исправить/дополнить присланный документ; "
             "пересобирать файл с нуля в этом случае нельзя. find должен буквально совпадать с текстом файла "
             "(возьми из get_attachment_text). Возвращает ссылку на обновлённый файл (отправь пользователю) и "
-            "новый attachment_id (для attach_files_to_task)."
+            "новый attachment_id (для attach_files_to_task). "
+            "PDF правится прямо в исходном файле: фрагмент стирается и переписывается на той же строке тем же "
+            "кеглем — вёрстка остаётся прежней, конвертировать документ для этого НЕ нужно. Так же убираются "
+            "персональные данные: replace='' удаляет фрагмент, replace='____' ставит прочерк. Скан (PDF без "
+            "текстового слоя) не правится — инструмент скажет об этом прямо. Если нужно не заменить фрагмент, "
+            "а переписать структуру документа — сначала convert_document(target='docx')."
         ),
         "inputSchema": {
             "type": "object",
@@ -10034,6 +10117,33 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_edit_attachment_document,
+    },
+    "convert_document": {
+        "description": (
+            "Преобразовать присланный документ: PDF → редактируемый Word (target='docx') или Word → PDF "
+            "(target='pdf'). Нужен, когда документ надо ПЕРЕПИСАТЬ по структуре — переставить разделы, "
+            "переписать текст целиком, собрать новую редакцию — или когда готовый docx нужно отдать "
+            "человеку в PDF. Для замены отдельных фрагментов (сумма, срок, реквизиты, персональные данные) "
+            "конвертация НЕ нужна и вредна: бери edit_attachment_document по исходному файлу — он сохраняет "
+            "вёрстку. После круга PDF → Word → PDF документ верстается заново: текст, порядок, таблицы и "
+            "начертания сохраняются, а расположение блоков и переносы строк будут своими; изображения "
+            "(печати, подписи) в Word не переносятся — инструмент предупреждает об этом. Возвращает ссылку "
+            "на файл и новый attachment_id."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "string", "description": "Токен att_… исходного вложения."},
+                "target": {
+                    "type": "string",
+                    "enum": ["docx", "pdf"],
+                    "description": "'docx' — сделать из PDF редактируемый Word; 'pdf' — сделать из docx PDF.",
+                },
+            },
+            "required": ["attachment_id", "target"],
+            "additionalProperties": False,
+        },
+        "handler": tool_convert_document,
     },
     "reopen_bitrix_task": {
         "description": (
@@ -12004,6 +12114,7 @@ CORE_TOOL_NAMES: set[str] = {
     "attach_files_to_task",
     "get_attachment_text",
     "edit_attachment_document",
+    "convert_document",
     "get_wb_prices",
     # zoom
     "list_zoom_calls",

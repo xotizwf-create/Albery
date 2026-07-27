@@ -81,4 +81,11 @@ def test_text_zero_match_counts_and_replacement():
 
 def test_unsupported_format_raises():
     with pytest.raises(docedit.UnsupportedFormat):
-        docedit.apply_edits(b"%PDF-1.4", "scan.pdf", [("a", "b")])
+        docedit.apply_edits(b"picture", "photo.png", [("a", "b")])
+
+
+def test_broken_pdf_is_refused_as_a_format_problem_not_a_server_error():
+    # PDF правится на месте (docedit → pdfedit), но обрубок файла обязан давать
+    # понятный отказ, а не внутреннюю ошибку библиотеки.
+    with pytest.raises(docedit.UnsupportedFormat):
+        docedit.apply_edits(b"%PDF-1.4", "broken.pdf", [("a", "b")])
