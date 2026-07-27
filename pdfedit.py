@@ -126,20 +126,35 @@ def _color_tuple(color: int) -> tuple[float, float, float]:
     )
 
 
-def _line_groups(rects: list) -> list[list]:
-    """Прямоугольники одного вхождения группируются по строкам.
+def _occurrence_groups(rects: list, occurrences: int) -> list[list]:
+    """Собрать прямоугольники поиска в группы — по одной на каждое вхождение фразы.
 
-    Поиск отдаёт фразу кусками: перенос строки, изменение начертания и даже широкий
-    пробел рвут её на части. Для замены важна первая строка вхождения — туда встаёт
-    новый текст, остальные куски просто стираются.
+    Поиск отдаёт фразу кусками: её рвут перенос строки, смена начертания и даже широкий
+    пробел выключки. Считать каждый кусок отдельным вхождением нельзя — тогда замена
+    вписывается по нескольку раз и ложится поверх соседних слов. Сколько вхождений на
+    странице на самом деле, известно из текста, поэтому куски сливаются попарно — начиная
+    с самых близких — ровно до этого числа.
     """
 
-    groups: list[list] = []
-    for rect in sorted(rects, key=lambda r: (round(r.y0, 1), r.x0)):
-        if groups and abs(groups[-1][-1].y0 - rect.y0) < 3 and rect.x0 >= groups[-1][-1].x0 - 1:
-            groups[-1].append(rect)
-        else:
-            groups.append([rect])
+    groups: list[list] = [[rect] for rect in sorted(rects, key=lambda r: (round(r.y0, 1), r.x0))]
+    if occurrences <= 0:
+        return groups
+
+    def distance(left: list, right: list) -> float:
+        last, first = left[-1], right[0]
+        if abs(last.y0 - first.y0) < 3:                 # один и тот же ряд
+            return max(0.0, first.x0 - last.x1)
+        if first.y0 > last.y0:                          # перенос на следующую строку
+            return 1000.0 + first.y0 - last.y1
+        return 1e9
+
+    while len(groups) > occurrences:
+        pairs = [(distance(groups[i], groups[i + 1]), i) for i in range(len(groups) - 1)]
+        best, index = min(pairs, key=lambda pair: pair[0])
+        if best >= 1e9:
+            break
+        groups[index] = groups[index] + groups[index + 1]
+        del groups[index + 1]
     return groups
 
 
@@ -196,11 +211,12 @@ def apply_edits(
                 needle = _normalized(find)
                 if not needle:
                     continue
-                counts[index] += page_text.count(needle)
+                occurrences = page_text.count(needle)
+                counts[index] += occurrences
                 rects = page.search_for(find) or page.search_for(needle)
                 if not rects:
                     continue
-                for group in _line_groups(rects):
+                for group in _occurrence_groups(rects, occurrences):
                     for rect in group:
                         page.add_redact_annot(rect)
                     if replace:

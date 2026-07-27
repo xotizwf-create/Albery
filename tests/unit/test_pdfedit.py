@@ -161,3 +161,35 @@ def test_scanned_pdf_without_a_text_layer_is_refused_not_silently_unchanged():
         pdfedit.apply_edits(buffer.getvalue(), [("ИНН", "___")])
 
     assert "скан" in str(excinfo.value).lower()
+
+
+def test_replacement_for_a_wrapped_phrase_is_written_once_not_on_every_line():
+    # Фраза разорвана переносом: поиск отдаёт два куска. Замена обязана встать один раз,
+    # иначе вторая копия ложится поверх соседних слов следующей строки.
+    source = _pdf([
+        (72, 100, "предприниматель Бобровская Виктория", 12),
+        (72, 118, "Николаевна, осуществляющая от своего имени", 12),
+    ])
+
+    result, counts, _ = pdfedit.apply_edits(
+        source, [("Бобровская Виктория Николаевна", "______")]
+    )
+
+    assert counts == [1]
+    text = _text(result)
+    assert text.count("______") == 1
+    assert "осуществляющая от своего имени" in text
+
+
+def test_two_separate_occurrences_on_different_lines_are_both_replaced():
+    source = _pdf([
+        (72, 100, "ИНН 231102850042 в шапке", 12),
+        (72, 130, "ИНН 231102850042 в реквизитах", 12),
+    ])
+
+    result, counts, _ = pdfedit.apply_edits(source, [("231102850042", "____")])
+
+    assert counts == [2]
+    text = _text(result)
+    assert text.count("____") == 2
+    assert "231102850042" not in text
