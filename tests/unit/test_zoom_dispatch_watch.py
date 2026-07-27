@@ -187,3 +187,14 @@ def test_alert_text_says_what_happened_and_what_to_do():
     assert "Не удалось собрать ни одного получателя" in payload["description"]
     assert "Отправка задач" in payload["description"]
     assert payload["result_criteria"]
+
+
+def test_alert_carries_a_deadline_or_it_would_never_be_created():
+    """Постановщик задач Битрикса отказывается создавать задачу без срока. Тревога без
+    дедлайна просто не создалась бы, и потерянные задачи снова остались бы незамеченными
+    (поймано живой проверкой 27.07.2026, юнит-тест с подменой отправителя это пропускал)."""
+    payload = watch.build_alert(call_row(), "любая причина")
+
+    assert payload["deadline"], "тревога без срока не будет создана порталом"
+    # Срок должен быть разбираемой датой, а не текстом «сегодня».
+    datetime.fromisoformat(payload["deadline"])

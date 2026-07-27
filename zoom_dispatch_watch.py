@@ -126,6 +126,19 @@ def run_once(
     return {"enabled": True, "sent": sent, "failed": failed, "alerted": alerted}
 
 
+def alert_deadline() -> str:
+    """Срок разбора тревоги — тот же, что у карточек созвона: сегодня 18:00 МСК, а если до
+    вечера уже недалеко, то следующее рабочее утро.
+
+    Срок здесь ОБЯЗАТЕЛЕН, и это не формальность: постановщик задач Битрикса отказывается
+    создавать задачу без дедлайна. Тревога без срока просто не создалась бы — и потерянные
+    задачи снова остались бы незамеченными (поймано живой проверкой 27.07.2026).
+    """
+    import business_hours
+
+    return business_hours.zoom_lead_deadline_at().isoformat()
+
+
 def build_alert(call: dict[str, Any], reason: str) -> dict[str, str]:
     """Текст тревоги. Пишем так, чтобы по нему можно было действовать без раскопок."""
     started = call.get("start_time_msk")
@@ -133,6 +146,7 @@ def build_alert(call: dict[str, Any], reason: str) -> dict[str, str]:
     topic = str(call.get("topic") or "").strip() or "без темы"
     tasks_count = call.get("tasks_count") or 0
     return {
+        "deadline": alert_deadline(),
         "title": f"Албери: задачи по созвону {when} не ушли в Битрикс",
         "description": (
             f"[b]Что случилось[/b]\n"
@@ -171,6 +185,7 @@ def _default_alert(*, call: dict[str, Any], reason: str) -> Any:
         "responsible_bitrix_user_id": OWNER_BITRIX_USER_ID,
         "creator_bitrix_user_id": AGENT_BITRIX_USER_ID,
         "result_criteria": payload["result_criteria"],
+        "deadline": payload["deadline"],
     })
 
 
