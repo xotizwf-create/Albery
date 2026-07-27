@@ -68,6 +68,10 @@ export interface Conversation {
   awaiting_reply_since?: string | null;
   /** «urgent» — клиент ждёт ответа дольше порога; считает сервер. */
   urgency?: "urgent" | "working" | string;
+  /** Рабочий статус: new_client | client_waiting | waiting_client. Считает сервер. */
+  work_state?: string;
+  work_state_label?: string;
+  urgent?: boolean;
   waiting_minutes?: number | null;
   /** Постоянный адрес обращения: /agent-funnels/<id>. */
   url?: string;

@@ -195,7 +195,7 @@ export const funnelWorkspaceApi = {
     if (params.q) search.set("q", params.q);
     if (params.status && params.status !== "all") search.set("status", params.status);
     if (params.stage && params.stage !== "all") search.set("stage", params.stage);
-    if (params.urgency && params.urgency !== "all") search.set("urgency", params.urgency);
+    if (params.urgency && params.urgency !== "all") search.set("state", params.urgency);
     search.set("limit", String(params.limit || 100));
     search.set("offset", String(params.offset || 0));
     return request<ConversationsPayload>(`/conversations?${search.toString()}`);

@@ -1179,6 +1179,8 @@ def test_deleting_a_missing_conversation_is_reported_not_silent():
 
 
 def test_urgency_filter_uses_the_same_threshold_as_the_badge():
+    """«urgency» осталась ради инструментов агента: urgent — тот же срочный статус,
+    working — «Ждём ответ клиента» (мы ответили последними)."""
     def respond(sql, _params):
         if sql.startswith("SELECT c.*, s.source_type"):
             return []
@@ -1194,9 +1196,9 @@ def test_urgency_filter_uses_the_same_threshold_as_the_badge():
 
     minutes = store.urgent_after_minutes()
     assert f"interval '{minutes} minutes'" in urgent_sql
-    # «В работе» — это и отвеченные диалоги, и те, кто ждёт меньше порога.
-    assert "IS NULL OR" in working_sql
-    assert f"interval '{minutes} minutes'" in working_sql
+    # «Ждём ответ клиента» — про очередь хода, а не про время, порога здесь быть не должно.
+    assert f"interval '{minutes} minutes'" not in working_sql
+    assert "IS NULL" in working_sql
 
 
 def test_unknown_urgency_is_refused():
@@ -1343,3 +1345,50 @@ def test_retention_rebuilds_conversation_counters_after_deleting_history():
     assert "last_message_text =" in sql
     assert "last_read_message_id =" in sql
     assert params[-1] == [41]
+
+
+def test_work_state_filters_use_the_answer_fact_not_a_stored_field():
+    """Четыре статуса считаются по переписке: «Новый клиент» — пока нет ни одного нашего
+    ответа, «Клиент ждёт ответ» — пока последнее слово за ним."""
+    def respond(sql, _params):
+        if sql.startswith("SELECT c.*, s.source_type"):
+            return []
+        raise AssertionError(sql)
+
+    captured = {}
+    for state in ("new_client", "client_waiting", "waiting_client", "urgent"):
+        connect, connection = connect_factory(respond)
+        store.list_conversations(state=state, connect=connect)
+        captured[state] = connection.cursor_instance.executed[0][0]
+
+    assert "NOT EXISTS" in captured["new_client"]
+    assert "IS NOT NULL" in captured["client_waiting"]
+    assert "IS NULL" in captured["waiting_client"]
+    assert f"interval '{store.urgent_after_minutes()} minutes'" in captured["urgent"]
+    # Признак «отвечали ли мы» обязан считаться по неотменённым ответам.
+    assert "author_type IN ('agent', 'operator')" in captured["new_client"]
+    assert "delivery_status <> 'cancelled'" in captured["new_client"]
+
+
+def test_unknown_work_state_is_refused():
+    connect, _connection = connect_factory(lambda sql, params: [])
+
+    with pytest.raises(store.WorkspaceValidationError):
+        store.list_conversations(state="в работе", connect=connect)
+
+
+def test_reopening_reply_windows_never_touches_spam():
+    """Открываем ответы всем, кроме помеченного спамом: спам открывать не просили."""
+    statements: list[tuple[str, object]] = []
+
+    def respond(sql, params):
+        statements.append((sql, params))
+        return []
+
+    connect, _connection = connect_factory(respond)
+    store.reopen_reply_windows(now=NOW, connect=connect)
+
+    sql, _params = statements[0]
+    assert sql.startswith("UPDATE funnel_workspace_conversations")
+    assert "reply_deadline_at = %s" in sql
+    assert "status <> 'spam'" in sql

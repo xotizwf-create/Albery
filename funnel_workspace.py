@@ -640,6 +640,15 @@ def workspace_meta() -> tuple[Response, int]:
             # Этапы берутся из самой воронки ИУ (iu_funnel.CHAIN), а не дублируются
             # списком: поменяют воронку — рабочее окно покажет ровно то же самое.
             "funnel_stages": funnel_stages(),
+            "work_states": [
+                {"value": value, "label": store.WORK_STATE_LABELS[value]}
+                for value in (
+                    store.WORK_STATE_NEW,
+                    store.WORK_STATE_CLIENT_WAITING,
+                    store.WORK_STATE_WAITING_CLIENT,
+                    store.WORK_STATE_URGENT,
+                )
+            ],
             "statuses": [
                 {"key": "new", "value": "new", "label": "Новая"},
                 {"key": "open", "value": "open", "label": "В работе"},
@@ -700,18 +709,31 @@ def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
     if isinstance(waiting, datetime):
         if waiting.tzinfo is None:
             waiting = waiting.replace(tzinfo=timezone.utc)
-        waiting_minutes = int(
-            (datetime.now(timezone.utc) - waiting).total_seconds() // 60
+        waiting_minutes = max(
+            0,
+            int((datetime.now(timezone.utc) - waiting).total_seconds() // 60),
         )
-        payload["waiting_minutes"] = max(0, waiting_minutes)
-        payload["urgency"] = (
-            "urgent"
-            if payload["waiting_minutes"] >= store.urgent_after_minutes()
-            else "working"
-        )
+        payload["waiting_minutes"] = waiting_minutes
     else:
+        waiting_minutes = None
         payload["waiting_minutes"] = None
-        payload["urgency"] = "working"
+
+    # Рабочий статус — факт переписки, а не отдельное поле: «Новый клиент», пока мы не
+    # ответили ни разу; «Клиент ждёт ответ», пока последнее слово за ним; иначе «Ждём
+    # ответ клиента». Срочность — отдельная пометка поверх, она про время.
+    has_answer = bool(payload.get("has_answer"))
+    if not has_answer:
+        payload["work_state"] = store.WORK_STATE_NEW
+    elif waiting_minutes is not None:
+        payload["work_state"] = store.WORK_STATE_CLIENT_WAITING
+    else:
+        payload["work_state"] = store.WORK_STATE_WAITING_CLIENT
+    payload["work_state_label"] = store.WORK_STATE_LABELS[payload["work_state"]]
+    payload["urgent"] = (
+        waiting_minutes is not None
+        and waiting_minutes >= store.urgent_after_minutes()
+    )
+    payload["urgency"] = "urgent" if payload["urgent"] else "working"
     return payload
 
 
@@ -760,6 +782,7 @@ def conversations_list() -> tuple[Response, int]:
         q=request.args.get("q", ""),
         status=request.args.get("status", ""),
         stage=request.args.get("stage", ""),
+        state=request.args.get("state", ""),
         urgency=request.args.get("urgency", ""),
         source=request.args.get("source", ""),
         limit=_int_arg("limit", 100, minimum=1, maximum=250),

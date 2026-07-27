@@ -85,6 +85,12 @@ def _conversation_brief(row: Mapping[str, Any]) -> dict[str, Any]:
         waiting_minutes is not None
         and waiting_minutes >= store.urgent_after_minutes()
     )
+    if not row.get("has_answer"):
+        work_state = store.WORK_STATE_NEW
+    elif waiting_minutes is not None:
+        work_state = store.WORK_STATE_CLIENT_WAITING
+    else:
+        work_state = store.WORK_STATE_WAITING_CLIENT
     name = (
         row.get("display_name")
         or (f"@{row['username']}" if row.get("username") else None)
@@ -100,8 +106,11 @@ def _conversation_brief(row: Mapping[str, Any]) -> dict[str, Any]:
         "stage_id": row.get("stage_id"),
         "status": row.get("status"),
         "control": CONTROL_LABELS.get(str(row.get("control_mode")), row.get("control_mode")),
+        "state": work_state,
+        "state_label": store.WORK_STATE_LABELS[work_state],
+        "urgent": urgent,
         "urgency": "urgent" if urgent else "working",
-        "urgency_label": "Очень срочно" if urgent else "В работе",
+        "urgency_label": "Очень срочно" if urgent else store.WORK_STATE_LABELS[work_state],
         "waiting_minutes": waiting_minutes,
         "unread_count": row.get("unread_count"),
         "last_message": row.get("last_message_text"),
@@ -116,6 +125,7 @@ def list_conversations(args: Mapping[str, Any] | None = None) -> dict[str, Any]:
     result = store.list_conversations(
         q=str(args.get("query") or "").strip(),
         stage=str(args.get("stage") or "").strip(),
+        state=str(args.get("state") or "").strip(),
         urgency=str(args.get("urgency") or "").strip(),
         status=str(args.get("status") or "").strip(),
         limit=max(1, min(MAX_LIST_LIMIT, limit)),

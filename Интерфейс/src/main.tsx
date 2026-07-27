@@ -4,10 +4,13 @@ import './index.css';
 
 async function bootstrap() {
   const pathname = window.location.pathname.replace(/\/+$/, '') || '/';
-  const RootComponent =
-    pathname === '/agent-funnels'
-      ? (await import('./funnel-workspace/FunnelWorkspace.tsx')).FunnelWorkspace
-      : (await import('./App.tsx')).default;
+  // Ссылка на конкретное обращение — /agent-funnels/37. Точное сравнение открывало по
+  // ней кабинет вместо рабочего окна, и человек попадал на пустой раздел.
+  const isWorkspace =
+    pathname === '/agent-funnels' || pathname.startsWith('/agent-funnels/');
+  const RootComponent = isWorkspace
+    ? (await import('./funnel-workspace/FunnelWorkspace.tsx')).FunnelWorkspace
+    : (await import('./App.tsx')).default;
 
   createRoot(document.getElementById('root')!).render(
     <StrictMode>

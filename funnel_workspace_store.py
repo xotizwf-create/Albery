@@ -28,6 +28,37 @@ AWAITING_REPLY_SQL = """(
            ), 0)
 )"""
 
+# Отвечали ли мы в этом диалоге хоть раз. Отменённый ответ ответом не считается —
+# клиент его не видел.
+HAS_ANSWER_SQL = """EXISTS (
+    SELECT 1
+      FROM funnel_workspace_messages answer
+     WHERE answer.conversation_id = c.id
+       AND answer.author_type IN ('agent', 'operator')
+       AND answer.delivery_status <> 'cancelled'
+)"""
+
+# Рабочие состояния обращения. Считаются по переписке, а не хранятся: любое хранимое
+# поле разъедется с реальностью при первом же сообщении, пришедшем мимо интерфейса.
+WORK_STATE_NEW = "new_client"          # мы ещё ничего не ответили
+WORK_STATE_CLIENT_WAITING = "client_waiting"  # клиент ждёт нашего ответа
+WORK_STATE_WAITING_CLIENT = "waiting_client"  # последнее слово за нами
+WORK_STATE_URGENT = "urgent"           # клиент ждёт дольше порога (дополняет первые два)
+
+VALID_WORK_STATES = frozenset({
+    WORK_STATE_NEW,
+    WORK_STATE_CLIENT_WAITING,
+    WORK_STATE_WAITING_CLIENT,
+    WORK_STATE_URGENT,
+})
+
+WORK_STATE_LABELS = {
+    WORK_STATE_NEW: "Новый клиент",
+    WORK_STATE_CLIENT_WAITING: "Клиент ждёт ответ",
+    WORK_STATE_WAITING_CLIENT: "Ждём ответ клиента",
+    WORK_STATE_URGENT: "Очень срочно",
+}
+
 VALID_STATUSES = frozenset({"new", "open", "waiting", "closed", "spam", "expired"})
 VALID_CONTROL_MODES = frozenset({"ai", "human", "paused"})
 VALID_AUTHOR_TYPES = frozenset({"client", "agent", "operator", "system"})
@@ -403,6 +434,49 @@ def enqueue_operator_stage_change(
             return {"conversation": dict(cur.fetchone()), "crm_action": action}
 
 
+def reopen_reply_windows(
+    *,
+    conversation_ids: list[int] | None = None,
+    now: datetime | None = None,
+    connect: ConnectFactory | None = None,
+) -> int:
+    """Снова разрешить отвечать в диалогах, где наше окно ответа истекло.
+
+    Это снимает НАШУ защиту, а не ограничение Telegram: там своё окно в 24 часа с
+    последнего сообщения клиента, и на просроченный диалог мессенджер ответит отказом.
+    Разница в том, что теперь оператор увидит настоящую причину отказа от Telegram,
+    а не наш преждевременный запрет.
+    """
+    timestamp = _now(now)
+    deadline = timestamp + timedelta(hours=reply_window_hours())
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            if conversation_ids:
+                cur.execute(
+                    """
+                    UPDATE funnel_workspace_conversations
+                       SET reply_deadline_at = %s,
+                           status = CASE WHEN status IN ('closed', 'spam', 'expired')
+                                         THEN 'open' ELSE status END,
+                           updated_at = %s
+                     WHERE id = ANY(%s)
+                    """,
+                    (deadline, timestamp, [int(item) for item in conversation_ids]),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE funnel_workspace_conversations
+                       SET reply_deadline_at = %s,
+                           status = CASE WHEN status = 'expired' THEN 'open' ELSE status END,
+                           updated_at = %s
+                     WHERE status <> 'spam'
+                    """,
+                    (deadline, timestamp),
+                )
+            return int(cur.rowcount or 0)
+
+
 def delete_conversation(
     conversation_id: Any,
     *,
@@ -628,7 +702,8 @@ def get_conversation(
             cur.execute(
                 f"""
                 SELECT c.*, s.source_type, s.display_name AS source_name,
-                       {AWAITING_REPLY_SQL} AS awaiting_reply_since
+                       {AWAITING_REPLY_SQL} AS awaiting_reply_since,
+                       {HAS_ANSWER_SQL} AS has_answer
                   FROM funnel_workspace_conversations c
                   JOIN funnel_workspace_sources s ON s.source_key = c.source_key
                  WHERE c.id = %s
@@ -644,14 +719,12 @@ def get_conversation(
             return row
 
 
-VALID_URGENCY = frozenset({"urgent", "working"})
-
-
 def list_conversations(
     *,
     q: str = "",
     status: str = "",
     stage: str = "",
+    state: str = "",
     urgency: str = "",
     source: str = "",
     limit: int = 100,
@@ -663,14 +736,17 @@ def list_conversations(
     # Этап воронки — это код сделки в Битриксе, а не наш перечень: проверять его по
     # белому списку нельзя, иначе новый этап у владельца перестанет фильтроваться.
     clean_stage = str(stage or "").strip()[:200]
-    clean_urgency = str(urgency or "").strip().lower()
+    # «urgency» осталась ради инструментов агента: urgent — тот же срочный статус.
+    clean_state = str(state or urgency or "").strip().lower()
+    if clean_state == "working":
+        clean_state = WORK_STATE_WAITING_CLIENT
     clean_source = str(source or "").strip()[:100]
     if clean_status and clean_status not in VALID_STATUSES:
         raise WorkspaceValidationError("Неизвестный статус.", details={"status": clean_status})
-    if clean_urgency and clean_urgency not in VALID_URGENCY:
+    if clean_state and clean_state not in VALID_WORK_STATES:
         raise WorkspaceValidationError(
-            "Неизвестная срочность.",
-            details={"urgency": clean_urgency},
+            "Неизвестный рабочий статус обращения.",
+            details={"state": clean_state},
         )
     limit = min(250, max(1, int(limit or 100)))
     offset = max(0, int(offset or 0))
@@ -683,16 +759,18 @@ def list_conversations(
     if clean_stage:
         clauses.append("c.stage_id = %s")
         params.append(clean_stage)
-    if clean_urgency:
+    if clean_state:
         # Порог считается на стороне БД от текущего времени: фильтр обязан совпадать
-        # с бейджем в списке, а тот пересчитывается у оператора каждую секунду.
+        # с подписью в списке, а она пересчитывается у оператора каждую секунду.
         threshold = f"now() - interval '{urgent_after_minutes()} minutes'"
-        if clean_urgency == "urgent":
-            clauses.append(f"{AWAITING_REPLY_SQL} <= {threshold}")
+        if clean_state == WORK_STATE_NEW:
+            clauses.append(f"NOT {HAS_ANSWER_SQL}")
+        elif clean_state == WORK_STATE_CLIENT_WAITING:
+            clauses.append(f"{HAS_ANSWER_SQL} AND {AWAITING_REPLY_SQL} IS NOT NULL")
+        elif clean_state == WORK_STATE_WAITING_CLIENT:
+            clauses.append(f"{HAS_ANSWER_SQL} AND {AWAITING_REPLY_SQL} IS NULL")
         else:
-            clauses.append(
-                f"({AWAITING_REPLY_SQL} IS NULL OR {AWAITING_REPLY_SQL} > {threshold})"
-            )
+            clauses.append(f"{AWAITING_REPLY_SQL} <= {threshold}")
     if clean_source:
         clauses.append("c.source_key = %s")
         params.append(clean_source)
@@ -726,6 +804,7 @@ def list_conversations(
                 f"""
                 SELECT c.*, s.source_type, s.display_name AS source_name,
                        {AWAITING_REPLY_SQL} AS awaiting_reply_since,
+                       {HAS_ANSWER_SQL} AS has_answer,
                        count(*) OVER () AS filtered_total
                   FROM funnel_workspace_conversations c
                   JOIN funnel_workspace_sources s ON s.source_key = c.source_key

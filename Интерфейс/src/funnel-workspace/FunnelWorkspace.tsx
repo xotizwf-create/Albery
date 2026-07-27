@@ -870,7 +870,8 @@ function StatusPill({
   );
 }
 
-/** «Очень срочно», если вопрос клиента висит без ответа дольше порога, иначе «В работе». */
+/** Рабочий статус обращения: «Новый клиент» → «Клиент ждёт ответ» → «Ждём ответ клиента».
+    Срочность — отдельная пометка поверх: она про время, а не про очередь хода. */
 function WorkBadge({
   conversation,
   now,
@@ -887,33 +888,42 @@ function WorkBadge({
     ? Math.max(0, Math.floor((now - waitingSince) / 60_000))
     : 0;
   const urgent = Boolean(waitingSince) && waitingMinutes >= urgentAfterMinutes;
+  const state = conversation.work_state || "waiting_client";
   const size = compact ? "px-2 py-1 text-[10px]" : "px-2.5 py-1.5 text-[11px]";
   const icon = compact ? "h-3 w-3" : "h-3.5 w-3.5";
 
-  if (urgent) {
-    return (
-      <span
-        className={cn(
-          "inline-flex items-center gap-1.5 rounded-full bg-red-50 font-black text-red-700 ring-1 ring-inset ring-red-200",
-          size,
-        )}
-      >
-        <AlertCircle className={icon} />
-        Очень срочно · {formatWaiting(waitingMinutes)}
-      </span>
-    );
-  }
+  const tone =
+    state === "new_client"
+      ? "bg-violet-50 text-violet-700"
+      : state === "client_waiting"
+        ? "bg-amber-50 text-amber-800"
+        : "bg-slate-100 text-slate-600";
+  const StateIcon =
+    state === "new_client" ? Sparkles : state === "client_waiting" ? Clock3 : CheckCheck;
 
   return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1.5 rounded-full bg-emerald-50 font-bold text-emerald-700",
-        size,
+    <>
+      <span className={cn("inline-flex items-center gap-1.5 rounded-full font-bold", tone, size)}>
+        <StateIcon className={icon} />
+        {conversation.work_state_label ||
+          (state === "new_client"
+            ? "Новый клиент"
+            : state === "client_waiting"
+              ? "Клиент ждёт ответ"
+              : "Ждём ответ клиента")}
+      </span>
+      {urgent && (
+        <span
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full bg-red-50 font-black text-red-700 ring-1 ring-inset ring-red-200",
+            size,
+          )}
+        >
+          <AlertCircle className={icon} />
+          Очень срочно · {formatWaiting(waitingMinutes)}
+        </span>
       )}
-    >
-      <MessageCircleMore className={icon} />
-      В работе
-    </span>
+    </>
   );
 }
 
@@ -1116,13 +1126,15 @@ function ConversationList({
 
         <div className="mt-2 grid grid-cols-2 gap-2">
           <SelectMenu
-            ariaLabel="Фильтр по срочности"
+            ariaLabel="Фильтр по статусу обращения"
             value={urgency}
             onChange={onUrgencyChange}
             options={[
-              { value: "all", label: "Вся срочность" },
-              { value: "urgent", label: "Очень срочные", color: "#dc2626" },
-              { value: "working", label: "В работе", color: "#059669" },
+              { value: "all", label: "Все статусы" },
+              { value: "new_client", label: "Новый клиент", color: "#7c3aed" },
+              { value: "client_waiting", label: "Клиент ждёт ответ", color: "#d97706" },
+              { value: "waiting_client", label: "Ждём ответ клиента", color: "#64748b" },
+              { value: "urgent", label: "Очень срочно", color: "#dc2626" },
             ]}
           />
           <SelectMenu
