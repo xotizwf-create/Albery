@@ -296,3 +296,47 @@ def set_control(args: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "url": funnel_workspace.conversation_url(conversation_id),
     }
+
+
+def list_lead_notes(args: Mapping[str, Any]) -> dict[str, Any]:
+    """Комментарии по лиду: что оператор и агент записали о клиенте и общении."""
+    conversation_id = _int_arg(args, "conversation_id")
+    limit = int(args.get("limit") or 20)
+    notes = store.list_lead_notes(conversation_id, limit=limit)
+    return {
+        "conversation_id": conversation_id,
+        "url": funnel_workspace.conversation_url(conversation_id),
+        "notes": [
+            {
+                "id": note["id"],
+                "author": "агент" if note["author_type"] == "agent" else (
+                    note["author_name"] or "оператор"),
+                "text": note["text"],
+                "created_at": note["created_at"],
+                # Комментарий, не доехавший до Битрикса, всё равно существует у нас —
+                # молчать об этом нельзя, иначе агент решит, что в CRM он есть.
+                "in_bitrix": bool(note["bitrix_mirrored"]),
+            }
+            for note in notes
+        ],
+    }
+
+
+def add_lead_note(args: Mapping[str, Any]) -> dict[str, Any]:
+    """Записать комментарий по лиду — он же уходит в ленту сделки Битрикса."""
+    conversation_id = _int_arg(args, "conversation_id")
+    text = _text_arg(args, "text", limit=store.LEAD_NOTE_MAX_CHARS)
+    note = store.add_lead_note(
+        conversation_id,
+        text,
+        author_type="agent",
+        author_name=str(args.get("actor_name") or "ИИ-агент"),
+    )
+    mirrored = funnel_workspace.mirror_lead_note_to_bitrix(conversation_id, note)
+    return {
+        "conversation_id": conversation_id,
+        "note_id": note["id"],
+        "in_bitrix": bool(mirrored.get("bitrix_mirrored")),
+        "bitrix_error": mirrored.get("bitrix_error"),
+        "url": funnel_workspace.conversation_url(conversation_id),
+    }

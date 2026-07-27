@@ -830,3 +830,103 @@ def test_an_ordinary_takeover_is_not_permanent(client, monkeypatch):
     assert response.status_code == 200
     assert captured["permanent"] is False
     assert response.get_json()["conversation"]["control_permanent"] is False
+
+
+def test_lead_note_is_saved_and_mirrored_to_the_deal(client, monkeypatch):
+    """Комментарий по лиду сохраняется у нас и уходит в ленту сделки Битрикса."""
+    saved = {}
+    mirrored = {}
+
+    def add_note(conversation_id, text, *, author_type, author_name):
+        saved.update(conversation_id=conversation_id, text=text,
+                     author_type=author_type, author_name=author_name)
+        return {"id": 7, "conversation_id": conversation_id, "author_type": author_type,
+                "author_name": author_name, "text": text, "bitrix_mirrored": False,
+                "bitrix_error": None, "created_at": datetime.now(timezone.utc)}
+
+    monkeypatch.setattr(workspace.store, "add_lead_note", add_note)
+    monkeypatch.setattr(workspace.store, "get_conversation",
+                        lambda conversation_id: {"id": conversation_id, "deal_id": 212})
+    monkeypatch.setattr(workspace.store, "mark_lead_note_mirrored",
+                        lambda note_id, error="": mirrored.update(note_id=note_id, error=error))
+    monkeypatch.setattr(
+        workspace, "mirror_lead_note_to_bitrix",
+        lambda conversation_id, note: dict(note, bitrix_mirrored=True, bitrix_error=None))
+    payload = login(client)
+
+    response = client.post(
+        "/api/funnel-workspace/conversations/41/notes",
+        json={"text": "Клиент просил вернуться после обеда", "csrf_token": payload["csrf_token"]},
+        headers={"Origin": ORIGIN, "X-CSRF-Token": payload["csrf_token"]},
+    )
+
+    assert response.status_code == 200
+    note = response.get_json()["note"]
+    assert note["text"] == "Клиент просил вернуться после обеда"
+    assert note["bitrix_mirrored"] is True
+    assert saved["author_type"] == "operator"
+    assert saved["conversation_id"] == 41
+
+
+def test_lead_note_survives_a_broken_bitrix(client, monkeypatch):
+    """Битрикс здесь зеркало: недоступная CRM не должна стоить человеку написанного —
+    комментарий остаётся сохранённым, а в панель приходит честная пометка."""
+    marked = {}
+
+    monkeypatch.setattr(
+        workspace.store, "add_lead_note",
+        lambda conversation_id, text, *, author_type, author_name: {
+            "id": 9, "conversation_id": conversation_id, "author_type": author_type,
+            "author_name": author_name, "text": text, "bitrix_mirrored": False,
+            "bitrix_error": None, "created_at": datetime.now(timezone.utc)})
+    monkeypatch.setattr(workspace.store, "get_conversation",
+                        lambda conversation_id: {"id": conversation_id, "deal_id": 212})
+    monkeypatch.setattr(workspace.store, "mark_lead_note_mirrored",
+                        lambda note_id, error="": marked.update(note_id=note_id, error=error))
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("CRM недоступна")
+
+    import mcp.context_server as cs
+
+    monkeypatch.setattr(cs, "tool_add_deal_comment", explode)
+    payload = login(client)
+
+    response = client.post(
+        "/api/funnel-workspace/conversations/41/notes",
+        json={"text": "Важное про клиента", "csrf_token": payload["csrf_token"]},
+        headers={"Origin": ORIGIN, "X-CSRF-Token": payload["csrf_token"]},
+    )
+
+    assert response.status_code == 200
+    note = response.get_json()["note"]
+    assert note["text"] == "Важное про клиента"
+    assert note["bitrix_mirrored"] is False
+    assert "CRM недоступна" in note["bitrix_error"]
+    assert marked["note_id"] == 9 and "CRM недоступна" in marked["error"]
+
+
+def test_lead_note_without_a_deal_says_so_instead_of_failing(client, monkeypatch):
+    """Сделки ещё нет — зеркалить некуда; комментарий всё равно сохраняется."""
+    monkeypatch.setattr(
+        workspace.store, "add_lead_note",
+        lambda conversation_id, text, *, author_type, author_name: {
+            "id": 11, "conversation_id": conversation_id, "author_type": author_type,
+            "author_name": author_name, "text": text, "bitrix_mirrored": False,
+            "bitrix_error": None, "created_at": datetime.now(timezone.utc)})
+    monkeypatch.setattr(workspace.store, "get_conversation",
+                        lambda conversation_id: {"id": conversation_id, "deal_id": None})
+    monkeypatch.setattr(workspace.store, "mark_lead_note_mirrored",
+                        lambda note_id, error="": None)
+    payload = login(client)
+
+    response = client.post(
+        "/api/funnel-workspace/conversations/41/notes",
+        json={"text": "Пока без сделки", "csrf_token": payload["csrf_token"]},
+        headers={"Origin": ORIGIN, "X-CSRF-Token": payload["csrf_token"]},
+    )
+
+    note = response.get_json()["note"]
+    assert response.status_code == 200
+    assert note["bitrix_mirrored"] is False
+    assert note["bitrix_error"] == "у обращения ещё нет сделки"

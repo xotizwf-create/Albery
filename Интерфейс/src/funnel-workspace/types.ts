@@ -124,3 +124,15 @@ export interface MessagesPayload {
   next_before_id?: number | null;
   has_more_before?: boolean;
 }
+
+/** Комментарий по лиду: свободная заметка оператора или агента о клиенте и общении.
+    Дублируется в ленту сделки Битрикса; in_bitrix=false — у нас есть, туда не доехало. */
+export interface LeadNote {
+  id: number;
+  author_type: "operator" | "agent" | string;
+  author_name: string;
+  text: string;
+  bitrix_mirrored: boolean;
+  bitrix_error?: string | null;
+  created_at: string;
+}

@@ -4964,3 +4964,104 @@ def message_export_rows(
                 tuple(params),
             )
             return [dict(row) for row in cur.fetchall()]
+
+
+# --- комментарии по лиду -------------------------------------------------------------
+# Свободный текст о клиенте и общении: пишет оператор из панели и агент своим
+# инструментом. Хранится у нас и зеркалится в ленту сделки Битрикса — зеркало отмечается
+# флагом, потому что недоступный в этот момент Битрикс не должен стоить человеку текста,
+# который он уже написал.
+
+LEAD_NOTE_AUTHORS = frozenset({"operator", "agent"})
+LEAD_NOTE_MAX_CHARS = 4000
+
+
+def add_lead_note(
+    conversation_id: Any,
+    text: str,
+    *,
+    author_type: str = "operator",
+    author_name: str = "",
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    item_id = _positive_int(conversation_id, "conversation_id")
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        raise WorkspaceValidationError("Комментарий пустой.", details={"field": "text"})
+    if len(clean_text) > LEAD_NOTE_MAX_CHARS:
+        raise WorkspaceValidationError(
+            f"Комментарий длиннее {LEAD_NOTE_MAX_CHARS} символов.",
+            details={"field": "text"},
+        )
+    clean_author = str(author_type or "operator").strip().lower()
+    if clean_author not in LEAD_NOTE_AUTHORS:
+        raise WorkspaceValidationError(
+            "Автор комментария может быть operator или agent.",
+            details={"author_type": clean_author},
+        )
+
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM funnel_workspace_conversations WHERE id = %s",
+                (item_id,),
+            )
+            if cur.fetchone() is None:
+                raise WorkspaceNotFoundError(
+                    "Обращение не найдено.", details={"conversation_id": item_id}
+                )
+            cur.execute(
+                """
+                INSERT INTO funnel_workspace_lead_notes
+                    (conversation_id, author_type, author_name, text)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, conversation_id, author_type, author_name, text,
+                          bitrix_mirrored, bitrix_error, created_at
+                """,
+                (item_id, clean_author, str(author_name or "")[:120], clean_text),
+            )
+            return dict(cur.fetchone())
+
+
+def list_lead_notes(
+    conversation_id: Any,
+    *,
+    limit: int = 50,
+    connect: ConnectFactory | None = None,
+) -> list[dict[str, Any]]:
+    item_id = _positive_int(conversation_id, "conversation_id")
+    clean_limit = min(200, max(1, int(limit or 50)))
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, conversation_id, author_type, author_name, text,
+                       bitrix_mirrored, bitrix_error, created_at
+                  FROM funnel_workspace_lead_notes
+                 WHERE conversation_id = %s
+                 ORDER BY id DESC
+                 LIMIT %s
+                """,
+                (item_id, clean_limit),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def mark_lead_note_mirrored(
+    note_id: Any,
+    *,
+    error: str = "",
+    connect: ConnectFactory | None = None,
+) -> None:
+    """Итог зеркалирования в Битрикс: успех или причина, по которой не доехало."""
+    item_id = _positive_int(note_id, "note_id")
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE funnel_workspace_lead_notes
+                   SET bitrix_mirrored = %s, bitrix_error = %s
+                 WHERE id = %s
+                """,
+                (not error, str(error or "")[:500] or None, item_id),
+            )

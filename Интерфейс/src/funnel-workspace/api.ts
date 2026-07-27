@@ -3,6 +3,7 @@ import type {
   ConversationMessage,
   ConversationStatus,
   ConversationsPayload,
+  LeadNote,
   MessagesPayload,
   WorkspaceMeta,
   WorkspaceSession,
@@ -293,6 +294,25 @@ export const funnelWorkspaceApi = {
   ) =>
     request<{ conversation: Conversation }>(
       `/conversations/${encodeURIComponent(String(conversationId))}/stage`,
+      {
+        method: "POST",
+        headers: csrfHeaders(payload.csrf_token),
+        body: JSON.stringify(payload),
+      },
+    ),
+
+  /** Комментарии по лиду: свободные заметки оператора и агента о клиенте. */
+  listNotes: (conversationId: Conversation["id"]) =>
+    request<{ notes: LeadNote[] }>(
+      `/conversations/${encodeURIComponent(String(conversationId))}/notes`,
+    ),
+
+  addNote: (
+    conversationId: Conversation["id"],
+    payload: { text: string; csrf_token: string },
+  ) =>
+    request<{ note: LeadNote }>(
+      `/conversations/${encodeURIComponent(String(conversationId))}/notes`,
       {
         method: "POST",
         headers: csrfHeaders(payload.csrf_token),

@@ -43,6 +43,7 @@ import type {
   Conversation,
   ConversationMessage,
   ConversationStatus,
+  LeadNote,
   WorkspaceMeta,
   WorkspaceSession,
 } from "./types";
@@ -85,6 +86,19 @@ const STAGE_COLORS = ["#7c3aed", "#2563eb", "#0891b2", "#d97706", "#16a34a"];
 const IN_FLIGHT_DELIVERY = new Set(["pending", "queued", "sending", "leased"]);
 
 const URGENT_AFTER_MINUTES_DEFAULT = 10;
+
+/** Дата и время комментария — коротко и по-московски, как везде в окне. */
+const formatDateTime = (value: string) => {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime())
+    ? ""
+    : parsed.toLocaleString("ru-RU", {
+        day: "2-digit",
+        month: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+};
 
 const formatWaiting = (minutes: number) => {
   if (minutes < 60) return `${minutes} мин`;
@@ -867,6 +881,83 @@ function StatusPill({
       />
       <span className="truncate">{label || STATUS_LABELS[status] || status}</span>
     </span>
+  );
+}
+
+/** Комментарии по лиду: свободные заметки о клиенте и общении. Видны оператору и агенту,
+    дублируются в ленту сделки Битрикса. Это заметка для своих — клиенту не уходит. */
+function LeadNotes({
+  notes,
+  busy,
+  onAdd,
+}: {
+  notes: LeadNote[];
+  busy: boolean;
+  onAdd: (text: string) => void;
+}) {
+  const [draft, setDraft] = useState("");
+
+  const submit = () => {
+    const clean = draft.trim();
+    if (!clean || busy) return;
+    onAdd(clean);
+    setDraft("");
+  };
+
+  return (
+    <section className="mt-6">
+      <div className="mb-2 text-[10px] font-black uppercase tracking-[0.12em] text-slate-400">
+        Комментарии по лиду
+      </div>
+      <textarea
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) submit();
+        }}
+        rows={3}
+        placeholder="Что важно помнить об этом клиенте…"
+        className="w-full resize-none rounded-2xl border border-slate-200 px-3 py-2 text-xs leading-5 text-slate-700 outline-none placeholder:text-slate-400 focus:border-slate-300"
+      />
+      <div className="mt-2 flex items-center justify-between gap-2">
+        <span className="text-[10px] font-medium text-slate-400">
+          Клиенту не уходит; дублируется в сделку Битрикса
+        </span>
+        <button
+          type="button"
+          onClick={submit}
+          disabled={busy || !draft.trim()}
+          className="rounded-xl bg-[#5B50EA] px-3 py-1.5 text-[11px] font-bold text-white disabled:opacity-40"
+        >
+          {busy ? "Сохраняю…" : "Добавить"}
+        </button>
+      </div>
+      <div className="mt-3 flex flex-col gap-2">
+        {notes.length === 0 && (
+          <div className="text-[11px] font-medium text-slate-400">Комментариев пока нет.</div>
+        )}
+        {notes.map((note) => (
+          <div key={note.id} className="rounded-2xl bg-slate-50 px-3 py-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                {note.author_type === "agent" ? "ИИ-агент" : note.author_name || "Оператор"}
+              </span>
+              <span className="text-[10px] font-medium text-slate-400">
+                {formatDateTime(note.created_at)}
+              </span>
+            </div>
+            <div className="mt-1 whitespace-pre-wrap text-xs leading-5 text-slate-700">
+              {note.text}
+            </div>
+            {!note.bitrix_mirrored && (
+              <div className="mt-1 text-[10px] font-semibold text-amber-700">
+                В Битрикс не ушло — комментарий сохранён только здесь
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -1994,9 +2085,12 @@ function ConversationDetails({
   now,
   controlBusy,
   stageBusy,
+  notes,
+  noteBusy,
   onClose,
   onControl,
   onStage,
+  onAddNote,
 }: {
   conversation: Conversation;
   meta: WorkspaceMeta | null;
@@ -2007,9 +2101,12 @@ function ConversationDetails({
   now: number;
   controlBusy: boolean;
   stageBusy: boolean;
+  notes: LeadNote[];
+  noteBusy: boolean;
   onClose?: () => void;
   onControl: (mode: "human" | "ai", permanent?: boolean) => void;
   onStage: (stage: string) => void;
+  onAddNote: (text: string) => void;
 }) {
   const lease = formatLease(conversation.resume_at, now);
   const canReply = conversation.can_reply !== false;
@@ -2126,6 +2223,8 @@ function ConversationDetails({
             подтягиваются в течение минуты.
           </div>
         </section>
+
+        <LeadNotes notes={notes} busy={noteBusy} onAdd={onAddNote} />
 
         <section className="mt-6 rounded-2xl border border-slate-200 p-4">
           <div className="flex items-center justify-between gap-3">
@@ -2347,6 +2446,8 @@ function OperatorWorkspace({
   const [sending, setSending] = useState(false);
   const [controlBusy, setControlBusy] = useState(false);
   const [stageBusy, setStageBusy] = useState(false);
+  const [leadNotes, setLeadNotes] = useState<LeadNote[]>([]);
+  const [noteBusy, setNoteBusy] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [mobilePane, setMobilePane] = useState<MobilePane>("list");
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -2368,6 +2469,29 @@ function OperatorWorkspace({
       ) || null,
     [conversations, selectedId],
   );
+
+  // Комментарии по лиду грузятся под выбранное обращение: список короткий, а держать их
+  // все в памяти списка значило бы тянуть заметки по каждому диалогу на каждом обновлении.
+  useEffect(() => {
+    if (!selectedId) {
+      setLeadNotes([]);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { notes } = await funnelWorkspaceApi.listNotes(selectedId);
+        if (!cancelled) setLeadNotes(notes);
+      } catch {
+        // Молча пустой список здесь допустим: заметки — дополнение к карточке, и их
+        // недоступность не должна закрывать оператору саму переписку.
+        if (!cancelled) setLeadNotes([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId]);
 
   // Этапы воронки ИУ: и фильтр слева, и подпись в карточке берут их отсюда.
   const stageOptions = useMemo(() => {
@@ -2956,6 +3080,32 @@ function OperatorWorkspace({
     }
   };
 
+  const addLeadNote = async (text: string) => {
+    const conversation = selectedConversation;
+    const clean = text.trim();
+    if (!conversation || noteBusy || !clean) return;
+    setNoteBusy(true);
+    try {
+      const { note } = await funnelWorkspaceApi.addNote(conversation.id, {
+        text: clean,
+        csrf_token: csrfToken(),
+      });
+      setLeadNotes((current) => [note, ...current]);
+      setToast({
+        // Комментарий сохранён у нас в любом случае — про Битрикс говорим отдельно,
+        // иначе человек решит, что заметка потерялась целиком.
+        message: note.bitrix_mirrored
+          ? "Комментарий сохранён и ушёл в сделку Битрикса."
+          : "Комментарий сохранён, но в Битрикс не ушёл — попробуйте позже.",
+        tone: note.bitrix_mirrored ? "success" : "error",
+      });
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setNoteBusy(false);
+    }
+  };
+
   const logout = async () => {
     if (loggingOut) return;
     if (session.admin_session) {
@@ -3106,6 +3256,9 @@ function OperatorWorkspace({
                 now={now}
                 controlBusy={controlBusy}
                 stageBusy={stageBusy}
+                notes={leadNotes}
+                noteBusy={noteBusy}
+                onAddNote={addLeadNote}
                 onControl={(mode, permanent) => void setControl(mode, permanent)}
                 onStage={(nextStage) => void changeStage(nextStage)}
               />
@@ -3136,6 +3289,9 @@ function OperatorWorkspace({
               now={now}
               controlBusy={controlBusy}
               stageBusy={stageBusy}
+              notes={leadNotes}
+              noteBusy={noteBusy}
+              onAddNote={addLeadNote}
               onClose={() => setDetailsOpen(false)}
               onControl={(mode, permanent) => void setControl(mode, permanent)}
               onStage={(nextStage) => void changeStage(nextStage)}

@@ -9025,6 +9025,40 @@ WORKSPACE_TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": _workspace_tool("list_conversations"),
     },
+    "workspace_list_lead_notes": {
+        "description": (
+            "Комментарии по лиду: что оператор и агент записали о клиенте и общении — "
+            "договорённости, особенности, чего клиент ждёт. Читай их перед ответом клиенту "
+            "и перед оценкой, что с лидом делать дальше."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {"type": "integer", "description": "Номер обращения в рабочем окне."},
+                "limit": {"type": "integer", "description": "Сколько комментариев вернуть, по умолчанию 20."},
+            },
+            "required": ["conversation_id"],
+            "additionalProperties": False,
+        },
+        "handler": _workspace_tool("list_lead_notes"),
+    },
+    "workspace_add_lead_note": {
+        "description": (
+            "Записать комментарий по лиду — свободный текст о клиенте и общении. "
+            "Комментарий виден оператору в панели обращения и уходит в ленту сделки "
+            "Битрикса. Это заметка для людей, а не сообщение клиенту: клиенту она не уходит."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {"type": "integer", "description": "Номер обращения в рабочем окне."},
+                "text": {"type": "string", "description": "Текст комментария."},
+            },
+            "required": ["conversation_id", "text"],
+            "additionalProperties": False,
+        },
+        "handler": _workspace_tool("add_lead_note"),
+    },
     "workspace_list_urgent": {
         "description": (
             "Обращения, на которые никто не ответил дольше порога (по умолчанию 10 минут). "

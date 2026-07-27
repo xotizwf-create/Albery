@@ -211,3 +211,33 @@ def test_conversation_card_includes_transcript(monkeypatch):
     assert card["conversation"]["conversation_id"] == 12
     assert card["messages"][0]["author"] == "Клиент"
     assert card["reply_open"] is True
+
+
+def test_agent_reads_and_writes_lead_notes(monkeypatch):
+    """У агента есть инструмент на комментарии по лиду: он их видит и может дописать свой."""
+    written = {}
+
+    monkeypatch.setattr(tools.store, "list_lead_notes", lambda conversation_id, limit=20: [
+        {"id": 3, "author_type": "operator", "author_name": "Юлия",
+         "text": "Клиент про доставку", "bitrix_mirrored": True, "created_at": "2026-07-27"},
+        {"id": 2, "author_type": "agent", "author_name": "ИИ-агент",
+         "text": "Отправил условия", "bitrix_mirrored": False, "created_at": "2026-07-26"},
+    ])
+    monkeypatch.setattr(
+        tools.store, "add_lead_note",
+        lambda conversation_id, text, *, author_type, author_name: written.update(
+            conversation_id=conversation_id, text=text, author_type=author_type) or {
+                "id": 4, "author_type": author_type, "author_name": author_name,
+                "text": text, "bitrix_mirrored": False, "bitrix_error": None})
+    monkeypatch.setattr(tools.funnel_workspace, "mirror_lead_note_to_bitrix",
+                        lambda conversation_id, note: dict(note, bitrix_mirrored=True))
+
+    listed = tools.list_lead_notes({"conversation_id": 41})
+    assert [note["author"] for note in listed["notes"]] == ["Юлия", "агент"]
+    # Не доехавший до Битрикса комментарий помечен честно — иначе агент решит, что он в CRM.
+    assert [note["in_bitrix"] for note in listed["notes"]] == [True, False]
+
+    added = tools.add_lead_note({"conversation_id": 41, "text": "Договорились созвониться"})
+    assert written == {"conversation_id": 41, "text": "Договорились созвониться",
+                       "author_type": "agent"}
+    assert added["in_bitrix"] is True

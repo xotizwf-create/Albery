@@ -1110,6 +1110,62 @@ def conversation_stage(conversation_id: int) -> tuple[Response, int]:
     return _json({"conversation": result["conversation"]})
 
 
+def mirror_lead_note_to_bitrix(conversation_id: int, note: dict[str, Any]) -> dict[str, Any]:
+    """Отправить комментарий по лиду в ленту сделки Битрикса.
+
+    Битрикс здесь зеркало, а не хранилище: комментарий уже сохранён у нас, и недоступная
+    CRM не должна стоить человеку написанного текста. Поэтому сбой не поднимается наверх —
+    он записывается в саму заметку и виден в панели («в Битрикс не ушло»).
+    """
+    author = str(note.get("author_name") or "").strip()
+    who = "агент" if note.get("author_type") == "agent" else (author or "оператор")
+    try:
+        conversation = store.get_conversation(conversation_id)
+        deal_id = conversation.get("deal_id")
+        if not deal_id:
+            store.mark_lead_note_mirrored(note["id"], error="у обращения ещё нет сделки")
+            return dict(note, bitrix_mirrored=False, bitrix_error="у обращения ещё нет сделки")
+
+        from mcp import context_server as cs
+
+        cs.tool_add_deal_comment({
+            "deal_id": int(deal_id),
+            "comment": f"Комментарий по лиду ({who}):\n{note['text']}",
+        })
+        store.mark_lead_note_mirrored(note["id"])
+        return dict(note, bitrix_mirrored=True, bitrix_error=None)
+    except Exception as exc:  # noqa: BLE001 — зеркало не должно ронять сохранение
+        reason = f"{type(exc).__name__}: {exc}"[:500]
+        logger.warning("комментарий %s не ушёл в сделку: %s", note.get("id"), reason)
+        try:
+            store.mark_lead_note_mirrored(note["id"], error=reason)
+        except Exception:  # noqa: BLE001
+            logger.warning("не удалось отметить сбой зеркала", exc_info=True)
+        return dict(note, bitrix_mirrored=False, bitrix_error=reason)
+
+
+@funnel_workspace_bp.get(
+    f"{API_PREFIX}/conversations/<int:conversation_id>/notes"
+)
+def conversation_notes(conversation_id: int) -> tuple[Response, int]:
+    """Комментарии по лиду — то, что оператор и агент записали о клиенте."""
+    return _json({"notes": store.list_lead_notes(conversation_id)})
+
+
+@funnel_workspace_bp.post(
+    f"{API_PREFIX}/conversations/<int:conversation_id>/notes"
+)
+def conversation_note_add(conversation_id: int) -> tuple[Response, int]:
+    body = _json_body()
+    note = store.add_lead_note(
+        conversation_id,
+        str(body.get("text") or ""),
+        author_type="operator",
+        author_name=workspace_operator_name(),
+    )
+    return _json({"note": mirror_lead_note_to_bitrix(conversation_id, note)})
+
+
 @funnel_workspace_bp.patch(
     f"{API_PREFIX}/conversations/<int:conversation_id>"
 )
