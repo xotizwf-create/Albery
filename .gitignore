@@ -43,3 +43,4 @@ tmp_*.py
 
 # graphify knowledge graph output (generated, rebuildable via `graphify update .`)
 graphify-out/
+Интерфейс/dist_*.tar.gz
