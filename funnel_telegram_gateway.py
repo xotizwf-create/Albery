@@ -654,6 +654,22 @@ def _send_as_manager_account(outbox: Mapping[str, Any], bot_error: Exception) ->
     return str(message_id)
 
 
+def _telegram_ids(payload: Mapping[str, Any]) -> tuple[int, int] | None:
+    """Числовые идентификаторы чата и сообщения в Telegram.
+
+    У записей, не проходивших через Telegram (перенесённая история, служебные записи),
+    идентификаторы нечисловые или их нет вовсе. Такое должно приводить к понятному
+    отказу, а не к падению на приведении типа.
+    """
+    try:
+        return (
+            int(payload["external_chat_id"]),
+            int(payload["provider_message_id"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def edit_delivered_message(payload: Mapping[str, Any]) -> str:
     """Заменить текст уже доставленного сообщения в Telegram.
 
@@ -663,19 +679,20 @@ def edit_delivered_message(payload: Mapping[str, Any]) -> str:
     """
     import tg_agent
 
-    provider_message_id = payload.get("provider_message_id")
-    if not provider_message_id:
+    ids = _telegram_ids(payload)
+    if ids is None:
         raise RuntimeError(
             "У сообщения нет идентификатора в Telegram — менять нечего. "
             "Так бывает у перенесённой истории: она не отправлялась через эту систему."
         )
+    chat_id, provider_message_id = ids
     try:
         tg_agent.api(
             "editMessageText",
             http_timeout=30,
             business_connection_id=payload["business_connection_id"],
-            chat_id=int(payload["external_chat_id"]),
-            message_id=int(provider_message_id),
+            chat_id=chat_id,
+            message_id=provider_message_id,
             text=str(payload["text"])[:4096],
         )
         return "bot"
@@ -687,8 +704,8 @@ def edit_delivered_message(payload: Mapping[str, Any]) -> str:
         if not tg_userbot.session_ready():
             raise RuntimeError(_no_peer_access_message(exc)) from exc
         tg_userbot.edit_message(
-            int(payload["external_chat_id"]),
-            int(provider_message_id),
+            chat_id,
+            provider_message_id,
             str(payload["text"])[:4096],
         )
         return "manager_account"
@@ -702,17 +719,18 @@ def delete_delivered_message(payload: Mapping[str, Any]) -> str:
     """
     import tg_agent
 
-    provider_message_id = payload.get("provider_message_id")
-    if not provider_message_id:
+    ids = _telegram_ids(payload)
+    if ids is None:
         # Локальная запись всё равно помечена удалённой — но честно скажем, что в
         # Telegram сообщения не тронули.
         return "local_only"
+    chat_id, provider_message_id = ids
     try:
         tg_agent.api(
             "deleteBusinessMessages",
             http_timeout=30,
             business_connection_id=payload["business_connection_id"],
-            message_ids=[int(provider_message_id)],
+            message_ids=[provider_message_id],
         )
         return "bot"
     except RuntimeError as exc:
@@ -721,16 +739,13 @@ def delete_delivered_message(payload: Mapping[str, Any]) -> str:
 
             if not tg_userbot.session_ready():
                 raise RuntimeError(_no_peer_access_message(exc)) from exc
-            tg_userbot.delete_message(
-                int(payload["external_chat_id"]),
-                int(provider_message_id),
-            )
+            tg_userbot.delete_message(chat_id, provider_message_id)
             return "manager_account"
         tg_agent.api(
             "deleteMessage",
             http_timeout=30,
-            chat_id=int(payload["external_chat_id"]),
-            message_id=int(provider_message_id),
+            chat_id=chat_id,
+            message_id=provider_message_id,
         )
         return "bot"
 

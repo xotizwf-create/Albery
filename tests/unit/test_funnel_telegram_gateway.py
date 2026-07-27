@@ -935,3 +935,23 @@ def test_edit_falls_back_to_the_manager_account_when_the_bot_has_no_access(monke
 
     assert applied == "manager_account"
     assert edited == {"peer_id": 212850563, "message_id": 712, "text": "Новый текст"}
+
+
+def test_non_numeric_identifiers_give_a_clear_refusal_not_a_crash():
+    """У перенесённой истории идентификаторы нечисловые: это должно давать понятный
+    отказ, а не падение на приведении типа (поймано проверкой на проде 27.07.2026)."""
+    payload = {
+        "external_chat_id": "selfcheck-b22ce9e3",
+        "business_connection_id": "bc-1",
+        "provider_message_id": "ours-b22ce9e3",
+        "text": "Новый текст",
+    }
+
+    try:
+        gateway.edit_delivered_message(payload)
+    except RuntimeError as exc:
+        assert "нет идентификатора" in str(exc)
+    else:
+        raise AssertionError("ожидался понятный отказ")
+
+    assert gateway.delete_delivered_message(payload) == "local_only"
