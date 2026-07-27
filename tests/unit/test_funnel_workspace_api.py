@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from flask import Flask
@@ -660,3 +660,135 @@ def test_deleting_a_delivered_message_still_goes_through_telegram(client, monkey
 
     assert response.status_code == 200
     assert response.get_json()["applied_by"] == "bot"
+
+
+def _payload(**overrides):
+    row = {
+        "id": 41,
+        "source_key": "telegram",
+        "external_chat_id": "9001",
+        "external_user_id": 9001,
+        "status": "open",
+        "control_mode": "ai",
+        "resume_at": None,
+        "state_version": 3,
+        "reply_deadline_at": None,
+        "awaiting_reply_since": None,
+        "has_answer": True,
+    }
+    row.update(overrides)
+    return workspace._conversation_payload(row)
+
+
+def test_control_badge_says_who_runs_the_conversation():
+    """Третий бейдж — про исполнителя: ИИ, человек или никто."""
+    assert _payload(control_mode="ai")["control_label"] == "ИИ управляет"
+    assert _payload(control_mode="human")["control_label"] == "Человек управляет"
+    assert _payload(control_mode="paused")["control_label"] == "Ответы приостановлены"
+
+
+def test_full_takeover_is_visible_as_a_separate_flag_not_a_fourth_badge():
+    """Полный перехват остаётся «Человек управляет»: оператору важно, что отвечает
+    человек, а бессрочность — отдельная пометка, а не ещё один статус."""
+    lease = datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
+    temporary = _payload(control_mode="human", resume_at=lease)
+    permanent = _payload(control_mode="human", resume_at=None)
+
+    assert temporary["control_label"] == permanent["control_label"] == "Человек управляет"
+    assert temporary["control_permanent"] is False
+    assert permanent["control_permanent"] is True
+
+
+def test_queue_priority_matches_the_owner_order():
+    """Очень срочно → новый клиент → клиент ждёт ответа → ждём ответа от клиента."""
+    long_ago = datetime.now(timezone.utc) - timedelta(hours=5)
+    just_now = datetime.now(timezone.utc)
+
+    urgent = _payload(has_answer=True, awaiting_reply_since=long_ago)
+    new_client = _payload(has_answer=False, awaiting_reply_since=just_now)
+    client_waiting = _payload(has_answer=True, awaiting_reply_since=just_now)
+    waiting_client = _payload(has_answer=True, awaiting_reply_since=None)
+
+    assert urgent["urgent"] is True
+    assert [
+        urgent["priority"],
+        new_client["priority"],
+        client_waiting["priority"],
+        waiting_client["priority"],
+    ] == [1, 2, 3, 4]
+    assert new_client["work_state_label"] == "Новый клиент"
+    assert client_waiting["work_state_label"] == "Клиент ждёт ответа"
+    assert waiting_client["work_state_label"] == "Ждём ответа от клиента"
+
+
+def test_a_new_client_left_waiting_becomes_urgent_too():
+    """Незнакомец, которому не ответили полчаса, — самая горячая строка списка, а не
+    просто «новый»."""
+    long_ago = datetime.now(timezone.utc) - timedelta(minutes=45)
+    row = _payload(has_answer=False, awaiting_reply_since=long_ago)
+
+    assert row["work_state"] == workspace.store.WORK_STATE_NEW
+    assert row["urgent"] is True
+    assert row["priority"] == 1
+
+
+def test_full_takeover_is_passed_through_the_control_endpoint(client, monkeypatch):
+    """Кнопка «Веду сам» обязана доехать до хранилища именно как полный перехват."""
+    session_payload = login(client)
+    captured = {}
+
+    def transition(conversation_id, **kwargs):
+        captured.update({"conversation_id": conversation_id, **kwargs})
+        return {
+            "id": conversation_id,
+            "control_mode": "human",
+            "resume_at": None,
+            "state_version": 4,
+            "status": "open",
+            "source_key": "telegram",
+            "external_chat_id": "9001",
+            "external_user_id": 9001,
+        }
+
+    monkeypatch.setattr(workspace.store, "transition_control", transition)
+    response = client.post(
+        "/api/funnel-workspace/conversations/41/control",
+        json={"mode": "human", "permanent": True, "expected_version": 3},
+        headers={"Origin": ORIGIN, "X-CSRF-Token": session_payload["csrf_token"]},
+    )
+
+    assert response.status_code == 200
+    assert captured["permanent"] is True
+    assert captured["mode"] == "human"
+    body = response.get_json()["conversation"]
+    assert body["control_permanent"] is True
+    assert body["control_label"] == "Человек управляет"
+
+
+def test_an_ordinary_takeover_is_not_permanent(client, monkeypatch):
+    captured = {}
+
+    def transition(conversation_id, **kwargs):
+        captured.update(kwargs)
+        return {
+            "id": conversation_id,
+            "control_mode": "human",
+            "resume_at": datetime(2026, 7, 27, 12, 2, tzinfo=timezone.utc),
+            "state_version": 4,
+            "status": "open",
+            "source_key": "telegram",
+            "external_chat_id": "9001",
+            "external_user_id": 9001,
+        }
+
+    session_payload = login(client)
+    monkeypatch.setattr(workspace.store, "transition_control", transition)
+    response = client.post(
+        "/api/funnel-workspace/conversations/41/control",
+        json={"mode": "human", "expected_version": 3},
+        headers={"Origin": ORIGIN, "X-CSRF-Token": session_payload["csrf_token"]},
+    )
+
+    assert response.status_code == 200
+    assert captured["permanent"] is False
+    assert response.get_json()["conversation"]["control_permanent"] is False

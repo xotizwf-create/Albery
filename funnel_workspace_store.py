@@ -14,7 +14,17 @@ from shared.db import connect as pg_connect
 # Момент, с которого клиент ждёт ответа: время самого раннего его сообщения, после
 # которого ни агент, ни оператор ничего не отправили. NULL — ответ уже дан. Считается
 # запросом, а не хранится в колонке: любое расхождение с перепиской здесь невозможно.
-AWAITING_REPLY_SQL = """(
+# Что считается НАШИМ ОТВЕТОМ клиенту. Ответом не является то, чего клиент не видел:
+# отменённая и неудавшаяся отправка, а также сообщение, которое мы сами удалили. Из
+# последнего следует требование владельца: удалили свой ответ — обращение возвращается
+# в прежний статус, как будто мы ещё не отвечали.
+ANSWER_IS_REAL_SQL = """(
+    answer.author_type IN ('agent', 'operator')
+    AND answer.delivery_status NOT IN ('cancelled', 'failed')
+    AND (answer.metadata ->> 'telegram_deleted') IS DISTINCT FROM 'true'
+)"""
+
+AWAITING_REPLY_SQL = f"""(
     SELECT min(client.occurred_at)
       FROM funnel_workspace_messages client
      WHERE client.conversation_id = c.id
@@ -23,19 +33,16 @@ AWAITING_REPLY_SQL = """(
                SELECT max(answer.id)
                  FROM funnel_workspace_messages answer
                 WHERE answer.conversation_id = c.id
-                  AND answer.author_type IN ('agent', 'operator')
-                  AND answer.delivery_status <> 'cancelled'
+                  AND {ANSWER_IS_REAL_SQL}
            ), 0)
 )"""
 
-# Отвечали ли мы в этом диалоге хоть раз. Отменённый ответ ответом не считается —
-# клиент его не видел.
-HAS_ANSWER_SQL = """EXISTS (
+# Отвечали ли мы в этом диалоге хоть раз.
+HAS_ANSWER_SQL = f"""EXISTS (
     SELECT 1
       FROM funnel_workspace_messages answer
      WHERE answer.conversation_id = c.id
-       AND answer.author_type IN ('agent', 'operator')
-       AND answer.delivery_status <> 'cancelled'
+       AND {ANSWER_IS_REAL_SQL}
 )"""
 
 # Рабочие состояния обращения. Считаются по переписке, а не хранятся: любое хранимое
@@ -54,9 +61,25 @@ VALID_WORK_STATES = frozenset({
 
 WORK_STATE_LABELS = {
     WORK_STATE_NEW: "Новый клиент",
-    WORK_STATE_CLIENT_WAITING: "Клиент ждёт ответ",
-    WORK_STATE_WAITING_CLIENT: "Ждём ответ клиента",
+    WORK_STATE_CLIENT_WAITING: "Клиент ждёт ответа",
+    WORK_STATE_WAITING_CLIENT: "Ждём ответа от клиента",
     WORK_STATE_URGENT: "Очень срочно",
+}
+
+# Порядок разбора очереди (владелец, 27.07.2026). Меньше число — выше в списке.
+# Срочность важнее новизны: просроченный вопрос не должен уезжать вниз под свежими.
+WORK_STATE_PRIORITY = {
+    WORK_STATE_URGENT: 1,
+    WORK_STATE_NEW: 2,
+    WORK_STATE_CLIENT_WAITING: 3,
+    WORK_STATE_WAITING_CLIENT: 4,
+}
+
+# Кто ведёт разговор. Третий бейдж обращения — он про исполнителя, а не про очередь хода.
+CONTROL_MODE_LABELS = {
+    "ai": "ИИ управляет",
+    "human": "Человек управляет",
+    "paused": "Ответы приостановлены",
 }
 
 VALID_STATUSES = frozenset({"new", "open", "waiting", "closed", "spam", "expired"})
@@ -155,6 +178,18 @@ def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int
     except (TypeError, ValueError):
         value = default
     return min(maximum, max(minimum, value))
+
+
+def is_permanent_hold(conversation: Mapping[str, Any]) -> bool:
+    """Диалог забран человеком НАСОВСЕМ.
+
+    Признак — режим человека без срока возврата: возврат аренды смотрит только на строки
+    с непустым ``resume_at``, поэтому пустой срок и означает «ИИ сюда не вернётся сам».
+    """
+    return (
+        str(conversation.get("control_mode") or "") == "human"
+        and conversation.get("resume_at") in (None, "")
+    )
 
 
 def _now(value: datetime | None = None) -> datetime:
@@ -1097,27 +1132,37 @@ def list_conversations(
         params.extend([pattern] * 6)
     params.extend([limit, offset])
 
+    urgent_threshold = f"now() - interval '{urgent_after_minutes()} minutes'"
     with _connection(connect) as conn:
         with conn.cursor() as cur:
+            # Признаки считаются во вложенном запросе, а порядок задаётся снаружи: внутри
+            # выражения ORDER BY PostgreSQL псевдонимы не видит, и без вложенности пришлось
+            # бы повторить оба подзапроса в каждой ветке CASE.
             cur.execute(
                 f"""
-                SELECT c.*, s.source_type, s.display_name AS source_name,
-                       {AWAITING_REPLY_SQL} AS awaiting_reply_since,
-                       {HAS_ANSWER_SQL} AS has_answer,
-                       count(*) OVER () AS filtered_total
-                  FROM funnel_workspace_conversations c
-                  JOIN funnel_workspace_sources s ON s.source_key = c.source_key
-                 WHERE {' AND '.join(clauses)}
+                SELECT * FROM (
+                    SELECT c.*, s.source_type, s.display_name AS source_name,
+                           {AWAITING_REPLY_SQL} AS awaiting_reply_since,
+                           {HAS_ANSWER_SQL} AS has_answer,
+                           count(*) OVER () AS filtered_total
+                      FROM funnel_workspace_conversations c
+                      JOIN funnel_workspace_sources s ON s.source_key = c.source_key
+                     WHERE {' AND '.join(clauses)}
+                ) ranked
                  ORDER BY
-                       -- Дольше всех ждущий клиент — вверху списка: срочность важнее
-                       -- новизны, иначе просроченный вопрос уезжает вниз под свежими.
-                       -- Псевдоним допустим только как самостоятельная ссылка: внутри
-                       -- выражения PostgreSQL его не видит, поэтому NULLS LAST, а не
-                       -- отдельный признак «ждёт ли ответа».
+                       -- Очередь разбора владельца: очень срочно → новый клиент →
+                       -- клиент ждёт ответа → ждём ответа от клиента.
+                       CASE
+                           WHEN awaiting_reply_since <= {urgent_threshold} THEN 1
+                           WHEN NOT has_answer THEN 2
+                           WHEN awaiting_reply_since IS NOT NULL THEN 3
+                           ELSE 4
+                       END,
+                       -- Внутри группы первым разбирают того, кто ждёт дольше.
                        awaiting_reply_since ASC NULLS LAST,
-                       (c.unread_count > 0) DESC,
-                       c.last_message_at DESC NULLS LAST,
-                       c.id DESC
+                       (unread_count > 0) DESC,
+                       last_message_at DESC NULLS LAST,
+                       id DESC
                  LIMIT %s OFFSET %s
                 """,
                 tuple(params),
@@ -1488,18 +1533,36 @@ def transition_control(
     actor_name: str | None = None,
     reason: str | None = None,
     lease_seconds: int | None = None,
+    permanent: bool = False,
     now: datetime | None = None,
     connect: ConnectFactory | None = None,
 ) -> dict[str, Any]:
+    """Передать разговор ИИ, человеку или поставить на паузу.
+
+    ``permanent=True`` вместе с ``human`` — это ПОЛНЫЙ перехват: диалог остаётся за
+    человеком, пока он сам не вернёт его ИИ. Обычный перехват держится арендой в
+    ``FUNNEL_WORKSPACE_HUMAN_LEASE_SECONDS`` и сам истекает; полный не истекает никогда,
+    потому что признак «навсегда» — это ``resume_at IS NULL``, а возврат аренды смотрит
+    только на строки с непустым ``resume_at``.
+    """
     clean_mode = str(mode or "").strip().lower()
     clean_actor = str(actor_type or "").strip().lower()
     if clean_mode not in VALID_CONTROL_MODES:
         raise WorkspaceValidationError("Неизвестный режим управления.", details={"mode": clean_mode})
     if clean_actor not in {"agent", "operator", "system"}:
         raise WorkspaceValidationError("Неизвестный тип автора.", details={"actor_type": clean_actor})
+    if permanent and clean_mode != "human":
+        raise WorkspaceValidationError(
+            "Полный перехват — это режим человека; для ИИ и паузы он смысла не имеет.",
+            details={"mode": clean_mode},
+        )
     timestamp = _now(now)
     lease = human_lease_seconds() if lease_seconds is None else max(10, min(86_400, int(lease_seconds)))
-    resume_at = timestamp + timedelta(seconds=lease) if clean_mode == "human" else None
+    resume_at = (
+        None
+        if permanent or clean_mode != "human"
+        else timestamp + timedelta(seconds=lease)
+    )
 
     with _connection(connect) as conn:
         with conn.cursor() as cur:
@@ -2159,14 +2222,22 @@ def ingest_business_message(
                     "Новое сообщение клиента отменило незавершённый ответ ИИ.",
                 )
             if clean_author == "operator":
+                held_forever = is_permanent_hold(conversation)
                 new_mode = "human"
                 lease = (
                     human_lease_seconds()
                     if operator_lease_seconds is None
                     else max(10, min(86_400, int(operator_lease_seconds)))
                 )
-                resume_at = timestamp + timedelta(seconds=lease)
-                assigned_to = _clean_optional(author_name, 200) or "Оператор"
+                # Полный перехват ответом не сбрасывается: иначе первая же реплика
+                # человека превратила бы «веду сам» в двухминутную аренду, и ИИ
+                # заговорил бы в диалоге, который у него забрали насовсем.
+                resume_at = None if held_forever else timestamp + timedelta(seconds=lease)
+                assigned_to = (
+                    conversation.get("assigned_to")
+                    if held_forever
+                    else _clean_optional(author_name, 200) or "Оператор"
+                )
                 if next_status in {"closed", "expired", "waiting"}:
                     next_status = "open"
                 _cancel_queued_ai(
@@ -2533,14 +2604,19 @@ def _enqueue_outgoing(
             next_status = str(row["status"])
             if clean_author == "operator":
                 _reject_if_agent_send_in_progress(cur, int(row["id"]))
+                held_forever = is_permanent_hold(row)
                 lease = (
                     human_lease_seconds()
                     if operator_lease_seconds is None
                     else max(10, min(86_400, int(operator_lease_seconds)))
                 )
                 next_mode = "human"
-                next_resume_at = timestamp + timedelta(seconds=lease)
-                next_assignee = _clean_optional(author_name, 200) or "Оператор"
+                # Полный перехват ответом не сбрасывается — см. ingest_business_message.
+                next_resume_at = (
+                    None if held_forever else timestamp + timedelta(seconds=lease)
+                )
+                if not held_forever:
+                    next_assignee = _clean_optional(author_name, 200) or "Оператор"
                 if next_status in {"new", "waiting"}:
                     next_status = "open"
                 _cancel_queued_ai(

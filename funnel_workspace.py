@@ -658,9 +658,17 @@ def workspace_meta() -> tuple[Response, int]:
                 {"key": "expired", "value": "expired", "label": "Истекло окно ответа"},
             ],
             "control_modes": [
-                {"key": "ai", "label": "Отвечает ИИ"},
-                {"key": "human", "label": "Отвечает человек"},
-                {"key": "paused", "label": "Ответы приостановлены"},
+                {"key": key, "label": label}
+                for key, label in store.CONTROL_MODE_LABELS.items()
+            ],
+            # Очередь разбора: в этом же порядке список приходит с сервера.
+            "work_state_priority": [
+                {"value": value, "label": store.WORK_STATE_LABELS[value],
+                 "priority": store.WORK_STATE_PRIORITY[value]}
+                for value in sorted(
+                    store.WORK_STATE_PRIORITY,
+                    key=store.WORK_STATE_PRIORITY.__getitem__,
+                )
             ],
             "human_lease_seconds": store.human_lease_seconds(),
             "reply_window_hours": store.reply_window_hours(),
@@ -734,6 +742,19 @@ def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
         and waiting_minutes >= store.urgent_after_minutes()
     )
     payload["urgency"] = "urgent" if payload["urgent"] else "working"
+    # Место в очереди разбора — тот же порядок, в котором список приходит с сервера.
+    payload["priority"] = store.WORK_STATE_PRIORITY[
+        store.WORK_STATE_URGENT if payload["urgent"] else payload["work_state"]
+    ]
+
+    # Третий бейдж — кто ведёт разговор. Полный перехват остаётся «Человек управляет»:
+    # для оператора важно, что отвечает человек, а бессрочность видна отдельной пометкой.
+    control_mode = str(payload.get("control_mode") or "")
+    payload["control_label"] = store.CONTROL_MODE_LABELS.get(
+        control_mode,
+        store.CONTROL_MODE_LABELS["paused"],
+    )
+    payload["control_permanent"] = store.is_permanent_hold(payload)
     return payload
 
 
@@ -899,20 +920,27 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
                 409,
                 "ai_rollout_disabled",
             )
+    permanent = bool(body.get("permanent"))
+    default_reason = (
+        "Оператор ведёт диалог сам — ИИ отключён в этом обращении."
+        if permanent
+        else "Переключено из рабочего окна."
+    )
     conversation = store.transition_control(
         conversation_id,
         mode=mode,
         expected_version=body.get("expected_version"),
         actor_type="operator",
         actor_name=workspace_operator_name(),
-        reason=str(body.get("reason") or "Переключено из рабочего окна."),
+        reason=str(body.get("reason") or default_reason),
         lease_seconds=(
             int(body["lease_seconds"])
             if body.get("lease_seconds") not in (None, "")
             else None
         ),
+        permanent=permanent,
     )
-    return _json({"conversation": conversation})
+    return _json({"conversation": _conversation_payload(dict(conversation))})
 
 
 @funnel_workspace_bp.patch(f"{API_PREFIX}/messages/<int:message_id>")

@@ -304,6 +304,8 @@ export const funnelWorkspaceApi = {
     conversationId: Conversation["id"],
     payload: {
       mode: "human" | "ai";
+      /** Полный перехват: ИИ не вернётся сам, пока оператор не отдаст диалог обратно. */
+      permanent?: boolean;
       expected_version: number;
       csrf_token: string;
     },

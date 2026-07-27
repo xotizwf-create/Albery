@@ -73,6 +73,12 @@ export interface Conversation {
   work_state_label?: string;
   urgent?: boolean;
   waiting_minutes?: number | null;
+  /** Место в очереди разбора: 1 — очень срочно, 4 — ждём ответа от клиента. */
+  priority?: number;
+  /** Третий бейдж: «ИИ управляет» / «Человек управляет» / «Ответы приостановлены». */
+  control_label?: string;
+  /** Диалог забран человеком насовсем: ИИ сам не вернётся. */
+  control_permanent?: boolean;
   /** Постоянный адрес обращения: /agent-funnels/<id>. */
   url?: string;
   stage_name: string | null;

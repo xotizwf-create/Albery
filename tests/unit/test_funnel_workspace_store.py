@@ -1069,7 +1069,7 @@ def test_crm_action_claim_serializes_stage_sets_per_conversation():
 
 def test_conversation_search_looks_through_the_whole_retained_history():
     def respond(sql, _params):
-        if sql.startswith("SELECT c.*, s.source_type"):
+        if "SELECT c.*, s.source_type" in sql:
             return []
         raise AssertionError(sql)
 
@@ -1085,7 +1085,7 @@ def test_conversation_list_reports_how_long_the_client_waits_for_an_answer():
     """Срочность считается по переписке, а не по отдельному полю: вопрос без ответа —
     это клиентское сообщение новее последнего исходящего."""
     def respond(sql, _params):
-        if sql.startswith("SELECT c.*, s.source_type"):
+        if "SELECT c.*, s.source_type" in sql:
             return []
         raise AssertionError(sql)
 
@@ -1095,9 +1095,13 @@ def test_conversation_list_reports_how_long_the_client_waits_for_an_answer():
     sql, _params = connection.cursor_instance.executed[0]
     assert "awaiting_reply_since" in sql
     assert "author_type IN ('agent', 'operator')" in sql
-    assert "delivery_status <> 'cancelled'" in sql
-    # Дольше всех ждущий клиент обязан быть вверху списка. Псевдоним допустим только
-    # как самостоятельная ссылка — внутри выражения PostgreSQL его не видит.
+    # Ответом клиенту не является то, чего он не видел: отменённое, неудавшееся и
+    # удалённое нами. Иначе удаление своего ответа не вернуло бы прежний статус.
+    assert "delivery_status NOT IN ('cancelled', 'failed')" in sql
+    assert "(answer.metadata ->> 'telegram_deleted') IS DISTINCT FROM 'true'" in sql
+    # Очередь разбора владельца: очень срочно → новый клиент → клиент ждёт ответа →
+    # ждём ответа от клиента; внутри группы первым — кто ждёт дольше.
+    assert "WHEN NOT has_answer THEN 2" in sql
     assert "awaiting_reply_since ASC NULLS LAST" in sql
 
 
@@ -1182,7 +1186,7 @@ def test_urgency_filter_uses_the_same_threshold_as_the_badge():
     """«urgency» осталась ради инструментов агента: urgent — тот же срочный статус,
     working — «Ждём ответ клиента» (мы ответили последними)."""
     def respond(sql, _params):
-        if sql.startswith("SELECT c.*, s.source_type"):
+        if "SELECT c.*, s.source_type" in sql:
             return []
         raise AssertionError(sql)
 
@@ -1195,10 +1199,14 @@ def test_urgency_filter_uses_the_same_threshold_as_the_badge():
     working_sql, _params = connection.cursor_instance.executed[0]
 
     minutes = store.urgent_after_minutes()
-    assert f"interval '{minutes} minutes'" in urgent_sql
-    # «Ждём ответ клиента» — про очередь хода, а не про время, порога здесь быть не должно.
-    assert f"interval '{minutes} minutes'" not in working_sql
-    assert "IS NULL" in working_sql
+    # Порог живёт и в ОТБОРЕ, и в порядке списка, поэтому сравнивать надо именно
+    # условие отбора: в порядке он есть всегда, и без разделения тест ничего не ловит.
+    urgent_filter = urgent_sql.split(") ranked")[0]
+    working_filter = working_sql.split(") ranked")[0]
+    assert f"interval '{minutes} minutes'" in urgent_filter
+    # «Ждём ответ клиента» — про очередь хода, а не про время: порога в отборе нет.
+    assert f"interval '{minutes} minutes'" not in working_filter
+    assert "IS NULL" in working_filter
 
 
 def test_unknown_urgency_is_refused():
@@ -1265,7 +1273,7 @@ def test_conversation_list_filters_by_funnel_stage():
     # Этап — код сделки в Битриксе, а не наш перечень: белого списка тут быть не должно,
     # иначе новый этап у владельца молча перестанет фильтроваться.
     def respond(sql, _params):
-        if sql.startswith("SELECT c.*, s.source_type"):
+        if "SELECT c.*, s.source_type" in sql:
             return []
         raise AssertionError(sql)
 
@@ -1351,7 +1359,7 @@ def test_work_state_filters_use_the_answer_fact_not_a_stored_field():
     """Четыре статуса считаются по переписке: «Новый клиент» — пока нет ни одного нашего
     ответа, «Клиент ждёт ответ» — пока последнее слово за ним."""
     def respond(sql, _params):
-        if sql.startswith("SELECT c.*, s.source_type"):
+        if "SELECT c.*, s.source_type" in sql:
             return []
         raise AssertionError(sql)
 
@@ -1365,9 +1373,14 @@ def test_work_state_filters_use_the_answer_fact_not_a_stored_field():
     assert "IS NOT NULL" in captured["client_waiting"]
     assert "IS NULL" in captured["waiting_client"]
     assert f"interval '{store.urgent_after_minutes()} minutes'" in captured["urgent"]
-    # Признак «отвечали ли мы» обязан считаться по неотменённым ответам.
+    # Признак «отвечали ли мы» обязан считаться по ответам, которые клиент ВИДЕЛ:
+    # отменённое, неудавшееся и удалённое нами ответом не является.
     assert "author_type IN ('agent', 'operator')" in captured["new_client"]
-    assert "delivery_status <> 'cancelled'" in captured["new_client"]
+    assert "delivery_status NOT IN ('cancelled', 'failed')" in captured["new_client"]
+    assert (
+        "(answer.metadata ->> 'telegram_deleted') IS DISTINCT FROM 'true'"
+        in captured["new_client"]
+    )
 
 
 def test_unknown_work_state_is_refused():

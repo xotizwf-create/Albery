@@ -959,7 +959,7 @@ function ControlBadge({
         )}
       >
         <Sparkles className={compact ? "h-3 w-3" : "h-3.5 w-3.5"} />
-        ИИ отвечает
+        {conversation.control_label || "ИИ управляет"}
       </span>
     );
   }
@@ -973,12 +973,19 @@ function ControlBadge({
         )}
       >
         <Clock3 className={compact ? "h-3 w-3" : "h-3.5 w-3.5"} />
-        Ответы приостановлены
+        {conversation.control_label || "Ответы приостановлены"}
       </span>
     );
   }
 
+  // Человек ведёт разговор. Насовсем или на время — видно припиской: бейдж один и тот же,
+  // потому что оператору в первую очередь важно, что отвечает человек.
   const lease = formatLease(conversation.resume_at, now);
+  const note = conversation.control_permanent
+    ? " · веду сам"
+    : lease.remaining > 0
+      ? ` · ${lease.text}`
+      : " · возврат ИИ…";
   return (
     <span
       className={cn(
@@ -987,7 +994,7 @@ function ControlBadge({
       )}
     >
       <UserRound className={compact ? "h-3 w-3" : "h-3.5 w-3.5"} />
-      {lease.remaining > 0 ? `Человек · ${lease.text}` : "Возврат ИИ…"}
+      {(conversation.control_label || "Человек управляет") + note}
     </span>
   );
 }
@@ -1651,7 +1658,7 @@ function ChatPanel({
   onLoadOlder: () => void;
   onSend: (text: string) => void;
   onRetry: (message: ConversationMessage) => void;
-  onControl: (mode: "human" | "ai") => void;
+  onControl: (mode: "human" | "ai", permanent?: boolean) => void;
   onMessageContextMenu: (
     message: ConversationMessage,
     position: { x: number; y: number },
@@ -1775,6 +1782,18 @@ function ChatPanel({
                   ? "Вернуть ИИ"
                   : "ИИ недоступен"}
           </button>
+          {!conversation.control_permanent && (
+            <button
+              type="button"
+              onClick={() => onControl("human", true)}
+              disabled={controlBusy || !canReply}
+              title="ИИ больше не будет отвечать в этом диалоге, пока вы не вернёте ему управление"
+              className="hidden h-10 items-center justify-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 text-xs font-bold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-50 sm:inline-flex"
+            >
+              <UserRound className="h-4 w-4" />
+              Веду сам
+            </button>
+          )}
           <button
             type="button"
             onClick={onShowDetails}
@@ -1786,7 +1805,15 @@ function ChatPanel({
         </div>
       </header>
 
-      {conversation.control_mode === "human" && lease && (
+      {conversation.control_mode === "human" && conversation.control_permanent && (
+        <div className="flex shrink-0 items-center justify-center gap-2 border-b border-emerald-100 bg-emerald-50 px-4 py-2 text-center text-[11px] font-semibold text-emerald-800">
+          <UserRound className="h-3.5 w-3.5" />
+          Вы ведёте диалог сами. ИИ здесь не отвечает и сам не вернётся — нажмите «Вернуть
+          ИИ», когда захотите передать разговор обратно.
+        </div>
+      )}
+
+      {conversation.control_mode === "human" && !conversation.control_permanent && lease && (
         <div className="flex shrink-0 items-center justify-center gap-2 border-b border-emerald-100 bg-emerald-50 px-4 py-2 text-center text-[11px] font-semibold text-emerald-800">
           <Clock3 className="h-3.5 w-3.5" />
           {lease.remaining > 0
@@ -1990,7 +2017,7 @@ function ConversationDetails({
   controlBusy: boolean;
   stageBusy: boolean;
   onClose?: () => void;
-  onControl: (mode: "human" | "ai") => void;
+  onControl: (mode: "human" | "ai", permanent?: boolean) => void;
   onStage: (stage: string) => void;
 }) {
   const lease = formatLease(conversation.resume_at, now);
@@ -2123,6 +2150,8 @@ function ConversationDetails({
               ? "Агент видит новые сообщения и отвечает клиенту по сценарию."
               : conversation.control_mode === "paused"
                 ? "Ответы приостановлены. Можно взять диалог себе или подключить разрешённого ИИ."
+              : conversation.control_permanent
+                ? "Диалог полностью за вами: ИИ здесь не отвечает и сам не вернётся."
               : lease.remaining > 0
                 ? `Агент молчит ещё ${lease.text}. Ответ менеджера начинает двухминутный интервал заново.`
                 : "Ручной интервал закончился. ИИ скоро продолжит диалог."}
@@ -2162,6 +2191,17 @@ function ConversationDetails({
             >
               <Bot className="h-4 w-4" />
               Подключить ИИ
+            </button>
+          )}
+          {canReply && !conversation.control_permanent && (
+            <button
+              type="button"
+              onClick={() => onControl("human", true)}
+              disabled={controlBusy}
+              className="mt-2 inline-flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 text-xs font-bold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-60"
+            >
+              <UserRound className="h-4 w-4" />
+              Веду сам — ИИ не отвечает
             </button>
           )}
         </section>
@@ -2770,9 +2810,13 @@ function OperatorWorkspace({
     }
   };
 
-  const setControl = async (mode: "human" | "ai") => {
+  const setControl = async (mode: "human" | "ai", permanent = false) => {
     const conversation = selectedConversation;
-    if (!conversation || controlBusy || conversation.control_mode === mode) return;
+    if (!conversation || controlBusy) return;
+    // Полный перехват из режима «человек» — не смена режима, а снятие срока возврата,
+    // поэтому одинаковый режим здесь блокировать нельзя.
+    if (conversation.control_mode === mode && !permanent) return;
+    if (permanent && conversation.control_permanent) return;
     if (conversation.can_reply === false) {
       setToast({
         message: "Управление недоступно до нового сообщения клиента.",
@@ -2791,15 +2835,18 @@ function OperatorWorkspace({
     try {
       await funnelWorkspaceApi.setControl(conversation.id, {
         mode,
+        permanent,
         expected_version: conversation.state_version,
         csrf_token: csrfToken(),
       });
       await refreshSelected();
       setToast({
         message:
-          mode === "human"
-            ? "ИИ остановлен на 2 минуты. Можно отвечать клиенту."
-            : "Управление возвращено ИИ-агенту.",
+          mode === "ai"
+            ? "Управление возвращено ИИ-агенту."
+            : permanent
+              ? "Вы ведёте диалог сами. ИИ здесь больше не отвечает, пока вы не вернёте его."
+              : "ИИ остановлен на 2 минуты. Можно отвечать клиенту.",
         tone: "success",
       });
     } catch (error) {
@@ -3008,9 +3055,13 @@ function OperatorWorkspace({
               onSelect={chooseConversation}
               onRefresh={() => void loadConversations(false)}
               onLoadMore={() => void loadMoreConversations()}
-              onConversationContextMenu={(conversation, position) =>
-                setContextMenu({ ...position, conversation })
-              }
+              onConversationContextMenu={(conversation, position) => {
+                // Пункты меню работают с ВЫБРАННЫМ диалогом, поэтому правый клик
+                // обязан сначала выбрать тот, по которому кликнули: иначе «Веду сам»
+                // забрало бы управление в соседнем разговоре.
+                chooseConversation(conversation);
+                setContextMenu({ ...position, conversation });
+              }}
             />
           </div>
 
@@ -3045,7 +3096,7 @@ function OperatorWorkspace({
               }}
               onSend={(text) => void sendMessage(text)}
               onRetry={(message) => void sendMessage(message.text, message)}
-              onControl={(mode) => void setControl(mode)}
+              onControl={(mode, permanent) => void setControl(mode, permanent)}
               onMessageContextMenu={(message, position) =>
                 setMessageMenu({ ...position, message })
               }
@@ -3064,7 +3115,7 @@ function OperatorWorkspace({
                 now={now}
                 controlBusy={controlBusy}
                 stageBusy={stageBusy}
-                onControl={(mode) => void setControl(mode)}
+                onControl={(mode, permanent) => void setControl(mode, permanent)}
                 onStage={(nextStage) => void changeStage(nextStage)}
               />
             ) : (
@@ -3095,7 +3146,7 @@ function OperatorWorkspace({
               controlBusy={controlBusy}
               stageBusy={stageBusy}
               onClose={() => setDetailsOpen(false)}
-              onControl={(mode) => void setControl(mode)}
+              onControl={(mode, permanent) => void setControl(mode, permanent)}
               onStage={(nextStage) => void changeStage(nextStage)}
             />
           </aside>
@@ -3125,6 +3176,15 @@ function OperatorWorkspace({
                     !contextMenu.conversation.ai_available,
                   onSelect: () => void setControl("ai"),
                 },
+            {
+              key: "hold",
+              label: "Веду сам — ИИ не отвечает",
+              icon: <UserRound className="h-3.5 w-3.5" />,
+              disabled:
+                contextMenu.conversation.can_reply === false ||
+                Boolean(contextMenu.conversation.control_permanent),
+              onSelect: () => void setControl("human", true),
+            },
             {
               key: "delete",
               label: "Удалить диалог",
