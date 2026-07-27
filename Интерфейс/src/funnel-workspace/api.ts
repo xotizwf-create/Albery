@@ -270,7 +270,11 @@ export const funnelWorkspaceApi = {
     ),
 
   deleteMessage: (messageId: number, csrfToken: string) =>
-    request<{ message: ConversationMessage; applied_by: string }>(
+    request<{
+      message?: ConversationMessage;
+      applied_by: string;
+      purged?: boolean;
+    }>(
       `/messages/${messageId}`,
       {
         method: "DELETE",

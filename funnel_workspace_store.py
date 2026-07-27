@@ -63,6 +63,10 @@ VALID_STATUSES = frozenset({"new", "open", "waiting", "closed", "spam", "expired
 VALID_CONTROL_MODES = frozenset({"ai", "human", "paused"})
 VALID_AUTHOR_TYPES = frozenset({"client", "agent", "operator", "system"})
 VALID_DELIVERY_RESULTS = frozenset({"sent", "failed", "unknown", "cancelled"})
+# Статусы, при которых наш ответ ТОЧНО не дошёл до клиента: `failed` — Telegram отказал,
+# `cancelled` — отправка отменена до вызова. `unknown` сюда не входит намеренно: там
+# Telegram мог принять сообщение до сетевого таймаута.
+UNDELIVERED_STATUSES = frozenset({"failed", "cancelled"})
 VALID_UPDATE_LANES = frozenset({"business", "bot"})
 ACTIVE_STATUSES = frozenset({"new", "open", "waiting"})
 DEFAULT_SOURCE_KEY = "telegram"
@@ -602,6 +606,131 @@ def delete_message_for_everyone(
         "provider_message_id": row.get("provider_message_id"),
         "author_type": row.get("author_type"),
     }
+
+
+def purge_undelivered_message(
+    message_id: Any,
+    *,
+    actor_name: str | None = None,
+    now: datetime | None = None,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    """Убрать из журнала наш ответ, который до клиента так и не дошёл.
+
+    Надгробие «[Сообщение удалено]» описывает то, что у клиента БЫЛО и исчезло. Для
+    ответа со статусом `failed`/`cancelled` это неправда: клиент его никогда не видел, а
+    в переписке оператора остаётся вечный след от несуществующего сообщения (живой
+    случай 27.07.2026, диалог 69 — три ответа с `PEER_ID_INVALID`). Такую запись
+    удаляем совсем.
+
+    Доставленное и `unknown` не трогаем: у клиента текст остался (или мог остаться), и
+    вычистить его у себя значит соврать оператору о состоянии переписки.
+    """
+    item_id = _positive_int(message_id, "message_id")
+    timestamp = _now(now)
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            row = _message_with_chat(cur, item_id)
+            if str(row.get("author_type")) not in {"agent", "operator"}:
+                raise WorkspaceValidationError(
+                    "Убрать из журнала можно только наше сообщение.",
+                    details={"author_type": row.get("author_type")},
+                )
+            status = str(row.get("delivery_status") or "").strip().lower()
+            if status not in UNDELIVERED_STATUSES:
+                raise WorkspaceControlError(
+                    "Сообщение дошло до клиента или могло дойти — из журнала "
+                    "его убирать нельзя, только удалять у всех.",
+                    details={"delivery_status": status},
+                )
+            cur.execute(
+                """
+                SELECT count(*) AS live
+                  FROM funnel_workspace_outbox
+                 WHERE message_id = %s
+                   AND delivery_status IN ('pending', 'leased', 'sending')
+                """,
+                (item_id,),
+            )
+            live = int(dict(_record(cur.fetchone()) or {}).get("live") or 0)
+            if live:
+                raise WorkspaceControlError(
+                    "Сообщение ещё в очереди отправки: сначала дождитесь её "
+                    "завершения, иначе клиент получит текст, которого у нас уже нет.",
+                    details={"message_id": item_id},
+                )
+            conversation_id = int(row["conversation_id"])
+            # Очередь отправки и последствия доставки ссылаются на сообщение с
+            # ON DELETE CASCADE, задание ИИ и запись обновления — с SET NULL:
+            # отдельного прохода по ним не нужно.
+            cur.execute(
+                "DELETE FROM funnel_workspace_messages WHERE id = %s",
+                (item_id,),
+            )
+            conversation = _rebuild_conversation_counters_cursor(
+                cur,
+                conversation_id,
+                timestamp,
+            )
+    return {
+        "deleted": True,
+        "purged": True,
+        "message_id": item_id,
+        "conversation_id": conversation_id,
+        "conversation": conversation,
+        "delivery_status": status,
+        "actor_name": _clean_optional(actor_name, 200),
+    }
+
+
+def _rebuild_conversation_counters_cursor(
+    cur: Any,
+    conversation_id: int,
+    timestamp: datetime,
+) -> dict[str, Any]:
+    """Пересобрать превью, метку прочтения и счётчик непрочитанного по уцелевшей переписке.
+
+    После удаления сообщения эти поля остались бы от записи, которой больше нет, и
+    список обращений разъехался бы с самой перепиской.
+    """
+    cur.execute(
+        """
+        UPDATE funnel_workspace_conversations c
+           SET last_message_id = n.id,
+               last_message_at = COALESCE(n.occurred_at, c.last_message_at),
+               last_message_text = n.text,
+               last_author_type = n.author_type,
+               last_read_message_id = LEAST(
+                   c.last_read_message_id, COALESCE(n.id, 0)
+               ),
+               unread_count = (
+                   SELECT count(*)
+                     FROM funnel_workspace_messages m
+                    WHERE m.conversation_id = c.id
+                      AND m.author_type = 'client'
+                      AND m.id > LEAST(c.last_read_message_id, COALESCE(n.id, 0))
+               ),
+               updated_at = %s
+          FROM (SELECT %s::bigint AS conversation_id) AS t
+          LEFT JOIN LATERAL (
+                   SELECT m.id, m.occurred_at, m.text, m.author_type
+                     FROM funnel_workspace_messages m
+                    WHERE m.conversation_id = t.conversation_id
+                    ORDER BY m.id DESC
+                    LIMIT 1
+               ) n ON true
+         WHERE c.id = t.conversation_id
+     RETURNING c.*
+        """,
+        (timestamp, conversation_id),
+    )
+    updated = _record(cur.fetchone())
+    if updated is None:
+        raise WorkspaceNotFoundError(
+            "Диалог не найден.",
+            details={"conversation_id": conversation_id},
+        )
+    return updated
 
 
 def reopen_reply_windows(

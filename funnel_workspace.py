@@ -957,10 +957,38 @@ def message_edit(message_id: int) -> tuple[Response, int]:
 
 @funnel_workspace_bp.delete(f"{API_PREFIX}/messages/<int:message_id>")
 def message_delete(message_id: int) -> tuple[Response, int]:
-    """Удалить сообщение у обеих сторон."""
+    """Удалить сообщение у обеих сторон — или убрать из журнала, если оно не дошло.
+
+    Ответ со статусом `failed`/`cancelled` клиент никогда не видел: удалять в Telegram
+    нечего, а надгробие «[Сообщение удалено]» оставляло бы в переписке вечный след от
+    несуществующего сообщения.
+    """
     import funnel_telegram_gateway
 
     preview = store.message_delivery_target(message_id)
+    if (
+        str(preview.get("author_type")) in {"agent", "operator"}
+        and str(preview.get("delivery_status") or "").strip().lower()
+        in store.UNDELIVERED_STATUSES
+    ):
+        result = store.purge_undelivered_message(
+            message_id,
+            actor_name=workspace_operator_name(),
+        )
+        logger.warning(
+            "workspace message %s purged as undelivered (%s) by %s",
+            message_id,
+            result.get("delivery_status"),
+            workspace_operator_name() or "неизвестный оператор",
+        )
+        return _json(
+            {
+                "purged": True,
+                "applied_by": "never_delivered",
+                "conversation_id": result.get("conversation_id"),
+                "delivery_status": result.get("delivery_status"),
+            }
+        )
     try:
         applied_by = funnel_telegram_gateway.delete_delivered_message(preview)
     except RuntimeError as exc:

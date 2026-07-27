@@ -567,3 +567,96 @@ def test_admin_can_bootstrap_only_scrypt_hash_without_secret_in_response(
     assert "separate workspace password" not in captured["hash"]
     assert "hash" not in response.get_json()
     assert "password" not in response.get_data(as_text=True).lower()
+
+
+def test_deleting_a_failed_message_purges_it_without_touching_telegram(
+    client, monkeypatch
+):
+    """Живой случай 27.07.2026 (диалог 69, Evgenii Pal): ответ лёг с `PEER_ID_INVALID`.
+    Дёргать Telegram нечем и незачем — запись просто уходит из журнала."""
+    payload = login(client)
+    import funnel_telegram_gateway
+
+    calls: list[str] = []
+
+    def refuse(_payload):
+        calls.append("telegram")
+        raise AssertionError("Telegram не должен трогаться для недоставленного ответа.")
+
+    monkeypatch.setattr(funnel_telegram_gateway, "delete_delivered_message", refuse)
+    monkeypatch.setattr(
+        workspace.store,
+        "message_delivery_target",
+        lambda _message_id: {
+            "message_id": 98,
+            "conversation_id": 69,
+            "author_type": "operator",
+            "delivery_status": "failed",
+            "provider_message_id": None,
+        },
+    )
+    purged = {}
+
+    def purge(message_id, **kwargs):
+        purged.update({"message_id": message_id, **kwargs})
+        return {
+            "deleted": True,
+            "purged": True,
+            "message_id": message_id,
+            "conversation_id": 69,
+            "conversation": {"id": 69, "state_version": 3},
+            "delivery_status": "failed",
+        }
+
+    monkeypatch.setattr(workspace.store, "purge_undelivered_message", purge)
+    response = client.delete(
+        "/api/funnel-workspace/messages/98",
+        headers={"Origin": ORIGIN, "X-CSRF-Token": payload["csrf_token"]},
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["purged"] is True
+    assert body["applied_by"] == "never_delivered"
+    assert purged["actor_name"] == "Александр"
+    assert calls == []
+
+
+def test_deleting_a_delivered_message_still_goes_through_telegram(client, monkeypatch):
+    """Доставленное удаляем у обеих сторон — здесь надгробие остаётся правдой."""
+    payload = login(client)
+    import funnel_telegram_gateway
+
+    monkeypatch.setattr(
+        workspace.store,
+        "message_delivery_target",
+        lambda _message_id: {
+            "message_id": 55,
+            "conversation_id": 41,
+            "author_type": "operator",
+            "delivery_status": "sent",
+            "provider_message_id": "712",
+        },
+    )
+    monkeypatch.setattr(
+        funnel_telegram_gateway, "delete_delivered_message", lambda _payload: "bot"
+    )
+    monkeypatch.setattr(
+        workspace.store,
+        "delete_message_for_everyone",
+        lambda message_id, **_kwargs: {
+            "message": {"id": message_id, "text": "[Сообщение удалено]"}
+        },
+    )
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("Доставленное сообщение нельзя вычищать из журнала.")
+
+    monkeypatch.setattr(workspace.store, "purge_undelivered_message", refuse)
+    response = client.delete(
+        "/api/funnel-workspace/messages/55",
+        headers={"Origin": ORIGIN, "X-CSRF-Token": payload["csrf_token"]},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["applied_by"] == "bot"

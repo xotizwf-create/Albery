@@ -1378,6 +1378,16 @@ function ConversationList({
   );
 }
 
+// Наш ответ, который клиент точно не видел: в Telegram удалять нечего, а запись уходит
+// из журнала целиком. `unknown` сюда не входит — там Telegram мог принять сообщение.
+function neverDelivered(message: ConversationMessage): boolean {
+  const status = (message.delivery_status || "").toLowerCase();
+  return (
+    message.author_type !== "client" &&
+    (status === "failed" || status === "cancelled")
+  );
+}
+
 function DeliveryStatus({ message }: { message: ConversationMessage }) {
   const status = (message.delivery_status || "").toLowerCase();
   if (status === "unknown") {
@@ -2869,9 +2879,11 @@ function OperatorWorkspace({
       await refreshSelected();
       setToast({
         message:
-          result.applied_by === "local_only"
-            ? "Сообщение убрано из переписки, но в Telegram его удалить нечем: у записи нет идентификатора сообщения."
-            : "Сообщение удалено у обеих сторон.",
+          result.applied_by === "never_delivered"
+            ? "Сообщение удалено из системы: до клиента оно не дошло."
+            : result.applied_by === "local_only"
+              ? "Сообщение убрано из переписки, но в Telegram его удалить нечем: у записи нет идентификатора сообщения."
+              : "Сообщение удалено у обеих сторон.",
         tone: result.applied_by === "local_only" ? "info" : "success",
       });
     } catch (error) {
@@ -3145,7 +3157,9 @@ function OperatorWorkspace({
             },
             {
               key: "delete",
-              label: "Удалить у всех",
+              label: neverDelivered(messageMenu.message)
+                ? "Удалить из системы"
+                : "Удалить у всех",
               icon: <Trash2 className="h-3.5 w-3.5" />,
               onSelect: () => setPendingMessageDelete(messageMenu.message),
             },
@@ -3194,14 +3208,29 @@ function OperatorWorkspace({
 
       {pendingMessageDelete && (
         <ConfirmDialog
-          title="Удалить сообщение у всех?"
-          description={
-            <>
-              Сообщение исчезнет и у клиента в Telegram, и в переписке. Отменить это
-              нельзя.
-            </>
+          title={
+            neverDelivered(pendingMessageDelete)
+              ? "Удалить сообщение из системы?"
+              : "Удалить сообщение у всех?"
           }
-          confirmLabel="Удалить у всех"
+          description={
+            neverDelivered(pendingMessageDelete) ? (
+              <>
+                Сообщение не дошло до клиента — в Telegram его нет. Запись исчезнет
+                из переписки насовсем. Отменить это нельзя.
+              </>
+            ) : (
+              <>
+                Сообщение исчезнет и у клиента в Telegram, и в переписке. Отменить это
+                нельзя.
+              </>
+            )
+          }
+          confirmLabel={
+            neverDelivered(pendingMessageDelete)
+              ? "Удалить из системы"
+              : "Удалить у всех"
+          }
           busy={messageBusy}
           onConfirm={() => void applyMessageDelete()}
           onCancel={() => setPendingMessageDelete(null)}

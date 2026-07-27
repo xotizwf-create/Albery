@@ -1473,3 +1473,92 @@ def test_deleted_message_uses_the_same_tombstone_as_a_client_delete():
 
     assert result["message"]["text"] == "[Сообщение удалено]"
     assert result["provider_message_id"] == "712"
+
+
+def test_message_that_never_reached_the_client_is_removed_not_tombstoned():
+    """Живой случай 27.07.2026: диалог 69 (Evgenii Pal), три ответа оператора легли с
+    `failed` (`PEER_ID_INVALID`). Надгробие «[Сообщение удалено]» оставляет в переписке
+    след от того, чего клиент никогда не видел, — такую запись надо убирать совсем."""
+    statements: list[str] = []
+
+    def respond(sql, params):
+        statements.append(sql)
+        if sql.startswith("SELECT m.*, c.external_chat_id"):
+            return message_row(
+                id=98,
+                conversation_id=69,
+                delivery_status="failed",
+                provider_message_id=None,
+                text="123 тест",
+                conversation_last_message_id=98,
+            )
+        if sql.startswith("SELECT count(*) AS live FROM funnel_workspace_outbox"):
+            return {"live": 0}
+        if sql.startswith("DELETE FROM funnel_workspace_messages"):
+            return None
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            return conversation(id=69, last_message_id=95, last_message_text="Предыдущее")
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    result = store.purge_undelivered_message(98, actor_name="Юлия", now=NOW, connect=connect)
+
+    assert result["deleted"] is True
+    assert result["message_id"] == 98
+    assert result["conversation_id"] == 69
+    # Запись именно удаляется, а не переписывается надгробием.
+    assert any(sql.startswith("DELETE FROM funnel_workspace_messages") for sql in statements)
+    assert not any("'[Сообщение удалено]'" in sql for sql in statements)
+    # Превью и счётчик непрочитанного пересобираются по уцелевшей переписке.
+    assert result["conversation"]["last_message_id"] == 95
+
+
+def test_delivered_message_is_never_purged_from_the_journal():
+    """У клиента сообщение осталось — вычистить его у себя значит соврать оператору."""
+    def respond(sql, _params):
+        if sql.startswith("SELECT m.*, c.external_chat_id"):
+            return message_row(delivery_status="sent")
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    with pytest.raises(store.WorkspaceControlError):
+        store.purge_undelivered_message(55, connect=connect)
+
+
+def test_unknown_delivery_is_never_purged_from_the_journal():
+    """`unknown` значит «Telegram мог принять»: удалять такую запись — терять улику."""
+    def respond(sql, _params):
+        if sql.startswith("SELECT m.*, c.external_chat_id"):
+            return message_row(delivery_status="unknown")
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    with pytest.raises(store.WorkspaceControlError):
+        store.purge_undelivered_message(55, connect=connect)
+
+
+def test_client_message_is_never_purged_even_when_it_looks_undelivered():
+    """Слова клиента — не наши, их нельзя вычищать из журнала ни при каком статусе."""
+    def respond(sql, _params):
+        if sql.startswith("SELECT m.*, c.external_chat_id"):
+            return message_row(author_type="client", delivery_status="failed")
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    with pytest.raises(store.WorkspaceValidationError):
+        store.purge_undelivered_message(55, connect=connect)
+
+
+def test_message_still_in_the_send_queue_is_not_purged_under_the_sender():
+    """Пока строка очереди жива, отправка может уйти в Telegram уже после удаления —
+    клиент получил бы текст, которого в системе больше нет."""
+    def respond(sql, _params):
+        if sql.startswith("SELECT m.*, c.external_chat_id"):
+            return message_row(delivery_status="failed", provider_message_id=None)
+        if sql.startswith("SELECT count(*) AS live FROM funnel_workspace_outbox"):
+            return {"live": 1}
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    with pytest.raises(store.WorkspaceControlError):
+        store.purge_undelivered_message(55, connect=connect)
