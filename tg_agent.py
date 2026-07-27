@@ -477,6 +477,25 @@ def api(method: str, http_timeout: int = 35, **params):
     return data.get("result")
 
 
+def api_multipart(method: str, files: dict, http_timeout: int = 120, **params):
+    """Вызов Bot API с файлом: JSON-телом файл не передать.
+
+    Остальные поля едут формой, поэтому вложенные структуры сериализуются в JSON —
+    так их ждёт Telegram. Файл читается потоком из открытого объекта, целиком в
+    память он не поднимается: на боксе 2 ГБ это принципиально."""
+    data = {
+        key: (value if isinstance(value, (str, int, float)) else json.dumps(value, ensure_ascii=False))
+        for key, value in params.items()
+        if value is not None
+    }
+    resp = requests.post(f"https://api.telegram.org/bot{bot_token()}/{method}",
+                         data=data, files=files, timeout=http_timeout)
+    payload = resp.json() if resp.content else {}
+    if not (isinstance(payload, dict) and payload.get("ok")):
+        raise RuntimeError(f"{method}: {str(payload)[:300]}")
+    return payload.get("result")
+
+
 _MARKUP_RE = re.compile(r"\[/?(?:b|i|u|s|url(?:=[^\]]*)?)\]|</?(?:b|i|u|s|strong|em)>", re.IGNORECASE)
 
 

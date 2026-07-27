@@ -98,6 +98,8 @@ VALID_UPDATE_LANES = frozenset({"business", "bot"})
 ACTIVE_STATUSES = frozenset({"new", "open", "waiting"})
 DEFAULT_SOURCE_KEY = "telegram"
 MAX_MESSAGE_LENGTH = 4096
+#: Telegram обрезает подпись к документу на 1024 символах — отправлять больше нечестно.
+MAX_CAPTION_LENGTH = 1024
 SCHEMA_TABLES = (
     "funnel_workspace_sources",
     "funnel_workspace_conversations",
@@ -2546,6 +2548,28 @@ def _find_idempotent_outgoing(
     }
 
 
+def _clean_attachment(attachment: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Описание исходящего файла для очереди доставки: токен + то, что увидит человек."""
+
+    if not attachment:
+        return None
+    token = _required_text(attachment.get("token"), "attachment.token", 200)
+    return {
+        "token": token,
+        "file_name": _required_text(attachment.get("file_name"), "attachment.file_name", 300),
+        "mime_type": _clean_optional(attachment.get("mime_type"), 200) or "application/octet-stream",
+        "file_size": _optional_int(attachment.get("file_size")),
+    }
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def _enqueue_outgoing(
     conversation_id: Any,
     *,
@@ -2558,8 +2582,20 @@ def _enqueue_outgoing(
     operator_lease_seconds: int | None,
     now: datetime | None,
     connect: ConnectFactory | None,
+    attachment: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    clean_text = _required_text(text, "text", MAX_MESSAGE_LENGTH)
+    clean_file = _clean_attachment(attachment)
+    if clean_file is None:
+        clean_text = _required_text(text, "text", MAX_MESSAGE_LENGTH)
+    else:
+        # Подпись к файлу в Telegram ограничена 1024 символами, и текст без файла
+        # обязателен — а с файлом сообщение осмысленно и без подписи.
+        clean_text = str(text or "").strip()
+        if len(clean_text) > MAX_CAPTION_LENGTH:
+            raise WorkspaceValidationError(
+                f"Подпись к файлу длиннее допустимых {MAX_CAPTION_LENGTH} символов.",
+                details={"field": "text", "max_length": MAX_CAPTION_LENGTH},
+            )
     clean_key = _required_text(idempotency_key, "idempotency_key", 300)
     clean_author = str(author_type).lower()
     if clean_author not in {"agent", "operator"}:
@@ -2633,6 +2669,12 @@ def _enqueue_outgoing(
                     "Оператор забрал диалог и отправляет ответ.",
                 )
 
+            message_metadata = dict(metadata or {})
+            if clean_file is not None:
+                message_metadata["outgoing_file"] = dict(clean_file)
+            # Пустая строка в списке диалогов читается как сбой, поэтому у сообщения
+            # без подписи превью — имя отправленного файла.
+            preview = clean_text or (f"📎 {clean_file['file_name']}" if clean_file else "")
             cur.execute(
                 """
                 INSERT INTO funnel_workspace_messages (
@@ -2648,7 +2690,7 @@ def _enqueue_outgoing(
                     clean_author,
                     _clean_optional(author_name, 200),
                     clean_text,
-                    Jsonb(dict(metadata or {})),
+                    Jsonb(message_metadata),
                     timestamp,
                 ),
             )
@@ -2678,7 +2720,7 @@ def _enqueue_outgoing(
                     next_version,
                     message["id"],
                     timestamp,
-                    clean_text[:1000],
+                    preview[:1000],
                     clean_author,
                     timestamp,
                     row["id"],
@@ -2703,7 +2745,7 @@ def _enqueue_outgoing(
                     row["business_connection_id"],
                     clean_author,
                     clean_text,
-                    Jsonb(dict(metadata or {})),
+                    Jsonb(message_metadata),
                     clean_key,
                     next_version,
                 ),
@@ -2737,6 +2779,7 @@ def enqueue_outgoing_operator(
     operator_name: str,
     idempotency_key: str,
     metadata: Mapping[str, Any] | None = None,
+    attachment: Mapping[str, Any] | None = None,
     lease_seconds: int | None = None,
     now: datetime | None = None,
     connect: ConnectFactory | None = None,
@@ -2752,6 +2795,7 @@ def enqueue_outgoing_operator(
         operator_lease_seconds=lease_seconds,
         now=now,
         connect=connect,
+        attachment=attachment,
     )
 
 
@@ -3663,6 +3707,7 @@ def finish_outbox(
     worker_id: str,
     result: str,
     provider_message_id: Any = None,
+    provider_media: Mapping[str, Any] | None = None,
     error: Any = None,
     retry_at: datetime | None = None,
     now: datetime | None = None,
@@ -3751,6 +3796,11 @@ def finish_outbox(
                     details={"outbox_id": item_id},
                 )
             message_status = "pending" if next_status == "pending" else next_status
+            delivered_media = (
+                Jsonb({"telegram_media": dict(provider_media)})
+                if clean_result == "sent" and provider_media
+                else None
+            )
             cur.execute(
                 """
                 UPDATE funnel_workspace_messages
@@ -3763,6 +3813,12 @@ def finish_outbox(
                            ELSE 'delivery_failed'
                        END,
                        error_detail = %s,
+                       -- Идентификатор доставленного файла у Telegram: с ним вложение
+                       -- открывается из ленты тем же прокси, что и входящие.
+                       metadata = CASE
+                           WHEN %s::jsonb IS NULL THEN metadata
+                           ELSE metadata || %s::jsonb
+                       END,
                        sent_at = CASE WHEN %s = 'sent' THEN %s ELSE sent_at END
                  WHERE id = %s
              RETURNING *
@@ -3774,6 +3830,8 @@ def finish_outbox(
                     clean_result,
                     clean_result,
                     _clean_optional(error, 4000),
+                    delivered_media,
+                    delivered_media,
                     clean_result,
                     timestamp,
                     outbox["message_id"],

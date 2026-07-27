@@ -21,6 +21,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 import funnel_workspace_store as store
 import funnel_workspace_media as workspace_media
+import funnel_workspace_uploads as workspace_uploads
 
 
 logger = logging.getLogger(__name__)
@@ -921,6 +922,26 @@ def _json_body() -> dict[str, Any]:
     return body
 
 
+@funnel_workspace_bp.post(f"{API_PREFIX}/uploads")
+def upload_create() -> tuple[Response, int]:
+    """Принять файл, который оператор собирается отправить клиенту.
+
+    Возвращается только токен и то, что оператор видит рядом с полем ответа: сами
+    байты остаются на сервере до отправки, а имя и тип фиксируются здесь, поэтому
+    подменить их вторым запросом невозможно.
+    """
+
+    uploaded = request.files.get("file")
+    if uploaded is None or not (uploaded.filename or "").strip():
+        raise workspace_uploads.UploadError("Файл не выбран.", code="file_missing")
+    saved = workspace_uploads.store_upload(
+        uploaded.stream,
+        file_name=uploaded.filename,
+        mime_type=uploaded.mimetype,
+    )
+    return _json({"upload": saved}, 201)
+
+
 @funnel_workspace_bp.post(
     f"{API_PREFIX}/conversations/<int:conversation_id>/messages"
 )
@@ -931,6 +952,16 @@ def message_create(conversation_id: int) -> tuple[Response, int]:
         or str(body.get("idempotency_key") or "").strip()
         or f"workspace:{uuid4()}"
     )
+    upload_token = str(body.get("upload_token") or "").strip()
+    attachment = None
+    if upload_token:
+        stored = workspace_uploads.resolve_upload(upload_token)
+        attachment = {
+            "token": stored["token"],
+            "file_name": stored["file_name"],
+            "mime_type": stored["mime_type"],
+            "file_size": stored["file_size"],
+        }
     result = store.enqueue_outgoing_operator(
         conversation_id,
         text=body.get("text"),
@@ -938,6 +969,7 @@ def message_create(conversation_id: int) -> tuple[Response, int]:
         operator_name=workspace_operator_name(),
         idempotency_key=idempotency_key,
         metadata={"channel": "workspace_ui"},
+        attachment=attachment,
     )
     return _json(result, 200 if result.get("duplicate") else 201)
 
@@ -1295,6 +1327,11 @@ def handle_store_error(exc: store.WorkspaceStoreError) -> tuple[Response, int]:
 def handle_attachment_error(
     exc: workspace_media.AttachmentProxyError,
 ) -> tuple[Response, int]:
+    return _error(str(exc), exc.status_code, exc.code)
+
+
+@funnel_workspace_bp.errorhandler(workspace_uploads.UploadError)
+def handle_upload_error(exc: workspace_uploads.UploadError) -> tuple[Response, int]:
     return _error(str(exc), exc.status_code, exc.code)
 
 

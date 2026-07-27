@@ -5,6 +5,7 @@ import type {
   ConversationsPayload,
   LeadNote,
   MessagesPayload,
+  OutgoingUpload,
   WorkspaceMeta,
   WorkspaceSession,
 } from "./types";
@@ -85,7 +86,10 @@ async function request<T>(
       credentials: "same-origin",
       headers: {
         Accept: "application/json",
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
+        // У multipart-загрузки заголовок ставит браузер: ему нужна граница частей.
+        ...(init.body && !(init.body instanceof FormData)
+          ? { "Content-Type": "application/json" }
+          : {}),
         ...(init.headers || {}),
       },
     });
@@ -226,6 +230,17 @@ export const funnelWorkspaceApi = {
     );
   },
 
+  /** Загрузить файл на сервер до отправки: клиенту он уйдёт по возвращённому токену. */
+  uploadFile: (file: File, csrfToken: string) => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    return request<{ upload: OutgoingUpload }>("/uploads", {
+      method: "POST",
+      headers: csrfHeaders(csrfToken),
+      body: form,
+    });
+  },
+
   sendMessage: (
     conversationId: Conversation["id"],
     payload: {
@@ -233,6 +248,7 @@ export const funnelWorkspaceApi = {
       expected_version: number;
       csrf_token: string;
       idempotency_key: string;
+      upload_token?: string;
     },
   ) =>
     request<Record<string, unknown>>(

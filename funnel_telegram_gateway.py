@@ -1115,6 +1115,65 @@ def process_outbox_once(*, worker_id: str, limit: int = 25) -> int:
     return len(rows)
 
 
+def _outgoing_file(outbox: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Файл, который оператор приложил к этому сообщению, или None."""
+
+    payload = outbox.get("payload") or {}
+    if not isinstance(payload, Mapping):
+        return None
+    attached = payload.get("outgoing_file")
+    return dict(attached) if isinstance(attached, Mapping) and attached else None
+
+
+def _send_document(
+    outbox: Mapping[str, Any],
+    outgoing_file: Mapping[str, Any],
+    *,
+    connection_id: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Отправить приложенный файл в тот же Telegram-диалог, что и текст.
+
+    Текст становится подписью к документу: клиент получает одно сообщение, а не
+    файл и отдельную реплику. Пропавший на диске файл — отказ, а не пустая отправка.
+    """
+
+    import funnel_workspace_uploads as uploads
+    import tg_agent
+
+    stored = uploads.resolve_upload(outgoing_file.get("token"))
+    caption = str(outbox.get("text") or "")[:1024]
+    with open(stored["path"], "rb") as handle:
+        sent = tg_agent.api_multipart(
+            "sendDocument",
+            files={"document": (stored["file_name"], handle, stored["mime_type"])},
+            business_connection_id=connection_id,
+            chat_id=int(outbox["external_chat_id"]),
+            caption=caption or None,
+        )
+
+    provider_message_id = (
+        str(sent.get("message_id"))
+        if isinstance(sent, Mapping) and sent.get("message_id") is not None
+        else None
+    )
+    document = sent.get("document") if isinstance(sent, Mapping) else None
+    file_id = str(document.get("file_id") or "").strip() if isinstance(document, Mapping) else ""
+    if not file_id:
+        # Доставка состоялась, но показать вложение в ленте нечем — врать об этом нельзя.
+        log.warning(
+            "outbox %s delivered a document without a provider file id", outbox.get("id")
+        )
+        return provider_message_id, None
+    return provider_message_id, {
+        "file_id": file_id,
+        "file_unique_id": str(document.get("file_unique_id") or "") or None,
+        "file_name": stored["file_name"],
+        "mime_type": stored["mime_type"],
+        "file_size": document.get("file_size") or stored["file_size"],
+        "media_type": "document",
+    }
+
+
 def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
     import tg_agent
 
@@ -1177,24 +1236,42 @@ def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
         return
     current = dict(boundary.get("outbox") or current)
 
+    outgoing_file = _outgoing_file(current)
+    provider_media: dict[str, Any] | None = None
+
     try:
         try:
-            sent = tg_agent.api(
-                "sendMessage",
-                http_timeout=45,
-                business_connection_id=connection_id,
-                chat_id=int(current["external_chat_id"]),
-                text=str(current.get("text") or "")[:4096],
-                link_preview_options={"is_disabled": True},
-            )
-            provider_message_id = (
-                str(sent.get("message_id"))
-                if isinstance(sent, Mapping) and sent.get("message_id") is not None
-                else None
-            )
+            if outgoing_file is not None:
+                provider_message_id, provider_media = _send_document(
+                    current,
+                    outgoing_file,
+                    connection_id=connection_id,
+                )
+            else:
+                sent = tg_agent.api(
+                    "sendMessage",
+                    http_timeout=45,
+                    business_connection_id=connection_id,
+                    chat_id=int(current["external_chat_id"]),
+                    text=str(current.get("text") or "")[:4096],
+                    link_preview_options={"is_disabled": True},
+                )
+                provider_message_id = (
+                    str(sent.get("message_id"))
+                    if isinstance(sent, Mapping) and sent.get("message_id") is not None
+                    else None
+                )
         except RuntimeError as exc:
             if not _peer_unknown_to_bot(exc):
                 raise
+            if outgoing_file is not None:
+                # Аккаунт менеджера умеет только текст, и подменять файл текстом нельзя:
+                # оператор должен увидеть отказ, а не решить, что документ ушёл.
+                raise RuntimeError(
+                    "Файл не отправлен: бот не может писать этому собеседнику, "
+                    "а через аккаунт менеджера файлы не отправляются. "
+                    "Дождитесь сообщения клиента или отправьте файл вручную."
+                ) from exc
             # Telegram отдаёт боту доступ только к тем собеседникам, кто написал в
             # бизнес-аккаунт после подключения бота. Остальным бот написать не может
             # вовсе — но у аккаунта менеджера диалог есть, и он может.
@@ -1204,6 +1281,7 @@ def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
             worker_id=worker_id,
             result="sent",
             provider_message_id=provider_message_id,
+            provider_media=provider_media,
         )
         _after_delivery(
             current,

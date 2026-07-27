@@ -26,6 +26,7 @@ import {
   LogOut,
   MessageCircleMore,
   PanelRight,
+  Paperclip,
   RefreshCw,
   Search,
   SendHorizontal,
@@ -44,6 +45,7 @@ import type {
   ConversationMessage,
   ConversationStatus,
   LeadNote,
+  OutgoingUpload,
   WorkspaceMeta,
   WorkspaceSession,
 } from "./types";
@@ -1723,6 +1725,7 @@ function ChatPanel({
   onShowDetails,
   onLoadOlder,
   onSend,
+  onUpload,
   onRetry,
   onControl,
   onMessageContextMenu,
@@ -1738,7 +1741,8 @@ function ChatPanel({
   onBack: () => void;
   onShowDetails: () => void;
   onLoadOlder: () => void;
-  onSend: (text: string) => void;
+  onSend: (text: string, upload?: OutgoingUpload) => void;
+  onUpload: (file: File) => Promise<OutgoingUpload>;
   onRetry: (message: ConversationMessage) => void;
   onControl: (mode: "human" | "ai", permanent?: boolean) => void;
   onMessageContextMenu: (
@@ -1747,6 +1751,9 @@ function ChatPanel({
   ) => void;
 }) {
   const [draft, setDraft] = useState("");
+  const [attachment, setAttachment] = useState<OutgoingUpload | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const selectedKey = stringId(conversation?.id);
@@ -1763,6 +1770,7 @@ function ChatPanel({
 
   useEffect(() => {
     setDraft("");
+    setAttachment(null);
     stickToBottomRef.current = true;
   }, [selectedKey]);
 
@@ -1775,12 +1783,30 @@ function ChatPanel({
     return () => window.cancelAnimationFrame(frame);
   }, [messages.length, selectedKey]);
 
+  // С файлом сообщение осмысленно и без текста, а подпись к документу Telegram
+  // обрезает на 1024 символах — поэтому лимит поля зависит от того, есть ли файл.
+  const captionLimit = attachment ? 1024 : 4096;
+  const canSubmit = Boolean(draft.trim() || attachment) && draft.length <= captionLimit;
+
   const submitDraft = () => {
+    if (!canSubmit || sending || uploading || conversation?.control_mode !== "human") return;
     const text = draft.trim();
-    if (!text || sending || conversation?.control_mode !== "human") return;
+    const upload = attachment;
     setDraft("");
+    setAttachment(null);
     stickToBottomRef.current = true;
-    onSend(text);
+    onSend(text, upload || undefined);
+  };
+
+  const pickFile = async (file: File | null | undefined) => {
+    if (!file) return;
+    setUploading(true);
+    try {
+      setAttachment(await onUpload(file));
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
   };
 
   const onDraftKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -2045,19 +2071,54 @@ function ChatPanel({
           <>
             {/* Мягкое кольцо фокуса вокруг всего поля вместо системной прямоугольной
                 обводки: браузерный outline на textarea рисует квадрат поверх скруглений. */}
+            {attachment && (
+              <div className="mb-2 flex items-center gap-2 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2">
+                <Paperclip className="h-4 w-4 shrink-0 text-violet-600" />
+                <span className="min-w-0 flex-1 truncate text-xs font-bold text-violet-900">
+                  {attachment.file_name}
+                </span>
+                <span className="shrink-0 text-[10px] font-semibold text-violet-500">
+                  {formatAttachmentSize(attachment.file_size)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setAttachment(null)}
+                  aria-label="Убрать файл"
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg text-violet-500 hover:bg-violet-100"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
             <div className="flex items-end gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-2 shadow-sm transition-all duration-150 focus-within:border-violet-400 focus-within:bg-white focus-within:shadow-md focus-within:shadow-violet-100 focus-within:ring-4 focus-within:ring-violet-100">
+              <input
+                ref={fileInputRef}
+                type="file"
+                className="hidden"
+                onChange={(event) => void pickFile(event.target.files?.[0])}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading || sending}
+                aria-label="Прикрепить файл"
+                title="Прикрепить файл"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-slate-500 transition hover:bg-slate-200 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Paperclip className="h-4 w-4" />}
+              </button>
               <textarea
                 value={draft}
-                onChange={(event) => setDraft(event.target.value.slice(0, 4096))}
+                onChange={(event) => setDraft(event.target.value.slice(0, captionLimit))}
                 onKeyDown={onDraftKeyDown}
                 rows={1}
-                placeholder="Напишите клиенту…"
+                placeholder={attachment ? "Подпись к файлу (необязательно)…" : "Напишите клиенту…"}
                 className="max-h-32 min-h-10 flex-1 resize-none rounded-xl bg-transparent px-2 py-2 text-sm leading-5 text-slate-900 outline-none ring-0 placeholder:text-slate-400 focus:outline-none focus:ring-0"
               />
               <button
                 type="button"
                 onClick={submitDraft}
-                disabled={!draft.trim() || sending}
+                disabled={!canSubmit || sending || uploading}
                 aria-label="Отправить сообщение"
                 className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#5B50EA] text-white shadow-sm transition hover:bg-[#4F45DB] disabled:cursor-not-allowed disabled:bg-slate-300"
               >
@@ -2066,7 +2127,11 @@ function ChatPanel({
             </div>
             <div className="mt-1.5 flex items-center justify-between px-1 text-[10px] font-medium text-slate-400">
               <span>Enter — отправить · Shift+Enter — новая строка</span>
-              {draft.length > 3500 && <span>{draft.length}/4096</span>}
+              {draft.length > captionLimit - 596 && (
+                <span>
+                  {draft.length}/{captionLimit}
+                </span>
+              )}
             </div>
           </>
         )}
@@ -2851,7 +2916,23 @@ function OperatorWorkspace({
     })();
   }, [reportError]);
 
-  const sendMessage = async (text: string, retryMessage?: ConversationMessage) => {
+  const uploadFile = async (file: File): Promise<OutgoingUpload> => {
+    try {
+      const result = await funnelWorkspaceApi.uploadFile(file, csrfToken());
+      return result.upload;
+    } catch (error) {
+      // Молча проглоченная загрузка выглядит как «файл прикрепился»: оператор
+      // нажмёт «отправить» и решит, что документ ушёл.
+      reportError(error);
+      throw error;
+    }
+  };
+
+  const sendMessage = async (
+    text: string,
+    retryMessage?: ConversationMessage,
+    upload?: OutgoingUpload,
+  ) => {
     const conversation = selectedConversation;
     if (!conversation || sending) return;
     if (conversation.can_reply === false) {
@@ -2882,7 +2963,7 @@ function OperatorWorkspace({
       author_type: "human",
       author_name: "Менеджер",
       direction: "outgoing",
-      text,
+      text: text || (upload ? `📎 ${upload.file_name}` : ""),
       delivery_status: "sending",
       error: null,
       idempotency_key: idempotencyKey,
@@ -2900,6 +2981,7 @@ function OperatorWorkspace({
         expected_version: conversation.state_version,
         csrf_token: csrfToken(),
         idempotency_key: idempotencyKey,
+        ...(upload ? { upload_token: upload.token } : {}),
       });
       setMessages((current) => current.filter((message) => message.id !== optimisticId));
       await refreshSelected();
@@ -3235,7 +3317,8 @@ function OperatorWorkspace({
                   setLoadingOlder(false),
                 );
               }}
-              onSend={(text) => void sendMessage(text)}
+              onSend={(text, upload) => void sendMessage(text, undefined, upload)}
+              onUpload={uploadFile}
               onRetry={(message) => void sendMessage(message.text, message)}
               onControl={(mode, permanent) => void setControl(mode, permanent)}
               onMessageContextMenu={(message, position) =>

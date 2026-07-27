@@ -97,6 +97,14 @@ export interface ConversationAttachment {
   download_url: string;
 }
 
+/** Файл, загруженный оператором и ещё не отправленный клиенту. */
+export interface OutgoingUpload {
+  token: string;
+  file_name: string;
+  mime_type: string;
+  file_size: number;
+}
+
 export interface ConversationMessage {
   id: number;
   created_at: string;
