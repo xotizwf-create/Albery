@@ -444,3 +444,182 @@ def test_stage_action_rechecks_after_adapter_returns_no_stage():
         "update_crm_deal",
         "get_crm_deal",
     ]
+
+
+def test_person_already_in_the_funnel_never_gets_a_second_deal():
+    """Живой дубль 27.07.2026: у Дарьи Фартаковой в воронке 16 уже лежала сделка #226
+    «Fartakova_D - Открытая линия», а рабочее пространство минутой позже завело ей
+    вторую (#228). Маркера `[tg:…]` на чужой сделке нет — узнаём человека по username."""
+    workspace = FakeWorkspace(
+        conversation(external_user_id=609797080, username="Fartakova_D",
+                     display_name="Дарья Фартакова")
+    )
+    calls = []
+
+    def crm_call(tool, args):
+        calls.append((tool, deepcopy(args)))
+        if tool == "list_crm_deals":
+            return {
+                "total": 1,
+                "deals": [
+                    {
+                        "deal_id": 226,
+                        "category_id": 16,
+                        "title": "Fartakova_D - Открытая линия",
+                        "custom_fields": {},
+                    }
+                ],
+            }
+        raise AssertionError(f"новая сделка заводиться не должна: {tool}")
+
+    result = crm.ensure_conversation_deal(
+        7,
+        get_conversation=workspace.get,
+        update_crm_link=workspace.update,
+        crm_call=crm_call,
+    )
+
+    assert result["status"] == "recovered"
+    assert result["deal_id"] == 226
+    assert workspace.row["deal_id"] == 226
+    assert [tool for tool, _ in calls] == ["list_crm_deals"]
+
+
+def test_old_telegram_lead_written_with_an_at_sign_is_recognised():
+    """Сделки прошлого формата несут `@username` — их тоже нельзя дублировать."""
+    workspace = FakeWorkspace(conversation(username="client_user"))
+
+    def crm_call(tool, args):
+        if tool == "list_crm_deals":
+            return {
+                "total": 1,
+                "deals": [
+                    {
+                        "deal_id": 140,
+                        "category_id": 16,
+                        "title": "Лид Telegram @client_user — Иван Клиентов",
+                        "custom_fields": {},
+                    }
+                ],
+            }
+        raise AssertionError(f"новая сделка заводиться не должна: {tool}")
+
+    result = crm.ensure_conversation_deal(
+        7,
+        get_conversation=workspace.get,
+        update_crm_link=workspace.update,
+        crm_call=crm_call,
+    )
+
+    assert result["deal_id"] == 140
+    assert result["status"] == "recovered"
+
+
+def test_the_oldest_foreign_card_wins_so_the_client_keeps_one_deal():
+    """Если чужих карточек по username уже несколько, диалог цепляется к САМОЙ РАННЕЙ:
+    в ней история, а поздние — как раз те дубли, ради которых всё это и делается."""
+    workspace = FakeWorkspace(conversation(username="client_user"))
+
+    def crm_call(tool, args):
+        if tool == "list_crm_deals":
+            return {
+                "total": 2,
+                "deals": [
+                    {"deal_id": 300, "category_id": 16,
+                     "title": "client_user — повторное обращение", "custom_fields": {}},
+                    {"deal_id": 140, "category_id": 16,
+                     "title": "client_user - Открытая линия", "custom_fields": {}},
+                ],
+            }
+        raise AssertionError(f"новая сделка заводиться не должна: {tool}")
+
+    result = crm.ensure_conversation_deal(
+        7,
+        get_conversation=workspace.get,
+        update_crm_link=workspace.update,
+        crm_call=crm_call,
+    )
+
+    assert result["deal_id"] == 140
+
+
+def test_our_own_marked_deal_beats_a_username_lookalike():
+    """Маркер `[tg:<id>]` опознаёт человека наверняка, username — лишь вероятно: его
+    меняют, и он может достаться другому. Точное совпадение всегда сильнее."""
+    workspace = FakeWorkspace(conversation(username="client_user"))
+
+    def crm_call(tool, args):
+        if tool == "list_crm_deals":
+            return {
+                "total": 2,
+                "deals": [
+                    {"deal_id": 300, "category_id": 16,
+                     "title": "Лид Telegram [tg:987654321] — Иван", "custom_fields": {}},
+                    {"deal_id": 140, "category_id": 16,
+                     "title": "client_user - Открытая линия", "custom_fields": {}},
+                ],
+            }
+        raise AssertionError(f"новая сделка заводиться не должна: {tool}")
+
+    result = crm.ensure_conversation_deal(
+        7,
+        get_conversation=workspace.get,
+        update_crm_link=workspace.update,
+        crm_call=crm_call,
+    )
+
+    assert result["deal_id"] == 300
+
+
+def test_username_inside_a_longer_word_is_not_a_match():
+    """`@ivan` не должен цепляться к сделке «ivanov»: чужая карточка страшнее дубля."""
+    workspace = FakeWorkspace(conversation(username="ivan"))
+    calls = []
+
+    def crm_call(tool, args):
+        calls.append((tool, deepcopy(args)))
+        if tool == "list_crm_deals":
+            return {
+                "total": 1,
+                "deals": [
+                    {"deal_id": 400, "category_id": 16,
+                     "title": "ivanov - Открытая линия", "custom_fields": {}},
+                ],
+            }
+        return {"deal_id": 401}
+
+    result = crm.ensure_conversation_deal(
+        7,
+        get_conversation=workspace.get,
+        update_crm_link=workspace.update,
+        crm_call=crm_call,
+    )
+
+    assert result["deal_id"] == 401
+    assert result["created"] is True
+
+
+def test_username_match_ignores_deals_of_another_funnel():
+    """Одноимённая сделка в другой воронке — не «человек уже в воронке ИУ»."""
+    workspace = FakeWorkspace(conversation(username="client_user"))
+
+    def crm_call(tool, args):
+        if tool == "list_crm_deals":
+            return {
+                "total": 1,
+                "deals": [
+                    {"deal_id": 500, "category_id": 0,
+                     "title": "client_user - Открытая линия", "custom_fields": {}},
+                ],
+            }
+        return {"deal_id": 501}
+
+    result = crm.ensure_conversation_deal(
+        7,
+        get_conversation=workspace.get,
+        update_crm_link=workspace.update,
+        crm_call=crm_call,
+    )
+
+    assert result["deal_id"] == 501
+    assert result["created"] is True

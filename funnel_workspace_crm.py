@@ -152,13 +152,19 @@ def find_existing_deal(
     telegram_field: str,
     telegram_id_field: str | None = None,
 ) -> int | None:
-    """Find a deal previously created for this numeric Telegram identity.
+    """Find a deal this person already has in the funnel.
 
     This lookup is intentionally performed before every create.  If it fails,
     the exception is allowed to escape: creating while reconciliation is
-    unavailable could duplicate a deal whose local link was lost.  When a
-    dedicated numeric-id field is configured, the whole category is paged:
-    title search alone cannot recover a deal whose operator edited its title.
+    unavailable could duplicate a deal whose local link was lost.
+
+    Three signals are accepted, and the whole category is paged so that none of
+    them can be missed by a title search: the deterministic ``[tg:<id>]``
+    marker, a dedicated numeric-id field, and the client's ``@username``.  The
+    username matters because deals born OUTSIDE this workspace carry no marker
+    at all — a CRM form, an old Telegram lead, an open-line chat — and the
+    owner's rule is that a person already in the funnel never gets a second
+    card (живой дубль 27.07.2026: #226 и #228 на одного клиента).
     """
 
     telegram_id = telegram_identity(conversation)
@@ -166,27 +172,20 @@ def find_existing_deal(
     username_field = str(telegram_field or "").strip()
     identity_field = str(telegram_id_field or "").strip()
     _validate_distinct_identity_field(username_field, identity_field)
+    username = _clean_username(conversation.get("username"))
+    username_pattern = _username_pattern(username)
 
-    if identity_field:
-        deals = _list_category_deals(
-            crm_call,
-            category_id=int(category_id),
-            include_custom_fields=True,
-        )
-    else:
-        response = crm_call(
-            "list_crm_deals",
-            {
-                "category_id": int(category_id),
-                "search": marker,
-                "include_custom_fields": False,
-                "limit": 50,
-                "offset": 0,
-            },
-        )
-        deals = _response_deals(response)
+    deals = _list_category_deals(
+        crm_call,
+        category_id=int(category_id),
+        include_custom_fields=bool(identity_field or username_field),
+    )
 
+    # Маркер и числовое поле опознают человека НАВЕРНЯКА, username — лишь вероятно
+    # (его можно сменить, и он может достаться другому). Поэтому совпадения копятся
+    # раздельно: пока есть точное, вероятное не рассматривается вовсе.
     matches: list[int] = []
+    username_matches: list[int] = []
     for deal in deals:
         if not isinstance(deal, Mapping):
             continue
@@ -198,9 +197,8 @@ def find_existing_deal(
             except (TypeError, ValueError):
                 continue
 
-        title_matches = marker.casefold() in str(
-            deal.get("title") or deal.get("TITLE") or ""
-        ).casefold()
+        title = str(deal.get("title") or deal.get("TITLE") or "").casefold()
+        title_matches = marker.casefold() in title
         fields = deal.get("custom_fields") or {}
         raw_identity = (
             fields.get(identity_field)
@@ -213,7 +211,14 @@ def find_existing_deal(
             raw_identity,
             telegram_id,
         )
-        if title_matches or field_matches:
+        username_match = bool(username_pattern) and (
+            bool(username_pattern.search(title))
+            or _username_value_matches(
+                _deal_field(deal, fields, username_field),
+                username,
+            )
+        )
+        if title_matches or field_matches or username_match:
             try:
                 deal_id = _positive_int(
                     deal.get("deal_id") or deal.get("id") or deal.get("ID")
@@ -223,9 +228,16 @@ def find_existing_deal(
                     "CRM returned a matching Telegram deal without a valid deal id; "
                     "deal creation was cancelled to avoid a duplicate."
                 ) from exc
-            matches.append(deal_id)
+            if title_matches or field_matches:
+                matches.append(deal_id)
+            else:
+                username_matches.append(deal_id)
 
-    return min(matches) if matches else None
+    if matches:
+        return min(matches)
+    # Из нескольких чужих карточек берём самую раннюю: в ней история, а поздние —
+    # как раз те дубли, ради которых всё это и делается.
+    return min(username_matches) if username_matches else None
 
 
 def ensure_conversation_deal(
@@ -548,6 +560,39 @@ def _one_line(value: Any, limit: int) -> str:
 
 def _clean_username(value: Any) -> str:
     return _one_line(value, 100).lstrip("@")
+
+
+def _username_pattern(username: str) -> re.Pattern[str] | None:
+    """Как узнать `@username` в названии сделки, не поймав чужую.
+
+    Границы обязательны: без них `@ivan` совпал бы со сделкой «ivanov», и разговор
+    прицепился бы к карточке другого человека — это хуже дубля. Слишком короткое имя
+    не берём вовсе: Telegram таких не выдаёт, а случайное совпадение вероятно.
+    """
+    clean = str(username or "").strip().casefold()
+    if len(clean) < 3 or not re.fullmatch(r"[a-z0-9_]+", clean):
+        return None
+    return re.compile(rf"(?<![a-z0-9_]){re.escape(clean)}(?![a-z0-9_])")
+
+
+def _username_value_matches(value: Any, username: str) -> bool:
+    """Тот же человек в поле «Telegram» сделки — с `@`, ссылкой или без них."""
+    expected = str(username or "").strip().casefold()
+    if not expected:
+        return False
+    raw = str(value or "").strip().casefold()
+    if not raw:
+        return False
+    raw = re.sub(r"^(https?://)?(t\.me/|telegram\.me/)", "", raw).lstrip("@").strip()
+    return raw == expected
+
+
+def _deal_field(deal: Mapping[str, Any], fields: Any, field: str) -> Any:
+    if not field:
+        return None
+    if isinstance(fields, Mapping) and field in fields:
+        return fields.get(field)
+    return deal.get(field)
 
 
 def _identity_value_matches(value: Any, telegram_id: int) -> bool:
