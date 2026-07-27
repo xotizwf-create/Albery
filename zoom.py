@@ -1012,6 +1012,13 @@ ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO = (
     "Также во время созвона были выделены следующие задачи, добавьте себе задачи, которые считаете нужными, "
     "в комментарии напишите, что добавили, а что нет, подтвердите артефактом"
 )
+# Кому уходит карточка, если ведущий созвона не определился. Владелец — единственный, кто
+# точно сможет её разослать; терять задачи нельзя (инцидент 27.07.2026).
+ZOOM_DISPATCH_FALLBACK_USER_ID = to_int(os.getenv("ZOOM_DISPATCH_FALLBACK_USER_ID", "16")) or 16
+ZOOM_DISPATCH_LEAD_UNRESOLVED_NOTE = (
+    "⚠️ Ведущий созвона в отчёте не определён, поэтому карточка пришла вам. "
+    "Проверьте список ниже и передайте задачи тому, кто вёл встречу."
+)
 def zoom_call_operational_tasks(call: dict[str, Any]) -> list[dict[str, Any]]:
     raw_json = call.get("raw_json") if isinstance(call.get("raw_json"), dict) else {}
     ai_report = raw_json.get("ai_report") if isinstance(raw_json.get("ai_report"), dict) else {}
@@ -1036,29 +1043,39 @@ def _zoom_ai_analysis(call: dict[str, Any]) -> dict[str, Any]:
 def zoom_call_participants(call: dict[str, Any]) -> list[dict[str, Any]]:
     """Actual call participants from saved AI reports.
 
-    New reports store people.actual_participants. Older reports only store
-    analysis.leaders_present; dispatch still must identify the call lead from
-    that field instead of treating the report as having no participants.
+    Отчёты приходят в трёх формах, и все три обязаны читаться: иначе созвон выглядит как
+    прошедший без людей, а его задачи молча теряются (инцидент 27.07.2026, созвон 07:01 —
+    список лежал в `analysis.participants`, и отправка упала с «нет получателей»).
+
+      1. `people.actual_participants` — штатная схема;
+      2. `analysis.participants` — схема отчёта с `report_version`;
+      3. `analysis.leaders_present` — старые отчёты, где сохранены только руководители.
     """
     analysis = _zoom_ai_analysis(call)
     people = analysis.get("people") if isinstance(analysis.get("people"), dict) else {}
-    raw = people.get("actual_participants") if isinstance(people.get("actual_participants"), list) else []
     result: list[dict[str, Any]] = []
-    for person in raw:
-        if not isinstance(person, dict):
-            continue
-        name = str(person.get("person_name") or person.get("raw_name") or "").strip()
-        if not name:
-            continue
-        result.append({
-            "name": name,
-            "bitrix_user_id": to_int(person.get("bitrix_user_id")),
-            "org_match": str(person.get("org_match") or "").strip().lower(),
-            "is_leader": bool(person.get("is_leader")),
-            "role_on_call": str(person.get("role_on_call") or "").strip().lower(),
-        })
-    if result:
-        return result
+    for key, source in (
+        ("actual_participants", people.get("actual_participants")),
+        ("participants", analysis.get("participants")),
+    ):
+        raw = source if isinstance(source, list) else []
+        for person in raw:
+            if not isinstance(person, dict):
+                continue
+            name = str(
+                person.get("person_name") or person.get("name") or person.get("raw_name") or ""
+            ).strip()
+            if not name:
+                continue
+            result.append({
+                "name": name,
+                "bitrix_user_id": to_int(person.get("bitrix_user_id")),
+                "org_match": str(person.get("org_match") or "").strip().lower(),
+                "is_leader": bool(person.get("is_leader")),
+                "role_on_call": str(person.get("role_on_call") or "").strip().lower(),
+            })
+        if result:
+            return result
 
     leaders_present = analysis.get("leaders_present") if isinstance(analysis.get("leaders_present"), list) else []
     for index, leader in enumerate(leaders_present):

@@ -2307,6 +2307,9 @@ def build_zoom_operational_task_cards(
             if resolve_zoom_recipient(nm, to_int(task.get("bitrix_user_id")), team, name_aliases) is None:
                 unmatched_assignees.append(nm)
 
+    # Ведущий ищется по нескольким признакам подряд. Двух прежних (`host` и `is_leader`)
+    # не хватило: 27.07.2026 оба созвона дня их не имели, и задачи с готовыми именами и
+    # bitrix_user_id молча исчезли. Порядок — от самого надёжного признака к слабому.
     host = None
     for person in participants:
         if str(person.get("role_on_call") or "").strip().lower() == "host":
@@ -2318,16 +2321,35 @@ def build_zoom_operational_task_cards(
                 host = person
                 break
     if host is None:
-        return [], unmatched_assignees, unmatched_participants
+        # Оценка руководителя называет ведущего прямо: она пишется на того, кто вёл встречу.
+        # `role_on_call` в части отчётов — это должность («руководитель направления…»),
+        # а не признак ведения, поэтому по нему ведущего не опознать.
+        host = _zoom_lead_from_evaluations(participants, leader_evals, name_aliases)
 
-    recipient = resolve_zoom_recipient(
-        str(host.get("name") or ""), to_int(host.get("bitrix_user_id")), team, name_aliases
-    )
+    lead_unresolved = False
+    recipient = None
+    if host is not None:
+        recipient = resolve_zoom_recipient(
+            str(host.get("name") or ""), to_int(host.get("bitrix_user_id")), team, name_aliases
+        )
+        if recipient is None:
+            nm = str(host.get("name") or "").strip()
+            if nm and nm not in unmatched_participants:
+                unmatched_participants.append(nm)
+
     if recipient is None:
-        nm = str(host.get("name") or "").strip()
-        if nm and nm not in unmatched_participants:
-            unmatched_participants.append(nm)
-        return [], unmatched_assignees, unmatched_participants
+        # Ведущего определить не удалось. Молчать нельзя: в задачах живая работа живых людей.
+        # Карточка уходит владельцу с прямой пометкой — он разошлёт её сам. Пустой созвон
+        # при этом никого не беспокоит: тревога про потерянные задачи, а не про тишину.
+        if not tasks:
+            return [], unmatched_assignees, unmatched_participants
+        recipient = resolve_zoom_recipient("", ZOOM_DISPATCH_FALLBACK_USER_ID, team, name_aliases)
+        if recipient is None:
+            recipient = {
+                "user_id": ZOOM_DISPATCH_FALLBACK_USER_ID,
+                "name": "Владелец",
+            }
+        lead_unresolved = True
 
     ev = find_zoom_leader_evaluation(
         str(recipient.get("name") or ""), to_int(recipient.get("user_id")), leader_evals, name_aliases
@@ -2338,11 +2360,15 @@ def build_zoom_operational_task_cards(
         leader_message = str(ev.get("message_for_leader") or ev.get("result_for_owner") or "").strip()
         leader_verdict = str(ev.get("verdict") or "").strip().lower() or None
 
+    description = build_zoom_lead_card_description(dispatch_summary, leader_message, tasks)
+    if lead_unresolved:
+        description = f"{ZOOM_DISPATCH_LEAD_UNRESOLVED_NOTE}\n\n{description}".strip()
+
     card = {
         "recipient": recipient,
         "assignee_name": recipient["name"],
         "title": title,
-        "description": build_zoom_lead_card_description(dispatch_summary, leader_message, tasks),
+        "description": description,
         "deadline": deadline,
         "deadline_text": deadline_text,
         "tasks": tasks,
@@ -2351,8 +2377,49 @@ def build_zoom_operational_task_cards(
         "leader_message": leader_message,
         "has_tasks": bool(tasks),
         "is_lead_card": True,
+        "lead_unresolved": lead_unresolved,
     }
     return [card], unmatched_assignees, unmatched_participants
+
+
+def _zoom_lead_from_evaluations(
+    participants: list[dict[str, Any]],
+    leader_evals: list[dict[str, Any]],
+    name_aliases: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Ведущий по оценке руководителя: её пишут на того, кто вёл встречу.
+
+    Сначала ищем оценённого среди участников — так сохраняется их разметка (id, org_match).
+    Если участников нет вовсе (отчёт другой схемы), берём человека прямо из оценки.
+    """
+    for evaluation in leader_evals:
+        if not isinstance(evaluation, dict):
+            continue
+        leader_name = str(evaluation.get("leader_name") or "").strip()
+        leader_id = to_int(evaluation.get("bitrix_user_id"))
+        if not leader_name and leader_id is None:
+            continue
+        for person in participants:
+            same_id = (
+                leader_id is not None
+                and to_int(person.get("bitrix_user_id")) == leader_id
+            )
+            same_name = (
+                bool(leader_name)
+                and str(person.get("name") or "").strip().casefold()
+                == leader_name.casefold()
+            )
+            if same_id or same_name:
+                return person
+        if leader_id is not None or leader_name:
+            return {
+                "name": leader_name,
+                "bitrix_user_id": leader_id,
+                "is_leader": True,
+                "role_on_call": "host",
+                "org_match": "matched" if leader_id is not None else "",
+            }
+    return None
 
 
 def build_zoom_operational_tasks_dispatch(call_id: str, require_webhook: bool = False) -> dict[str, Any]:
@@ -18632,6 +18699,8 @@ def download_export(filename: str):
 # Zoom integration (moved out verbatim 2026-07-02): registers routes on import; the
 import zoom  # noqa: E402,F401
 from zoom import (  # noqa: E402
+    ZOOM_DISPATCH_FALLBACK_USER_ID,
+    ZOOM_DISPATCH_LEAD_UNRESOLVED_NOTE,
     ZOOM_EXPORT_DIR,
     ZOOM_OPERATIONAL_TASKS_DISPATCH_INTRO,
     ZOOM_SPEAKER_NOISE_NAMES,
