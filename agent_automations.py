@@ -26,6 +26,7 @@ import subprocess
 import threading
 import time
 
+from datetime import timedelta
 from typing import Any
 
 from flask import jsonify, request
@@ -779,7 +780,47 @@ def _scheduler_tick(minute_start) -> None:
             _work_q.put((row, 1))
 
 
+def _recover_interrupted_runs() -> int:
+    """Пометить запуски, оборванные перезапуском сервиса, как прерванные.
+
+    Воркеры живут внутри процесса: рестарт (деплой, авария) убивает выполняющуюся
+    автоматизацию вместе с её hermes-подпроцессами, и `_finish_run` уже не отработает —
+    запись остаётся в «выполняется» навсегда. Так 27.07.2026 повис «Ежедневный отчёт
+    собственнику»: захватил минуту 18:00, а в 18:00:40 сервис перезапустили при выкате.
+    Панель показывала «выполняется» четвёртый час, хотя выполнять было уже некому,
+    и по этой же причине правило «рестартовать только когда нет running-автоматизаций»
+    блокировалось мёртвой записью.
+
+    Чинятся только зависшие (старше окна таймаута с запасом) — живой долгий запуск
+    из соседнего процесса не трогаем. Сбой самой починки не должен мешать планировщику:
+    он логируется и работа продолжается.
+    """
+
+    cutoff = msk_now() - timedelta(seconds=_RUNNING_STALE_S)
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE agent_automations SET last_status = 'interrupted', "
+                        "last_error = COALESCE(NULLIF(last_error, ''), %s), updated_at = now() "
+                        "WHERE last_status = 'running' AND last_run_at < %s "
+                        "RETURNING id, name",
+                        ("запуск прерван перезапуском сервиса — результат не был доставлен",
+                         cutoff),
+                    )
+                    rows = list(cur.fetchall())
+    except Exception:  # noqa: BLE001 - починка состояния не важнее самой работы планировщика
+        logging.exception("agent automations: recovery of interrupted runs failed")
+        return 0
+    for row in rows:
+        logging.warning("agent automation %s (%s) was interrupted by a restart — marked as such",
+                        row["id"], row["name"])
+    return len(rows)
+
+
 def _scheduler_loop() -> None:
+    _recover_interrupted_runs()
     time.sleep(120)  # let the app finish booting
     last_minute = None
     while True:
