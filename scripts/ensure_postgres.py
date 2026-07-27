@@ -28,7 +28,6 @@ REQUIRED_TABLE_MIGRATIONS = {
     "funnel_task_watch": "063_funnel_task_watch.sql",
     "agent_decisions": "064_agent_decisions.sql",
     "funnel_scenarios": "065_funnel_scenarios.sql",
-    "openline_dialogs": "069_openline_dialogs.sql",
     "zoom_recording_events": "019_zoom_recording_events.sql",
     "owner_recommendation_events": "020_recommendation_feedback_events.sql",
     "company_drive_folders": "021_company_drive_folders.sql",
@@ -51,6 +50,9 @@ ALWAYS_APPLY_MIGRATIONS = [
     # поэтому идемпотентный ADD COLUMN IF NOT EXISTS применяется каждый раз.
     "067_funnel_testing_mode.sql",
     "068_funnel_blocked_phrases.sql",
+    # Открытая линия вырезана: снос её таблицы состояния идемпотентен и на уже
+    # вычищенной базе просто ничего не делает.
+    "072_drop_openline_dialogs.sql",
     # Idempotent WB resumable sync state. 055 also covers catalogue columns
     # that older, already-created WB schemas could otherwise silently miss.
     "054_wb_sync_state_v2.sql",

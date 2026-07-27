@@ -368,11 +368,18 @@ if (
         "от legacy CRM_TELEGRAM_FIELD"
     )
 
+# Открытая линия Битрикса вырезана (владелец, 27.07.2026). Её остатки в окружении —
+# признак незавершённой выкатки: их надо убрать, иначе следующий человек решит, что
+# канал где-то ещё жив, и будет искать несуществующий выключатель.
+for stale in ("OPENLINE_AGENT_ENABLED", "B24_OPENLINE_BOT_ID"):
+    if os.getenv(stale) is not None:
+        failures.append(
+            f"{stale} остался в .env, хотя открытая линия вырезана из системы"
+        )
+
 if workspace_enabled:
     if env_flag("TG_BUSINESS_AUTOREPLY"):
         failures.append("workspace включён, но TG_BUSINESS_AUTOREPLY всё ещё включён")
-    if env_flag("OPENLINE_AGENT_ENABLED"):
-        failures.append("workspace включён, но OPENLINE_AGENT_ENABLED всё ещё включён")
 
     password_hash = os.getenv("FUNNEL_WORKSPACE_PASSWORD_HASH", "").strip()
     if not password_hash:
