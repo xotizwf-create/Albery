@@ -117,6 +117,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "070_funnel_workspace.sql",
     # Idempotent: operator-initiated stage moves have no outbox row behind them.
     "071_workspace_operator_stage.sql",
+    # Idempotent: комментарии по лиду (заметки оператора и агента, зеркалятся в сделку).
+    "073_workspace_lead_notes.sql",
 ]
 
 
