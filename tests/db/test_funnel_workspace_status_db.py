@@ -202,7 +202,11 @@ def test_full_takeover_survives_an_operator_reply_and_the_lease_sweeper():
 
 
 def test_a_temporary_takeover_still_expires_back_to_ai():
-    """Обычный перехват обязан истекать: иначе «взял на минуту» молча стало бы навсегда."""
+    """Обычный перехват обязан истекать: иначе «взял на минуту» молча стало бы навсегда.
+
+    Время сдвигаем чуть дальше аренды, а не на сутки: за сутки истекло бы ещё и окно
+    ответа Telegram, и диалог ушёл бы в паузу совсем по другой причине.
+    """
     suffix = uuid4().hex[:12]
     source_key = f"test-lease-{suffix}"
     chat_id = "700000202"
@@ -221,9 +225,11 @@ def test_a_temporary_takeover_still_expires_back_to_ai():
         assert store.is_permanent_hold(held) is False
 
         released = store.release_expired_human_leases(
-            now=datetime.now(timezone.utc) + timedelta(days=1)
+            now=held["resume_at"] + timedelta(seconds=1)
         )
         assert conversation_id in {int(row["id"]) for row in released}
-        assert store.get_conversation(conversation_id)["control_mode"] == "ai"
+        current = store.get_conversation(conversation_id)
+        assert current["control_mode"] == "ai"
+        assert current["resume_at"] is None
     finally:
         _cleanup(source_key)
