@@ -358,3 +358,26 @@ def test_lead_is_created_for_a_client_who_came_through_the_bot():
 
     with pytest.raises(crm.WorkspaceCrmError):
         crm._validate_conversation({"id": 5, "source_key": "whatsapp", "external_user_id": 555}, 5)
+
+
+def test_ai_job_for_a_bot_dialog_is_not_cancelled_by_the_business_rollout(monkeypatch):
+    """Пустой список тестовых ID бизнес-контура не должен глушить ответы бота.
+
+    Живой прогон 28.07.2026: клиент задал вопрос в боте и не получил ничего — задание
+    ИИ отменялось проверкой, которая относится к другому каналу.
+    """
+
+    monkeypatch.setenv("FUNNEL_WORKSPACE_AI_ALLOW_IDS", "")  # бизнес-rollout закрыт
+    monkeypatch.setenv("FUNNEL_WORKSPACE_AI_ENABLED", "1")
+    monkeypatch.setenv("IU_CLIENT_BOT_ENABLED", "1")
+    monkeypatch.setenv("IU_CLIENT_BOT_AI", "1")
+
+    bot_dialog = {"source_key": "telegram_bot", "external_user_id": 555}
+    business_dialog = {"source_key": "telegram", "external_user_id": 555}
+
+    assert gateway.ai_allowed_in_channel(bot_dialog, 555) is True
+    assert gateway.ai_allowed_in_channel(business_dialog, 555) is False
+
+    # Выключенный рубильник бота молчит так же явно.
+    monkeypatch.setenv("IU_CLIENT_BOT_AI", "0")
+    assert gateway.ai_allowed_in_channel(bot_dialog, 555) is False

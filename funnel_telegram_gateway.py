@@ -265,7 +265,9 @@ def _maintenance_loop() -> None:
             for conversation in released:
                 if (
                     conversation.get("control_mode") == "ai"
-                    and not ai_allowed(conversation.get("external_user_id"))
+                    and not ai_allowed_in_channel(
+                        conversation, conversation.get("external_user_id")
+                    )
                 ):
                     try:
                         store.transition_control(
@@ -1203,7 +1205,7 @@ def _process_ai_job(job: Mapping[str, Any], *, worker_id: str) -> None:
         )
         return
     conversation = store.get_conversation(job["conversation_id"])
-    if not ai_allowed(conversation.get("external_user_id")):
+    if not ai_allowed_in_channel(conversation, conversation.get("external_user_id")):
         _cancel_ai_job_safely(
             job_id,
             worker_id=worker_id,
@@ -1332,14 +1334,23 @@ def process_outbox_once(*, worker_id: str, limit: int = 25) -> int:
     return len(rows)
 
 
-def _agent_replies_allowed(outbox: Mapping[str, Any]) -> bool:
-    """Разрешены ли ответы ИИ этому собеседнику — по каналу, из которого пришёл диалог."""
+def ai_allowed_in_channel(row: Mapping[str, Any], telegram_id: Any) -> bool:
+    """Разрешены ли ответы ИИ — по каналу, из которого пришёл диалог.
 
-    if str(outbox.get("source_key") or "") == BOT_SOURCE_KEY:
+    У бизнес-переписки это точечный список тестовых Telegram-ID, у клиентского бота —
+    собственный рубильник. Один общий список сделал бы бота заложником настройки, которая
+    задумана для другого канала: пустой rollout молча отменял бы каждый ответ.
+    """
+
+    if str(row.get("source_key") or "") == BOT_SOURCE_KEY:
         import iu_client_bot
 
         return iu_client_bot.enabled() and iu_client_bot.ai_answers_enabled()
-    return ai_allowed(outbox.get("external_chat_id"))
+    return ai_allowed(telegram_id)
+
+
+def _agent_replies_allowed(outbox: Mapping[str, Any]) -> bool:
+    return ai_allowed_in_channel(outbox, outbox.get("external_chat_id"))
 
 
 def _outgoing_file(outbox: Mapping[str, Any]) -> dict[str, Any] | None:
