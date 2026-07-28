@@ -283,15 +283,41 @@ def score_card(query: str, card: Card, weights: dict | None = None) -> float:
             return 1.0
 
     query_stems = stems(value)
+    if not query_stems:
+        return 0.0
     alias_hit = max((_coverage(query_stems, alias, weights) for alias in card.aliases), default=0.0)
     title_hit = _coverage(query_stems, card.title, weights)
     body_hit = _coverage(query_stems, f"{card.answer} {card.simple}", weights)
     best = max(alias_hit, 0.95 * title_hit, 0.85 * body_hit)
-    # Мягкое сложение: второй сигнал добавляет часть недостающего, но потолок остаётся 1.0.
+    # Второй сигнал добавляет немного: совпасть и в заголовке, и в теле — довод в пользу
+    # карточки, но не повод считать её ответом на вопрос.
     rest = sorted((alias_hit, title_hit, body_hit), reverse=True)[1:]
     for extra in rest:
-        best += (1.0 - best) * 0.35 * extra
+        best += (1.0 - best) * 0.15 * extra
+
+    # Тема вопроса держится на редких словах. Если совпали только ходовые («какой», «товар»,
+    # «условия»), карточка похожа на ответ лишь на вид: так «WB не против?» попадал в карточку
+    # про экономику, а «вы какие-то неторопливые» — в стоимость подключения. Отвечать невпопад
+    # хуже, чем честно передать человеку, поэтому такие совпадения приглушаются.
+    if weights:
+        значимые = [weights.get(stem, 1.0) for stem in query_stems]
+        порог = max(significant_weight(weights), 0.0)
+        field_stems = stems(f"{card.title} {' '.join(card.aliases)} {card.answer} {card.simple}")
+        matched_rare = [stem for stem in query_stems & field_stems
+                        if weights.get(stem, 1.0) >= порог]
+        if значимые and not matched_rare:
+            best *= 0.4
     return min(1.0, best)
+
+
+def significant_weight(weights: dict) -> float:
+    """Граница «редкого» слова: медиана весов базы."""
+
+    values = sorted(weights.values())
+    if not values:
+        return 0.0
+    middle = len(values) // 2
+    return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
 
 
 @dataclass(frozen=True)
