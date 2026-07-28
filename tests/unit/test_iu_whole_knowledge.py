@@ -151,3 +151,26 @@ def test_money_dispute_still_goes_to_a_human():
         reply="44% считается от суммы реализации.", source_ids=["комиссия"]))
 
     assert out.escalate
+
+
+def test_partial_answer_is_not_replaced_by_a_handoff():
+    """Владелец 28.07.2026 прислал девять вопросов одним сообщением.
+
+    На семь ответ в базе был, на два — нет, и агент заменял ВЕСЬ ответ на «уточню у команды».
+    ChatGPT в том же тесте ответил по пунктам и честно сказал, чего не знает."""
+    out = run("Какая комиссия и на какой срок договор?", ask=model(
+        reply="Единая комиссия 44% от суммы реализации.\n\nПро срок договора уточню у коллег.",
+        source_ids=["комиссия"], answered=["комиссия"], unresolved=["срок договора"]))
+
+    assert "44%" in out.reply, "ответ на известную часть обязан дойти до клиента"
+    assert out.answered_client
+    assert out.sources == ("комиссия",)
+
+
+def test_unanswered_part_is_still_named_for_the_operator():
+    """Частичный ответ не значит «забыли»: неотвеченное обязано остаться в решении хода."""
+    out = run("Какая комиссия и на какой срок договор?", ask=model(
+        reply="Единая комиссия 44%.\n\nПро срок договора уточню у коллег.",
+        source_ids=["комиссия"], answered=["комиссия"], unresolved=["срок договора"]))
+
+    assert "срок договора" in out.reason

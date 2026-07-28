@@ -1683,6 +1683,17 @@ def _after_delivery(
                 if result == "unknown"
                 else "Ответ ИИ не доставлен."
             )
+        # Клиент получил ответ по существу, а без ответа осталась только часть вопроса —
+        # разговор у ИИ не забираем: обращение поднимается в очередь оператора, но клиент
+        # может спрашивать дальше и получать ответы. Полная передача остаётся там, где
+        # агент не ответил вовсе или ответ не доставлен.
+        if result == "sent" and payload.get("answered_client"):
+            try:
+                _store().flag_needs_human(conversation_id, reason=reason)
+            except Exception as exc:  # noqa: BLE001 — пометка не важнее уже доставленного ответа
+                log.warning("не удалось пометить обращение %s: %s",
+                            conversation_id, _safe_error(exc))
+            return
         _mark_waiting_if_current(
             conversation_id,
             expected_version=int(outbox["conversation_version"]),
@@ -1836,14 +1847,24 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
         and payload.get("escalate_after_delivery")
     )
     if escalated:
-        _mark_waiting_if_current(
-            int(action["conversation_id"]),
-            expected_version=int(payload.get("conversation_version") or 0),
-            reason=str(
-                payload.get("escalation_reason")
-                or "После доставленного ответа ИИ нужен ответ человека."
-            ),
+        reason = str(
+            payload.get("escalation_reason")
+            or "После доставленного ответа ИИ нужен ответ человека."
         )
+        # Ответ по существу клиент получил, без ответа осталась часть вопроса — обращение
+        # поднимается в очередь оператора, но разговор остаётся у ИИ (владелец, 28.07.2026).
+        if payload.get("answered_client"):
+            try:
+                _store().flag_needs_human(int(action["conversation_id"]), reason=reason)
+            except Exception as exc:  # noqa: BLE001 — пометка не важнее доставленного ответа
+                log.warning("не удалось пометить обращение %s: %s",
+                            action.get("conversation_id"), _safe_error(exc))
+        else:
+            _mark_waiting_if_current(
+                int(action["conversation_id"]),
+                expected_version=int(payload.get("conversation_version") or 0),
+                reason=reason,
+            )
     return {
         "conversation_id": int(action["conversation_id"]),
         "status": "applied",

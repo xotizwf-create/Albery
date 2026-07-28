@@ -955,3 +955,85 @@ def test_non_numeric_identifiers_give_a_clear_refusal_not_a_crash():
         raise AssertionError("ожидался понятный отказ")
 
     assert gateway.delete_delivered_message(payload) == "local_only"
+
+
+def test_partial_answer_flags_a_human_without_taking_the_dialog_away(monkeypatch):
+    """Владелец 28.07.2026: агент отвечает на то, что знает, и разговор продолжает вести.
+
+    Раньше любой неотвеченный пункт ставил обращение на паузу: клиент получал ответ, но
+    следующий его вопрос повисал без ответа до прихода оператора."""
+    flagged = []
+    waiting = []
+    tg = SimpleNamespace(
+        _terms_already_sent=lambda _telegram_id: True,
+        _mark_terms_sent=lambda _telegram_id: None,
+        _invite_already_sent=lambda _telegram_id: True,
+        _mark_invited=lambda _telegram_id: None,
+    )
+    monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    monkeypatch.setattr(
+        gateway, "_mark_waiting_if_current",
+        lambda conversation_id, **kwargs: waiting.append((conversation_id, kwargs)))
+    monkeypatch.setattr(
+        gateway, "_store",
+        lambda: SimpleNamespace(
+            flag_needs_human=lambda conversation_id, *, reason: flagged.append(
+                (conversation_id, reason))))
+
+    action = {
+        "id": 73,
+        "conversation_id": 11,
+        "action_type": "delivery_effects",
+        "payload": {
+            "author_type": "agent",
+            "conversation_version": 4,
+            "escalate_after_delivery": True,
+            "escalation_reason": "остались без ответа: срок договора",
+            "answered_client": True,
+        },
+    }
+
+    result = gateway._apply_delivery_effects(action)
+
+    assert result["escalated"] is True
+    assert flagged == [(11, "остались без ответа: срок договора")]
+    assert waiting == [], "разговор у ИИ не забираем — клиент получил ответ по существу"
+
+
+def test_answer_that_did_not_happen_still_hands_the_dialog_over(monkeypatch):
+    """Агент не ответил вовсе — полная передача человеку остаётся как была."""
+    flagged = []
+    waiting = []
+    tg = SimpleNamespace(
+        _terms_already_sent=lambda _telegram_id: True,
+        _mark_terms_sent=lambda _telegram_id: None,
+        _invite_already_sent=lambda _telegram_id: True,
+        _mark_invited=lambda _telegram_id: None,
+    )
+    monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    monkeypatch.setattr(
+        gateway, "_mark_waiting_if_current",
+        lambda conversation_id, **kwargs: waiting.append((conversation_id, kwargs)))
+    monkeypatch.setattr(
+        gateway, "_store",
+        lambda: SimpleNamespace(
+            flag_needs_human=lambda conversation_id, *, reason: flagged.append(
+                (conversation_id, reason))))
+
+    action = {
+        "id": 74,
+        "conversation_id": 12,
+        "action_type": "delivery_effects",
+        "payload": {
+            "author_type": "agent",
+            "conversation_version": 5,
+            "escalate_after_delivery": True,
+            "escalation_reason": "В знаниях нет ответа",
+            "answered_client": False,
+        },
+    }
+
+    gateway._apply_delivery_effects(action)
+
+    assert flagged == []
+    assert waiting == [(12, {"expected_version": 5, "reason": "В знаниях нет ответа"})]

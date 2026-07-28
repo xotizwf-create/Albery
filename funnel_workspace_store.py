@@ -1754,6 +1754,54 @@ def mark_waiting_human(
             return updated
 
 
+def flag_needs_human(
+    conversation_id: Any,
+    *,
+    reason: str,
+    now: datetime | None = None,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    """Пометить обращение «нужен человек», НЕ отбирая разговор у ИИ.
+
+    Владелец 28.07.2026: агент должен отвечать на то, что знает, а не заменять весь ответ на
+    «уточню у команды» из-за одного пункта без ответа. Но и терять этот пункт нельзя — иначе
+    вопрос клиента не увидит никто. Поэтому обращение поднимается в очередь оператора, а
+    разговор продолжает вести ИИ: клиент получил ответ по существу и вправе спрашивать дальше.
+
+    Версия состояния НЕ увеличивается намеренно: она отменила бы уже запланированный ответ на
+    следующее сообщение клиента, и разговор снова оборвался бы молчанием."""
+    clean_reason = _required_text(reason, "reason", 1000)
+    timestamp = _now(now)
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            row = _load_conversation_locked(cur, conversation_id)
+            if str(row["status"]) not in ACTIVE_STATUSES:
+                return dict(row)
+            cur.execute(
+                """
+                UPDATE funnel_workspace_conversations
+                   SET status = 'waiting',
+                       updated_at = %s
+                 WHERE id = %s
+             RETURNING *
+                """,
+                (timestamp, row["id"]),
+            )
+            updated = dict(cur.fetchone())
+            _insert_control_event(
+                cur,
+                conversation_id=int(row["id"]),
+                from_mode=row["control_mode"],
+                to_mode=row["control_mode"],
+                actor_type="agent",
+                actor_name="ИИ-агент",
+                reason=clean_reason,
+                from_version=int(row["state_version"]),
+                to_version=int(row["state_version"]),
+            )
+            return updated
+
+
 def mark_read(
     conversation_id: Any,
     *,
