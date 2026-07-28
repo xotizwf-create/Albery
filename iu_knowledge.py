@@ -172,6 +172,49 @@ def _multiline(block: str, name: str) -> str:
     return (match.group(1) + "\n" + tail).strip()
 
 
+#: Раздел «Вопрос — ответ» владелец ведёт списком, а не карточками: «1. Вопрос?» на своей
+#: строке, под ним «Ответ: …» и дальше свободный текст с примерами и перечислениями. Формат
+#: другой, но смысл тот же самый, поэтому он превращается в те же карточки — и поиск,
+#: цитирование и ссылки на источник работают без единой правки.
+_QA_QUESTION_RE = re.compile(r"^\s*\d+[.)]\s*(?:\d+[.)]\s*)?(.+?)\s*$", re.M)
+#: Служебная шапка, которую добавляет синк с Google Drive, вопросом не является.
+_QA_SERVICE_RE = re.compile(r"^\s*(источник|обновлено[^:]*|тип)\s*:", re.I)
+
+
+def parse_qa(document: str) -> tuple[Card, ...]:
+    """Разобрать раздел «Вопрос — ответ» в карточки.
+
+    Вопрос-заголовок часто содержит несколько формулировок подряд — владелец пишет их так,
+    как спрашивают клиенты («Какая комиссия будет у Вас? Сколько я буду получать?»). Первая
+    становится названием карточки, остальные — точными формулировками для поиска.
+    """
+
+    text = str(document or "")
+    matches = [m for m in _QA_QUESTION_RE.finditer(text) if not _QA_SERVICE_RE.match(m.group(0))]
+    out: list[Card] = []
+    seen: dict[str, int] = {}
+    for index, match in enumerate(matches):
+        heading = match.group(1).strip()
+        if not heading:
+            continue
+        body = text[match.end(): matches[index + 1].start() if index + 1 < len(matches) else len(text)]
+        answer_match = re.search(r"^\s*ответ\s*:\s*(.*)$", body, re.I | re.M)
+        answer = ""
+        if answer_match:
+            answer = (answer_match.group(1) + "\n" + body[answer_match.end():]).strip()
+        wordings = [part.strip() + "?" for part in heading.split("?") if part.strip()]
+        title = wordings[0] if wordings else heading
+        base = _slug(title)
+        seen[base] = seen.get(base, 0) + 1
+        out.append(Card(
+            id=base if seen[base] == 1 else f"{base}-{seen[base]}",
+            title=title,
+            answer=answer,
+            aliases=tuple(wordings[1:]),
+        ))
+    return tuple(out)
+
+
 def approved(cards) -> tuple[Card, ...]:
     """Только то, что владелец действительно заполнил."""
     return tuple(card for card in cards if card.approved)

@@ -31,6 +31,9 @@ log = logging.getLogger("iu-runtime")
 # Документ владельца с фактами ИУ. Правится на Google Drive, синк подхватывает изменения сам.
 KNOWLEDGE_DOC_NAME = os.getenv(
     "IU_KNOWLEDGE_DOC", "Что отвечать лидам — вопросы и ответы").strip()
+#: Раздел «Вопрос — ответ»: владелец ведёт его отдельным документом и списком вопросов,
+#: а не карточками. Формат другой, назначение то же — это факты для ответа клиенту.
+QA_DOC_NAME = os.getenv("IU_QA_DOC", "Вопрос - ответ").strip()
 
 _CARDS_TTL_S = float(os.getenv("IU_CARDS_TTL_S", "300") or 300)
 _cards_cache: dict = {"at": 0.0, "cards": ()}
@@ -50,26 +53,37 @@ def knowledge_cards(force: bool = False) -> tuple:
     try:
         from mcp import context_server as cs
 
-        files = cs.TOOLS["list_company_files"]["handler"]({"limit": 300})
-        wanted = KNOWLEDGE_DOC_NAME.casefold()
-        match = next((f for f in (files.get("files") or files.get("items") or [])
-                      if wanted in str(f.get("name") or "").casefold()
-                      and f.get("google_file_id")), None)
-        if not match:
-            log.warning("документ знаний «%s» не найден", KNOWLEDGE_DOC_NAME)
+        files = (cs.TOOLS["list_company_files"]["handler"]({"limit": 300}) or {})
+        items = files.get("files") or files.get("items") or []
+
+        def _read(doc_name: str) -> str:
+            wanted = doc_name.casefold()
+            match = next((f for f in items
+                          if wanted in str(f.get("name") or "").casefold()
+                          and f.get("google_file_id")), None)
+            if not match:
+                log.warning("документ знаний «%s» не найден", doc_name)
+                return ""
+            res = cs.TOOLS["get_company_file"]["handler"](
+                {"google_file_id": match["google_file_id"]}) or {}
+            return str(res.get("content") or res.get("text") or "")
+
+        cards = iu_knowledge.parse_cards(_read(KNOWLEDGE_DOC_NAME))
+        # Раздел «Вопрос — ответ» разбирается своим парсером и встаёт рядом с карточками:
+        # для поиска, цитирования и ссылок на источник это один и тот же материал.
+        if QA_DOC_NAME:
+            cards = cards + iu_knowledge.parse_qa(_read(QA_DOC_NAME))
+        if not cards:
             _cards_cache.update({"at": now, "cards": ()})
             return ()
-        res = cs.TOOLS["get_company_file"]["handler"](
-            {"google_file_id": match["google_file_id"]})
-        raw = str(res.get("content") or res.get("text") or "")
-        cards = iu_knowledge.parse_cards(raw)
     except Exception:  # noqa: BLE001 — без знаний агент зовёт людей, но не падает
         log.warning("документ знаний не прочитан", exc_info=True)
         return _cards_cache["cards"]
 
     approved = iu_knowledge.approved(cards)
     drafts = iu_knowledge.drafts(cards)
-    log.info("знания ИУ: %d карточек готово, %d в черновике", len(approved), len(drafts))
+    log.info("знания ИУ: %d карточек готово, %d в черновике (с разделом «%s»)",
+             len(approved), len(drafts), QA_DOC_NAME)
     _cards_cache.update({"at": now, "cards": cards})
     return cards
 
