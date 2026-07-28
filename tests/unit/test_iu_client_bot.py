@@ -156,7 +156,7 @@ def test_calling_the_operator_hands_the_dialog_to_a_human(monkeypatch):
     assert "менеджер" in store.queued[0]["text"].lower()
 
 
-def test_ai_reply_carries_the_operator_button_after_the_threshold(monkeypatch):
+def test_ai_reply_carries_the_menu_but_not_the_operator_item(monkeypatch):
     import iu_contract
 
     store = FakeStore(agent_replies=3)
@@ -181,8 +181,10 @@ def test_ai_reply_carries_the_operator_button_after_the_threshold(monkeypatch):
     )
 
     keyboard = prepared.metadata.get("reply_markup", {}).get("keyboard")
-    assert keyboard, "после третьего ответа ИИ в меню появляется вызов оператора"
-    assert keyboard[-1][0]["text"] == bot.BUTTON_OPERATOR
+    assert keyboard, "меню приходит вместе с ответом ИИ"
+    titles = [button["text"] for row in keyboard for button in row]
+    # Пункт вызова оператора владелец убрал: человека зовут другие ветки сценария.
+    assert bot.BUTTON_OPERATOR not in titles
 
 
 def test_ai_reply_has_no_button_before_the_threshold(monkeypatch):

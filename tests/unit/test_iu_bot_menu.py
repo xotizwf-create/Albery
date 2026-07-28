@@ -88,13 +88,15 @@ def test_menu_lives_under_the_input_field_not_inside_a_message():
     ]
 
 
-def test_operator_item_joins_the_menu_after_the_third_ai_reply():
-    plain = bot.main_menu()
-    with_operator = bot.main_menu(offer_operator=True)
+def test_menu_has_no_operator_item():
+    """Владелец убрал пункт 28.07.2026: человека зовут присоединение, калькулятор и сам агент."""
 
-    assert len(with_operator["keyboard"]) == len(plain["keyboard"]) + 1
-    last = with_operator["keyboard"][-1][0]
-    assert (last["text"] if isinstance(last, dict) else last) == bot.BUTTON_OPERATOR
+    titles = [button["text"] for row in bot.main_menu()["keyboard"] for button in row]
+    with_flag = [button["text"] for row in bot.main_menu(offer_operator=True)["keyboard"]
+                 for button in row]
+
+    assert bot.BUTTON_OPERATOR not in titles
+    assert with_flag == titles, "старый флаг больше ничего не добавляет"
 
 
 def test_start_answers_with_the_menu(monkeypatch):

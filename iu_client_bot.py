@@ -93,9 +93,11 @@ def main_menu(*, offer_operator: bool = False) -> dict:
     обычным текстовым сообщением — сценарий узнаёт его по подписи.
     """
 
+    # Пункт «Позвать оператора» убран из меню владельцем 28.07.2026. Сам вызов человека
+    # остался: его делают кнопки присоединения и калькулятора, а также решение агента
+    # передать разговор, когда ответа в базе нет.
+    del offer_operator
     rows = [[BUTTON_TERMS], [BUTTON_JOIN], [BUTTON_CALCULATOR], [BUTTON_ASK]]
-    if offer_operator:
-        rows.append([BUTTON_OPERATOR])
     return {
         "keyboard": [[{"text": title} for title in row] for row in rows],
         "resize_keyboard": True,

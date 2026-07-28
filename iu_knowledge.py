@@ -38,6 +38,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -225,21 +226,54 @@ def drafts(cards) -> tuple[Card, ...]:
     return tuple(card for card in cards if not card.approved)
 
 
-def _coverage(query_stems: frozenset[str], field: str) -> float:
-    """Какая доля значимых слов запроса нашлась в поле карточки."""
+def _coverage(query_stems: frozenset[str], field: str, weights: dict | None = None) -> float:
+    """Какая доля ЗНАЧИМОСТИ вопроса нашлась в поле карточки.
+
+    Раньше считалась доля слов, и все слова весили одинаково: «ваша компания на осно» — три
+    слова, из них совпало одно, значит 0.33, хотя именно «осно» и определяет тему вопроса.
+    Теперь вес слова — его редкость по базе: то, что встречается в каждой карточке, почти
+    ничего не значит, а редкий термин («осно», «дрр», «усн») тянет скор вверх.
+    """
+
     if not query_stems:
         return 0.0
     field_stems = stems(field)
     if not field_stems:
         return 0.0
-    return len(query_stems & field_stems) / len(query_stems)
+    weights = weights or {}
+    total = sum(weights.get(stem, 1.0) for stem in query_stems)
+    if total <= 0:
+        return 0.0
+    hit = sum(weights.get(stem, 1.0) for stem in query_stems & field_stems)
+    return hit / total
 
 
-def score_card(query: str, card: Card) -> float:
+def idf_weights(cards) -> dict[str, float]:
+    """Вес каждого слова по редкости в базе: чем в меньшем числе карточек, тем важнее."""
+
+    documents = [f"{card.title} {' '.join(card.aliases)} {card.answer} {card.simple}"
+                 for card in approved(cards)]
+    if not documents:
+        return {}
+    seen: dict[str, int] = {}
+    for document in documents:
+        for stem in stems(document):
+            seen[stem] = seen.get(stem, 0) + 1
+    total = len(documents)
+    return {stem: math.log(1.0 + total / count) for stem, count in seen.items()}
+
+
+def score_card(query: str, card: Card, weights: dict | None = None) -> float:
     """Насколько карточка отвечает на запрос: 0..1.
 
     Формулировка клиента весит больше заголовка, а заголовок — больше тела ответа. Полное
-    вхождение одной из клиентских формулировок считается точным попаданием."""
+    вхождение одной из клиентских формулировок считается точным попаданием.
+
+    Сигналы складываются, а не соперничают: совпадение и в заголовке, и в теле ответа — более
+    веский довод, чем совпадение только в одном месте. Раньше брался максимум, и вопрос,
+    раскиданный по обоим полям, оценивался как половинчатый.
+    """
+
     value = " ".join(str(query or "").split()).casefold()
     if not value:
         return 0.0
@@ -249,10 +283,15 @@ def score_card(query: str, card: Card) -> float:
             return 1.0
 
     query_stems = stems(value)
-    alias_hit = max((_coverage(query_stems, alias) for alias in card.aliases), default=0.0)
-    title_hit = _coverage(query_stems, card.title)
-    body_hit = _coverage(query_stems, f"{card.answer} {card.simple}")
-    return max(alias_hit, 0.9 * title_hit, 0.6 * body_hit)
+    alias_hit = max((_coverage(query_stems, alias, weights) for alias in card.aliases), default=0.0)
+    title_hit = _coverage(query_stems, card.title, weights)
+    body_hit = _coverage(query_stems, f"{card.answer} {card.simple}", weights)
+    best = max(alias_hit, 0.95 * title_hit, 0.85 * body_hit)
+    # Мягкое сложение: второй сигнал добавляет часть недостающего, но потолок остаётся 1.0.
+    rest = sorted((alias_hit, title_hit, body_hit), reverse=True)[1:]
+    for extra in rest:
+        best += (1.0 - best) * 0.35 * extra
+    return min(1.0, best)
 
 
 @dataclass(frozen=True)
@@ -274,7 +313,8 @@ def search(query: str, cards, *, limit: int = 4, floor: float = 0.15,
     не нашла вовсе («сколько это займёт» → «Сроки подключения»); если сначала отсечь по
     лексическому скору, семантический слой сможет только переставлять уже найденное, то есть
     ровно то, ради чего он и нужен, окажется невозможным."""
-    hits = [Found(card, score_card(query, card)) for card in approved(cards)]
+    weights = idf_weights(cards)
+    hits = [Found(card, score_card(query, card, weights)) for card in approved(cards)]
     if rerank is not None:
         try:
             reranked = rerank(query, hits)
