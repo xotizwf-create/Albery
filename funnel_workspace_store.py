@@ -2296,6 +2296,15 @@ def ingest_business_message(
                     int(conversation["id"]),
                     "Новое сообщение клиента отменило незавершённый ответ ИИ.",
                 )
+                # Владелец 28.07.2026: в боте отвечает ИИ всем, кто пишет. Передача
+                # человеку ставит паузу — и следующий вопрос клиента раньше уходил в
+                # никуда: ИИ выключен, человек ещё не подошёл, в переписке «ответы
+                # приостановлены». Молчание — сломанная логика, поэтому новый вопрос
+                # возвращает ход ИИ. Разрешение канала уже посчитано в `schedule_ai`,
+                # так что переписка менеджера с выключенным ИИ остаётся на паузе.
+                # Забранный человеком диалог (`human`) не трогаем: там за рулём человек.
+                if schedule_ai and new_mode == "paused" and next_status in ACTIVE_STATUSES:
+                    new_mode = "ai"
             if clean_author == "operator":
                 held_forever = is_permanent_hold(conversation)
                 new_mode = "human"
@@ -2375,6 +2384,18 @@ def ingest_business_message(
                     actor_type="operator",
                     actor_name=_clean_optional(author_name, 200),
                     reason="Ответ отправлен из Telegram.",
+                    from_version=current_version,
+                    to_version=next_version,
+                )
+            elif new_mode != old_mode:
+                _insert_control_event(
+                    cur,
+                    conversation_id=int(conversation["id"]),
+                    from_mode=old_mode,
+                    to_mode=new_mode,
+                    actor_type="system",
+                    actor_name="Система",
+                    reason="Клиент написал снова — ответ вернулся ИИ.",
                     from_version=current_version,
                     to_version=next_version,
                 )

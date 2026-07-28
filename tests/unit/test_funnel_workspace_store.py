@@ -402,6 +402,160 @@ def test_ingest_schedules_debounced_ai_when_explicitly_enabled():
     assert result["ai_job"]["trigger_message_id"] == 51
 
 
+def _paused_dialog_responder(conv_before, message, job, executed_modes):
+    """Отвечает как настоящая таблица: режим в UPDATE решает код, а не подделка теста."""
+
+    def respond(sql, params):
+        if sql.startswith("INSERT INTO funnel_workspace_sources"):
+            return None
+        if sql.startswith("INSERT INTO funnel_workspace_conversations"):
+            return conv_before
+        if sql.startswith("SELECT * FROM funnel_workspace_messages"):
+            return None
+        if sql.startswith("INSERT INTO funnel_workspace_messages"):
+            return message
+        if "UPDATE funnel_workspace_outbox" in sql:
+            return None
+        if sql.startswith("UPDATE funnel_workspace_ai_jobs"):
+            return None
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            executed_modes.append(params[1])
+            return {
+                **conv_before,
+                "status": params[0],
+                "control_mode": params[1],
+                "state_version": params[5],
+            }
+        if sql.startswith("INSERT INTO funnel_workspace_control_events"):
+            return {"id": 81}
+        if sql.startswith("INSERT INTO funnel_workspace_ai_jobs"):
+            return job
+        if sql.startswith("INSERT INTO funnel_workspace_crm_actions"):
+            return {
+                "id": 71,
+                "conversation_id": 41,
+                "message_id": 51,
+                "action_type": "ensure_deal",
+                "processing_status": "pending",
+            }
+        raise AssertionError(sql)
+
+    return respond
+
+
+def test_new_client_question_returns_a_paused_dialog_to_the_ai():
+    """Жалоба владельца 28.07.2026: «написано ответы приостановлены».
+
+    Передав разговор человеку, агент ставит режим `paused`. Дальше клиент пишет снова —
+    и не получает НИЧЕГО: ИИ отключён, человек ещё не подошёл. Молчание — сломанная
+    логика, поэтому новый вопрос клиента возвращает ход ИИ там, где ИИ разрешён.
+    """
+
+    conv_before = conversation(state_version=7, status="waiting", control_mode="paused")
+    message = {
+        "id": 51,
+        "conversation_id": 41,
+        "author_type": "client",
+        "text": "Как я буду платить налоги?",
+    }
+    job = {
+        "id": 61,
+        "conversation_id": 41,
+        "trigger_message_id": 51,
+        "expected_version": 8,
+        "processing_status": "pending",
+    }
+    modes: list[str] = []
+
+    connect, connection = connect_factory(
+        _paused_dialog_responder(conv_before, message, job, modes)
+    )
+    result = store.ingest_business_message(
+        source_key="telegram_bot",
+        external_chat_id="9001",
+        external_message_id="100",
+        text="Как я буду платить налоги?",
+        author_type="client",
+        occurred_at=NOW,
+        schedule_ai=True,
+        connect=connect,
+    )
+
+    assert modes == ["ai"]
+    assert result["conversation"]["control_mode"] == "ai"
+    assert result["ai_job"]["trigger_message_id"] == 51
+    events = [
+        params
+        for sql, params in connection.cursor_instance.executed
+        if sql.startswith("INSERT INTO funnel_workspace_control_events")
+    ]
+    assert len(events) == 1
+    assert "paused" in events[0] and "ai" in events[0]
+
+
+def test_paused_dialog_stays_paused_where_the_ai_is_switched_off():
+    """Канал без ИИ не оживает от сообщения клиента: там отвечает только человек."""
+
+    conv_before = conversation(state_version=7, status="waiting", control_mode="paused")
+    message = {
+        "id": 51,
+        "conversation_id": 41,
+        "author_type": "client",
+        "text": "Добрый день!",
+    }
+    modes: list[str] = []
+
+    connect, connection = connect_factory(
+        _paused_dialog_responder(conv_before, message, None, modes)
+    )
+    result = store.ingest_business_message(
+        external_chat_id="9001",
+        external_message_id="100",
+        text="Добрый день!",
+        author_type="client",
+        occurred_at=NOW,
+        schedule_ai=False,
+        connect=connect,
+    )
+
+    assert modes == ["paused"]
+    assert result["ai_job"] is None
+    assert not any(
+        sql.startswith("INSERT INTO funnel_workspace_control_events")
+        for sql, _ in connection.cursor_instance.executed
+    )
+
+
+def test_human_hold_is_not_taken_away_by_a_new_client_question():
+    """Оператор, забравший диалог, остаётся за рулём: ИИ не перебивает человека."""
+
+    conv_before = conversation(state_version=7, status="open", control_mode="human")
+    message = {
+        "id": 51,
+        "conversation_id": 41,
+        "author_type": "client",
+        "text": "Ну что там?",
+    }
+    modes: list[str] = []
+
+    connect, _connection = connect_factory(
+        _paused_dialog_responder(conv_before, message, None, modes)
+    )
+    result = store.ingest_business_message(
+        source_key="telegram_bot",
+        external_chat_id="9001",
+        external_message_id="100",
+        text="Ну что там?",
+        author_type="client",
+        occurred_at=NOW,
+        schedule_ai=True,
+        connect=connect,
+    )
+
+    assert modes == ["human"]
+    assert result["ai_job"] is None
+
+
 def test_edit_updates_client_tombstone_and_invalidates_old_ai_work():
     conv_before = conversation(state_version=7)
     conv_after = conversation(state_version=8)
