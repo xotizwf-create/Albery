@@ -3590,6 +3590,9 @@ def _cancel_stale_agent_outbox(cur: Any, timestamp: datetime) -> None:
              WHERE o.conversation_id = c.id
                AND o.author_type = 'agent'
                AND o.delivery_status = 'pending'
+               -- Служебные подтверждения нажатых кнопок устареть не могут: они отвечают
+               -- на действие клиента, а не продолжают разговор от имени ИИ.
+               AND COALESCE(o.payload->>'service_reply', 'false') <> 'true'
                AND (
                     c.control_mode <> 'ai'
                     OR c.state_version <> o.conversation_version

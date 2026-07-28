@@ -324,15 +324,20 @@ def test_handover_does_not_cancel_the_service_confirmation():
     assert cancel_block.count("COALESCE(payload->>'service_reply', 'false') <> 'true'") == 2
 
 
-def test_service_reply_passes_both_delivery_gates():
-    """Служебный ответ должен быть и взят в работу, и допущен к отправке.
+def test_service_reply_survives_every_gate_on_the_way_to_telegram():
+    """Барьеров на пути ответа четыре, и пропуск любого гасит подтверждение.
 
-    Барьеров два — очередь берёт сообщения по одному условию, а граница вызова Telegram
-    проверяет его повторно. Пропуск в одном месте оставил бы подтверждение висеть.
+    Найдено живым прогоном 28.07.2026: сначала подтверждение отменяла передача диалога
+    человеку, потом — фоновая чистка «устаревших» ответов ИИ, и только после этого стало
+    видно, что очередь и граница вызова Telegram проверяют условие каждая по-своему.
     """
 
     from pathlib import Path
 
     source = (Path(__file__).resolve().parents[2] / "funnel_workspace_store.py").read_text(
         encoding="utf-8")
+    # Пропуск: выборка в работу и граница вызова Telegram.
     assert source.count("COALESCE(o.payload->>'service_reply', 'false') = 'true'") == 2
+    # Отмена: снятие при передаче человеку (два запроса) и чистка устаревших.
+    assert source.count("COALESCE(payload->>'service_reply', 'false') <> 'true'") == 2
+    assert source.count("COALESCE(o.payload->>'service_reply', 'false') <> 'true'") == 1
