@@ -322,3 +322,17 @@ def test_handover_does_not_cancel_the_service_confirmation():
     cancel_block = source.split("def _cancel_queued_ai", 1)[1].split("def ", 1)[0]
     # Обе отмены (ожидающие и уже взятые в работу) обязаны обходить служебные ответы.
     assert cancel_block.count("COALESCE(payload->>'service_reply', 'false') <> 'true'") == 2
+
+
+def test_service_reply_passes_both_delivery_gates():
+    """Служебный ответ должен быть и взят в работу, и допущен к отправке.
+
+    Барьеров два — очередь берёт сообщения по одному условию, а граница вызова Telegram
+    проверяет его повторно. Пропуск в одном месте оставил бы подтверждение висеть.
+    """
+
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "funnel_workspace_store.py").read_text(
+        encoding="utf-8")
+    assert source.count("COALESCE(o.payload->>'service_reply', 'false') = 'true'") == 2

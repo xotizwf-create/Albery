@@ -3641,6 +3641,14 @@ def claim_outbox(
                                 AND c.state_version = o.conversation_version
                                 AND c.status IN ('new', 'open', 'waiting')
                             )
+                            -- Подтверждение нажатой клиентом кнопки: его порождает сама
+                            -- передача диалога человеку, поэтому режим и версия здесь не
+                            -- показатель — иначе клиент останется без ответа на нажатие.
+                            OR (
+                                o.author_type = 'agent'
+                                AND COALESCE(o.payload->>'service_reply', 'false') = 'true'
+                                AND c.status IN ('new', 'open', 'waiting')
+                            )
                        )
                      ORDER BY o.id
                      FOR UPDATE OF o SKIP LOCKED
@@ -3755,6 +3763,14 @@ def begin_outbox_send(
                                 o.author_type = 'agent'
                                 AND c.control_mode = 'ai'
                                 AND c.state_version = o.conversation_version
+                                AND c.status IN ('new', 'open', 'waiting')
+                            )
+                            -- Подтверждение нажатой клиентом кнопки: его порождает сама
+                            -- передача диалога человеку, поэтому режим и версия здесь не
+                            -- показатель — иначе клиент останется без ответа на нажатие.
+                            OR (
+                                o.author_type = 'agent'
+                                AND COALESCE(o.payload->>'service_reply', 'false') = 'true'
                                 AND c.status IN ('new', 'open', 'waiting')
                             )
                        )
