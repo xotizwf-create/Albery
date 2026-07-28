@@ -373,6 +373,10 @@ def route_captured_update(
             # тем же путём. Пока канал выключен, чужие сообщения по-прежнему игнорируются.
             return ingest_bot_message(message, provider_update_id=provider_update_id)
         return None, None
+    if update.get("callback_query"):
+        if not client_bot_enabled():
+            return None, None
+        return handle_bot_callback(dict(update["callback_query"]))
     if update.get("business_connection"):
         tg_agent.handle_business_connection(dict(update["business_connection"]))
         return None, None
@@ -409,13 +413,133 @@ def route_captured_update(
 def client_bot_enabled() -> bool:
     """Открыт ли боту клиентский вход. Выключено — чужие сообщения игнорируются, как раньше."""
 
-    return os.getenv("IU_CLIENT_BOT_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    import iu_client_bot
+
+    return iu_client_bot.enabled()
+
+
+def _reply_to_client(
+    conversation_id: int,
+    text: str,
+    *,
+    idempotency_key: str,
+    reply_markup: Mapping[str, Any] | None = None,
+) -> None:
+    """Служебный ответ бота — через ту же очередь, что и ответы оператора.
+
+    Прямая отправка в Telegram оставила бы команду без половины разговора: в ленте
+    обращения не было бы ни приветствия, ни условий, ни того, что клиент нажимал.
+    """
+
+    store = _store()
+    conversation = store.get_conversation(conversation_id) or {}
+    metadata: dict[str, Any] = {"channel": "iu_client_bot"}
+    if reply_markup:
+        metadata["reply_markup"] = dict(reply_markup)
+    try:
+        store.enqueue_outgoing_agent(
+            conversation_id,
+            text=text,
+            expected_version=conversation.get("state_version"),
+            idempotency_key=idempotency_key,
+            agent_name=AGENT_NAME,
+            metadata=metadata,
+        )
+    except store.WorkspaceControlError:
+        # Диалог уже забрал человек — навязывать поверх него ответ бота нельзя.
+        log.info("iu client bot: conversation %s is handled by a human, service reply skipped",
+                 conversation_id)
+        return
+    _wake_event.set()
+
+
+def _conversation_for_bot_chat(chat_id: Any) -> int | None:
+    """Обращение, заведённое для этого чата с ботом."""
+
+    conversation = _store().find_conversation(
+        source_key=BOT_SOURCE_KEY,
+        business_connection_id="",
+        external_chat_id=str(chat_id),
+    )
+    return _as_int((conversation or {}).get("id"))
+
+
+def handle_bot_callback(callback: Mapping[str, Any]) -> tuple[int | None, int | None]:
+    """Нажатие кнопки в клиентском боте."""
+
+    import iu_client_bot
+    import tg_agent
+
+    data = str(callback.get("data") or "")
+    label = iu_client_bot.button_label(data)
+    message = dict(callback.get("message") or {})
+    chat = dict(message.get("chat") or {})
+    sender = dict(callback.get("from") or {})
+    chat_id = chat.get("id")
+    if chat_id is None or not label:
+        return None, None
+
+    # Telegram ждёт подтверждения нажатия, иначе кнопка «крутится» у клиента.
+    try:
+        tg_agent.api("answerCallbackQuery", callback_query_id=callback.get("id"))
+    except Exception as exc:  # noqa: BLE001 - косметика не важнее самого ответа
+        log.info("answerCallbackQuery failed: %s", _safe_error(exc))
+
+    # Нажатие — такая же реплика клиента, как текст: без неё лента станет односторонней.
+    conversation_id, _ = ingest_bot_message(
+        {
+            "message_id": f"cb-{callback.get('id')}",
+            "date": message.get("date"),
+            "chat": chat,
+            "from": sender,
+            "text": label,
+        },
+        schedule_ai=False,
+    )
+    if conversation_id is None:
+        conversation_id = _conversation_for_bot_chat(chat_id)
+    if conversation_id is None:
+        return None, None
+
+    key = f"iu-bot:{chat_id}:{callback.get('id')}"
+    if data == iu_client_bot.CB_TERMS:
+        try:
+            terms = tg_agent._strip_markup(tg_agent.terms_text())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("iu client bot: terms unavailable: %s", _safe_error(exc))
+            terms = iu_client_bot.TERMS_FALLBACK
+        _reply_to_client(conversation_id, terms, idempotency_key=key)
+    elif data == iu_client_bot.CB_JOIN:
+        _reply_to_client(conversation_id, iu_client_bot.JOIN_STUB, idempotency_key=key)
+        _hand_over_to_human(conversation_id, "Клиент нажал «Присоединиться к ИУ».")
+    elif data == iu_client_bot.CB_ASK:
+        _reply_to_client(conversation_id, iu_client_bot.ASK_PROMPT, idempotency_key=key)
+    elif data == iu_client_bot.CB_OPERATOR:
+        _reply_to_client(conversation_id, iu_client_bot.OPERATOR_CALLED, idempotency_key=key)
+        _hand_over_to_human(conversation_id, "Клиент нажал «Позвать оператора».")
+    return conversation_id, None
+
+
+def _hand_over_to_human(conversation_id: int, reason: str) -> None:
+    """Передать обращение человеку: дальше отвечает оператор из рабочего окна."""
+
+    store = _store()
+    conversation = store.get_conversation(conversation_id) or {}
+    try:
+        store.mark_waiting_human(
+            conversation_id,
+            expected_version=conversation.get("state_version"),
+            reason=reason,
+        )
+    except Exception as exc:  # noqa: BLE001 - клиент уже получил ответ, сбой не должен его терять
+        log.warning("iu client bot: handover failed for %s: %s", conversation_id, _safe_error(exc))
 
 
 def ingest_bot_message(
     message: Mapping[str, Any],
     *,
     provider_update_id: int | None = None,
+    schedule_ai: bool | None = None,
 ) -> tuple[int | None, int | None]:
     """Сообщение, которое клиент написал боту напрямую, — в общий поток обращений.
 
@@ -432,13 +556,20 @@ def ingest_bot_message(
     if chat_id is None or external_message_id is None:
         raise ValueError("Bot message lacks chat/message identity")
 
+    import iu_client_bot
+
     sender = dict(message.get("from") or {})
     customer_id = _as_int(sender.get("id")) or _as_int(chat_id)
     display_name = _display_name(sender) or _display_name(chat) or f"Telegram {chat_id}"
+    text = telegram_message_text(message)
+    is_command = text.strip().startswith("/")
+    if schedule_ai is None:
+        # Команда — не вопрос: на «/start» отвечает сценарий, а не модель.
+        schedule_ai = iu_client_bot.ai_answers_enabled() and not is_command
     result = _store().ingest_business_message(
         external_chat_id=str(chat_id),
         external_message_id=str(external_message_id),
-        text=telegram_message_text(message),
+        text=text,
         author_type="client",
         source_key=BOT_SOURCE_KEY,
         business_connection_id="",
@@ -453,11 +584,19 @@ def ingest_bot_message(
             "telegram_media_type": telegram_media_type(message),
             **telegram_media_metadata(message),
         },
-        schedule_ai=ai_allowed(customer_id),
+        schedule_ai=bool(schedule_ai),
     )
     conversation = dict(result.get("conversation") or {})
     journaled = dict(result.get("message") or {})
-    return _as_int(conversation.get("id")), _as_int(journaled.get("id"))
+    conversation_id = _as_int(conversation.get("id"))
+    if conversation_id is not None and text.strip().split()[0:1] == ["/start"]:
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.WELCOME,
+            idempotency_key=f"iu-bot:start:{chat_id}:{external_message_id}",
+            reply_markup=iu_client_bot.main_keyboard(),
+        )
+    return conversation_id, _as_int(journaled.get("id"))
 
 
 def ingest_business_message(
@@ -941,6 +1080,7 @@ def prepare_reply(
     *,
     telegram_user_id: int,
     facts: Any = None,
+    conversation: Mapping[str, Any] | None = None,
 ) -> PreparedReply:
     """Turn an ИУ decision into one atomic Telegram text for the durable outbox."""
 
@@ -1018,6 +1158,16 @@ def prepare_reply(
         "sources": list(outcome.sources or ()),
         "trace": dict(outcome.trace or {}),
     }
+    # Клиенту, который уже несколько раз спросил у ИИ, показываем прямой путь к человеку.
+    # В переписке менеджера кнопки не нужны: там и так отвечает человек.
+    if conversation and str(conversation.get("source_key") or "") == BOT_SOURCE_KEY:
+        import iu_client_bot
+
+        replies = _store().count_agent_replies(conversation["id"])
+        if iu_client_bot.should_offer_operator(
+            replies, control_mode=str(conversation.get("control_mode") or "ai")
+        ):
+            metadata["reply_markup"] = iu_client_bot.operator_keyboard()
     return PreparedReply(
         text=body,
         metadata=metadata,
@@ -1108,6 +1258,7 @@ def _process_ai_job(job: Mapping[str, Any], *, worker_id: str) -> None:
             outcome,
             telegram_user_id=int(author["id"]),
             facts=facts,
+            conversation=conversation,
         )
 
         # The model can take minutes.  Re-check ownership/version immediately before enqueue.
@@ -1176,6 +1327,16 @@ def process_outbox_once(*, worker_id: str, limit: int = 25) -> int:
     for row in rows:
         _process_outbox_item(row, worker_id=worker_id)
     return len(rows)
+
+
+def _agent_replies_allowed(outbox: Mapping[str, Any]) -> bool:
+    """Разрешены ли ответы ИИ этому собеседнику — по каналу, из которого пришёл диалог."""
+
+    if str(outbox.get("source_key") or "") == BOT_SOURCE_KEY:
+        import iu_client_bot
+
+        return iu_client_bot.enabled() and iu_client_bot.ai_answers_enabled()
+    return ai_allowed(outbox.get("external_chat_id"))
 
 
 def _outgoing_file(outbox: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1252,9 +1413,9 @@ def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
         )
         return
     current = dict(guard.get("outbox") or item)
-    if current.get("author_type") == "agent" and not ai_allowed(
-        current.get("external_chat_id")
-    ):
+    # У каждого канала свой рубильник: список тестовых ID бизнес-контура не должен
+    # отменять ответы клиентского бота, и наоборот.
+    if current.get("author_type") == "agent" and not _agent_replies_allowed(current):
         store.finish_outbox(
             outbox_id,
             worker_id=worker_id,
@@ -1317,6 +1478,8 @@ def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
                     connection_id=connection_id,
                 )
             else:
+                payload = current.get("payload")
+                keyboard = (payload or {}).get("reply_markup") if isinstance(payload, Mapping) else None
                 sent = tg_agent.api(
                     "sendMessage",
                     http_timeout=45,
@@ -1324,6 +1487,7 @@ def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
                     text=str(current.get("text") or "")[:4096],
                     link_preview_options={"is_disabled": True},
                     **({"business_connection_id": connection_id} if connection_id else {}),
+                    **({"reply_markup": keyboard} if keyboard else {}),
                 )
                 provider_message_id = (
                     str(sent.get("message_id"))

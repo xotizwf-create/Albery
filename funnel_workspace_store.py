@@ -1031,6 +1031,62 @@ def _require_version(row: Mapping[str, Any], expected_version: Any) -> int:
     return current
 
 
+def find_conversation(
+    *,
+    source_key: str,
+    business_connection_id: str,
+    external_chat_id: Any,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any] | None:
+    """Обращение по адресу диалога у провайдера, или None."""
+
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM funnel_workspace_conversations
+                 WHERE source_key = %s
+                   AND business_connection_id = %s
+                   AND external_chat_id = %s
+                """,
+                (
+                    _required_text(source_key, "source_key", 100),
+                    str(business_connection_id or "")[:300],
+                    _required_text(external_chat_id, "external_chat_id", 200),
+                ),
+            )
+            return _record(cur.fetchone())
+
+
+def count_agent_replies(
+    conversation_id: Any,
+    *,
+    connect: ConnectFactory | None = None,
+) -> int:
+    """Сколько раз ИИ уже ответил клиенту в этом обращении.
+
+    Считается по журналу, а не отдельным счётчиком: недоставленный ответ не должен
+    приближать предложение позвать человека, а собственный счётчик разошёлся бы с лентой
+    при первой же ошибке доставки.
+    """
+
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT count(*) AS replies
+                  FROM funnel_workspace_messages
+                 WHERE conversation_id = %s
+                   AND author_type = 'agent'
+                   AND direction = 'outbound'
+                   AND delivery_status = 'sent'
+                """,
+                (_positive_int(conversation_id, "conversation_id"),),
+            )
+            row = _record(cur.fetchone()) or {}
+    return int(row.get("replies") or 0)
+
+
 def get_conversation(
     conversation_id: Any,
     *,

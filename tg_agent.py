@@ -3040,6 +3040,9 @@ def poll_forever() -> None:
                 offset=offset,
                 allowed_updates=[
                     "message",
+                    # Нажатия кнопок клиентского бота: без этого типа Telegram их не отдаёт,
+                    # и кнопки выглядят рабочими, но ничего не делают.
+                    "callback_query",
                     "business_connection",
                     "business_message",
                     "edited_business_message",
