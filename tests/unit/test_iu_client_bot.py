@@ -341,3 +341,20 @@ def test_service_reply_survives_every_gate_on_the_way_to_telegram():
     # Отмена: снятие при передаче человеку (два запроса) и чистка устаревших.
     assert source.count("COALESCE(payload->>'service_reply', 'false') <> 'true'") == 2
     assert source.count("COALESCE(o.payload->>'service_reply', 'false') <> 'true'") == 1
+
+
+def test_lead_is_created_for_a_client_who_came_through_the_bot():
+    """Клиент из бота — такой же лид, как написавший менеджеру.
+
+    Живой прогон 28.07.2026: сделка не заводилась вовсе — адаптер CRM отвергал новый
+    источник, и обращение оставалось без лида в Битриксе.
+    """
+
+    import funnel_workspace_crm as crm
+
+    # Диалог из бота проходит проверку источника наравне с перепиской менеджера.
+    crm._validate_conversation({"id": 5, "source_key": "telegram_bot", "external_user_id": 555}, 5)
+    crm._validate_conversation({"id": 5, "source_key": "telegram", "external_user_id": 555}, 5)
+
+    with pytest.raises(crm.WorkspaceCrmError):
+        crm._validate_conversation({"id": 5, "source_key": "whatsapp", "external_user_id": 555}, 5)

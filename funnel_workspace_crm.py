@@ -473,7 +473,9 @@ def _validate_conversation(conversation: Mapping[str, Any], expected_id: int) ->
             f"Conversation getter returned id {actual_id}, expected {expected_id}."
         )
     source = str(conversation.get("source_key") or "telegram").strip().lower()
-    if source != "telegram":
+    # Оба Telegram-канала ведут одну и ту же воронку: клиент из бота — такой же лид,
+    # как написавший менеджеру. Разница только в транспорте ответа.
+    if source not in {"telegram", "telegram_bot"}:
         raise WorkspaceCrmError(
             f"CRM adapter only supports Telegram conversations, got {source!r}."
         )
