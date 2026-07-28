@@ -213,27 +213,27 @@ def test_model_asking_for_human_always_escalates():
 
 def test_threshold_is_the_owner_number():
     assert c.THRESHOLD == pytest.approx(0.65)
-    assert c.CALC_THRESHOLD == pytest.approx(0.95)
+    # Владелец 28.07.2026: «нужно, чтобы уверенность была 65%» — отдельного порога для
+    # расчётов больше нет, защиту цифр держит вето на числа без подтверждения.
+    assert c.CALC_THRESHOLD == pytest.approx(0.65)
 
 
 # --- строгий порог для денег ------------------------------------------------------------------
 
-def test_calculation_request_uses_the_strict_threshold():
-    """Владелец 26.07.2026: «когда дело касается расчётов — уверенность 95%+»."""
+def test_every_turn_uses_the_single_threshold():
+    """Порог один для всего разговора (владелец 28.07.2026).
+
+    Прежний строгий порог 0.95 задумывался как защита расчётов, но на практике уводил к
+    человеку обычные вопросы про цены и сроки: включался он от слов, а не от смысла.
+    Расчёты защищает вето — цифра обязана быть из базы, из слов клиента или выводиться из них.
+    """
+
     plan = c.parse(plan_json(reply="Расскажу, как это устроено.", answered=[]),
                    offered_sources=OFFERED)
 
     for message in ("посчитайте мою экономику", "какая будет прибыль?",
                     "от чего считается процент?", "а выручка какая выйдет?"):
-        assert c.threshold_for(plan, message) == pytest.approx(0.95), message
-
-
-def test_models_own_calculation_wording_also_triggers_it():
-    """Клиент мог не просить расчёт — модель начала считать сама."""
-    plan = c.parse(plan_json(reply="44% вычитается от суммы к перечислению."),
-                   offered_sources=OFFERED)
-
-    assert c.threshold_for(plan, "а как это работает?") == pytest.approx(0.95)
+        assert c.threshold_for(plan, message) == pytest.approx(0.65), message
 
 
 def test_quoting_a_rate_is_not_a_calculation():
@@ -253,16 +253,17 @@ def test_ordinary_talk_keeps_the_normal_threshold():
     assert c.threshold_for(plan, "как быстро подключите?") == pytest.approx(0.65)
 
 
-def test_calculation_that_would_pass_normally_still_escalates():
-    """Ход, проходящий обычный порог, на расчёте уходит человеку."""
-    plan = c.parse(plan_json(reply="Выходит около 3 дней ожидания.", confidence=0.9),
+def test_invented_number_in_a_calculation_still_escalates():
+    """Порог един, но выдуманная цифра в расчёте по-прежнему не доходит до клиента."""
+
+    plan = c.parse(plan_json(reply="Посчитал: получится 777 777 ₽.", confidence=0.9),
                    offered_sources=OFFERED)
 
     verdict = c.assess(plan, retrieval=0.85, sources_text=SOURCES,
                        message="посчитайте, сколько получится")
 
-    assert 0.65 < verdict.score < 0.95
     assert verdict.escalate
+    assert any("вето" in reason for reason in verdict.reasons)
 
 
 def test_score_is_dominated_by_checkable_parts():

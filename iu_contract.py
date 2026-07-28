@@ -50,7 +50,10 @@ THRESHOLD = float(os.getenv("IU_CONFIDENCE_THRESHOLD", "0.65") or 0.65)
 # Владелец 26.07.2026: «когда дело касается расчётов — модель должна быть уверена на 95%+».
 # Деньги — единственная тема, где ошибка агента сразу стоит доверия и денег: 25.07.2026 клиент
 # поправлял агента, что 44% вычитается не от суммы к перечислению, а от продаж.
-CALC_THRESHOLD = float(os.getenv("IU_CALC_THRESHOLD", "0.95") or 0.95)
+# Владелец 28.07.2026: «нужно, чтобы уверенность была 65%». Отдельный строгий порог для
+# расчётов убран — он уводил к человеку обычные вопросы про цены и сроки. Защита от выдумок
+# осталась на вете: цифра обязана быть из базы, из слов клиента или выводиться из них.
+CALC_THRESHOLD = float(os.getenv("IU_CALC_THRESHOLD", "0.65") or 0.65)
 
 # Веса слагаемых уверенности. Мнение модели весит меньше всех намеренно: это единственная
 # часть, которую нельзя проверить.
@@ -303,6 +306,24 @@ _CALC_REPLY_RE = re.compile(
 )
 
 
+#: Клиент не спрашивает, а возражает: «вы неправильно считаете», «это не так», «вы ошиблись».
+#: Спор о деньгах — зона человека. Живой случай 25.07.2026: агент вступил в пререкание о том,
+#: от чего вычитается 44%, и был неправ. Порог тут ни при чём: даже уверенный ответ в споре
+#: стоит дороже, чем пауза на менеджера.
+_DISPUTE_RE = re.compile(
+    r"не\s*правильно|неправильно|вы\s+ошиб\w*|это\s+не\s+так|"
+    r"не\s+соглас\w*|вы\s+не\s+так\s+(?:счита\w*|пиш\w*|поня\w*)|"
+    r"вычита\w+\s+не\s|считаете\s+не\s",
+    re.I,
+)
+
+
+def is_dispute(message: str) -> bool:
+    """Клиент оспаривает наши цифры или трактовку — такой ход всегда уходит человеку."""
+
+    return bool(_DISPUTE_RE.search(str(message or "")))
+
+
 def is_calculation(plan: TurnPlan, message: str = "") -> bool:
     """Идёт ли в ходе речь о расчёте.
 
@@ -333,14 +354,67 @@ def _numbers(text: str) -> set[str]:
     return out
 
 
-def unbacked_numbers(plan: TurnPlan, sources_text: str) -> set[str]:
-    """Числа ответа, которых нет в источниках.
+#: Признаки того, что агент ведёт расчёт, а не называет условие. Только в таком ответе
+#: разрешены числа, полученные арифметикой: «наша комиссия для вас 42%» — это выдумка, а
+#: «при вашей ставке 6% налог составит 42 ₽» — пересчёт нашего же примера.
+_EXAMPLE_CONTEXT_RE = re.compile(
+    r"пример\w*|например|посчита\w*|расч[её]т\w*|состав\w+|получ\w+|итого|"
+    r"при\s+ваш\w+|у\s+вас|ваш\w+\s+ставк\w*",
+    re.I,
+)
+
+
+def _derivable(base: set[str], message_numbers: set[str]) -> set[str]:
+    """Числа, которые получаются арифметикой из наших данных и слов клиента.
+
+    Владелец 28.07.2026: «если клиент говорит, у меня 6% налог, агент просто пересчитывает из
+    примера». Пересчёт неизбежно рождает новое число, поэтому запрет на любые новые числа
+    делал такую гибкость невозможной. Здесь разрешается ровно то, что выводится из уже
+    известных величин: проценты, доли и суммы. Ставка, взятая из воздуха, так не выводится.
+    """
+
+    values: list[float] = []
+    for raw in base | message_numbers:
+        try:
+            values.append(float(raw))
+        except ValueError:
+            continue
+    out: set[str] = set()
+    for left in values:
+        for right in values:
+            for candidate in (
+                left * right / 100.0,      # процент от суммы
+                left - left * right / 100.0,  # сумма за вычетом процента
+                left + right,
+                left - right,
+                left * right,
+                left / right if right else 0.0,
+            ):
+                if candidate <= 0 or candidate != candidate:
+                    continue
+                out.add(str(int(round(candidate))))
+    return out
+
+
+def unbacked_numbers(plan: TurnPlan, sources_text: str, message: str = "") -> set[str]:
+    """Числа ответа, которые не подтверждены ни базой, ни словами клиента, ни расчётом из них.
 
     Это ВЕТО, а не слагаемое оценки. Средневзвешенный скор позволял высокому поиску и бодрой
     само-оценке модели перевесить проваленную проверку цифр: ответ «для вас сделаем 20%» при
     источнике с 44% набирал 0.81 и уходил клиенту. Цифра, взятая из воздуха, — самая дорогая
-    ошибка агента, и она не может компенсироваться ничем."""
-    return _numbers(plan.reply) - _numbers(sources_text)
+    ошибка агента, и она не может компенсироваться ничем.
+
+    Пересчёт под цифру клиента выдумкой не считается: он выводится из чисел базы и того, что
+    назвал сам клиент, и разрешён только там, где агент действительно ведёт пример.
+    """
+
+    known = _numbers(sources_text) | _numbers(message)
+    unknown = _numbers(plan.reply) - known
+    if not unknown:
+        return set()
+    if not _EXAMPLE_CONTEXT_RE.search(plan.reply or ""):
+        return unknown
+    return unknown - _derivable(_numbers(sources_text), _numbers(message))
 
 
 def grounding_score(plan: TurnPlan, sources_text: str) -> tuple[float, tuple[str, ...]]:
@@ -387,6 +461,10 @@ def assess(plan: TurnPlan, *, retrieval: float, sources_text: str = "",
         return Verdict(False, 0.0, retrieval, 0.0, plan.confidence,
                        (f"модель сама попросила человека: {plan.handoff_reason}",))
 
+    if is_dispute(message):
+        return Verdict(False, 0.0, retrieval, 0.0, plan.confidence,
+                       ("клиент спорит о наших цифрах — такой разговор ведёт человек",))
+
     if not states_facts(plan, message):
         # Разговорный ход: здороваемся, уточняем, подтверждаем. Проверять нечего.
         return Verdict(True, 1.0, retrieval, 1.0, plan.confidence, (), checked=False)
@@ -394,7 +472,7 @@ def assess(plan: TurnPlan, *, retrieval: float, sources_text: str = "",
     grounding, reasons = grounding_score(plan, sources_text)
     score = W_RETRIEVAL * retrieval + W_GROUNDING * grounding + W_SELF * plan.confidence
 
-    invented = unbacked_numbers(plan, sources_text)
+    invented = unbacked_numbers(plan, sources_text, message)
     if invented:
         return Verdict(False, score, retrieval, grounding, plan.confidence,
                        reasons + (f"вето: числа не подтверждены источником "
