@@ -240,8 +240,14 @@ def test_client_bot_channel_is_off_until_it_is_switched_on(monkeypatch):
     assert store.calls == [], "пока канал не включён, поведение системы не меняется"
 
 
-def test_owner_dm_still_goes_to_the_internal_channel(monkeypatch):
-    monkeypatch.setenv("IU_CLIENT_BOT_ENABLED", "1")
+def test_owner_falls_back_to_the_assistant_only_while_the_client_channel_is_off(monkeypatch):
+    """С выключенным клиентским входом бот остаётся внутренним каналом владельца.
+
+    Включённый канал делает его ботом-менеджером для всех (решение владельца 28.07.2026),
+    и это проверяется отдельно в test_iu_bot_menu.
+    """
+
+    monkeypatch.delenv("IU_CLIENT_BOT_ENABLED", raising=False)
     store = _IngestStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)
     submitted = []
@@ -254,5 +260,5 @@ def test_owner_dm_still_goes_to_the_internal_channel(monkeypatch):
 
     gateway.route_captured_update(_client_update("покажи задачи"))
 
-    assert submitted, "владелец продолжает работать со своим ассистентом"
+    assert submitted, "пока канал выключен, владелец работает со своим ассистентом"
     assert store.calls == [], "переписка владельца не заводит лид в воронке"

@@ -99,7 +99,7 @@ def test_start_creates_a_lead_and_shows_three_buttons(monkeypatch):
     # Приветствие с кнопками ушло durable-очередью, а не мимо журнала.
     assert store.queued, "ответ на /start обязан попасть в ленту обращения"
     reply = store.queued[0]
-    keyboard = reply["metadata"]["reply_markup"]["inline_keyboard"]
+    keyboard = reply["metadata"]["reply_markup"]["keyboard"]
     assert [row[0]["text"] for row in keyboard] == [
         bot.BUTTON_TERMS,
         bot.BUTTON_JOIN,
@@ -179,9 +179,9 @@ def test_ai_reply_carries_the_operator_button_after_the_threshold(monkeypatch):
         conversation={"id": 5, "source_key": "telegram_bot", "control_mode": "ai"},
     )
 
-    keyboard = prepared.metadata.get("reply_markup", {}).get("inline_keyboard")
-    assert keyboard, "после третьего ответа ИИ клиент должен видеть кнопку вызова оператора"
-    assert keyboard[0][0]["text"] == bot.BUTTON_OPERATOR
+    keyboard = prepared.metadata.get("reply_markup", {}).get("keyboard")
+    assert keyboard, "после третьего ответа ИИ в меню появляется вызов оператора"
+    assert keyboard[-1][0]["text"] == bot.BUTTON_OPERATOR
 
 
 def test_ai_reply_has_no_button_before_the_threshold(monkeypatch):
@@ -254,7 +254,7 @@ def test_keyboard_reaches_telegram_on_delivery(monkeypatch):
                 "external_chat_id": "555",
                 "business_connection_id": "",
                 "text": "Здравствуйте!",
-                "payload": {"reply_markup": bot.main_keyboard()},
+                "payload": {"reply_markup": bot.main_menu()},
             }
             self.finishes = []
 
@@ -278,7 +278,7 @@ def test_keyboard_reaches_telegram_on_delivery(monkeypatch):
 
     gateway._process_outbox_item(store.item, worker_id="worker")
 
-    assert calls[0][1]["reply_markup"]["inline_keyboard"][0][0]["text"] == bot.BUTTON_TERMS
+    assert calls[0][1]["reply_markup"]["keyboard"][0][0]["text"] == bot.BUTTON_TERMS
     assert store.finishes[0]["result"] == "sent"
 
 

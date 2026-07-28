@@ -370,24 +370,20 @@ def route_captured_update(
     import tg_agent
 
     if update.get("message"):
-        # Direct bot messages are outside the lead inbox. Only the owner may use
-        # this internal channel in workspace mode; strangers are silently
-        # ignored. The existing bounded tg_agent pool keeps even a long owner
-        # Hermes turn from blocking ordered Telegram Business ingestion.
         message = dict(update["message"])
         chat = message.get("chat") or {}
         sender = message.get("from") or {}
+        if chat.get("type") == "private" and client_bot_enabled():
+            # Один и тот же бот-менеджер для всех, включая владельца (его решение
+            # 28.07.2026). Раньше свои попадали в личного ИИ-ассистента, и один бот жил
+            # двумя жизнями: клиент видел воронку, сотрудник — ассистента.
+            return ingest_bot_message(message, provider_update_id=provider_update_id)
         if chat.get("type") == "private" and tg_agent.is_owner(sender):
+            # Клиентский вход выключен — бот остаётся внутренним каналом владельца.
             tg_agent._workers.submit(
                 tg_agent._handle_update_safely,
                 {"message": message},
             )
-            return None, None
-        if chat.get("type") == "private" and client_bot_enabled():
-            # Клиент написал боту сам. Такая переписка идёт в то же рабочее окно, что и
-            # бизнес-диалоги менеджера: команда видит её в одном списке, сделка заводится
-            # тем же путём. Пока канал выключен, чужие сообщения по-прежнему игнорируются.
-            return ingest_bot_message(message, provider_update_id=provider_update_id)
         return None, None
     if update.get("callback_query"):
         if not client_bot_enabled():
@@ -506,7 +502,9 @@ def handle_bot_callback(callback: Mapping[str, Any]) -> tuple[int | None, int | 
     conversation_id, _ = ingest_bot_message(
         {
             "message_id": f"cb-{callback.get('id')}",
-            "date": message.get("date"),
+            # Момент нажатия, а не дата сообщения с кнопками: иначе в ленте рабочего окна
+            # все нажатия слипаются во время приветствия и встают раньше ответов на них.
+            "date": int(time.time()),
             "chat": chat,
             "from": sender,
             "text": label,
@@ -582,9 +580,13 @@ def ingest_bot_message(
     display_name = _display_name(sender) or _display_name(chat) or f"Telegram {chat_id}"
     text = telegram_message_text(message)
     is_command = text.strip().startswith("/")
+    # Пункт меню приходит обычным текстом. Это выбор действия, а не вопрос: отвечает
+    # сценарий, модель не вызывается вовсе.
+    action = iu_client_bot.menu_action(text)
     if schedule_ai is None:
-        # Команда — не вопрос: на «/start» отвечает сценарий, а не модель.
-        schedule_ai = iu_client_bot.ai_answers_enabled() and not is_command
+        schedule_ai = (
+            iu_client_bot.ai_answers_enabled() and not is_command and not action
+        )
     result = _store().ingest_business_message(
         external_chat_id=str(chat_id),
         external_message_id=str(external_message_id),
@@ -608,14 +610,47 @@ def ingest_bot_message(
     conversation = dict(result.get("conversation") or {})
     journaled = dict(result.get("message") or {})
     conversation_id = _as_int(conversation.get("id"))
-    if conversation_id is not None and text.strip().split()[0:1] == ["/start"]:
+    if conversation_id is None:
+        return None, _as_int(journaled.get("id"))
+    if text.strip().split()[0:1] == ["/start"]:
         _reply_to_client(
             conversation_id,
             iu_client_bot.WELCOME,
             idempotency_key=f"iu-bot:start:{chat_id}:{external_message_id}",
-            reply_markup=iu_client_bot.main_keyboard(),
+            reply_markup=iu_client_bot.main_menu(),
+        )
+    elif action:
+        run_menu_action(
+            action,
+            conversation_id=conversation_id,
+            idempotency_key=f"iu-bot:menu:{chat_id}:{external_message_id}",
         )
     return conversation_id, _as_int(journaled.get("id"))
+
+
+def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) -> None:
+    """Выполнить выбранный в меню пункт."""
+
+    import iu_client_bot
+    import tg_agent
+
+    if action == iu_client_bot.CB_TERMS:
+        try:
+            body = tg_agent._strip_markup(tg_agent.terms_text())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("iu client bot: terms unavailable: %s", _safe_error(exc))
+            body = iu_client_bot.TERMS_FALLBACK
+        _reply_to_client(conversation_id, body, idempotency_key=idempotency_key)
+    elif action == iu_client_bot.CB_JOIN:
+        _reply_to_client(conversation_id, iu_client_bot.JOIN_STUB, idempotency_key=idempotency_key)
+        _hand_over_to_human(conversation_id, "Клиент выбрал «Присоединиться к ИУ».")
+    elif action == iu_client_bot.CB_ASK:
+        _reply_to_client(conversation_id, iu_client_bot.ASK_PROMPT, idempotency_key=idempotency_key)
+    elif action == iu_client_bot.CB_OPERATOR:
+        _reply_to_client(
+            conversation_id, iu_client_bot.OPERATOR_CALLED, idempotency_key=idempotency_key
+        )
+        _hand_over_to_human(conversation_id, "Клиент выбрал «Позвать оператора».")
 
 
 def ingest_business_message(
@@ -1186,7 +1221,7 @@ def prepare_reply(
         if iu_client_bot.should_offer_operator(
             replies, control_mode=str(conversation.get("control_mode") or "ai")
         ):
-            metadata["reply_markup"] = iu_client_bot.operator_keyboard()
+            metadata["reply_markup"] = iu_client_bot.main_menu(offer_operator=True)
     return PreparedReply(
         text=body,
         metadata=metadata,

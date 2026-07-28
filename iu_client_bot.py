@@ -72,20 +72,34 @@ def ai_answers_enabled() -> bool:
     return os.getenv("IU_CLIENT_BOT_AI", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def main_keyboard() -> dict:
-    """Три кнопки первого экрана — по одной в ряд, чтобы подписи не обрезались."""
+def main_menu(*, offer_operator: bool = False) -> dict:
+    """Постоянное меню под полем ввода.
 
+    Владелец 28.07.2026: кнопки должны быть меню, а не «висеть где-то наверху». Кнопки
+    внутри сообщения уезжают вместе с историей, и через десяток реплик до них не добраться;
+    меню под полем ввода остаётся на месте весь разговор. Нажатие такого пункта приходит
+    обычным текстовым сообщением — сценарий узнаёт его по подписи.
+    """
+
+    rows = [[BUTTON_TERMS], [BUTTON_JOIN], [BUTTON_ASK]]
+    if offer_operator:
+        rows.append([BUTTON_OPERATOR])
     return {
-        "inline_keyboard": [
-            [{"text": BUTTON_TERMS, "callback_data": CB_TERMS}],
-            [{"text": BUTTON_JOIN, "callback_data": CB_JOIN}],
-            [{"text": BUTTON_ASK, "callback_data": CB_ASK}],
-        ]
+        "keyboard": [[{"text": title} for title in row] for row in rows],
+        "resize_keyboard": True,
+        "is_persistent": True,
     }
 
 
-def operator_keyboard() -> dict:
-    return {"inline_keyboard": [[{"text": BUTTON_OPERATOR, "callback_data": CB_OPERATOR}]]}
+def menu_action(text: str) -> str:
+    """Пункт меню, который выбрал клиент, или пустая строка для обычного сообщения."""
+
+    return {
+        BUTTON_TERMS: CB_TERMS,
+        BUTTON_JOIN: CB_JOIN,
+        BUTTON_ASK: CB_ASK,
+        BUTTON_OPERATOR: CB_OPERATOR,
+    }.get(str(text or "").strip(), "")
 
 
 def should_offer_operator(agent_replies: int, *, control_mode: str = "ai") -> bool:
