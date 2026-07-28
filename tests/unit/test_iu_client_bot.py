@@ -86,7 +86,7 @@ def _channel_on(monkeypatch):
     monkeypatch.setenv("IU_CLIENT_BOT_ENABLED", "1")
 
 
-def test_start_creates_a_lead_and_shows_three_buttons(monkeypatch):
+def test_start_creates_a_lead_and_shows_the_menu(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)
     _tg(monkeypatch)
@@ -103,6 +103,7 @@ def test_start_creates_a_lead_and_shows_three_buttons(monkeypatch):
     assert [row[0]["text"] for row in keyboard] == [
         bot.BUTTON_TERMS,
         bot.BUTTON_JOIN,
+        bot.BUTTON_CALCULATOR,
         bot.BUTTON_ASK,
     ]
 

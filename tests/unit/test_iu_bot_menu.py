@@ -83,6 +83,7 @@ def test_menu_lives_under_the_input_field_not_inside_a_message():
     assert [row[0]["text"] if isinstance(row[0], dict) else row[0] for row in menu["keyboard"]] == [
         bot.BUTTON_TERMS,
         bot.BUTTON_JOIN,
+        bot.BUTTON_CALCULATOR,
         bot.BUTTON_ASK,
     ]
 

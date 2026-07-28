@@ -17,15 +17,19 @@
 from __future__ import annotations
 
 import os
+import re
 
-#: Тексты кнопок. Владелец 28.07.2026 согласовал состав: условия, присоединение, вопрос.
-BUTTON_TERMS = "Условия присоединения к ИУ"
-BUTTON_JOIN = "Присоединиться к ИУ"
-BUTTON_ASK = "Задать вопрос"
-BUTTON_OPERATOR = "Позвать оператора"
+#: Подписи пунктов меню. Состав согласован владельцем 28.07.2026; смайлики — его же
+#: просьба, они помогают отличить пункты друг от друга беглым взглядом.
+BUTTON_TERMS = "📄 Условия присоединения к ИУ"
+BUTTON_JOIN = "🤝 Присоединиться к ИУ"
+BUTTON_CALCULATOR = "🧮 Калькулятор расчёта ИУ"
+BUTTON_ASK = "💬 Задать вопрос"
+BUTTON_OPERATOR = "🙋 Позвать оператора"
 
 CB_TERMS = "iu:terms"
 CB_JOIN = "iu:join"
+CB_CALCULATOR = "iu:calculator"
 CB_ASK = "iu:ask"
 CB_OPERATOR = "iu:operator"
 
@@ -35,6 +39,14 @@ OPERATOR_OFFER_AFTER_REPLIES = int(os.getenv("IU_CLIENT_BOT_OPERATOR_AFTER", "3"
 WELCOME = (
     "Здравствуйте! Это бот компании по индивидуальным условиям (ИУ) работы с Wildberries.\n\n"
     "Выберите, с чего начать:"
+)
+
+#: Расчёт экономики пока считает человек: обещать клиенту автоматический калькулятор,
+#: которого нет, нельзя — поэтому пункт честно ведёт к менеджеру.
+CALCULATOR_STUB = (
+    "Калькулятор расчёта ИУ сейчас в разработке.\n\n"
+    "Чтобы не ждать, менеджер посчитает вашу экономику вручную — он уже видит обращение. "
+    "Напишите здесь категорию товара и примерный объём продаж в месяц, это ускорит расчёт."
 )
 
 #: Анкеты пока нет — владелец даст ссылку позже. Клиенту нельзя говорить «заполните анкету»
@@ -81,7 +93,7 @@ def main_menu(*, offer_operator: bool = False) -> dict:
     обычным текстовым сообщением — сценарий узнаёт его по подписи.
     """
 
-    rows = [[BUTTON_TERMS], [BUTTON_JOIN], [BUTTON_ASK]]
+    rows = [[BUTTON_TERMS], [BUTTON_JOIN], [BUTTON_CALCULATOR], [BUTTON_ASK]]
     if offer_operator:
         rows.append([BUTTON_OPERATOR])
     return {
@@ -91,15 +103,34 @@ def main_menu(*, offer_operator: bool = False) -> dict:
     }
 
 
+#: Подписи без смайликов — у клиентов, начавших разговор до их появления, меню закреплено
+#: на стороне Telegram со старым текстом. Нажатие такой кнопки обязано остаться выбором
+#: пункта, а не превратиться в вопрос к модели.
+_MENU_BY_TITLE = {
+    "условия присоединения к иу": CB_TERMS,
+    "присоединиться к иу": CB_JOIN,
+    "калькулятор расчёта иу": CB_CALCULATOR,
+    "калькулятор расчета иу": CB_CALCULATOR,
+    "задать вопрос": CB_ASK,
+    "позвать оператора": CB_OPERATOR,
+}
+
+
+def _title_key(text: str) -> str:
+    """Подпись без смайликов и лишних пробелов — по ней и узнаётся пункт меню."""
+
+    letters = [
+        character
+        for character in str(text or "")
+        if character.isalpha() or character.isspace() or character == "-"
+    ]
+    return re.sub(r"\s+", " ", "".join(letters)).strip().lower()
+
+
 def menu_action(text: str) -> str:
     """Пункт меню, который выбрал клиент, или пустая строка для обычного сообщения."""
 
-    return {
-        BUTTON_TERMS: CB_TERMS,
-        BUTTON_JOIN: CB_JOIN,
-        BUTTON_ASK: CB_ASK,
-        BUTTON_OPERATOR: CB_OPERATOR,
-    }.get(str(text or "").strip(), "")
+    return _MENU_BY_TITLE.get(_title_key(text), "")
 
 
 def should_offer_operator(agent_replies: int, *, control_mode: str = "ai") -> bool:
@@ -121,6 +152,7 @@ def button_label(callback_data: str) -> str:
     return {
         CB_TERMS: BUTTON_TERMS,
         CB_JOIN: BUTTON_JOIN,
+        CB_CALCULATOR: BUTTON_CALCULATOR,
         CB_ASK: BUTTON_ASK,
         CB_OPERATOR: BUTTON_OPERATOR,
     }.get(str(callback_data or ""), "")

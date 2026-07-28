@@ -393,11 +393,16 @@ def route_captured_update(
         tg_agent.handle_business_connection(dict(update["business_connection"]))
         return None, None
     if update.get("business_message"):
-        return ingest_business_message(
-            dict(update["business_message"]),
-            provider_update_id=provider_update_id,
-        )
+        message = dict(update["business_message"])
+        # Эхо собственной отправки — не новое обращение, а подтверждение того, что наш
+        # ответ ушёл. Его обрабатываем даже с выключенным приёмом, иначе сообщение,
+        # отправленное до отключения, навсегда осталось бы «в пути».
+        if not business_intake_enabled() and not message.get("sender_business_bot"):
+            return None, None
+        return ingest_business_message(message, provider_update_id=provider_update_id)
     if update.get("edited_business_message"):
+        if not business_intake_enabled():
+            return None, None
         return ingest_business_message(
             dict(update["edited_business_message"]),
             provider_update_id=provider_update_id,
@@ -420,6 +425,22 @@ def route_captured_update(
         conversation = result.get("conversation") or {}
         return _as_int(conversation.get("id")), _as_int(result.get("message_id"))
     return None, None
+
+
+def business_intake_enabled() -> bool:
+    """Заводит ли личка аккаунта менеджера обращения в рабочем окне.
+
+    Владелец 28.07.2026: единственный источник обращений — бот, переписка в личке менеджера
+    в рабочее окно больше не идёт. Выключается только явным флагом: потеря настройки не
+    должна молча обрубать канал, через который сейчас живут открытые диалоги.
+    """
+
+    return os.getenv("FUNNEL_WORKSPACE_BUSINESS_INTAKE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def client_bot_enabled() -> bool:
@@ -644,6 +665,11 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
     elif action == iu_client_bot.CB_JOIN:
         _reply_to_client(conversation_id, iu_client_bot.JOIN_STUB, idempotency_key=idempotency_key)
         _hand_over_to_human(conversation_id, "Клиент выбрал «Присоединиться к ИУ».")
+    elif action == iu_client_bot.CB_CALCULATOR:
+        _reply_to_client(
+            conversation_id, iu_client_bot.CALCULATOR_STUB, idempotency_key=idempotency_key
+        )
+        _hand_over_to_human(conversation_id, "Клиент выбрал «Калькулятор расчёта ИУ».")
     elif action == iu_client_bot.CB_ASK:
         _reply_to_client(conversation_id, iu_client_bot.ASK_PROMPT, idempotency_key=idempotency_key)
     elif action == iu_client_bot.CB_OPERATOR:
