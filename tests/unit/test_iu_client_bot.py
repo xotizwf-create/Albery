@@ -280,3 +280,33 @@ def test_keyboard_reaches_telegram_on_delivery(monkeypatch):
 
     assert calls[0][1]["reply_markup"]["inline_keyboard"][0][0]["text"] == bot.BUTTON_TERMS
     assert store.finishes[0]["result"] == "sent"
+
+
+def test_operator_confirmation_survives_the_handover(monkeypatch):
+    """Клиент нажал «Позвать оператора» — он обязан получить подтверждение.
+
+    Передача человеку меняет режим и версию диалога, и обычный ответ ИИ после этого
+    отменяется очередью. На живом прогоне 28.07.2026 клиент из-за этого не получал
+    вообще ничего: кнопка выглядела нерабочей.
+    """
+
+    class HumanTakenStore(FakeStore):
+        def enqueue_outgoing_agent(self, conversation_id, **kwargs):
+            if not kwargs.get("service"):
+                raise WorkspaceControlError("ИИ больше не управляет этим диалогом.")
+            return super().enqueue_outgoing_agent(conversation_id, **kwargs)
+
+    class WorkspaceControlError(Exception):
+        pass
+
+    store = HumanTakenStore(agent_replies=3, control_mode="paused")
+    store.WorkspaceControlError = WorkspaceControlError
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_callback_update(bot.CB_OPERATOR))
+
+    assert store.queued, "подтверждение клиенту обязано быть отправлено, а не проглочено"
+    assert store.queued[0].get("service") is True
+    assert "менеджер" in store.queued[0]["text"].lower()

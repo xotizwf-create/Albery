@@ -424,6 +424,7 @@ def _reply_to_client(
     *,
     idempotency_key: str,
     reply_markup: Mapping[str, Any] | None = None,
+    service: bool = True,
 ) -> None:
     """Служебный ответ бота — через ту же очередь, что и ответы оператора.
 
@@ -444,11 +445,11 @@ def _reply_to_client(
             idempotency_key=idempotency_key,
             agent_name=AGENT_NAME,
             metadata=metadata,
+            service=service,
         )
-    except store.WorkspaceControlError:
-        # Диалог уже забрал человек — навязывать поверх него ответ бота нельзя.
-        log.info("iu client bot: conversation %s is handled by a human, service reply skipped",
-                 conversation_id)
+    except store.WorkspaceConflictError as exc:
+        # Повтор того же нажатия — сообщение уже стоит в очереди, второй раз не нужно.
+        log.info("iu client bot: reply %s already queued (%s)", idempotency_key, _safe_error(exc))
         return
     _wake_event.set()
 
@@ -515,6 +516,8 @@ def handle_bot_callback(callback: Mapping[str, Any]) -> tuple[int | None, int | 
     elif data == iu_client_bot.CB_ASK:
         _reply_to_client(conversation_id, iu_client_bot.ASK_PROMPT, idempotency_key=key)
     elif data == iu_client_bot.CB_OPERATOR:
+        # Сначала подтверждение клиенту, потом передача: подтверждение помечено служебным,
+        # поэтому смена режима его уже не отменит.
         _reply_to_client(conversation_id, iu_client_bot.OPERATOR_CALLED, idempotency_key=key)
         _hand_over_to_human(conversation_id, "Клиент нажал «Позвать оператора».")
     return conversation_id, None

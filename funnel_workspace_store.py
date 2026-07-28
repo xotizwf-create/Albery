@@ -2639,6 +2639,7 @@ def _enqueue_outgoing(
     now: datetime | None,
     connect: ConnectFactory | None,
     attachment: Mapping[str, Any] | None = None,
+    service: bool = False,
 ) -> dict[str, Any]:
     clean_file = _clean_attachment(attachment)
     if clean_file is None:
@@ -2692,7 +2693,7 @@ def _enqueue_outgoing(
                     "Окно ответа Telegram истекло. Дождитесь нового сообщения клиента.",
                     details={"reply_deadline_at": deadline},
                 )
-            if clean_author == "agent" and row["control_mode"] != "ai":
+            if clean_author == "agent" and row["control_mode"] != "ai" and not service:
                 raise WorkspaceControlError(
                     "ИИ больше не управляет этим диалогом.",
                     details={"control_mode": row["control_mode"]},
@@ -2726,6 +2727,10 @@ def _enqueue_outgoing(
                 )
 
             message_metadata = dict(metadata or {})
+            if service:
+                # Подтверждение нажатой кнопки — не реплика ИИ, а ответ системы на действие
+                # клиента. Оно обязано дойти, даже если диалог в этот момент забрал человек.
+                message_metadata["service_reply"] = True
             if clean_file is not None:
                 message_metadata["outgoing_file"] = dict(clean_file)
             # Пустая строка в списке диалогов читается как сбой, поэтому у сообщения
@@ -2863,6 +2868,7 @@ def enqueue_outgoing_agent(
     idempotency_key: str,
     agent_name: str = "ИИ-агент",
     metadata: Mapping[str, Any] | None = None,
+    service: bool = False,
     now: datetime | None = None,
     connect: ConnectFactory | None = None,
 ) -> dict[str, Any]:
@@ -2877,6 +2883,7 @@ def enqueue_outgoing_agent(
         operator_lease_seconds=None,
         now=now,
         connect=connect,
+        service=service,
     )
 
 
@@ -3673,7 +3680,12 @@ def outbox_send_guard(
         return {"allowed": False, "reason": "lease_lost", "outbox": row}
     if row.get("cancel_requested"):
         return {"allowed": False, "reason": "cancel_requested", "outbox": row}
-    if row["author_type"] == "agent":
+    payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+    # Служебный ответ на действие клиента (нажатую кнопку) отменять по смене режима нельзя:
+    # он подтверждает то, что уже произошло. Именно передача диалога человеку и меняет режим,
+    # так что обычная проверка гасила бы подтверждение «зову менеджера» — клиент оставался
+    # без ответа, а кнопка выглядела нерабочей.
+    if row["author_type"] == "agent" and not payload.get("service_reply"):
         if row["control_mode"] != "ai":
             return {"allowed": False, "reason": "control_changed", "outbox": row}
         if int(row["conversation_version"]) != int(row["current_version"]):
