@@ -288,11 +288,40 @@ def one_next_step(text: str) -> str:
     Правило «в сообщении максимум один следующий шаг» есть и в промпте, но полагаться только на
     послушание модели нельзя: два вопроса подряд превращают консультацию в допрос, и владелец
     жаловался ровно на это. Содержательные предложения сохраняются все — сначала ответ, потом
-    один шаг."""
-    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(str(text or "").strip()) if p.strip()]
-    informational = [p for p in parts if not is_next_step(p)]
-    steps = [p for p in parts if is_next_step(p)]
-    return " ".join(informational + steps[:1]).strip()
+    один шаг.
+
+    **Разбивка на строки сохраняется.** Владелец 28.07.2026 попросил отвечать так, как отвечает
+    человек: прямой ответ, под ним перечисление, в конце вывод. Прежняя склейка всего текста
+    через пробел превращала такой ответ в сплошной абзац — список из четырёх пунктов приезжал
+    клиенту одной строкой. Плоский ответ без переносов обрабатывается как раньше, чтобы
+    привычное поведение коротких реплик не поехало."""
+    value = str(text or "").strip()
+    if "\n" not in value:
+        parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(value) if p.strip()]
+        informational = [p for p in parts if not is_next_step(p)]
+        steps = [p for p in parts if is_next_step(p)]
+        return " ".join(informational + steps[:1]).strip()
+
+    kept_step = ""
+    lines: list[str] = []
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if not line:
+            lines.append("")
+            continue
+        keep = []
+        for part in (p.strip() for p in _SENTENCE_SPLIT_RE.split(line)):
+            if not part:
+                continue
+            if is_next_step(part):
+                kept_step = kept_step or part
+                continue
+            keep.append(part)
+        lines.append(" ".join(keep))
+    body = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    if not kept_step:
+        return body
+    return f"{body}\n\n{kept_step}".strip() if body else kept_step
 
 
 def claims_action(text: str) -> str:
