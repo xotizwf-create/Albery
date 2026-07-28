@@ -30,6 +30,9 @@ import requests
 log = logging.getLogger("funnel-telegram-gateway")
 
 SOURCE_KEY = "telegram"
+#: Диалог, который клиент завёл сам, написав боту. Отличается от бизнес-переписки
+#: менеджера тем, что бизнес-подключения у него нет: ответ уходит обычным сообщением.
+BOT_SOURCE_KEY = "telegram_bot"
 AGENT_NAME = "Агент по работе с ИУ"
 _TEXT_LIMIT = 3500
 
@@ -363,6 +366,12 @@ def route_captured_update(
                 tg_agent._handle_update_safely,
                 {"message": message},
             )
+            return None, None
+        if chat.get("type") == "private" and client_bot_enabled():
+            # Клиент написал боту сам. Такая переписка идёт в то же рабочее окно, что и
+            # бизнес-диалоги менеджера: команда видит её в одном списке, сделка заводится
+            # тем же путём. Пока канал выключен, чужие сообщения по-прежнему игнорируются.
+            return ingest_bot_message(message, provider_update_id=provider_update_id)
         return None, None
     if update.get("business_connection"):
         tg_agent.handle_business_connection(dict(update["business_connection"]))
@@ -395,6 +404,60 @@ def route_captured_update(
         conversation = result.get("conversation") or {}
         return _as_int(conversation.get("id")), _as_int(result.get("message_id"))
     return None, None
+
+
+def client_bot_enabled() -> bool:
+    """Открыт ли боту клиентский вход. Выключено — чужие сообщения игнорируются, как раньше."""
+
+    return os.getenv("IU_CLIENT_BOT_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def ingest_bot_message(
+    message: Mapping[str, Any],
+    *,
+    provider_update_id: int | None = None,
+) -> tuple[int | None, int | None]:
+    """Сообщение, которое клиент написал боту напрямую, — в общий поток обращений.
+
+    Отличие от бизнес-переписки одно: здесь нет посредника-аккаунта, поэтому автор всегда
+    клиент, а бизнес-подключения нет. Дальше всё общее — тот же журнал, то же рабочее окно,
+    та же сделка в CRM.
+    """
+
+    chat = dict(message.get("chat") or {})
+    if str(chat.get("type") or "private") != "private":
+        return None, None
+    chat_id = chat.get("id")
+    external_message_id = message.get("message_id")
+    if chat_id is None or external_message_id is None:
+        raise ValueError("Bot message lacks chat/message identity")
+
+    sender = dict(message.get("from") or {})
+    customer_id = _as_int(sender.get("id")) or _as_int(chat_id)
+    display_name = _display_name(sender) or _display_name(chat) or f"Telegram {chat_id}"
+    result = _store().ingest_business_message(
+        external_chat_id=str(chat_id),
+        external_message_id=str(external_message_id),
+        text=telegram_message_text(message),
+        author_type="client",
+        source_key=BOT_SOURCE_KEY,
+        business_connection_id="",
+        external_user_id=customer_id,
+        username=sender.get("username") or chat.get("username"),
+        display_name=display_name,
+        author_name=display_name,
+        provider_update_id=provider_update_id,
+        occurred_at=_message_datetime(message),
+        metadata={
+            "telegram_chat_type": str(chat.get("type") or "private"),
+            "telegram_media_type": telegram_media_type(message),
+            **telegram_media_metadata(message),
+        },
+        schedule_ai=ai_allowed(customer_id),
+    )
+    conversation = dict(result.get("conversation") or {})
+    journaled = dict(result.get("message") or {})
+    return _as_int(conversation.get("id")), _as_int(journaled.get("id"))
 
 
 def ingest_business_message(
@@ -1146,9 +1209,9 @@ def _send_document(
         sent = tg_agent.api_multipart(
             "sendDocument",
             files={"document": (stored["file_name"], handle, stored["mime_type"])},
-            business_connection_id=connection_id,
             chat_id=int(outbox["external_chat_id"]),
             caption=caption or None,
+            **({"business_connection_id": connection_id} if connection_id else {}),
         )
 
     provider_message_id = (
@@ -1200,22 +1263,28 @@ def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
         )
         return
 
-    connection_id, connection_error = tg_agent._business_connection_id(
-        str(current.get("business_connection_id") or "")
-    )
-    if not connection_id:
-        finished = store.finish_outbox(
-            outbox_id,
-            worker_id=worker_id,
-            result="failed",
-            error=connection_error,
+    # Диалог, пришедший в бота напрямую, отвечается обычным сообщением: бизнес-подключения
+    # у такого чата нет и быть не может. У диалога бизнес-аккаунта наоборот — без подключения
+    # отправлять нельзя, иначе ответ придёт клиенту «от бота», а не от менеджера.
+    direct_bot_chat = str(current.get("source_key") or "") == BOT_SOURCE_KEY
+    connection_id = ""
+    if not direct_bot_chat:
+        connection_id, connection_error = tg_agent._business_connection_id(
+            str(current.get("business_connection_id") or "")
         )
-        _after_delivery(
-            current,
-            result=str((finished.get("outbox") or {}).get("delivery_status") or "failed"),
-            finished=finished,
-        )
-        return
+        if not connection_id:
+            finished = store.finish_outbox(
+                outbox_id,
+                worker_id=worker_id,
+                result="failed",
+                error=connection_error,
+            )
+            _after_delivery(
+                current,
+                result=str((finished.get("outbox") or {}).get("delivery_status") or "failed"),
+                finished=finished,
+            )
+            return
 
     boundary = store.begin_outbox_send(
         outbox_id,
@@ -1251,10 +1320,10 @@ def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
                 sent = tg_agent.api(
                     "sendMessage",
                     http_timeout=45,
-                    business_connection_id=connection_id,
                     chat_id=int(current["external_chat_id"]),
                     text=str(current.get("text") or "")[:4096],
                     link_preview_options={"is_disabled": True},
+                    **({"business_connection_id": connection_id} if connection_id else {}),
                 )
                 provider_message_id = (
                     str(sent.get("message_id"))

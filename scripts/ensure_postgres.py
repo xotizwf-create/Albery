@@ -53,6 +53,9 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Открытая линия вырезана: снос её таблицы состояния идемпотентен и на уже
     # вычищенной базе просто ничего не делает.
     "072_drop_openline_dialogs.sql",
+    # Строка-справочник нового канала: таблица источников уже существует, поэтому
+    # проверка «нет таблицы — накатить» этот INSERT не поймает.
+    "074_workspace_bot_source.sql",
     # Idempotent WB resumable sync state. 055 also covers catalogue columns
     # that older, already-created WB schemas could otherwise silently miss.
     "054_wb_sync_state_v2.sql",

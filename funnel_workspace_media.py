@@ -251,7 +251,8 @@ def _load_message_media(
                 (message_id,),
             )
             row = cur.fetchone()
-    if not row or str(row.get("source_key") or "") != "telegram":
+    # Вложение живёт в Telegram у обоих каналов — и у бизнес-переписки, и у чата с ботом.
+    if not row or str(row.get("source_key") or "") not in {"telegram", "telegram_bot"}:
         raise AttachmentProxyError(
             "Вложение не найдено.",
             status_code=404,
