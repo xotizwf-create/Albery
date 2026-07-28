@@ -149,14 +149,17 @@ def handle(request: Request, deps: Deps) -> Outcome:
             trace=trace,
         )
 
-    # 2. Знания. Повторный вопрос ищем так же, но берём упрощённую формулировку факта.
+    # 2. Знания. Модель получает базу ЦЕЛИКОМ, а не выбранную за неё карточку: подбор одной
+    # карточки лексическим скором и был причиной «уточню у команды» на вопросы, ответ на
+    # которые в базе есть. Порядок — по близости к вопросу, повторный вопрос берёт упрощённую
+    # формулировку факта.
     repeated = is_repeat(request.message, request.history)
-    found = iu_knowledge.search(request.message, deps.cards, rerank=deps.rerank)
+    found = iu_knowledge.everything(request.message, deps.cards, rerank=deps.rerank)
     sources = iu_knowledge.sources_text(found, simple=repeated)
     offered = iu_knowledge.offered_ids(found)
     retrieval = iu_knowledge.retrieval_score(found)
     human_when = iu_knowledge.human_required(found)
-    trace.update({"retrieval": round(retrieval, 3), "sources": list(offered),
+    trace.update({"retrieval": round(retrieval, 3), "shown": len(offered),
                   "repeated": repeated})
 
     # 3. Промпт.
@@ -218,14 +221,18 @@ def handle(request: Request, deps: Deps) -> Outcome:
     # формулировки («если клиент спорит с расчётом») здесь НЕ принуждаются: выполнено ли
     # условие, видно только из сообщения клиента — это решает модель, получив условие в
     # промпте. Иначе один вопрос про комиссию уводил бы к людям каждый разговор о цене.
-    always = iu_knowledge.always_human(found)
+    always = iu_knowledge.always_human_for(found, plan.source_ids)
     if always:
         trace["human_required"] = always
         return _escalate(f"правило карточки знаний: {always}", trace=trace,
                          stage_move=stage_move)
 
-    # 8. Порог уверенности. Разговор о деньгах судится строже — 0.95 вместо 0.65.
-    verdict = iu_contract.assess(plan, retrieval=retrieval, sources_text=sources,
+    # 8. Порог уверенности. Опора хода — не «нашёл ли поиск карточку» (базу показали целиком),
+    # а «сослался ли агент на настоящую карточку владельца». Ссылка проверяема: контракт хода
+    # сверяет её со списком показанных, выдумать идентификатор нельзя. Утверждение о фактах
+    # без ссылки на базу уходит человеку — это и есть замена прежнего порога поиска.
+    grounded = 1.0 if plan.source_ids else 0.0
+    verdict = iu_contract.assess(plan, retrieval=grounded, sources_text=sources,
                                  message=request.message)
     trace.update({"score": round(verdict.score, 3), "checked": verdict.checked,
                   "grounding": round(verdict.grounding, 3),

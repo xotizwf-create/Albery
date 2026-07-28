@@ -455,5 +455,7 @@ def test_every_turn_leaves_a_readable_trace():
         reply="Комиссия 44%.", source_ids=["комиссия"], answered=["комиссия"]))
 
     assert out.trace["retrieval"] > 0
-    assert out.trace["sources"] == ["комиссия"]
+    # Базу агент видит целиком, поэтому в трассе важно не «что показали», а «на что сослался».
+    assert out.trace["shown"] == len(iu_knowledge.approved(CARDS))
+    assert out.trace["cited"] == ["комиссия"]
     assert "score" in out.trace and "action" in out.trace

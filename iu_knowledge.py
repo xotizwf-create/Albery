@@ -353,6 +353,31 @@ def search(query: str, cards, *, limit: int = 4, floor: float = 0.15,
     return tuple(hits[:limit])
 
 
+def everything(query: str, cards, *, rerank=None) -> tuple[Found, ...]:
+    """Вся утверждённая база, отсортированная по близости к вопросу.
+
+    Владелец 28.07.2026: «нужен такой же агент, как Албери, чтобы я дополнял базу и агент её
+    видел». Албери отвечает хорошо не поэтому, что у него лучше поиск, а потому что он видит
+    документы целиком и сам решает, есть ли в них ответ. Здесь то же самое: база ИУ — это
+    ~2 900 токенов, она помещается в промпт полностью, поэтому выбирать карточку до модели
+    незачем. Замер на живых вопросах из переписок: подбор одной карточки отвечал на 1 из 8,
+    полная база — на 4 из 8, а оставшиеся 4 не отвечает никто, потому что ответа в базе нет.
+
+    Порядок сохраняем по лексическому скору: самое близкое к вопросу идёт первым, и модель
+    читает его раньше остального. Скор больше ничего не отсекает — он остаётся в трассе."""
+    weights = idf_weights(cards)
+    hits = [Found(card, score_card(query, card, weights)) for card in approved(cards)]
+    if rerank is not None:
+        try:
+            reranked = rerank(query, hits)
+            if reranked:
+                hits = list(reranked)
+        except Exception:  # noqa: BLE001 — семантика не обязана работать, порядок и так есть
+            pass
+    hits.sort(key=lambda hit: hit.score, reverse=True)
+    return tuple(hits)
+
+
 def retrieval_score(found) -> float:
     """Число для порога уверенности: насколько уверенно нашлась лучшая карточка."""
     return max((hit.score for hit in found), default=0.0)
@@ -376,15 +401,25 @@ def offered_ids(found) -> tuple[str, ...]:
 
 
 def human_required(found) -> str:
-    """Условие владельца «здесь нужен человек», если оно стоит на найденной карточке.
+    """Условия владельца «здесь нужен человек» по показанным карточкам.
 
     Это УСЛОВИЕ, а не запрет: «если клиент спорит с расчётом» не означает, что человек нужен
     на каждый вопрос про комиссию. Выполнено ли оно, видно только из сообщения клиента, поэтому
-    условие уходит в промпт, а решение принимает модель."""
+    условие уходит в промпт, а решение принимает модель.
+
+    Когда в промпт уходит вся база, условий видно несколько — и каждое обязано быть названо
+    вместе со своей темой. Без темы условие «если клиент торгуется» повисает в воздухе и
+    модель применяет его к разговору, к которому владелец его не писал. Безусловные условия
+    («всегда») сюда не попадают: их исполняет код по процитированной карточке."""
+    parts = []
     for hit in found:
-        if hit.card.human_when:
-            return hit.card.human_when
-    return ""
+        condition = hit.card.human_when.strip()
+        if not condition or _is_unconditional(condition):
+            continue
+        line = f"«{hit.card.title}» — {condition}"
+        if line not in parts:
+            parts.append(line)
+    return "; ".join(parts)
 
 
 # Безусловные формулировки: тут владелец запретил отвечать самому в принципе, и код обязан
@@ -392,10 +427,27 @@ def human_required(found) -> str:
 _ALWAYS = ("всегда", "да", "обязательно", "любой вопрос", "все вопросы")
 
 
+def _is_unconditional(condition: str) -> bool:
+    value = str(condition or "").strip().casefold()
+    return bool(value) and any(value.startswith(mark) for mark in _ALWAYS)
+
+
 def always_human(found) -> str:
     """Условие, которое НЕ зависит от сообщения клиента, — его принуждает код."""
     for hit in found:
-        value = hit.card.human_when.strip().casefold()
-        if value and any(value.startswith(mark) for mark in _ALWAYS):
+        if _is_unconditional(hit.card.human_when):
             return hit.card.human_when
     return ""
+
+
+def always_human_for(found, cited_ids) -> str:
+    """То же безусловное правило, но по карточкам, на которые агент реально сослался.
+
+    Когда модели показывают всю базу, «показанная карточка» перестаёт значить «карточка по
+    теме разговора»: одно правило «всегда зовём человека» на карточке про гарантии увело бы
+    к человеку каждый разговор, включая вопрос о сроках. Решает ссылка: агент назвал карточку
+    источником ответа — правило этой карточки и применяется."""
+    cited = {str(value) for value in (cited_ids or ())}
+    if not cited:
+        return ""
+    return always_human(tuple(hit for hit in found if hit.card.id in cited))

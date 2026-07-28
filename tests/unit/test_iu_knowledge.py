@@ -141,10 +141,14 @@ def test_card_without_simple_wording_falls_back_to_the_answer():
     assert "3 рабочих дня" in k.sources_text(found, simple=True)
 
 
-def test_human_required_condition_is_surfaced():
+def test_human_required_condition_is_surfaced_with_its_topic():
+    """Условие обязано называть свою тему: базу видно целиком, условий в промпте несколько.
+
+    Без темы «если клиент спорит с расчётом» повисает в воздухе, и модель применяет его к
+    разговору, для которого владелец его не писал."""
     found = k.search("а сколько вы берёте?", CARDS)
 
-    assert k.human_required(found) == "если клиент спорит с расчётом"
+    assert k.human_required(found) == "«Комиссия» — если клиент спорит с расчётом"
 
 
 def test_rerank_hook_can_reorder_without_rewriting_search():

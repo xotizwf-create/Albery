@@ -25,16 +25,21 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
 import iu_contract
 
+log = logging.getLogger("iu-prompt")
+
 # Роль владельца ограничена: карточка — место для тона и акцентов, а не для второго свода
 # правил. Всё, что длиннее, обрезается, и это лучше, чем молча вернуть свалку.
 ROLE_CAP = int(os.getenv("IU_ROLE_CAP", "2000") or 2000)
 HISTORY_CAP = int(os.getenv("IU_HISTORY_CAP", "4000") or 4000)
-KNOWLEDGE_CAP = int(os.getenv("IU_KNOWLEDGE_CAP", "6000") or 6000)
+# База ИУ уходит в промпт целиком (владелец 28.07.2026), сейчас это ~9 000 символов. Запас
+# нужен, чтобы дописанная владельцем карточка не срезалась молча вместе с ответом на неё.
+KNOWLEDGE_CAP = int(os.getenv("IU_KNOWLEDGE_CAP", "24000") or 24000)
 
 DEFAULT_ROLE = (
     "Ты — менеджер компании Albery. Ведёшь переписку в Telegram с продавцами Wildberries, "
@@ -148,6 +153,12 @@ def _task_block(ctx: Context) -> str:
 
 def build(ctx: Context) -> str:
     """Собрать промпт одного клиентского хода."""
+    knowledge = (ctx.knowledge or "").strip()
+    if len(knowledge) > KNOWLEDGE_CAP:
+        # Молча срезанная база выглядит как «ответа нет»: агент передаёт вопрос человеку, и
+        # никто не понимает, почему. Обрезаем по-прежнему, но так, чтобы это было видно.
+        log.warning("база знаний ИУ не помещается в промпт: %d символов при лимите %d — "
+                    "часть карточек агент не увидит", len(knowledge), KNOWLEDGE_CAP)
     role = (ctx.role or "").strip()[:ROLE_CAP] or DEFAULT_ROLE
     who = f"Пишет: {ctx.name}" if ctx.name else "Пишет клиент"
     blocks = [
