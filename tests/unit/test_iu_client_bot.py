@@ -381,3 +381,22 @@ def test_ai_job_for_a_bot_dialog_is_not_cancelled_by_the_business_rollout(monkey
     # Выключенный рубильник бота молчит так же явно.
     monkeypatch.setenv("IU_CLIENT_BOT_AI", "0")
     assert gateway.ai_allowed_in_channel(bot_dialog, 555) is False
+
+
+def test_ai_worker_runs_for_the_bot_channel_alone(monkeypatch):
+    """Обработчик заданий ИИ обязан работать, даже когда бизнес-контур выключен.
+
+    Живой прогон 28.07.2026: задание клиента висело «ожидает» до бесконечности —
+    воркер сверялся с общим рубильником, который относится к другому каналу.
+    """
+
+    monkeypatch.setenv("FUNNEL_WORKSPACE_AI_ENABLED", "0")
+    monkeypatch.setenv("IU_CLIENT_BOT_ENABLED", "1")
+    monkeypatch.setenv("IU_CLIENT_BOT_AI", "1")
+    assert gateway.ai_worker_needed() is True
+
+    monkeypatch.setenv("IU_CLIENT_BOT_AI", "0")
+    assert gateway.ai_worker_needed() is False
+
+    monkeypatch.setenv("FUNNEL_WORKSPACE_AI_ENABLED", "1")
+    assert gateway.ai_worker_needed() is True

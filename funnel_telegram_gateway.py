@@ -216,11 +216,25 @@ def _bot_update_loop() -> None:
             _loop_wait(0.5)
 
 
+def ai_worker_needed() -> bool:
+    """Нужен ли обработчик заданий ИИ хоть какому-то каналу.
+
+    Общий рубильник относится к переписке бизнес-аккаунта и намеренно выключен. Если
+    сверяться только с ним, задания клиентского бота копились бы в очереди нетронутыми:
+    клиент видел бы молчание, а в базе — вечное «ожидает». Кому именно отвечать, решает
+    ai_allowed_in_channel уже по каналу диалога.
+    """
+
+    import iu_client_bot
+
+    return ai_enabled() or (iu_client_bot.enabled() and iu_client_bot.ai_answers_enabled())
+
+
 def _ai_loop() -> None:
     worker_id = f"{_worker_prefix}-ai"
     while not _stop_event.is_set():
         count = 0
-        if ai_enabled():
+        if ai_worker_needed():
             try:
                 count = process_ai_jobs_once(worker_id=worker_id)
             except Exception:  # noqa: BLE001
