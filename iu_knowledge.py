@@ -180,6 +180,25 @@ def _multiline(block: str, name: str) -> str:
 _QA_QUESTION_RE = re.compile(r"^\s*\d+[.)]\s*(?:\d+[.)]\s*)?(.+?)\s*$", re.M)
 #: Служебная шапка, которую добавляет синк с Google Drive, вопросом не является.
 _QA_SERVICE_RE = re.compile(r"^\s*(источник|обновлено[^:]*|тип)\s*:", re.I)
+#: Заголовок раздела без номера: «Кто мы?», «Важно». Владелец пишет их между списками вопросов,
+#: и без отдельного разбора такой раздел молча прилипал к ответу на предыдущий вопрос — агент
+#: цитировал одну карточку, а рассказывал факты из другой.
+_QA_HEADING_RE = re.compile(r"^\s*(\S[^\n]{0,58})\s*$", re.M)
+_QA_HEADING_STOP = ("-", "—", "–", "•", "*", "#")
+
+
+def _is_qa_heading(line: str) -> bool:
+    """Похожа ли строка на заголовок раздела, а не на фразу внутри ответа.
+
+    Мерки нарочно узкие: ошибиться сюда — значит откусить у карточки ответ и превратить её в
+    черновик, то есть потерять её для агента. Заголовок короткий, без завершающего знака, не
+    пункт списка и не начало нумерации."""
+    value = line.strip()
+    if not value or value[0].isdigit() or value.startswith(_QA_HEADING_STOP):
+        return False
+    if value.endswith((".", ":", ";", ",", "!")):
+        return False
+    return len(value) <= 58 and len(value.split()) <= 6
 
 
 def parse_qa(document: str) -> tuple[Card, ...]:
@@ -188,32 +207,60 @@ def parse_qa(document: str) -> tuple[Card, ...]:
     Вопрос-заголовок часто содержит несколько формулировок подряд — владелец пишет их так,
     как спрашивают клиенты («Какая комиссия будет у Вас? Сколько я буду получать?»). Первая
     становится названием карточки, остальные — точными формулировками для поиска.
+
+    **Слово «Ответ:» не обязательно.** Владелец 28.07.2026 дописал в документ 16 вопросов,
+    ответы под которыми написаны просто текстом, — и все они молча стали черновиками, то есть
+    агент их не видел вовсе. Отвечал он при этом «в базе нет информации», хотя ответ владелец
+    уже написал. Поэтому ответом считается ВЕСЬ текст под вопросом; «Ответ:» остаётся
+    поддержанной, но не обязательной пометкой.
     """
 
     text = str(document or "")
     matches = [m for m in _QA_QUESTION_RE.finditer(text) if not _QA_SERVICE_RE.match(m.group(0))]
     out: list[Card] = []
     seen: dict[str, int] = {}
-    for index, match in enumerate(matches):
-        heading = match.group(1).strip()
-        if not heading:
-            continue
-        body = text[match.end(): matches[index + 1].start() if index + 1 < len(matches) else len(text)]
-        answer_match = re.search(r"^\s*ответ\s*:\s*(.*)$", body, re.I | re.M)
-        answer = ""
-        if answer_match:
-            answer = (answer_match.group(1) + "\n" + body[answer_match.end():]).strip()
-        wordings = [part.strip() + "?" for part in heading.split("?") if part.strip()]
-        title = wordings[0] if wordings else heading
+
+    def add(title: str, answer: str, aliases: tuple[str, ...] = ()) -> None:
         base = _slug(title)
         seen[base] = seen.get(base, 0) + 1
         out.append(Card(
             id=base if seen[base] == 1 else f"{base}-{seen[base]}",
             title=title,
-            answer=answer,
-            aliases=tuple(wordings[1:]),
+            answer=answer.strip(),
+            aliases=aliases,
         ))
+
+    for index, match in enumerate(matches):
+        heading = match.group(1).strip()
+        if not heading:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[match.end():end]
+        answer_match = re.search(r"^\s*ответ\s*:\s*(.*)$", body, re.I | re.M)
+        if answer_match:
+            body = (answer_match.group(1) + "\n" + body[answer_match.end():])
+        # Ненумерованный раздел между вопросами («Кто мы?») — самостоятельная карточка,
+        # а не хвост чужого ответа.
+        answer, section = _split_trailing_section(body)
+        wordings = [part.strip() + "?" for part in heading.split("?") if part.strip()]
+        add(wordings[0] if wordings else heading, answer, tuple(wordings[1:]))
+        if section:
+            add(*section)
     return tuple(out)
+
+
+def _split_trailing_section(body: str) -> tuple[str, tuple[str, str] | None]:
+    """Отделить от ответа ненумерованный раздел, если владелец начал его прямо под ответом."""
+    lines = body.splitlines()
+    for position in range(1, len(lines)):
+        if lines[position - 1].strip() or not _is_qa_heading(lines[position]):
+            continue  # заголовок раздела всегда стоит после пустой строки
+        head = "\n".join(lines[:position]).strip()
+        tail = "\n".join(lines[position + 1:]).strip()
+        if not head or not tail:
+            continue  # без ответа у вопроса и без текста у раздела делить нечего
+        return head, (lines[position].strip(), tail)
+    return body.strip(), None
 
 
 def approved(cards) -> tuple[Card, ...]:

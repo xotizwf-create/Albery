@@ -156,3 +156,82 @@ def test_missing_qa_document_does_not_break_the_rest(monkeypatch):
     cards = iu_runtime.knowledge_cards(force=True)
 
     assert [card.title for card in cards] == ["Комиссия"]
+
+
+# Фрагмент документа владельца от 28.07.2026, второй список вопросов. Ответы под вопросами
+# написаны просто текстом — БЕЗ слова «Ответ:». Прежний разбор давал по ним пустые карточки,
+# они считались черновиками, и агент отвечал «в базе нет информации» на вопросы, ответ на
+# которые владелец уже написал. Между списками стоит ненумерованный раздел «Кто мы?».
+PLAIN_DOCUMENT = """1. Можно ли перенести существующие карточки товаров и остатки в новый кабинет?
+
+Сейчас перенос карточек и остатков не рассматривается: технически этот процесс сопряжён со сложностями.
+
+Для начала работы рекомендуем создать новые карточки товаров в кабинете и вести продажи с нуля.
+
+2. От чьего юридического лица клиент закупает товар у поставщиков?
+
+Клиент закупает товар самостоятельно, от своего юридического лица.
+
+3. Как устроена базовая экономика: 56%, эквайринг, реклама и СПП?
+
+Базовая логика расчётов следующая:
+
+- клиент получает 56% от суммы реализации до СПП;
+
+- отдельно удерживается эквайринг — ориентировочно около 2%.
+
+Кто мы?
+
+Мы — партнёр, который сопровождает подключение селлеров к действующему кабинету Wildberries.
+
+Кабинет работает более 7 лет, оборот за прошлый год — около 3 млрд рублей.
+"""
+
+
+def _by_title(cards, title):
+    return next(card for card in cards if card.title == title)
+
+
+def test_answer_without_the_word_otvet_is_still_an_answer():
+    """Жалоба владельца 28.07.2026: «агент очень плохо ищет, а ChatGPT справился идеально».
+
+    ChatGPT показывали документ целиком, а агент видел только карточки со словом «Ответ:» —
+    16 дописанных владельцем вопросов были для него пустыми черновиками."""
+    cards = iu_knowledge.parse_qa(PLAIN_DOCUMENT)
+    approved = iu_knowledge.approved(cards)
+
+    titles = [card.title for card in approved]
+    assert "Можно ли перенести существующие карточки товаров и остатки в новый кабинет?" in titles
+    assert "От чьего юридического лица клиент закупает товар у поставщиков?" in titles
+
+    card = _by_title(approved, "От чьего юридического лица клиент закупает товар у поставщиков?")
+    assert "от своего юридического лица" in card.answer
+
+
+def test_plain_answer_keeps_its_whole_body():
+    cards = iu_knowledge.parse_qa(PLAIN_DOCUMENT)
+
+    card = _by_title(cards, "Как устроена базовая экономика: 56%, эквайринг, реклама и СПП?")
+    assert "56% от суммы реализации до СПП" in card.answer
+    assert "эквайринг" in card.answer
+
+
+def test_unnumbered_section_becomes_its_own_card():
+    """«Кто мы?» раньше прилипал к ответу на предыдущий вопрос: агент цитировал одну карточку,
+    а рассказывал факты из другой."""
+    cards = iu_knowledge.parse_qa(PLAIN_DOCUMENT)
+
+    about = _by_title(cards, "Кто мы?")
+    assert "более 7 лет" in about.answer
+    assert "3 млрд" in about.answer
+
+    economics = _by_title(cards, "Как устроена базовая экономика: 56%, эквайринг, реклама и СПП?")
+    assert "7 лет" not in economics.answer
+
+
+def test_the_word_otvet_still_works_as_before():
+    cards = iu_knowledge.parse_qa(DOCUMENT)
+
+    card = _by_title(cards, "Какая комиссия будет у Вас?")
+    assert card.answer.startswith("Базовая комиссия")
+    assert "Ответ:" not in card.answer
