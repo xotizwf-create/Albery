@@ -68,3 +68,4 @@ def test_prompt_asks_for_the_owners_answer_shape():
     assert "первой строкой — прямой ответ" in rules
     assert "«— » в начале" in rules
     assert "Простой вопрос — простой короткий ответ" in rules
+    assert "пункты списка — точкой с запятой" in rules
