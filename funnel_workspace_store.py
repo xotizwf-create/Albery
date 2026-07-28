@@ -1327,6 +1327,13 @@ def conversation_detail(
 
 
 def _cancel_queued_ai(cur: Any, conversation_id: int, reason: str) -> None:
+    """Снять недоставленные ответы ИИ, когда диалог перешёл к человеку.
+
+    Служебные подтверждения нажатых кнопок исключены: они отвечают на уже случившееся
+    действие клиента, и именно передача человеку их и порождает. Отменять их — значит
+    оставить клиента без ответа на собственное нажатие.
+    """
+
     cur.execute(
         """
         WITH cancelled AS (
@@ -1338,6 +1345,7 @@ def _cancel_queued_ai(cur: Any, conversation_id: int, reason: str) -> None:
              WHERE conversation_id = %s
                AND author_type = 'agent'
                AND delivery_status = 'pending'
+               AND COALESCE(payload->>'service_reply', 'false') <> 'true'
          RETURNING message_id
         )
         UPDATE funnel_workspace_messages
@@ -1357,6 +1365,7 @@ def _cancel_queued_ai(cur: Any, conversation_id: int, reason: str) -> None:
          WHERE conversation_id = %s
            AND author_type = 'agent'
            AND delivery_status IN ('leased', 'sending')
+           AND COALESCE(payload->>'service_reply', 'false') <> 'true'
         """,
         (reason, conversation_id),
     )

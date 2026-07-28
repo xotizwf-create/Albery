@@ -310,3 +310,15 @@ def test_operator_confirmation_survives_the_handover(monkeypatch):
     assert store.queued, "подтверждение клиенту обязано быть отправлено, а не проглочено"
     assert store.queued[0].get("service") is True
     assert "менеджер" in store.queued[0]["text"].lower()
+
+
+def test_handover_does_not_cancel_the_service_confirmation():
+    """Передача человеку снимает недоставленные ответы ИИ — но не подтверждение кнопки."""
+
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "funnel_workspace_store.py").read_text(
+        encoding="utf-8")
+    cancel_block = source.split("def _cancel_queued_ai", 1)[1].split("def ", 1)[0]
+    # Обе отмены (ожидающие и уже взятые в работу) обязаны обходить служебные ответы.
+    assert cancel_block.count("COALESCE(payload->>'service_reply', 'false') <> 'true'") == 2
