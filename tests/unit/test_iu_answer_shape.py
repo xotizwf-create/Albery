@@ -65,7 +65,11 @@ def test_flat_short_answer_behaves_exactly_as_before():
 def test_prompt_asks_for_the_owners_answer_shape():
     rules = iu_prompt.RULES
 
-    assert "первой строкой — прямой ответ" in rules
-    assert "«— » в начале" in rules
+    assert "Первой строкой — прямой ответ" in rules
+    assert "с «— » в начале" in rules
+    assert "написано сплошной строкой" in rules
     assert "Простой вопрос — простой короткий ответ" in rules
-    assert "пункты списка — точкой с запятой" in rules
+    # Требование знаков препинания: агент писал строки без точек, и ответ обрывался
+    # на полуслове. Пробелы в правиле переносятся, поэтому сверяем по словам.
+    assert "Знаки препинания обязательны" in rules
+    assert "с точкой с запятой" in " ".join(rules.split())
