@@ -6078,6 +6078,41 @@ def tool_create_google_doc(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"Create Google Doc failed: {exc}") from exc
 
 
+def tool_read_google_doc(args: dict[str, Any]) -> dict[str, Any]:
+    doc_id = str(args.get("document_id") or args.get("url") or "").strip()
+    if not doc_id:
+        raise McpError(-32602, "document_id (id или ссылка на Google-документ) обязателен.")
+    fmt = str(args.get("output_format") or "text")
+    try:
+        return app_workflow_function("read_google_doc")(doc_id, fmt)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"read_google_doc failed: {exc}") from exc
+
+
+def tool_edit_google_doc(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Правка Google-документа требует confirm=true. Сначала прочитай документ (read_google_doc), покажи "
+            "пользователю, что именно изменится, получи согласие, затем вызови с confirm=true.",
+        )
+    doc_id = str(args.get("document_id") or args.get("url") or "").strip()
+    if not doc_id:
+        raise McpError(-32602, "document_id (id или ссылка на Google-документ) обязателен.")
+    html = str(args.get("html") or args.get("html_body") or args.get("content") or "").strip()
+    if not html:
+        raise McpError(-32602, "html (полное новое содержимое документа) обязателен.")
+    try:
+        return app_workflow_function("edit_google_doc")(
+            doc_id, html, args.get("font_size_pt"), args.get("line_spacing"))
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"edit_google_doc failed: {exc}") from exc
+
+
 def tool_get_google_sheet_meta(args: dict[str, Any]) -> dict[str, Any]:
     sid = str(args.get("spreadsheet_id") or "").strip()
     if not sid:
@@ -11243,6 +11278,50 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_create_google_doc,
     },
+    "read_google_doc": {
+        "description": (
+            "Прочитать СУЩЕСТВУЮЩИЙ Google-документ по ссылке или id: output_format='text' — текст для ответа "
+            "пользователю, output_format='html' — разметка для правки. Всегда читай документ ПЕРЕД правкой: "
+            "edit_google_doc заменяет содержимое целиком, поэтому «поменяй только вот это» делается как "
+            "read_google_doc(html) → правишь именно нужные места в этом HTML → edit_google_doc тем же HTML. "
+            "Только чтение."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "string", "description": "id документа или ссылка docs.google.com/document/d/…"},
+                "output_format": {"type": "string", "enum": ["text", "html"], "description": "text (по умолчанию) или html для последующей правки"},
+            },
+            "required": ["document_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_read_google_doc,
+    },
+    "edit_google_doc": {
+        "description": (
+            "Отредактировать СУЩЕСТВУЮЩИЙ Google-документ: заменяет его содержимое переданным HTML, сохраняя тот же "
+            "документ, ту же ссылку и тот же доступ. Это правильный ответ на «исправь/переоформи/выдели жирным в этом "
+            "документе» — НЕ создавай копию и НЕ говори, что нет доступа: если правка невозможна, инструмент вернёт "
+            "конкретную ошибку, и только её можно пересказывать пользователю. Порядок обязателен: read_google_doc "
+            "(output_format='html') → внеси В ЭТОТ HTML только то, о чём просили, остальное оставь дословно → "
+            "edit_google_doc. Замена полная, поэтому неполный HTML = потеря текста. Перед вызовом покажи пользователю, "
+            "что именно изменится, и вызывай с confirm=true. Предыдущая версия остаётся в истории Google Docs, её id "
+            "возвращается в previous_revision_id. Оформление — тот же рендер, что у create_google_doc и export_document."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "string", "description": "id документа или ссылка docs.google.com/document/d/…"},
+                "html": {"type": "string", "description": "ПОЛНОЕ новое содержимое документа в HTML (h1/h2/p/b/ul/table)"},
+                "font_size_pt": {"type": "number", "description": "Кегль (по умолчанию 12)"},
+                "line_spacing": {"type": "number", "description": "Межстрочный интервал (по умолчанию 1.5)"},
+                "confirm": {"type": "boolean", "description": "Должно быть true после явного согласия пользователя"},
+            },
+            "required": ["document_id", "html", "confirm"],
+            "additionalProperties": False,
+        },
+        "handler": tool_edit_google_doc,
+    },
     "get_google_sheet_meta": {
         "description": (
             "Read a Google Sheet's structure: its tabs (sheetId / title / grid size). Call this "
@@ -11281,10 +11360,13 @@ TOOLS: dict[str, dict[str, Any]] = {
     "write_google_sheet_values": {
         "description": (
             "Write a 2D array of values/formulas into an A1 range of a Google Sheet (USER_ENTERED, "
-            "so formulas work). The server normalizes formula argument separators for the target Sheet locale "
-            "(ru_RU uses semicolons, not commas) and validates the updated range; if formulas still produce "
-            "#ERROR, the tool fails instead of letting the assistant claim success. Use for sheets the agent "
-            "created via create_google_sheet."
+            "so formulas work). WRITE FORMULAS THE WAY YOU NORMALLY WOULD — dot for decimals and comma for "
+            "arguments, e.g. =ROUND(B1*0.14,2). The server converts them to the target sheet's locale (a ru_RU "
+            "sheet needs =ROUND(B1*0,14;2)), reads the cells back, and if Google flagged an error re-writes them "
+            "with the other reading of an ambiguous comma. Do NOT hand-convert separators yourself and do NOT "
+            "retry a formula by guessing punctuation: if the tool returns an error it lists the exact cells and "
+            "what Google said, and that error is the only thing to report. A successful result means the cells "
+            "were read back clean — nothing else may be reported as written."
         ),
         "inputSchema": {
             "type": "object",
@@ -11313,7 +11395,8 @@ TOOLS: dict[str, dict[str, Any]] = {
             "create_google_sheet auto-applies a default readable style when rows are provided; use this tool for any "
             "extra formatting, dashboards, charts, task/status colors, merged title blocks or polished layout. "
             "Before saying a dashboard is ready, write/check formulas with write_google_sheet_values so formula "
-            "errors are caught; for ru_RU sheets use semicolons in formulas. "
+            "errors are caught; write formulas in the usual dot-decimal/comma-argument form — the server converts "
+            "them to the sheet's locale. "
             "Get each tab's sheetId from get_google_sheet_meta. requests = standard Sheets API request objects "
             "(repeatCell, mergeCells, updateSheetProperties, addChart, addConditionalFormatRule, "
             "updateDimensionProperties, ...)."
@@ -12170,6 +12253,11 @@ CORE_TOOL_NAMES: set[str] = {
     # google workflow the bot prompt teaches
     "create_google_sheet",
     "create_google_doc",
+    # Documents must be as visible as sheets. While only "create" was in the core set, the model
+    # saw no way to change an existing document and told users it lacked ACCESS (29.07.2026) —
+    # a capability the agent cannot see is a capability it does not have.
+    "read_google_doc",
+    "edit_google_doc",
     "get_google_sheet_meta",
     "read_google_sheet_values",
     "write_google_sheet_values",
