@@ -1,7 +1,7 @@
 """iu_client_bot.py — клиентский вход в воронку ИУ через бота.
 
 Раньше попасть в воронку можно было единственным способом: написать в Telegram-аккаунт
-менеджера. Здесь появляется вход по ссылке на бота — с /start, тремя кнопками и понятным
+менеджера. Здесь появляется вход по ссылке на бота — с /start, четырьмя кнопками и понятным
 следующим шагом на каждой.
 
 Что важно в устройстве. Сценарий не хранит собственного состояния: «на каком шаге клиент»
@@ -26,19 +26,31 @@ BUTTON_JOIN = "🤝 Присоединиться к ИУ"
 BUTTON_CALCULATOR = "🧮 Калькулятор расчёта ИУ"
 BUTTON_ASK = "💬 Задать вопрос"
 BUTTON_OPERATOR = "🙋 Позвать оператора"
+BUTTON_EXIT_SUPPORT = "↩️ Выйти из диалога поддержки"
+BUTTON_CONFIRM_YES = "✅ Да"
+BUTTON_CONFIRM_NO = "❌ Нет"
 
 CB_TERMS = "iu:terms"
 CB_JOIN = "iu:join"
 CB_CALCULATOR = "iu:calculator"
 CB_ASK = "iu:ask"
 CB_OPERATOR = "iu:operator"
+CB_EXIT_SUPPORT = "iu:exit-support"
+CB_CONFIRM_YES = "iu:exit-yes"
+CB_CONFIRM_NO = "iu:exit-no"
 
-#: После скольких ответов ИИ клиенту предлагается позвать человека (владелец: «после 3-го»).
-OPERATOR_OFFER_AFTER_REPLIES = int(os.getenv("IU_CLIENT_BOT_OPERATOR_AFTER", "3") or "3")
+#: После двух ответов ИИ кнопка показывается вместе с ответом на третий вопрос.
+OPERATOR_OFFER_AFTER_REPLIES = int(os.getenv("IU_CLIENT_BOT_OPERATOR_AFTER", "2") or "2")
 
 WELCOME = (
     "Здравствуйте! Это бот компании по индивидуальным условиям (ИУ) работы с Wildberries.\n\n"
     "Выберите, с чего начать:"
+)
+WELCOME_BACK = "С возвращением! Выберите нужный раздел:"
+MENU_PROMPT = "Главное меню:"
+STOPPED = (
+    "Поддержка и напоминания остановлены. Чтобы начать снова, используйте /start "
+    "или вернитесь в меню командой /menu."
 )
 
 #: Публичный калькулятор не требует входа и не отправляет введённые значения на сервер.
@@ -55,10 +67,13 @@ CALCULATOR_REPLY = (
 #: Анкета выдаётся ПЕРСОНАЛЬНОЙ ссылкой: по ней заявка приклеивается к этому же человеку, а не
 #: заводит вторую карточку в воронке. Текст собирается в `join_reply`.
 JOIN_INTRO = (
-    "Хорошо, оформим присоединение.\n\n"
-    "Заполните короткую анкету — по ней менеджер подготовит для вас условия:\n"
-    "[Заполнить анкету]({url})\n\n"
-    "Ссылка личная, поэтому заявку я сразу свяжу с нашим разговором."
+    "Заполните короткую анкету, менеджер с Вами свяжется!\n\n"
+    "[Заполнить анкету]({url})"
+)
+JOIN_REPEAT = (
+    "Вижу, анкета ещё не заполнена. Вот ваша ссылка — можно продолжить с неё.\n\n"
+    "Заполните короткую анкету, менеджер с Вами свяжется!\n\n"
+    "[Заполнить анкету]({url})"
 )
 
 #: Ссылку выдать не удалось (база недоступна). Молчать нельзя, но и врать про анкету тоже:
@@ -73,19 +88,22 @@ JOIN_STUB = (
 #: Анкета уже заполнена: второй раз её давать нельзя (владелец 29.07.2026). Данные
 #: показываем те, что РЕАЛЬНО лежат в сделке, — «вот ваши данные» из его же формулировки.
 JOIN_FILLED = (
-    "Вы уже заполнили анкету — она у менеджера, он готовит для вас условия.\n\n"
-    "{anketa}\n\n"
-    "Если что-то нужно поправить, напишите здесь, что именно, и я передам."
+    "Анкета уже получена и прикреплена к вашей заявке. Менеджер готовит дальнейшие шаги.\n\n"
+    "Напишите здесь, что нужно изменить, — передам менеджеру."
+)
+FORM_RECEIVED = (
+    "Увидел Вашу анкету, менеджер свяжется с Вами в ближайшее время!"
 )
 
 
-def join_reply(url: str) -> str:
+def join_reply(url: str, *, repeated: bool = False) -> str:
     """Ответ на «Присоединиться к ИУ» с персональной ссылкой."""
 
-    return JOIN_INTRO.format(url=url)
+    template = JOIN_REPEAT if repeated else JOIN_INTRO
+    return template.format(url=url)
 
 
-def join_answer(anketa: str, url: str) -> tuple[str, bool]:
+def join_answer(anketa: str, url: str, *, repeated: bool = False) -> tuple[str, bool]:
     """Что ответить на «Присоединиться к ИУ»: `(текст, анкета уже есть)`.
 
     Решает НАЛИЧИЕ анкеты в сделке, а не наша отметка о выдаче ссылки. Владелец 29.07.2026
@@ -95,12 +113,37 @@ def join_answer(anketa: str, url: str) -> tuple[str, bool]:
 
     body = str(anketa or "").strip()
     if body:
-        return JOIN_FILLED.format(anketa=body), True
-    return join_reply(url), False
+        return JOIN_FILLED, True
+    return join_reply(url, repeated=repeated), False
 
 ASK_PROMPT = (
-    "Конечно, спрашивайте. Отвечу по условиям работы, комиссии, срокам и документам — "
-    "напишите вопрос сообщением."
+    "Спрашивайте — помогу разобраться в условиях работы, комиссии, сроках и документах.\n\n"
+    "Также прикрепил ответы на частые вопросы — там вы сможете найти ответ на свой вопрос."
+)
+
+STRICT_QUESTION_HINT = (
+    "Если у вас есть вопрос, нажмите «Задать вопрос» — я постараюсь помочь."
+)
+FILE_NEEDS_CONTEXT = (
+    "Файл получил. Напишите, пожалуйста, что именно нужно проверить."
+)
+FILE_SENT_TO_MANAGER = (
+    "Передал файл менеджеру — он посмотрит и ответит здесь."
+)
+EXIT_CONFIRM = "Вы уверены, что хотите выйти из окна поддержки?"
+EXITED_SUPPORT = "Если появятся новые вопросы, снова нажмите «Задать вопрос»!"
+CONTINUE_SUPPORT = "Хорошо, остаёмся в поддержке. Напишите ваш вопрос."
+FORM_EDIT_SENT = "Передал менеджеру, что нужно изменить в анкете. Он ответит здесь."
+REMINDER_WAITING_QUESTION = (
+    "Мы готовы помочь. Напишите ваш вопрос, когда будет удобно."
+)
+REMINDER_AFTER_ANSWER = (
+    "Остались ли у вас вопросы? Если что-то понадобится — напишите, я на связи."
+)
+
+TERMS_REPLY = (
+    "Условия присоединения к ИУ и примерный договор прикреплены к сообщению. "
+    f"Вы можете посчитать свою экономию в нашем [калькуляторе ИУ]({CALCULATOR_URL})"
 )
 
 OPERATOR_CALLED = (
@@ -133,9 +176,8 @@ def main_menu(*, offer_operator: bool = False) -> dict:
     обычным текстовым сообщением — сценарий узнаёт его по подписи.
     """
 
-    # Пункт «Позвать оператора» убран из меню владельцем 28.07.2026. Сам вызов человека
-    # остался: его делает кнопка присоединения, а также решение агента передать разговор,
-    # когда ответа в базе нет. Калькулятор теперь работает без участия менеджера.
+    # Пункт «Позвать оператора» не живёт в главном меню: он появляется только внутри
+    # поддержки после двух содержательных ответов ИИ.
     del offer_operator
     rows = [[BUTTON_TERMS], [BUTTON_JOIN], [BUTTON_CALCULATOR], [BUTTON_ASK]]
     return {
@@ -143,6 +185,31 @@ def main_menu(*, offer_operator: bool = False) -> dict:
         "resize_keyboard": True,
         "is_persistent": True,
     }
+
+
+def support_menu(*, offer_operator: bool = False) -> dict:
+    """Клавиатура отдельного режима поддержки."""
+
+    rows: list[list[str]] = [[BUTTON_EXIT_SUPPORT]]
+    if offer_operator:
+        rows.insert(0, [BUTTON_OPERATOR])
+    return {
+        "keyboard": [[{"text": title} for title in row] for row in rows],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def exit_confirmation_menu() -> dict:
+    return {
+        "keyboard": [[{"text": BUTTON_CONFIRM_YES}, {"text": BUTTON_CONFIRM_NO}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+def remove_keyboard() -> dict:
+    return {"remove_keyboard": True}
 
 
 #: Подписи без смайликов — у клиентов, начавших разговор до их появления, меню закреплено
@@ -155,6 +222,12 @@ _MENU_BY_TITLE = {
     "калькулятор расчета иу": CB_CALCULATOR,
     "задать вопрос": CB_ASK,
     "позвать оператора": CB_OPERATOR,
+    "оператор": CB_OPERATOR,
+    "менеджер": CB_OPERATOR,
+    "человек": CB_OPERATOR,
+    "выйти из диалога поддержки": CB_EXIT_SUPPORT,
+    "да": CB_CONFIRM_YES,
+    "нет": CB_CONFIRM_NO,
 }
 
 
@@ -197,4 +270,7 @@ def button_label(callback_data: str) -> str:
         CB_CALCULATOR: BUTTON_CALCULATOR,
         CB_ASK: BUTTON_ASK,
         CB_OPERATOR: BUTTON_OPERATOR,
+        CB_EXIT_SUPPORT: BUTTON_EXIT_SUPPORT,
+        CB_CONFIRM_YES: BUTTON_CONFIRM_YES,
+        CB_CONFIRM_NO: BUTTON_CONFIRM_NO,
     }.get(str(callback_data or ""), "")

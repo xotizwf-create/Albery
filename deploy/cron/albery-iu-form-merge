@@ -1,0 +1,8 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON_TZ=Europe/Moscow
+
+# CRM-форма создаётся самим Bitrix. Раз в минуту переносим анкету в исходную
+# Telegram-сделку и подтверждаем заполнение клиенту. flock не даёт проходам
+# пересекаться, если Bitrix отвечает дольше минуты.
+* * * * * root flock -n /run/albery-iu-form-merge.lock bash -lc 'cd /var/www/albery && /var/www/albery/.venv/bin/python /var/www/albery/scripts/iu_form_merge_watch.py' >> /var/log/albery/iu-form-merge.log 2>&1

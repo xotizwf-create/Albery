@@ -184,7 +184,7 @@ def test_unknown_token_is_not_a_crash():
 
 # --- что отвечает бот ------------------------------------------------------------------------
 
-def test_answer_shows_the_real_anketa_not_our_flag():
+def test_answer_hides_the_link_when_the_real_anketa_exists():
     """Владелец 29.07.2026: «я в битриксе анкету удалил, а бот всё равно говорит, что
     человек её заполнил». Правда об анкете живёт в сделке, а не в нашей отметке."""
     import iu_client_bot
@@ -193,8 +193,8 @@ def test_answer_shows_the_real_anketa_not_our_flag():
         "Вижу анкету:\n\n• Категории товара — Одежда\n\nВсё верно?", "")
 
     assert filled is True
-    assert "уже заполнили" in body
-    assert "Категории товара — Одежда" in body
+    assert "Анкета уже получена" in body
+    assert "что нужно изменить" in body
     assert "http" not in body
 
 

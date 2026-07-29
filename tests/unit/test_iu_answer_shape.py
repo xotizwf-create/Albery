@@ -271,7 +271,7 @@ def test_join_reply_carries_the_personal_link():
     body = iu_client_bot.join_reply("https://www.m4s.ru/iu/abc")
 
     assert "[Заполнить анкету](https://www.m4s.ru/iu/abc)" in body
-    assert "личная" in body
+    assert "менеджер с Вами свяжется" in body
 
 
 def test_already_filled_answer_does_not_offer_the_form_again():
@@ -280,6 +280,6 @@ def test_already_filled_answer_does_not_offer_the_form_again():
     И показывает данные из САМОЙ сделки: «вот ваши данные» из его же формулировки."""
     import iu_client_bot
 
-    assert "уже заполнили" in iu_client_bot.JOIN_FILLED
-    assert "{anketa}" in iu_client_bot.JOIN_FILLED
+    assert "Анкета уже получена" in iu_client_bot.JOIN_FILLED
+    assert "что нужно изменить" in iu_client_bot.JOIN_FILLED
     assert "http" not in iu_client_bot.JOIN_FILLED

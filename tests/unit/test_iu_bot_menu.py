@@ -88,15 +88,10 @@ def test_menu_lives_under_the_input_field_not_inside_a_message():
     ]
 
 
-def test_menu_has_no_operator_item():
-    """Владелец убрал пункт 28.07.2026: человека зовут присоединение и сам агент."""
+def test_main_menu_has_no_operator_item():
 
     titles = [button["text"] for row in bot.main_menu()["keyboard"] for button in row]
-    with_flag = [button["text"] for row in bot.main_menu(offer_operator=True)["keyboard"]
-                 for button in row]
-
     assert bot.BUTTON_OPERATOR not in titles
-    assert with_flag == titles, "старый флаг больше ничего не добавляет"
 
 
 def test_start_answers_with_the_menu(monkeypatch):
@@ -115,23 +110,108 @@ def test_menu_item_is_handled_as_an_action_not_as_a_question(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)
     _tg(monkeypatch)
+    import iu_bot_documents
+    monkeypatch.setattr(
+        iu_bot_documents,
+        "attachment",
+        lambda kind: {
+            "token": f"token-{kind}-abcdefghijkl",
+            "file_name": f"{kind}.pdf",
+            "mime_type": "application/pdf",
+            "file_size": 100,
+        },
+    )
 
     gateway.route_captured_update(_message(bot.BUTTON_TERMS))
 
     # Пункт меню приходит обычным текстом — и должен выполнить действие, а не уйти в ИИ.
     assert store.ingested[0]["schedule_ai"] is False
-    assert "Условия ИУ" in store.queued[0]["text"]
+    assert [item["attachment"]["file_name"] for item in store.queued[:2]] == [
+        "terms.pdf",
+        "contract.pdf",
+    ]
 
 
-def test_free_question_still_goes_to_the_ai(monkeypatch):
+def test_free_question_outside_support_gets_hint_not_ai(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)
     _tg(monkeypatch)
 
     gateway.route_captured_update(_message("А какая у вас комиссия?"))
 
-    assert store.ingested[0]["schedule_ai"] is True
-    assert store.queued == [], "на свободный вопрос отвечает ИИ, а не сценарий"
+    assert store.ingested[0]["schedule_ai"] is False
+    assert store.queued
+    assert "нажмите «Задать вопрос»" in store.queued[0]["text"]
+
+
+def test_repeated_free_question_outside_support_does_not_call_operator(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(
+        gateway,
+        "_bot_messages",
+        lambda _conversation_id: [
+            {
+                "id": 1,
+                "author_type": "agent",
+                "text": bot.STRICT_QUESTION_HINT,
+                "metadata": {
+                    "iu_event": "strict_question_hint",
+                    "service_reply": True,
+                },
+            }
+        ],
+    )
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message("Повторю вопрос: какая комиссия?"))
+
+    assert store.ingested[0]["schedule_ai"] is False
+    assert store.transitions == []
+    assert store.queued[-1]["text"] == bot.STRICT_QUESTION_HINT
+
+
+def test_service_reply_retries_once_after_state_version_race(monkeypatch):
+    import funnel_workspace_store
+
+    class RacingStore(FakeStore):
+        WorkspaceConflictError = funnel_workspace_store.WorkspaceConflictError
+
+        def __init__(self):
+            super().__init__()
+            self.current_version = 7
+            self.attempts = 0
+
+        def get_conversation(self, conversation_id):
+            return {
+                "id": conversation_id,
+                "state_version": self.current_version,
+                "control_mode": "ai",
+                "source_key": "telegram_bot",
+            }
+
+        def enqueue_outgoing_agent(self, conversation_id, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                self.current_version = 8
+                raise self.WorkspaceConflictError(
+                    "version changed",
+                    details={"expected_version": 7, "current_version": 8},
+                )
+            return super().enqueue_outgoing_agent(conversation_id, **kwargs)
+
+    store = RacingStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+
+    queued = gateway._reply_to_client(
+        5,
+        "Служебный ответ",
+        idempotency_key="test:version-race",
+    )
+
+    assert queued
+    assert store.attempts == 2
+    assert store.queued[0]["expected_version"] == 8
 
 
 def test_owner_gets_the_same_manager_bot_not_a_personal_assistant(monkeypatch):

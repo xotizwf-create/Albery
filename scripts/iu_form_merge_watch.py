@@ -63,6 +63,71 @@ class BitrixCrm:
         self._call("delete_crm_deal", {"deal_id": int(deal_id), "confirm": True})
 
 
+def notify_bot_clients() -> int:
+    """Подтвердить заполнение анкеты в том же Telegram-диалоге.
+
+    Ключ сообщения привязан к id формовой сделки: повторный запуск/падение между
+    отправкой и отметкой не создаёт дубль.
+    """
+
+    import funnel_telegram_gateway as gateway
+    import funnel_workspace_store as store
+    import iu_client_bot
+    from shared.db import connect
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT form_deal_id, telegram_id
+                  FROM iu_form_merges
+                 WHERE bot_notified_at IS NULL
+                   AND telegram_id IS NOT NULL
+                 ORDER BY merged_at
+                 LIMIT 30
+                """
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+    sent = 0
+    for row in rows:
+        form_id = int(row["form_deal_id"])
+        telegram_id = int(row["telegram_id"])
+        error = ""
+        try:
+            conversation = store.find_conversation(
+                source_key=gateway.BOT_SOURCE_KEY,
+                business_connection_id="",
+                external_chat_id=str(telegram_id),
+            )
+            if not conversation:
+                raise RuntimeError("Telegram-диалог клиента не найден")
+            queued = gateway._reply_to_client(
+                int(conversation["id"]),
+                iu_client_bot.FORM_RECEIVED,
+                idempotency_key=f"iu-form-filled:{form_id}",
+                reply_markup=iu_client_bot.main_menu(),
+                metadata={"iu_event": "form_received", "form_deal_id": form_id},
+            )
+            if not queued:
+                raise RuntimeError("уведомление не удалось поставить в очередь")
+            sent += 1
+        except Exception as exc:  # noqa: BLE001 - следующий cron повторит
+            error = str(exc)[:1000]
+            log.warning("подтверждение анкеты %s не поставлено в очередь: %s", form_id, error)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE iu_form_merges
+                       SET bot_notified_at = CASE WHEN %s = '' THEN now() ELSE bot_notified_at END,
+                           bot_notify_error = NULLIF(%s, '')
+                     WHERE form_deal_id = %s
+                    """,
+                    (error, error, form_id),
+                )
+    return sent
+
+
 def main() -> int:
     import iu_form_merge
     from shared.db import connect
@@ -72,9 +137,10 @@ def main() -> int:
     crm = BitrixCrm()
     with connect() as conn:
         stats = iu_form_merge.run_once(crm=crm, conn=conn)
+    notified = notify_bot_clients()
     # Тишина в журнале, когда делать нечего: сторож ходит каждую минуту.
-    if stats["merged"] or stats["unmatched"]:
-        log.info("анкеты: %s", stats)
+    if stats["merged"] or stats["unmatched"] or notified:
+        log.info("анкеты: %s; уведомлений: %s", stats, notified)
     return 0
 
 

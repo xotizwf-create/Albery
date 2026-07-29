@@ -128,6 +128,14 @@ def build_deal_payload(
         "Источник: Telegram Business.",
         f"Telegram user id: {telegram_id}; workspace marker: {marker}.",
     ]
+    metadata = conversation.get("metadata")
+    start_source = (
+        str(metadata.get("iu_start_source") or "").strip()
+        if isinstance(metadata, Mapping)
+        else ""
+    )
+    if start_source:
+        comments.append(f"Метка входа в бота: {start_source[:64]}.")
     if username:
         comments.append(f"Username на момент обращения: @{username}.")
     comments.append(

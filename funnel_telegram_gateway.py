@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import socket
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 import requests
@@ -136,6 +137,7 @@ def start_workers() -> list[threading.Thread]:
             return list(_threads)
         _stop_event.clear()
         _wake_event.clear()
+        register_client_bot_commands()
         store = _store()
         for recover in (
             store.recover_updates,
@@ -153,6 +155,7 @@ def start_workers() -> list[threading.Thread]:
             ("ai", _ai_loop),
             ("outbox", _outbox_loop),
             ("crm-actions", _crm_action_loop),
+            ("iu-reminders", _reminder_loop),
             ("maintenance", _maintenance_loop),
         )
         _threads[:] = []
@@ -165,6 +168,28 @@ def start_workers() -> list[threading.Thread]:
             thread.start()
             _threads.append(thread)
         return list(_threads)
+
+
+def register_client_bot_commands() -> bool:
+    """Показать команды в системном меню Telegram."""
+
+    if not client_bot_enabled():
+        return False
+    try:
+        import tg_agent
+
+        tg_agent.api(
+            "setMyCommands",
+            commands=[
+                {"command": "start", "description": "Начать или перезапустить сценарий"},
+                {"command": "menu", "description": "Вернуться в главное меню"},
+                {"command": "stop", "description": "Остановить поддержку и напоминания"},
+            ],
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 - регистрация меню не останавливает транспорт
+        log.warning("iu client bot commands were not registered: %s", _safe_error(exc))
+        return False
 
 
 def stop_workers(timeout: float = 3.0) -> None:
@@ -265,6 +290,91 @@ def _crm_action_loop() -> None:
             count = 0
         if not count:
             _loop_wait(_poll_seconds("FUNNEL_WORKSPACE_CRM_POLL_SECONDS", 2.0))
+
+
+def _reminder_loop() -> None:
+    worker_id = f"{_worker_prefix}-iu-reminders"
+    while not _stop_event.is_set():
+        try:
+            count = process_iu_reminders_once(worker_id=worker_id)
+        except Exception:  # noqa: BLE001
+            log.exception("IU reminder worker failed")
+            count = 0
+        if not count:
+            _loop_wait(_poll_seconds("IU_BOT_REMINDER_POLL_SECONDS", 5.0))
+
+
+def process_iu_reminders_once(*, worker_id: str, limit: int = 20) -> int:
+    import iu_bot_reminders
+    import iu_bot_state
+    import iu_client_bot
+
+    rows = iu_bot_reminders.claim_due(worker_id=worker_id, limit=limit)
+    for row in rows:
+        try:
+            decision = iu_bot_reminders.delivery_decision(
+                datetime.now(timezone.utc), row["due_at"]
+            )
+            if decision.action == "wait":
+                iu_bot_reminders.finish(
+                    row,
+                    worker_id=worker_id,
+                    status="pending",
+                    retry_at=decision.retry_at,
+                )
+                continue
+            if decision.action == "cancel":
+                iu_bot_reminders.finish(
+                    row, worker_id=worker_id, status="cancelled"
+                )
+                continue
+            conversation = _store().get_conversation(row["conversation_id"]) or {}
+            messages = _bot_messages(int(row["conversation_id"]))
+            state = iu_bot_state.support_state(messages)
+            newer_client_message = any(
+                message.get("author_type") == "client"
+                and int(message.get("id") or 0) > int(row["anchor_message_id"] or 0)
+                for message in messages
+            )
+            if (
+                str(conversation.get("source_key") or "") != BOT_SOURCE_KEY
+                or str(conversation.get("control_mode") or "") != "ai"
+                or state.mode != "active"
+                or newer_client_message
+            ):
+                iu_bot_reminders.finish(
+                    row, worker_id=worker_id, status="cancelled"
+                )
+                continue
+            text = (
+                iu_client_bot.REMINDER_WAITING_QUESTION
+                if row["kind"] == "waiting_question"
+                else iu_client_bot.REMINDER_AFTER_ANSWER
+            )
+            _reply_to_client(
+                int(row["conversation_id"]),
+                text,
+                idempotency_key=(
+                    f"iu-reminder:{row['conversation_id']}:{row['kind']}:"
+                    f"{row['anchor_message_id']}"
+                ),
+                reply_markup=iu_client_bot.support_menu(
+                    offer_operator=iu_client_bot.should_offer_operator(
+                        iu_bot_state.support_agent_replies(messages)
+                    )
+                ),
+                metadata={"iu_event": "support_quiet_close"},
+            )
+            iu_bot_reminders.finish(row, worker_id=worker_id, status="sent")
+        except Exception as exc:  # noqa: BLE001
+            iu_bot_reminders.finish(
+                row,
+                worker_id=worker_id,
+                status="pending",
+                retry_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+                error=_safe_error(exc),
+            )
+    return len(rows)
 
 
 def _maintenance_loop() -> None:
@@ -457,8 +567,10 @@ def _reply_to_client(
     *,
     idempotency_key: str,
     reply_markup: Mapping[str, Any] | None = None,
+    attachment: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
     service: bool = True,
-) -> None:
+) -> Mapping[str, Any] | None:
     """Служебный ответ бота — через ту же очередь, что и ответы оператора.
 
     Прямая отправка в Telegram оставила бы команду без половины разговора: в ленте
@@ -466,36 +578,180 @@ def _reply_to_client(
     """
 
     store = _store()
-    conversation = store.get_conversation(conversation_id) or {}
-    metadata: dict[str, Any] = {"channel": "iu_client_bot"}
+    if not hasattr(store, "enqueue_outgoing_agent"):
+        return None
+    conversation = (
+        store.get_conversation(conversation_id) or {}
+        if hasattr(store, "get_conversation")
+        else {}
+    )
+    message_metadata: dict[str, Any] = {
+        "channel": "iu_client_bot",
+        **dict(metadata or {}),
+    }
     if reply_markup:
-        metadata["reply_markup"] = dict(reply_markup)
-    try:
-        store.enqueue_outgoing_agent(
-            conversation_id,
-            text=text,
-            expected_version=conversation.get("state_version"),
-            idempotency_key=idempotency_key,
-            agent_name=AGENT_NAME,
-            metadata=metadata,
-            service=service,
-        )
-    except store.WorkspaceConflictError as exc:
-        # Повтор того же нажатия — сообщение уже стоит в очереди, второй раз не нужно.
-        log.info("iu client bot: reply %s already queued (%s)", idempotency_key, _safe_error(exc))
-        return
+        message_metadata["reply_markup"] = dict(reply_markup)
+    for attempt in range(2):
+        try:
+            queued = store.enqueue_outgoing_agent(
+                conversation_id,
+                text=text,
+                expected_version=conversation.get("state_version"),
+                idempotency_key=idempotency_key,
+                agent_name=AGENT_NAME,
+                metadata=message_metadata,
+                attachment=attachment,
+                service=service,
+            )
+            break
+        except store.WorkspaceConflictError as exc:
+            # Параллельное входящее сообщение или служебный ответ могли успеть
+            # изменить версию диалога. Один раз перечитываем состояние:
+            # идемпотентный ключ всё равно не позволит создать дубль.
+            if attempt == 0 and "current_version" in getattr(exc, "details", {}):
+                conversation = store.get_conversation(conversation_id) or {}
+                continue
+            log.warning(
+                "iu client bot: reply %s was not queued (%s)",
+                idempotency_key,
+                _safe_error(exc),
+            )
+            return None
+    else:  # pragma: no cover - цикл либо поставил сообщение, либо вернулся из except
+        return None
     _wake_event.set()
+    return queued
 
 
 def _conversation_for_bot_chat(chat_id: Any) -> int | None:
     """Обращение, заведённое для этого чата с ботом."""
 
-    conversation = _store().find_conversation(
+    store = _store()
+    if not hasattr(store, "find_conversation"):
+        return None
+    conversation = store.find_conversation(
         source_key=BOT_SOURCE_KEY,
         business_connection_id="",
         external_chat_id=str(chat_id),
     )
     return _as_int((conversation or {}).get("id"))
+
+
+def _bot_messages(conversation_id: int) -> list[dict[str, Any]]:
+    store = _store()
+    if not hasattr(store, "list_messages"):
+        return []
+    return list(store.list_messages(conversation_id, limit=500) or [])
+
+
+def _cancel_bot_reminders(conversation_id: int) -> None:
+    try:
+        import iu_bot_reminders
+
+        iu_bot_reminders.cancel_all(conversation_id)
+    except Exception as exc:  # noqa: BLE001 - сценарий продолжает работать без напоминаний
+        log.warning("iu client bot: reminders were not cancelled: %s", _safe_error(exc))
+
+
+def _schedule_existing_question(conversation_id: int, messages: list[dict[str, Any]]) -> None:
+    import iu_bot_state
+
+    trigger_message_id = iu_bot_state.latest_pending_question(messages)
+    if not trigger_message_id:
+        return
+    store = _store()
+    conversation = store.get_conversation(conversation_id) or {}
+    try:
+        store.schedule_ai_job(
+            conversation_id,
+            trigger_message_id=trigger_message_id,
+            expected_version=conversation.get("state_version"),
+        )
+        _wake_event.set()
+    except Exception as exc:  # noqa: BLE001 - новый вопрос клиент всё равно сможет написать
+        log.warning("iu client bot: pending question was not scheduled: %s", _safe_error(exc))
+
+
+def _send_terms_documents(conversation_id: int, *, idempotency_key: str) -> None:
+    import iu_bot_documents
+    import iu_client_bot
+
+    try:
+        terms = iu_bot_documents.attachment("terms")
+        contract = iu_bot_documents.attachment("contract")
+        _reply_to_client(
+            conversation_id,
+            "",
+            idempotency_key=f"{idempotency_key}:terms-pdf",
+            attachment=terms,
+            metadata={"iu_event": "terms_pdf"},
+        )
+        _reply_to_client(
+            conversation_id,
+            "",
+            idempotency_key=f"{idempotency_key}:contract-pdf",
+            attachment=contract,
+            metadata={"iu_event": "contract_pdf"},
+        )
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.TERMS_REPLY,
+            idempotency_key=f"{idempotency_key}:text",
+            reply_markup=iu_client_bot.main_menu(),
+            metadata={"iu_event": "terms_sent"},
+        )
+    except Exception as exc:  # noqa: BLE001 - юридический документ нельзя подменять догадкой
+        log.warning("iu client bot: PDF documents unavailable: %s", _safe_error(exc))
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.TERMS_FALLBACK,
+            idempotency_key=f"{idempotency_key}:unavailable",
+            reply_markup=iu_client_bot.main_menu(),
+            metadata={"iu_event": "terms_unavailable"},
+        )
+        _hand_over_to_human(
+            conversation_id,
+            f"Не удалось отправить утверждённые PDF условий/договора: {_safe_error(exc)}",
+        )
+
+
+def _enter_support(
+    conversation_id: int,
+    *,
+    idempotency_key: str,
+    messages: list[dict[str, Any]],
+) -> None:
+    import iu_bot_documents
+    import iu_bot_reminders
+    import iu_client_bot
+
+    try:
+        faq = iu_bot_documents.attachment("faq")
+        _reply_to_client(
+            conversation_id,
+            "",
+            idempotency_key=f"{idempotency_key}:faq",
+            attachment=faq,
+            metadata={"iu_event": "support_faq"},
+        )
+    except Exception as exc:  # noqa: BLE001 - текстовый вход в поддержку остаётся доступен
+        log.warning("iu client bot: FAQ PDF unavailable: %s", _safe_error(exc))
+    queued = _reply_to_client(
+        conversation_id,
+        iu_client_bot.ASK_PROMPT,
+        idempotency_key=f"{idempotency_key}:prompt",
+        reply_markup=iu_client_bot.support_menu(),
+        metadata={"iu_event": "support_enter"},
+    )
+    anchor = _as_int(((queued or {}).get("message") or {}).get("id"))
+    try:
+        iu_bot_reminders.schedule_waiting_question(
+            conversation_id,
+            anchor_message_id=anchor or 0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("iu client bot: support reminder was not scheduled: %s", _safe_error(exc))
+    _schedule_existing_question(conversation_id, messages)
 
 
 def handle_bot_callback(callback: Mapping[str, Any]) -> tuple[int | None, int | None]:
@@ -531,6 +787,7 @@ def handle_bot_callback(callback: Mapping[str, Any]) -> tuple[int | None, int | 
             "text": label,
         },
         schedule_ai=False,
+        handle_scenario=False,
     )
     if conversation_id is None:
         conversation_id = _conversation_for_bot_chat(chat_id)
@@ -538,23 +795,11 @@ def handle_bot_callback(callback: Mapping[str, Any]) -> tuple[int | None, int | 
         return None, None
 
     key = f"iu-bot:{chat_id}:{callback.get('id')}"
-    if data == iu_client_bot.CB_TERMS:
-        try:
-            terms = tg_agent._strip_markup(tg_agent.terms_text())
-        except Exception as exc:  # noqa: BLE001
-            log.warning("iu client bot: terms unavailable: %s", _safe_error(exc))
-            terms = iu_client_bot.TERMS_FALLBACK
-        _reply_to_client(conversation_id, terms, idempotency_key=key)
-    elif data == iu_client_bot.CB_JOIN:
-        _reply_to_client(conversation_id, iu_client_bot.JOIN_STUB, idempotency_key=key)
-        _hand_over_to_human(conversation_id, "Клиент нажал «Присоединиться к ИУ».")
-    elif data == iu_client_bot.CB_ASK:
-        _reply_to_client(conversation_id, iu_client_bot.ASK_PROMPT, idempotency_key=key)
-    elif data == iu_client_bot.CB_OPERATOR:
-        # Сначала подтверждение клиенту, потом передача: подтверждение помечено служебным,
-        # поэтому смена режима его уже не отменит.
-        _reply_to_client(conversation_id, iu_client_bot.OPERATOR_CALLED, idempotency_key=key)
-        _hand_over_to_human(conversation_id, "Клиент нажал «Позвать оператора».")
+    run_menu_action(
+        data,
+        conversation_id=conversation_id,
+        idempotency_key=key,
+    )
     return conversation_id, None
 
 
@@ -578,6 +823,7 @@ def ingest_bot_message(
     *,
     provider_update_id: int | None = None,
     schedule_ai: bool | None = None,
+    handle_scenario: bool = True,
 ) -> tuple[int | None, int | None]:
     """Сообщение, которое клиент написал боту напрямую, — в общий поток обращений.
 
@@ -595,19 +841,49 @@ def ingest_bot_message(
         raise ValueError("Bot message lacks chat/message identity")
 
     import iu_client_bot
+    import iu_bot_state
 
     sender = dict(message.get("from") or {})
     customer_id = _as_int(sender.get("id")) or _as_int(chat_id)
     display_name = _display_name(sender) or _display_name(chat) or f"Telegram {chat_id}"
     text = telegram_message_text(message)
+    existing_id = _conversation_for_bot_chat(chat_id)
+    previous_conversation = (
+        dict(_store().get_conversation(existing_id) or {}) if existing_id else {}
+    )
+    previous_messages = _bot_messages(existing_id) if existing_id else []
+    previous_support = iu_bot_state.support_state(previous_messages)
     is_command = text.strip().startswith("/")
     # Пункт меню приходит обычным текстом. Это выбор действия, а не вопрос: отвечает
     # сценарий, модель не вызывается вовсе.
     action = iu_client_bot.menu_action(text)
+    if action == iu_client_bot.CB_OPERATOR and previous_support.mode not in {
+        "active",
+        "confirming",
+    }:
+        action = ""
+    if action in {iu_client_bot.CB_CONFIRM_YES, iu_client_bot.CB_CONFIRM_NO} and (
+        previous_support.mode != "confirming"
+    ):
+        action = ""
+    media_type = telegram_media_type(message)
+    has_media_caption = bool(str(message.get("text") or message.get("caption") or "").strip())
+    awaiting_file_context = iu_bot_state.awaiting_file_context(previous_messages)
     if schedule_ai is None:
         schedule_ai = (
-            iu_client_bot.ai_answers_enabled() and not is_command and not action
+            iu_client_bot.ai_answers_enabled()
+            and not is_command
+            and not action
+            and media_type == "text"
+            and not awaiting_file_context
+            and previous_support.mode in {"active", "quiet"}
         )
+    command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower() if text.strip() else ""
+    start_payload = ""
+    if command == "/start":
+        parts = text.strip().split(maxsplit=1)
+        if len(parts) == 2 and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", parts[1]):
+            start_payload = parts[1]
     result = _store().ingest_business_message(
         external_chat_id=str(chat_id),
         external_message_id=str(external_message_id),
@@ -623,8 +899,10 @@ def ingest_bot_message(
         occurred_at=_message_datetime(message),
         metadata={
             "telegram_chat_type": str(chat.get("type") or "private"),
-            "telegram_media_type": telegram_media_type(message),
+            "telegram_media_type": media_type,
+            "telegram_has_caption": has_media_caption,
             **telegram_media_metadata(message),
+            **({"iu_start_source": start_payload} if start_payload else {}),
         },
         schedule_ai=bool(schedule_ai),
     )
@@ -633,12 +911,33 @@ def ingest_bot_message(
     conversation_id = _as_int(conversation.get("id"))
     if conversation_id is None:
         return None, _as_int(journaled.get("id"))
-    if text.strip().split()[0:1] == ["/start"]:
+    _cancel_bot_reminders(conversation_id)
+    all_messages = _bot_messages(conversation_id)
+    if not handle_scenario:
+        return conversation_id, _as_int(journaled.get("id"))
+    if command == "/start":
         _reply_to_client(
             conversation_id,
-            iu_client_bot.WELCOME,
+            iu_client_bot.WELCOME if not previous_messages else iu_client_bot.WELCOME_BACK,
             idempotency_key=f"iu-bot:start:{chat_id}:{external_message_id}",
             reply_markup=iu_client_bot.main_menu(),
+            metadata={"iu_event": "start"},
+        )
+    elif command == "/menu":
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.MENU_PROMPT,
+            idempotency_key=f"iu-bot:menu-command:{chat_id}:{external_message_id}",
+            reply_markup=iu_client_bot.main_menu(),
+            metadata={"iu_event": "menu"},
+        )
+    elif command == "/stop":
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.STOPPED,
+            idempotency_key=f"iu-bot:stop:{chat_id}:{external_message_id}",
+            reply_markup=iu_client_bot.remove_keyboard(),
+            metadata={"iu_event": "stop"},
         )
     elif action:
         run_menu_action(
@@ -646,6 +945,87 @@ def ingest_bot_message(
             conversation_id=conversation_id,
             idempotency_key=f"iu-bot:menu:{chat_id}:{external_message_id}",
         )
+    elif (
+        media_type != "text"
+        and not has_media_caption
+        and previous_conversation.get("control_mode") != "human"
+        and not iu_bot_state.bot_stopped(previous_messages)
+    ):
+        current_support = iu_bot_state.support_state(all_messages)
+        queued = _reply_to_client(
+            conversation_id,
+            iu_client_bot.FILE_NEEDS_CONTEXT,
+            idempotency_key=f"iu-bot:file-context:{chat_id}:{external_message_id}",
+            reply_markup=(
+                iu_client_bot.support_menu(
+                    offer_operator=iu_client_bot.should_offer_operator(
+                        iu_bot_state.support_agent_replies(all_messages)
+                    )
+                )
+                if current_support.mode in {"active", "quiet"}
+                else iu_client_bot.main_menu()
+            ),
+            metadata={"iu_event": "file_needs_context"},
+        )
+        if current_support.mode in {"active", "quiet"}:
+            try:
+                import iu_bot_reminders
+
+                iu_bot_reminders.schedule_waiting_question(
+                    conversation_id,
+                    anchor_message_id=_as_int(
+                        ((queued or {}).get("message") or {}).get("id")
+                    ) or 0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "iu client bot: file clarification reminder was not scheduled: %s",
+                    _safe_error(exc),
+                )
+    elif (
+        (media_type != "text" or awaiting_file_context)
+        and previous_conversation.get("control_mode") != "human"
+        and not iu_bot_state.bot_stopped(previous_messages)
+    ):
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.FILE_SENT_TO_MANAGER,
+            idempotency_key=f"iu-bot:file-handover:{chat_id}:{external_message_id}",
+            reply_markup=iu_client_bot.remove_keyboard(),
+            metadata={"iu_event": "file_handover"},
+        )
+        _hand_over_to_human(
+            conversation_id,
+            "Клиент прислал файл с пояснением — требуется ручной разбор содержимого.",
+        )
+    elif (
+        not schedule_ai
+        and previous_conversation.get("control_mode") != "human"
+        and not iu_bot_state.bot_stopped(previous_messages)
+    ):
+        if iu_bot_state.last_join_result(previous_messages) == "filled":
+            _reply_to_client(
+                conversation_id,
+                iu_client_bot.FORM_EDIT_SENT,
+                idempotency_key=f"iu-bot:form-edit:{chat_id}:{external_message_id}",
+                reply_markup=iu_client_bot.main_menu(),
+                metadata={"iu_event": "form_edit_handover"},
+            )
+            _hand_over_to_human(
+                conversation_id,
+                "Клиент прислал изменения к уже заполненной анкете.",
+            )
+        else:
+            # Вне режима поддержки ИИ не отвечает по существу и не переводит клиента
+            # к человеку самовольно. На каждое свободное сообщение напоминаем, какой
+            # пункт меню открывает консультацию.
+            _reply_to_client(
+                conversation_id,
+                iu_client_bot.STRICT_QUESTION_HINT,
+                idempotency_key=f"iu-bot:strict-hint:{chat_id}:{external_message_id}",
+                reply_markup=iu_client_bot.main_menu(),
+                metadata={"iu_event": "strict_question_hint"},
+            )
     return conversation_id, _as_int(journaled.get("id"))
 
 
@@ -672,7 +1052,7 @@ def _anketa_in_crm(deal_id) -> str:
         return ""
 
 
-def _join_body(conversation_id: int) -> tuple[str, bool]:
+def _join_body(conversation_id: int, *, repeated: bool = False) -> tuple[str, bool]:
     """Текст ответа на «Присоединиться к ИУ» и признак «анкета уже заполнена».
 
     Ссылка персональная: по метке в ней заявка приклеивается к этому же человеку, а не заводит
@@ -697,14 +1077,14 @@ def _join_body(conversation_id: int) -> tuple[str, bool]:
         anketa = _anketa_in_crm(deal_id)
         if anketa:
             # Ссылку не выдаём вовсе: анкета есть, и второй раз её заполнять незачем.
-            return iu_client_bot.join_answer(anketa, "")
+            return iu_client_bot.join_answer(anketa, "", repeated=repeated)
         with pg_connect() as conn:
             live = iu_form_link.issue(
                 conn, telegram_id,
                 conversation_id=conversation_id,
                 deal_id=deal_id,
             )
-        return iu_client_bot.join_answer("", live["url"])
+        return iu_client_bot.join_answer("", live["url"], repeated=repeated)
     except Exception as exc:  # noqa: BLE001 — без ссылки клиент всё равно получает ответ
         log.warning("персональная ссылка на анкету не выдана: %s", _safe_error(exc))
         return iu_client_bot.JOIN_STUB, False
@@ -714,31 +1094,100 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
     """Выполнить выбранный в меню пункт."""
 
     import iu_client_bot
-    import tg_agent
+    import iu_bot_state
 
+    messages = _bot_messages(conversation_id)
     if action == iu_client_bot.CB_TERMS:
-        try:
-            body = tg_agent._strip_markup(tg_agent.terms_text())
-        except Exception as exc:  # noqa: BLE001
-            log.warning("iu client bot: terms unavailable: %s", _safe_error(exc))
-            body = iu_client_bot.TERMS_FALLBACK
-        _reply_to_client(conversation_id, body, idempotency_key=idempotency_key)
+        _send_terms_documents(conversation_id, idempotency_key=idempotency_key)
     elif action == iu_client_bot.CB_JOIN:
-        body, already = _join_body(conversation_id)
-        _reply_to_client(conversation_id, body, idempotency_key=idempotency_key)
-        if not already:
-            _hand_over_to_human(conversation_id, "Клиент выбрал «Присоединиться к ИУ».")
+        repeated = iu_bot_state.action_count(messages, iu_client_bot.BUTTON_JOIN) > 1
+        body, already = _join_body(conversation_id, repeated=repeated)
+        _reply_to_client(
+            conversation_id,
+            body,
+            idempotency_key=idempotency_key,
+            reply_markup=iu_client_bot.main_menu(),
+            metadata={
+                "iu_event": (
+                    "join_filled"
+                    if already
+                    else "join_unavailable"
+                    if body == iu_client_bot.JOIN_STUB
+                    else "join_unfilled"
+                )
+            },
+        )
+        if body == iu_client_bot.JOIN_STUB:
+            _hand_over_to_human(
+                conversation_id,
+                "Персональную ссылку на анкету не удалось подготовить.",
+            )
     elif action == iu_client_bot.CB_CALCULATOR:
         _reply_to_client(
-            conversation_id, iu_client_bot.CALCULATOR_REPLY, idempotency_key=idempotency_key
+            conversation_id,
+            iu_client_bot.CALCULATOR_REPLY,
+            idempotency_key=idempotency_key,
+            reply_markup=iu_client_bot.main_menu(),
+            metadata={"iu_event": "calculator"},
         )
     elif action == iu_client_bot.CB_ASK:
-        _reply_to_client(conversation_id, iu_client_bot.ASK_PROMPT, idempotency_key=idempotency_key)
-    elif action == iu_client_bot.CB_OPERATOR:
-        _reply_to_client(
-            conversation_id, iu_client_bot.OPERATOR_CALLED, idempotency_key=idempotency_key
+        _enter_support(
+            conversation_id,
+            idempotency_key=idempotency_key,
+            messages=messages,
         )
-        _hand_over_to_human(conversation_id, "Клиент выбрал «Позвать оператора».")
+    elif action == iu_client_bot.CB_OPERATOR:
+        replies = iu_bot_state.support_agent_replies(messages)
+        if not messages and hasattr(_store(), "count_agent_replies"):
+            replies = int(_store().count_agent_replies(conversation_id) or 0)
+        if not iu_client_bot.should_offer_operator(replies):
+            _reply_to_client(
+                conversation_id,
+                "Пока постараюсь помочь сам. Напишите вопрос — если понадобится, "
+                "подключим менеджера.",
+                idempotency_key=idempotency_key,
+                reply_markup=iu_client_bot.support_menu(),
+                metadata={"iu_event": "operator_too_early"},
+            )
+        else:
+            _reply_to_client(
+                conversation_id,
+                iu_client_bot.OPERATOR_CALLED,
+                idempotency_key=idempotency_key,
+                reply_markup=iu_client_bot.remove_keyboard(),
+                metadata={"iu_event": "operator_called"},
+            )
+            _cancel_bot_reminders(conversation_id)
+            _hand_over_to_human(conversation_id, "Клиент выбрал «Позвать оператора».")
+    elif action == iu_client_bot.CB_EXIT_SUPPORT:
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.EXIT_CONFIRM,
+            idempotency_key=idempotency_key,
+            reply_markup=iu_client_bot.exit_confirmation_menu(),
+            metadata={"iu_event": "support_exit_confirm"},
+        )
+    elif action == iu_client_bot.CB_CONFIRM_YES:
+        _cancel_bot_reminders(conversation_id)
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.EXITED_SUPPORT,
+            idempotency_key=idempotency_key,
+            reply_markup=iu_client_bot.main_menu(),
+            metadata={"iu_event": "support_exit"},
+        )
+    elif action == iu_client_bot.CB_CONFIRM_NO:
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.CONTINUE_SUPPORT,
+            idempotency_key=idempotency_key,
+            reply_markup=iu_client_bot.support_menu(
+                offer_operator=iu_client_bot.should_offer_operator(
+                    iu_bot_state.support_agent_replies(messages)
+                )
+            ),
+            metadata={"iu_event": "support_continue"},
+        )
 
 
 def ingest_business_message(
@@ -1308,12 +1757,19 @@ def prepare_reply(
     # В переписке менеджера кнопки не нужны: там и так отвечает человек.
     if conversation and str(conversation.get("source_key") or "") == BOT_SOURCE_KEY:
         import iu_client_bot
+        import iu_bot_state
 
-        replies = _store().count_agent_replies(conversation["id"])
-        if iu_client_bot.should_offer_operator(
-            replies, control_mode=str(conversation.get("control_mode") or "ai")
-        ):
-            metadata["reply_markup"] = iu_client_bot.main_menu(offer_operator=True)
+        messages = _bot_messages(int(conversation["id"]))
+        state = iu_bot_state.support_state(messages)
+        if state.mode in {"active", "quiet"}:
+            replies = iu_bot_state.support_agent_replies(messages)
+            metadata["reply_markup"] = iu_client_bot.support_menu(
+                offer_operator=iu_client_bot.should_offer_operator(
+                    replies,
+                    control_mode=str(conversation.get("control_mode") or "ai"),
+                )
+            )
+            metadata["iu_event"] = "support_answer"
     return PreparedReply(
         text=body,
         metadata=metadata,
@@ -1774,6 +2230,23 @@ def _after_delivery(
             tg_agent._mark_terms_sent(telegram_id)
         elif asset == "form" and telegram_id:
             tg_agent._mark_invited(telegram_id)
+        if (
+            str(outbox.get("source_key") or "") == BOT_SOURCE_KEY
+            and str(payload.get("iu_event") or "") == "support_answer"
+        ):
+            try:
+                import iu_bot_reminders
+
+                iu_bot_reminders.cancel_all(conversation_id)
+                iu_bot_reminders.schedule_after_answer(
+                    conversation_id,
+                    anchor_message_id=int(outbox.get("message_id") or 0),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "iu client bot: after-answer reminder was not scheduled: %s",
+                    _safe_error(exc),
+                )
 
     if outbox.get("author_type") != "agent":
         return
@@ -1796,6 +2269,8 @@ def _after_delivery(
                 log.warning("не удалось пометить обращение %s: %s",
                             conversation_id, _safe_error(exc))
             return
+        if str(outbox.get("source_key") or "") == BOT_SOURCE_KEY:
+            _cancel_bot_reminders(conversation_id)
         _mark_waiting_if_current(
             conversation_id,
             expected_version=int(outbox["conversation_version"]),

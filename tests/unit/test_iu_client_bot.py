@@ -15,12 +15,13 @@ import iu_client_bot as bot
 class FakeStore:
     """Журнал обращений в объёме, который нужен сценарию бота."""
 
-    def __init__(self, *, agent_replies=0, control_mode="ai"):
+    def __init__(self, *, agent_replies=0, control_mode="ai", messages=None):
         self.ingested: list[dict] = []
         self.queued: list[dict] = []
         self.transitions: list[dict] = []
         self.agent_replies = agent_replies
         self.control_mode = control_mode
+        self.messages = list(messages or [])
 
     def ingest_business_message(self, **kwargs):
         self.ingested.append(kwargs)
@@ -36,6 +37,9 @@ class FakeStore:
 
     def count_agent_replies(self, conversation_id):
         return self.agent_replies
+
+    def list_messages(self, conversation_id, **kwargs):
+        return self.messages
 
     def enqueue_outgoing_agent(self, conversation_id, **kwargs):
         self.queued.append({"conversation_id": conversation_id, **kwargs})
@@ -114,12 +118,27 @@ def test_terms_button_sends_the_real_terms(monkeypatch):
     monkeypatch.setattr(gateway, "_store", lambda: store)
     monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
     _tg(monkeypatch)
+    import iu_bot_documents
+    monkeypatch.setattr(
+        iu_bot_documents,
+        "attachment",
+        lambda kind: {
+            "token": f"token-{kind}-abcdefghijkl",
+            "file_name": f"{kind}.pdf",
+            "mime_type": "application/pdf",
+            "file_size": 100,
+        },
+    )
 
     gateway.route_captured_update(_callback_update(bot.CB_TERMS))
 
     # Нажатие видно команде как реплика клиента, иначе лента обрывается.
     assert store.ingested[0]["text"] == bot.BUTTON_TERMS
-    assert "Условия ИУ" in store.queued[0]["text"]
+    assert [item["attachment"]["file_name"] for item in store.queued[:2]] == [
+        "terms.pdf",
+        "contract.pdf",
+    ]
+    assert "калькуляторе ИУ" in store.queued[2]["text"]
 
 
 def test_join_button_answers_honestly_while_the_form_is_missing(monkeypatch):
@@ -148,10 +167,10 @@ def test_calculator_button_sends_the_public_url_without_handover(monkeypatch):
     assert store.transitions == []
 
 
-def test_operator_button_appears_only_after_the_third_ai_reply():
+def test_operator_button_appears_when_the_client_asks_a_third_question():
     assert bot.should_offer_operator(0) is False
-    assert bot.should_offer_operator(2) is False
-    assert bot.should_offer_operator(3) is True
+    assert bot.should_offer_operator(1) is False
+    assert bot.should_offer_operator(2) is True
     # Диалог уже у человека — звать его второй раз незачем.
     assert bot.should_offer_operator(5, control_mode="human") is False
 
@@ -169,10 +188,18 @@ def test_calling_the_operator_hands_the_dialog_to_a_human(monkeypatch):
     assert "менеджер" in store.queued[0]["text"].lower()
 
 
-def test_ai_reply_carries_the_menu_but_not_the_operator_item(monkeypatch):
+def test_third_ai_reply_carries_support_exit_and_operator(monkeypatch):
     import iu_contract
 
-    store = FakeStore(agent_replies=3)
+    messages = [
+        {"id": 1, "author_type": "client", "text": bot.BUTTON_ASK},
+        {"id": 2, "author_type": "agent", "direction": "outbound",
+         "delivery_status": "sent", "text": "Ответ 1", "metadata": {}},
+        {"id": 3, "author_type": "agent", "direction": "outbound",
+         "delivery_status": "sent", "text": "Ответ 2", "metadata": {}},
+        {"id": 4, "author_type": "client", "text": "Третий вопрос"},
+    ]
+    store = FakeStore(agent_replies=2, messages=messages)
     monkeypatch.setattr(gateway, "_store", lambda: store)
     _tg(monkeypatch)
 
@@ -194,16 +221,25 @@ def test_ai_reply_carries_the_menu_but_not_the_operator_item(monkeypatch):
     )
 
     keyboard = prepared.metadata.get("reply_markup", {}).get("keyboard")
-    assert keyboard, "меню приходит вместе с ответом ИИ"
+    assert keyboard, "клавиатура поддержки приходит вместе с ответом ИИ"
     titles = [button["text"] for row in keyboard for button in row]
-    # Пункт вызова оператора владелец убрал: человека зовут другие ветки сценария.
-    assert bot.BUTTON_OPERATOR not in titles
+    assert bot.BUTTON_OPERATOR in titles
+    assert bot.BUTTON_EXIT_SUPPORT in titles
+    assert bot.BUTTON_TERMS not in titles
 
 
-def test_ai_reply_has_no_button_before_the_threshold(monkeypatch):
+def test_ai_reply_has_only_exit_before_the_threshold(monkeypatch):
     import iu_contract
 
-    store = FakeStore(agent_replies=1)
+    store = FakeStore(
+        agent_replies=1,
+        messages=[
+            {"id": 1, "author_type": "client", "text": bot.BUTTON_ASK},
+            {"id": 2, "author_type": "agent", "direction": "outbound",
+             "delivery_status": "sent", "text": "Ответ 1", "metadata": {}},
+            {"id": 3, "author_type": "client", "text": "Второй вопрос"},
+        ],
+    )
     monkeypatch.setattr(gateway, "_store", lambda: store)
     _tg(monkeypatch)
 
@@ -224,7 +260,12 @@ def test_ai_reply_has_no_button_before_the_threshold(monkeypatch):
         conversation={"id": 5, "source_key": "telegram_bot", "control_mode": "ai"},
     )
 
-    assert "reply_markup" not in prepared.metadata
+    titles = [
+        button["text"]
+        for row in prepared.metadata["reply_markup"]["keyboard"]
+        for button in row
+    ]
+    assert titles == [bot.BUTTON_EXIT_SUPPORT]
 
 
 def test_business_dialogs_never_get_bot_buttons(monkeypatch):

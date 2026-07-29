@@ -41,6 +41,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "access_requests": "036_access_requests.sql",
     "iu_form_tokens": "075_iu_form_tokens.sql",
     "iu_form_merges": "076_iu_form_merges.sql",
+    "iu_bot_reminders": "077_iu_bot_reminders.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {
@@ -48,6 +49,8 @@ REQUIRED_FUNCTION_MIGRATIONS = {
 }
 
 ALWAYS_APPLY_MIGRATIONS = [
+    # Adds notification bookkeeping to the already existing form merge table.
+    "077_iu_bot_reminders.sql",
     # Колонка в уже существующей таблице: проверка «нет таблицы — накатить» её не поймает,
     # поэтому идемпотентный ADD COLUMN IF NOT EXISTS применяется каждый раз.
     "067_funnel_testing_mode.sql",
