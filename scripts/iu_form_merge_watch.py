@@ -55,7 +55,9 @@ class BitrixCrm:
         self._call("update_crm_deal", args)
 
     def comment(self, deal_id, text: str):
-        self._call("add_deal_comment", {"deal_id": int(deal_id), "text": text})
+        # Инструмент ждёт именно `comment`; на `text` он отвечает отказом, и первый живой
+        # прогон 29.07.2026 упал ровно здесь — уже перенеся поля.
+        self._call("add_deal_comment", {"deal_id": int(deal_id), "comment": text})
 
     def delete_deal(self, deal_id):
         self._call("delete_crm_deal", {"deal_id": int(deal_id), "confirm": True})
