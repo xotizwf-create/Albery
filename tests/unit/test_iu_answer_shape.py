@@ -73,3 +73,50 @@ def test_prompt_asks_for_the_owners_answer_shape():
     # на полуслове. Пробелы в правиле переносятся, поэтому сверяем по словам.
     assert "Знаки препинания обязательны" in rules
     assert "через точку с запятой" in " ".join(rules.split())
+
+
+# --- разметка в Telegram --------------------------------------------------------------------
+
+def test_headings_become_bold_for_telegram():
+    """Владелец 29.07.2026: «непонятно, на какие вопросы он дал ответ».
+
+    Бот шлёт текст без разметки, поэтому девять ответов подряд читались одной простынёй.
+    Строка-заголовок опознаётся по двоеточию и выделяется при отправке."""
+    import tg_agent
+
+    rendered = tg_agent.telegram_html(
+        "Перенос карточек:\nСоздаём новые карточки.\n\nДоступ к кабинету:\nПосле оплаты."
+    )
+
+    assert "<b>Перенос карточек:</b>" in rendered
+    assert "<b>Доступ к кабинету:</b>" in rendered
+    assert "Создаём новые карточки." in rendered
+
+
+def test_model_cannot_smuggle_tags_through_the_formatting():
+    """Разметку собираем сами: всё, что написала модель, экранируется."""
+    import tg_agent
+
+    rendered = tg_agent.telegram_html("<b>жирный</b> и <a href='x'>ссылка</a>\nИтог:")
+
+    assert "&lt;b&gt;жирный&lt;/b&gt;" in rendered
+    assert "<a href" not in rendered
+    assert "<b>Итог:</b>" in rendered
+
+
+def test_long_sentence_with_a_colon_is_not_a_heading():
+    """Заголовок — короткая строка. Иначе жирным станет половина ответа."""
+    import tg_agent
+
+    line = ("Порядок расчётов, отчётности, обязательства сторон и все прочие условия работы "
+            "фиксируются в договоре при подключении:")
+    rendered = tg_agent.telegram_html(line)
+
+    assert "<b>" not in rendered
+
+
+def test_prompt_requires_a_heading_per_question():
+    rules = iu_prompt.RULES
+
+    assert "ОТДЕЛЬНОЙ строкой-заголовком" in rules
+    assert "заканчивается двоеточием" in rules

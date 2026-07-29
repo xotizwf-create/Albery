@@ -1487,6 +1487,43 @@ def _send_document(
     }
 
 
+def _send_text(
+    outbox: Mapping[str, Any],
+    *,
+    connection_id: str,
+    keyboard: Any,
+    formatted: bool,
+) -> Mapping[str, Any]:
+    """Отправить текст клиенту: с жирными заголовками там, где это бот.
+
+    Разметка — украшение, доставка — обязательство. Если Telegram не примет разметку (модель
+    написала что-то, что он разберёт как сломанный тег), то же сообщение уходит обычным
+    текстом, а не теряется. В переписке бизнес-аккаунта разметки нет вовсе: там сообщение
+    отправляется от лица менеджера обычным текстом."""
+    import tg_agent
+
+    text = str(outbox.get("text") or "")[:4096]
+    common = {
+        "http_timeout": 45,
+        "chat_id": int(outbox["external_chat_id"]),
+        "link_preview_options": {"is_disabled": True},
+        **({"business_connection_id": connection_id} if connection_id else {}),
+        **({"reply_markup": keyboard} if keyboard else {}),
+    }
+    if formatted:
+        rendered = tg_agent.telegram_html(text)
+        if "<b>" in rendered:
+            try:
+                return tg_agent.api("sendMessage", text=rendered[:4096],
+                                    parse_mode="HTML", **common)
+            except RuntimeError as exc:
+                if _peer_unknown_to_bot(exc):
+                    raise
+                log.warning("Telegram не принял разметку, шлём обычным текстом: %s",
+                            _safe_error(exc))
+    return tg_agent.api("sendMessage", text=text, **common)
+
+
 def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
     import tg_agent
 
@@ -1569,14 +1606,11 @@ def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
             else:
                 payload = current.get("payload")
                 keyboard = (payload or {}).get("reply_markup") if isinstance(payload, Mapping) else None
-                sent = tg_agent.api(
-                    "sendMessage",
-                    http_timeout=45,
-                    chat_id=int(current["external_chat_id"]),
-                    text=str(current.get("text") or "")[:4096],
-                    link_preview_options={"is_disabled": True},
-                    **({"business_connection_id": connection_id} if connection_id else {}),
-                    **({"reply_markup": keyboard} if keyboard else {}),
+                sent = _send_text(
+                    current,
+                    connection_id=connection_id,
+                    keyboard=keyboard,
+                    formatted=direct_bot_chat,
                 )
                 provider_message_id = (
                     str(sent.get("message_id"))

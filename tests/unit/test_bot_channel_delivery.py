@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import funnel_telegram_gateway as gateway
+import tg_agent as real_tg
 
 
 class FakeStore:
@@ -57,6 +58,7 @@ def test_reply_to_a_bot_chat_goes_out_without_a_business_connection(monkeypatch)
     tg = SimpleNamespace(
         _business_connection_id=lambda preferred: ("", "бизнес-подключение не найдено"),
         api=api,
+        telegram_html=real_tg.telegram_html,
     )
     monkeypatch.setitem(sys.modules, "funnel_workspace_store", store)
     monkeypatch.setitem(sys.modules, "tg_agent", tg)

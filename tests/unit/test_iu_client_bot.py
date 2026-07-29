@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import funnel_telegram_gateway as gateway
+import tg_agent as real_tg
 import iu_client_bot as bot
 
 
@@ -275,6 +276,7 @@ def test_keyboard_reaches_telegram_on_delivery(monkeypatch):
     tg = SimpleNamespace(
         _business_connection_id=lambda preferred: ("", "нет подключения"),
         api=lambda method, **kwargs: (calls.append((method, kwargs)) or {"message_id": 1}),
+        telegram_html=real_tg.telegram_html,
     )
     monkeypatch.setitem(sys.modules, "funnel_workspace_store", store)
     monkeypatch.setitem(sys.modules, "tg_agent", tg)

@@ -508,6 +508,27 @@ def _strip_markup(text: str) -> str:
     return text
 
 
+#: Заголовок внутри ответа: короткая строка, заканчивающаяся двоеточием («Перенос карточек:»,
+#: «В эти 44% уже входят:»). Разметку в тексте не храним — она бы торчала у оператора в рабочем
+#: окне, — а собираем её при отправке по этому признаку.
+_HEADING_LINE_RE = re.compile(r"^(\s*)(\S[^\n]{0,79}:)\s*$")
+
+
+def telegram_html(text: str) -> str:
+    """Ответ клиенту с жирными заголовками — для отправки с parse_mode=HTML.
+
+    Владелец 29.07.2026: «непонятно, на какие вопросы он дал ответ». В сплошном тексте без
+    выделения девять ответов подряд читаются как одна простыня. Экранируем всё, что могло бы
+    сломать разбор Telegram, и выделяем только строки-заголовки: модель не может протащить
+    сюда произвольный тег, а человек видит структуру."""
+    escaped = html.escape(str(text or ""), quote=False)
+    lines = []
+    for line in escaped.splitlines():
+        match = _HEADING_LINE_RE.match(line)
+        lines.append(f"{match.group(1)}<b>{match.group(2)}</b>" if match else line)
+    return "\n".join(lines)
+
+
 def react(chat_id, message_id, emoji: str, business_connection_id: str = "") -> None:
     """Поставить реакцию на сообщение собеседника — как агент в Битриксе.
 
