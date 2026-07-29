@@ -288,7 +288,7 @@ try:
         f"{APP_URL}/{urllib.parse.quote('Калькулятор')}/", timeout=15
     ) as resp:
         body = resp.read().decode("utf-8", errors="replace")
-        if resp.status != 200 or "Калькулятор ИУ" not in body:
+        if resp.status != 200 or "Калькулятор расчёта ИУ" not in body:
             failures.append(
                 f"/Калькулятор/: status={resp.status}, calculator marker missing"
             )
