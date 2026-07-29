@@ -235,3 +235,20 @@ def last_join_result(messages: Sequence[Mapping[str, Any]]) -> str:
         ):
             break
     return ""
+
+
+def calculator_discussion_pending(messages: Sequence[Mapping[str, Any]]) -> bool:
+    """The calculator client still needs to finish the form before manager handover."""
+
+    pending = False
+    for message in messages:
+        event = event_of(message)
+        if event == "calculator_discussion_unfilled":
+            pending = True
+        elif event in {
+            "calculator_discussion_filled",
+            "calculator_discussion_unavailable",
+            "calculator_form_received",
+        }:
+            pending = False
+    return pending

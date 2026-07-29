@@ -23,9 +23,9 @@ type FormKey = keyof FormData;
 
 const MAX_AMOUNT = 999_999_999_999;
 const TELEGRAM_URL =
-  'https://t.me/AlberyAIManager?text=' +
+  'https://t.me/Albery_AI2_Bot?text=' +
   encodeURIComponent(
-    'Здравствуйте! Я рассчитал экономику ИУ и хочу обсудить сотрудничество.',
+    'Здравствуйте! Я рассчитал экономику ИУ и хочу обсудить условия подключения.',
   );
 
 const fields = [
@@ -332,7 +332,7 @@ function Results({data, onReset}: {data: FormData; onReset: () => void}) {
           rel="noopener noreferrer"
           className="mt-6 flex h-13 w-full items-center justify-center rounded-xl bg-sky-500 px-5 text-center text-sm font-semibold text-white transition hover:bg-sky-600"
         >
-          Обсудить подключение к ИУ
+          Обсудить условия
         </a>
 
         <button

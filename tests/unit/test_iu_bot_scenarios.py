@@ -201,3 +201,37 @@ def test_approved_customer_copy_is_kept_exactly():
     assert bot.REMINDER_WAITING_QUESTION == (
         "Мы готовы помочь. Напишите ваш вопрос, когда будет удобно."
     )
+    assert bot.TERMS_REPLY == (
+        "Условия присоединения к ИУ вы можете прочитать в ПДФ файле выше.\n\n"
+        "Вы можете посчитать свою экономию в нашем "
+        f"[калькуляторе ИУ]({bot.CALCULATOR_URL}), а также ознакомиться с примерным "
+        "договором, прикрепленным ниже."
+    )
+
+
+def test_calculator_discussion_state_survives_until_form_confirmation():
+    messages = [
+        agent(
+            1,
+            bot.join_reply("https://www.m4s.ru/iu/personal"),
+            event="calculator_discussion_unfilled",
+            service=True,
+        )
+    ]
+    assert state.calculator_discussion_pending(messages) is True
+
+    messages.append(
+        agent(
+            2,
+            bot.CALCULATOR_FORM_RECEIVED,
+            event="calculator_form_received",
+            service=True,
+        )
+    )
+    assert state.calculator_discussion_pending(messages) is False
+
+
+def test_calculator_discussion_accepts_current_and_cached_page_copy():
+    assert bot.is_calculator_discussion(bot.CALCULATOR_DISCUSSION_TEXT) is True
+    assert bot.is_calculator_discussion(bot.CALCULATOR_DISCUSSION_LEGACY_TEXT) is True
+    assert bot.is_calculator_discussion("Хочу просто задать вопрос") is False

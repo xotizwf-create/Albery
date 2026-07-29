@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import unquote
+
+import iu_client_bot
 
 
 def test_calculator_is_public_but_similar_paths_stay_protected(
@@ -32,6 +35,17 @@ def test_calculator_url_without_slash_has_a_canonical_public_redirect(client):
 
     assert response.status_code == 308
     assert unquote(response.headers["Location"]).endswith("/Калькулятор/")
+
+
+def test_calculator_returns_to_the_client_bot_with_the_recognized_draft():
+    source = (
+        Path(__file__).resolve().parents[2] / "calculator" / "src" / "App.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert "https://t.me/Albery_AI2_Bot?text=" in source
+    assert iu_client_bot.CALCULATOR_DISCUSSION_TEXT in source
+    assert "Обсудить условия" in source
+    assert "https://t.me/AlberyAIManager?text=" not in source
 
 
 def test_auth_exemptions_require_a_real_route_boundary(app_module):

@@ -680,6 +680,51 @@ def _schedule_existing_question(conversation_id: int, messages: list[dict[str, A
         log.warning("iu client bot: pending question was not scheduled: %s", _safe_error(exc))
 
 
+def _manager_request_metadata(event: str) -> dict[str, Any]:
+    """Delivery metadata for every customer-facing handover to the IU manager."""
+
+    return {
+        "iu_event": event,
+        "notify_manager_after_delivery": True,
+        "manager_notification_recipient": os.getenv(
+            "IU_MANAGER_NOTIFY_BITRIX_USER_ID", "16"
+        ),
+        "manager_notification_bot_id": (
+            _as_int(os.getenv("IU_AGENT_BOT_ID", "86")) or 86
+        ),
+    }
+
+
+def _reply_and_hand_over(
+    conversation_id: int,
+    text: str,
+    *,
+    idempotency_key: str,
+    event: str,
+    reason: str,
+    metadata: Mapping[str, Any] | None = None,
+    **reply_options: Any,
+) -> dict[str, Any] | None:
+    """Tell the client, persist the manager badge and enqueue a durable Bitrix alert."""
+
+    payload = dict(metadata or {})
+    payload.update(_manager_request_metadata(event))
+    queued = _reply_to_client(
+        conversation_id,
+        text,
+        idempotency_key=idempotency_key,
+        metadata=payload,
+        **reply_options,
+    )
+    _cancel_bot_reminders(conversation_id)
+    _hand_over_to_human(
+        conversation_id,
+        reason,
+        manager_requested=True,
+    )
+    return queued
+
+
 def _send_terms_documents(conversation_id: int, *, idempotency_key: str) -> None:
     import iu_bot_documents
     import iu_client_bot
@@ -696,16 +741,16 @@ def _send_terms_documents(conversation_id: int, *, idempotency_key: str) -> None
         )
     except Exception as exc:  # noqa: BLE001 - юридический документ нельзя подменять догадкой
         log.warning("iu client bot: PDF documents unavailable: %s", _safe_error(exc))
-        _reply_to_client(
+        _reply_and_hand_over(
             conversation_id,
             iu_client_bot.TERMS_FALLBACK,
             idempotency_key=f"{idempotency_key}:unavailable",
+            event="terms_unavailable",
+            reason=(
+                "Не удалось отправить утверждённые PDF условий/договора: "
+                f"{_safe_error(exc)}"
+            ),
             reply_markup=iu_client_bot.main_menu(),
-            metadata={"iu_event": "terms_unavailable"},
-        )
-        _hand_over_to_human(
-            conversation_id,
-            f"Не удалось отправить утверждённые PDF условий/договора: {_safe_error(exc)}",
         )
 
 
@@ -721,22 +766,23 @@ def _enter_support(
 
     try:
         faq = iu_bot_documents.attachment("faq")
-        _reply_to_client(
+        queued = _reply_to_client(
             conversation_id,
-            "",
+            iu_client_bot.ASK_PROMPT,
             idempotency_key=f"{idempotency_key}:faq",
             attachment=faq,
-            metadata={"iu_event": "support_faq"},
+            reply_markup=iu_client_bot.support_menu(),
+            metadata={"iu_event": "support_enter"},
         )
     except Exception as exc:  # noqa: BLE001 - текстовый вход в поддержку остаётся доступен
         log.warning("iu client bot: FAQ PDF unavailable: %s", _safe_error(exc))
-    queued = _reply_to_client(
-        conversation_id,
-        iu_client_bot.ASK_PROMPT,
-        idempotency_key=f"{idempotency_key}:prompt",
-        reply_markup=iu_client_bot.support_menu(),
-        metadata={"iu_event": "support_enter"},
-    )
+        queued = _reply_to_client(
+            conversation_id,
+            iu_client_bot.ASK_PROMPT,
+            idempotency_key=f"{idempotency_key}:prompt",
+            reply_markup=iu_client_bot.support_menu(),
+            metadata={"iu_event": "support_enter", "faq_unavailable": True},
+        )
     anchor = _as_int(((queued or {}).get("message") or {}).get("id"))
     try:
         iu_bot_reminders.schedule_waiting_question(
@@ -801,7 +847,7 @@ def _hand_over_to_human(
     conversation_id: int,
     reason: str,
     *,
-    manager_requested: bool = False,
+    manager_requested: bool = True,
 ) -> None:
     """Передать обращение человеку: дальше отвечает оператор из рабочего окна."""
 
@@ -857,6 +903,7 @@ def ingest_bot_message(
     # Пункт меню приходит обычным текстом. Это выбор действия, а не вопрос: отвечает
     # сценарий, модель не вызывается вовсе.
     action = iu_client_bot.menu_action(text)
+    calculator_discussion = iu_client_bot.is_calculator_discussion(text)
     if action == iu_client_bot.CB_OPERATOR and previous_support.mode not in {
         "active",
         "confirming",
@@ -874,6 +921,7 @@ def ingest_bot_message(
             iu_client_bot.ai_answers_enabled()
             and not is_command
             and not action
+            and not calculator_discussion
             and media_type == "text"
             and not awaiting_file_context
             and previous_support.mode in {"active", "quiet"}
@@ -939,6 +987,14 @@ def ingest_bot_message(
             reply_markup=iu_client_bot.remove_keyboard(),
             metadata={"iu_event": "stop"},
         )
+    elif (
+        calculator_discussion
+        and previous_conversation.get("control_mode") != "human"
+    ):
+        _handle_calculator_discussion(
+            conversation_id,
+            idempotency_key=f"iu-bot:calculator-discussion:{chat_id}:{external_message_id}",
+        )
     elif action:
         run_menu_action(
             action,
@@ -987,16 +1043,15 @@ def ingest_bot_message(
         and previous_conversation.get("control_mode") != "human"
         and not iu_bot_state.bot_stopped(previous_messages)
     ):
-        _reply_to_client(
+        _reply_and_hand_over(
             conversation_id,
             iu_client_bot.FILE_SENT_TO_MANAGER,
             idempotency_key=f"iu-bot:file-handover:{chat_id}:{external_message_id}",
+            event="file_handover",
+            reason=(
+                "Клиент прислал файл с пояснением — требуется ручной разбор содержимого."
+            ),
             reply_markup=iu_client_bot.remove_keyboard(),
-            metadata={"iu_event": "file_handover"},
-        )
-        _hand_over_to_human(
-            conversation_id,
-            "Клиент прислал файл с пояснением — требуется ручной разбор содержимого.",
         )
     elif (
         not schedule_ai
@@ -1004,16 +1059,13 @@ def ingest_bot_message(
         and not iu_bot_state.bot_stopped(previous_messages)
     ):
         if iu_bot_state.last_join_result(previous_messages) == "filled":
-            _reply_to_client(
+            _reply_and_hand_over(
                 conversation_id,
                 iu_client_bot.FORM_EDIT_SENT,
                 idempotency_key=f"iu-bot:form-edit:{chat_id}:{external_message_id}",
+                event="form_edit_handover",
+                reason="Клиент прислал изменения к уже заполненной анкете.",
                 reply_markup=iu_client_bot.main_menu(),
-                metadata={"iu_event": "form_edit_handover"},
-            )
-            _hand_over_to_human(
-                conversation_id,
-                "Клиент прислал изменения к уже заполненной анкете.",
             )
         else:
             # Вне режима поддержки ИИ не отвечает по существу и не переводит клиента
@@ -1090,6 +1142,61 @@ def _join_body(conversation_id: int, *, repeated: bool = False) -> tuple[str, bo
         return iu_client_bot.JOIN_STUB, False
 
 
+def _handle_calculator_discussion(
+    conversation_id: int,
+    *,
+    idempotency_key: str,
+) -> None:
+    """Continue calculator conversion in the bot, gated by the live CRM form state."""
+
+    import iu_bot_state
+    import iu_client_bot
+
+    messages = _bot_messages(conversation_id)
+    repeated = (
+        iu_bot_state.action_count(messages, iu_client_bot.BUTTON_JOIN) > 0
+        or iu_bot_state.calculator_discussion_pending(messages)
+    )
+    body, form_filled = _join_body(conversation_id, repeated=repeated)
+    if form_filled:
+        _reply_and_hand_over(
+            conversation_id,
+            iu_client_bot.CALCULATOR_MANAGER_READY,
+            idempotency_key=idempotency_key,
+            event="calculator_discussion_filled",
+            reason=(
+                "Клиент вернулся из калькулятора, хочет обсудить условия; анкета заполнена."
+            ),
+            reply_markup=iu_client_bot.remove_keyboard(),
+            metadata={"calculator_origin": True},
+        )
+        return
+    if body == iu_client_bot.JOIN_STUB:
+        _reply_and_hand_over(
+            conversation_id,
+            body,
+            idempotency_key=idempotency_key,
+            event="calculator_discussion_unavailable",
+            reason=(
+                "Клиент вернулся из калькулятора, но персональную ссылку на анкету "
+                "не удалось подготовить."
+            ),
+            reply_markup=iu_client_bot.remove_keyboard(),
+            metadata={"calculator_origin": True},
+        )
+        return
+    _reply_to_client(
+        conversation_id,
+        body,
+        idempotency_key=idempotency_key,
+        reply_markup=iu_client_bot.main_menu(),
+        metadata={
+            "iu_event": "calculator_discussion_unfilled",
+            "calculator_origin": True,
+        },
+    )
+
+
 def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) -> None:
     """Выполнить выбранный в меню пункт."""
 
@@ -1102,25 +1209,22 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
     elif action == iu_client_bot.CB_JOIN:
         repeated = iu_bot_state.action_count(messages, iu_client_bot.BUTTON_JOIN) > 1
         body, already = _join_body(conversation_id, repeated=repeated)
-        _reply_to_client(
-            conversation_id,
-            body,
-            idempotency_key=idempotency_key,
-            reply_markup=iu_client_bot.main_menu(),
-            metadata={
-                "iu_event": (
-                    "join_filled"
-                    if already
-                    else "join_unavailable"
-                    if body == iu_client_bot.JOIN_STUB
-                    else "join_unfilled"
-                )
-            },
-        )
         if body == iu_client_bot.JOIN_STUB:
-            _hand_over_to_human(
+            _reply_and_hand_over(
                 conversation_id,
-                "Персональную ссылку на анкету не удалось подготовить.",
+                body,
+                idempotency_key=idempotency_key,
+                event="join_unavailable",
+                reason="Персональную ссылку на анкету не удалось подготовить.",
+                reply_markup=iu_client_bot.main_menu(),
+            )
+        else:
+            _reply_to_client(
+                conversation_id,
+                body,
+                idempotency_key=idempotency_key,
+                reply_markup=iu_client_bot.main_menu(),
+                metadata={"iu_event": "join_filled" if already else "join_unfilled"},
             )
     elif action == iu_client_bot.CB_CALCULATOR:
         _reply_to_client(
@@ -1150,27 +1254,13 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
                 metadata={"iu_event": "operator_too_early"},
             )
         else:
-            _reply_to_client(
+            _reply_and_hand_over(
                 conversation_id,
                 iu_client_bot.OPERATOR_CALLED,
                 idempotency_key=idempotency_key,
+                event="operator_called",
+                reason="Клиент выбрал «Позвать оператора».",
                 reply_markup=iu_client_bot.remove_keyboard(),
-                metadata={
-                    "iu_event": "operator_called",
-                    "notify_manager_after_delivery": True,
-                    "manager_notification_recipient": os.getenv(
-                        "IU_MANAGER_NOTIFY_BITRIX_USER_ID", "16"
-                    ),
-                    "manager_notification_bot_id": (
-                        _as_int(os.getenv("IU_AGENT_BOT_ID", "86")) or 86
-                    ),
-                },
-            )
-            _cancel_bot_reminders(conversation_id)
-            _hand_over_to_human(
-                conversation_id,
-                "Клиент выбрал «Позвать оператора».",
-                manager_requested=True,
             )
     elif action == iu_client_bot.CB_EXIT_SUPPORT:
         _reply_to_client(
@@ -1770,6 +1860,8 @@ def prepare_reply(
         "sources": list(outcome.sources or ()),
         "trace": dict(outcome.trace or {}),
     }
+    if escalate:
+        metadata.update(_manager_request_metadata("ai_escalation"))
     # Клиенту, который уже несколько раз спросил у ИИ, показываем прямой путь к человеку.
     # В переписке менеджера кнопки не нужны: там и так отвечает человек.
     if conversation and str(conversation.get("source_key") or "") == BOT_SOURCE_KEY:
@@ -2413,6 +2505,7 @@ def _mark_waiting_if_current(
             conversation_id,
             expected_version=expected_version,
             reason=(reason or "Нужен ответ человека.")[:1000],
+            manager_requested=True,
         )
     except (
         store.WorkspaceConflictError,

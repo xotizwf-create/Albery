@@ -140,6 +140,43 @@ def test_question_during_human_lease_is_scheduled_when_ai_returns():
         _cleanup(source_key)
 
 
+def test_ai_escalation_sets_the_same_manager_request_badge():
+    suffix = uuid4().hex[:12]
+    source_key = f"test-manager-badge-{suffix}"
+    chat_id = "700000204"
+    requested_at = datetime(2026, 7, 29, 18, 0, tzinfo=timezone.utc)
+    try:
+        store.ensure_source(
+            source_key,
+            source_type="test",
+            display_name="manager badge",
+        )
+        first = _ingest(
+            source_key,
+            chat_id,
+            author="client",
+            text="Проверьте документ",
+            message_id=f"{suffix}-1",
+        )
+        conversation_id = int(first["conversation"]["id"])
+
+        updated = store.flag_needs_human(
+            conversation_id,
+            reason="Нужна ручная проверка файла.",
+            now=requested_at,
+        )
+
+        assert updated["status"] == "waiting"
+        assert updated["control_mode"] == "ai"
+        assert updated["metadata"]["manager_requested_at"] == requested_at.isoformat()
+        assert (
+            updated["metadata"]["manager_request_reason"]
+            == "Нужна ручная проверка файла."
+        )
+    finally:
+        _cleanup(source_key)
+
+
 def test_a_failed_answer_never_counts_as_an_answer_to_the_client():
     """Ответ, который Telegram отверг, клиент не видел — статус обязан остаться прежним."""
     suffix = uuid4().hex[:12]

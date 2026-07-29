@@ -1825,11 +1825,21 @@ def flag_needs_human(
                 """
                 UPDATE funnel_workspace_conversations
                    SET status = 'waiting',
+                       metadata = metadata || %s,
                        updated_at = %s
                  WHERE id = %s
              RETURNING *
                 """,
-                (timestamp, row["id"]),
+                (
+                    Jsonb(
+                        {
+                            "manager_requested_at": timestamp.isoformat(),
+                            "manager_request_reason": clean_reason,
+                        }
+                    ),
+                    timestamp,
+                    row["id"],
+                ),
             )
             updated = dict(cur.fetchone())
             _insert_control_event(

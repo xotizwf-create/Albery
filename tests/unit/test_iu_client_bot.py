@@ -86,6 +86,22 @@ def _callback_update(data):
     }
 
 
+def _message_update(text: str = "", *, document: dict | None = None, caption: str = ""):
+    message = {
+        "message_id": 3,
+        "date": 1785600200,
+        "chat": {"id": 555, "type": "private"},
+        "from": {"id": 555, "first_name": "Пётр", "username": "petr"},
+    }
+    if text:
+        message["text"] = text
+    if document:
+        message["document"] = document
+    if caption:
+        message["caption"] = caption
+    return {"message": message}
+
+
 @pytest.fixture(autouse=True)
 def _channel_on(monkeypatch):
     monkeypatch.setenv("IU_CLIENT_BOT_ENABLED", "1")
@@ -140,6 +156,135 @@ def test_terms_button_sends_the_real_terms(monkeypatch):
     ]
     assert "калькуляторе ИУ" in store.queued[0]["text"]
     assert len(store.queued) == 1
+
+
+def test_support_entry_sends_faq_and_prompt_as_one_message(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+    import iu_bot_documents
+
+    monkeypatch.setattr(
+        iu_bot_documents,
+        "attachment",
+        lambda kind: {
+            "token": f"token-{kind}-abcdefghijkl",
+            "file_name": f"{kind}.pdf",
+            "mime_type": "application/pdf",
+            "file_size": 100,
+        },
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "iu_bot_reminders",
+        SimpleNamespace(
+            cancel_all=lambda *_a, **_k: None,
+            schedule_waiting_question=lambda *_a, **_k: None,
+        ),
+    )
+
+    gateway.route_captured_update(_callback_update(bot.CB_ASK))
+
+    assert len(store.queued) == 1
+    assert store.queued[0]["text"] == bot.ASK_PROMPT
+    assert store.queued[0]["attachment"]["file_name"] == "faq.pdf"
+    assert store.queued[0]["metadata"]["iu_event"] == "support_enter"
+    assert "keyboard" in store.queued[0]["metadata"]["reply_markup"]
+
+
+def test_file_handover_always_sets_badge_and_bitrix_notification(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(
+        _message_update(
+            document={
+                "file_id": "document-id",
+                "file_unique_id": "document-unique",
+                "file_name": "договор.pdf",
+                "mime_type": "application/pdf",
+            },
+            caption="Проверьте, пожалуйста, пункт про комиссию.",
+        )
+    )
+
+    assert store.queued[0]["text"] == bot.FILE_SENT_TO_MANAGER
+    assert store.queued[0]["metadata"]["notify_manager_after_delivery"] is True
+    assert store.queued[0]["metadata"]["manager_notification_recipient"] == "16"
+    assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
+    assert store.transitions[0]["manager_requested"] is True
+
+
+def test_calculator_message_requests_form_without_starting_ai(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    monkeypatch.setattr(
+        gateway,
+        "_join_body",
+        lambda *_a, **_k: (
+            bot.join_reply("https://www.m4s.ru/iu/personal"),
+            False,
+        ),
+    )
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message_update(bot.CALCULATOR_DISCUSSION_TEXT))
+
+    assert store.ingested[0]["schedule_ai"] is False
+    assert "https://www.m4s.ru/iu/personal" in store.queued[0]["text"]
+    assert store.queued[0]["metadata"]["iu_event"] == "calculator_discussion_unfilled"
+    assert store.transitions == []
+
+
+def test_calculator_message_with_filled_form_calls_manager(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    monkeypatch.setattr(gateway, "_join_body", lambda *_a, **_k: ("filled", True))
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message_update(bot.CALCULATOR_DISCUSSION_TEXT))
+
+    assert store.queued[0]["text"] == bot.CALCULATOR_MANAGER_READY
+    assert store.queued[0]["metadata"]["notify_manager_after_delivery"] is True
+    assert store.queued[0]["metadata"]["iu_event"] == "calculator_discussion_filled"
+    assert store.transitions[0]["manager_requested"] is True
+
+
+def test_any_ai_escalation_enqueues_the_same_bitrix_manager_alert(monkeypatch):
+    import iu_contract
+
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    _tg(monkeypatch)
+    outcome = SimpleNamespace(
+        reply="Передал вопрос менеджеру.",
+        action=iu_contract.REPLY_ONLY,
+        escalate=True,
+        reason="Нужна ручная проверка.",
+        stage_move="",
+        answered_client=True,
+        sources=(),
+        trace={},
+    )
+
+    prepared = gateway.prepare_reply(
+        outcome,
+        telegram_user_id=555,
+        conversation={
+            "id": 5,
+            "source_key": gateway.BOT_SOURCE_KEY,
+            "control_mode": "ai",
+        },
+    )
+
+    assert prepared.metadata["notify_manager_after_delivery"] is True
+    assert prepared.metadata["manager_notification_recipient"] == "16"
+    assert prepared.metadata["manager_notification_bot_id"] == 86
 
 
 def test_join_button_answers_honestly_while_the_form_is_missing(monkeypatch):
