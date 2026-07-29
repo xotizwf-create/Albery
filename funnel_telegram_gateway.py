@@ -649,12 +649,35 @@ def ingest_bot_message(
     return conversation_id, _as_int(journaled.get("id"))
 
 
+def _anketa_in_crm(deal_id) -> str:
+    """Сверка анкеты ЖИВЬЁМ из сделки. Пусто — анкеты нет.
+
+    Это единственный источник правды о том, заполнена ли анкета. Наша отметка о выдаче ссылки
+    правдой не является: владелец 29.07.2026 удалил анкету в Битриксе, а бот продолжал
+    говорить «вы уже заполнили». Сверку собирает `tg_agent.anketa_block` — тот же код, что
+    показывает анкету в обычном ходе, с живыми названиями полей из воронки.
+
+    Сделку могли удалить целиком, CRM могла не ответить — в обоих случаях считаем, что анкеты
+    нет: предложить заполнить её лишний раз безопаснее, чем отказать человеку, который её не
+    заполнял."""
+
+    if not deal_id:
+        return ""
+    import tg_agent
+
+    try:
+        return tg_agent.anketa_block(tg_agent._deal_for_watch(int(deal_id)) or {})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("анкета сделки %s не сверена: %s", deal_id, _safe_error(exc))
+        return ""
+
+
 def _join_body(conversation_id: int) -> tuple[str, bool]:
     """Текст ответа на «Присоединиться к ИУ» и признак «анкета уже заполнена».
 
     Ссылка персональная: по метке в ней заявка приклеивается к этому же человеку, а не заводит
     вторую карточку в воронке. Повторное нажатие отдаёт ТУ ЖЕ ссылку, пока анкета не заполнена,
-    и честное «вы уже заполнили» — после.
+    и сверку данных из сделки — после.
 
     Сбой базы не оставляет клиента ни с чем: он получает прежний ответ с обещанием менеджера.
     """
@@ -670,16 +693,18 @@ def _join_body(conversation_id: int) -> tuple[str, bool]:
             conversation.get("external_chat_id"))
         if not telegram_id:
             raise ValueError("у обращения нет Telegram id")
+        deal_id = _as_int(conversation.get("deal_id"))
+        anketa = _anketa_in_crm(deal_id)
+        if anketa:
+            # Ссылку не выдаём вовсе: анкета есть, и второй раз её заполнять незачем.
+            return iu_client_bot.join_answer(anketa, "")
         with pg_connect() as conn:
             live = iu_form_link.issue(
                 conn, telegram_id,
                 conversation_id=conversation_id,
-                deal_id=_as_int(conversation.get("deal_id")),
+                deal_id=deal_id,
             )
-            filled = iu_form_link.filled_by(conn, telegram_id)
-        if filled:
-            return iu_client_bot.JOIN_ALREADY, True
-        return iu_client_bot.join_reply(live["url"]), False
+        return iu_client_bot.join_answer("", live["url"])
     except Exception as exc:  # noqa: BLE001 — без ссылки клиент всё равно получает ответ
         log.warning("персональная ссылка на анкету не выдана: %s", _safe_error(exc))
         return iu_client_bot.JOIN_STUB, False

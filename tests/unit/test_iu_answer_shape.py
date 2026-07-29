@@ -275,8 +275,11 @@ def test_join_reply_carries_the_personal_link():
 
 
 def test_already_filled_answer_does_not_offer_the_form_again():
-    """Владелец 29.07.2026: «если для его айди заполнено — бот скажет, вы уже заполнили»."""
+    """Владелец 29.07.2026: «если для его айди заполнено — бот скажет, вы уже заполнили».
+
+    И показывает данные из САМОЙ сделки: «вот ваши данные» из его же формулировки."""
     import iu_client_bot
 
-    assert "уже заполнили" in iu_client_bot.JOIN_ALREADY
-    assert "http" not in iu_client_bot.JOIN_ALREADY
+    assert "уже заполнили" in iu_client_bot.JOIN_FILLED
+    assert "{anketa}" in iu_client_bot.JOIN_FILLED
+    assert "http" not in iu_client_bot.JOIN_FILLED

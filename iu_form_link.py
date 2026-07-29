@@ -168,22 +168,10 @@ def burn(conn, token: str, *, deal_id=None) -> bool:
         return cur.fetchone() is not None
 
 
-def filled_by(conn, telegram_id: int) -> dict | None:
-    """Заполненная этим человеком анкета, если она была. Иначе None.
-
-    По ней бот отвечает «вы уже заполнили» вместо второй ссылки: владелец 29.07.2026 —
-    «если для его айди заполнено, то всё отлично»."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT token, used_at, used_deal_id FROM iu_form_tokens
-            WHERE telegram_id = %s AND used_at IS NOT NULL
-            ORDER BY used_at DESC LIMIT 1
-            """,
-            (int(telegram_id),),
-        )
-        row = cur.fetchone()
-    return dict(row) if row else None
+#: Отметки о выдаче и гашении ссылки НЕ являются ответом на вопрос «заполнена ли анкета».
+#: Владелец 29.07.2026 удалил анкету в Битриксе, а бот продолжал говорить «вы уже заполнили»:
+#: отметка живёт у нас, а правда — в сделке. Поэтому такой функции здесь намеренно нет, и
+#: сверку делает `funnel_telegram_gateway._anketa_in_crm` живым чтением карточки.
 
 
 def state_of(row: dict | None) -> str:

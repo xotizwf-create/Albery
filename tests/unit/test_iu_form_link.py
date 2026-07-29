@@ -63,10 +63,6 @@ class FakeCursor:
                 self._result = {"token": token}
             else:
                 self._result = None
-        elif text.startswith("SELECT token, used_at, used_deal_id FROM iu_form_tokens"):
-            used = [r for r in self.rows.values()
-                    if r["telegram_id"] == params[0] and r["used_at"]]
-            self._result = max(used, key=lambda r: r["used_at"]) if used else None
         else:  # pragma: no cover — незнакомый запрос в тесте это ошибка теста
             raise AssertionError(f"неожиданный запрос: {text[:80]}")
 
@@ -157,14 +153,15 @@ def test_the_same_form_is_not_merged_twice():
     assert link.burn(conn, token, deal_id=264) is False
 
 
-def test_burned_link_is_replaced_by_a_new_one_only_deliberately():
-    """После заполнения бот отвечает «вы уже заполнили», а не выдаёт вторую ссылку молча."""
+def test_a_new_link_is_issued_after_the_old_one_burned():
+    """Анкету могли удалить в Битриксе — тогда человеку нужна новая ссылка.
+
+    Решение, показывать её или ответить «вы уже заполнили», принимает сценарий по ЖИВОЙ
+    сверке со сделкой, а не по этой отметке."""
     conn = FakeConn()
     token = link.issue(conn, 555)["token"]
     link.burn(conn, token, deal_id=264)
 
-    assert link.filled_by(conn, 555)["used_deal_id"] == 264
-    # Новая ссылка выдаётся — но решение показать её принимает сценарий, а не эта функция.
     assert link.issue(conn, 555)["token"] != token
 
 
@@ -183,4 +180,35 @@ def test_unknown_token_is_not_a_crash():
     assert link.resolve(conn, "нет-такого") is None
     assert link.resolve(conn, "") is None
     assert link.state_of(None) == "unknown"
-    assert link.filled_by(conn, 555) is None
+
+
+# --- что отвечает бот ------------------------------------------------------------------------
+
+def test_answer_shows_the_real_anketa_not_our_flag():
+    """Владелец 29.07.2026: «я в битриксе анкету удалил, а бот всё равно говорит, что
+    человек её заполнил». Правда об анкете живёт в сделке, а не в нашей отметке."""
+    import iu_client_bot
+
+    body, filled = iu_client_bot.join_answer(
+        "Вижу анкету:\n\n• Категории товара — Одежда\n\nВсё верно?", "")
+
+    assert filled is True
+    assert "уже заполнили" in body
+    assert "Категории товара — Одежда" in body
+    assert "http" not in body
+
+
+def test_answer_gives_the_link_when_the_anketa_is_gone():
+    """Анкету удалили — человек обязан получить возможность заполнить её снова."""
+    import iu_client_bot
+
+    body, filled = iu_client_bot.join_answer("", "https://www.m4s.ru/iu/abc")
+
+    assert filled is False
+    assert "https://www.m4s.ru/iu/abc" in body
+
+
+def test_blank_anketa_block_is_not_a_filled_anketa():
+    import iu_client_bot
+
+    assert iu_client_bot.join_answer("   \n ", "https://x/iu/1")[1] is False
