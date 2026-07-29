@@ -129,6 +129,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Рабочий Bitrix-агент ИУ управляет передачей ИИ/человеку и статусом обращения.
     # Миграция только добавляет два инструмента, не стирая выбранные владельцем.
     "078_iu_agent_workspace_tools.sql",
+    # Durable alerts when an IU lead waits for a real manager reply.
+    "079_iu_manager_wait_alerts.sql",
 ]
 
 

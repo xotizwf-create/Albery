@@ -168,6 +168,7 @@ def start_workers() -> list[threading.Thread]:
             ("outbox", _outbox_loop),
             ("crm-actions", _crm_action_loop),
             ("iu-reminders", _reminder_loop),
+            ("iu-manager-wait", _manager_wait_loop),
             ("maintenance", _maintenance_loop),
         )
         _threads[:] = []
@@ -314,6 +315,54 @@ def _reminder_loop() -> None:
             count = 0
         if not count:
             _loop_wait(_poll_seconds("IU_BOT_REMINDER_POLL_SECONDS", 5.0))
+
+
+def _manager_wait_loop() -> None:
+    worker_id = f"{_worker_prefix}-iu-manager-wait"
+    while not _stop_event.is_set():
+        try:
+            count = process_iu_manager_wait_once(worker_id=worker_id)
+        except Exception:  # noqa: BLE001 - durable rows are retried after transient failures
+            log.exception("IU manager response watch failed")
+            count = 0
+        if not count:
+            _loop_wait(
+                _poll_seconds("IU_MANAGER_RESPONSE_WATCH_POLL_SECONDS", 30.0)
+            )
+
+
+def _notify_iu_manager(text: str) -> dict[str, Any]:
+    import tg_agent
+
+    result = tg_agent.mcp_call(
+        "notify_iu_group",
+        {
+            "text": text,
+            "dialog_id": str(
+                os.getenv("IU_MANAGER_NOTIFY_BITRIX_USER_ID", "16")
+            ).strip(),
+            "bot_id": _as_int(os.getenv("IU_AGENT_BOT_ID", "86")) or 86,
+        },
+    )
+    if not result.get("sent"):
+        raise RuntimeError(f"Bitrix did not confirm IU manager alert: {result!r}"[:400])
+    return result
+
+
+def process_iu_manager_wait_once(*, worker_id: str, limit: int = 50) -> int:
+    import iu_manager_response_watch
+
+    return iu_manager_response_watch.process_once(
+        worker_id=worker_id,
+        notify=_notify_iu_manager,
+        limit=limit,
+    )
+
+
+def _manager_notifications_open(now: datetime | None = None) -> bool:
+    import iu_manager_response_watch
+
+    return iu_manager_response_watch.manager_notifications_open(now)
 
 
 def process_iu_reminders_once(*, worker_id: str, limit: int = 20) -> int:
@@ -739,8 +788,26 @@ def _reply_and_hand_over(
 ) -> dict[str, Any] | None:
     """Tell the client, persist the manager badge and enqueue a durable Bitrix alert."""
 
+    import iu_manager_response_watch
+
     payload = dict(metadata or {})
-    payload.update(_manager_request_metadata(event, conversation_id))
+    if _manager_notifications_open():
+        payload.update(_manager_request_metadata(event, conversation_id))
+    else:
+        import iu_client_bot
+
+        payload.update(
+            {
+                "iu_event": event,
+                "manager_notification_deferred": True,
+                "after_hours": True,
+            }
+        )
+        text = iu_manager_response_watch.AFTER_HOURS_CLIENT_REPLY
+        idempotency_key = iu_manager_response_watch.after_hours_period_key(
+            conversation_id
+        )
+        reply_options["reply_markup"] = iu_client_bot.remove_keyboard()
     queued = _reply_to_client(
         conversation_id,
         text,
@@ -903,8 +970,8 @@ def _hand_over_to_human(
     """Передать обращение человеку: дальше отвечает оператор из рабочего окна."""
 
     store = _store()
-    conversation = store.get_conversation(conversation_id) or {}
     try:
+        conversation = store.get_conversation(conversation_id) or {}
         store.mark_waiting_human(
             conversation_id,
             expected_version=conversation.get("state_version"),
@@ -953,6 +1020,7 @@ def ingest_bot_message(
     )
     previous_messages = _bot_messages(existing_id) if existing_id else []
     previous_support = iu_bot_state.support_state(previous_messages)
+    manager_window_open = _manager_notifications_open()
     is_command = text.strip().startswith("/")
     # Пункт меню приходит обычным текстом. Это выбор действия, а не вопрос: отвечает
     # сценарий, модель не вызывается вовсе.
@@ -973,6 +1041,7 @@ def ingest_bot_message(
     if schedule_ai is None:
         schedule_ai = (
             iu_client_bot.ai_answers_enabled()
+            and manager_window_open
             and not is_command
             and not action
             and not calculator_discussion
@@ -1054,6 +1123,29 @@ def ingest_bot_message(
             action,
             conversation_id=conversation_id,
             idempotency_key=f"iu-bot:menu:{chat_id}:{external_message_id}",
+        )
+    elif (
+        not manager_window_open
+        and not iu_bot_state.bot_stopped(previous_messages)
+    ):
+        import iu_manager_response_watch
+
+        _reply_and_hand_over(
+            conversation_id,
+            iu_manager_response_watch.AFTER_HOURS_CLIENT_REPLY,
+            idempotency_key=iu_manager_response_watch.after_hours_period_key(
+                conversation_id
+            ),
+            event="manager_after_hours",
+            reason=(
+                "Клиент написал вне рабочего окна менеджеров ИУ "
+                "(09:00–18:00 МСК)."
+            ),
+            metadata={
+                "manager_notification_deferred": True,
+                "after_hours": True,
+            },
+            reply_markup=iu_client_bot.remove_keyboard(),
         )
     elif (
         media_type != "text"
@@ -2696,8 +2788,14 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
             tg_agent._mark_invited(telegram_id)
         applied_asset = asset
 
-    manager_notified = bool(payload.get("notify_manager_after_delivery"))
-    if manager_notified:
+    manager_notification_requested = bool(
+        payload.get("notify_manager_after_delivery")
+    )
+    manager_notified = False
+    manager_notification_deferred = False
+    if manager_notification_requested and not _manager_notifications_open():
+        manager_notification_deferred = True
+    elif manager_notification_requested:
         import funnel_workspace
 
         conversation_id = int(action["conversation_id"])
@@ -2721,7 +2819,7 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
             if client_name and client_name.casefold() != "клиент"
             else "Клиент"
         )
-        tg_agent.mcp_call(
+        notification = tg_agent.mcp_call(
             "notify_iu_group",
             {
                 "text": (
@@ -2732,6 +2830,13 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
                 "bot_id": bot_id,
             },
         )
+        if not notification.get("sent"):
+            raise RuntimeError(
+                f"Bitrix did not confirm IU manager notification: {notification!r}"[
+                    :400
+                ]
+            )
+        manager_notified = True
 
     escalated = bool(
         payload.get("author_type") == "agent"
@@ -2762,6 +2867,7 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
         "asset": applied_asset,
         "escalated": escalated,
         "manager_notified": manager_notified,
+        "manager_notification_deferred": manager_notification_deferred,
     }
 
 

@@ -145,8 +145,6 @@ def test_migration_registers_the_bot_source():
 def test_attachment_from_a_bot_chat_is_served(monkeypatch):
     import funnel_workspace_media as media
 
-    from contextlib import contextmanager
-
     class Cursor:
         def __enter__(self):
             return self
@@ -215,6 +213,7 @@ def _tg_stub(monkeypatch, *, owner=False):
 
 def test_client_message_to_the_bot_reaches_the_workspace(monkeypatch):
     monkeypatch.setenv("IU_CLIENT_BOT_ENABLED", "1")
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: True)
     store = _IngestStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)
     _tg_stub(monkeypatch)

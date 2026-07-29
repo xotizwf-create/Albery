@@ -71,6 +71,9 @@ def _message(text, *, date=None, message_id=7):
 def _channel_on(monkeypatch):
     monkeypatch.setenv("IU_CLIENT_BOT_ENABLED", "1")
     monkeypatch.setenv("IU_CLIENT_BOT_AI", "1")
+    # Daytime is the default for existing menu scenarios; quiet hours have
+    # dedicated deterministic tests below.
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: True)
 
 
 def test_menu_lives_under_the_input_field_not_inside_a_message():
@@ -254,6 +257,32 @@ def test_repeated_free_question_outside_support_does_not_call_operator(monkeypat
     assert store.ingested[0]["schedule_ai"] is False
     assert store.transitions == []
     assert store.queued[-1]["text"] == bot.STRICT_QUESTION_HINT
+
+
+def test_any_free_question_gets_one_after_hours_acknowledgement(monkeypatch):
+    import iu_manager_response_watch as watch
+
+    store = FakeStore(control_mode="ai")
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda _chat_id: 5)
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: False)
+    monkeypatch.setattr(
+        watch,
+        "after_hours_period_key",
+        lambda conversation_id: f"night:{conversation_id}:2026-07-30",
+    )
+    monkeypatch.setattr(gateway, "_cancel_bot_reminders", lambda _conversation_id: None)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message("Когда мне ответит менеджер?"))
+
+    assert len(store.queued) == 1
+    assert store.queued[0]["text"] == watch.AFTER_HOURS_CLIENT_REPLY
+    assert store.queued[0]["idempotency_key"] == "night:5:2026-07-30"
+    assert store.queued[0]["metadata"]["after_hours"] is True
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.remove_keyboard()
+    assert store.ingested[0]["schedule_ai"] is False
+    assert store.transitions[0]["permanent_human"] is True
 
 
 def test_service_reply_retries_once_after_state_version_race(monkeypatch):

@@ -334,8 +334,9 @@ try:
             "funnel_workspace_outbox",
             "funnel_workspace_crm_actions",
             "funnel_workspace_settings",
+            "iu_manager_wait_alerts",
         ],
-        hint="Apply migration 070_funnel_workspace.sql.",
+        hint="Apply workspace migrations through 079_iu_manager_wait_alerts.sql.",
     )
     print("workspace tables: OK")
 except Exception as exc:  # noqa: BLE001

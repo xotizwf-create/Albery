@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, time as dt_time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from config import MSK_TZ
@@ -28,18 +28,15 @@ def enabled() -> bool:
 
 
 def delivery_decision(now: datetime, due_at: datetime) -> DeliveryDecision:
+    import iu_manager_response_watch
+
     now = now.astimezone(MSK_TZ)
     due_at = due_at.astimezone(MSK_TZ)
     if now - due_at > timedelta(hours=STALE_HOURS):
         return DeliveryDecision("cancel")
-    if 9 <= now.hour < 21:
+    if iu_manager_response_watch.manager_notifications_open(now):
         return DeliveryDecision("send")
-    if now.hour < 9:
-        retry = datetime.combine(now.date(), dt_time(9), tzinfo=MSK_TZ)
-    else:
-        retry = datetime.combine(
-            now.date() + timedelta(days=1), dt_time(9), tzinfo=MSK_TZ
-        )
+    retry = iu_manager_response_watch.next_manager_morning(now)
     if retry - due_at > timedelta(hours=STALE_HOURS):
         return DeliveryDecision("cancel")
     return DeliveryDecision("wait", retry)

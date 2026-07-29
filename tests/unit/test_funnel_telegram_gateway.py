@@ -909,9 +909,11 @@ def test_operator_request_notifies_alexander_from_iu_agent_with_dialog_link(
         _mark_terms_sent=lambda _telegram_id: None,
         _invite_already_sent=lambda _telegram_id: True,
         _mark_invited=lambda _telegram_id: None,
-        mcp_call=lambda tool, arguments: calls.append((tool, arguments)) or {"ok": True},
+        mcp_call=lambda tool, arguments: calls.append((tool, arguments))
+        or {"sent": True},
     )
     monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: True)
     import funnel_workspace
 
     monkeypatch.setattr(
@@ -948,6 +950,35 @@ def test_operator_request_notifies_alexander_from_iu_agent_with_dialog_link(
             },
         )
     ]
+
+
+def test_night_delivery_defers_immediate_manager_notification(monkeypatch):
+    calls = []
+    tg = SimpleNamespace(
+        _terms_already_sent=lambda _telegram_id: True,
+        _mark_terms_sent=lambda _telegram_id: None,
+        _invite_already_sent=lambda _telegram_id: True,
+        _mark_invited=lambda _telegram_id: None,
+        mcp_call=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: False)
+
+    result = gateway._apply_delivery_effects(
+        {
+            "id": 76,
+            "conversation_id": 311,
+            "action_type": "delivery_effects",
+            "payload": {
+                "author_type": "agent",
+                "notify_manager_after_delivery": True,
+            },
+        }
+    )
+
+    assert result["manager_notified"] is False
+    assert result["manager_notification_deferred"] is True
+    assert calls == []
 
 
 def test_stage_sync_pulls_a_stage_moved_by_people_in_crm(monkeypatch):

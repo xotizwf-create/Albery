@@ -106,6 +106,9 @@ def _message_update(text: str = "", *, document: dict | None = None, caption: st
 @pytest.fixture(autouse=True)
 def _channel_on(monkeypatch):
     monkeypatch.setenv("IU_CLIENT_BOT_ENABLED", "1")
+    # Existing scenario assertions describe the daytime path. Night behaviour
+    # has its own explicit tests and must not depend on the wall clock of CI.
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: True)
 
 
 def test_start_creates_a_lead_and_shows_the_menu(monkeypatch):
