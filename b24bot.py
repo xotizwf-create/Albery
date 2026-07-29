@@ -3195,7 +3195,11 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
         _HERMES_RUN_SLOTS.release()
 
 
-_B24_CORE_INSTR_NAMES = ("Маршрутная карта", "Порядок поиска", "Формат ответа", "Базовое поведение", "Критическое мышление")
+# «Вопросы о возможностях и доступе» добавлена 29.07.2026: именно она задаёт, КАК агент
+# объясняет отказ, а лежала вне инжекта — поэтому агент говорил «у вас не тот уровень прав»
+# там, где просто не было инструмента. Правило, которого модель не видит каждый ход, не работает.
+_B24_CORE_INSTR_NAMES = ("Маршрутная карта", "Порядок поиска", "Формат ответа", "Базовое поведение",
+                         "Вопросы о возможностях и доступе", "Критическое мышление")
 _B24_CORE_INSTR_CAP = int(os.getenv("B24_CORE_INSTR_CAP", "30000") or "30000")
 _B24_CORE_INSTR_CACHE: dict[str, Any] = {"at": 0.0, "text": ""}
 
@@ -3715,16 +3719,39 @@ def _b24_log_access_request(dialog_id: str, from_user_id: Any, requester_name: s
         logging.exception("b24 testbot: access-request log failed")
 
 
-def _b24_forward_access_request(dialog_id: str, from_user_id: Any, request_text: str) -> None:
-    """Notify the owner (Telegram) that a user requests more access, and log it for the record."""
+def _b24_forward_access_request(dialog_id: str, from_user_id: Any, request_text: str,
+                                client_endpoint: str = "", access_token: str = "",
+                                bot_id: Any = None) -> None:
+    """Notify the owner that a user requests more access, and log it for the record.
+
+    The reply to the user ("Готово, передал Александру") is posted BEFORE this runs, so a failure
+    here turns that reply into a lie. On 29.07.2026 exactly that happened: the Telegram bot token
+    was revoked, `sendMessage` answered Unauthorized, and every escalation died silently while the
+    agent kept reporting success. Hence two rules: try the Bitrix notification chat as a second
+    channel (it runs on a different token), and if BOTH fail, correct ourselves in the dialog —
+    a failed delivery must never be silent.
+    """
     name = _b24_requester_name(from_user_id)
     text = (f"🔐 {name} просит расширить доступ к ИИ-агенту.\n\n"
             f"Запрос: {request_text}\n\n"
             f"Сейчас прав не хватает — уровень доступа можно изменить в «Настройки Агента».")
     ok, err = _albery_tg_notify(text, os.getenv("ALBERY_ACCESS_REQUEST_TG_CHAT", "").strip() or None)
-    _b24_log_access_request(dialog_id, from_user_id, name, request_text, ok, err)
     if not ok:
         logging.error("b24 testbot: access-request TG delivery failed: %s", err)
+        backup_ok, backup_err = _albery_bitrix_notify(
+            text, client_endpoint=client_endpoint, access_token=access_token, bot_id=bot_id)
+        if backup_ok:
+            ok, err = True, None
+        else:
+            err = f"telegram: {err}; bitrix: {backup_err}"
+            logging.error("b24 testbot: access-request backup delivery failed: %s", backup_err)
+    _b24_log_access_request(dialog_id, from_user_id, name, request_text, ok, err)
+    if not ok and client_endpoint:
+        _b24_app_reply(
+            client_endpoint, access_token, bot_id, dialog_id,
+            "⚠️ Поправка: передать запрос автоматически не получилось — уведомление не ушло. "
+            "Напишите, пожалуйста, Александру Никитенко напрямую.",
+        )
 
 
 # --- Live progress message: one bot message edited in place while the brain works ------------
@@ -3935,7 +3962,8 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
     if escalation_request is not None:
         threading.Thread(
             target=_b24_forward_access_request,
-            args=(dialog_id, from_user_id, escalation_request or user_text),
+            args=(dialog_id, from_user_id, escalation_request or user_text,
+                  client_endpoint, access_token, bot_id),
             daemon=True,
         ).start()
     # done: swap 👀 (read) → 👍 (done) on the user's message.
