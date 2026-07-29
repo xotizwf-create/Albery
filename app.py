@@ -709,12 +709,7 @@ def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = Tr
     """Create a new Google Doc from HTML (as the agent's Google account), optionally share it
     anyone-with-link = editor and return its id + url. The only sanctioned way to make a Google
     Doc for a user: Apps Script web-app detours produce artifacts the requester cannot open."""
-    import io as _io
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseUpload
-
-    creds = _google_user_credentials()
-    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    drive = _build_drive_service()
     clean_title = (str(title or "").strip() or "Новый документ")[:200]
     html = str(html_body or "").strip()
     if not html:
@@ -725,16 +720,11 @@ def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = Tr
     # conversion — so a Google Doc looks exactly like the agent's docx files (owner 2026-07-17:
     # оформление «один в один»). A plain text/html upload rendered visibly differently.
     from docformat import html_to_docx
-    docx_bytes = html_to_docx(
+    media = _drive_docx_media(html_to_docx(
         html,
         font_size_pt=float(font_size_pt or 12),
         line_spacing=float(line_spacing or 1.5),
-    )
-    media = MediaIoBaseUpload(
-        _io.BytesIO(docx_bytes),
-        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        resumable=False,
-    )
+    ))
     created = drive.files().create(
         body={"name": clean_title, "mimeType": "application/vnd.google-apps.document"},
         media_body=media, fields="id,webViewLink,name,mimeType",
@@ -750,6 +740,134 @@ def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = Tr
         "url": url,
         "title": created.get("name") or clean_title,
         "access": "anyone_with_link_editor" if share_anyone_writer else "private",
+    }
+
+
+def _build_drive_service(creds: Any = None) -> Any:
+    """Single place the Drive client is constructed, so the document path can be tested."""
+    from googleapiclient.discovery import build
+
+    return build("drive", "v3", credentials=creds if creds is not None else _google_user_credentials(),
+                 cache_discovery=False)
+
+
+def _drive_docx_media(docx_bytes: bytes) -> Any:
+    """Wrap rendered .docx bytes as a Drive upload body (its own seam, so document tests
+    do not need the Google client library installed)."""
+    import io as _io
+
+    from googleapiclient.http import MediaIoBaseUpload
+
+    return MediaIoBaseUpload(
+        _io.BytesIO(docx_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        resumable=False,
+    )
+
+
+def _google_doc_meta(drive: Any, document_id: str) -> dict[str, Any]:
+    meta = drive.files().get(
+        fileId=document_id,
+        fields="id,name,mimeType,webViewLink,modifiedTime,capabilities(canEdit)",
+    ).execute()
+    if str(meta.get("mimeType") or "") != "application/vnd.google-apps.document":
+        raise RuntimeError(
+            f"«{meta.get('name')}» — не Google-документ (mimeType={meta.get('mimeType')}). "
+            "Таблицы редактируются через write_google_sheet_values."
+        )
+    return meta
+
+
+def read_google_doc(document_id: str, output_format: str = "text") -> dict[str, Any]:
+    """Read an EXISTING Google Doc as plain text or as HTML.
+
+    Exported through Drive, not the Docs API: the agent's Google Cloud project does not have the
+    Docs API enabled, and Drive export needs only the `drive` scope the agent already holds.
+    `html` is the format to ask for when the next step is editing — edit_google_doc takes HTML
+    back, so read → transform → write round-trips without losing the document's structure.
+    """
+    doc_id = _extract_drive_folder_id(document_id) or str(document_id or "").strip()
+    if not doc_id:
+        raise ValueError("document_id (id или ссылка на Google-документ) обязателен")
+    fmt = "html" if str(output_format or "").lower() in ("html", "text/html") else "text"
+    drive = _build_drive_service()
+    meta = _google_doc_meta(drive, doc_id)
+    mime = "text/html" if fmt == "html" else "text/plain"
+    content = drive.files().export(fileId=doc_id, mimeType=mime).execute()
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", errors="replace")
+    return {
+        "document_id": doc_id,
+        "title": meta.get("name"),
+        "url": meta.get("webViewLink") or f"https://docs.google.com/document/d/{doc_id}/edit",
+        "format": fmt,
+        "can_edit": bool((meta.get("capabilities") or {}).get("canEdit")),
+        "modified_time": meta.get("modifiedTime"),
+        "content": content,
+        "content_length": len(content),
+    }
+
+
+def edit_google_doc(document_id: str, html_body: str, font_size_pt: float | None = None,
+                    line_spacing: float | None = None) -> dict[str, Any]:
+    """Replace the content of an EXISTING Google Doc in place, keeping its id, URL and sharing.
+
+    Until 2026-07-29 the agent could only CREATE documents, so every "reformat this doc" request
+    dead-ended — and the assistant reported it to users as a missing access right, which it never
+    was. The write goes through Drive `files().update` with a docx rendered by the same
+    `html_to_docx` used by create_google_doc and export_document, so an edited document looks
+    exactly like a generated one. Drive keeps the previous revision, and its id is returned for
+    rollback. The result is read back so an edit can never be reported without being verified.
+    """
+    from docformat import html_to_docx
+
+    doc_id = _extract_drive_folder_id(document_id) or str(document_id or "").strip()
+    if not doc_id:
+        raise ValueError("document_id (id или ссылка на Google-документ) обязателен")
+    html = str(html_body or "").strip()
+    if not html:
+        raise RuntimeError("html пуст — соберите HTML нового содержимого документа.")
+    if not html.lstrip().lower().startswith(("<!doctype", "<html", "<h1", "<h2", "<h3", "<p", "<div", "<table", "<ul", "<ol")):
+        html = "<p>" + html.replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
+    drive = _build_drive_service()
+    meta = _google_doc_meta(drive, doc_id)
+    if not (meta.get("capabilities") or {}).get("canEdit", True):
+        raise RuntimeError(
+            f"У аккаунта агента (a9ent.ai@gmail.com) нет прав на редактирование «{meta.get('name')}». "
+            "Попросите владельца документа выдать доступ «Редактор»."
+        )
+    previous_revision = ""
+    try:
+        revisions = drive.revisions().list(fileId=doc_id, fields="revisions(id,modifiedTime)").execute()
+        items = revisions.get("revisions") or []
+        previous_revision = str((items[-1] if items else {}).get("id") or "")
+    except Exception:  # noqa: BLE001 — откат по ревизии полезен, но не обязателен для правки
+        previous_revision = ""
+    media = _drive_docx_media(html_to_docx(
+        html,
+        font_size_pt=float(font_size_pt or 12),
+        line_spacing=float(line_spacing or 1.5),
+    ))
+    updated = drive.files().update(
+        fileId=doc_id, media_body=media, body={}, fields="id,name,webViewLink,modifiedTime,mimeType",
+    ).execute()
+    if str(updated.get("mimeType") or "") != "application/vnd.google-apps.document":
+        raise RuntimeError(
+            f"После записи файл перестал быть Google-документом (mimeType={updated.get('mimeType')})."
+        )
+    readback = drive.files().export(fileId=doc_id, mimeType="text/plain").execute()
+    if isinstance(readback, bytes):
+        readback = readback.decode("utf-8", errors="replace")
+    if not readback.strip():
+        raise RuntimeError("После записи документ пуст — правка не применилась, откатите по previous_revision_id.")
+    return {
+        "document_id": doc_id,
+        "title": updated.get("name") or meta.get("name"),
+        "url": updated.get("webViewLink") or f"https://docs.google.com/document/d/{doc_id}/edit",
+        "modified_time": updated.get("modifiedTime"),
+        "previous_revision_id": previous_revision,
+        "content_length": len(readback),
+        "content_preview": readback.strip()[:500],
     }
 
 
