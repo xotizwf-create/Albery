@@ -189,6 +189,65 @@ def test_status_change_refuses_an_unknown_value(monkeypatch):
         tools.set_status({"conversation_id": 12, "status": "в архив"})
 
 
+def test_mcp_can_return_public_bot_dialog_to_ai(monkeypatch):
+    import funnel_telegram_gateway
+
+    captured = {}
+    row = conversation(source_key="telegram_bot", control_mode="human")
+    monkeypatch.setattr(tools.store, "get_conversation", lambda _conversation_id: row)
+    monkeypatch.setattr(
+        funnel_telegram_gateway,
+        "ai_allowed_in_channel",
+        lambda current, telegram_id: (
+            current["source_key"] == "telegram_bot" and telegram_id == 9001
+        ),
+    )
+
+    def transition(conversation_id, **kwargs):
+        captured.update(conversation_id=conversation_id, **kwargs)
+        return conversation(source_key="telegram_bot", control_mode="ai", state_version=5)
+
+    monkeypatch.setattr(tools.store, "transition_control", transition)
+
+    result = tools.set_control(
+        {"conversation_id": 12, "mode": "ai", "reason": "Вопрос решён"}
+    )
+
+    assert result["control"] == "отвечает ИИ"
+    assert captured["mode"] == "ai"
+    assert captured["actor_type"] == "agent"
+
+
+def test_mcp_human_takeover_hides_public_bot_menu(monkeypatch):
+    import funnel_telegram_gateway
+
+    hidden = {}
+    row = conversation(source_key="telegram_bot", control_mode="ai")
+    monkeypatch.setattr(tools.store, "get_conversation", lambda _conversation_id: row)
+    monkeypatch.setattr(
+        tools.store,
+        "transition_control",
+        lambda *_args, **_kwargs: conversation(
+            source_key="telegram_bot",
+            control_mode="human",
+            state_version=5,
+        ),
+    )
+    monkeypatch.setattr(
+        funnel_telegram_gateway,
+        "hide_client_menu_for_manager",
+        lambda conversation_id, *, state_version: hidden.update(
+            conversation_id=conversation_id,
+            state_version=state_version,
+        ),
+    )
+
+    result = tools.set_control({"conversation_id": 12, "mode": "human"})
+
+    assert result["control"] == "отвечает человек"
+    assert hidden == {"conversation_id": 12, "state_version": 5}
+
+
 def test_conversation_card_includes_transcript(monkeypatch):
     monkeypatch.setattr(tools.store, "get_conversation", lambda conversation_id: conversation())
     monkeypatch.setattr(

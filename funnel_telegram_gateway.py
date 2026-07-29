@@ -97,20 +97,31 @@ def ai_allowed(telegram_user_id: Any) -> bool:
 
 
 def telegram_connected() -> bool:
-    """Current Telegram Business right, read from the sole transport's durable state."""
+    """Есть ли хотя бы один рабочий Telegram-транспорт.
+
+    Рабочее окно объединяет Telegram Business и публичного ИУ-бота. Раньше индикатор
+    смотрел только Business-соединения и показывал «Нет связи» даже у живого диалога
+    ``telegram_bot``. Для публичного бота достаточны включённый сценарий и настроенный
+    Bot API token; фактическую доставку по-прежнему контролирует outbox.
+    """
+
+    import tg_agent
 
     try:
-        import tg_agent
-
+        public_bot_ready = client_bot_enabled() and bool(tg_agent.bot_token())
+    except Exception:  # noqa: BLE001
+        public_bot_ready = False
+    try:
         connections = (tg_agent.load_state().get("business") or {}).values()
     except Exception:  # noqa: BLE001
-        return False
-    return any(
+        connections = ()
+    business_ready = any(
         info
         and info.get("enabled") is not False
         and info.get("can_reply") is not False
         for info in connections
     )
+    return public_bot_ready or business_ready
 
 
 def capture_poll_update(update: Mapping[str, Any]) -> dict[str, Any]:
@@ -1919,7 +1930,9 @@ def prepare_reply(
             replies = iu_bot_state.support_agent_replies(messages)
             metadata["reply_markup"] = iu_client_bot.support_menu(
                 offer_operator=iu_client_bot.should_offer_operator(
-                    replies,
+                    # ``messages`` ещё не содержит готовящийся ответ. Кнопка должна
+                    # появиться вместе со вторым ответом ИИ, а не только перед третьим.
+                    replies + 1,
                     control_mode=str(conversation.get("control_mode") or "ai"),
                 )
             )

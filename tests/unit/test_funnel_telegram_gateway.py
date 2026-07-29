@@ -32,6 +32,26 @@ def test_empty_allowlist_blocks_everyone_even_when_ai_enabled(monkeypatch):
     assert gateway.ai_allowed(123)
 
 
+def test_public_bot_counts_as_connected_without_telegram_business(monkeypatch):
+    import tg_agent
+
+    monkeypatch.setattr(tg_agent, "load_state", lambda: {"business": {}})
+    monkeypatch.setattr(tg_agent, "bot_token", lambda: "configured")
+    monkeypatch.setattr(gateway, "client_bot_enabled", lambda: True)
+
+    assert gateway.telegram_connected() is True
+
+
+def test_telegram_is_disconnected_when_neither_transport_is_ready(monkeypatch):
+    import tg_agent
+
+    monkeypatch.setattr(tg_agent, "load_state", lambda: {"business": {}})
+    monkeypatch.setattr(tg_agent, "bot_token", lambda: "")
+    monkeypatch.setattr(gateway, "client_bot_enabled", lambda: True)
+
+    assert gateway.telegram_connected() is False
+
+
 def test_media_without_caption_is_visible_to_operator():
     assert gateway.telegram_message_text(
         {"document": {"file_name": "условия.pdf"}}
@@ -87,6 +107,79 @@ def test_terms_delivery_persists_fact_derived_stage_before_outbox_send(monkeypat
 
     assert prepared.metadata["asset"] == "terms"
     assert prepared.metadata["stage_move"] == iu_funnel.STAGE_TERMS
+
+
+def test_second_ai_answer_already_offers_the_operator(monkeypatch):
+    import iu_client_bot
+    import iu_contract
+    import tg_agent
+
+    monkeypatch.setattr(tg_agent, "_strip_markup", lambda text, **_kwargs: text)
+    monkeypatch.setattr(
+        gateway,
+        "_bot_messages",
+        lambda _conversation_id: [
+            {
+                "id": 1,
+                "author_type": "client",
+                "direction": "inbound",
+                "text": iu_client_bot.BUTTON_ASK,
+                "delivery_status": "sent",
+                "metadata": {},
+            },
+            {
+                "id": 2,
+                "author_type": "client",
+                "direction": "inbound",
+                "text": "Первый вопрос",
+                "delivery_status": "sent",
+                "metadata": {},
+            },
+            {
+                "id": 3,
+                "author_type": "agent",
+                "direction": "outbound",
+                "text": "Первый ответ",
+                "delivery_status": "sent",
+                "metadata": {},
+            },
+            {
+                "id": 4,
+                "author_type": "client",
+                "direction": "inbound",
+                "text": "Второй вопрос",
+                "delivery_status": "sent",
+                "metadata": {},
+            },
+        ],
+    )
+    outcome = SimpleNamespace(
+        reply="Второй ответ",
+        action=iu_contract.REPLY_ONLY,
+        escalate=False,
+        reason="",
+        stage_move="",
+        answered_client=True,
+        sources=(),
+        trace={},
+    )
+
+    prepared = gateway.prepare_reply(
+        outcome,
+        telegram_user_id=123,
+        conversation={
+            "id": 41,
+            "source_key": gateway.BOT_SOURCE_KEY,
+            "control_mode": "ai",
+        },
+    )
+
+    labels = [
+        button["text"]
+        for row in prepared.metadata["reply_markup"]["keyboard"]
+        for button in row
+    ]
+    assert iu_client_bot.BUTTON_OPERATOR in labels
 
 
 class FakeConflict(RuntimeError):

@@ -177,6 +177,86 @@ def test_ai_escalation_sets_the_same_manager_request_badge():
         _cleanup(source_key)
 
 
+def test_closing_question_clears_the_manager_request_badge():
+    suffix = uuid4().hex[:12]
+    source_key = f"test-manager-close-{suffix}"
+    chat_id = "700000205"
+    try:
+        store.ensure_source(source_key, source_type="test", display_name="manager close")
+        first = _ingest(
+            source_key,
+            chat_id,
+            author="client",
+            text="Позовите менеджера",
+            message_id=f"{suffix}-1",
+        )
+        conversation_id = int(first["conversation"]["id"])
+        requested = store.mark_waiting_human(
+            conversation_id,
+            expected_version=int(first["conversation"]["state_version"]),
+            reason="Клиент позвал менеджера.",
+            manager_requested=True,
+        )
+
+        closed = store.update_conversation_status(
+            conversation_id,
+            status="closed",
+            expected_version=int(requested["state_version"]),
+            actor_name="Александр",
+        )
+
+        assert closed["status"] == "closed"
+        assert (
+            closed["metadata"]["manager_request_handled_at"]
+            >= closed["metadata"]["manager_requested_at"]
+        )
+    finally:
+        _cleanup(source_key)
+
+
+def test_returning_dialog_to_ai_clears_the_manager_request_badge():
+    suffix = uuid4().hex[:12]
+    source_key = f"test-manager-ai-{suffix}"
+    chat_id = "700000206"
+    try:
+        store.ensure_source(source_key, source_type="test", display_name="manager ai")
+        first = _ingest(
+            source_key,
+            chat_id,
+            author="client",
+            text="Позовите менеджера",
+            message_id=f"{suffix}-1",
+        )
+        conversation_id = int(first["conversation"]["id"])
+        requested = store.mark_waiting_human(
+            conversation_id,
+            expected_version=int(first["conversation"]["state_version"]),
+            reason="Клиент позвал менеджера.",
+            manager_requested=True,
+        )
+        held = store.transition_control(
+            conversation_id,
+            mode="human",
+            expected_version=int(requested["state_version"]),
+            actor_name="Александр",
+        )
+
+        returned = store.transition_control(
+            conversation_id,
+            mode="ai",
+            expected_version=int(held["state_version"]),
+            actor_name="Александр",
+        )
+
+        assert returned["control_mode"] == "ai"
+        assert (
+            returned["metadata"]["manager_request_handled_at"]
+            >= returned["metadata"]["manager_requested_at"]
+        )
+    finally:
+        _cleanup(source_key)
+
+
 def test_a_failed_answer_never_counts_as_an_answer_to_the_client():
     """Ответ, который Telegram отверг, клиент не видел — статус обязан остаться прежним."""
     suffix = uuid4().hex[:12]

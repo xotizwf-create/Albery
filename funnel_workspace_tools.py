@@ -273,6 +273,8 @@ def set_status(args: Mapping[str, Any]) -> dict[str, Any]:
 
 def set_control(args: Mapping[str, Any]) -> dict[str, Any]:
     """Передать диалог человеку или вернуть его агенту."""
+    import funnel_telegram_gateway
+
     conversation_id = _int_arg(args, "conversation_id")
     mode = _text_arg(args, "mode", limit=20).lower()
     if mode not in store.VALID_CONTROL_MODES:
@@ -280,6 +282,11 @@ def set_control(args: Mapping[str, Any]) -> dict[str, Any]:
             "Режим должен быть одним из: " + ", ".join(sorted(store.VALID_CONTROL_MODES))
         )
     conversation = store.get_conversation(conversation_id)
+    if mode == "ai" and not funnel_telegram_gateway.ai_allowed_in_channel(
+        conversation,
+        conversation.get("external_user_id"),
+    ):
+        raise WorkspaceToolError("ИИ не включён для Telegram-канала этого диалога.")
     updated = store.transition_control(
         conversation_id,
         mode=mode,
@@ -288,6 +295,13 @@ def set_control(args: Mapping[str, Any]) -> dict[str, Any]:
         actor_name=str(args.get("actor_name") or "ИИ-агент"),
         reason=str(args.get("reason") or "Переключено агентом."),
     )
+    if mode == "human" and str(updated.get("source_key") or "") == "telegram_bot":
+        queued = funnel_telegram_gateway.hide_client_menu_for_manager(
+            conversation_id,
+            state_version=int(updated.get("state_version") or 0),
+        )
+        if queued and isinstance(queued.get("conversation"), dict):
+            updated = queued["conversation"]
     return {
         "conversation_id": conversation_id,
         "control": CONTROL_LABELS.get(

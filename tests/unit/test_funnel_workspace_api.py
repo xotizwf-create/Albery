@@ -746,6 +746,23 @@ def test_manager_request_replaces_paused_control_status():
     assert row["control_label"] == "Клиент позвал менеджера"
 
 
+def test_public_bot_ai_availability_uses_its_channel_switch(monkeypatch):
+    import funnel_telegram_gateway
+
+    seen = {}
+
+    def allowed(row, telegram_id):
+        seen.update(source=row.get("source_key"), telegram_id=telegram_id)
+        return row.get("source_key") == "telegram_bot"
+
+    monkeypatch.setattr(funnel_telegram_gateway, "ai_allowed_in_channel", allowed)
+
+    row = _payload(source_key="telegram_bot", external_user_id=1451982360)
+
+    assert row["ai_available"] is True
+    assert seen == {"source": "telegram_bot", "telegram_id": 1451982360}
+
+
 def test_ai_conversations_are_serialized_as_read():
     row = _payload(control_mode="ai", unread_count=7)
 

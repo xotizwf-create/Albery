@@ -11,7 +11,7 @@ import secrets
 import threading
 import time
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
-from typing import Any
+from typing import Any, Mapping
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -238,10 +238,13 @@ def funnel_stages() -> list[dict[str, Any]]:
     return stages or chain
 
 
-def _workspace_ai_allowed(external_user_id: Any) -> bool:
+def _workspace_ai_allowed(conversation: Mapping[str, Any]) -> bool:
     import funnel_telegram_gateway
 
-    return funnel_telegram_gateway.ai_allowed(external_user_id)
+    return funnel_telegram_gateway.ai_allowed_in_channel(
+        conversation,
+        conversation.get("external_user_id"),
+    )
 
 
 def workspace_authenticated() -> bool:
@@ -752,7 +755,7 @@ def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
     )
     payload["can_reply"] = reply_open
     payload["ai_available"] = (
-        reply_open and _workspace_ai_allowed(payload.get("external_user_id"))
+        reply_open and _workspace_ai_allowed(payload)
     )
     payload["url"] = conversation_url(payload["id"])
     waiting = payload.get("awaiting_reply_since")
@@ -1006,9 +1009,9 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
     mode = str(body.get("mode") or "").strip().lower()
     if mode == "ai":
         current = store.get_conversation(conversation_id)
-        if not _workspace_ai_allowed(current.get("external_user_id")):
+        if not _workspace_ai_allowed(current):
             return _error(
-                "ИИ пока не включён для этого тестового Telegram-диалога.",
+                "ИИ не включён для этого Telegram-канала.",
                 409,
                 "ai_rollout_disabled",
             )

@@ -2526,6 +2526,7 @@ function OperatorWorkspace({
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [sending, setSending] = useState(false);
   const [controlBusy, setControlBusy] = useState(false);
+  const [statusBusy, setStatusBusy] = useState(false);
   const [stageBusy, setStageBusy] = useState(false);
   const [leadNotes, setLeadNotes] = useState<LeadNote[]>([]);
   const [noteBusy, setNoteBusy] = useState(false);
@@ -3158,6 +3159,30 @@ function OperatorWorkspace({
     await setConversationControl(selectedConversation, mode, permanent);
   };
 
+  const closeConversationQuestion = async (conversation: Conversation | null) => {
+    if (!conversation || statusBusy || conversation.status === "closed") return;
+    setStatusBusy(true);
+    try {
+      await funnelWorkspaceApi.setStatus(conversation.id, {
+        status: "closed",
+        expected_version: conversation.state_version,
+        csrf_token: csrfToken(),
+      });
+      await loadConversations(true, true);
+      setToast({
+        message: "Вопрос закрыт. Запрос менеджера снят.",
+        tone: "success",
+      });
+    } catch (error) {
+      if (error instanceof FunnelWorkspaceApiError && error.status === 409) {
+        await refreshSelected();
+      }
+      reportError(error);
+    } finally {
+      setStatusBusy(false);
+    }
+  };
+
   const deleteConversation = async (conversation: Conversation) => {
     if (deleting) return;
     setDeleting(true);
@@ -3519,6 +3544,15 @@ function OperatorWorkspace({
                 Boolean(contextMenu.conversation.control_permanent),
               onSelect: () =>
                 void setConversationControl(contextMenu.conversation, "human", true),
+            },
+            {
+              key: "close-question",
+              label: "Вопрос закрыт",
+              icon: <CheckCheck className="h-3.5 w-3.5" />,
+              disabled:
+                statusBusy || contextMenu.conversation.status === "closed",
+              onSelect: () =>
+                void closeConversationQuestion(contextMenu.conversation),
             },
             {
               key: "delete",

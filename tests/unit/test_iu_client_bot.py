@@ -315,7 +315,7 @@ def test_calculator_button_sends_the_public_url_without_handover(monkeypatch):
     assert store.transitions == []
 
 
-def test_operator_button_appears_when_the_client_asks_a_third_question():
+def test_operator_button_is_allowed_after_two_ai_answers():
     assert bot.should_offer_operator(0) is False
     assert bot.should_offer_operator(1) is False
     assert bot.should_offer_operator(2) is True
@@ -380,16 +380,14 @@ def test_third_ai_reply_carries_support_exit_and_operator(monkeypatch):
     assert bot.BUTTON_TERMS not in titles
 
 
-def test_ai_reply_has_only_exit_before_the_threshold(monkeypatch):
+def test_first_ai_reply_has_only_exit_before_the_threshold(monkeypatch):
     import iu_contract
 
     store = FakeStore(
-        agent_replies=1,
+        agent_replies=0,
         messages=[
             {"id": 1, "author_type": "client", "text": bot.BUTTON_ASK},
-            {"id": 2, "author_type": "agent", "direction": "outbound",
-             "delivery_status": "sent", "text": "Ответ 1", "metadata": {}},
-            {"id": 3, "author_type": "client", "text": "Второй вопрос"},
+            {"id": 2, "author_type": "client", "text": "Первый вопрос"},
         ],
     )
     monkeypatch.setattr(gateway, "_store", lambda: store)

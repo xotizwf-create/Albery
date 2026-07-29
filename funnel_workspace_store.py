@@ -1676,6 +1676,7 @@ def transition_control(
                    SET control_mode = %s,
                        resume_at = %s,
                        assigned_to = %s,
+                       metadata = metadata || %s,
                        last_read_message_id = CASE
                            WHEN %s = 'ai' THEN GREATEST(
                                last_read_message_id,
@@ -1696,6 +1697,11 @@ def transition_control(
                     clean_mode,
                     resume_at,
                     assigned_to,
+                    Jsonb(
+                        {"manager_request_handled_at": timestamp.isoformat()}
+                        if clean_mode == "ai"
+                        else {}
+                    ),
                     clean_mode,
                     clean_mode,
                     next_version,
@@ -1958,6 +1964,7 @@ def update_conversation_status(
                        control_mode = %s,
                        resume_at = %s,
                        assigned_to = %s,
+                       metadata = metadata || %s,
                        closed_at = CASE WHEN %s = 'closed' THEN %s ELSE NULL END,
                        state_version = %s,
                        updated_at = %s
@@ -1969,6 +1976,11 @@ def update_conversation_status(
                     next_mode,
                     resume_at,
                     assigned_to,
+                    Jsonb(
+                        {"manager_request_handled_at": timestamp.isoformat()}
+                        if clean_status in {"closed", "spam", "expired"}
+                        else {}
+                    ),
                     clean_status,
                     timestamp,
                     next_version,
