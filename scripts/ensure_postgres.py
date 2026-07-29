@@ -41,7 +41,6 @@ REQUIRED_TABLE_MIGRATIONS = {
     "access_requests": "036_access_requests.sql",
     "iu_form_tokens": "075_iu_form_tokens.sql",
     "iu_form_merges": "076_iu_form_merges.sql",
-    "iu_bot_reminders": "077_iu_bot_reminders.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {
@@ -49,8 +48,6 @@ REQUIRED_FUNCTION_MIGRATIONS = {
 }
 
 ALWAYS_APPLY_MIGRATIONS = [
-    # Adds notification bookkeeping to the already existing form merge table.
-    "077_iu_bot_reminders.sql",
     # Колонка в уже существующей таблице: проверка «нет таблицы — накатить» её не поймает,
     # поэтому идемпотентный ADD COLUMN IF NOT EXISTS применяется каждый раз.
     "067_funnel_testing_mode.sql",
@@ -123,6 +120,9 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Idempotent: standalone funnel workspace (durable Telegram inbox/outbox, conversations,
     # control leases and audit trail). It intentionally does not import legacy personal chats.
     "070_funnel_workspace.sql",
+    # Depends on the workspace conversations table from 070 and adds notification
+    # bookkeeping to the already existing IU form merge table.
+    "077_iu_bot_reminders.sql",
     # Idempotent: operator-initiated stage moves have no outbox row behind them.
     "071_workspace_operator_stage.sql",
     # Idempotent: комментарии по лиду (заметки оператора и агента, зеркалятся в сделку).
