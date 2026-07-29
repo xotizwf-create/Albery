@@ -95,6 +95,7 @@ def test_alerts_fire_once_at_10_30_60_and_ignore_bot_acknowledgements():
             expected_version=int(current["state_version"]),
             idempotency_key=f"test-ack-{suffix}",
             metadata={"service_reply": True},
+            service=True,
         )
 
         for minute, expected in ((10, "10 минут"), (30, "30 минут"), (60, "60 минут")):
