@@ -65,10 +65,18 @@ def clean_username(value) -> str:
     return text.lstrip("@").strip()
 
 
+#: Название карточки, которую заводит CRM-форма. Опознаём и по нему тоже: СПИСОК сделок
+#: Битрикса не отдаёт служебные поля (`SOURCE_ID`, `UTM_*`) — они видны только в карточке
+#: целиком. Первый живой прогон 29.07.2026 не нашёл ни одной анкеты именно поэтому.
+_FORM_TITLE_RE = re.compile(r"заполнени\w*\s+crm[- ]?форм", re.I)
+
+
 def is_form_deal(deal) -> bool:
     """Сделка родилась из CRM-формы, а не из переписки."""
     fields = (deal or {}).get("fields") or {}
-    return str(fields.get("SOURCE_ID") or "").upper() == "WEBFORM"
+    if str(fields.get("SOURCE_ID") or "").upper() == "WEBFORM":
+        return True
+    return bool(_FORM_TITLE_RE.search(str((deal or {}).get("title") or "")))
 
 
 def token_of(deal) -> str:
@@ -177,12 +185,15 @@ def run_once(*, crm, conn, delete_form: bool = True) -> dict:
     candidates = [d for d in deals if not is_form_deal(d)]
     seen["scanned"] = len(forms)
 
-    for form in forms:
-        form_id = int(form["deal_id"])
+    for listed in forms:
+        form_id = int(listed["deal_id"])
         if already_merged(conn, form_id):
             seen["skipped"] += 1
             continue
 
+        # Карточку читаем целиком: в списке Битрикс не отдаёт ни `SOURCE_ID`, ни метку —
+        # только по ней и можно понять, чья это заявка.
+        form = crm.get_deal(form_id)
         token = token_of(form)
         telegram_id = 0
         if token:
@@ -198,7 +209,7 @@ def run_once(*, crm, conn, delete_form: bool = True) -> dict:
             continue
 
         target = crm.get_deal(target_id)
-        payload = crm.get_deal(form_id)
+        payload = form
         updates = fields_to_copy(form, target)
         stage = next_stage_for(target)
         if updates or stage:

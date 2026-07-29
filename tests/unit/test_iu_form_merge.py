@@ -45,7 +45,11 @@ class FakeCrm:
         self.deleted: list[int] = []
 
     def list_deals(self, *, category_id, limit):
-        return [dict(d) for d in self.deals.values()]
+        """Как отдаёт Битрикс: в СПИСКЕ служебных полей нет.
+
+        Первый живой прогон 29.07.2026 не нашёл ни одной анкеты именно поэтому: `SOURCE_ID`
+        и `UTM_CONTENT` видны только в карточке целиком, а тест этого не воспроизводил."""
+        return [{k: v for k, v in d.items() if k != "fields"} for d in self.deals.values()]
 
     def get_deal(self, deal_id):
         return dict(self.deals[int(deal_id)])
@@ -233,3 +237,11 @@ def test_failed_deletion_still_records_the_merge():
 
     assert stats["merged"] == 1
     assert conn.merges[268]["deleted"] is False
+
+
+def test_form_deal_is_recognised_without_service_fields():
+    """Список сделок Битрикса не отдаёт SOURCE_ID — узнаём анкету и по названию."""
+    listed = {k: v for k, v in FORM_DEAL.items() if k != "fields"}
+
+    assert merge.is_form_deal(listed) is True
+    assert merge.is_form_deal({"title": "Лид Telegram [tg:1] — Кто-то"}) is False
