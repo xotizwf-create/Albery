@@ -332,7 +332,7 @@ function Results({data, onReset}: {data: FormData; onReset: () => void}) {
           rel="noopener noreferrer"
           className="mt-6 flex h-13 w-full items-center justify-center rounded-xl bg-sky-500 px-5 text-center text-sm font-semibold text-white transition hover:bg-sky-600"
         >
-          Обсудить подключение к ИУ
+          Обсудить индивидуальные условия
         </a>
 
         <button
