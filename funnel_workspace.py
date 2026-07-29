@@ -795,9 +795,17 @@ def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
     # Третий бейдж — кто ведёт разговор. Полный перехват остаётся «Человек управляет»:
     # для оператора важно, что отвечает человек, а бессрочность видна отдельной пометкой.
     control_mode = str(payload.get("control_mode") or "")
-    payload["control_label"] = store.CONTROL_MODE_LABELS.get(
-        control_mode,
-        store.CONTROL_MODE_LABELS["paused"],
+    if control_mode == "ai":
+        # Непрочитанные имеют смысл только в операторской очереди. Старые счётчики,
+        # накопленные до этого правила, тоже не должны шуметь в интерфейсе ИИ-диалогов.
+        payload["unread_count"] = 0
+    payload["control_label"] = (
+        "Клиент позвал менеджера"
+        if payload["manager_requested"]
+        else store.CONTROL_MODE_LABELS.get(
+            control_mode,
+            store.CONTROL_MODE_LABELS["paused"],
+        )
     )
     payload["control_permanent"] = store.is_permanent_hold(payload)
     return payload
@@ -970,13 +978,21 @@ def message_create(conversation_id: int) -> tuple[Response, int]:
             "mime_type": stored["mime_type"],
             "file_size": stored["file_size"],
         }
+    import iu_client_bot
+
+    # У клиента остаётся только системное меню Telegram с /start, /menu и /stop.
+    # Закреплённые кнопки сценария не должны висеть во время живого диалога.
+    message_metadata: dict[str, Any] = {
+        "channel": "workspace_ui",
+        "reply_markup": iu_client_bot.remove_keyboard(),
+    }
     result = store.enqueue_outgoing_operator(
         conversation_id,
         text=body.get("text"),
         expected_version=body.get("expected_version"),
         operator_name=workspace_operator_name(),
         idempotency_key=idempotency_key,
-        metadata={"channel": "workspace_ui"},
+        metadata=message_metadata,
         attachment=attachment,
     )
     return _json(result, 200 if result.get("duplicate") else 201)
@@ -1016,6 +1032,15 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
         ),
         permanent=permanent,
     )
+    if mode == "human" and str(conversation.get("source_key") or "") == "telegram_bot":
+        import funnel_telegram_gateway
+
+        queued = funnel_telegram_gateway.hide_client_menu_for_manager(
+            conversation_id,
+            state_version=int(conversation.get("state_version") or 0),
+        )
+        if queued and isinstance(queued.get("conversation"), dict):
+            conversation = queued["conversation"]
     return _json({"conversation": _conversation_payload(dict(conversation))})
 
 

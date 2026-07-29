@@ -273,6 +273,11 @@ def test_operator_send_contract_uses_version_and_idempotency(client, monkeypatch
         }
 
     monkeypatch.setattr(workspace.store, "enqueue_outgoing_operator", enqueue)
+    monkeypatch.setattr(
+        workspace.store,
+        "get_conversation",
+        lambda conversation_id: {"id": conversation_id, "source_key": "telegram"},
+    )
     response = client.post(
         "/api/funnel-workspace/conversations/41/messages",
         json={"text": "Добрый день", "expected_version": 5},
@@ -731,6 +736,22 @@ def test_manager_request_badge_stays_until_operator_reply():
     )["manager_requested"] is False
 
 
+def test_manager_request_replaces_paused_control_status():
+    row = _payload(
+        control_mode="paused",
+        metadata={"manager_requested_at": "2026-07-29T12:00:00+00:00"},
+    )
+
+    assert row["manager_requested"] is True
+    assert row["control_label"] == "Клиент позвал менеджера"
+
+
+def test_ai_conversations_are_serialized_as_read():
+    row = _payload(control_mode="ai", unread_count=7)
+
+    assert row["unread_count"] == 0
+
+
 def test_full_takeover_is_visible_as_a_separate_flag_not_a_fourth_badge():
     """Полный перехват остаётся «Человек управляет»: оператору важно, что отвечает
     человек, а бессрочность — отдельная пометка, а не ещё один статус."""
@@ -843,6 +864,40 @@ def test_an_ordinary_takeover_is_not_permanent(client, monkeypatch):
     assert response.status_code == 200
     assert captured["permanent"] is False
     assert response.get_json()["conversation"]["control_permanent"] is False
+
+
+def test_takeover_hides_the_client_reply_keyboard(client, monkeypatch):
+    import funnel_telegram_gateway
+
+    hidden = {}
+
+    def transition(conversation_id, **_kwargs):
+        return {
+            "id": conversation_id,
+            "control_mode": "human",
+            "resume_at": datetime(2026, 7, 29, 12, 2, tzinfo=timezone.utc),
+            "state_version": 4,
+            "status": "open",
+            "source_key": "telegram_bot",
+            "external_chat_id": "9001",
+            "external_user_id": 9001,
+        }
+
+    def hide(conversation_id, *, state_version):
+        hidden.update(conversation_id=conversation_id, state_version=state_version)
+        return None
+
+    session_payload = login(client)
+    monkeypatch.setattr(workspace.store, "transition_control", transition)
+    monkeypatch.setattr(funnel_telegram_gateway, "hide_client_menu_for_manager", hide)
+    response = client.post(
+        "/api/funnel-workspace/conversations/41/control",
+        json={"mode": "human", "expected_version": 3},
+        headers={"Origin": ORIGIN, "X-CSRF-Token": session_payload["csrf_token"]},
+    )
+
+    assert response.status_code == 200
+    assert hidden == {"conversation_id": 41, "state_version": 4}
 
 
 def test_lead_note_is_saved_and_mirrored_to_the_deal(client, monkeypatch):

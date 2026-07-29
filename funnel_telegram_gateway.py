@@ -680,9 +680,29 @@ def _schedule_existing_question(conversation_id: int, messages: list[dict[str, A
         log.warning("iu client bot: pending question was not scheduled: %s", _safe_error(exc))
 
 
-def _manager_request_metadata(event: str) -> dict[str, Any]:
+def _manager_request_metadata(
+    event: str,
+    conversation_id: int | None = None,
+) -> dict[str, Any]:
     """Delivery metadata for every customer-facing handover to the IU manager."""
 
+    conversation = (
+        _store().get_conversation(conversation_id) or {}
+        if conversation_id is not None
+        else {}
+    )
+    client_name = str(
+        conversation.get("display_name")
+        or (
+            f"@{str(conversation.get('username')).lstrip('@')}"
+            if conversation.get("username")
+            else ""
+        )
+        or "Клиент"
+    ).strip()
+    # Имя попадает в BBCode-сообщение Битрикса: убираем управляющие скобки и переносы,
+    # оставляя само имя читаемым.
+    client_name = " ".join(client_name.replace("[", "").replace("]", "").split())[:300]
     return {
         "iu_event": event,
         "notify_manager_after_delivery": True,
@@ -692,6 +712,7 @@ def _manager_request_metadata(event: str) -> dict[str, Any]:
         "manager_notification_bot_id": (
             _as_int(os.getenv("IU_AGENT_BOT_ID", "86")) or 86
         ),
+        "manager_notification_client_name": client_name or "Клиент",
     }
 
 
@@ -708,7 +729,7 @@ def _reply_and_hand_over(
     """Tell the client, persist the manager badge and enqueue a durable Bitrix alert."""
 
     payload = dict(metadata or {})
-    payload.update(_manager_request_metadata(event))
+    payload.update(_manager_request_metadata(event, conversation_id))
     queued = _reply_to_client(
         conversation_id,
         text,
@@ -723,6 +744,25 @@ def _reply_and_hand_over(
         manager_requested=True,
     )
     return queued
+
+
+def hide_client_menu_for_manager(
+    conversation_id: int,
+    *,
+    state_version: int,
+) -> Mapping[str, Any] | None:
+    """Remove the scenario reply keyboard as soon as an operator takes the chat."""
+
+    import iu_client_bot
+
+    return _reply_to_client(
+        conversation_id,
+        "Менеджер подключился к диалогу.",
+        idempotency_key=f"iu-bot:manager-takeover:{conversation_id}:{state_version}",
+        reply_markup=iu_client_bot.remove_keyboard(),
+        metadata={"iu_event": "manager_takeover"},
+        service=True,
+    )
 
 
 def _send_terms_documents(conversation_id: int, *, idempotency_key: str) -> None:
@@ -1861,7 +1901,12 @@ def prepare_reply(
         "trace": dict(outcome.trace or {}),
     }
     if escalate:
-        metadata.update(_manager_request_metadata("ai_escalation"))
+        metadata.update(
+            _manager_request_metadata(
+                "ai_escalation",
+                _as_int((conversation or {}).get("id")),
+            )
+        )
     # Клиенту, который уже несколько раз спросил у ИИ, показываем прямой путь к человеку.
     # В переписке менеджера кнопки не нужны: там и так отвечает человек.
     if conversation and str(conversation.get("source_key") or "") == BOT_SOURCE_KEY:
@@ -2652,11 +2697,19 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
             or _as_int(os.getenv("IU_AGENT_BOT_ID", "86"))
             or 86
         )
+        client_name = str(
+            payload.get("manager_notification_client_name") or "Клиент"
+        ).strip()
+        client_label = (
+            f"Клиент {client_name}"
+            if client_name and client_name.casefold() != "клиент"
+            else "Клиент"
+        )
         tg_agent.mcp_call(
             "notify_iu_group",
             {
                 "text": (
-                    "Клиент позвал менеджера в "
+                    f"{client_label} позвал менеджера в "
                     f"[URL={dialog_url}]диалоге[/URL]"
                 ),
                 "dialog_id": recipient,

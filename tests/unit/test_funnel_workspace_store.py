@@ -424,7 +424,7 @@ def _paused_dialog_responder(conv_before, message, job, executed_modes):
                 **conv_before,
                 "status": params[0],
                 "control_mode": params[1],
-                "state_version": params[5],
+                "state_version": params[9],
             }
         if sql.startswith("INSERT INTO funnel_workspace_control_events"):
             return {"id": 81}
@@ -830,6 +830,51 @@ def test_control_transition_takes_human_lease_and_advances_version():
     assert result["control_mode"] == "human"
     assert result["state_version"] == 8
     assert result["resume_at"] == datetime(2026, 7, 26, 12, 2, tzinfo=timezone.utc)
+
+
+def test_control_return_to_ai_clears_operator_unread_queue():
+    before = conversation(
+        state_version=7,
+        control_mode="human",
+        unread_count=4,
+        last_message_id=91,
+    )
+    after = conversation(
+        state_version=8,
+        control_mode="ai",
+        unread_count=0,
+        last_read_message_id=91,
+    )
+
+    def respond(sql, _params):
+        if sql.startswith("SELECT * FROM funnel_workspace_conversations"):
+            return before
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            return after
+        if sql.startswith("INSERT INTO funnel_workspace_control_events"):
+            return None
+        if sql.startswith("SELECT client.id"):
+            return None
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    result = store.transition_control(
+        41,
+        mode="ai",
+        expected_version=7,
+        actor_name="Александр",
+        now=NOW,
+        connect=connect,
+    )
+
+    update_sql = next(
+        sql
+        for sql, _params in connection.cursor_instance.executed
+        if sql.startswith("UPDATE funnel_workspace_conversations")
+    )
+    assert "unread_count = CASE WHEN %s = 'ai' THEN 0" in update_sql
+    assert "last_read_message_id = CASE" in update_sql
+    assert result["unread_count"] == 0
 
 
 def test_human_takeover_rejects_an_ai_send_already_at_provider_boundary():
@@ -1368,6 +1413,20 @@ def test_unknown_urgency_is_refused():
 
     with pytest.raises(store.WorkspaceValidationError):
         store.list_conversations(urgency="очень-очень", connect=connect)
+
+
+def test_manager_request_is_available_as_a_status_filter():
+    def respond(sql, _params):
+        if "SELECT c.*, s.source_type" in sql:
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    store.list_conversations(urgency="manager_requested", connect=connect)
+    sql = connection.cursor_instance.executed[0][0]
+
+    assert "manager_requested_at" in sql
+    assert "manager_request_handled_at" in sql
 
 
 def test_migration_allows_a_stage_move_without_a_sent_message():

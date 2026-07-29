@@ -835,6 +835,7 @@ def test_operator_request_notifies_alexander_from_iu_agent_with_dialog_link(
             "notify_manager_after_delivery": True,
             "manager_notification_recipient": "16",
             "manager_notification_bot_id": 86,
+            "manager_notification_client_name": "Александр Никитенко",
         },
     }
 
@@ -846,7 +847,7 @@ def test_operator_request_notifies_alexander_from_iu_agent_with_dialog_link(
             "notify_iu_group",
             {
                 "text": (
-                    "Клиент позвал менеджера в "
+                    "Клиент Александр Никитенко позвал менеджера в "
                     "[URL=https://www.m4s.ru/agent-funnels/311]диалоге[/URL]"
                 ),
                 "dialog_id": "16",

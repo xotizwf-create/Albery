@@ -33,6 +33,7 @@ class FakeStore:
             "state_version": 7,
             "control_mode": self.control_mode,
             "source_key": "telegram_bot",
+            "display_name": "Пётр Иванов",
         }
 
     def count_agent_replies(self, conversation_id):
@@ -215,6 +216,7 @@ def test_file_handover_always_sets_badge_and_bitrix_notification(monkeypatch):
     assert store.queued[0]["metadata"]["notify_manager_after_delivery"] is True
     assert store.queued[0]["metadata"]["manager_notification_recipient"] == "16"
     assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
+    assert store.queued[0]["metadata"]["manager_notification_client_name"] == "Пётр Иванов"
     assert store.transitions[0]["manager_requested"] is True
 
 

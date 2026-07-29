@@ -99,9 +99,10 @@ JOIN_STUB = (
 
 #: Анкета уже заполнена: второй раз её давать нельзя (владелец 29.07.2026). Данные
 #: показываем те, что РЕАЛЬНО лежат в сделке, — «вот ваши данные» из его же формулировки.
-JOIN_FILLED = (
-    "Анкета уже получена и прикреплена к вашей заявке. Менеджер готовит дальнейшие шаги.\n\n"
-    "Напишите здесь, что нужно изменить, — передам менеджеру."
+JOIN_FILLED_FOLLOWUP = (
+    "Если всё верно - то пожалуйста, подождите, менеджер с Вами скоро свяжется\n\n"
+    "Если у Вас есть срочный вопрос или нужно изменить данные в анкете - "
+    "напишите прямо сюда, я передам это менеджеру"
 )
 FORM_RECEIVED = (
     "Увидел Вашу анкету, менеджер свяжется с Вами в ближайшее время!"
@@ -125,7 +126,10 @@ def join_answer(anketa: str, url: str, *, repeated: bool = False) -> tuple[str, 
 
     body = str(anketa or "").strip()
     if body:
-        return JOIN_FILLED, True
+        confirmation = "Всё верно?"
+        if body.endswith(confirmation):
+            body = body[: -len(confirmation)].rstrip()
+        return f"{body}\n\n{JOIN_FILLED_FOLLOWUP}", True
     return join_reply(url, repeated=repeated), False
 
 ASK_PROMPT = (

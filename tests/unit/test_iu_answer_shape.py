@@ -280,6 +280,13 @@ def test_already_filled_answer_does_not_offer_the_form_again():
     И показывает данные из САМОЙ сделки: «вот ваши данные» из его же формулировки."""
     import iu_client_bot
 
-    assert "Анкета уже получена" in iu_client_bot.JOIN_FILLED
-    assert "что нужно изменить" in iu_client_bot.JOIN_FILLED
-    assert "http" not in iu_client_bot.JOIN_FILLED
+    body, filled = iu_client_bot.join_answer(
+        "Вижу анкету:\n\n• Имя — Александр\n\nВсё верно?",
+        "",
+    )
+
+    assert filled is True
+    assert "• Имя — Александр" in body
+    assert "Если всё верно - то пожалуйста, подождите" in body
+    assert "нужно изменить данные в анкете" in body
+    assert "http" not in body

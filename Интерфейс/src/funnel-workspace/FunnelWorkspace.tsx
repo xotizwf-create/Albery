@@ -1022,6 +1022,20 @@ function ControlBadge({
   now: number;
   compact?: boolean;
 }) {
+  if (conversation.manager_requested) {
+    return (
+      <span
+        className={cn(
+          "inline-flex items-center gap-1.5 rounded-full bg-rose-50 font-black text-rose-700 ring-1 ring-inset ring-rose-200",
+          compact ? "px-2 py-1 text-[10px]" : "px-2.5 py-1.5 text-[11px]",
+        )}
+      >
+        <BellRing className={compact ? "h-3 w-3" : "h-3.5 w-3.5"} />
+        Клиент позвал менеджера
+      </span>
+    );
+  }
+
   if (conversation.can_reply === false) {
     return (
       <span
@@ -1081,27 +1095,6 @@ function ControlBadge({
     >
       <UserRound className={compact ? "h-3 w-3" : "h-3.5 w-3.5"} />
       {(conversation.control_label || "Человек управляет") + note}
-    </span>
-  );
-}
-
-function ManagerRequestedBadge({
-  conversation,
-  compact = false,
-}: {
-  conversation: Conversation;
-  compact?: boolean;
-}) {
-  if (!conversation.manager_requested) return null;
-  return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1.5 rounded-full bg-rose-50 font-black text-rose-700 ring-1 ring-inset ring-rose-200",
-        compact ? "px-2 py-1 text-[10px]" : "px-2.5 py-1.5 text-[11px]",
-      )}
-    >
-      <BellRing className={compact ? "h-3 w-3" : "h-3.5 w-3.5"} />
-      Клиент позвал менеджера
     </span>
   );
 }
@@ -1245,6 +1238,7 @@ function ConversationList({
             onChange={onUrgencyChange}
             options={[
               { value: "all", label: "Все статусы" },
+              { value: "manager_requested", label: "Клиент позвал менеджера", color: "#e11d48" },
               { value: "client_waiting", label: "Клиент ждёт ответ", color: "#d97706" },
               { value: "waiting_client", label: "Ждём ответ клиента", color: "#64748b" },
               { value: "urgent", label: "Очень срочно", color: "#dc2626" },
@@ -1466,7 +1460,6 @@ function ConversationList({
                           urgentAfterMinutes={urgentAfterMinutes}
                           compact
                         />
-                        <ManagerRequestedBadge conversation={conversation} compact />
                         <ControlBadge conversation={conversation} now={now} compact />
                       </span>
                     </span>
@@ -1884,9 +1877,6 @@ function ChatPanel({
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
-          <div className="hidden lg:block">
-            <ManagerRequestedBadge conversation={conversation} />
-          </div>
           <div className="hidden lg:block">
             <ControlBadge conversation={conversation} now={now} />
           </div>
@@ -2322,7 +2312,6 @@ function ConversationDetails({
             <div className="text-[10px] font-black uppercase tracking-[0.12em] text-slate-400">
               Управление диалогом
             </div>
-            <ManagerRequestedBadge conversation={conversation} compact />
             <ControlBadge conversation={conversation} now={now} compact />
           </div>
           <div className="mt-3 text-xs leading-5 text-slate-500">
@@ -2553,6 +2542,11 @@ function OperatorWorkspace({
   const mobilePaneRef = useRef<MobilePane>("list");
   const listRequestSequenceRef = useRef(0);
   const messageRequestSequenceRef = useRef(0);
+  const unreadSnapshotRef = useRef<Map<string, number> | null>(null);
+  const notificationAudioRef = useRef<AudioContext | null>(null);
+  const baseDocumentTitleRef = useRef(
+    typeof document === "undefined" ? "Обращения" : document.title,
+  );
 
   const selectedConversation = useMemo(
     () =>
@@ -2561,6 +2555,64 @@ function OperatorWorkspace({
       ) || null,
     [conversations, selectedId],
   );
+
+  const operatorUnreadTotal = useMemo(
+    () =>
+      conversations.reduce(
+        (sum, conversation) =>
+          sum +
+          (conversation.control_mode === "ai"
+            ? 0
+            : Math.max(0, Number(conversation.unread_count) || 0)),
+        0,
+      ),
+    [conversations],
+  );
+
+  useEffect(() => {
+    const unlockAudio = () => {
+      if (!notificationAudioRef.current) {
+        notificationAudioRef.current = new window.AudioContext();
+      }
+      if (notificationAudioRef.current.state === "suspended") {
+        void notificationAudioRef.current.resume();
+      }
+    };
+    window.addEventListener("pointerdown", unlockAudio, { once: true });
+    window.addEventListener("keydown", unlockAudio, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", unlockAudio);
+      window.removeEventListener("keydown", unlockAudio);
+      const context = notificationAudioRef.current;
+      notificationAudioRef.current = null;
+      if (context) void context.close();
+    };
+  }, []);
+
+  const playManagerNotification = useCallback(() => {
+    const context = notificationAudioRef.current;
+    if (!context || context.state !== "running") return;
+    const start = context.currentTime;
+    const gain = context.createGain();
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.055, start + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.42);
+    gain.connect(context.destination);
+    [659.25, 783.99].forEach((frequency, index) => {
+      const oscillator = context.createOscillator();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(frequency, start);
+      oscillator.connect(gain);
+      oscillator.start(start + index * 0.1);
+      oscillator.stop(start + 0.28 + index * 0.1);
+    });
+  }, []);
+
+  useEffect(() => {
+    document.title = operatorUnreadTotal
+      ? `(${operatorUnreadTotal}) ${baseDocumentTitleRef.current}`
+      : baseDocumentTitleRef.current;
+  }, [operatorUnreadTotal]);
 
   // Комментарии по лиду грузятся под выбранное обращение: список короткий, а держать их
   // все в памяти списка значило бы тянуть заметки по каждому диалогу на каждом обновлении.
@@ -2685,6 +2737,22 @@ function OperatorWorkspace({
         });
         if (sequence !== listRequestSequenceRef.current) return;
         const rows = Array.isArray(payload.conversations) ? payload.conversations : [];
+        const previousUnread = unreadSnapshotRef.current;
+        const nextUnread = new Map(
+          rows.map((row) => [stringId(row.id), Math.max(0, Number(row.unread_count) || 0)]),
+        );
+        unreadSnapshotRef.current = nextUnread;
+        if (
+          previousUnread &&
+          rows.some(
+            (row) =>
+              row.control_mode !== "ai" &&
+              (nextUnread.get(stringId(row.id)) || 0) >
+                (previousUnread.get(stringId(row.id)) || 0),
+          )
+        ) {
+          playManagerNotification();
+        }
         setConversationTotal(Number(payload.total) || rows.length);
         setConversations((current) => {
           if (replaceAll || current.length <= rows.length) return rows;
@@ -2710,7 +2778,7 @@ function OperatorWorkspace({
         if (!quiet) setListLoading(false);
       }
     },
-    [query, reportError, stage, urgency],
+    [playManagerNotification, query, reportError, stage, urgency],
   );
 
   const loadMoreConversations = useCallback(async () => {
@@ -3034,8 +3102,11 @@ function OperatorWorkspace({
     }
   };
 
-  const setControl = async (mode: "human" | "ai", permanent = false) => {
-    const conversation = selectedConversation;
+  const setConversationControl = async (
+    conversation: Conversation | null,
+    mode: "human" | "ai",
+    permanent = false,
+  ) => {
     if (!conversation || controlBusy) return;
     // Полный перехват из режима «человек» — не смена режима, а снятие срока возврата,
     // поэтому одинаковый режим здесь блокировать нельзя.
@@ -3081,6 +3152,10 @@ function OperatorWorkspace({
     } finally {
       setControlBusy(false);
     }
+  };
+
+  const setControl = async (mode: "human" | "ai", permanent = false) => {
+    await setConversationControl(selectedConversation, mode, permanent);
   };
 
   const deleteConversation = async (conversation: Conversation) => {
@@ -3422,7 +3497,8 @@ function OperatorWorkspace({
                   label: "Взять себе",
                   icon: <UserRound className="h-3.5 w-3.5" />,
                   disabled: contextMenu.conversation.can_reply === false,
-                  onSelect: () => void setControl("human"),
+                  onSelect: () =>
+                    void setConversationControl(contextMenu.conversation, "human"),
                 }
               : {
                   key: "give",
@@ -3431,7 +3507,8 @@ function OperatorWorkspace({
                   disabled:
                     contextMenu.conversation.can_reply === false ||
                     !contextMenu.conversation.ai_available,
-                  onSelect: () => void setControl("ai"),
+                  onSelect: () =>
+                    void setConversationControl(contextMenu.conversation, "ai"),
                 },
             {
               key: "hold",
@@ -3440,7 +3517,8 @@ function OperatorWorkspace({
               disabled:
                 contextMenu.conversation.can_reply === false ||
                 Boolean(contextMenu.conversation.control_permanent),
-              onSelect: () => void setControl("human", true),
+              onSelect: () =>
+                void setConversationControl(contextMenu.conversation, "human", true),
             },
             {
               key: "delete",

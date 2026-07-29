@@ -167,9 +167,14 @@ def test_join_copy_for_first_repeat_and_filled_states():
     assert filled is False
     assert repeated.startswith("Вижу, анкета ещё не заполнена")
 
-    complete, filled = bot.join_answer("данные из CRM", "")
+    complete, filled = bot.join_answer(
+        "Вижу анкету:\n\n• Категория — Одежда\n\nВсё верно?", ""
+    )
     assert filled is True
-    assert "Анкета уже получена" in complete
+    assert "• Категория — Одежда" in complete
+    assert "Если всё верно - то пожалуйста, подождите" in complete
+    assert "нужно изменить данные в анкете" in complete
+    assert complete.count("Всё верно?") == 0
     assert "https://" not in complete
 
 

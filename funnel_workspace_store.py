@@ -54,6 +54,7 @@ HAS_ANSWER_SQL = f"""EXISTS (
 WORK_STATE_CLIENT_WAITING = "client_waiting"  # клиент ждёт нашего ответа
 WORK_STATE_WAITING_CLIENT = "waiting_client"  # последнее слово за нами
 WORK_STATE_URGENT = "urgent"           # клиент ждёт дольше порога (дополняет первый)
+FILTER_MANAGER_REQUESTED = "manager_requested"  # клиент явно запросил живого менеджера
 
 # Ушедший статус: старые ссылки, сохранённые фильтры и вызовы инструментов агента с ним
 # приходят до сих пор — читаем как «клиент ждёт ответа», а не отвечаем ошибкой.
@@ -63,6 +64,7 @@ VALID_WORK_STATES = frozenset({
     WORK_STATE_CLIENT_WAITING,
     WORK_STATE_WAITING_CLIENT,
     WORK_STATE_URGENT,
+    FILTER_MANAGER_REQUESTED,
 })
 
 WORK_STATE_LABELS = {
@@ -1165,7 +1167,16 @@ def list_conversations(
         threshold = f"now() - interval '{urgent_after_minutes()} minutes'"
         # Ход за нами — независимо от того, отвечали мы в этом диалоге раньше или нет:
         # без этого клиент, которому ещё ни разу не ответили, выпадал из обоих фильтров.
-        if clean_state == WORK_STATE_CLIENT_WAITING:
+        if clean_state == FILTER_MANAGER_REQUESTED:
+            clauses.append(
+                """c.metadata ->> 'manager_requested_at' IS NOT NULL
+                   AND (
+                       c.metadata ->> 'manager_request_handled_at' IS NULL
+                       OR c.metadata ->> 'manager_request_handled_at'
+                          < c.metadata ->> 'manager_requested_at'
+                   )"""
+            )
+        elif clean_state == WORK_STATE_CLIENT_WAITING:
             clauses.append(f"{AWAITING_REPLY_SQL} IS NOT NULL")
         elif clean_state == WORK_STATE_WAITING_CLIENT:
             clauses.append(f"{AWAITING_REPLY_SQL} IS NULL")
@@ -1665,6 +1676,17 @@ def transition_control(
                    SET control_mode = %s,
                        resume_at = %s,
                        assigned_to = %s,
+                       last_read_message_id = CASE
+                           WHEN %s = 'ai' THEN GREATEST(
+                               last_read_message_id,
+                               COALESCE(last_message_id, 0)
+                           )
+                           ELSE last_read_message_id
+                       END,
+                       unread_count = CASE
+                           WHEN %s = 'ai' THEN 0
+                           ELSE unread_count
+                       END,
                        state_version = %s,
                        updated_at = %s
                  WHERE id = %s
@@ -1674,6 +1696,8 @@ def transition_control(
                     clean_mode,
                     resume_at,
                     assigned_to,
+                    clean_mode,
+                    clean_mode,
                     next_version,
                     timestamp,
                     row["id"],
@@ -2388,7 +2412,7 @@ def ingest_business_message(
             new_mode = old_mode
             resume_at = conversation.get("resume_at")
             assigned_to = conversation.get("assigned_to")
-            unread_increment = 1 if clean_author == "client" else 0
+            unread_increment = 0
             next_status = str(conversation["status"])
             if clean_author == "client" and next_status in {"closed", "expired"}:
                 next_status = "open"
@@ -2431,6 +2455,11 @@ def ingest_business_message(
                     int(conversation["id"]),
                     "Оператор ответил напрямую в Telegram.",
                 )
+            # Непрочитанные — очередь именно для человека. Пока диалог ведёт ИИ,
+            # входящие автоматически считаются обработанными и не создают шум/звук в UI.
+            # В paused сообщение сохраняем непрочитанным: это очередь вызванного менеджера.
+            if clean_author == "client" and new_mode != "ai":
+                unread_increment = 1
 
             current_version = int(conversation["state_version"])
             next_version = current_version + 1
@@ -2442,7 +2471,14 @@ def ingest_business_message(
                        resume_at = %s,
                        assigned_to = %s,
                        metadata = metadata || %s,
-                       unread_count = unread_count + %s,
+                       last_read_message_id = CASE
+                           WHEN %s = 'ai' THEN GREATEST(last_read_message_id, %s)
+                           ELSE last_read_message_id
+                       END,
+                       unread_count = CASE
+                           WHEN %s = 'ai' THEN 0
+                           ELSE unread_count + %s
+                       END,
                        state_version = %s,
                        reply_deadline_at = CASE
                            WHEN %s <> 'client' THEN reply_deadline_at
@@ -2468,6 +2504,9 @@ def ingest_business_message(
                         if clean_author == "operator"
                         else {}
                     ),
+                    new_mode,
+                    message["id"],
+                    new_mode,
                     unread_increment,
                     next_version,
                     clean_author,
@@ -4173,6 +4212,10 @@ def _enqueue_delivery_effect_action_cursor(
         ),
         "manager_notification_bot_id": _optional_int(
             source_payload.get("manager_notification_bot_id")
+        ),
+        "manager_notification_client_name": _clean_optional(
+            source_payload.get("manager_notification_client_name"),
+            300,
         ),
         "provider_message_id": _clean_optional(
             outbox.get("provider_message_id"),
