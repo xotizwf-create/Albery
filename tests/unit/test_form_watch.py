@@ -13,8 +13,8 @@ import pytest
 LABELS = {
     "UF_CRM_1784297026": "Ссылка на магазин / бренд WB",
     "UF_CRM_1784297137": "Категории товара",
-    "UF_CRM_1784297181": "Оборот на WB сейчас, ₽/мес.",
-    "UF_CRM_1784297221": "Планируемый оборот через кабинет, ₽/мес.",
+    "UF_CRM_1784297181": "Оборот на WB сейчас, млн ₽/мес.",
+    "UF_CRM_1784297221": "Планируемый оборот через кабинет, млн ₽/мес.",
 }
 
 DEAL = {
@@ -22,8 +22,8 @@ DEAL = {
     "custom_fields": {
         "UF_CRM_1784297026": "Test",
         "UF_CRM_1784297137": "одежда",
-        "UF_CRM_1784297181": "5000000",
-        "UF_CRM_1784297221": "20000000",
+        "UF_CRM_1784297181": "5",
+        "UF_CRM_1784297221": "20",
     },
 }
 
@@ -55,8 +55,8 @@ def test_anketa_block_uses_live_field_names(tg):
         "Вижу анкету:\n\n"
         "• Ссылка на магазин / бренд WB — Test\n"
         "• Категории товара — одежда\n"
-        "• Оборот на WB сейчас, ₽/мес. — 5 млн\n"
-        "• Планируемый оборот через кабинет, ₽/мес. — 20 млн\n\n"
+        "• Оборот на WB сейчас, млн ₽/мес. — 5\n"
+        "• Планируемый оборот через кабинет, млн ₽/мес. — 20\n\n"
         "Всё верно?")
 
 
@@ -65,7 +65,22 @@ def test_renamed_field_changes_the_message_without_deploy(tg, monkeypatch):
     renamed = dict(LABELS, UF_CRM_1784297181="Оборот на данный момент")
     monkeypatch.setattr(tg, "_deal_field_labels", lambda: renamed)
 
-    assert "• Оборот на данный момент — 5 млн" in tg.anketa_block(DEAL)
+    assert "• Оборот на данный момент — 5" in tg.anketa_block(DEAL)
+
+
+def test_turnover_form_values_are_explicitly_labeled_as_millions(tg):
+    deal = {
+        "stage_id": "C16:NEW",
+        "custom_fields": {
+            "UF_CRM_1784297181": "200",
+            "UF_CRM_1784297221": "300",
+        },
+    }
+
+    block = tg.anketa_block(deal)
+
+    assert "• Оборот на WB сейчас, млн ₽/мес. — 200" in block
+    assert "• Планируемый оборот через кабинет, млн ₽/мес. — 300" in block
 
 
 def test_empty_form_fields_are_not_shown(tg):
@@ -140,12 +155,12 @@ def test_refilled_anketa_is_surveyed_again(tg, monkeypatch):
     assert len(sent) == 1
 
     changed = dict(DEAL, custom_fields=dict(DEAL["custom_fields"],
-                                            UF_CRM_1784297181="9000000"))
+                                            UF_CRM_1784297181="9"))
     monkeypatch.setattr(tg, "_deal_for_watch", lambda i: dict(changed))
     tg._check_new_forms()
 
     assert len(sent) == 2, "изменившаяся анкета обязана получить новую сверку"
-    assert "9 млн" in sent[1][1]
+    assert "млн ₽/мес. — 9" in sent[1][1]
 
 
 def test_empty_anketa_is_not_surveyed(tg, monkeypatch):

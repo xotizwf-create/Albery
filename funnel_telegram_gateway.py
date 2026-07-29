@@ -910,6 +910,9 @@ def _hand_over_to_human(
             expected_version=conversation.get("state_version"),
             reason=reason,
             manager_requested=manager_requested,
+            # Явный handoff — не временный перехват. ИИ не должен сам вернуться через
+            # две минуты; только действие менеджера/UI/MCP вернёт режим ``ai``.
+            permanent_human=True,
         )
     except Exception as exc:  # noqa: BLE001 - клиент уже получил ответ, сбой не должен его терять
         log.warning("iu client bot: handover failed for %s: %s", conversation_id, _safe_error(exc))

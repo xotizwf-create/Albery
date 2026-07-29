@@ -218,6 +218,7 @@ def test_file_handover_always_sets_badge_and_bitrix_notification(monkeypatch):
     assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
     assert store.queued[0]["metadata"]["manager_notification_client_name"] == "Пётр Иванов"
     assert store.transitions[0]["manager_requested"] is True
+    assert store.transitions[0]["permanent_human"] is True
 
 
 def test_calculator_message_requests_form_without_starting_ai(monkeypatch):
@@ -334,6 +335,7 @@ def test_calling_the_operator_hands_the_dialog_to_a_human(monkeypatch):
     assert store.transitions, "обращение обязано встать в очередь к человеку"
     assert "оператор" in store.transitions[0]["reason"].lower()
     assert store.transitions[0]["manager_requested"] is True
+    assert store.transitions[0]["permanent_human"] is True
     assert "менеджер" in store.queued[0]["text"].lower()
     assert store.queued[0]["metadata"]["notify_manager_after_delivery"] is True
     assert store.queued[0]["metadata"]["manager_notification_recipient"] == "16"

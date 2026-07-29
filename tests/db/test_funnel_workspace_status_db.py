@@ -214,6 +214,40 @@ def test_closing_question_clears_the_manager_request_badge():
         _cleanup(source_key)
 
 
+def test_explicit_manager_request_is_a_permanent_human_takeover():
+    suffix = uuid4().hex[:12]
+    source_key = f"test-manager-permanent-{suffix}"
+    chat_id = "700000207"
+    try:
+        store.ensure_source(
+            source_key,
+            source_type="test",
+            display_name="permanent manager takeover",
+        )
+        first = _ingest(
+            source_key,
+            chat_id,
+            author="client",
+            text="Позовите менеджера",
+            message_id=f"{suffix}-1",
+        )
+        conversation_id = int(first["conversation"]["id"])
+
+        requested = store.mark_waiting_human(
+            conversation_id,
+            expected_version=int(first["conversation"]["state_version"]),
+            reason="Клиент позвал менеджера.",
+            manager_requested=True,
+            permanent_human=True,
+        )
+
+        assert requested["control_mode"] == "human"
+        assert requested["resume_at"] is None
+        assert store.is_permanent_hold(requested) is True
+    finally:
+        _cleanup(source_key)
+
+
 def test_returning_dialog_to_ai_clears_the_manager_request_badge():
     suffix = uuid4().hex[:12]
     source_key = f"test-manager-ai-{suffix}"

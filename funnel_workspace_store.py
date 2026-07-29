@@ -1745,11 +1745,20 @@ def mark_waiting_human(
     reason: str,
     assigned_to: str | None = None,
     manager_requested: bool = False,
+    permanent_human: bool = False,
     now: datetime | None = None,
     connect: ConnectFactory | None = None,
 ) -> dict[str, Any]:
+    """Поставить обращение в очередь человеку.
+
+    ``permanent_human=True`` означает явный вызов менеджера клиентом: управление сразу
+    передаётся человеку без двухминутной аренды и не вернётся ИИ само. Обычная
+    эскалация без этого флага остаётся на паузе до решения оркестратора/оператора.
+    """
+
     timestamp = _now(now)
     clean_reason = _required_text(reason, "reason", 1000)
+    next_mode = "human" if permanent_human else "paused"
     with _connection(connect) as conn:
         with conn.cursor() as cur:
             row = _load_conversation_locked(cur, conversation_id)
@@ -1760,7 +1769,7 @@ def mark_waiting_human(
                 """
                 UPDATE funnel_workspace_conversations
                    SET status = 'waiting',
-                       control_mode = 'paused',
+                       control_mode = %s,
                        resume_at = NULL,
                        assigned_to = %s,
                        metadata = metadata || %s,
@@ -1770,6 +1779,7 @@ def mark_waiting_human(
              RETURNING *
                 """,
                 (
+                    next_mode,
                     _clean_optional(assigned_to, 200),
                     Jsonb(
                         {
@@ -1789,7 +1799,7 @@ def mark_waiting_human(
                 cur,
                 conversation_id=int(row["id"]),
                 from_mode=row["control_mode"],
-                to_mode="paused",
+                to_mode=next_mode,
                 actor_type="agent",
                 actor_name="ИИ-агент",
                 reason=clean_reason,

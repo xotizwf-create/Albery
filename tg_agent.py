@@ -1375,13 +1375,21 @@ def _deal_field_labels() -> dict[str, str]:
     return dict(_FIELD_LABELS_CACHE["labels"])
 
 
-def _fmt_form_value(value) -> str:
-    """Числа анкеты — по-человечески: 5000000 → «5 млн», 1500000 → «1.5 млн»."""
+def _fmt_form_value(value, *, label: str = "") -> str:
+    """Показать число без двойного применения единицы из названия поля.
+
+    В полях с подписью «млн ₽/мес.» значение 200 уже означает 200 млн. Его нельзя
+    делить ещё раз или дописывать второе «млн». Для старых рублёвых полей сохраняем
+    прежнее сокращение 5 000 000 → «5 млн».
+    """
+
     s = str(value).strip()
     try:
         n = float(s.replace(" ", "").replace(",", "."))
     except ValueError:
         return s
+    if "млн" in str(label or "").casefold():
+        return str(int(n)) if n.is_integer() else f"{n:.15g}"
     if n >= 1_000_000:
         return f"{n / 1_000_000:g} млн"
     if n == int(n):
@@ -1402,7 +1410,8 @@ def anketa_block(deal: dict) -> str:
         value = uf.get(code)
         if not _filled(value):
             continue
-        lines.append(f"• {labels.get(code, code)} — {_fmt_form_value(value)}")
+        label = labels.get(code, code)
+        lines.append(f"• {label} — {_fmt_form_value(value, label=label)}")
     if not lines:
         return ""
     return "Вижу анкету:\n\n" + "\n".join(lines) + "\n\nВсё верно?"

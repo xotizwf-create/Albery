@@ -11,7 +11,8 @@ Checks:
 2. Core MCP endpoints answer tools/list with sane tool counts.
 3. The dedicated customer connector is active and exposes exactly zero tools.
 4. The site and standalone funnel workspace routes are wired.
-5. When the workspace is enabled, its password, Telegram right and rollout flags are coherent.
+5. When the workspace is enabled, its password, at least one Telegram transport and
+   rollout flags are coherent.
 
 Exit code 0 = safe to walk away; 1 = do not leave the deploy like this.
 """
@@ -340,8 +341,9 @@ try:
 except Exception as exc:  # noqa: BLE001
     failures.append(f"workspace tables: {exc}")
 
-# 5. Enabling the workspace is a cutover: the legacy sender must be off and the new
-# transport must actually hold the Telegram Business reply right.
+# 5. Enabling the workspace is a cutover: the legacy sender must be off and at least
+# one real transport must be available. The workspace serves both Telegram Business
+# and the public IU bot, so requiring Business specifically produces a false alarm.
 workspace_enabled = env_flag("FUNNEL_WORKSPACE_ENABLED")
 ai_enabled = env_flag("FUNNEL_WORKSPACE_AI_ENABLED")
 allowlist_raw = os.getenv("FUNNEL_WORKSPACE_AI_ALLOW_IDS", "")
@@ -418,18 +420,12 @@ if workspace_enabled:
     if not looks_like_password_hash(password_hash):
         failures.append("workspace включён без отдельного password hash")
 
-    try:
-        state = json.loads((BASE / ".tg_agent_state.json").read_text(encoding="utf-8"))
-        connected = any(
-            info
-            and info.get("enabled") is True
-            and info.get("can_reply") is True
-            for info in (state.get("business") or {}).values()
-        )
-    except (OSError, ValueError):
-        connected = False
-    if not connected:
-        failures.append("workspace включён, но Telegram Business не может отвечать")
+    import funnel_telegram_gateway
+
+    if not funnel_telegram_gateway.telegram_connected():
+        failures.append("workspace включён, но ни один Telegram-транспорт не готов")
+    else:
+        print("workspace Telegram transport: OK")
 
 if failures:
     print("SMOKE FAILED:")
