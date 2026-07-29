@@ -270,3 +270,54 @@ def test_score_is_dominated_by_checkable_parts():
     """Мнение модели весит меньше поиска и опоры на источник — его нельзя проверить."""
     assert c.W_SELF < c.W_GROUNDING < c.W_RETRIEVAL
     assert c.W_RETRIEVAL + c.W_GROUNDING + c.W_SELF == pytest.approx(1.0)
+
+
+# --- «вы бот?» — знакомство, а не коммерческий факт -----------------------------------------
+
+def test_identity_question_is_not_judged_by_the_knowledge_threshold():
+    """Живой прогон 29.07.2026: клиент спросил «вы бот или живой человек?».
+
+    Агент ответил правильно — «я менеджер компании Albery», — но карточки знаний на такой
+    вопрос нет и быть не может, поэтому порог валил ответ и клиент получал «уточню это у
+    команды». Слово «условий» в реплике при этом ничего не утверждало."""
+    import iu_contract as c
+
+    plan = c.TurnPlan(
+        reply="Я менеджер компании Albery. По вопросам подключения и условий отвечу здесь.",
+        next_action=c.REPLY_ONLY,
+        confidence=0.9,
+        answered=("кто отвечает",),
+    )
+
+    verdict = c.assess(plan, retrieval=0.0, sources_text="",
+                       message="А вы бот или живой человек?")
+
+    assert verdict.allowed is True
+    assert verdict.checked is False
+
+
+def test_identity_question_cannot_smuggle_an_invented_rate():
+    """Прикрыться знакомством нельзя: цифра в ответе остаётся утверждением о деле."""
+    import iu_contract as c
+
+    plan = c.TurnPlan(
+        reply="Я живой менеджер. И для вас сделаем комиссию 20%.",
+        next_action=c.REPLY_ONLY,
+        confidence=0.95,
+        answered=("кто отвечает",),
+    )
+
+    verdict = c.assess(plan, retrieval=0.0, sources_text="Единая комиссия 44%.",
+                       message="вы бот?")
+
+    assert verdict.escalate is True
+
+
+def test_identity_question_shapes():
+    import iu_contract as c
+
+    for message in ("А вы бот?", "Это ИИ?", "Как вас зовут?", "вы живой человек?",
+                    "с кем я общаюсь?", "человек или бот?"):
+        assert c.is_identity_question(message), message
+    for message in ("Какая у вас комиссия?", "Когда выплаты?", "Здравствуйте"):
+        assert not c.is_identity_question(message), message
