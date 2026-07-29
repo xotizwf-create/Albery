@@ -98,3 +98,36 @@ def test_client_disputing_our_numbers_always_goes_to_a_human():
     # Обычный вопрос спором не считается.
     ok = c.assess(plan, retrieval=0.9, sources_text=SOURCES, message="а от чего считается 44%?")
     assert ok.allowed is True
+
+
+def test_list_numbering_is_not_a_claimed_number():
+    """Владелец 29.07.2026 попросил нумеровать перечисления — и номер пункта тут же сработал
+    как «число не подтверждено источником»: живой прогон уводил к человеку ответ, в котором
+    агент не называл ни одной цифры от себя."""
+    import iu_contract as c
+
+    plan = c.TurnPlan(
+        reply=("Для подключения нужны:\n"
+               "1. Согласование условий и подписание договора;\n"
+               "2. Документы на товар и бренд;\n"
+               "3. Доступы к кабинету;\n"
+               "4. Настройка «Честного знака»."),
+        next_action=c.REPLY_ONLY,
+        confidence=0.9,
+        source_ids=("подключение",),
+    )
+
+    assert c.unbacked_numbers(plan, "Для подключения нужны документы и доступы.") == set()
+
+
+def test_a_real_invented_number_is_still_caught_in_a_numbered_list():
+    import iu_contract as c
+
+    plan = c.TurnPlan(
+        reply="Условия:\n1. Комиссия 20% вместо 44%;\n2. Подключение бесплатно.",
+        next_action=c.REPLY_ONLY,
+        confidence=0.9,
+        source_ids=("комиссия",),
+    )
+
+    assert "20" in c.unbacked_numbers(plan, "Единая комиссия 44% от суммы реализации.")

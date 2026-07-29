@@ -344,10 +344,18 @@ def threshold_for(plan: TurnPlan, message: str = "") -> float:
     return CALC_THRESHOLD if is_calculation(plan, message) else THRESHOLD
 
 
+#: Номер пункта нумерованного списка: «1.», «2)» в начале строки. Это оформление, а не факт.
+#: Владелец 29.07.2026 попросил нумеровать перечисления — и четвёртый пункт списка тут же
+#: сработал как «число не подтверждено источником», хотя никакой цифры агент не утверждал.
+_LIST_ORDINAL_RE = re.compile(r"(?m)^\s*\d{1,2}[.)]\s+")
+
+
 def _numbers(text: str) -> set[str]:
-    """Числа в нормальном виде: «30 000» и «30000» — одно и то же."""
+    """Числа в нормальном виде: «30 000» и «30000» — одно и то же.
+
+    Нумерация пунктов списка числами ответа не считается: это разметка."""
     out = set()
-    for raw in _NUMBER_RE.findall(text or ""):
+    for raw in _NUMBER_RE.findall(_LIST_ORDINAL_RE.sub("", text or "")):
         digits = re.sub(r"[^\d]", "", raw)
         if digits:
             out.add(digits.lstrip("0") or "0")
