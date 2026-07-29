@@ -135,3 +135,62 @@ def test_cabinet_instructions_are_not_part_of_the_prompt():
     assert "Источник:" not in built
     assert "Стандартный формат ответа:" not in built
     assert "[URL=" not in built
+
+
+# --- составной вопрос: форма ответа Агента Албери -------------------------------------------
+
+NINE_QUESTIONS = """Вопросы:
+1. Перенос карточек с существующего кабинета с остатками.
+2. Подгрузка остатков на карточки уже на новом кабинете, по какому договору.
+3. Доступ к кабинету для управления карточками.
+"""
+
+
+def test_composite_sample_appears_only_for_a_list_of_questions():
+    """Второй образец стоит килобайт и нужен только там, где вопросов несколько.
+
+    Владелец 29.07.2026: «непонятно, на какие вопросы он дал ответ». Форма ответа Агента
+    Албери на этот же список — нумерация вопросами клиента — показывается модели примером,
+    но на «а какая комиссия?» она бы только раздувала промпт."""
+    assert "SAMPLE_MANY" not in p.build(CTX)
+    assert "4–5. Доступ к карточкам и ценам" not in p.build(CTX)
+
+    built = p.build(p.Context(message=NINE_QUESTIONS))
+    assert "4–5. Доступ к карточкам и ценам" in built
+    assert "уточню у коллег и вернусь с ответом" in built
+
+
+def test_many_questions_recognises_both_shapes():
+    assert p.many_questions(NINE_QUESTIONS)
+    assert p.many_questions("А какая комиссия? И когда выплаты?")
+    assert not p.many_questions("А какая у вас комиссия?")
+    assert not p.many_questions("Здравствуйте")
+
+
+def test_rules_demand_the_clients_own_numbering():
+    rules = " ".join(p.RULES.split())
+
+    assert "отвечай ЕГО номерами" in rules
+    assert "Пункт, ответа на который в ЗНАНИЯХ нет, НЕ пропускай" in rules
+
+
+def test_rules_keep_the_manager_identity_against_the_engine_persona():
+    """Встроенная личность движка представляется «ИИ-ассистентом Hermes» с доступом в интернет.
+
+    Проверено вживую 29.07.2026: на прямой вопрос «кто ты?» голый ход отвечает именно так, и
+    `--ignore-rules` этого не меняет — текст идёт из системного промпта самого Hermes. Значит
+    роль обязана перебивать его явным правилом, иначе клиент однажды услышит про нейросеть."""
+    rules = " ".join(p.RULES.split())
+
+    assert "вы бот?" in rules
+    assert "Hermes" in rules
+
+
+def test_send_terms_hint_forbids_retelling_the_document():
+    """Условия теперь и в знаниях, и в отправке — клиент не должен получить их дважды."""
+    built = p.build(p.Context(
+        message="пришлите условия",
+        allowed_actions=(iu_contract.REPLY_ONLY, iu_contract.SEND_TERMS),
+    ))
+
+    assert "сами условия НЕ пересказывай" in " ".join(built.split())
