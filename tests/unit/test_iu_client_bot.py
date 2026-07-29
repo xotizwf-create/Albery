@@ -134,11 +134,12 @@ def test_terms_button_sends_the_real_terms(monkeypatch):
 
     # Нажатие видно команде как реплика клиента, иначе лента обрывается.
     assert store.ingested[0]["text"] == bot.BUTTON_TERMS
-    assert [item["attachment"]["file_name"] for item in store.queued[:2]] == [
+    assert [item["file_name"] for item in store.queued[0]["attachments"]] == [
         "terms.pdf",
         "contract.pdf",
     ]
-    assert "калькуляторе ИУ" in store.queued[2]["text"]
+    assert "калькуляторе ИУ" in store.queued[0]["text"]
+    assert len(store.queued) == 1
 
 
 def test_join_button_answers_honestly_while_the_form_is_missing(monkeypatch):
@@ -185,7 +186,11 @@ def test_calling_the_operator_hands_the_dialog_to_a_human(monkeypatch):
 
     assert store.transitions, "обращение обязано встать в очередь к человеку"
     assert "оператор" in store.transitions[0]["reason"].lower()
+    assert store.transitions[0]["manager_requested"] is True
     assert "менеджер" in store.queued[0]["text"].lower()
+    assert store.queued[0]["metadata"]["notify_manager_after_delivery"] is True
+    assert store.queued[0]["metadata"]["manager_notification_recipient"] == "16"
+    assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
 
 
 def test_third_ai_reply_carries_support_exit_and_operator(monkeypatch):

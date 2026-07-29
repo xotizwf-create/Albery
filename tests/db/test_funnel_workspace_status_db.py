@@ -86,6 +86,60 @@ def test_deleting_our_answer_returns_the_conversation_to_the_previous_status():
         _cleanup(source_key)
 
 
+def test_question_during_human_lease_is_scheduled_when_ai_returns():
+    """A client turn received during the manager lease must not disappear."""
+
+    suffix = uuid4().hex[:12]
+    source_key = f"test-lease-question-{suffix}"
+    chat_id = "700000203"
+    try:
+        store.ensure_source(
+            source_key,
+            source_type="test",
+            display_name="lease pending question",
+        )
+        first = _ingest(
+            source_key,
+            chat_id,
+            author="client",
+            text="Первый вопрос",
+            message_id=f"{suffix}-1",
+        )
+        conversation_id = int(first["conversation"]["id"])
+        held = store.transition_control(
+            conversation_id,
+            mode="human",
+            expected_version=int(first["conversation"]["state_version"]),
+            actor_name="Юлия",
+        )
+        pending = _ingest(
+            source_key,
+            chat_id,
+            author="client",
+            text="Вопрос, заданный менеджеру",
+            message_id=f"{suffix}-2",
+            schedule_ai=True,
+        )
+        assert pending["ai_job"] is None
+
+        released = store.release_expired_human_leases(
+            now=held["resume_at"] + timedelta(seconds=1)
+        )
+        assert conversation_id in {int(row["id"]) for row in released}
+        jobs = [
+            row
+            for row in store.list_pending_ai_jobs(limit=100)
+            if int(row["conversation_id"]) == conversation_id
+        ]
+        assert len(jobs) == 1
+        assert int(jobs[0]["trigger_message_id"]) == int(pending["message"]["id"])
+        assert int(jobs[0]["expected_version"]) == int(
+            store.get_conversation(conversation_id)["state_version"]
+        )
+    finally:
+        _cleanup(source_key)
+
+
 def test_a_failed_answer_never_counts_as_an_answer_to_the_client():
     """Ответ, который Telegram отверг, клиент не видел — статус обязан остаться прежним."""
     suffix = uuid4().hex[:12]

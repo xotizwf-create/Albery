@@ -720,6 +720,14 @@ def workspace_meta() -> tuple[Response, int]:
 
 def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
     payload = dict(row)
+    metadata = payload.get("metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    requested_at = metadata.get("manager_requested_at")
+    handled_at = metadata.get("manager_request_handled_at")
+    payload["manager_requested_at"] = requested_at
+    payload["manager_requested"] = bool(
+        requested_at and (not handled_at or str(handled_at) < str(requested_at))
+    )
     payload["source"] = payload.get("source_key")
     payload["last_message"] = payload.get("last_message_text")
     payload["display_name"] = (

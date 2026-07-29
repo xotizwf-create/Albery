@@ -718,6 +718,19 @@ def test_control_badge_says_who_runs_the_conversation():
     assert _payload(control_mode="paused")["control_label"] == "Ответы приостановлены"
 
 
+def test_manager_request_badge_stays_until_operator_reply():
+    requested = "2026-07-29T12:00:00+00:00"
+    assert _payload(
+        metadata={"manager_requested_at": requested}
+    )["manager_requested"] is True
+    assert _payload(
+        metadata={
+            "manager_requested_at": requested,
+            "manager_request_handled_at": "2026-07-29T12:01:00+00:00",
+        }
+    )["manager_requested"] is False
+
+
 def test_full_takeover_is_visible_as_a_separate_flag_not_a_fourth_badge():
     """Полный перехват остаётся «Человек управляет»: оператору важно, что отвечает
     человек, а бессрочность — отдельная пометка, а не ещё один статус."""

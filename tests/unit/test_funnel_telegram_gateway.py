@@ -530,6 +530,80 @@ def test_outbox_uses_exact_connection_and_persists_provider_message_id(monkeypat
     assert store.finishes[0][1]["provider_message_id"] == "456"
 
 
+def test_two_documents_are_sent_as_one_native_media_group(monkeypatch, tmp_path):
+    first = tmp_path / "terms.pdf"
+    second = tmp_path / "contract.pdf"
+    first.write_bytes(b"%PDF-terms")
+    second.write_bytes(b"%PDF-contract")
+    uploads = {
+        "terms-token": {
+            "path": str(first),
+            "file_name": "terms.pdf",
+            "mime_type": "application/pdf",
+            "file_size": first.stat().st_size,
+        },
+        "contract-token": {
+            "path": str(second),
+            "file_name": "contract.pdf",
+            "mime_type": "application/pdf",
+            "file_size": second.stat().st_size,
+        },
+    }
+    calls = []
+    tg = SimpleNamespace(
+        telegram_html=lambda text: f"<b>{text}</b>",
+        api_multipart=lambda method, files, **kwargs: (
+            calls.append((method, files, kwargs))
+            or [
+                {
+                    "message_id": 101,
+                    "document": {
+                        "file_id": "file-terms",
+                        "file_unique_id": "unique-terms",
+                    },
+                },
+                {
+                    "message_id": 102,
+                    "document": {
+                        "file_id": "file-contract",
+                        "file_unique_id": "unique-contract",
+                    },
+                },
+            ]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    monkeypatch.setitem(
+        sys.modules,
+        "funnel_workspace_uploads",
+        SimpleNamespace(resolve_upload=lambda token: uploads[token]),
+    )
+
+    provider_id, media = gateway._send_document_group(
+        {
+            "id": 8,
+            "external_chat_id": "123",
+            "text": "Условия и договор",
+        },
+        [{"token": "terms-token"}, {"token": "contract-token"}],
+        connection_id="",
+    )
+
+    assert provider_id == "101"
+    assert calls[0][0] == "sendMediaGroup"
+    assert [item["media"] for item in calls[0][2]["media"]] == [
+        "attach://document0",
+        "attach://document1",
+    ]
+    assert calls[0][2]["media"][0]["caption"] == "<b>Условия и договор</b>"
+    assert "caption" not in calls[0][2]["media"][1]
+    assert media["provider_message_ids"] == ["101", "102"]
+    assert [item["file_id"] for item in media["media_group"]] == [
+        "file-terms",
+        "file-contract",
+    ]
+
+
 def test_ambiguous_network_failure_is_never_automatically_retried(monkeypatch):
     store = FakeStoreForOutbox()
     store.item = _operator_outbox()
@@ -730,6 +804,55 @@ def test_delivery_effects_replay_terms_and_escalation_idempotently(monkeypatch):
     assert waiting == [
         (7, {"expected_version": 9, "reason": "Нужен менеджер"}),
         (7, {"expected_version": 9, "reason": "Нужен менеджер"}),
+    ]
+
+
+def test_operator_request_notifies_alexander_from_iu_agent_with_dialog_link(
+    monkeypatch,
+):
+    calls = []
+    tg = SimpleNamespace(
+        _terms_already_sent=lambda _telegram_id: True,
+        _mark_terms_sent=lambda _telegram_id: None,
+        _invite_already_sent=lambda _telegram_id: True,
+        _mark_invited=lambda _telegram_id: None,
+        mcp_call=lambda tool, arguments: calls.append((tool, arguments)) or {"ok": True},
+    )
+    monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    import funnel_workspace
+
+    monkeypatch.setattr(
+        funnel_workspace,
+        "conversation_url",
+        lambda conversation_id: f"https://www.m4s.ru/agent-funnels/{conversation_id}",
+    )
+    action = {
+        "id": 75,
+        "conversation_id": 311,
+        "action_type": "delivery_effects",
+        "payload": {
+            "author_type": "agent",
+            "notify_manager_after_delivery": True,
+            "manager_notification_recipient": "16",
+            "manager_notification_bot_id": 86,
+        },
+    }
+
+    result = gateway._apply_delivery_effects(action)
+
+    assert result["manager_notified"] is True
+    assert calls == [
+        (
+            "notify_iu_group",
+            {
+                "text": (
+                    "Клиент позвал менеджера в "
+                    "[URL=https://www.m4s.ru/agent-funnels/311]диалоге[/URL]"
+                ),
+                "dialog_id": "16",
+                "bot_id": 86,
+            },
+        )
     ]
 
 

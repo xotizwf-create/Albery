@@ -1714,6 +1714,7 @@ def mark_waiting_human(
     expected_version: Any,
     reason: str,
     assigned_to: str | None = None,
+    manager_requested: bool = False,
     now: datetime | None = None,
     connect: ConnectFactory | None = None,
 ) -> dict[str, Any]:
@@ -1732,12 +1733,26 @@ def mark_waiting_human(
                        control_mode = 'paused',
                        resume_at = NULL,
                        assigned_to = %s,
+                       metadata = metadata || %s,
                        state_version = %s,
                        updated_at = %s
                  WHERE id = %s
              RETURNING *
                 """,
-                (_clean_optional(assigned_to, 200), next_version, timestamp, row["id"]),
+                (
+                    _clean_optional(assigned_to, 200),
+                    Jsonb(
+                        {
+                            "manager_requested_at": timestamp.isoformat(),
+                            "manager_request_reason": clean_reason,
+                        }
+                        if manager_requested
+                        else {}
+                    ),
+                    next_version,
+                    timestamp,
+                    row["id"],
+                ),
             )
             updated = dict(cur.fetchone())
             _insert_control_event(
@@ -1752,6 +1767,35 @@ def mark_waiting_human(
                 to_version=next_version,
             )
             return updated
+
+
+def mark_manager_request_handled(
+    conversation_id: Any,
+    *,
+    now: datetime | None = None,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    """Clear the UI request badge only after a real operator reply was delivered."""
+
+    timestamp = _now(now)
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            row = _load_conversation_locked(cur, conversation_id)
+            cur.execute(
+                """
+                UPDATE funnel_workspace_conversations
+                   SET metadata = metadata || %s,
+                       updated_at = %s
+                 WHERE id = %s
+             RETURNING *
+                """,
+                (
+                    Jsonb({"manager_request_handled_at": timestamp.isoformat()}),
+                    timestamp,
+                    row["id"],
+                ),
+            )
+            return dict(cur.fetchone())
 
 
 def flag_needs_human(
@@ -2387,6 +2431,7 @@ def ingest_business_message(
                        control_mode = %s,
                        resume_at = %s,
                        assigned_to = %s,
+                       metadata = metadata || %s,
                        unread_count = unread_count + %s,
                        state_version = %s,
                        reply_deadline_at = CASE
@@ -2408,6 +2453,11 @@ def ingest_business_message(
                     new_mode,
                     resume_at,
                     assigned_to,
+                    Jsonb(
+                        {"manager_request_handled_at": timestamp.isoformat()}
+                        if clean_author == "operator"
+                        else {}
+                    ),
                     unread_increment,
                     next_version,
                     clean_author,
@@ -2696,6 +2746,30 @@ def _clean_attachment(attachment: Mapping[str, Any] | None) -> dict[str, Any] | 
     }
 
 
+def _clean_attachments(
+    attachment: Mapping[str, Any] | None,
+    attachments: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] | None,
+) -> list[dict[str, Any]]:
+    """Validate one Telegram attachment or a native 2-10 item media group."""
+
+    if attachment and attachments:
+        raise WorkspaceValidationError(
+            "Передайте один файл или группу файлов, но не оба варианта одновременно."
+        )
+    raw = list(attachments or ([] if attachment is None else [attachment]))
+    if len(raw) == 1:
+        cleaned = _clean_attachment(raw[0])
+        return [cleaned] if cleaned is not None else []
+    if raw and not 2 <= len(raw) <= 10:
+        raise WorkspaceValidationError(
+            "Группа Telegram должна содержать от 2 до 10 файлов."
+        )
+    cleaned_group = [_clean_attachment(item) for item in raw]
+    if any(item is None for item in cleaned_group):
+        raise WorkspaceValidationError("Пустой файл в группе Telegram недопустим.")
+    return [item for item in cleaned_group if item is not None]
+
+
 def _optional_int(value: Any) -> int | None:
     try:
         parsed = int(value)
@@ -2717,10 +2791,12 @@ def _enqueue_outgoing(
     now: datetime | None,
     connect: ConnectFactory | None,
     attachment: Mapping[str, Any] | None = None,
+    attachments: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] | None = None,
     service: bool = False,
 ) -> dict[str, Any]:
-    clean_file = _clean_attachment(attachment)
-    if clean_file is None:
+    clean_files = _clean_attachments(attachment, attachments)
+    clean_file = clean_files[0] if clean_files else None
+    if not clean_files:
         clean_text = _required_text(text, "text", MAX_MESSAGE_LENGTH)
     else:
         # Подпись к файлу в Telegram ограничена 1024 символами, и текст без файла
@@ -2811,6 +2887,8 @@ def _enqueue_outgoing(
                 message_metadata["service_reply"] = True
             if clean_file is not None:
                 message_metadata["outgoing_file"] = dict(clean_file)
+            if len(clean_files) > 1:
+                message_metadata["outgoing_files"] = [dict(item) for item in clean_files]
             # Пустая строка в списке диалогов читается как сбой, поэтому у сообщения
             # без подписи превью — имя отправленного файла.
             preview = clean_text or (f"📎 {clean_file['file_name']}" if clean_file else "")
@@ -2919,6 +2997,7 @@ def enqueue_outgoing_operator(
     idempotency_key: str,
     metadata: Mapping[str, Any] | None = None,
     attachment: Mapping[str, Any] | None = None,
+    attachments: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] | None = None,
     lease_seconds: int | None = None,
     now: datetime | None = None,
     connect: ConnectFactory | None = None,
@@ -2935,6 +3014,7 @@ def enqueue_outgoing_operator(
         now=now,
         connect=connect,
         attachment=attachment,
+        attachments=attachments,
     )
 
 
@@ -2947,6 +3027,7 @@ def enqueue_outgoing_agent(
     agent_name: str = "ИИ-агент",
     metadata: Mapping[str, Any] | None = None,
     attachment: Mapping[str, Any] | None = None,
+    attachments: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] | None = None,
     service: bool = False,
     now: datetime | None = None,
     connect: ConnectFactory | None = None,
@@ -2960,6 +3041,7 @@ def enqueue_outgoing_agent(
         idempotency_key=idempotency_key,
         metadata=metadata,
         attachment=attachment,
+        attachments=attachments,
         operator_lease_seconds=None,
         now=now,
         connect=connect,
@@ -4051,9 +4133,10 @@ def _enqueue_delivery_effect_action_cursor(
         source_payload = {}
     asset = str(source_payload.get("asset") or "").strip()
     escalate = bool(source_payload.get("escalate_after_delivery"))
+    notify_manager = bool(source_payload.get("notify_manager_after_delivery"))
     if asset not in {"terms", "form"} and not (
         outbox.get("author_type") == "agent" and escalate
-    ):
+    ) and not notify_manager:
         return None
     outbox_id = _positive_int(outbox.get("id"), "outbox_id")
     conversation_id = _positive_int(
@@ -4072,6 +4155,14 @@ def _enqueue_delivery_effect_action_cursor(
         "escalation_reason": _clean_optional(
             source_payload.get("escalation_reason"),
             1000,
+        ),
+        "notify_manager_after_delivery": notify_manager,
+        "manager_notification_recipient": _clean_optional(
+            source_payload.get("manager_notification_recipient"),
+            100,
+        ),
+        "manager_notification_bot_id": _optional_int(
+            source_payload.get("manager_notification_bot_id")
         ),
         "provider_message_id": _clean_optional(
             outbox.get("provider_message_id"),

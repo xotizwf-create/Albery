@@ -22,6 +22,7 @@ import socket
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -386,6 +387,11 @@ def _maintenance_loop() -> None:
         try:
             store = _store()
             released = store.release_expired_human_leases(limit=100)
+            if released:
+                # release_expired_human_leases already restores the latest unanswered
+                # client turn. Wake the AI worker immediately instead of making the
+                # customer wait for another polling interval.
+                _wake_event.set()
             for conversation in released:
                 if (
                     conversation.get("control_mode") == "ai"
@@ -568,6 +574,7 @@ def _reply_to_client(
     idempotency_key: str,
     reply_markup: Mapping[str, Any] | None = None,
     attachment: Mapping[str, Any] | None = None,
+    attachments: list[Mapping[str, Any]] | None = None,
     metadata: Mapping[str, Any] | None = None,
     service: bool = True,
 ) -> Mapping[str, Any] | None:
@@ -601,6 +608,7 @@ def _reply_to_client(
                 agent_name=AGENT_NAME,
                 metadata=message_metadata,
                 attachment=attachment,
+                attachments=attachments,
                 service=service,
             )
             break
@@ -681,24 +689,10 @@ def _send_terms_documents(conversation_id: int, *, idempotency_key: str) -> None
         contract = iu_bot_documents.attachment("contract")
         _reply_to_client(
             conversation_id,
-            "",
-            idempotency_key=f"{idempotency_key}:terms-pdf",
-            attachment=terms,
-            metadata={"iu_event": "terms_pdf"},
-        )
-        _reply_to_client(
-            conversation_id,
-            "",
-            idempotency_key=f"{idempotency_key}:contract-pdf",
-            attachment=contract,
-            metadata={"iu_event": "contract_pdf"},
-        )
-        _reply_to_client(
-            conversation_id,
             iu_client_bot.TERMS_REPLY,
-            idempotency_key=f"{idempotency_key}:text",
-            reply_markup=iu_client_bot.main_menu(),
-            metadata={"iu_event": "terms_sent"},
+            idempotency_key=f"{idempotency_key}:documents",
+            attachments=[terms, contract],
+            metadata={"iu_event": "terms_sent", "asset": "terms"},
         )
     except Exception as exc:  # noqa: BLE001 - юридический документ нельзя подменять догадкой
         log.warning("iu client bot: PDF documents unavailable: %s", _safe_error(exc))
@@ -803,7 +797,12 @@ def handle_bot_callback(callback: Mapping[str, Any]) -> tuple[int | None, int | 
     return conversation_id, None
 
 
-def _hand_over_to_human(conversation_id: int, reason: str) -> None:
+def _hand_over_to_human(
+    conversation_id: int,
+    reason: str,
+    *,
+    manager_requested: bool = False,
+) -> None:
     """Передать обращение человеку: дальше отвечает оператор из рабочего окна."""
 
     store = _store()
@@ -813,6 +812,7 @@ def _hand_over_to_human(conversation_id: int, reason: str) -> None:
             conversation_id,
             expected_version=conversation.get("state_version"),
             reason=reason,
+            manager_requested=manager_requested,
         )
     except Exception as exc:  # noqa: BLE001 - клиент уже получил ответ, сбой не должен его терять
         log.warning("iu client bot: handover failed for %s: %s", conversation_id, _safe_error(exc))
@@ -1155,10 +1155,23 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
                 iu_client_bot.OPERATOR_CALLED,
                 idempotency_key=idempotency_key,
                 reply_markup=iu_client_bot.remove_keyboard(),
-                metadata={"iu_event": "operator_called"},
+                metadata={
+                    "iu_event": "operator_called",
+                    "notify_manager_after_delivery": True,
+                    "manager_notification_recipient": os.getenv(
+                        "IU_MANAGER_NOTIFY_BITRIX_USER_ID", "16"
+                    ),
+                    "manager_notification_bot_id": (
+                        _as_int(os.getenv("IU_AGENT_BOT_ID", "86")) or 86
+                    ),
+                },
             )
             _cancel_bot_reminders(conversation_id)
-            _hand_over_to_human(conversation_id, "Клиент выбрал «Позвать оператора».")
+            _hand_over_to_human(
+                conversation_id,
+                "Клиент выбрал «Позвать оператора».",
+                manager_requested=True,
+            )
     elif action == iu_client_bot.CB_EXIT_SUPPORT:
         _reply_to_client(
             conversation_id,
@@ -1188,6 +1201,10 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
             ),
             metadata={"iu_event": "support_continue"},
         )
+        # Нажатие «Выйти» является новым клиентским событием и отменяет незавершённую
+        # генерацию. После «Нет» возвращаем в очередь исходный вопрос, а не ждём,
+        # пока клиент догадается повторить его.
+        _schedule_existing_question(conversation_id, messages)
 
 
 def ingest_business_message(
@@ -1960,6 +1977,92 @@ def _outgoing_file(outbox: Mapping[str, Any]) -> dict[str, Any] | None:
     return dict(attached) if isinstance(attached, Mapping) and attached else None
 
 
+def _outgoing_files(outbox: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """All files for one Telegram delivery; legacy single-file payloads still work."""
+
+    payload = outbox.get("payload") or {}
+    if not isinstance(payload, Mapping):
+        return []
+    grouped = payload.get("outgoing_files")
+    if isinstance(grouped, list):
+        files = [dict(item) for item in grouped if isinstance(item, Mapping) and item]
+        if len(files) >= 2:
+            return files[:10]
+    single = _outgoing_file(outbox)
+    return [single] if single is not None else []
+
+
+def _send_document_group(
+    outbox: Mapping[str, Any],
+    outgoing_files: list[Mapping[str, Any]],
+    *,
+    connection_id: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Send 2-10 documents as one native Telegram album with one shared caption."""
+
+    import funnel_workspace_uploads as uploads
+    import tg_agent
+
+    stored_files = [uploads.resolve_upload(item.get("token")) for item in outgoing_files]
+    rendered_caption = tg_agent.telegram_html(str(outbox.get("text") or "")[:1024])
+    media: list[dict[str, Any]] = []
+    multipart: dict[str, Any] = {}
+    with ExitStack() as stack:
+        for index, stored in enumerate(stored_files):
+            field = f"document{index}"
+            handle = stack.enter_context(open(stored["path"], "rb"))
+            multipart[field] = (stored["file_name"], handle, stored["mime_type"])
+            item: dict[str, Any] = {
+                "type": "document",
+                "media": f"attach://{field}",
+            }
+            if index == 0 and rendered_caption:
+                item["caption"] = rendered_caption
+                item["parse_mode"] = "HTML"
+            media.append(item)
+        sent = tg_agent.api_multipart(
+            "sendMediaGroup",
+            files=multipart,
+            chat_id=int(outbox["external_chat_id"]),
+            media=media,
+            **({"business_connection_id": connection_id} if connection_id else {}),
+        )
+
+    messages = list(sent) if isinstance(sent, list) else []
+    provider_ids = [
+        str(item.get("message_id"))
+        for item in messages
+        if isinstance(item, Mapping) and item.get("message_id") is not None
+    ]
+    delivered: list[dict[str, Any]] = []
+    for index, item in enumerate(messages):
+        document = item.get("document") if isinstance(item, Mapping) else None
+        if not isinstance(document, Mapping) or not document.get("file_id"):
+            continue
+        stored = stored_files[min(index, len(stored_files) - 1)]
+        delivered.append(
+            {
+                "file_id": str(document["file_id"]),
+                "file_unique_id": str(document.get("file_unique_id") or "") or None,
+                "file_name": stored["file_name"],
+                "mime_type": stored["mime_type"],
+                "file_size": document.get("file_size") or stored["file_size"],
+                "media_type": "document",
+            }
+        )
+    if len(delivered) != len(outgoing_files):
+        log.warning(
+            "outbox %s delivered a media group without all provider file ids",
+            outbox.get("id"),
+        )
+    provider_media = (
+        {**delivered[0], "media_group": delivered, "provider_message_ids": provider_ids}
+        if delivered
+        else None
+    )
+    return (provider_ids[0] if provider_ids else None), provider_media
+
+
 def _send_document(
     outbox: Mapping[str, Any],
     outgoing_file: Mapping[str, Any],
@@ -2116,12 +2219,19 @@ def _process_outbox_item(item: Mapping[str, Any], *, worker_id: str) -> None:
         return
     current = dict(boundary.get("outbox") or current)
 
-    outgoing_file = _outgoing_file(current)
+    outgoing_files = _outgoing_files(current)
+    outgoing_file = outgoing_files[0] if outgoing_files else None
     provider_media: dict[str, Any] | None = None
 
     try:
         try:
-            if outgoing_file is not None:
+            if len(outgoing_files) > 1:
+                provider_message_id, provider_media = _send_document_group(
+                    current,
+                    outgoing_files,
+                    connection_id=connection_id,
+                )
+            elif outgoing_file is not None:
                 provider_message_id, provider_media = _send_document(
                     current,
                     outgoing_file,
@@ -2224,6 +2334,19 @@ def _after_delivery(
     conversation_id = int(outbox["conversation_id"])
 
     if result == "sent":
+        if outbox.get("author_type") == "operator":
+            try:
+                handled_at = outbox.get("created_at")
+                _store().mark_manager_request_handled(
+                    conversation_id,
+                    now=handled_at if isinstance(handled_at, datetime) else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - reply was delivered; badge cleanup is retry-safe
+                log.warning(
+                    "workspace manager-request badge was not cleared for %s: %s",
+                    conversation_id,
+                    _safe_error(exc),
+                )
         asset = str(payload.get("asset") or "")
         telegram_id = _as_int(outbox.get("external_chat_id"))
         if asset == "terms" and telegram_id:
@@ -2419,6 +2542,35 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
             tg_agent._mark_invited(telegram_id)
         applied_asset = asset
 
+    manager_notified = bool(payload.get("notify_manager_after_delivery"))
+    if manager_notified:
+        import funnel_workspace
+
+        conversation_id = int(action["conversation_id"])
+        dialog_url = funnel_workspace.conversation_url(conversation_id)
+        if dialog_url.startswith("/"):
+            dialog_url = f"https://www.m4s.ru{dialog_url}"
+        recipient = str(
+            payload.get("manager_notification_recipient")
+            or os.getenv("IU_MANAGER_NOTIFY_BITRIX_USER_ID", "16")
+        ).strip()
+        bot_id = (
+            _as_int(payload.get("manager_notification_bot_id"))
+            or _as_int(os.getenv("IU_AGENT_BOT_ID", "86"))
+            or 86
+        )
+        tg_agent.mcp_call(
+            "notify_iu_group",
+            {
+                "text": (
+                    "Клиент позвал менеджера в "
+                    f"[URL={dialog_url}]диалоге[/URL]"
+                ),
+                "dialog_id": recipient,
+                "bot_id": bot_id,
+            },
+        )
+
     escalated = bool(
         payload.get("author_type") == "agent"
         and payload.get("escalate_after_delivery")
@@ -2447,6 +2599,7 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
         "status": "applied",
         "asset": applied_asset,
         "escalated": escalated,
+        "manager_notified": manager_notified,
     }
 
 

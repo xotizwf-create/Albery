@@ -65,6 +65,27 @@ def test_only_delivered_non_service_ai_answers_open_operator_button():
     assert titles == [bot.BUTTON_OPERATOR, bot.BUTTON_EXIT_SUPPORT]
 
 
+def test_exit_no_keeps_answer_counter_and_pending_question():
+    messages = [
+        client(1, bot.BUTTON_ASK),
+        agent(2, bot.ASK_PROMPT, event="support_enter", service=True),
+        client(3, "Первый вопрос"),
+        agent(4, "Первый ответ"),
+        client(5, "Второй вопрос"),
+        agent(6, "Второй ответ"),
+        client(7, "Третий вопрос"),
+        client(8, bot.BUTTON_EXIT_SUPPORT),
+        agent(9, bot.EXIT_CONFIRM, event="support_exit_confirm", service=True),
+        client(10, bot.BUTTON_CONFIRM_NO),
+        agent(11, bot.CONTINUE_SUPPORT, event="support_continue", service=True),
+    ]
+
+    assert state.support_state(messages).mode == "active"
+    assert state.support_agent_replies(messages) == 2
+    assert state.latest_pending_question(messages) == 7
+    assert bot.should_offer_operator(state.support_agent_replies(messages))
+
+
 def test_strict_hint_is_one_time_and_original_question_is_preserved():
     messages = [
         client(1, "Какая комиссия?"),

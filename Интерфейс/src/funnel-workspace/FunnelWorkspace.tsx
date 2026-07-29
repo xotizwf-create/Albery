@@ -11,6 +11,7 @@ import {
 import {
   AlertCircle,
   ArrowLeft,
+  BellRing,
   Bot,
   Check,
   CheckCheck,
@@ -1084,6 +1085,27 @@ function ControlBadge({
   );
 }
 
+function ManagerRequestedBadge({
+  conversation,
+  compact = false,
+}: {
+  conversation: Conversation;
+  compact?: boolean;
+}) {
+  if (!conversation.manager_requested) return null;
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-full bg-rose-50 font-black text-rose-700 ring-1 ring-inset ring-rose-200",
+        compact ? "px-2 py-1 text-[10px]" : "px-2.5 py-1.5 text-[11px]",
+      )}
+    >
+      <BellRing className={compact ? "h-3 w-3" : "h-3.5 w-3.5"} />
+      Клиент позвал менеджера
+    </span>
+  );
+}
+
 function ConversationList({
   conversations,
   selectedId,
@@ -1444,6 +1466,7 @@ function ConversationList({
                           urgentAfterMinutes={urgentAfterMinutes}
                           compact
                         />
+                        <ManagerRequestedBadge conversation={conversation} compact />
                         <ControlBadge conversation={conversation} now={now} compact />
                       </span>
                     </span>
@@ -1861,6 +1884,9 @@ function ChatPanel({
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
+          <div className="hidden lg:block">
+            <ManagerRequestedBadge conversation={conversation} />
+          </div>
           <div className="hidden lg:block">
             <ControlBadge conversation={conversation} now={now} />
           </div>
@@ -2296,6 +2322,7 @@ function ConversationDetails({
             <div className="text-[10px] font-black uppercase tracking-[0.12em] text-slate-400">
               Управление диалогом
             </div>
+            <ManagerRequestedBadge conversation={conversation} compact />
             <ControlBadge conversation={conversation} now={now} compact />
           </div>
           <div className="mt-3 text-xs leading-5 text-slate-500">

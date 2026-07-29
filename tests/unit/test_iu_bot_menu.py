@@ -126,10 +126,95 @@ def test_menu_item_is_handled_as_an_action_not_as_a_question(monkeypatch):
 
     # Пункт меню приходит обычным текстом — и должен выполнить действие, а не уйти в ИИ.
     assert store.ingested[0]["schedule_ai"] is False
-    assert [item["attachment"]["file_name"] for item in store.queued[:2]] == [
+    assert [item["file_name"] for item in store.queued[0]["attachments"]] == [
         "terms.pdf",
         "contract.pdf",
     ]
+    assert store.queued[0]["text"] == bot.TERMS_REPLY
+    assert len(store.queued) == 1
+
+
+def test_confirm_no_reschedules_question_cancelled_by_exit(monkeypatch):
+    store = FakeStore(agent_replies=2)
+    scheduled = []
+    messages = [
+        {
+            "id": 1,
+            "author_type": "client",
+            "direction": "inbound",
+            "text": bot.BUTTON_ASK,
+            "metadata": {},
+        },
+        {
+            "id": 2,
+            "author_type": "client",
+            "direction": "inbound",
+            "text": "Первый вопрос",
+            "metadata": {},
+        },
+        {
+            "id": 3,
+            "author_type": "agent",
+            "direction": "outbound",
+            "delivery_status": "sent",
+            "text": "Первый ответ",
+            "metadata": {},
+        },
+        {
+            "id": 4,
+            "author_type": "client",
+            "direction": "inbound",
+            "text": "Второй вопрос",
+            "metadata": {},
+        },
+        {
+            "id": 5,
+            "author_type": "agent",
+            "direction": "outbound",
+            "delivery_status": "sent",
+            "text": "Второй ответ",
+            "metadata": {},
+        },
+        {
+            "id": 6,
+            "author_type": "client",
+            "direction": "inbound",
+            "text": "Третий вопрос",
+            "metadata": {},
+        },
+        {
+            "id": 7,
+            "author_type": "client",
+            "direction": "inbound",
+            "text": bot.BUTTON_EXIT_SUPPORT,
+            "metadata": {},
+        },
+        {
+            "id": 8,
+            "author_type": "client",
+            "direction": "inbound",
+            "text": bot.BUTTON_CONFIRM_NO,
+            "metadata": {},
+        },
+    ]
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_bot_messages", lambda _conversation_id: messages)
+    monkeypatch.setattr(
+        gateway,
+        "_schedule_existing_question",
+        lambda conversation_id, current: scheduled.append((conversation_id, current)),
+    )
+
+    gateway.run_menu_action(
+        bot.CB_CONFIRM_NO,
+        conversation_id=5,
+        idempotency_key="confirm-no",
+    )
+
+    assert scheduled == [(5, messages)]
+    markup = store.queued[-1]["metadata"]["reply_markup"]
+    titles = [button["text"] for row in markup["keyboard"] for button in row]
+    assert bot.BUTTON_OPERATOR in titles
 
 
 def test_free_question_outside_support_gets_hint_not_ai(monkeypatch):
