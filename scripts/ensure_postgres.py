@@ -40,6 +40,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "agent_access": "034_agent_access.sql",
     "access_requests": "036_access_requests.sql",
     "iu_form_tokens": "075_iu_form_tokens.sql",
+    "iu_form_merges": "076_iu_form_merges.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {
