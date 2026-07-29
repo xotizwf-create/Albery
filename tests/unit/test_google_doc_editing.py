@@ -93,6 +93,19 @@ class TestToolsExist:
         # сотрудники работают на ops-уровне — там инструменты и понадобились
         assert {"read_google_doc", "edit_google_doc"} <= set(ctx.OPS_TOOL_NAMES)
 
+    def test_google_toolset_is_symmetric_in_the_core_set(self, ctx):
+        """Возможность, которой агент не видит, — это возможность, которой у него нет.
+
+        create_google_doc лежал в CORE (модель видит его каждый ход), а чтения и правки не было
+        нигде — поэтому агент и решил, что дело в правах доступа. Для таблиц набор был полным.
+        """
+        for entity, names in (
+            ("документы", {"create_google_doc", "read_google_doc", "edit_google_doc"}),
+            ("таблицы", {"create_google_sheet", "read_google_sheet_values", "write_google_sheet_values"}),
+        ):
+            missing = names - set(ctx.CORE_TOOL_NAMES)
+            assert not missing, f"{entity}: модель не видит {sorted(missing)}"
+
     def test_edit_requires_confirm(self, ctx):
         with pytest.raises(ctx.McpError):
             ctx.TOOLS["edit_google_doc"]["handler"]({"document_id": DOC_ID, "html": "<p>x</p>"})

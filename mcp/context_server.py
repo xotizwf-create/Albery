@@ -12253,6 +12253,11 @@ CORE_TOOL_NAMES: set[str] = {
     # google workflow the bot prompt teaches
     "create_google_sheet",
     "create_google_doc",
+    # Documents must be as visible as sheets. While only "create" was in the core set, the model
+    # saw no way to change an existing document and told users it lacked ACCESS (29.07.2026) —
+    # a capability the agent cannot see is a capability it does not have.
+    "read_google_doc",
+    "edit_google_doc",
     "get_google_sheet_meta",
     "read_google_sheet_values",
     "write_google_sheet_values",
