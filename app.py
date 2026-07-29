@@ -2624,6 +2624,29 @@ def build_zoom_combined_dispatch(call_id: str, require_webhook: bool = False) ->
             if isinstance(card, dict):
                 cards.append({**card, "card_kind": "participant_report"})
 
+    # Один человек — одна карточка на созвон. Списки оперативных карточек и персональных
+    # итогов строятся независимо и каждый дедуплицируется сам по себе, но НА СТЫКЕ защиты не
+    # было: дедуп ниже собирал только получателей, а сами карточки склеивались как есть.
+    # 29.07.2026 по созвону 10:58–11:32 Анастасия Андрусяк получила две одинаковые задачи
+    # (2314 и 2318, отпечаток описания совпадает), потому что попала в списки дважды — под
+    # своим именем и как «Анастасия Докучаева» (алиас оргструктуры сводит их в одного
+    # человека, id 42). Порядок важен: оперативная карточка идёт первой и остаётся, потому
+    # что несёт задачи, а не только общие итоги.
+    deduped: list[dict[str, Any]] = []
+    seen_recipients: set[int] = set()
+    for card in cards:
+        recipient = card.get("recipient") if isinstance(card.get("recipient"), dict) else None
+        user_id = to_int(recipient.get("user_id")) if recipient else None
+        if user_id is not None:
+            if user_id in seen_recipients:
+                logging.getLogger(__name__).info(
+                    "созвон %s: вторая карточка для получателя %s пропущена (%s)",
+                    call_id, user_id, card.get("card_kind"))
+                continue
+            seen_recipients.add(user_id)
+        deduped.append(card)
+    cards = deduped
+
     recipients_by_id: dict[int, dict[str, Any]] = {}
     for card in cards:
         recipient = card.get("recipient") if isinstance(card.get("recipient"), dict) else None
