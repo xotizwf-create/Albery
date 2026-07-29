@@ -99,10 +99,15 @@ def test_customer_runtime_uses_only_dedicated_zero_tool_connector(monkeypatch):
     assert tg_agent.customer_toolsets() == "agent-iu-customer-runtime"
 
 
-def test_customer_role_defaults_to_existing_iu_agent(monkeypatch):
+def test_customer_role_comes_from_the_client_agent_card(monkeypatch):
+    """Роль клиента — из карточки клиентского агента, а не внутреннего (владелец, 29.07.2026).
+
+    У «Агента по работе с ИУ» роль написана под работу в группе Битрикса: «1–3 предложения»,
+    «точку в конце реплики не ставь», «переспроси сотрудника в группе». В промпте она стоит
+    выше правил хода и молча их отменяла — отсюда сухие обрывочные ответы клиенту."""
     monkeypatch.delenv("FUNNEL_WORKSPACE_AGENT_SLUG", raising=False)
 
-    assert tg_agent.customer_agent_slug() == "agent-po-rabote-s-iu"
+    assert tg_agent.customer_agent_slug() == "iu-customer-runtime"
 
 
 def test_customer_runtime_rejects_broad_role_agent_connector(monkeypatch):

@@ -121,3 +121,23 @@ def test_prompt_requires_a_heading_per_question():
 
     assert "ОТДЕЛЬНОЙ строкой-заголовком" in rules
     assert "заканчивается двоеточием" in rules
+
+
+def test_client_role_comes_from_the_client_agent_card():
+    """Владелец 29.07.2026: «ответы сухие и пресные».
+
+    Роль бралась у внутреннего «Агента по работе с ИУ» — того, что работает в группе Битрикса
+    с сотрудниками. В его карточке «пиши 1–3 предложения» и «точку в конце реплики не ставь»,
+    и этот текст стоит в промпте выше всех правил, то есть молча их отменял."""
+    import tg_agent
+
+    assert tg_agent.customer_agent_slug() == "iu-customer-runtime"
+
+
+def test_prompt_shows_the_owners_sample_answer():
+    """Пример показывает форму целиком и работает сильнее любой инструкции."""
+    built = iu_prompt.build(iu_prompt.Context(message="а какая комиссия?"))
+
+    assert "ОБРАЗЕЦ ОТВЕТА" in built
+    assert "В эти 44% уже входят:" in built
+    assert "— комиссия Wildberries;" in built

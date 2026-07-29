@@ -128,7 +128,12 @@ def customer_agent_slug() -> str:
     agent's prompt, instructions and MCP boundary.  Changing the agent never creates a second
     Telegram consumer.
     """
-    default_slug = "agent-po-rabote-s-iu"
+    # Роль берётся из карточки КЛИЕНТСКОГО агента, а не внутреннего «Агента по работе с ИУ»
+    # (владелец 29.07.2026: «ответы сухие и пресные»). У внутреннего агента роль написана под
+    # работу в группе Битрикса: «пиши 1–3 предложения», «точку в конце реплики не ставь»,
+    # «не понял фактуру — переспроси сотрудника». Этот текст стоит в промпте выше всех правил
+    # и молча отменял их: отсюда и обрывки без точек, и тяга передать разговор человеку.
+    default_slug = "iu-customer-runtime"
     return (
         os.getenv("FUNNEL_WORKSPACE_AGENT_SLUG") or default_slug
     ).strip() or default_slug
