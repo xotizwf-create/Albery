@@ -131,3 +131,36 @@ def test_a_real_invented_number_is_still_caught_in_a_numbered_list():
     )
 
     assert "20" in c.unbacked_numbers(plan, "Единая комиссия 44% от суммы реализации.")
+
+
+def test_client_question_numbers_in_bold_headings_are_not_facts():
+    """Отвечая на список вопросов, агент нумерует блоки номерами САМОГО клиента.
+
+    Живой прогон 29.07.2026: «[b]4–5. Управление карточками и ценами[/b]» дал «числа не
+    подтверждены источником: 4, 6, 8, 9» и срезал треть опоры ответа, в котором агент не
+    назвал от себя ни одной цифры."""
+    import iu_contract as c
+
+    plan = c.TurnPlan(
+        reply=("[b]1. Перенос карточек[/b]\nПеренос не рассматривается.\n\n"
+               "[b]4–5. Управление карточками и ценами[/b]\nДоступ после оплаты.\n\n"
+               "[b]9. Экономика[/b]\nВы получаете 56% от суммы реализации."),
+        next_action=c.REPLY_ONLY,
+        confidence=0.9,
+        source_ids=("экономика",),
+    )
+    sources = "Клиенту остаётся 56% от суммы реализации до СПП."
+
+    assert c.unbacked_numbers(plan, sources) == set()
+    grounding, reasons = c.grounding_score(plan, sources)
+    assert grounding == 1.0, reasons
+
+
+def test_a_decimal_number_keeps_its_whole_part():
+    """«1.5 млн» — это число, а не пункт списка: пробел после точки обязателен."""
+    import iu_contract as c
+
+    plan = c.TurnPlan(reply="1.5 млн ₽ оборота.", next_action=c.REPLY_ONLY,
+                      confidence=0.9, source_ids=("оборот",))
+
+    assert c.unbacked_numbers(plan, "Программа рассчитана на оборот от 3 млн ₽.") == {"15"}
