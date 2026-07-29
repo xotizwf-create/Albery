@@ -178,7 +178,7 @@ export default function App() {
           <section className="mx-auto flex w-full max-w-xl flex-col items-center">
             <header className="mb-10 flex w-full flex-col items-center gap-5 sm:mb-12">
               <p className="w-full text-center text-[10px] font-semibold uppercase leading-relaxed tracking-[0.15em] text-amber-400 sm:text-xs sm:tracking-[0.24em]">
-                Albery · Индивидуальные условия
+                Калькулятор расчёта ИУ
               </p>
               <div
                 aria-label={`Шаг ${step + 1} из ${steps.length}`}
@@ -340,17 +340,14 @@ function Results({data, onReset}: {data: FormData; onReset: () => void}) {
       transition={{duration: 0.5, ease: [0.16, 1, 0.3, 1]}}
       className="mx-auto flex w-full max-w-3xl flex-col items-center"
     >
-      <p className="mb-7 w-full text-center text-[10px] font-semibold uppercase leading-relaxed tracking-[0.15em] text-amber-400 sm:text-xs sm:tracking-[0.24em]">
-        Albery · Индивидуальные условия
+      <p className="mb-8 w-full text-center text-[10px] font-semibold uppercase leading-relaxed tracking-[0.15em] text-amber-400 sm:text-xs sm:tracking-[0.24em]">
+        Калькулятор расчёта ИУ
       </p>
-      <div className="mb-7 flex h-20 w-20 items-center justify-center rounded-full border border-amber-500/20 bg-gradient-to-br from-amber-400/20 to-amber-600/10 shadow-[0_0_40px_-10px_rgba(245,158,11,0.2)]">
-        <CheckCircle2 aria-hidden="true" className="h-10 w-10 text-amber-400" />
-      </div>
-      <h1 className="mb-4 text-center text-4xl font-light tracking-tight text-white sm:text-5xl">
-        Расчёт готов
+      <h1 className="mb-7 text-center text-2xl font-light tracking-tight text-zinc-200 sm:text-3xl">
+        Введённые вами данные:
       </h1>
 
-      <div className="mb-11 grid w-full grid-cols-2 gap-3 sm:grid-cols-4 sm:gap-4">
+      <div className="mb-10 grid w-full grid-cols-2 gap-3 sm:grid-cols-4 sm:gap-4">
         {steps.map((item) => (
           <div
             key={item.id}
@@ -370,34 +367,66 @@ function Results({data, onReset}: {data: FormData; onReset: () => void}) {
         ))}
       </div>
 
-      <p className="mb-8 text-center text-lg text-zinc-400 sm:text-xl">
-        При работе на индивидуальных условиях вы получите:
-      </p>
+      <section
+        aria-labelledby="calculation-result-title"
+        className="relative mb-10 w-full overflow-hidden rounded-[2rem] border border-amber-500/30 bg-gradient-to-br from-amber-500/12 via-zinc-900/90 to-zinc-950 p-4 shadow-[0_24px_80px_-32px_rgba(245,158,11,0.55)] sm:p-8"
+      >
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute -right-24 -top-24 h-64 w-64 rounded-full bg-amber-400/15 blur-3xl"
+        />
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute -bottom-32 -left-20 h-72 w-72 rounded-full bg-amber-600/10 blur-3xl"
+        />
 
-      <div className="mb-10 grid w-full gap-4">
-        <ResultCard
-          title="Налогооблагаемая база"
-          value={results.taxBase}
-          subtitle="Цена реализации минус СПП"
-        />
-        <ResultCard
-          title="Общая комиссия (46%)"
-          value={results.commission}
-          subtitle="Wildberries + эквайринг + агентская комиссия"
-        />
-        <ResultCard
-          title="К переводу от нас"
-          value={results.payout}
-          subtitle="Цена реализации минус общая комиссия и реклама"
-          highlight
-        />
-        <ResultCard
-          title="Маржинальный доход"
-          value={results.margin}
-          subtitle="Цена реализации минус общая комиссия и себестоимость"
-          highlight
-        />
-      </div>
+        <div className="relative mb-8 flex flex-col items-center px-2 pt-4 text-center sm:mb-10 sm:pt-2">
+          <div className="mb-5 flex h-20 w-20 items-center justify-center rounded-full border border-amber-400/30 bg-amber-400/10 shadow-[0_0_50px_-12px_rgba(245,158,11,0.6)]">
+            <CheckCircle2 aria-hidden="true" className="h-10 w-10 text-amber-400" />
+          </div>
+          <span className="mb-3 rounded-full border border-amber-400/20 bg-amber-400/10 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-[0.22em] text-amber-300 sm:text-xs">
+            Ваш результат
+          </span>
+          <h2
+            id="calculation-result-title"
+            className="text-4xl font-medium tracking-tight text-white sm:text-5xl"
+          >
+            Расчёт готов!
+          </h2>
+          <p className="mt-4 text-xl font-medium text-amber-300 sm:text-2xl">
+            При работе на ИУ вы получите…
+          </p>
+          <p className="mt-3 max-w-xl text-sm leading-relaxed text-zinc-400 sm:text-base">
+            Прозрачная экономика: сразу видно комиссию, сумму к переводу и ваш
+            маржинальный доход.
+          </p>
+        </div>
+
+        <div className="relative grid w-full gap-3 sm:gap-4">
+          <ResultCard
+            title="Налогооблагаемая база"
+            value={results.taxBase}
+            subtitle="Цена реализации минус СПП"
+          />
+          <ResultCard
+            title="Общая комиссия (46%)"
+            value={results.commission}
+            subtitle="Wildberries + эквайринг + агентская комиссия"
+          />
+          <ResultCard
+            title="К переводу от нас"
+            value={results.payout}
+            subtitle="Цена реализации минус общая комиссия и реклама"
+            highlight
+          />
+          <ResultCard
+            title="Ваш маржинальный доход"
+            value={results.margin}
+            subtitle="Цена реализации минус общая комиссия и себестоимость"
+            highlight
+          />
+        </div>
+      </section>
 
       <a
         href={TELEGRAM_URL}
