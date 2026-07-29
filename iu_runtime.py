@@ -29,6 +29,8 @@ import iu_turn
 log = logging.getLogger("iu-runtime")
 
 # Документ владельца с фактами ИУ. Правится на Google Drive, синк подхватывает изменения сам.
+# На 29.07.2026 его на Drive нет — владелец ведёт знания в «Вопрос - ответ», — поэтому его
+# отсутствие не считается поломкой и не пишется в журнал предупреждением каждые пять минут.
 KNOWLEDGE_DOC_NAME = os.getenv(
     "IU_KNOWLEDGE_DOC", "Что отвечать лидам — вопросы и ответы").strip()
 #: Раздел «Вопрос — ответ»: владелец ведёт его отдельным документом и списком вопросов,
@@ -40,6 +42,31 @@ _cards_cache: dict = {"at": 0.0, "cards": ()}
 # Векторы карточек переживают перечитывание документа: они кэшируются по хэшу содержимого,
 # поэтому правка одной карточки не тянет пересчёт всего корпуса.
 _vector_store: dict = {}
+
+
+def terms_doc_name() -> str:
+    """Имя документа условий. Живёт в `tg_agent`, чтобы отправка и знания не разъехались."""
+    import tg_agent
+
+    return tg_agent.TERMS_DOC_NAME
+
+
+def _terms_cards(raw: str) -> tuple:
+    """Карточки из документа условий — только клиентская часть, ниже строки-маркера.
+
+    Вырезание маркера берём у `tg_agent`: там оно уже пережило автозамену тире в Google Docs
+    и обвешано тестами. Вторая реализация того же правила рано или поздно разошлась бы с
+    первой, и агент отвечал бы по тексту, которого клиент никогда не получит."""
+    import tg_agent
+
+    if not str(raw or "").strip():
+        return ()
+    body = tg_agent._after_terms_marker(raw)
+    if not body.strip():
+        log.warning("в документе условий нет строки «%s» — в знания он не попал",
+                    tg_agent.TERMS_MARKER)
+        return ()
+    return iu_knowledge.parse_terms(body)
 
 
 def knowledge_cards(force: bool = False) -> tuple:
@@ -56,23 +83,28 @@ def knowledge_cards(force: bool = False) -> tuple:
         files = (cs.TOOLS["list_company_files"]["handler"]({"limit": 300}) or {})
         items = files.get("files") or files.get("items") or []
 
-        def _read(doc_name: str) -> str:
+        def _read(doc_name: str, *, optional: bool = False) -> str:
             wanted = doc_name.casefold()
             match = next((f for f in items
                           if wanted in str(f.get("name") or "").casefold()
                           and f.get("google_file_id")), None)
             if not match:
-                log.warning("документ знаний «%s» не найден", doc_name)
+                log.log(logging.INFO if optional else logging.WARNING,
+                        "документ знаний «%s» не найден", doc_name)
                 return ""
             res = cs.TOOLS["get_company_file"]["handler"](
                 {"google_file_id": match["google_file_id"]}) or {}
             return str(res.get("content") or res.get("text") or "")
 
-        cards = iu_knowledge.parse_cards(_read(KNOWLEDGE_DOC_NAME))
+        cards = iu_knowledge.parse_cards(_read(KNOWLEDGE_DOC_NAME, optional=True))
         # Раздел «Вопрос — ответ» разбирается своим парсером и встаёт рядом с карточками:
         # для поиска, цитирования и ссылок на источник это один и тот же материал.
         if QA_DOC_NAME:
             cards = cards + iu_knowledge.parse_qa(_read(QA_DOC_NAME))
+        # Документ условий — второй источник фактов той же папки. Албери отвечает лучше не
+        # потому, что у него лучше модель, а потому, что видит ВСЮ папку: выплаты, взнос и
+        # состав услуги описаны именно здесь.
+        cards = cards + _terms_cards(_read(terms_doc_name()))
         if not cards:
             _cards_cache.update({"at": now, "cards": ()})
             return ()

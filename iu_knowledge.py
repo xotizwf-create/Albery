@@ -263,6 +263,57 @@ def _split_trailing_section(body: str) -> tuple[str, tuple[str, str] | None]:
     return body.strip(), None
 
 
+#: Заголовок раздела в документе условий: короткая строка, заканчивающаяся двоеточием
+#: («Что входит в условия:», «Условия входа:»). Пункт перечисления заголовком не считается.
+_TERMS_SECTION_RE = re.compile(r"^\s*(\S[^\n]{0,78}):\s*$")
+_TERMS_LIST_RE = re.compile(r"^\s*(?:\d{1,2}[.)]|[-—–•*])\s+")
+#: Как назвать вводную часть документа — ту, что идёт до первого раздела.
+TERMS_INTRO_TITLE = "Условия программы"
+
+
+def parse_terms(client_text: str) -> tuple[Card, ...]:
+    """Разобрать клиентскую часть документа «Условия ИУ» в карточки.
+
+    Зачем. Этот документ агент умел только ОТПРАВЛЯТЬ дословно по действию `send_terms`, а
+    отвечать по нему не мог: в карточки он не попадал. Из-за этого агент не знал того, что в
+    нём написано, — «выплаты в течение 3 рабочих дней», «еженедельный отчёт комиссионера»,
+    «персональный менеджер», размер взноса, — и на прямые вопросы про выплаты и вход отвечал
+    «уточню у коллег». Агент Албери те же факты называет, потому что читает оба документа
+    папки (живой разбор 29.07.2026, диалог 16).
+
+    Ожидается уже ВЫРЕЗАННАЯ клиентская часть (то, что ниже строки-маркера), иначе в знания
+    попала бы инструкция владельца самому себе. Резать документ — забота вызывающего кода:
+    этот слой чистый.
+
+    Разделы владелец пишет строкой с двоеточием, под ней перечисление. Каждый раздел —
+    отдельная карточка: так на вопрос про выплаты цитируется раздел про условия, а не весь
+    документ. Пометка [ЗАПОЛНИТЬ] превращает карточку в черновик тем же правилом, что и везде.
+    """
+    lines = str(client_text or "").replace("\r\n", "\n").split("\n")
+    sections: list[tuple[str, list[str]]] = [(TERMS_INTRO_TITLE, [])]
+    for line in lines:
+        match = _TERMS_SECTION_RE.match(line)
+        if match and not _TERMS_LIST_RE.match(line):
+            sections.append((match.group(1).strip(), []))
+            continue
+        sections[-1][1].append(line)
+
+    out: list[Card] = []
+    seen: dict[str, int] = {}
+    for title, body in sections:
+        answer = "\n".join(body).strip()
+        if not answer or not title:
+            continue
+        base = _slug(title)
+        seen[base] = seen.get(base, 0) + 1
+        out.append(Card(
+            id=base if seen[base] == 1 else f"{base}-{seen[base]}",
+            title=title,
+            answer=answer,
+        ))
+    return tuple(out)
+
+
 def approved(cards) -> tuple[Card, ...]:
     """Только то, что владелец действительно заполнил."""
     return tuple(card for card in cards if card.approved)
