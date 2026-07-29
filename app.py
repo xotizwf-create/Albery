@@ -186,54 +186,145 @@ def write_company_google_sheet(
 _FORMULA_ERROR_PREFIXES = ("#ERROR", "#VALUE", "#REF", "#DIV/0", "#NAME", "#N/A", "#NUM", "#NULL")
 
 
+_COMMA_DECIMAL_LOCALES = (
+    "ru", "uk", "be", "de", "fr", "es", "it", "pl", "pt", "nl", "cs", "da", "fi", "sv", "tr",
+)
+_PLAIN_DECIMAL_NUMBER_RE = re.compile(r"^-?\d+\.\d+$")
+
+
 def _formula_argument_separator_for_locale(locale: str | None) -> str:
     """Google Sheets parses USER_ENTERED formulas with locale-specific argument separators.
     Russian and many European locales require semicolons, while en_US accepts commas."""
-    loc = (locale or "").lower()
-    if loc.startswith(("ru", "uk", "be", "de", "fr", "es", "it", "pl", "pt", "nl", "cs", "da", "fi", "sv", "tr")):
-        return ";"
-    return ","
+    return ";" if (locale or "").lower().startswith(_COMMA_DECIMAL_LOCALES) else ","
 
 
-def _normalize_formula_for_separator(value: Any, separator: str) -> Any:
-    """Convert comma-separated formula arguments to semicolons outside quoted strings.
-    This prevents #ERROR in ru_RU sheets when an LLM writes English-style formulas.
-    Cell values that are not formulas are returned unchanged."""
-    if separator != ";" or not isinstance(value, str) or not value.startswith("="):
-        return value
-    out: list[str] = []
-    in_double = False
-    in_single = False
-    escape_next = False
-    for ch in value:
+def _formula_decimal_separator_for_locale(locale: str | None) -> str:
+    """The same locales that separate arguments with `;` write fractions with a comma:
+    in a ru_RU sheet `=B3*0.14` is a syntax error and `=B3*0,14` is the correct formula."""
+    return "," if (locale or "").lower().startswith(_COMMA_DECIMAL_LOCALES) else "."
+
+
+def _formula_tokens_outside_quotes(formula: str):
+    """Yield (index, char, paren_depth) for characters outside quoted string literals."""
+    in_double = in_single = escape_next = False
+    depth = 0
+    for i, ch in enumerate(formula):
         if escape_next:
-            out.append(ch)
             escape_next = False
             continue
         if ch == "\\":
-            out.append(ch)
             escape_next = True
             continue
         if ch == '"' and not in_single:
             in_double = not in_double
-            out.append(ch)
             continue
         if ch == "'" and not in_double:
             in_single = not in_single
-            out.append(ch)
             continue
-        if ch == "," and not in_double and not in_single:
-            out.append(";")
-        else:
-            out.append(ch)
-    return "".join(out)
+        if in_double or in_single:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        yield i, ch, depth
 
 
-def _normalize_sheet_values_for_locale(values: list, separator: str) -> list:
+def convert_formula_to_locale(value: Any, argument_separator: str, decimal_separator: str,
+                              commas_are_arguments: bool | None = None) -> Any:
+    """Rewrite a cell value into the dialect the target Sheet actually parses.
+
+    The assistant may legitimately produce either dialect — the en-US one it was trained on
+    (`=ROUND(B1*0.3,2)`) or the Russian one a user would type (`=ROUND(B1*0,3;2)`). Both must
+    end up as a working formula, because in a ru_RU sheet the first form is a syntax error and
+    the second one is what Google expects. The ambiguous case is a comma between two digits:
+    it is a decimal comma outside a function call, or when the formula already uses `;` as its
+    argument separator; otherwise it separates arguments. `commas_are_arguments` overrides that
+    guess so a failed write can be retried with the opposite reading.
+    """
+    if not isinstance(value, str):
+        return value
+    if not value.startswith("="):
+        # A bare "0.14" silently lands as TEXT in a ru_RU sheet — no #ERROR, just a dead cell.
+        if decimal_separator == "," and _PLAIN_DECIMAL_NUMBER_RE.match(value.strip()):
+            return value.strip().replace(".", ",")
+        return value
+    if argument_separator == "," and decimal_separator == ".":
+        # en-US target: only bring a Russian-dialect formula back to commas.
+        chars = list(value)
+        for i, ch, _depth in _formula_tokens_outside_quotes(value):
+            if ch == ";":
+                chars[i] = ","
+            elif ch == "," and 0 < i < len(value) - 1 and value[i - 1].isdigit() and value[i + 1].isdigit():
+                chars[i] = "."
+        return "".join(chars)
+    if commas_are_arguments is None:
+        commas_are_arguments = not any(
+            ch == ";" for _i, ch, _d in _formula_tokens_outside_quotes(value)
+        )
+    chars = list(value)
+    for i, ch, depth in _formula_tokens_outside_quotes(value):
+        prev_digit = i > 0 and value[i - 1].isdigit()
+        next_digit = i + 1 < len(value) and value[i + 1].isdigit()
+        if ch == "." and prev_digit and next_digit:
+            chars[i] = decimal_separator
+        elif ch == ",":
+            between_digits = prev_digit and next_digit
+            is_decimal = between_digits and (depth == 0 or not commas_are_arguments)
+            chars[i] = decimal_separator if is_decimal else argument_separator
+    return "".join(chars)
+
+
+def _normalize_sheet_values_for_locale(values: list, argument_separator: str, decimal_separator: str,
+                                       commas_are_arguments: bool | None = None) -> list:
     return [
-        [_normalize_formula_for_separator(cell, separator) for cell in (row if isinstance(row, list) else [row])]
+        [
+            convert_formula_to_locale(cell, argument_separator, decimal_separator, commas_are_arguments)
+            for cell in (row if isinstance(row, list) else [row])
+        ]
         for row in (values or [])
     ]
+
+
+def _sheet_value_variants(values: list, argument_separator: str, decimal_separator: str) -> list[list]:
+    """Ordered candidate renderings of a block of cells, best guess first.
+
+    A readback decides which one Google actually accepted, so an ambiguous comma can never
+    strand the assistant in the dead end that produced `=B3*0;14` on 28.07.2026.
+    """
+    variants: list[list] = []
+    for commas_are_arguments in (None, True, False):
+        candidate = _normalize_sheet_values_for_locale(
+            values, argument_separator, decimal_separator, commas_are_arguments)
+        if candidate not in variants:
+            variants.append(candidate)
+    if values not in variants:
+        variants.append(values)
+    return variants
+
+
+def _normalize_formulas_in_batch_requests(node: Any, argument_separator: str, decimal_separator: str) -> Any:
+    """Apply the same locale conversion to formulas embedded in batchUpdate request objects."""
+    if isinstance(node, dict):
+        return {
+            key: (
+                convert_formula_to_locale(item, argument_separator, decimal_separator)
+                if key == "formulaValue"
+                else _normalize_formulas_in_batch_requests(item, argument_separator, decimal_separator)
+            )
+            for key, item in node.items()
+        }
+    if isinstance(node, list):
+        return [_normalize_formulas_in_batch_requests(item, argument_separator, decimal_separator) for item in node]
+    return node
+
+
+def _build_sheets_service(creds: Any = None) -> Any:
+    """Single place the Sheets client is constructed, so the write path can be tested."""
+    from googleapiclient.discovery import build
+
+    return build("sheets", "v4", credentials=creds if creds is not None else _google_user_credentials(),
+                 cache_discovery=False)
 
 
 def _sheet_locale(sheets: Any, spreadsheet_id: str) -> str:
@@ -265,10 +356,39 @@ def _scan_formula_errors(sheets: Any, spreadsheet_id: str, cell_range: str, limi
     for r, row in enumerate(vr.get("values", []) or [], start=1):
         for c, val in enumerate(row or [], start=1):
             if isinstance(val, str) and val.upper().startswith(_FORMULA_ERROR_PREFIXES):
-                errors.append({"row": r, "column": c, "value": val})
+                errors.append({"row": r, "column": c, "cell": f"{_a1_column_name(c)}{r}", "value": val})
                 if len(errors) >= limit:
                     return errors
     return errors
+
+
+def _write_values_with_locale_retry(
+    sheets: Any, spreadsheet_id: str, cell_range: str, values: list,
+    argument_separator: str, decimal_separator: str,
+) -> tuple[dict[str, Any], list, int]:
+    """Write a block of cells, then read it back; if Google flagged formula errors, re-write it
+    reading the ambiguous commas the other way. Returns (api response, values that stuck, tries).
+
+    Verification by readback is the point: the assistant must never be able to report a formula
+    as written when the sheet is showing `#ERROR!`.
+    """
+    variants = _sheet_value_variants(values, argument_separator, decimal_separator)
+    last_errors: list[dict[str, Any]] = []
+    resp: dict[str, Any] = {}
+    for attempt, candidate in enumerate(variants, start=1):
+        resp = sheets.spreadsheets().values().update(
+            spreadsheetId=str(spreadsheet_id), range=str(cell_range),
+            valueInputOption="USER_ENTERED", body={"values": candidate},
+        ).execute()
+        last_errors = _scan_formula_errors(
+            sheets, str(spreadsheet_id), resp.get("updatedRange") or str(cell_range))
+        if not last_errors:
+            return resp, candidate, attempt
+    raise RuntimeError(
+        "Google Sheets отклонил формулы во всех вариантах записи "
+        f"(локаль: аргументы «{argument_separator}», дробь «{decimal_separator}»). "
+        f"Ячейки с ошибкой: {last_errors[:10]}. Записано последним: {variants[-1]!r}"
+    )
 
 
 def _first_sheet_id(sheets: Any, spreadsheet_id: str) -> int:
@@ -561,17 +681,14 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
     url = spreadsheet.get("spreadsheetUrl") or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
     locale = _sheet_locale(sheets, sid)
     formula_separator = _formula_argument_separator_for_locale(locale)
+    decimal_separator = _formula_decimal_separator_for_locale(locale)
     style_applied = False
     if rows:
         width = max((len(r) for r in rows if isinstance(r, list)), default=1)
         norm = [[(r[i] if isinstance(r, list) and i < len(r) else "") for i in range(width)] for r in rows]
-        norm = _normalize_sheet_values_for_locale(norm, formula_separator)
-        sheets.spreadsheets().values().update(
-            spreadsheetId=sid, range="A1", valueInputOption="USER_ENTERED", body={"values": norm},
-        ).execute()
-        formula_errors = _scan_formula_errors(sheets, sid, f"A1:{_a1_column_name(width)}{len(norm)}")
-        if formula_errors:
-            raise RuntimeError(f"Google Sheet formula validation failed after create: {formula_errors[:5]}")
+        _resp, norm = _write_values_with_locale_retry(
+            sheets, sid, f"A1:{_a1_column_name(width)}{len(norm)}", norm,
+            formula_separator, decimal_separator)[:2]
         style_applied = _apply_default_google_sheet_style(sheets, sid, width, len(norm), values=norm)
     if share_anyone_writer:
         drive.permissions().create(fileId=sid, body={"type": "anyone", "role": "writer"}).execute()
@@ -581,6 +698,7 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
         "title": clean_title,
         "locale": locale,
         "formula_separator": formula_separator,
+        "decimal_separator": decimal_separator,
         "style_applied": style_applied,
         "access": "anyone_with_link_editor" if share_anyone_writer else "private",
     }
@@ -693,31 +811,33 @@ def write_google_sheet_values(
     spreadsheet_id: str, cell_range: str, values: list, value_input_option: str = "USER_ENTERED",
 ) -> dict[str, Any]:
     """Write a 2D array of values (formulas allowed with USER_ENTERED) into an A1 range.
-    USER_ENTERED formulas are normalized for the target sheet locale and then validated."""
-    from googleapiclient.discovery import build
+    Formulas are converted to the target sheet's locale, then verified by reading the cells
+    back; an ambiguous decimal/argument comma is retried the other way instead of failing."""
     if not isinstance(values, list):
         raise ValueError("values must be a list of rows (each row a list)")
-    creds = _google_user_credentials()
-    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    sheets = _build_sheets_service()
     opt = value_input_option if value_input_option in ("USER_ENTERED", "RAW") else "USER_ENTERED"
     locale = _sheet_locale(sheets, str(spreadsheet_id))
     formula_separator = _formula_argument_separator_for_locale(locale)
-    values_to_write = values
-    if opt == "USER_ENTERED":
-        values_to_write = _normalize_sheet_values_for_locale(values, formula_separator)
-    resp = sheets.spreadsheets().values().update(
-        spreadsheetId=str(spreadsheet_id), range=str(cell_range),
-        valueInputOption=opt, body={"values": values_to_write},
-    ).execute()
-    formula_errors = _scan_formula_errors(sheets, str(spreadsheet_id), resp.get("updatedRange") or str(cell_range))
-    if formula_errors:
-        raise RuntimeError(f"Google Sheet formula validation failed after write: {formula_errors[:10]}")
+    decimal_separator = _formula_decimal_separator_for_locale(locale)
+    if opt == "RAW":
+        resp = sheets.spreadsheets().values().update(
+            spreadsheetId=str(spreadsheet_id), range=str(cell_range),
+            valueInputOption=opt, body={"values": values},
+        ).execute()
+        attempts, written = 1, values
+    else:
+        resp, written, attempts = _write_values_with_locale_retry(
+            sheets, str(spreadsheet_id), str(cell_range), values, formula_separator, decimal_separator)
     return {
         "spreadsheet_id": str(spreadsheet_id),
         "updated_range": resp.get("updatedRange"),
         "updated_cells": resp.get("updatedCells"),
         "locale": locale,
         "formula_separator": formula_separator,
+        "decimal_separator": decimal_separator,
+        "attempts": attempts,
+        "written_values": written,
         "formula_errors": 0,
     }
 
@@ -788,11 +908,15 @@ def format_google_sheet(spreadsheet_id: str, requests: list) -> dict[str, Any]:
     """Apply Sheets API batchUpdate request objects: cell formatting, number/currency formats,
     conditional formatting, frozen rows/cols, column widths, merges, and charts (addChart)
     for dashboards. The caller builds standard Sheets API request objects."""
-    from googleapiclient.discovery import build
     if not isinstance(requests, list) or not requests:
         raise ValueError("requests must be a non-empty list of Sheets API request objects")
-    creds = _google_user_credentials()
-    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    sheets = _build_sheets_service()
+    locale = _sheet_locale(sheets, str(spreadsheet_id))
+    requests = _normalize_formulas_in_batch_requests(
+        requests,
+        _formula_argument_separator_for_locale(locale),
+        _formula_decimal_separator_for_locale(locale),
+    )
     resp = sheets.spreadsheets().batchUpdate(
         spreadsheetId=str(spreadsheet_id), body={"requests": requests},
     ).execute()

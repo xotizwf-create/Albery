@@ -11281,10 +11281,13 @@ TOOLS: dict[str, dict[str, Any]] = {
     "write_google_sheet_values": {
         "description": (
             "Write a 2D array of values/formulas into an A1 range of a Google Sheet (USER_ENTERED, "
-            "so formulas work). The server normalizes formula argument separators for the target Sheet locale "
-            "(ru_RU uses semicolons, not commas) and validates the updated range; if formulas still produce "
-            "#ERROR, the tool fails instead of letting the assistant claim success. Use for sheets the agent "
-            "created via create_google_sheet."
+            "so formulas work). WRITE FORMULAS THE WAY YOU NORMALLY WOULD — dot for decimals and comma for "
+            "arguments, e.g. =ROUND(B1*0.14,2). The server converts them to the target sheet's locale (a ru_RU "
+            "sheet needs =ROUND(B1*0,14;2)), reads the cells back, and if Google flagged an error re-writes them "
+            "with the other reading of an ambiguous comma. Do NOT hand-convert separators yourself and do NOT "
+            "retry a formula by guessing punctuation: if the tool returns an error it lists the exact cells and "
+            "what Google said, and that error is the only thing to report. A successful result means the cells "
+            "were read back clean — nothing else may be reported as written."
         ),
         "inputSchema": {
             "type": "object",
@@ -11313,7 +11316,8 @@ TOOLS: dict[str, dict[str, Any]] = {
             "create_google_sheet auto-applies a default readable style when rows are provided; use this tool for any "
             "extra formatting, dashboards, charts, task/status colors, merged title blocks or polished layout. "
             "Before saying a dashboard is ready, write/check formulas with write_google_sheet_values so formula "
-            "errors are caught; for ru_RU sheets use semicolons in formulas. "
+            "errors are caught; write formulas in the usual dot-decimal/comma-argument form — the server converts "
+            "them to the sheet's locale. "
             "Get each tab's sheetId from get_google_sheet_meta. requests = standard Sheets API request objects "
             "(repeatCell, mergeCells, updateSheetProperties, addChart, addConditionalFormatRule, "
             "updateDimensionProperties, ...)."
