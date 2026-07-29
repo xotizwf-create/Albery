@@ -64,7 +64,8 @@ def main() -> None:
         sys.exit(2)
 
     cli = paramiko.SSHClient()
-    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.load_system_host_keys()
+    cli.set_missing_host_key_policy(paramiko.RejectPolicy())
     cli.connect(PROD_HOST, username="root", password=password,
                 look_for_keys=False, allow_agent=False, timeout=20)
 

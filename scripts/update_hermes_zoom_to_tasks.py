@@ -7,7 +7,7 @@ Usage:
         # clear the cooldown fingerprint, and run the watchdog once.
 """
 from __future__ import annotations
-import argparse, pathlib, shlex, sys, paramiko
+import argparse, json, pathlib, shlex, sys, uuid, paramiko
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENV_PATH = REPO_ROOT / ".env"
@@ -38,7 +38,8 @@ def main() -> None:
 
     pw = read_env()["root_password"]
     cli = paramiko.SSHClient()
-    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.load_system_host_keys()
+    cli.set_missing_host_key_policy(paramiko.RejectPolicy())
     cli.connect(PROD_HOST, username="root", password=pw,
                 look_for_keys=False, allow_agent=False, timeout=20)
 
@@ -63,13 +64,25 @@ def main() -> None:
     sftp.close()
 
     if args.reset_and_run:
-        call_id = args.reset_and_run
+        try:
+            call_id = str(uuid.UUID(args.reset_and_run))
+        except ValueError:
+            parser.error("--reset-and-run requires a UUID zoom_call_id")
         # 1. Delete report via MCP
+        delete_payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "delete_zoom_call_report",
+                "arguments": {"call_id": call_id, "confirm": True},
+            },
+        }, separators=(",", ":"))
         del_cmd = (
             "secret=$(awk -F= '/^MCP_SHARED_SECRET=/{sub(/^[^=]*=/,\"\"); print; exit}' /var/www/albery/.env); "
             "curl -sS -X POST http://127.0.0.1:5002/mcp/$secret "
             "-H 'Content-Type: application/json' "
-            f"-d '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"delete_zoom_call_report\",\"arguments\":{{\"call_id\":\"{call_id}\",\"confirm\":true}}}}}}'"
+            f"-d {shlex.quote(delete_payload)}"
         )
         print(f"\nDelete saved report for {call_id} via MCP")
         _, out, err = cli.exec_command(del_cmd, timeout=60)

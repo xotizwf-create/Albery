@@ -11,6 +11,7 @@ import html
 import logging
 import mimetypes
 import os
+import secrets
 import subprocess
 import threading
 from queue import Empty, Queue
@@ -3772,7 +3773,10 @@ def safe_attachment_name(dialog_id: str, message_id: Any, file_id: Any, file_nam
     extension = Path(file_name or "").suffix.lower()
     if extension not in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".pdf"}:
         extension = ".bin"
-    digest = hashlib.sha1(f"{dialog_id}:{message_id}:{file_id}:{file_name or ''}".encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha1(
+        f"{dialog_id}:{message_id}:{file_id}:{file_name or ''}".encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:16]
     return f"{dialog_id.replace('/', '_')}_{message_id}_{file_id}_{digest}{extension}"
 
 
@@ -5674,7 +5678,10 @@ def analyze_chat_work_with_ai(dialog_id: str, date_from: date, date_to: date) ->
                     for index, task in enumerate(tasks, start=1):
                         if not isinstance(task, dict) or not str(task.get("title") or "").strip():
                             continue
-                        fingerprint = hashlib.sha1(f"{dialog_id}|{date_from}|{date_to}|{task.get('title')}|{task.get('assignee_name')}".encode("utf-8")).hexdigest()[:12]
+                        fingerprint = hashlib.sha1(
+                            f"{dialog_id}|{date_from}|{date_to}|{task.get('title')}|{task.get('assignee_name')}".encode("utf-8"),
+                            usedforsecurity=False,
+                        ).hexdigest()[:12]
                         artifact_id = pg_upsert_source_artifact(
                             cur,
                             "ai_analysis",
@@ -5692,7 +5699,10 @@ def analyze_chat_work_with_ai(dialog_id: str, date_from: date, date_to: date) ->
                         if not text:
                             continue
                         person = pg_get_user_by_name(cur, fact.get("person_name"))
-                        fingerprint = hashlib.sha1(f"{dialog_id}|{date_from}|{date_to}|{fact.get('type')}|{text}|{fact.get('person_name')}".encode("utf-8")).hexdigest()[:12]
+                        fingerprint = hashlib.sha1(
+                            f"{dialog_id}|{date_from}|{date_to}|{fact.get('type')}|{text}|{fact.get('person_name')}".encode("utf-8"),
+                            usedforsecurity=False,
+                        ).hexdigest()[:12]
                         pg_upsert_source_artifact(
                             cur,
                             "ai_analysis",
@@ -5709,7 +5719,10 @@ def analyze_chat_work_with_ai(dialog_id: str, date_from: date, date_to: date) ->
                         text = str(confirmation.get("reason") or confirmation.get("target_title") or "").strip() if isinstance(confirmation, dict) else ""
                         if not text:
                             continue
-                        fingerprint = hashlib.sha1(f"{dialog_id}|{date_from}|{date_to}|confirmation|{text}|{index}".encode("utf-8")).hexdigest()[:12]
+                        fingerprint = hashlib.sha1(
+                            f"{dialog_id}|{date_from}|{date_to}|confirmation|{text}|{index}".encode("utf-8"),
+                            usedforsecurity=False,
+                        ).hexdigest()[:12]
                         pg_upsert_source_artifact(
                             cur,
                             "ai_analysis",
@@ -5724,7 +5737,10 @@ def analyze_chat_work_with_ai(dialog_id: str, date_from: date, date_to: date) ->
                         text = str(block.get("text") or block.get("reason") or "").strip() if isinstance(block, dict) else ""
                         if not text:
                             continue
-                        fingerprint = hashlib.sha1(f"{dialog_id}|{date_from}|{date_to}|unknown|{text}|{index}".encode("utf-8")).hexdigest()[:12]
+                        fingerprint = hashlib.sha1(
+                            f"{dialog_id}|{date_from}|{date_to}|unknown|{text}|{index}".encode("utf-8"),
+                            usedforsecurity=False,
+                        ).hexdigest()[:12]
                         pg_upsert_source_artifact(
                             cur,
                             "ai_analysis",
@@ -14336,7 +14352,8 @@ def append_chat_tail(tails: list[dict[str, Any]], seen: set[tuple[str, str, str]
     normalized["text"] = text
     normalized["person_name"] = person
     normalized["task_id"] = normalized.get("task_id") or hashlib.sha1(
-        "|".join(chat_tail_key(normalized)).encode("utf-8")
+        "|".join(chat_tail_key(normalized)).encode("utf-8"),
+        usedforsecurity=False,
     ).hexdigest()[:16]
     key = chat_tail_key(normalized)
     if key in seen:
@@ -15853,16 +15870,30 @@ def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = Fal
     return load_chat_day(dialog_id, target_date)
 
 
+_INSECURE_SESSION_SECRET = "change-this-secret"
+
+
+def session_signing_secret() -> str:
+    """Use the configured key or an unguessable, process-local fallback."""
+
+    configured = os.getenv("FLASK_SECRET_KEY", "").strip()
+    if configured and configured != _INSECURE_SESSION_SECRET:
+        return configured
+    logging.getLogger(__name__).critical(
+        "FLASK_SECRET_KEY is missing or insecure; using an ephemeral session key. "
+        "Browser sessions will be invalidated on process restart."
+    )
+    return secrets.token_urlsafe(48)
+
+
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "change-this-secret")
+app.config["SECRET_KEY"] = session_signing_secret()
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=int(os.getenv("AUTH_SESSION_DAYS", "30") or "30"))
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = os.getenv("SESSION_COOKIE_SAMESITE", "Lax")
 session_cookie_secure_default = "1" if os.getenv("CANONICAL_WEB_HOST", "").strip() else "0"
 app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", session_cookie_secure_default).strip().lower() not in {"0", "false", "no"}
 app.jinja_env.filters["dt_ru"] = format_datetime_ru
-if app.config["SECRET_KEY"] == "change-this-secret":
-    app.logger.warning("FLASK_SECRET_KEY is not configured; session signing uses the insecure development fallback.")
 if os.getenv("MCP_ALLOW_UNAUTHENTICATED", "").strip() == "1":
     app.logger.warning("MCP_ALLOW_UNAUTHENTICATED=1 is enabled; MCP endpoints are open without a shared secret.")
 if not postgres_enabled():
@@ -15890,21 +15921,42 @@ def handle_unhandled_exception(exc: Exception):
 
 MCP_SSE_SESSIONS: dict[str, Queue[str]] = {}
 LOGIN_ATTEMPTS: dict[str, list[float]] = {}
-AUTH_EXEMPT_PREFIXES = (
+AUTH_EXEMPT_ROUTES = frozenset({
     "/login",
     "/logout",
-    "/assets/",
-    "/favicon",
     "/mcp",
     "/mcp-faq",
+    "/mcp-ops",
+    "/mcp-core",
+    "/mcp-ops-core",
     "/sse",
     "/sse-faq",
+    "/sse-ops",
+    "/favicon.ico",
+    "/favicon.svg",
+    "/favicon-16x16.png",
+    "/favicon-32x32.png",
+    "/favicon-64x64.png",
+    "/Калькулятор",
+})
+AUTH_EXEMPT_PREFIXES = (
+    "/assets/",
+    "/mcp/",
+    "/mcp-faq/",
+    "/mcp-ops/",
+    "/mcp-core/",
+    "/mcp-ops-core/",
+    "/mcp-agent/",
+    "/sse/",
+    "/sse-faq/",
+    "/sse-ops/",
     "/bitrix/events/",
     "/bitrix/imbot/",
     "/zoom/events/",
     "/google-drive/events/",
     "/zoom-export/",
     "/applet/",
+    "/Калькулятор/",
 )
 
 
@@ -15944,7 +15996,7 @@ def authenticated() -> bool:
 
 
 def auth_exempt_path(path: str) -> bool:
-    return any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in AUTH_EXEMPT_PREFIXES)
+    return path in AUTH_EXEMPT_ROUTES or any(path.startswith(prefix) for prefix in AUTH_EXEMPT_PREFIXES)
 
 
 def internal_api_auth_ok() -> bool:
@@ -16608,6 +16660,28 @@ def index():
 @app.get("/assets/<path:filename>")
 def frontend_assets(filename: str):
     return send_from_directory(FRONTEND_DIST / "assets", filename)
+
+
+# --- Public, standalone IU calculator. It has no API and stores no submitted data. ---
+CALCULATOR_DIST = APP_ROOT / "calculator" / "dist"
+
+
+@app.get("/Калькулятор")
+def calculator_canonical_redirect():
+    return redirect("/Калькулятор/", code=308)
+
+
+@app.get("/Калькулятор/")
+def calculator_index():
+    index_file = CALCULATOR_DIST / "index.html"
+    if index_file.exists():
+        return send_from_directory(CALCULATOR_DIST, "index.html")
+    return jsonify({"error": "Calculator build not found."}), 503
+
+
+@app.get("/Калькулятор/<path:filename>")
+def calculator_assets(filename: str):
+    return send_from_directory(CALCULATOR_DIST, filename)
 
 
 # --- Standalone WB-cabinet page served at /Analytics (own Vite bundle, base=/analytics/).

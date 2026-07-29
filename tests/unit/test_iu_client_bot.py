@@ -136,6 +136,18 @@ def test_join_button_answers_honestly_while_the_form_is_missing(monkeypatch):
     assert "http" not in text
 
 
+def test_calculator_button_sends_the_public_url_without_handover(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_callback_update(bot.CB_CALCULATOR))
+
+    assert bot.CALCULATOR_URL in store.queued[0]["text"]
+    assert store.transitions == []
+
+
 def test_operator_button_appears_only_after_the_third_ai_reply():
     assert bot.should_offer_operator(0) is False
     assert bot.should_offer_operator(2) is False

@@ -89,7 +89,7 @@ def test_menu_lives_under_the_input_field_not_inside_a_message():
 
 
 def test_menu_has_no_operator_item():
-    """Владелец убрал пункт 28.07.2026: человека зовут присоединение, калькулятор и сам агент."""
+    """Владелец убрал пункт 28.07.2026: человека зовут присоединение и сам агент."""
 
     titles = [button["text"] for row in bot.main_menu()["keyboard"] for button in row]
     with_flag = [button["text"] for row in bot.main_menu(offer_operator=True)["keyboard"]

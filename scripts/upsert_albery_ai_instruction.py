@@ -5,7 +5,7 @@ Usage:
     python scripts/upsert_albery_ai_instruction.py "Cron автоматизации/Zoom задачи — ответ ставь" scripts/ai_instruction_zoom_approval.md
 """
 from __future__ import annotations
-import json, pathlib, sys, paramiko
+import json, pathlib, secrets, sys, paramiko
 
 
 def read_env(path: pathlib.Path) -> dict[str, str]:
@@ -32,13 +32,14 @@ def main() -> None:
 
     pw = read_env(pathlib.Path(__file__).resolve().parent.parent / ".env")["root_password"]
     cli = paramiko.SSHClient()
-    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.load_system_host_keys()
+    cli.set_missing_host_key_policy(paramiko.RejectPolicy())
     cli.connect("186.246.7.32", username="root", password=pw,
                 look_for_keys=False, allow_agent=False, timeout=20)
 
     # Upload content to a temp file on prod (avoids JSON escape issues for long markdown)
     sftp = cli.open_sftp()
-    remote_tmp = "/tmp/ai_instruction_payload.json"
+    remote_tmp = f"/tmp/ai_instruction_payload_{secrets.token_hex(8)}.json"
     payload = {
         "jsonrpc": "2.0",
         "id": 1,

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -67,7 +68,7 @@ def _xlsx_openpyxl(data: bytes, max_chars: int) -> str:
 def _xlsx_stream(data: bytes, max_chars: int) -> str:
     """Stream-parse sheet XML directly. Unlike openpyxl's read_only mode this does not trust
     row indexes / dimensions, so exports that omit them (WB, some 1C) are read in full."""
-    from xml.etree.ElementTree import fromstring, iterparse
+    from defusedxml.ElementTree import fromstring, iterparse
 
     z = zipfile.ZipFile(io.BytesIO(data))
     names = set(z.namelist())
@@ -160,6 +161,57 @@ _DOC_CTYPES = {
 _DOC_URL_EXT_RE = re.compile(r"\.(pdf|docx|xlsx|xlsm)($|[?#])", re.I)
 
 
+def assert_public_http_url(url: str) -> None:
+    """Reject non-web and non-public targets before any server-side request.
+
+    This protects fetch_url from SSRF into loopback, private networks, cloud metadata
+    services and DNS names that resolve to any non-global address.
+    """
+
+    parsed = urllib.parse.urlsplit(str(url or "").strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Only absolute http:// or https:// URLs are allowed.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Credentials in URLs are not allowed.")
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("Local addresses are not allowed.")
+    try:
+        addresses = {
+            item[4][0].split("%", 1)[0]
+            for item in socket.getaddrinfo(host, parsed.port, type=socket.SOCK_STREAM)
+        }
+    except (OSError, ValueError) as exc:
+        raise ValueError("URL host could not be resolved.") from exc
+    if not addresses:
+        raise ValueError("URL host did not resolve to an address.")
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError as exc:
+            raise ValueError("URL host resolved to an invalid address.") from exc
+        if not ip.is_global:
+            raise ValueError("Private, local and reserved network addresses are not allowed.")
+
+
+class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        assert_public_http_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def public_url_opener(*handlers):
+    """urllib opener that validates both the initial URL and every redirect target."""
+
+    return urllib.request.build_opener(*handlers, _PublicOnlyRedirectHandler())
+
+
+def safe_urlopen(request, *, timeout: int):
+    url = request.full_url if isinstance(request, urllib.request.Request) else str(request)
+    assert_public_http_url(url)
+    return public_url_opener().open(request, timeout=timeout)
+
+
 def direct_fetch(url: str, headers: dict | None = None, timeout: int = 25,
                  doc_limit: int = 12 * 1024 * 1024, text_limit: int = 350_000):
     """GET ``url`` with sockets bound to the physical RU interface (SO_BINDTODEVICE), bypassing
@@ -202,7 +254,8 @@ def direct_fetch(url: str, headers: dict | None = None, timeout: int = 25,
             return self.do_open(_HTTP, req)
 
     try:
-        opener = urllib.request.build_opener(_HHandler(), _HsHandler())
+        assert_public_http_url(url)
+        opener = public_url_opener(_HHandler(), _HsHandler())
         req = urllib.request.Request(url, headers=dict(headers or {"User-Agent": _UA}))
         with opener.open(req, timeout=timeout) as resp:
             status = getattr(resp, "status", 200)

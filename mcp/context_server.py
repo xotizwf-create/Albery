@@ -6991,6 +6991,11 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32602, "url is required.")
     if not re.match(r"^https?://", url):
         raise McpError(-32602, "url must start with http:// or https://.")
+    import webread
+    try:
+        webread.assert_public_http_url(url)
+    except ValueError as exc:
+        raise McpError(-32602, f"URL is not allowed: {exc}") from exc
     max_chars_raw = args.get("max_chars")
     if max_chars_raw in (None, ""):
         max_chars = 50_000
@@ -7008,7 +7013,6 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
     # routes, reader proxy included), while WB's static basket CDN serves the same card as
     # JSON with no antibot — answer card links from the CDN.
     try:
-        import webread
         wb_result = webread.wb_card_result(url, max_chars)
     except Exception as exc:  # noqa: BLE001
         logging.warning("fetch_url: wb card handler failed: %s", repr(exc)[:160])
@@ -7027,7 +7031,7 @@ def tool_fetch_url(args: dict[str, Any]) -> dict[str, Any]:
     else:
         request = urllib.request.Request(fetched_url, headers=dict(_FETCH_BROWSER_HEADERS), method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with webread.safe_urlopen(request, timeout=30) as response:
                 status = response.status
                 content_type = response.headers.get("Content-Type", "") or ""
                 doc_ext = _binary_doc_ext(fetched_url, content_type)

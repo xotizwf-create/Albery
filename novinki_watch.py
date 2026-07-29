@@ -146,7 +146,7 @@ def _score_candidates(per_file_msgs):
                 score -= 4
             if score < 4:
                 continue
-            k = hashlib.md5(t[:100].encode("utf-8")).hexdigest()
+            k = hashlib.md5(t[:100].encode("utf-8"), usedforsecurity=False).hexdigest()
             if k in seen:
                 continue
             seen.add(k)

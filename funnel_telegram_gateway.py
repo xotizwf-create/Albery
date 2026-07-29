@@ -667,9 +667,8 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
         _hand_over_to_human(conversation_id, "Клиент выбрал «Присоединиться к ИУ».")
     elif action == iu_client_bot.CB_CALCULATOR:
         _reply_to_client(
-            conversation_id, iu_client_bot.CALCULATOR_STUB, idempotency_key=idempotency_key
+            conversation_id, iu_client_bot.CALCULATOR_REPLY, idempotency_key=idempotency_key
         )
-        _hand_over_to_human(conversation_id, "Клиент выбрал «Калькулятор расчёта ИУ».")
     elif action == iu_client_bot.CB_ASK:
         _reply_to_client(conversation_id, iu_client_bot.ASK_PROMPT, idempotency_key=idempotency_key)
     elif action == iu_client_bot.CB_OPERATOR:

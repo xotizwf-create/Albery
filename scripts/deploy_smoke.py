@@ -284,6 +284,20 @@ except Exception as exc:  # noqa: BLE001
     failures.append(f"/login: {exc}")
 
 try:
+    with urllib.request.urlopen(
+        f"{APP_URL}/{urllib.parse.quote('Калькулятор')}/", timeout=15
+    ) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+        if resp.status != 200 or "Калькулятор ИУ" not in body:
+            failures.append(
+                f"/Калькулятор/: status={resp.status}, calculator marker missing"
+            )
+        else:
+            print("/Калькулятор/: OK (public)")
+except Exception as exc:  # noqa: BLE001
+    failures.append(f"/Калькулятор/: {type(exc).__name__}")
+
+try:
     with urllib.request.urlopen(f"{APP_URL}/agent-funnels", timeout=15) as resp:
         if resp.status != 200 or not resp.geturl().rstrip("/").endswith("/agent-funnels"):
             failures.append(

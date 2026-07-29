@@ -1904,7 +1904,7 @@ def _facts_for_turn(author: dict, text: str, deal_id: int | None = None, *,
 
 def _anketa_fingerprint(block: str) -> str:
     """Отпечаток содержимого анкеты — по нему видно, сверяли эти данные или ещё нет."""
-    return hashlib.sha1(block.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha1(block.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
 
 
 def _check_new_forms() -> None:

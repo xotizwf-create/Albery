@@ -122,7 +122,7 @@ def test_menu_has_the_calculator_and_emoji_on_every_item():
     assert bot.BUTTON_OPERATOR[0] not in "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
 
 
-def test_calculator_answers_with_a_stub_and_calls_a_human(monkeypatch):
+def test_calculator_opens_the_public_page_without_calling_a_human(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)
     _tg(monkeypatch)
@@ -135,9 +135,10 @@ def test_calculator_answers_with_a_stub_and_calls_a_human(monkeypatch):
     }})
 
     assert store.ingested[0]["schedule_ai"] is False
-    text = store.queued[0]["text"].lower()
-    assert "расч" in text
-    assert store.transitions, "клиент, которому нужен расчёт, ждёт человека"
+    text = store.queued[0]["text"]
+    assert bot.CALCULATOR_URL in text
+    assert "без регистрации" in text.lower()
+    assert store.transitions == [], "готовый калькулятор не должен передавать клиента человеку"
 
 
 def test_old_menu_titles_are_still_recognised():
