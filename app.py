@@ -15957,6 +15957,9 @@ AUTH_EXEMPT_PREFIXES = (
     "/zoom-export/",
     "/applet/",
     "/Калькулятор/",
+    # Персональная ссылка на анкету ИУ: её открывает клиент, у которого нет и не может быть
+    # доступа в кабинет. Страница ничего не отдаёт, кроме перехода на анкету.
+    "/iu/",
 )
 
 
@@ -18853,6 +18856,7 @@ register_funnel_workspace(app)
 import agent_center  # noqa: E402,F401
 import wb_cabinet  # noqa: E402,F401  — WB-кабинет: /api/wb-cab/*
 import funnel_view  # noqa: E402,F401  — воронка ИУ в кабинете: /api/agent-center/funnel/*
+import iu_form_link  # noqa: E402,F401  — персональная ссылка на анкету ИУ: /iu/<токен>
 
 
 if __name__ == "__main__":

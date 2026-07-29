@@ -649,6 +649,42 @@ def ingest_bot_message(
     return conversation_id, _as_int(journaled.get("id"))
 
 
+def _join_body(conversation_id: int) -> tuple[str, bool]:
+    """Текст ответа на «Присоединиться к ИУ» и признак «анкета уже заполнена».
+
+    Ссылка персональная: по метке в ней заявка приклеивается к этому же человеку, а не заводит
+    вторую карточку в воронке. Повторное нажатие отдаёт ТУ ЖЕ ссылку, пока анкета не заполнена,
+    и честное «вы уже заполнили» — после.
+
+    Сбой базы не оставляет клиента ни с чем: он получает прежний ответ с обещанием менеджера.
+    """
+
+    import iu_client_bot
+
+    try:
+        import iu_form_link
+        from app import pg_connect
+
+        conversation = dict(_store().get_conversation(conversation_id) or {})
+        telegram_id = _as_int(conversation.get("external_user_id")) or _as_int(
+            conversation.get("external_chat_id"))
+        if not telegram_id:
+            raise ValueError("у обращения нет Telegram id")
+        with pg_connect() as conn:
+            live = iu_form_link.issue(
+                conn, telegram_id,
+                conversation_id=conversation_id,
+                deal_id=_as_int(conversation.get("deal_id")),
+            )
+            filled = iu_form_link.filled_by(conn, telegram_id)
+        if filled:
+            return iu_client_bot.JOIN_ALREADY, True
+        return iu_client_bot.join_reply(live["url"]), False
+    except Exception as exc:  # noqa: BLE001 — без ссылки клиент всё равно получает ответ
+        log.warning("персональная ссылка на анкету не выдана: %s", _safe_error(exc))
+        return iu_client_bot.JOIN_STUB, False
+
+
 def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) -> None:
     """Выполнить выбранный в меню пункт."""
 
@@ -663,8 +699,10 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
             body = iu_client_bot.TERMS_FALLBACK
         _reply_to_client(conversation_id, body, idempotency_key=idempotency_key)
     elif action == iu_client_bot.CB_JOIN:
-        _reply_to_client(conversation_id, iu_client_bot.JOIN_STUB, idempotency_key=idempotency_key)
-        _hand_over_to_human(conversation_id, "Клиент выбрал «Присоединиться к ИУ».")
+        body, already = _join_body(conversation_id)
+        _reply_to_client(conversation_id, body, idempotency_key=idempotency_key)
+        if not already:
+            _hand_over_to_human(conversation_id, "Клиент выбрал «Присоединиться к ИУ».")
     elif action == iu_client_bot.CB_CALCULATOR:
         _reply_to_client(
             conversation_id, iu_client_bot.CALCULATOR_REPLY, idempotency_key=idempotency_key
@@ -1515,7 +1553,9 @@ def _send_text(
     }
     if formatted:
         rendered = tg_agent.telegram_html(text)
-        if "<b>" in rendered:
+        # Ссылка — такой же повод включить разметку, как и жирный: без HTML-режима клиент
+        # получил бы markdown-скобки, а не кликабельную подпись.
+        if "<b>" in rendered or "<a href=" in rendered:
             try:
                 return tg_agent.api("sendMessage", text=rendered[:4096],
                                     parse_mode="HTML", **common)

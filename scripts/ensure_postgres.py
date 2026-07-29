@@ -39,6 +39,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "bitrix_error_reports": "032_bitrix_error_reports.sql",
     "agent_access": "034_agent_access.sql",
     "access_requests": "036_access_requests.sql",
+    "iu_form_tokens": "075_iu_form_tokens.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {

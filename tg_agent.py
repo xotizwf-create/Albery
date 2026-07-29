@@ -33,6 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -531,13 +532,26 @@ def _strip_markup(text: str, *, keep_bold: bool = False) -> str:
 _HEADING_LINE_RE = re.compile(r"^(\s*)(\S[^\n]{0,79}:)\s*$")
 
 
+#: Ссылка, написанная по-человечески: «[Калькулятор ИУ](https://…)». Подпись без переносов и
+#: без вложенных скобок — чтобы разбор не уехал на произвольном тексте.
+_TG_LINK_RE = re.compile(r"\[([^\]\n]{1,80})\]\((https?://[^\s)]+)\)")
+
+
+def _safe_link_url(url: str) -> str:
+    """Адрес, пригодный для тега `<a href>`.
+
+    Кириллица в пути («/Калькулятор/») обязана быть процентно-кодирована: Telegram отбивает
+    сообщение целиком, если не разбирает адрес, и клиент не получает ничего."""
+    return quote(str(url or ""), safe="/:?=&#%@+,;$!*'()~[]")
+
+
 def telegram_html(text: str) -> str:
-    """Ответ клиенту с жирными заголовками — для отправки с parse_mode=HTML.
+    """Ответ клиенту с жирными заголовками и ссылками — для отправки с parse_mode=HTML.
 
     Владелец 29.07.2026: «непонятно, на какие вопросы он дал ответ». В сплошном тексте без
     выделения девять ответов подряд читаются как одна простыня. Экранируем всё, что могло бы
-    сломать разбор Telegram, и выделяем только строки-заголовки: модель не может протащить
-    сюда произвольный тег, а человек видит структуру."""
+    сломать разбор Telegram, и собираем теги только из НАШЕЙ разметки: модель не может
+    протащить сюда произвольный тег, а человек видит структуру и кликабельную ссылку."""
     escaped = html.escape(str(text or ""), quote=False)
     lines = []
     for line in escaped.splitlines():
@@ -546,7 +560,9 @@ def telegram_html(text: str) -> str:
     rendered = "\n".join(lines)
     # Жирный, который агент поставил сам — тем же BB-кодом, что и в Битриксе. Экранирование
     # прошло раньше, поэтому тегом станет только наша разметка, а не текст клиента.
-    return re.sub(r"\[b\](.+?)\[/b\]", r"<b>\1</b>", rendered, flags=re.S | re.I)
+    rendered = re.sub(r"\[b\](.+?)\[/b\]", r"<b>\1</b>", rendered, flags=re.S | re.I)
+    return _TG_LINK_RE.sub(
+        lambda m: f'<a href="{_safe_link_url(m.group(2))}">{m.group(1)}</a>', rendered)
 
 
 def react(chat_id, message_id, emoji: str, business_connection_id: str = "") -> None:

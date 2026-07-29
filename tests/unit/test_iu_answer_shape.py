@@ -221,3 +221,62 @@ def test_sample_answer_is_written_in_that_style():
     assert "[b]Комиссия[/b]" in built
     assert "1. Комиссия Wildberries;" in built
     assert "[b]Итог[/b]" in built
+
+
+# --- ссылки в сообщениях бота ---------------------------------------------------------------
+
+def test_link_becomes_clickable_for_the_client():
+    """Владелец 29.07.2026: «чтоб Калькулятор ИУ был как гиперссылка».
+
+    Без этого клиент получал бы markdown-скобки: разметку собирала только жирная строка."""
+    import tg_agent
+
+    rendered = tg_agent.telegram_html("Считайте в [Калькуляторе ИУ](https://www.m4s.ru/calc/).")
+
+    assert '<a href="https://www.m4s.ru/calc/">Калькуляторе ИУ</a>' in rendered
+    assert "[" not in rendered
+
+
+def test_cyrillic_url_is_percent_encoded():
+    """Адрес калькулятора кириллический. Неразобранный адрес Telegram отбивает целиком —
+    клиент не получает НИЧЕГО, поэтому кодирование обязательно."""
+    import tg_agent
+
+    rendered = tg_agent.telegram_html("[Калькулятор ИУ](https://www.m4s.ru/Калькулятор/)")
+
+    assert "%D0%9A" in rendered
+    assert "Калькулятор/" not in rendered.split("href=")[1].split('"')[1]
+
+
+def test_model_cannot_smuggle_a_link_tag():
+    """Разметку собираем мы: тег из текста модели остаётся текстом."""
+    import tg_agent
+
+    rendered = tg_agent.telegram_html('<a href="https://evil.example">жми</a>')
+
+    assert "&lt;a href=" in rendered
+    assert "<a href=" not in rendered
+
+
+def test_calculator_reply_is_a_sentence_with_a_link():
+    import iu_client_bot
+
+    assert "[Калькуляторе ИУ](" in iu_client_bot.CALCULATOR_REPLY
+    assert "Посчитать свою выгоду" in iu_client_bot.CALCULATOR_REPLY
+
+
+def test_join_reply_carries_the_personal_link():
+    import iu_client_bot
+
+    body = iu_client_bot.join_reply("https://www.m4s.ru/iu/abc")
+
+    assert "[Заполнить анкету](https://www.m4s.ru/iu/abc)" in body
+    assert "личная" in body
+
+
+def test_already_filled_answer_does_not_offer_the_form_again():
+    """Владелец 29.07.2026: «если для его айди заполнено — бот скажет, вы уже заполнили»."""
+    import iu_client_bot
+
+    assert "уже заполнили" in iu_client_bot.JOIN_ALREADY
+    assert "http" not in iu_client_bot.JOIN_ALREADY
