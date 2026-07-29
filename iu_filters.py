@@ -274,6 +274,12 @@ _CTA_RE = re.compile(
     re.I,
 )
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|\n+")
+#: Разбивка ОДНОЙ строки на предложения. Переносы разбираются отдельно, поэтому сюда они
+#: не входят: иначе строка списка теряла бы свою границу.
+_SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+")
+#: Пункт перечисления: «1.», «2)», «— », «• ». Это СОДЕРЖАНИЕ ответа, а не следующий шаг, —
+#: даже когда пункт написан повелительным наклонением («1. Пришлите реквизиты;»).
+_LIST_ITEM_RE = re.compile(r"^\s*(?:\d{1,2}[.)]|[-—–•*])\s+")
 
 
 def is_next_step(sentence: str) -> bool:
@@ -282,46 +288,64 @@ def is_next_step(sentence: str) -> bool:
     return bool("?" in value or _URL_RE.search(value) or _CTA_RE.search(value))
 
 
-def one_next_step(text: str) -> str:
-    """Оставить содержательный ответ и не больше одного вопроса или призыва.
-
-    Правило «в сообщении максимум один следующий шаг» есть и в промпте, но полагаться только на
-    послушание модели нельзя: два вопроса подряд превращают консультацию в допрос, и владелец
-    жаловался ровно на это. Содержательные предложения сохраняются все — сначала ответ, потом
-    один шаг.
-
-    **Разбивка на строки сохраняется.** Владелец 28.07.2026 попросил отвечать так, как отвечает
-    человек: прямой ответ, под ним перечисление, в конце вывод. Прежняя склейка всего текста
-    через пробел превращала такой ответ в сплошной абзац — список из четырёх пунктов приезжал
-    клиенту одной строкой. Плоский ответ без переносов обрабатывается как раньше, чтобы
-    привычное поведение коротких реплик не поехало."""
-    value = str(text or "").strip()
-    if "\n" not in value:
-        parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(value) if p.strip()]
-        informational = [p for p in parts if not is_next_step(p)]
-        steps = [p for p in parts if is_next_step(p)]
-        return " ".join(informational + steps[:1]).strip()
-
-    kept_step = ""
+def _trim_block(block: str) -> tuple[str, bool]:
+    """Оставить в блоке не больше одного шага. Возвращает текст и признак правки."""
+    kept = False
+    changed = False
     lines: list[str] = []
-    for raw_line in value.splitlines():
-        line = raw_line.strip()
-        if not line:
-            lines.append("")
+    for raw_line in block.splitlines():
+        if _LIST_ITEM_RE.match(raw_line):
+            lines.append(raw_line)
             continue
-        keep = []
-        for part in (p.strip() for p in _SENTENCE_SPLIT_RE.split(line)):
+        keep: list[str] = []
+        for part in (p.strip() for p in _SENTENCE_RE.split(raw_line.strip())):
             if not part:
                 continue
             if is_next_step(part):
-                kept_step = kept_step or part
-                continue
+                if kept:
+                    changed = True
+                    continue
+                kept = True
             keep.append(part)
-        lines.append(" ".join(keep))
-    body = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-    if not kept_step:
-        return body
-    return f"{body}\n\n{kept_step}".strip() if body else kept_step
+        line = " ".join(keep)
+        if line or not raw_line.strip():
+            lines.append(line)
+        else:
+            changed = True
+    return "\n".join(lines).strip(), changed
+
+
+def one_next_step(text: str) -> str:
+    """Оставить в ЗАКЛЮЧИТЕЛЬНОМ блоке не больше одного шага. Остальной текст не трогать.
+
+    Правило «в сообщении максимум один следующий шаг» есть и в промпте, но полагаться только на
+    послушание модели нельзя: два вопроса подряд превращают консультацию в допрос, и владелец
+    жаловался ровно на это.
+
+    **Почему проверка сузилась до последнего блока (29.07.2026).** Прежняя версия искала шаг в
+    КАЖДОЙ строке и оставляла один на весь ответ. Признаком шага считается повелительный глагол
+    («пришлите», «укажите», «подтвердите»), а из таких глаголов состоит любой ответ на вопрос
+    «что от меня нужно». В результате ответ
+
+        1. Пришлите реквизиты компании;
+        2. Укажите систему налогообложения;
+        3. Подтвердите форму подписания.
+
+    приезжал клиенту как «1.», «2.», «3.» — пункты оставались, текст исчезал, а первый пункт
+    уезжал в самый низ сообщения. Ломалось это ровно на тех ответах, которые двигают воронку.
+
+    Поэтому теперь: пункты перечисления неприкосновенны; содержательные предложения не
+    вырезаются и не переставляются; лишние шаги убираются только в последнем блоке — там, где
+    у живого письма и стоит закрывающий вопрос."""
+    value = str(text or "").strip()
+    if not value:
+        return value
+    blocks = re.split(r"\n\s*\n", value)
+    trimmed, changed = _trim_block(blocks[-1])
+    if not changed:
+        return value
+    blocks[-1] = trimmed
+    return "\n\n".join(block.strip() for block in blocks if block.strip()).strip()
 
 
 def claims_action(text: str) -> str:
