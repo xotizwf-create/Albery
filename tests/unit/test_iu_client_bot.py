@@ -53,7 +53,7 @@ def _tg(monkeypatch, answered=None):
         _handle_update_safely=lambda _u: None,
         api=lambda method, **kwargs: (answered.append((method, kwargs)) if answered is not None else None) or {},
         terms_text=lambda: "Условия ИУ: комиссия, сроки, документы.",
-        _strip_markup=lambda value: str(value),
+        _strip_markup=lambda value, **_kw: str(value),
     )
     monkeypatch.setitem(sys.modules, "tg_agent", tg)
     return tg

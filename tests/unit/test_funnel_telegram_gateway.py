@@ -66,7 +66,7 @@ def test_terms_delivery_persists_fact_derived_stage_before_outbox_send(monkeypat
     import iu_funnel
     import tg_agent
 
-    monkeypatch.setattr(tg_agent, "_strip_markup", lambda value: str(value))
+    monkeypatch.setattr(tg_agent, "_strip_markup", lambda value, **_kw: str(value))
     monkeypatch.setattr(tg_agent, "terms_text", lambda: "Условия ИУ")
     outcome = SimpleNamespace(
         reply="Отправляю.",

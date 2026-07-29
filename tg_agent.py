@@ -502,12 +502,24 @@ def api_multipart(method: str, files: dict, http_timeout: int = 120, **params):
 
 
 _MARKUP_RE = re.compile(r"\[/?(?:b|i|u|s|url(?:=[^\]]*)?)\]|</?(?:b|i|u|s|strong|em)>", re.IGNORECASE)
+#: То же, но жирный BB-код остаётся: его собирает в разметку отправка клиентского бота.
+_MARKUP_KEEP_BOLD_RE = re.compile(
+    r"\[/?(?:i|u|s|url(?:=[^\]]*)?)\]|</?(?:i|u|s|strong|em)>", re.IGNORECASE)
 
 
-def _strip_markup(text: str) -> str:
+def _strip_markup(text: str, *, keep_bold: bool = False) -> str:
     """The model mixes Bitrix BB-codes ([b]…[/b]) and HTML (<b>…</b>) into its answers; this bot
     sends PLAIN text (no parse_mode), so those tags reached people literally («какие-то символы
-    <b>» — владелец, 2026-07-14). Strip them; bold emphasis is lost, garbage is worse."""
+    <b>» — владелец, 2026-07-14). Strip them; bold emphasis is lost, garbage is worse.
+
+    `keep_bold=True` — для клиентского бота, который с 29.07.2026 умеет отправлять разметку:
+    жирный из ответа сохраняется в виде BB-кода, а собирается в HTML уже при отправке. Так
+    выделение доезжает до клиента, а всё остальное по-прежнему вычищается."""
+    if keep_bold:
+        text = re.sub(r"<\s*b\s*>(.+?)<\s*/\s*b\s*>", r"[b]\1[/b]", text or "",
+                      flags=re.S | re.I)
+        text = re.sub(r"\*\*(.+?)\*\*", r"[b]\1[/b]", text, flags=re.S)
+        return _MARKUP_KEEP_BOLD_RE.sub("", text)
     text = _MARKUP_RE.sub("", text or "")
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.S)
     return text
@@ -531,7 +543,10 @@ def telegram_html(text: str) -> str:
     for line in escaped.splitlines():
         match = _HEADING_LINE_RE.match(line)
         lines.append(f"{match.group(1)}<b>{match.group(2)}</b>" if match else line)
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    # Жирный, который агент поставил сам — тем же BB-кодом, что и в Битриксе. Экранирование
+    # прошло раньше, поэтому тегом станет только наша разметка, а не текст клиента.
+    return re.sub(r"\[b\](.+?)\[/b\]", r"<b>\1</b>", rendered, flags=re.S | re.I)
 
 
 def react(chat_id, message_id, emoji: str, business_connection_id: str = "") -> None:

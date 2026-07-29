@@ -46,7 +46,7 @@ def _tg(monkeypatch):
         _handle_update_safely=lambda _u: None,
         api=lambda method, **kwargs: {},
         terms_text=lambda: "Условия ИУ: комиссия, сроки, документы.",
-        _strip_markup=lambda value: str(value),
+        _strip_markup=lambda value, **_kw: str(value),
         _business_owner_id=lambda _connection: 777,
         handle_business_connection=lambda _payload: None,
     )

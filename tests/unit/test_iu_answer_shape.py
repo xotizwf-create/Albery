@@ -63,12 +63,12 @@ def test_flat_short_answer_behaves_exactly_as_before():
 
 
 def test_prompt_asks_for_the_owners_answer_shape():
+    """Форма ответа — стандарт компании «Формат ответа», по которому отвечает Агент Албери."""
     rules = iu_prompt.RULES
 
-    assert "Первой строкой — прямой ответ" in rules
-    assert "с «— » в начале" in rules
-    assert "написано сплошной строкой" in rules
-    assert "Простой вопрос — простой короткий ответ" in rules
+    assert "Между смысловыми блоками — ПУСТАЯ строка" in " ".join(rules.split())
+    assert "Полотно" in rules
+    assert "Простой вопрос — простой короткий ответ" in " ".join(rules.split())
     # Требование знаков препинания: агент писал строки без точек, и ответ обрывался
     # на полуслове. Пробелы в правиле переносятся, поэтому сверяем по словам.
     assert "Знаки препинания обязательны" in rules
@@ -117,10 +117,10 @@ def test_long_sentence_with_a_colon_is_not_a_heading():
 
 
 def test_prompt_requires_a_heading_per_question():
-    rules = iu_prompt.RULES
+    rules = " ".join(iu_prompt.RULES.split())
 
-    assert "ОТДЕЛЬНОЙ строкой-заголовком" in rules
-    assert "заканчивается двоеточием" in rules
+    assert "на каждый свой блок: жирный заголовок темы" in rules
+    assert "Отвечай в порядке клиента" in rules
 
 
 def test_client_role_comes_from_the_client_agent_card():
@@ -140,4 +140,43 @@ def test_prompt_shows_the_owners_sample_answer():
 
     assert "ОБРАЗЕЦ ОТВЕТА" in built
     assert "В эти 44% уже входят:" in built
-    assert "— комиссия Wildberries;" in built
+    assert "1. Комиссия Wildberries;" in built
+
+
+# --- стиль Агента Албери --------------------------------------------------------------------
+
+def test_bold_from_the_agent_reaches_the_client():
+    """Владелец 29.07.2026: «скопируй стиль ответа Албери и перенеси на этого агента».
+
+    Стандарт компании «Формат ответа»: заголовки и ключевые цифры жирным BB-кодом. Раньше
+    любой [b] вырезался перед отправкой, потому что бот слал чистый текст."""
+    import tg_agent
+
+    kept = tg_agent._strip_markup("[b]Комиссия[/b]\nБазовая — [b]44%[/b].", keep_bold=True)
+    assert kept == "[b]Комиссия[/b]\nБазовая — [b]44%[/b]."
+
+    rendered = tg_agent.telegram_html(kept)
+    assert rendered == "<b>Комиссия</b>\nБазовая — <b>44%</b>."
+
+
+def test_business_channel_still_gets_plain_text():
+    """В переписке менеджерского аккаунта разметки нет — там сообщение уходит от лица человека."""
+    import tg_agent
+
+    assert tg_agent._strip_markup("[b]Комиссия[/b] 44%") == "Комиссия 44%"
+
+
+def test_prompt_demands_numbered_lists_and_bold_headings():
+    rules = iu_prompt.RULES
+
+    assert "Перечисления НУМЕРУЙ" in rules
+    assert "[b]Комиссия[/b]" in rules
+    assert "Маркеры «—» и «•» не используй" in rules
+
+
+def test_sample_answer_is_written_in_that_style():
+    built = iu_prompt.build(iu_prompt.Context(message="а какая комиссия?"))
+
+    assert "[b]Комиссия[/b]" in built
+    assert "1. Комиссия Wildberries;" in built
+    assert "[b]Итог[/b]" in built

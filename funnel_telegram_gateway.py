@@ -1167,7 +1167,11 @@ def prepare_reply(
     import iu_contract
     import tg_agent
 
-    body = tg_agent._strip_markup(str(outcome.reply or "").strip())
+    # В боте жирный доезжает до клиента (собирается в разметку при отправке), в переписке
+    # бизнес-аккаунта сообщение уходит обычным текстом от лица менеджера — там вычищаем всё.
+    keep_bold = bool(conversation) and str(
+        (conversation or {}).get("source_key") or "") == BOT_SOURCE_KEY
+    body = tg_agent._strip_markup(str(outcome.reply or "").strip(), keep_bold=keep_bold)
     action = str(outcome.action or iu_contract.REPLY_ONLY)
     escalate = bool(outcome.escalate)
     reason = str(outcome.reason or "").strip()
