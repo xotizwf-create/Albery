@@ -7917,7 +7917,38 @@ _CRM_DEAL_LIST_SELECT = [
 ]
 
 
+#: Вебхук принадлежит ОДНОМУ пользователю (сейчас 22, «ИИ Агент»), и все его вызовы портал
+#: подписывает им. Токен приложения так не умеет: он перезаписывается тем, кто ПОСЛЕДНИМ
+#: вызвал событие портала, — поэтому сделки заводились то Софьей, то Юлией, то Артуром
+#: (жалоба владельца 29.07.2026). Ходим вебхуком, когда ему хватает прав.
+#:
+#: Пока в вебхуке нет права `crm`, он отвечает `insufficient_scope`. Запоминаем это на время
+#: и не дёргаем портал дважды на каждый вызов; как только право добавят, авторство станет
+#: единым само, без деплоя.
+_CRM_WEBHOOK_BLIND_UNTIL = 0.0
+_CRM_WEBHOOK_RETRY_S = float(os.getenv("CRM_WEBHOOK_RETRY_SECONDS", "600") or 600)
+
+
+def _crm_webhook_usable() -> bool:
+    if os.getenv("CRM_VIA_WEBHOOK", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    if not (os.getenv("BITRIX_WEBHOOK_BASE", "") or "").strip():
+        return False
+    return time.time() >= _CRM_WEBHOOK_BLIND_UNTIL
+
+
 def _crm_call(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    global _CRM_WEBHOOK_BLIND_UNTIL
+
+    if _crm_webhook_usable():
+        try:
+            return _webhook_raw(method, payload or {})
+        except McpError as exc:
+            if "insufficient_scope" not in str(exc):
+                raise
+            # Прав на CRM у вебхука нет — работаем токеном приложения, как раньше.
+            _CRM_WEBHOOK_BLIND_UNTIL = time.time() + _CRM_WEBHOOK_RETRY_S
+            logger.info("вебхуку не хватает права crm — CRM идёт токеном приложения")
     try:
         return app_workflow_function("b24_app_method_call")(method, payload or {})
     except McpError:

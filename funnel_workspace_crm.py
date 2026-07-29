@@ -21,6 +21,10 @@ import funnel_workspace_store as workspace_store
 
 
 DEFAULT_CATEGORY_ID = 16
+#: Кто ведёт сделки воронки: «ИИ Агент» на портале Albery. Владелец 29.07.2026 — «работать с
+#: воронкой только от имени ИИ агента». Вынесено в окружение: если пользователя пересоздадут,
+#: правится настройкой, а не деплоем.
+AGENT_USER_ID = int(os.getenv("CRM_AGENT_USER_ID", "22") or 22)
 _LINK_RETRIES = 4
 _CRM_PAGE_SIZE = 200
 _MAX_RECONCILE_PAGES = 100
@@ -141,6 +145,10 @@ def build_deal_payload(
         "stage": str(stage_id),
         "custom_fields": custom_fields,
         "comments": "\n".join(comments),
+        # Ответственный — «ИИ Агент», а не тот, чей токен случайно оказался свежим. Без этого
+        # сделки доставались Софье, Юлии, Артуру: токен приложения перезаписывается тем, кто
+        # ПОСЛЕДНИМ вызвал событие портала (жалоба владельца 29.07.2026).
+        "responsible_bitrix_user_id": AGENT_USER_ID,
     }
 
 
