@@ -55,9 +55,6 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Открытая линия вырезана: снос её таблицы состояния идемпотентен и на уже
     # вычищенной базе просто ничего не делает.
     "072_drop_openline_dialogs.sql",
-    # Строка-справочник нового канала: таблица источников уже существует, поэтому
-    # проверка «нет таблицы — накатить» этот INSERT не поймает.
-    "074_workspace_bot_source.sql",
     # Idempotent WB resumable sync state. 055 also covers catalogue columns
     # that older, already-created WB schemas could otherwise silently miss.
     "054_wb_sync_state_v2.sql",
@@ -120,6 +117,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Idempotent: standalone funnel workspace (durable Telegram inbox/outbox, conversations,
     # control leases and audit trail). It intentionally does not import legacy personal chats.
     "070_funnel_workspace.sql",
+    # Строка-справочник нового канала зависит от таблицы источников из 070.
+    "074_workspace_bot_source.sql",
     # Depends on the workspace conversations table from 070 and adds notification
     # bookkeeping to the already existing IU form merge table.
     "077_iu_bot_reminders.sql",

@@ -24,3 +24,11 @@ def test_iu_bot_reminders_run_after_workspace_tables():
     assert migrations.index("070_funnel_workspace.sql") < migrations.index(
         "077_iu_bot_reminders.sql"
     )
+
+
+def test_workspace_bot_source_runs_after_workspace_tables():
+    migrations = ensure_postgres.ALWAYS_APPLY_MIGRATIONS
+
+    assert migrations.index("070_funnel_workspace.sql") < migrations.index(
+        "074_workspace_bot_source.sql"
+    )
