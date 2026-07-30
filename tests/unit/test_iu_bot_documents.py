@@ -129,6 +129,29 @@ def test_google_faq_is_exported_as_the_original_pdf(monkeypatch):
     assert [name for name, _args in files.calls] == ["get", "export"]
 
 
+def test_terms_pdf_uses_the_current_google_document_export(monkeypatch):
+    requested: list[str] = []
+
+    def original_pdf(name):
+        requested.append(name)
+        return b"%PDF-1.7 current-terms-with-original-layout"
+
+    monkeypatch.setattr(documents, "_original_pdf_bytes", original_pdf)
+    monkeypatch.setattr(
+        documents,
+        "render_pdf",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("terms must not be rebuilt from plain text")
+        ),
+    )
+    documents._cache.clear()
+
+    data = documents.pdf_bytes("terms")
+
+    assert data == b"%PDF-1.7 current-terms-with-original-layout"
+    assert requested == [documents.TERMS_DOCUMENT_NAME]
+
+
 def test_client_attachment_names_describe_the_new_documents(monkeypatch):
     stored: list[str] = []
     fake_uploads = SimpleNamespace(
@@ -148,7 +171,12 @@ def test_client_attachment_names_describe_the_new_documents(monkeypatch):
     monkeypatch.setattr(documents, "pdf_bytes", lambda _kind: b"%PDF-1.7 test")
     documents._attachment_cache.clear()
 
+    documents.attachment("terms")
     documents.attachment("contract")
     documents.attachment("faq")
 
-    assert stored == ["Договор оферты.pdf", "Ответы на частые вопросы.pdf"]
+    assert stored == [
+        "Условия присоединения к ИУ.pdf",
+        "Договор оферты.pdf",
+        "Ответы на частые вопросы.pdf",
+    ]

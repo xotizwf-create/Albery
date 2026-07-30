@@ -12,6 +12,10 @@ from typing import Any
 
 _TTL_SECONDS = float(os.getenv("IU_BOT_PDF_CACHE_SECONDS", "300") or 300)
 _MAX_PDF_BYTES = int(os.getenv("IU_BOT_PDF_MAX_BYTES", "20000000") or 20000000)
+TERMS_DOCUMENT_NAME = os.getenv(
+    "IU_BOT_TERMS_DOCUMENT",
+    "Условия ИУ — текст для клиента",
+).strip()
 CONTRACT_DOCUMENT_NAME = os.getenv(
     "IU_BOT_CONTRACT_DOCUMENT",
     "Договор оферты",
@@ -235,12 +239,12 @@ def pdf_bytes(kind: str) -> bytes:
         cached = _cache.get(kind)
         if cached and now - cached[0] < _TTL_SECONDS:
             return cached[1]
-    if kind == "contract":
+    if kind == "terms":
+        data = _original_pdf_bytes(TERMS_DOCUMENT_NAME)
+    elif kind == "contract":
         data = _original_pdf_bytes(CONTRACT_DOCUMENT_NAME)
     elif kind == "faq":
         data = _original_pdf_bytes(FAQ_DOCUMENT_NAME)
-    elif kind == "terms":
-        data = render_pdf("Условия присоединения к ИУ", source_text(kind))
     else:
         raise ValueError(f"Неизвестный PDF ИУ: {kind}")
     with _lock:
