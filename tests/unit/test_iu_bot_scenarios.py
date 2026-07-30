@@ -18,7 +18,7 @@ def client(message_id: int, text: str, metadata=None):
     }
 
 
-def agent(message_id: int, text: str, *, event="", service=False):
+def agent(message_id: int, text: str, *, event="", service=False, metadata=None):
     return {
         "id": message_id,
         "author_type": "agent",
@@ -28,6 +28,7 @@ def agent(message_id: int, text: str, *, event="", service=False):
         "metadata": {
             **({"iu_event": event} if event else {}),
             **({"service_reply": True} if service else {}),
+            **(metadata or {}),
         },
     }
 
@@ -200,12 +201,57 @@ def test_reminder_delivery_window_and_stale_cancellation(monkeypatch):
 
 def test_approved_customer_copy_is_kept_exactly():
     assert bot.FORM_RECEIVED == (
-        "Увидел Вашу анкету, менеджер свяжется с Вами в ближайшее время!"
+        "Анкету получили. Остались ли у Вас вопросы по подключению?"
     )
+    assert bot.CALCULATOR_FORM_RECEIVED == bot.FORM_RECEIVED
+    assert bot.FORM_QUESTIONS_HINT == (
+        'Задать вопрос вы можете нажав на кнопку "Задать вопрос".'
+    )
+    assert bot.FORM_MANAGER_READY == (
+        "Отлично! Сейчас менеджер подключится к диалогу для согласования дальнейших шагов!"
+    )
+    assert bot.form_questions_menu()["keyboard"] == [
+        [
+            {"text": "Да"},
+            {"text": "Нет"},
+        ]
+    ]
     assert bot.EXIT_CONFIRM == "Вы уверены, что хотите выйти из окна поддержки?"
     assert bot.REMINDER_WAITING_QUESTION == (
         "Мы готовы помочь. Напишите ваш вопрос, когда будет удобно."
     )
+
+
+def test_post_form_no_does_not_reactivate_support_mode():
+    messages = [
+        agent(
+            1,
+            bot.FORM_RECEIVED,
+            event="form_received",
+            metadata={"form_questions_pending": True, "form_deal_id": 264},
+        ),
+        client(2, bot.BUTTON_FORM_QUESTIONS_NO),
+        agent(3, bot.FORM_MANAGER_READY, event="form_questions_no"),
+    ]
+
+    assert state.pending_form_questions(messages) == {}
+    assert state.support_state(messages).mode == "inactive"
+
+
+def test_post_form_yes_clears_question_and_keeps_support_inactive():
+    messages = [
+        agent(
+            1,
+            bot.FORM_RECEIVED,
+            event="form_received",
+            metadata={"form_questions_pending": True, "form_deal_id": 264},
+        ),
+        client(2, bot.BUTTON_FORM_QUESTIONS_YES),
+        agent(3, bot.FORM_QUESTIONS_HINT, event="form_questions_yes"),
+    ]
+
+    assert state.pending_form_questions(messages) == {}
+    assert state.support_state(messages).mode == "inactive"
     assert bot.TERMS_REPLY == (
         "Условия присоединения к ИУ вы можете прочитать в ПДФ файле выше.\n\n"
         "Вы можете посчитать свою экономию в нашем "

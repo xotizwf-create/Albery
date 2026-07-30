@@ -237,6 +237,28 @@ def last_join_result(messages: Sequence[Mapping[str, Any]]) -> str:
     return ""
 
 
+def pending_form_questions(
+    messages: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Metadata of the latest unanswered post-form Да/Нет question, or an empty mapping."""
+
+    pending: Mapping[str, Any] = {}
+    for message in messages:
+        event = event_of(message)
+        if event in {"form_received", "calculator_form_received"} and bool(
+            _metadata(message).get("form_questions_pending")
+        ):
+            pending = _metadata(message)
+        elif event in {
+            "form_questions_yes",
+            "form_questions_no",
+            "join_filled",
+            "calculator_discussion_filled",
+        }:
+            pending = {}
+    return pending
+
+
 def calculator_discussion_pending(messages: Sequence[Mapping[str, Any]]) -> bool:
     """The calculator client still needs to finish the form before manager handover."""
 

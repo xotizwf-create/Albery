@@ -17,13 +17,21 @@ import iu_client_bot as bot
 class FakeStore:
     """Журнал обращений в объёме, который нужен сценарию бота."""
 
-    def __init__(self, *, agent_replies=0, control_mode="ai", messages=None):
+    def __init__(
+        self,
+        *,
+        agent_replies=0,
+        control_mode="ai",
+        messages=None,
+        deal_id=284,
+    ):
         self.ingested: list[dict] = []
         self.queued: list[dict] = []
         self.transitions: list[dict] = []
         self.agent_replies = agent_replies
         self.control_mode = control_mode
         self.messages = list(messages or [])
+        self.deal_id = deal_id
 
     def ingest_business_message(self, **kwargs):
         self.ingested.append(kwargs)
@@ -36,6 +44,7 @@ class FakeStore:
             "control_mode": self.control_mode,
             "source_key": "telegram_bot",
             "display_name": "Пётр Иванов",
+            "deal_id": self.deal_id,
         }
 
     def count_agent_replies(self, conversation_id):
@@ -308,6 +317,81 @@ def test_calculator_message_with_filled_form_calls_manager(monkeypatch):
     assert store.queued[0]["metadata"]["iu_event"] == "calculator_discussion_filled"
     assert store.transitions[0]["manager_requested"] is True
     assert store.queued[0]["metadata"]["manager_notification_kind"] == "client_called"
+
+
+def _pending_form_message(*, calculator_origin=False):
+    return {
+        "id": 40,
+        "author_type": "agent",
+        "direction": "outbound",
+        "delivery_status": "sent",
+        "text": bot.FORM_RECEIVED,
+        "metadata": {
+            "iu_event": (
+                "calculator_form_received" if calculator_origin else "form_received"
+            ),
+            "form_questions_pending": True,
+            "form_deal_id": 264,
+            "manager_notification_form_deal_id": 284,
+            **({"calculator_origin": True} if calculator_origin else {}),
+        },
+    }
+
+
+def test_form_yes_opens_menu_without_notifying_manager(monkeypatch):
+    store = FakeStore(messages=[_pending_form_message()])
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message_update(bot.BUTTON_FORM_QUESTIONS_YES))
+
+    assert store.ingested[0]["schedule_ai"] is False
+    assert store.queued[0]["text"] == bot.FORM_QUESTIONS_HINT
+    assert store.queued[0]["metadata"]["iu_event"] == "form_questions_yes"
+    assert "notify_manager_after_delivery" not in store.queued[0]["metadata"]
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.main_menu()
+    assert store.transitions == []
+
+
+def test_form_no_notifies_manager_and_hands_over(monkeypatch):
+    store = FakeStore(messages=[_pending_form_message(calculator_origin=True)])
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message_update(bot.BUTTON_FORM_QUESTIONS_NO))
+
+    queued = store.queued[0]
+    assert store.ingested[0]["schedule_ai"] is False
+    assert queued["text"] == bot.FORM_MANAGER_READY
+    assert queued["metadata"]["iu_event"] == "form_questions_no"
+    assert queued["metadata"]["notify_manager_after_delivery"] is True
+    assert queued["metadata"]["manager_notification_kind"] == "form_completed"
+    assert queued["metadata"]["manager_notification_form_deal_id"] == 284
+    assert queued["metadata"]["calculator_origin"] is True
+    assert queued["metadata"]["reply_markup"] == bot.remove_keyboard()
+    assert store.transitions[0]["manager_requested"] is True
+    assert store.transitions[0]["permanent_human"] is True
+
+
+def test_repeat_join_with_filled_form_notifies_manager(monkeypatch):
+    store = FakeStore(deal_id=284)
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    monkeypatch.setattr(gateway, "_join_body", lambda *_a, **_k: ("filled", True))
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_callback_update(bot.CB_JOIN))
+
+    queued = store.queued[0]
+    assert queued["text"] == "filled"
+    assert queued["metadata"]["iu_event"] == "join_filled"
+    assert queued["metadata"]["notify_manager_after_delivery"] is True
+    assert queued["metadata"]["manager_notification_kind"] == "form_completed"
+    assert queued["metadata"]["manager_notification_form_deal_id"] == 284
+    assert queued["metadata"]["repeat_join"] is True
+    assert store.transitions[0]["manager_requested"] is True
 
 
 def test_any_ai_escalation_enqueues_the_same_bitrix_manager_alert(monkeypatch):

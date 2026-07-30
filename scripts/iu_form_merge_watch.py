@@ -145,35 +145,21 @@ def notify_bot_clients() -> int:
                 if calculator_pending
                 else "form_received"
             )
-            reason = (
-                "Клиент вернулся из калькулятора и заполнил анкету — "
-                "требуется ответ менеджера."
-                if calculator_pending
-                else "Клиент заполнил анкету — требуется ответ менеджера."
-            )
-            metadata = gateway._manager_request_metadata(
-                event,
-                conversation_id,
-                notification_kind="form_completed",
-            )
-            metadata.update(
-                {
-                    "form_deal_id": form_id,
-                    "manager_notification_form_deal_id": target_deal_id,
-                    # После подтверждённой доставки обращение попадёт в очередь
-                    # «Нужен ответ менеджера», но останется под управлением ИИ.
-                    "escalate_after_delivery": True,
-                    "answered_client": True,
-                    "escalation_reason": reason,
-                    **({"calculator_origin": True} if calculator_pending else {}),
-                }
-            )
+            # Получение анкеты ещё не означает вызов менеджера. Сначала клиент отвечает на
+            # отдельный вопрос Да/Нет; уведомление и handover появятся только после «Нет».
+            metadata = {
+                "iu_event": event,
+                "form_deal_id": form_id,
+                "manager_notification_form_deal_id": target_deal_id,
+                "form_questions_pending": True,
+                **({"calculator_origin": True} if calculator_pending else {}),
+            }
             if calculator_pending:
                 queued = gateway._reply_to_client(
                     conversation_id,
                     iu_client_bot.CALCULATOR_FORM_RECEIVED,
                     idempotency_key=f"iu-form-filled:{form_id}",
-                    reply_markup=iu_client_bot.main_menu(),
+                    reply_markup=iu_client_bot.form_questions_menu(),
                     metadata=metadata,
                 )
             else:
@@ -181,7 +167,7 @@ def notify_bot_clients() -> int:
                     conversation_id,
                     iu_client_bot.FORM_RECEIVED,
                     idempotency_key=f"iu-form-filled:{form_id}",
-                    reply_markup=iu_client_bot.main_menu(),
+                    reply_markup=iu_client_bot.form_questions_menu(),
                     metadata=metadata,
                 )
             if not queued:

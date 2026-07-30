@@ -29,6 +29,8 @@ BUTTON_OPERATOR = "🙋 Позвать оператора"
 BUTTON_EXIT_SUPPORT = "↩️ Выйти из диалога поддержки"
 BUTTON_CONFIRM_YES = "✅ Да"
 BUTTON_CONFIRM_NO = "❌ Нет"
+BUTTON_FORM_QUESTIONS_YES = "Да"
+BUTTON_FORM_QUESTIONS_NO = "Нет"
 
 CB_TERMS = "iu:terms"
 CB_JOIN = "iu:join"
@@ -38,6 +40,8 @@ CB_OPERATOR = "iu:operator"
 CB_EXIT_SUPPORT = "iu:exit-support"
 CB_CONFIRM_YES = "iu:exit-yes"
 CB_CONFIRM_NO = "iu:exit-no"
+CB_FORM_QUESTIONS_YES = "iu:form-questions-yes"
+CB_FORM_QUESTIONS_NO = "iu:form-questions-no"
 
 #: После двух ответов ИИ кнопка показывается вместе с ответом на третий вопрос.
 OPERATOR_OFFER_AFTER_REPLIES = int(os.getenv("IU_CLIENT_BOT_OPERATOR_AFTER", "2") or "2")
@@ -73,7 +77,7 @@ CALCULATOR_MANAGER_READY = (
     "Ваша анкета уже получена. Сейчас менеджер подключится к диалогу."
 )
 CALCULATOR_FORM_RECEIVED = (
-    "Анкету получили. Сейчас менеджер подключится к диалогу!"
+    "Анкету получили. Остались ли у Вас вопросы по подключению?"
 )
 
 #: Анкета выдаётся ПЕРСОНАЛЬНОЙ ссылкой: по ней заявка приклеивается к этому же человеку, а не
@@ -105,7 +109,13 @@ JOIN_FILLED_FOLLOWUP = (
     "напишите прямо сюда, я передам это менеджеру"
 )
 FORM_RECEIVED = (
-    "Увидел Вашу анкету, менеджер свяжется с Вами в ближайшее время!"
+    "Анкету получили. Остались ли у Вас вопросы по подключению?"
+)
+FORM_QUESTIONS_HINT = (
+    'Задать вопрос вы можете нажав на кнопку "Задать вопрос".'
+)
+FORM_MANAGER_READY = (
+    "Отлично! Сейчас менеджер подключится к диалогу для согласования дальнейших шагов!"
 )
 
 
@@ -225,6 +235,21 @@ def exit_confirmation_menu() -> dict:
     }
 
 
+def form_questions_menu() -> dict:
+    """Temporary Да/Нет keyboard shown only after the form was received."""
+
+    return {
+        "keyboard": [
+            [
+                {"text": BUTTON_FORM_QUESTIONS_YES},
+                {"text": BUTTON_FORM_QUESTIONS_NO},
+            ]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
 def remove_keyboard() -> dict:
     return {"remove_keyboard": True}
 
@@ -262,6 +287,12 @@ def _title_key(text: str) -> str:
 def menu_action(text: str) -> str:
     """Пункт меню, который выбрал клиент, или пустая строка для обычного сообщения."""
 
+    # У вопроса после анкеты свои подписи без emoji. Это намеренно отделяет их от
+    # `✅ Да / ❌ Нет`, которыми подтверждается выход из поддержки.
+    if text == BUTTON_FORM_QUESTIONS_YES:
+        return CB_FORM_QUESTIONS_YES
+    if text == BUTTON_FORM_QUESTIONS_NO:
+        return CB_FORM_QUESTIONS_NO
     return _MENU_BY_TITLE.get(_title_key(text), "")
 
 
@@ -304,4 +335,6 @@ def button_label(callback_data: str) -> str:
         CB_EXIT_SUPPORT: BUTTON_EXIT_SUPPORT,
         CB_CONFIRM_YES: BUTTON_CONFIRM_YES,
         CB_CONFIRM_NO: BUTTON_CONFIRM_NO,
+        CB_FORM_QUESTIONS_YES: BUTTON_FORM_QUESTIONS_YES,
+        CB_FORM_QUESTIONS_NO: BUTTON_FORM_QUESTIONS_NO,
     }.get(str(callback_data or ""), "")

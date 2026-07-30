@@ -823,6 +823,7 @@ def _reply_and_hand_over(
     event: str,
     reason: str,
     manager_requested: bool = False,
+    notification_kind: str | None = None,
     metadata: Mapping[str, Any] | None = None,
     **reply_options: Any,
 ) -> dict[str, Any] | None:
@@ -837,7 +838,8 @@ def _reply_and_hand_over(
                 event,
                 conversation_id,
                 notification_kind=(
-                    "client_called" if manager_requested else "manager_needed"
+                    notification_kind
+                    or ("client_called" if manager_requested else "manager_needed")
                 ),
             )
         )
@@ -1415,13 +1417,41 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
                 reason="Персональную ссылку на анкету не удалось подготовить.",
                 reply_markup=iu_client_bot.main_menu(),
             )
+        elif already:
+            pending = iu_bot_state.pending_form_questions(messages)
+            conversation = _store().get_conversation(conversation_id) or {}
+            form_deal_id = (
+                _as_int(pending.get("manager_notification_form_deal_id"))
+                or _as_int(conversation.get("deal_id"))
+            )
+            _reply_and_hand_over(
+                conversation_id,
+                body,
+                idempotency_key=idempotency_key,
+                event="join_filled",
+                reason=(
+                    "Клиент повторно открыл подключение к ИУ при уже заполненной анкете — "
+                    "ему требуется ответ менеджера."
+                ),
+                manager_requested=True,
+                notification_kind="form_completed",
+                reply_markup=iu_client_bot.remove_keyboard(),
+                metadata={
+                    **(
+                        {"manager_notification_form_deal_id": form_deal_id}
+                        if form_deal_id
+                        else {}
+                    ),
+                    "repeat_join": True,
+                },
+            )
         else:
             _reply_to_client(
                 conversation_id,
                 body,
                 idempotency_key=idempotency_key,
                 reply_markup=iu_client_bot.main_menu(),
-                metadata={"iu_event": "join_filled" if already else "join_unfilled"},
+                metadata={"iu_event": "join_unfilled"},
             )
     elif action == iu_client_bot.CB_CALCULATOR:
         _reply_to_client(
@@ -1493,6 +1523,49 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
         # генерацию. После «Нет» возвращаем в очередь исходный вопрос, а не ждём,
         # пока клиент догадается повторить его.
         _schedule_existing_question(conversation_id, messages)
+    elif action == iu_client_bot.CB_FORM_QUESTIONS_YES:
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.FORM_QUESTIONS_HINT,
+            idempotency_key=idempotency_key,
+            reply_markup=iu_client_bot.main_menu(),
+            metadata={"iu_event": "form_questions_yes"},
+        )
+    elif action == iu_client_bot.CB_FORM_QUESTIONS_NO:
+        pending = iu_bot_state.pending_form_questions(messages)
+        if not pending:
+            return
+        form_deal_id = _as_int(pending.get("manager_notification_form_deal_id"))
+        _reply_and_hand_over(
+            conversation_id,
+            iu_client_bot.FORM_MANAGER_READY,
+            idempotency_key=idempotency_key,
+            event="form_questions_no",
+            reason=(
+                "Клиент подтвердил, что вопросов по подключению не осталось — "
+                "нужно согласовать дальнейшие шаги."
+            ),
+            manager_requested=True,
+            notification_kind="form_completed",
+            reply_markup=iu_client_bot.remove_keyboard(),
+            metadata={
+                **(
+                    {"manager_notification_form_deal_id": form_deal_id}
+                    if form_deal_id
+                    else {}
+                ),
+                **(
+                    {"form_deal_id": pending.get("form_deal_id")}
+                    if pending.get("form_deal_id")
+                    else {}
+                ),
+                **(
+                    {"calculator_origin": True}
+                    if pending.get("calculator_origin")
+                    else {}
+                ),
+            },
+        )
 
 
 def ingest_business_message(
