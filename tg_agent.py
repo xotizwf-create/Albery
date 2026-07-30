@@ -1776,7 +1776,11 @@ def check_finished_tasks(limit: int = 50) -> dict:
                 cur.execute("UPDATE funnel_task_watch SET notified_at = now() WHERE id = %s",
                             (w["id"],))
         served.add(key)
-        if w["deal_id"] and w["next_stage"]:
+        if (
+            AUTOMATIC_STAGE_TRANSITIONS_ENABLED
+            and w["deal_id"]
+            and w["next_stage"]
+        ):
             try:
                 # Через MCP по HTTP: у вебхука нет прав на CRM, а импортировать context_server
                 # в процесс tg-агента нельзя.
@@ -1863,10 +1867,14 @@ def merge_form_duplicate(uname: str) -> dict:
     moved = {k: v for k, v in (dup.get("custom_fields") or {}).items()
              if _filled(v) and not _filled((keep.get("custom_fields") or {}).get(k))}
     try:
-        mcp_call("update_crm_deal", {
-            "deal_id": keep_id, "stage": STAGE_FORM_DONE,
+        update_args = {
+            "deal_id": keep_id,
             **({"custom_fields": moved} if moved else {}),
-            "comments": f"Анкета заполнена — данные перенесены из сделки {dup_id}, дубль удалён."})
+            "comments": f"Анкета заполнена — данные перенесены из сделки {dup_id}, дубль удалён.",
+        }
+        if AUTOMATIC_STAGE_TRANSITIONS_ENABLED:
+            update_args["stage"] = STAGE_FORM_DONE
+        mcp_call("update_crm_deal", update_args)
         mcp_call("delete_crm_deal", {"deal_id": dup_id, "confirm": True})
     except Exception as exc:  # noqa: BLE001
         log.warning("склейка сделок @%s не удалась: %s", uname, str(exc)[:200])
@@ -1978,9 +1986,12 @@ def _check_new_forms() -> None:
                     _remember_anketa(uid_str, deal_id, fingerprint)
                 continue
             stage = facts.stage
-            # Анкета есть — этап обязан это показывать. Склейка ставит его сама, но когда дубля
-            # не было (сделку создала только форма), этап так и оставался «Связались».
-            if stage in (STAGE_NEW, STAGE_CONTACTED):
+            # Старое правило синхронизации этапа сохранено только за аварийным
+            # env-тумблером. По умолчанию анкета не двигает воронку.
+            if (
+                AUTOMATIC_STAGE_TRANSITIONS_ENABLED
+                and stage in (STAGE_NEW, STAGE_CONTACTED)
+            ):
                 _move_deal_stage(deal_id, STAGE_FORM_DONE, "Клиент заполнил анкету.")
             # Сверка — тоже сообщение живого человека: с приветствием при первом контакте и
             # подводкой. Раньше клиент получал голое «Вижу анкету:» (диалог 256942600).
@@ -2398,6 +2409,10 @@ CRM_TELEGRAM_FIELD = os.getenv("CRM_TELEGRAM_FIELD", "UF_CRM_1784296997").strip(
 STAGE_NEW = funnel_rules.STAGE_NEW
 STAGE_CONTACTED = funnel_rules.STAGE_CONTACTED
 STAGE_FORM_DONE = funnel_rules.STAGE_FORM_DONE
+AUTOMATIC_STAGE_TRANSITIONS_ENABLED = os.getenv(
+    "IU_AUTOMATIC_STAGE_TRANSITIONS_ENABLED",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _iu_intent(texts: list[str]) -> bool:
@@ -2431,6 +2446,13 @@ def _open_lead_deal(username: str, telegram_id, name: str = "") -> int | None:
 
 def _move_deal_stage(deal_id, stage: str, comment: str = "") -> None:
     """Передвинуть сделку по воронке. Тихо: движение стадии не должно ломать ответ клиенту."""
+    if not AUTOMATIC_STAGE_TRANSITIONS_ENABLED:
+        log.info(
+            "автоматический перевод сделки %s на %s пропущен: управление этапами отключено",
+            deal_id,
+            stage,
+        )
+        return
     try:
         mcp_call("update_crm_deal", {"deal_id": int(deal_id), "stage": stage,
                                      **({"comments": comment} if comment else {})})

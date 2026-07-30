@@ -202,6 +202,7 @@ def test_next_stage_moves_through_http_mcp(tg, monkeypatch):
     monkeypatch.setattr(tg, "_task_status", lambda tid: {"status": "5"})
     monkeypatch.setattr(tg, "send_html", lambda *a: (True, ""))
     monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "AUTOMATIC_STAGE_TRANSITIONS_ENABLED", True)
     monkeypatch.setattr(tg, "mcp_call", lambda tool, args: moved.append((tool, args)) or {})
 
     res = tg.check_finished_tasks()

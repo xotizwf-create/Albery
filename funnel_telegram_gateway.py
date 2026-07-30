@@ -1981,20 +1981,10 @@ def prepare_reply(
     if len(body) > _TEXT_LIMIT:
         body = body[:_TEXT_LIMIT].rstrip()
 
-    stage_move = str(outcome.stage_move or "").strip()
-    if asset == "terms" and facts is not None:
-        import iu_funnel
-
-        after_delivery = iu_funnel.DealFacts(
-            stage=str(getattr(facts, "stage", "") or ""),
-            terms_delivered=True,
-            form_filled=bool(getattr(facts, "form_filled", False)),
-            contract_sent=bool(getattr(facts, "contract_sent", False)),
-            contract_signed=bool(getattr(facts, "contract_signed", False)),
-        )
-        # Match the legacy runtime's fact transition, but persist the desired
-        # stage before Telegram send so a later Business echo can repair it.
-        stage_move = iu_funnel.next_stage(after_delivery) or stage_move
+    # Владелец 30.07.2026 отключил любые неявные переходы воронки. Доставка ответа,
+    # условий или анкеты не означает, что сделку можно двигать. Этап меняет только
+    # явное действие человека в UI или MCP-инструмент ИИ по будущим правилам.
+    stage_move = ""
 
     metadata = {
         "action": action,
@@ -2724,12 +2714,21 @@ def _process_crm_action(
                 "orphan_deal_id": _as_int(ensured.get("orphan_deal_id")),
             }
         elif action_type == "move_stage":
-            import funnel_workspace_crm
+            if action.get("outbox_id") is not None:
+                # Старые автоматические действия могли остаться в durable-очереди до
+                # отключения автоматики. Завершаем их без обращения к Битриксу и без
+                # изменения локального этапа; явные действия UI/MCP имеют outbox_id=NULL.
+                result = {
+                    "status": "skipped",
+                    "reason": "automatic_stage_transitions_disabled",
+                }
+            else:
+                import funnel_workspace_crm
 
-            result = funnel_workspace_crm.apply_conversation_stage_action(
-                action["conversation_id"],
-                action["target_stage"],
-            )
+                result = funnel_workspace_crm.apply_conversation_stage_action(
+                    action["conversation_id"],
+                    action["target_stage"],
+                )
         else:
             raise RuntimeError(
                 f"Unsupported durable workspace action {action_type!r}."

@@ -8700,7 +8700,14 @@ def tool_add_deal_comment(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32602, "comment is required.")
     res = _crm_call("crm.timeline.comment.add", {"fields": {
         "ENTITY_ID": deal_id, "ENTITY_TYPE": "deal", "COMMENT": comment[:10000]}})
-    return {"added": True, "comment_id": res.get("result")}
+    comment_id = res.get("result") if isinstance(res, dict) else None
+    if not comment_id:
+        raise McpError(
+            -32010,
+            "Битрикс не подтвердил добавление комментария: "
+            f"crm.timeline.comment.add вернул без id ({res!r})"[:400],
+        )
+    return {"added": True, "comment_id": comment_id}
 
 
 def _crm_deal_common_fields(args: dict[str, Any]) -> dict[str, Any]:

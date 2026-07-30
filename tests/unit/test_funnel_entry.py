@@ -98,9 +98,24 @@ def test_form_duplicate_is_merged_into_the_original_deal(tg, monkeypatch):
 
     assert res["merged"] and res["kept"] == 500 and res["deleted"] == 520
     upd = [a for t, a in calls if t == "update_crm_deal"][0]
-    assert upd["deal_id"] == 500 and upd["stage"] == tg.STAGE_FORM_DONE
+    assert upd["deal_id"] == 500
+    assert "stage" not in upd, "склейка анкеты не должна автоматически двигать воронку"
     assert upd["custom_fields"]["UF_CRM_1784297137"] == "Одежда", "данные анкеты перенесены"
     assert [a for t, a in calls if t == "delete_crm_deal"][0]["deal_id"] == 520
+
+
+def test_legacy_stage_helper_is_disabled_by_default(tg, monkeypatch):
+    calls = []
+    monkeypatch.setattr(tg, "AUTOMATIC_STAGE_TRANSITIONS_ENABLED", False)
+    monkeypatch.setattr(
+        tg,
+        "mcp_call",
+        lambda tool, args: calls.append((tool, args)) or {},
+    )
+
+    tg._move_deal_stage(500, tg.STAGE_FORM_DONE, "Автоматический переход")
+
+    assert calls == []
 
 
 def test_nothing_to_merge_when_there_is_one_deal(tg, monkeypatch):

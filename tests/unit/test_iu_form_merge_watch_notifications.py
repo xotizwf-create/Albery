@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import funnel_telegram_gateway as gateway
 import funnel_workspace_store as store
 import iu_client_bot as bot
@@ -38,6 +40,46 @@ class FakeConnection:
 
     def cursor(self):
         return self._cursor
+
+
+def test_merge_comment_is_not_added_twice_when_timeline_already_has_it():
+    crm = watch.BitrixCrm.__new__(watch.BitrixCrm)
+    added: list[tuple] = []
+    crm.cs = SimpleNamespace(
+        _crm_call=lambda _method, _args: {
+            "result": [{"ID": "91", "COMMENT": "Итог склейки"}]
+        }
+    )
+    crm._call = lambda name, args: added.append((name, args)) or {}
+
+    result = crm.comment(284, "  Итог склейки  ")
+
+    assert result == {"added": False, "duplicate": True, "comment_id": "91"}
+    assert added == []
+
+
+def test_merge_comment_is_added_once_when_timeline_has_no_exact_match():
+    crm = watch.BitrixCrm.__new__(watch.BitrixCrm)
+    added: list[tuple] = []
+    crm.cs = SimpleNamespace(
+        _crm_call=lambda _method, _args: {
+            "result": [{"ID": "90", "COMMENT": "Другой итог"}]
+        }
+    )
+    crm._call = lambda name, args: (
+        added.append((name, args))
+        or {"added": True, "comment_id": "92"}
+    )
+
+    result = crm.comment(284, "Итог склейки")
+
+    assert result == {"added": True, "comment_id": "92"}
+    assert added == [
+        (
+            "add_deal_comment",
+            {"deal_id": 284, "comment": "Итог склейки"},
+        )
+    ]
 
 
 def test_calculator_form_completion_confirms_and_calls_manager(monkeypatch):

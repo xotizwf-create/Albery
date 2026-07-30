@@ -55,9 +55,38 @@ class BitrixCrm:
         self._call("update_crm_deal", args)
 
     def comment(self, deal_id, text: str):
-        # Инструмент ждёт именно `comment`; на `text` он отвечает отказом, и первый живой
-        # прогон 29.07.2026 упал ровно здесь — уже перенеся поля.
-        self._call("add_deal_comment", {"deal_id": int(deal_id), "comment": text})
+        """Добавить итог склейки не более одного раза.
+
+        Запрос к Битриксу мог фактически создать комментарий, но оборваться до ответа.
+        Повтор cron тогда раньше писал тот же текст второй раз. Перед добавлением читаем
+        свежий таймлайн и считаем точное совпадение уже выполненной операцией.
+        """
+        clean = str(text or "").strip()
+        response = self.cs._crm_call(
+            "crm.timeline.comment.list",
+            {
+                "filter": {
+                    "ENTITY_ID": int(deal_id),
+                    "ENTITY_TYPE": "deal",
+                },
+                "order": {"CREATED": "DESC"},
+                "select": ["ID", "COMMENT", "CREATED"],
+                "start": 0,
+            },
+        )
+        comments = response.get("result") if isinstance(response, dict) else []
+        for item in comments if isinstance(comments, list) else []:
+            if str(item.get("COMMENT") or "").strip() == clean:
+                return {
+                    "added": False,
+                    "duplicate": True,
+                    "comment_id": item.get("ID"),
+                }
+        # Инструмент ждёт именно `comment`; на `text` он отвечает отказом.
+        return self._call(
+            "add_deal_comment",
+            {"deal_id": int(deal_id), "comment": clean},
+        )
 
     def delete_deal(self, deal_id):
         self._call("delete_crm_deal", {"deal_id": int(deal_id), "confirm": True})

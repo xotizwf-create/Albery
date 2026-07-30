@@ -2526,7 +2526,6 @@ function OperatorWorkspace({
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [sending, setSending] = useState(false);
   const [controlBusy, setControlBusy] = useState(false);
-  const [statusBusy, setStatusBusy] = useState(false);
   const [stageBusy, setStageBusy] = useState(false);
   const [leadNotes, setLeadNotes] = useState<LeadNote[]>([]);
   const [noteBusy, setNoteBusy] = useState(false);
@@ -3107,25 +3106,27 @@ function OperatorWorkspace({
     conversation: Conversation | null,
     mode: "human" | "ai",
     permanent = false,
+    successMessage?: string,
+    force = false,
   ) => {
-    if (!conversation || controlBusy) return;
+    if (!conversation || controlBusy) return false;
     // Полный перехват из режима «человек» — не смена режима, а снятие срока возврата,
     // поэтому одинаковый режим здесь блокировать нельзя.
-    if (conversation.control_mode === mode && !permanent) return;
-    if (permanent && conversation.control_permanent) return;
+    if (conversation.control_mode === mode && !permanent && !force) return false;
+    if (permanent && conversation.control_permanent) return false;
     if (conversation.can_reply === false) {
       setToast({
         message: "Управление недоступно до нового сообщения клиента.",
         tone: "info",
       });
-      return;
+      return false;
     }
     if (mode === "ai" && !conversation.ai_available) {
       setToast({
         message: "ИИ пока не разрешён для этого тестового Telegram-диалога.",
         tone: "info",
       });
-      return;
+      return false;
     }
     setControlBusy(true);
     try {
@@ -3138,18 +3139,21 @@ function OperatorWorkspace({
       await refreshSelected();
       setToast({
         message:
-          mode === "ai"
+          successMessage ??
+          (mode === "ai"
             ? "Управление возвращено ИИ-агенту."
             : permanent
               ? "Вы ведёте диалог сами. ИИ здесь больше не отвечает, пока вы не вернёте его."
-              : "ИИ остановлен на 2 минуты. Можно отвечать клиенту.",
+              : "ИИ остановлен на 2 минуты. Можно отвечать клиенту."),
         tone: "success",
       });
+      return true;
     } catch (error) {
       if (error instanceof FunnelWorkspaceApiError && error.status === 409) {
         await refreshSelected();
       }
       reportError(error);
+      return false;
     } finally {
       setControlBusy(false);
     }
@@ -3160,26 +3164,15 @@ function OperatorWorkspace({
   };
 
   const closeConversationQuestion = async (conversation: Conversation | null) => {
-    if (!conversation || statusBusy || conversation.status === "closed") return;
-    setStatusBusy(true);
-    try {
-      await funnelWorkspaceApi.setStatus(conversation.id, {
-        status: "closed",
-        expected_version: conversation.state_version,
-        csrf_token: csrfToken(),
-      });
+    const returnedToAi = await setConversationControl(
+      conversation,
+      "ai",
+      false,
+      "Вопрос закрыт. Запрос менеджера снят, диалог возвращён ИИ.",
+      true,
+    );
+    if (returnedToAi) {
       await loadConversations(true, true);
-      setToast({
-        message: "Вопрос закрыт. Запрос менеджера снят.",
-        tone: "success",
-      });
-    } catch (error) {
-      if (error instanceof FunnelWorkspaceApiError && error.status === 409) {
-        await refreshSelected();
-      }
-      reportError(error);
-    } finally {
-      setStatusBusy(false);
     }
   };
 
@@ -3550,7 +3543,7 @@ function OperatorWorkspace({
               label: "Вопрос закрыт",
               icon: <CheckCheck className="h-3.5 w-3.5" />,
               disabled:
-                statusBusy || contextMenu.conversation.status === "closed",
+                controlBusy || contextMenu.conversation.status === "closed",
               onSelect: () =>
                 void closeConversationQuestion(contextMenu.conversation),
             },

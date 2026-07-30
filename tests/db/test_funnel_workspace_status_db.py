@@ -283,6 +283,8 @@ def test_returning_dialog_to_ai_clears_the_manager_request_badge():
         )
 
         assert returned["control_mode"] == "ai"
+        assert returned["status"] == "waiting"
+        assert returned["closed_at"] is None
         assert (
             returned["metadata"]["manager_request_handled_at"]
             >= returned["metadata"]["manager_requested_at"]

@@ -8,6 +8,8 @@ expected tools for each server.
 """
 from __future__ import annotations
 
+import pytest
+
 
 def test_every_tool_is_well_formed(ctx):
     for name, spec in ctx.TOOLS.items():
@@ -124,6 +126,19 @@ def test_add_comment_supports_author_and_result(ctx):
         assert field in schema, f"add_bitrix_task_comment missing {field}"
     # comment_text is no longer required (a comment may carry only attachments).
     assert "comment_text" not in ctx.TOOLS["add_bitrix_task_comment"]["inputSchema"]["required"]
+
+
+def test_add_deal_comment_requires_a_confirmed_portal_comment_id(ctx, monkeypatch):
+    monkeypatch.setattr(
+        ctx,
+        "_crm_call",
+        lambda _method, _args: {"result": None},
+    )
+
+    with pytest.raises(ctx.McpError) as error:
+        ctx.tool_add_deal_comment({"deal_id": 284, "comment": "Проверка"})
+
+    assert error.value.code == -32010
 
 
 def test_reopen_supports_new_deadline(ctx):

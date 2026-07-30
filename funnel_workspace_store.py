@@ -4806,7 +4806,10 @@ def complete_crm_action(
                     "CRM-действие больше не принадлежит этому обработчику.",
                     details={"action_id": item_id},
                 )
-            if action.get("action_type") == "move_stage":
+            if (
+                action.get("action_type") == "move_stage"
+                and str((result or {}).get("status") or "") != "skipped"
+            ):
                 cur.execute(
                     """
                     UPDATE funnel_workspace_conversations

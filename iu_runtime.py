@@ -38,6 +38,10 @@ KNOWLEDGE_DOC_NAME = os.getenv(
 QA_DOC_NAME = os.getenv("IU_QA_DOC", "Вопрос - ответ").strip()
 
 _CARDS_TTL_S = float(os.getenv("IU_CARDS_TTL_S", "300") or 300)
+AUTOMATIC_STAGE_TRANSITIONS_ENABLED = os.getenv(
+    "IU_AUTOMATIC_STAGE_TRANSITIONS_ENABLED",
+    "0",
+).strip().lower() in ("1", "true", "yes", "on")
 _cards_cache: dict = {"at": 0.0, "cards": ()}
 # Векторы карточек переживают перечитывание документа: они кэшируются по хэшу содержимого,
 # поэтому правка одной карточки не тянет пересчёт всего корпуса.
@@ -200,7 +204,11 @@ def about_our_product(outcome) -> bool:
 
 def stage_after_turn(deal_id, telegram_id, outcome) -> str:
     """Куда перевести только что заведённую сделку. Считается по фактам, уже ставшим правдой."""
-    if outcome is None or not deal_id:
+    if (
+        not AUTOMATIC_STAGE_TRANSITIONS_ENABLED
+        or outcome is None
+        or not deal_id
+    ):
         return ""
     return iu_funnel.next_stage(deal_facts(deal_id, telegram_id))
 
@@ -349,10 +357,14 @@ def _execute(author: dict, texts: list[str], deal_id, facts, outcome) -> bool:
         tg_agent.escalate_to_human(author, outcome.reason or "нужен ответ человека", message,
                                    answered=outcome.answered_client)
 
-    # Этап двигаем только по фактам и только после доставки: «отправили» — это факт, а
-    # «собирались отправить» — нет.
-    move = outcome.stage_move
-    if asset_ok and outcome.action == iu_contract.SEND_TERMS:
+    # Старый переход по фактам оставлен только за аварийным env-тумблером. По умолчанию
+    # доставка ответа или документа не двигает воронку.
+    move = outcome.stage_move if AUTOMATIC_STAGE_TRANSITIONS_ENABLED else ""
+    if (
+        AUTOMATIC_STAGE_TRANSITIONS_ENABLED
+        and asset_ok
+        and outcome.action == iu_contract.SEND_TERMS
+    ):
         after = iu_funnel.DealFacts(
             stage=facts.stage, terms_delivered=True, form_filled=facts.form_filled,
             contract_sent=facts.contract_sent, contract_signed=facts.contract_signed)

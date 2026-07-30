@@ -195,19 +195,17 @@ def test_watch_does_not_touch_deals_past_the_survey_stage(tg, monkeypatch):
     assert sent == []
 
 
-def test_anketa_moves_the_deal_to_its_stage(tg, monkeypatch):
-    """Синхронность (владелец 24.07.2026): анкета пришла — этап «Анкета заполнена».
-
-    Склейка ставит этап сама, но когда дубля не было (сделку создала только форма), сделка
-    оставалась на «Связались», хотя анкета уже заполнена."""
+def test_anketa_does_not_move_the_deal_automatically(tg, monkeypatch):
+    """Анкета остаётся доступной, но этап меняет только человек или явный ИИ-инструмент."""
     moves = []
     sent, _ = _wire_watch(tg, monkeypatch, deal=dict(DEAL, stage_id="C16:CONTACTED"))
     monkeypatch.setattr(tg, "_move_deal_stage",
                         lambda did, stage, note="": moves.append((did, stage)))
+    monkeypatch.setattr(tg, "AUTOMATIC_STAGE_TRANSITIONS_ENABLED", False)
 
     tg._check_new_forms()
 
-    assert moves == [(82, tg.STAGE_FORM_DONE)], "этап обязан догнать факт заполнения анкеты"
+    assert moves == []
     assert len(sent) == 1
 
 

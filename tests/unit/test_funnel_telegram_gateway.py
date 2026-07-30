@@ -81,7 +81,7 @@ def test_dialog_turn_uses_latest_client_batch_and_prior_history():
     assert turn.history == "Клиент: Здравствуйте\nАгент: Добрый день"
 
 
-def test_terms_delivery_persists_fact_derived_stage_before_outbox_send(monkeypatch):
+def test_terms_delivery_never_moves_the_funnel_stage_implicitly(monkeypatch):
     import iu_contract
     import iu_funnel
     import tg_agent
@@ -106,7 +106,7 @@ def test_terms_delivery_persists_fact_derived_stage_before_outbox_send(monkeypat
     )
 
     assert prepared.metadata["asset"] == "terms"
-    assert prepared.metadata["stage_move"] == iu_funnel.STAGE_TERMS
+    assert prepared.metadata["stage_move"] == ""
 
 
 def test_second_ai_answer_already_offers_the_operator(monkeypatch):
@@ -762,20 +762,40 @@ class FakeStoreForCrmActions:
         return {**self.action, "processing_status": "dead_letter"}
 
 
-def _crm_action():
+def _crm_action(*, outbox_id=9):
     return {
         "id": 71,
         "conversation_id": 7,
         "message_id": 8,
-        "outbox_id": 9,
+        "outbox_id": outbox_id,
         "action_type": "move_stage",
         "target_stage": "C16:TERMS",
         "attempts": 3,
     }
 
 
-def test_durable_crm_worker_completes_verified_stage_set(monkeypatch):
+def test_durable_crm_worker_skips_old_delivery_driven_stage_set(monkeypatch):
     store = FakeStoreForCrmActions(_crm_action())
+    monkeypatch.setitem(sys.modules, "funnel_workspace_store", store)
+
+    assert gateway.process_crm_actions_once(worker_id="crm-worker") == 1
+    assert store.completed == [
+        (
+            71,
+            {
+                "worker_id": "crm-worker",
+                "result": {
+                    "status": "skipped",
+                    "reason": "automatic_stage_transitions_disabled",
+                },
+            },
+        )
+    ]
+    assert store.retried == []
+
+
+def test_durable_crm_worker_keeps_explicit_human_or_ai_stage_set(monkeypatch):
+    store = FakeStoreForCrmActions(_crm_action(outbox_id=None))
     applied = {
         "conversation_id": 7,
         "deal_id": 82,
@@ -801,7 +821,7 @@ def test_durable_crm_worker_completes_verified_stage_set(monkeypatch):
 
 
 def test_durable_crm_worker_retries_with_bounded_backoff(monkeypatch):
-    store = FakeStoreForCrmActions(_crm_action())
+    store = FakeStoreForCrmActions(_crm_action(outbox_id=None))
     monkeypatch.setitem(sys.modules, "funnel_workspace_store", store)
     monkeypatch.setitem(
         sys.modules,

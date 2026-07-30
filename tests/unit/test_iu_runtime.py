@@ -35,6 +35,7 @@ class FakeTG:
         self.invited_recently = False
         self.escalations = []
         self.send_ok = True
+        self.moves = []
 
     # --- то, что вызывает iu_runtime._execute ---
     def terms_text(self):
@@ -66,13 +67,13 @@ class FakeTG:
         pass
 
     def _move_deal_stage(self, deal_id, stage, comment=""):
-        pass
+        self.moves.append((deal_id, stage, comment))
 
 
-def run(monkeypatch, out, tg=None, facts=None):
+def run(monkeypatch, out, tg=None, facts=None, deal_id=None):
     tg = tg or FakeTG()
     monkeypatch.setitem(__import__("sys").modules, "tg_agent", tg)
-    ok = iu_runtime._execute(AUTHOR, ["вопрос"], None,
+    ok = iu_runtime._execute(AUTHOR, ["вопрос"], deal_id,
                              facts or iu_funnel.DealFacts(), out)
     return ok, tg
 
@@ -153,6 +154,21 @@ def test_first_form_invite_goes_through(monkeypatch):
 
     assert "Заполните анкету" in tg.sent[0]
     assert tg.marked_invite
+
+
+def test_legacy_turn_does_not_move_the_funnel_automatically(monkeypatch):
+    out = iu_turn.Outcome(
+        reply="Готово.",
+        action=iu_contract.REPLY_ONLY,
+        stage_move=iu_funnel.STAGE_FORM,
+        trace={},
+    )
+    monkeypatch.setattr(iu_runtime, "AUTOMATIC_STAGE_TRANSITIONS_ENABLED", False)
+
+    ok, tg = run(monkeypatch, out, facts=iu_funnel.DealFacts(), deal_id=500)
+
+    assert ok
+    assert tg.moves == []
 
 
 # --- повтор при сбое модели -------------------------------------------------------------------

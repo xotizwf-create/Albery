@@ -131,6 +131,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "078_iu_agent_workspace_tools.sql",
     # Durable alerts when an IU lead waits for a real manager reply.
     "079_iu_manager_wait_alerts.sql",
+    # Owner disabled all delivery/form-driven stage transitions.
+    "080_disable_automatic_stage_transitions.sql",
 ]
 
 

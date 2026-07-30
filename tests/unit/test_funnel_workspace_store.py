@@ -1266,6 +1266,39 @@ def test_crm_action_claim_serializes_stage_sets_per_conversation():
     assert "'pending', 'leased', 'retry'" in claim
 
 
+def test_skipped_automatic_crm_action_does_not_change_local_stage():
+    action = {
+        "id": 70,
+        "conversation_id": 41,
+        "outbox_id": 9,
+        "action_type": "move_stage",
+        "target_stage": "C16:TERMS",
+        "processing_status": "done",
+    }
+
+    def respond(sql, _params):
+        if sql.startswith("UPDATE funnel_workspace_crm_actions"):
+            return action
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            raise AssertionError("skipped automatic action must not change local stage")
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    result = store.complete_crm_action(
+        70,
+        worker_id="crm-worker",
+        result={
+            "status": "skipped",
+            "reason": "automatic_stage_transitions_disabled",
+        },
+        now=NOW,
+        connect=connect,
+    )
+
+    assert result == action
+    assert len(connection.cursor_instance.executed) == 1
+
+
 def test_conversation_search_looks_through_the_whole_retained_history():
     def respond(sql, _params):
         if "SELECT c.*, s.source_type" in sql:

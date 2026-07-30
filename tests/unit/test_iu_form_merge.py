@@ -1,8 +1,8 @@
 """Анкета приклеивается к карточке человека, а не заводит вторую.
 
 Владелец 29.07.2026 (со скриншотом канбана, где на него одного висят две карточки): «человек
-заходит в тг-бота — его лид попадает в Битрикс; потом он заполняет форму, и лид автоматически
-переходит в стадию „Анкета“ вместе с анкетой; лид и анкета соединяются в одну сделку».
+заходит в тг-бота — его лид попадает в Битрикс; потом он заполняет форму; лид и анкета
+соединяются в одну сделку». Уточнение 30.07.2026: этап при этом автоматически не меняется.
 
 Живой случай, на котором всё и проверяется: #266 «Лид Telegram [tg:1451982360] — Александр
 Никитенко · @alexxandrn» в 15:26:48 и #268 «Заполнение CRM-формы …» в 15:27:15 с меткой
@@ -163,14 +163,24 @@ def test_filled_values_are_not_overwritten():
     assert copied["UF_CRM_1784297137"] == "1321"
 
 
-def test_stage_moves_forward_only():
+def test_stage_never_moves_automatically_without_the_owner_flag(monkeypatch):
+    monkeypatch.setattr(merge, "AUTOMATIC_STAGE_TRANSITIONS_ENABLED", False)
+
+    assert merge.next_stage_for(TG_DEAL) == ""
+    assert merge.next_stage_for({**TG_DEAL, "stage_id": "C16:S84294149"}) == ""
+
+
+def test_old_stage_rule_is_available_only_behind_the_explicit_flag(monkeypatch):
+    monkeypatch.setattr(merge, "AUTOMATIC_STAGE_TRANSITIONS_ENABLED", True)
+
     assert merge.next_stage_for(TG_DEAL) == "C16:UC_ANKETA"
     assert merge.next_stage_for({**TG_DEAL, "stage_id": "C16:S84294149"}) == ""
 
 
 # --- полный проход ---------------------------------------------------------------------------
 
-def test_live_case_merges_and_removes_the_duplicate():
+def test_live_case_merges_without_moving_the_stage(monkeypatch):
+    monkeypatch.setattr(merge, "AUTOMATIC_STAGE_TRANSITIONS_ENABLED", False)
     crm = FakeCrm([FORM_DEAL, TG_DEAL])
     conn = FakeConn(telegram_id=1451982360)
 
@@ -180,10 +190,11 @@ def test_live_case_merges_and_removes_the_duplicate():
     deal_id, custom, stage = crm.updated[0]
     assert deal_id == 266
     assert custom["UF_CRM_1784297026"] == "Teat"
-    assert stage == "C16:UC_ANKETA"
+    assert stage is None
     assert crm.deleted == [268]
     assert conn.burned == [TOKEN]
     assert "анкету" in crm.comments[0][1]
+    assert "Этап переведён" not in crm.comments[0][1]
 
 
 def test_a_second_pass_changes_nothing():
