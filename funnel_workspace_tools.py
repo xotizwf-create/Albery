@@ -295,13 +295,6 @@ def set_control(args: Mapping[str, Any]) -> dict[str, Any]:
         actor_name=str(args.get("actor_name") or "ИИ-агент"),
         reason=str(args.get("reason") or "Переключено агентом."),
     )
-    if mode == "human" and str(updated.get("source_key") or "") == "telegram_bot":
-        queued = funnel_telegram_gateway.hide_client_menu_for_manager(
-            conversation_id,
-            state_version=int(updated.get("state_version") or 0),
-        )
-        if queued and isinstance(queued.get("conversation"), dict):
-            updated = queued["conversation"]
     return {
         "conversation_id": conversation_id,
         "control": CONTROL_LABELS.get(

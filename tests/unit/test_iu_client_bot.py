@@ -135,19 +135,6 @@ def test_start_creates_a_lead_and_shows_the_menu(monkeypatch):
     ]
 
 
-def test_manager_takeover_removes_keyboard_without_visible_join_message(monkeypatch):
-    store = FakeStore()
-    monkeypatch.setattr(gateway, "_store", lambda: store)
-
-    gateway.hide_client_menu_for_manager(5, state_version=8)
-
-    queued = store.queued[0]
-    assert queued["text"] == "\u2063"
-    assert queued["metadata"]["reply_markup"] == {"remove_keyboard": True}
-    assert queued["metadata"]["delete_after_delivery"] is True
-    assert "Менеджер подключился" not in queued["text"]
-
-
 def test_closed_manager_question_restores_the_main_menu(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)

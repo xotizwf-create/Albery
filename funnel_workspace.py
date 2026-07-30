@@ -1058,16 +1058,7 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
         ),
         permanent=permanent,
     )
-    if mode == "human" and str(conversation.get("source_key") or "") == "telegram_bot":
-        import funnel_telegram_gateway
-
-        queued = funnel_telegram_gateway.hide_client_menu_for_manager(
-            conversation_id,
-            state_version=int(conversation.get("state_version") or 0),
-        )
-        if queued and isinstance(queued.get("conversation"), dict):
-            conversation = queued["conversation"]
-    elif (
+    if (
         mode == "ai"
         and restore_main_menu
         and str(conversation.get("source_key") or "") == "telegram_bot"

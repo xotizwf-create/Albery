@@ -314,15 +314,19 @@ function WorkspaceLogin({
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const resolvedOperatorName =
+    configuredOperatorName?.trim() || operatorName.trim();
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    const name = configuredOperatorName || operatorName.trim();
-    if (!name || !password || submitting || !configured) return;
+    if (!resolvedOperatorName || !password || submitting || !configured) return;
     setSubmitting(true);
     setError("");
     try {
-      const nextSession = await funnelWorkspaceApi.login(password, name);
+      const nextSession = await funnelWorkspaceApi.login(
+        password,
+        resolvedOperatorName,
+      );
       if (!nextSession.authenticated) {
         setError("Неверный пароль.");
         return;
@@ -418,8 +422,10 @@ function WorkspaceLogin({
                 </span>
                 <input
                   type="password"
+                  name="password"
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
+                  onInput={(event) => setPassword(event.currentTarget.value)}
                   autoComplete="current-password"
                   placeholder="Введите пароль"
                   className="h-12 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 text-[15px] font-medium text-slate-900 transition placeholder:text-slate-400 focus:border-violet-300 focus:bg-white"
@@ -438,7 +444,12 @@ function WorkspaceLogin({
 
               <button
                 type="submit"
-                disabled={submitting || !operatorName.trim() || !password}
+                disabled={
+                  submitting ||
+                  !configured ||
+                  !resolvedOperatorName ||
+                  !password
+                }
                 className="mt-5 inline-flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#5B50EA] px-5 text-sm font-bold text-white shadow-lg shadow-violet-200 transition hover:bg-[#4F45DB] disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}

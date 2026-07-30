@@ -872,28 +872,6 @@ def _reply_and_hand_over(
     return queued
 
 
-def hide_client_menu_for_manager(
-    conversation_id: int,
-    *,
-    state_version: int,
-) -> Mapping[str, Any] | None:
-    """Remove the scenario reply keyboard as soon as an operator takes the chat."""
-
-    import iu_client_bot
-
-    return _reply_to_client(
-        conversation_id,
-        "\u2063",
-        idempotency_key=f"iu-bot:manager-takeover:{conversation_id}:{state_version}",
-        reply_markup=iu_client_bot.remove_keyboard(),
-        metadata={
-            "iu_event": "manager_takeover",
-            "delete_after_delivery": True,
-        },
-        service=True,
-    )
-
-
 def restore_client_menu_after_closed_question(
     conversation_id: int,
     *,

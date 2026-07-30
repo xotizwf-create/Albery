@@ -218,10 +218,9 @@ def test_mcp_can_return_public_bot_dialog_to_ai(monkeypatch):
     assert captured["actor_type"] == "agent"
 
 
-def test_mcp_human_takeover_hides_public_bot_menu(monkeypatch):
+def test_mcp_human_takeover_does_not_send_a_transient_message(monkeypatch):
     import funnel_telegram_gateway
 
-    hidden = {}
     row = conversation(source_key="telegram_bot", control_mode="ai")
     monkeypatch.setattr(tools.store, "get_conversation", lambda _conversation_id: row)
     monkeypatch.setattr(
@@ -235,17 +234,15 @@ def test_mcp_human_takeover_hides_public_bot_menu(monkeypatch):
     )
     monkeypatch.setattr(
         funnel_telegram_gateway,
-        "hide_client_menu_for_manager",
-        lambda conversation_id, *, state_version: hidden.update(
-            conversation_id=conversation_id,
-            state_version=state_version,
+        "_reply_to_client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("taking a dialog must not send a service message")
         ),
     )
 
     result = tools.set_control({"conversation_id": 12, "mode": "human"})
 
     assert result["control"] == "отвечает человек"
-    assert hidden == {"conversation_id": 12, "state_version": 5}
 
 
 def test_conversation_card_includes_transcript(monkeypatch):

@@ -916,10 +916,8 @@ def test_an_ordinary_takeover_is_not_permanent(client, monkeypatch):
     assert response.get_json()["conversation"]["control_permanent"] is False
 
 
-def test_takeover_hides_the_client_reply_keyboard(client, monkeypatch):
+def test_takeover_does_not_send_a_transient_telegram_message(client, monkeypatch):
     import funnel_telegram_gateway
-
-    hidden = {}
 
     def transition(conversation_id, **_kwargs):
         return {
@@ -933,13 +931,16 @@ def test_takeover_hides_the_client_reply_keyboard(client, monkeypatch):
             "external_user_id": 9001,
         }
 
-    def hide(conversation_id, *, state_version):
-        hidden.update(conversation_id=conversation_id, state_version=state_version)
-        return None
+    def unexpected_reply(*_args, **_kwargs):
+        raise AssertionError("taking a dialog must not send a service message")
 
     session_payload = login(client)
     monkeypatch.setattr(workspace.store, "transition_control", transition)
-    monkeypatch.setattr(funnel_telegram_gateway, "hide_client_menu_for_manager", hide)
+    monkeypatch.setattr(
+        funnel_telegram_gateway,
+        "_reply_to_client",
+        unexpected_reply,
+    )
     response = client.post(
         "/api/funnel-workspace/conversations/41/control",
         json={"mode": "human", "expected_version": 3},
@@ -947,7 +948,7 @@ def test_takeover_hides_the_client_reply_keyboard(client, monkeypatch):
     )
 
     assert response.status_code == 200
-    assert hidden == {"conversation_id": 41, "state_version": 4}
+    assert response.get_json()["conversation"]["control_mode"] == "human"
 
 
 def test_close_question_restores_the_client_main_menu(client, monkeypatch):
