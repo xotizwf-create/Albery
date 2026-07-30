@@ -552,10 +552,20 @@ def _b24_app_call(client_endpoint: str, access_token: str, method: str, payload:
     return result
 
 
-def _b24_capture_tokens(payload: dict[str, Any], state: dict[str, Any]) -> None:
-    """Persist the app OAuth tokens carried in every event's `auth` block, so cron jobs (which have
-    no live event) can later post AS THE BOT via a refresh_token grant. Best-effort; saves state.
-    state['app_tokens'] = {access_token, refresh_token, expires (unix), client_endpoint}."""
+def _b24_capture_tokens(
+    payload: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    event_name: str = "",
+) -> None:
+    """Persist the installer's OAuth chain, never an arbitrary event sender's token.
+
+    Bitrix event OAuth tokens belong to the employee who caused the event.  Saving the token from
+    every chat/task event therefore made background CRM calls randomly impersonate the last active
+    employee.  Only install/update events are allowed to establish or rotate the persistent chain.
+    """
+    if str(event_name or "").upper() not in {"ONAPPINSTALL", "ONAPPUPDATE"}:
+        return
     access_token = _imbot_auth(payload, "access_token")
     refresh_token = _imbot_auth(payload, "refresh_token")
     client_endpoint = _imbot_auth(payload, "client_endpoint")
@@ -585,7 +595,7 @@ def _b24_app_access_token() -> tuple[str, str]:
     """Return (client_endpoint, access_token) usable for app REST calls OUTSIDE a live event.
     Reuses the cached token while valid, otherwise refreshes via oauth.bitrix.info using the stored
     refresh_token and persists the rotated pair — so the weekly cron keeps the chain alive forever.
-    Returns ('', '') if not bootstrapped yet (the bot must receive at least one event first)."""
+    Returns ('', '') if the install/update OAuth chain has not been bootstrapped yet."""
     state = _b24_load_state()
     tok = state.get("app_tokens") or {}
     endpoint = (tok.get("client_endpoint") or state.get("client_endpoint") or "").strip()
@@ -619,7 +629,7 @@ def _b24_app_access_token() -> tuple[str, str]:
         if fresh.get("access_token") and fresh_exp - 120 > int(time.time()):
             return (fresh.get("client_endpoint") or endpoint).strip(), fresh["access_token"].strip()
         raise RuntimeError(f"b24 token refresh failed: {str(data)[:300]}")
-    state = _b24_load_state()  # re-read to merge a possibly newer event-stored pair
+    state = _b24_load_state()  # re-read to merge a concurrent refresh/app-update
     tok = dict(state.get("app_tokens") or {})
     tok["access_token"] = new_access
     tok["refresh_token"] = (data.get("refresh_token") or refresh_token).strip()
@@ -636,13 +646,41 @@ def _b24_app_access_token() -> tuple[str, str]:
 
 
 def b24_app_method_call(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Bitrix REST call with the local-app OAuth token (auto-refreshing). The app token carries the
-    `crm` scope the incoming webhooks lack, so CRM tools (funnels/deals) must go through here."""
+    """Bitrix REST call with the auto-refreshing local-app OAuth token."""
     client_endpoint, access_token = _b24_app_access_token()
     if not access_token:
         raise RuntimeError(
             "Bitrix app OAuth token is unavailable (the bot has not stored app_tokens yet — "
             "it needs to receive at least one portal event first).")
+    return _b24_app_call(client_endpoint, access_token, method, payload)
+
+
+def b24_app_method_call_as_user(
+    expected_user_id: int,
+    method: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run one REST mutation only when this exact OAuth token belongs to ``expected_user_id``.
+
+    The identity check and mutation deliberately reuse the same in-memory token.  A separate
+    ``b24_app_method_call('user.current')`` followed by another state lookup would leave a race in
+    which another process could rotate/replace the token between the two calls.
+    """
+    client_endpoint, access_token = _b24_app_access_token()
+    if not access_token:
+        raise RuntimeError("Bitrix app OAuth token is unavailable.")
+    current = _b24_app_call(
+        client_endpoint, access_token, "user.current", {}, _log=False
+    ).get("result") or {}
+    try:
+        actual_user_id = int(current.get("ID") or current.get("id"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("Bitrix app OAuth identity could not be verified.") from exc
+    if actual_user_id != int(expected_user_id):
+        raise RuntimeError(
+            "Bitrix app OAuth belongs to user "
+            f"{actual_user_id}, expected AI agent user {int(expected_user_id)}; mutation refused."
+        )
     return _b24_app_call(client_endpoint, access_token, method, payload)
 
 
@@ -4704,8 +4742,13 @@ def _bitrix_imbot_app_event():
     access_token = _imbot_auth(payload, "access_token")
     client_endpoint = _imbot_auth(payload, "client_endpoint")
     state = _b24_load_state()
-    # Persist the app OAuth tokens from this event so cron digests can post as the bot later.
-    _b24_capture_tokens(payload, state)
+    stored = str(state.get("application_token") or "")
+    if event_name in ("ONAPPINSTALL", "ONAPPUPDATE") and stored:
+        if not app_token or not hmac.compare_digest(app_token, stored):
+            return jsonify({"error": "forbidden"}), 403
+    # Keep only the installer/update OAuth chain. Tokens on ordinary events belong to the employee
+    # who caused that event and must never replace the identity used by background CRM calls.
+    _b24_capture_tokens(payload, state, event_name=event_name)
 
     if event_name in ("ONAPPINSTALL", "ONAPPUPDATE"):
         try:
@@ -4717,7 +4760,6 @@ def _bitrix_imbot_app_event():
             logging.exception("b24 app install failed")
             return jsonify({"ok": False, "event": event_name, "error": str(exc)[:300]}), 200
 
-    stored = state.get("application_token", "")
     if not stored and app_token:
         # Self-heal after an accidental state wipe (the pre-fix ONIMBOTDELETE bug erased the
         # whole state when a SUBAGENT bot was deleted): every event of this install keeps

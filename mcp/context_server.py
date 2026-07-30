@@ -7937,8 +7937,10 @@ def tool_get_employee_absences(args: dict[str, Any]) -> dict[str, Any]:
 
 
 # --- CRM: воронки сделок (deal pipelines) -------------------------------------------------------
-# The incoming webhooks have no `crm` scope (probed live 2026-07-08), but the bot local-app OAuth
-# token does — every funnel/deal tool calls Bitrix through b24bot.b24_app_method_call (auto-refresh).
+# Reads prefer the agent-owned incoming webhook and may fall back to local-app OAuth. Mutations are
+# stricter: Bitrix derives CREATED_BY/MODIFY_BY/MOVED_BY from the REST credential and those fields
+# are read-only, so a write is allowed only after the very same credential is verified as the AI
+# agent. This prevents an employee event token from ever becoming a "random" CRM author.
 # CRM lives on the bot portal (b24-0xrp3s): user ids here are bot-portal ids, the same id space
 # _b24_active_users() / get_employee_absences use. userfieldconfig.* is NOT allowed for this token —
 # custom deal fields go through the classic crm.deal.userfield.* API.
@@ -7953,15 +7955,17 @@ _CRM_DEAL_LIST_SELECT = [
 
 
 #: Вебхук принадлежит ОДНОМУ пользователю (сейчас 22, «ИИ Агент»), и все его вызовы портал
-#: подписывает им. Токен приложения так не умеет: он перезаписывается тем, кто ПОСЛЕДНИМ
+#: подписывает им. Раньше постоянный токен приложения перезаписывался тем, кто ПОСЛЕДНИМ
 #: вызвал событие портала, — поэтому сделки заводились то Софьей, то Юлией, то Артуром
-#: (жалоба владельца 29.07.2026). Ходим вебхуком, когда ему хватает прав.
+#: (жалоба владельца 29.07.2026). Теперь обычные события токен не меняют, а каждая CRM-запись
+#: дополнительно сверяет user.current на той же учётной цепочке.
 #:
 #: Пока в вебхуке нет права `crm`, он отвечает `insufficient_scope`. Запоминаем это на время
 #: и не дёргаем портал дважды на каждый вызов; как только право добавят, авторство станет
 #: единым само, без деплоя.
 _CRM_WEBHOOK_BLIND_UNTIL = 0.0
 _CRM_WEBHOOK_RETRY_S = float(os.getenv("CRM_WEBHOOK_RETRY_SECONDS", "600") or 600)
+_CRM_MUTATION_VERBS = {"add", "update", "delete"}
 
 
 def _crm_webhook_usable() -> bool:
@@ -7972,12 +7976,78 @@ def _crm_webhook_usable() -> bool:
     return time.time() >= _CRM_WEBHOOK_BLIND_UNTIL
 
 
+def _crm_agent_user_id() -> int:
+    try:
+        return int(os.getenv("CRM_AGENT_USER_ID", "22") or 22)
+    except ValueError as exc:
+        raise McpError(-32012, "CRM_AGENT_USER_ID must be an integer.") from exc
+
+
+def _crm_method_mutates(method: str) -> bool:
+    parts = str(method or "").lower().split(".")
+    return bool(parts and parts[0] == "crm" and parts[-1] in _CRM_MUTATION_VERBS)
+
+
+def _crm_result_user_id(response: dict[str, Any]) -> int | None:
+    result = response.get("result") if isinstance(response, dict) else None
+    if not isinstance(result, dict):
+        return None
+    try:
+        return int(result.get("ID") or result.get("id"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _crm_agent_mutation_call(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Execute a CRM mutation only with a credential proven to belong to the AI agent."""
+    global _CRM_WEBHOOK_BLIND_UNTIL
+
+    expected_user_id = _crm_agent_user_id()
+    webhook_error = ""
+    if _crm_webhook_usable():
+        try:
+            identity = _webhook_raw("user.current", {})
+        except McpError as exc:
+            webhook_error = str(exc)
+        else:
+            actual_user_id = _crm_result_user_id(identity)
+            if actual_user_id != expected_user_id:
+                webhook_error = (
+                    f"webhook user is {actual_user_id or 'unknown'}, expected {expected_user_id}"
+                )
+            else:
+                try:
+                    return _webhook_raw(method, payload)
+                except McpError as exc:
+                    webhook_error = str(exc)
+                    if "insufficient_scope" not in webhook_error:
+                        raise
+                    _CRM_WEBHOOK_BLIND_UNTIL = time.time() + _CRM_WEBHOOK_RETRY_S
+
+    try:
+        return app_workflow_function("b24_app_method_call_as_user")(
+            expected_user_id, method, payload
+        )
+    except Exception as exc:  # noqa: BLE001
+        app_error = str(exc)[:220]
+        detail = f" webhook: {webhook_error[:160]};" if webhook_error else ""
+        raise McpError(
+            -32012,
+            "Bitrix CRM mutation refused: no CRM credential verified as AI agent "
+            f"user {expected_user_id}.{detail} app: {app_error}",
+        ) from exc
+
+
 def _crm_call(method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     global _CRM_WEBHOOK_BLIND_UNTIL
 
+    body = payload or {}
+    if _crm_method_mutates(method):
+        return _crm_agent_mutation_call(method, body)
+
     if _crm_webhook_usable():
         try:
-            return _webhook_raw(method, payload or {})
+            return _webhook_raw(method, body)
         except McpError as exc:
             if "insufficient_scope" not in str(exc):
                 raise
@@ -7985,7 +8055,7 @@ def _crm_call(method: str, payload: dict[str, Any] | None = None) -> dict[str, A
             _CRM_WEBHOOK_BLIND_UNTIL = time.time() + _CRM_WEBHOOK_RETRY_S
             logger.info("вебхуку не хватает права crm — CRM идёт токеном приложения")
     try:
-        return app_workflow_function("b24_app_method_call")(method, payload or {})
+        return app_workflow_function("b24_app_method_call")(method, body)
     except McpError:
         raise
     except Exception as exc:  # noqa: BLE001
