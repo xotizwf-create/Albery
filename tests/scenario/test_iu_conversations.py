@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import iu_contract
 import iu_filters
 import iu_funnel
@@ -82,6 +84,40 @@ def test_greeting_gets_a_human_reply_and_no_form():
 
     assert out.reply == "Здравствуйте! Чем могу помочь?"
     assert out.action == iu_contract.REPLY_ONLY
+    assert not out.escalate
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Здравствуйте! Помогите мне",
+        "Помогите, пожалуйста",
+        "Мне нужна помощь",
+        "Можно задать вопрос?",
+        "У меня есть вопрос",
+    ],
+)
+def test_vague_help_request_asks_for_details_without_manager(message):
+    asked = []
+
+    out = run(message, ask=lambda prompt: asked.append(prompt))
+
+    assert "с чем помочь" in out.reply.lower()
+    assert out.action == iu_contract.REPLY_ONLY
+    assert not out.escalate
+    assert not out.answered_client
+    assert asked == [], "неопределённая просьба не должна зависеть от решения модели"
+
+
+def test_specific_help_request_is_not_swallowed_by_vague_help_guard():
+    out = run("Помогите разобраться с комиссией", ask=model(
+        reply="Комиссия 44%.",
+        source_ids=["комиссия"],
+        answered=["комиссия"],
+    ))
+
+    assert out.reply == "Комиссия 44%."
+    assert out.answered_client
     assert not out.escalate
 
 

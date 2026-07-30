@@ -727,9 +727,19 @@ def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
     metadata = dict(metadata) if isinstance(metadata, dict) else {}
     requested_at = metadata.get("manager_requested_at")
     handled_at = metadata.get("manager_request_handled_at")
+    needs_human_at = metadata.get("needs_human_at")
+    needs_human_handled_at = metadata.get("needs_human_handled_at")
     payload["manager_requested_at"] = requested_at
     payload["manager_requested"] = bool(
         requested_at and (not handled_at or str(handled_at) < str(requested_at))
+    )
+    payload["needs_human_at"] = needs_human_at
+    payload["needs_human"] = bool(
+        needs_human_at
+        and (
+            not needs_human_handled_at
+            or str(needs_human_handled_at) < str(needs_human_at)
+        )
     )
     payload["source"] = payload.get("source_key")
     payload["last_message"] = payload.get("last_message_text")
@@ -805,6 +815,8 @@ def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
     payload["control_label"] = (
         "Клиент позвал менеджера"
         if payload["manager_requested"]
+        else "Нужен ответ менеджера"
+        if payload["needs_human"]
         else store.CONTROL_MODE_LABELS.get(
             control_mode,
             store.CONTROL_MODE_LABELS["paused"],

@@ -948,6 +948,7 @@ def test_operator_request_notifies_alexander_from_iu_agent_with_dialog_link(
         "payload": {
             "author_type": "agent",
             "notify_manager_after_delivery": True,
+            "manager_notification_kind": "client_called",
             "manager_notification_recipient": "16",
             "manager_notification_bot_id": 86,
             "manager_notification_client_name": "Александр Никитенко",
@@ -970,6 +971,49 @@ def test_operator_request_notifies_alexander_from_iu_agent_with_dialog_link(
             },
         )
     ]
+
+
+def test_automatic_ai_escalation_does_not_claim_that_client_called_manager(
+    monkeypatch,
+):
+    calls = []
+    tg = SimpleNamespace(
+        _terms_already_sent=lambda _telegram_id: True,
+        _mark_terms_sent=lambda _telegram_id: None,
+        _invite_already_sent=lambda _telegram_id: True,
+        _mark_invited=lambda _telegram_id: None,
+        mcp_call=lambda tool, arguments: calls.append((tool, arguments))
+        or {"sent": True},
+    )
+    monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: True)
+    import funnel_workspace
+
+    monkeypatch.setattr(
+        funnel_workspace,
+        "conversation_url",
+        lambda conversation_id: f"https://www.m4s.ru/agent-funnels/{conversation_id}",
+    )
+
+    gateway._apply_delivery_effects(
+        {
+            "id": 76,
+            "conversation_id": 311,
+            "action_type": "delivery_effects",
+            "payload": {
+                "author_type": "agent",
+                "notify_manager_after_delivery": True,
+                "manager_notification_kind": "manager_needed",
+                "manager_notification_client_name": "Александр Никитенко",
+            },
+        }
+    )
+
+    assert calls[0][1]["text"] == (
+        "Клиент Александр Никитенко: требуется ответ менеджера в "
+        "[URL=https://www.m4s.ru/agent-funnels/311]диалоге[/URL]"
+    )
+    assert "позвал менеджера" not in calls[0][1]["text"]
 
 
 def test_night_delivery_defers_immediate_manager_notification(monkeypatch):

@@ -1135,6 +1135,8 @@ def test_confirmed_delivery_enqueues_crm_stage_in_same_transaction():
             "stage_move": "C16:TERMS",
             "asset": "terms",
             "escalate_after_delivery": False,
+            "answered_client": True,
+            "manager_notification_kind": "manager_needed",
         },
     }
     delivery_action = {
@@ -1189,6 +1191,15 @@ def test_confirmed_delivery_enqueues_crm_stage_in_same_transaction():
     ) < statements.index(
         next(sql for sql in statements if sql.startswith("INSERT INTO funnel_workspace_crm_actions"))
     )
+    delivery_insert = next(
+        params
+        for sql, params in connection.cursor_instance.executed
+        if sql.startswith("INSERT INTO funnel_workspace_crm_actions")
+        and "'delivery_effects'" in sql
+    )
+    persisted_payload = delivery_insert[3].obj
+    assert persisted_payload["answered_client"] is True
+    assert persisted_payload["manager_notification_kind"] == "manager_needed"
 
 
 def test_crm_action_enqueue_is_idempotent_and_rejects_payload_drift():

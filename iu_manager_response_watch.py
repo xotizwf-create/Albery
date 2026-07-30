@@ -123,20 +123,36 @@ def _waiting_rows(
                                       OR (
                                           answer.author_type = 'agent'
                                           AND c.control_mode <> 'human'
-                                          AND NOT (
-                                              c.metadata
-                                                  ->> 'manager_requested_at'
-                                              IS NOT NULL
-                                              AND (
-                                                  c.metadata
-                                                      ->> 'manager_request_handled_at'
-                                                  IS NULL
-                                                  OR c.metadata
-                                                      ->> 'manager_request_handled_at'
-                                                     < c.metadata
-                                                      ->> 'manager_requested_at'
-                                              )
-                                          )
+                                           AND NOT (
+                                               (
+                                                   c.metadata
+                                                       ->> 'manager_requested_at'
+                                                   IS NOT NULL
+                                                   AND (
+                                                       c.metadata
+                                                           ->> 'manager_request_handled_at'
+                                                       IS NULL
+                                                       OR c.metadata
+                                                           ->> 'manager_request_handled_at'
+                                                          < c.metadata
+                                                           ->> 'manager_requested_at'
+                                                   )
+                                               )
+                                               OR (
+                                                   c.metadata
+                                                       ->> 'needs_human_at'
+                                                   IS NOT NULL
+                                                   AND (
+                                                       c.metadata
+                                                           ->> 'needs_human_handled_at'
+                                                       IS NULL
+                                                       OR c.metadata
+                                                           ->> 'needs_human_handled_at'
+                                                          < c.metadata
+                                                           ->> 'needs_human_at'
+                                                   )
+                                               )
+                                           )
                                       )
                                   )
                                   AND answer.direction = 'outbound'

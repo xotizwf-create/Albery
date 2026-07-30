@@ -743,6 +743,8 @@ def _schedule_existing_question(conversation_id: int, messages: list[dict[str, A
 def _manager_request_metadata(
     event: str,
     conversation_id: int | None = None,
+    *,
+    notification_kind: str = "client_called",
 ) -> dict[str, Any]:
     """Delivery metadata for every customer-facing handover to the IU manager."""
 
@@ -773,6 +775,7 @@ def _manager_request_metadata(
             _as_int(os.getenv("IU_AGENT_BOT_ID", "86")) or 86
         ),
         "manager_notification_client_name": client_name or "Клиент",
+        "manager_notification_kind": notification_kind,
     }
 
 
@@ -2001,6 +2004,7 @@ def prepare_reply(
             _manager_request_metadata(
                 "ai_escalation",
                 _as_int((conversation or {}).get("id")),
+                notification_kind="manager_needed",
             )
         )
     # Клиенту, который уже несколько раз спросил у ИИ, показываем прямой путь к человеку.
@@ -2648,7 +2652,9 @@ def _mark_waiting_if_current(
             conversation_id,
             expected_version=expected_version,
             reason=(reason or "Нужен ответ человека.")[:1000],
-            manager_requested=True,
+            # Автоматическая эскалация не означает, что клиент сам позвал менеджера.
+            # Явные вызовы проходят через _reply_and_hand_over и ставят отдельный бейдж.
+            manager_requested=False,
         )
     except (
         store.WorkspaceConflictError,
@@ -2818,13 +2824,23 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
             if client_name and client_name.casefold() != "клиент"
             else "Клиент"
         )
+        notification_kind = str(
+            payload.get("manager_notification_kind") or "manager_needed"
+        ).strip()
+        if notification_kind == "client_called":
+            notification_text = (
+                f"{client_label} позвал менеджера в "
+                f"[URL={dialog_url}]диалоге[/URL]"
+            )
+        else:
+            notification_text = (
+                f"{client_label}: требуется ответ менеджера в "
+                f"[URL={dialog_url}]диалоге[/URL]"
+            )
         notification = tg_agent.mcp_call(
             "notify_iu_group",
             {
-                "text": (
-                    f"{client_label} позвал менеджера в "
-                    f"[URL={dialog_url}]диалоге[/URL]"
-                ),
+                "text": notification_text,
                 "dialog_id": recipient,
                 "bot_id": bot_id,
             },

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 
 import iu_contract
@@ -39,6 +40,37 @@ ESCALATION_REPLY = os.getenv(
 
 # Насколько сообщение должно совпасть с прежним вопросом клиента, чтобы считаться повтором.
 REPEAT_RATIO = float(os.getenv("IU_REPEAT_RATIO", "0.6") or 0.6)
+
+# Реплика без самого вопроса требует уточнения, а не менеджера. Модель уже умеет отвечать
+# правильно, но однажды вернула одновременно хороший уточняющий вопрос и техническое
+# ``unresolved=["Конкретный вопрос клиента"]``. Общая логика эскалации приняла это поле за
+# реальный неотвеченный вопрос и создала ложный вызов менеджера. Узкий детерминированный путь
+# исключает неоднозначность, не задевая «помогите с комиссией» или «позовите менеджера».
+VAGUE_HELP_REPLY = os.getenv(
+    "IU_VAGUE_HELP_REPLY",
+    "Конечно! Напишите, пожалуйста, с чем помочь — постараюсь разобраться.",
+).strip()
+_GREETING_PREFIX = (
+    r"(?:(?:здравствуйте|здравствуй|добрый\s+(?:день|вечер|утро)|привет)"
+    r"[\s!,.—-]*)?"
+)
+_VAGUE_HELP_RE = re.compile(
+    rf"^\s*{_GREETING_PREFIX}(?:"
+    r"помог(?:и|ите)(?:\s+мне)?|"
+    r"(?:можете|сможете)\s+(?:мне\s+)?помочь|"
+    r"(?:мне\s+)?нужна\s+помощь|"
+    r"у\s+меня\s+(?:есть\s+)?вопрос|"
+    r"можно\s+(?:задать\s+)?вопрос|"
+    r"хочу\s+задать\s+вопрос"
+    r")(?:\s*,?\s*пожалуйста)?[\s!?.]*$",
+    re.I,
+)
+
+
+def is_vague_help_request(message: str) -> bool:
+    """Просьба начать помощь без темы, факта или явного вызова человека."""
+
+    return bool(_VAGUE_HELP_RE.fullmatch(str(message or "")))
 
 
 @dataclass(frozen=True)
@@ -131,6 +163,15 @@ def handle(request: Request, deps: Deps) -> Outcome:
     # в отказ выслать документ, который до клиента не дошёл.
     resend = iu_funnel.resend_requested(request.message)
     trace: dict = {"stage": facts.stage, "stage_move": stage_move, "resend": resend}
+
+    if is_vague_help_request(request.message):
+        trace["conversational_clarification"] = True
+        return Outcome(
+            reply=VAGUE_HELP_REPLY,
+            action=iu_contract.REPLY_ONLY,
+            stage_move=stage_move,
+            trace=trace,
+        )
 
     # 1. Фильтр входа. Совпало — модель не зовём вовсе: дешевле и надёжнее, чем надеяться,
     # что она откажется сама.
@@ -271,7 +312,10 @@ def handle(request: Request, deps: Deps) -> Outcome:
         trace["trimmed_steps"] = True
 
     return Outcome(
-        answered_client=True,
+        # Уточняющий вопрос — полезный ответ в диалоге, но не ответ ПО СУЩЕСТВУ.
+        # Для частичного ответа достаточно либо названной моделью темы, либо проверяемого
+        # источника знаний; это удерживает разговор у ИИ, пока менеджер разбирает остаток.
+        answered_client=bool(plan.answered or plan.source_ids),
         reply=reply,
         action=plan.next_action,
         escalate=bool(plan.unresolved),

@@ -746,6 +746,17 @@ def test_manager_request_replaces_paused_control_status():
     assert row["control_label"] == "Клиент позвал менеджера"
 
 
+def test_automatic_escalation_has_honest_non_client_request_badge():
+    row = _payload(
+        control_mode="ai",
+        metadata={"needs_human_at": "2026-07-29T12:00:00+00:00"},
+    )
+
+    assert row["manager_requested"] is False
+    assert row["needs_human"] is True
+    assert row["control_label"] == "Нужен ответ менеджера"
+
+
 def test_public_bot_ai_availability_uses_its_channel_switch(monkeypatch):
     import funnel_telegram_gateway
 

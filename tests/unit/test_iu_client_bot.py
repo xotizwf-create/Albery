@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 import funnel_telegram_gateway as gateway
+import iu_filters
+import iu_turn
 import tg_agent as real_tg
 import iu_client_bot as bot
 
@@ -220,6 +222,7 @@ def test_file_handover_always_sets_badge_and_bitrix_notification(monkeypatch):
     assert store.queued[0]["metadata"]["manager_notification_recipient"] == "16"
     assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
     assert store.queued[0]["metadata"]["manager_notification_client_name"] == "Пётр Иванов"
+    assert store.queued[0]["metadata"]["manager_notification_kind"] == "client_called"
     assert store.transitions[0]["manager_requested"] is True
     assert store.transitions[0]["permanent_human"] is True
 
@@ -291,6 +294,34 @@ def test_any_ai_escalation_enqueues_the_same_bitrix_manager_alert(monkeypatch):
     assert prepared.metadata["notify_manager_after_delivery"] is True
     assert prepared.metadata["manager_notification_recipient"] == "16"
     assert prepared.metadata["manager_notification_bot_id"] == 86
+    assert prepared.metadata["manager_notification_kind"] == "manager_needed"
+
+
+def test_vague_help_request_neither_calls_nor_notifies_manager(monkeypatch):
+    monkeypatch.setattr(gateway, "_store", lambda: FakeStore())
+    outcome = iu_turn.handle(
+        iu_turn.Request(message="Здравствуйте! Помогите мне"),
+        iu_turn.Deps(
+            ask=lambda _prompt: (_ for _ in ()).throw(
+                AssertionError("vague help must not call the model")
+            ),
+            rules=iu_filters.Ruleset(),
+        ),
+    )
+
+    prepared = gateway.prepare_reply(
+        outcome,
+        telegram_user_id=555,
+        conversation={
+            "id": 5,
+            "source_key": gateway.BOT_SOURCE_KEY,
+            "control_mode": "ai",
+        },
+    )
+
+    assert prepared.escalate is False
+    assert "notify_manager_after_delivery" not in prepared.metadata
+    assert "manager_notification_kind" not in prepared.metadata
 
 
 def test_join_button_answers_honestly_while_the_form_is_missing(monkeypatch):

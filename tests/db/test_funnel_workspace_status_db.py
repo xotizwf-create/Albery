@@ -140,7 +140,7 @@ def test_question_during_human_lease_is_scheduled_when_ai_returns():
         _cleanup(source_key)
 
 
-def test_ai_escalation_sets_the_same_manager_request_badge():
+def test_ai_escalation_is_not_recorded_as_an_explicit_client_request():
     suffix = uuid4().hex[:12]
     source_key = f"test-manager-badge-{suffix}"
     chat_id = "700000204"
@@ -168,9 +168,10 @@ def test_ai_escalation_sets_the_same_manager_request_badge():
 
         assert updated["status"] == "waiting"
         assert updated["control_mode"] == "ai"
-        assert updated["metadata"]["manager_requested_at"] == requested_at.isoformat()
+        assert "manager_requested_at" not in updated["metadata"]
+        assert updated["metadata"]["needs_human_at"] == requested_at.isoformat()
         assert (
-            updated["metadata"]["manager_request_reason"]
+            updated["metadata"]["needs_human_reason"]
             == "Нужна ручная проверка файла."
         )
     finally:

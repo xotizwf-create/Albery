@@ -1698,7 +1698,10 @@ def transition_control(
                     resume_at,
                     assigned_to,
                     Jsonb(
-                        {"manager_request_handled_at": timestamp.isoformat()}
+                        {
+                            "manager_request_handled_at": timestamp.isoformat(),
+                            "needs_human_handled_at": timestamp.isoformat(),
+                        }
                         if clean_mode == "ai"
                         else {}
                     ),
@@ -1782,12 +1785,17 @@ def mark_waiting_human(
                     next_mode,
                     _clean_optional(assigned_to, 200),
                     Jsonb(
-                        {
-                            "manager_requested_at": timestamp.isoformat(),
-                            "manager_request_reason": clean_reason,
-                        }
-                        if manager_requested
-                        else {}
+                        (
+                            {
+                                "manager_requested_at": timestamp.isoformat(),
+                                "manager_request_reason": clean_reason,
+                            }
+                            if manager_requested
+                            else {
+                                "needs_human_at": timestamp.isoformat(),
+                                "needs_human_reason": clean_reason,
+                            }
+                        )
                     ),
                     next_version,
                     timestamp,
@@ -1830,7 +1838,12 @@ def mark_manager_request_handled(
              RETURNING *
                 """,
                 (
-                    Jsonb({"manager_request_handled_at": timestamp.isoformat()}),
+                    Jsonb(
+                        {
+                            "manager_request_handled_at": timestamp.isoformat(),
+                            "needs_human_handled_at": timestamp.isoformat(),
+                        }
+                    ),
                     timestamp,
                     row["id"],
                 ),
@@ -1873,8 +1886,8 @@ def flag_needs_human(
                 (
                     Jsonb(
                         {
-                            "manager_requested_at": timestamp.isoformat(),
-                            "manager_request_reason": clean_reason,
+                            "needs_human_at": timestamp.isoformat(),
+                            "needs_human_reason": clean_reason,
                         }
                     ),
                     timestamp,
@@ -1987,7 +2000,10 @@ def update_conversation_status(
                     resume_at,
                     assigned_to,
                     Jsonb(
-                        {"manager_request_handled_at": timestamp.isoformat()}
+                        {
+                            "manager_request_handled_at": timestamp.isoformat(),
+                            "needs_human_handled_at": timestamp.isoformat(),
+                        }
                         if clean_status in {"closed", "spam", "expired"}
                         else {}
                     ),
@@ -2522,7 +2538,10 @@ def ingest_business_message(
                     resume_at,
                     assigned_to,
                     Jsonb(
-                        {"manager_request_handled_at": timestamp.isoformat()}
+                        {
+                            "manager_request_handled_at": timestamp.isoformat(),
+                            "needs_human_handled_at": timestamp.isoformat(),
+                        }
                         if clean_author == "operator"
                         else {}
                     ),
@@ -4223,11 +4242,18 @@ def _enqueue_delivery_effect_action_cursor(
         "author_type": str(outbox.get("author_type") or ""),
         "conversation_version": int(outbox.get("conversation_version") or 0),
         "escalate_after_delivery": escalate,
+        # Сохраняем факт частичного ответа в durable action. Иначе второй обработчик
+        # ошибочно считает доставленный ответ полным провалом и ставит диалог на паузу.
+        "answered_client": bool(source_payload.get("answered_client")),
         "escalation_reason": _clean_optional(
             source_payload.get("escalation_reason"),
             1000,
         ),
         "notify_manager_after_delivery": notify_manager,
+        "manager_notification_kind": _clean_optional(
+            source_payload.get("manager_notification_kind"),
+            100,
+        ),
         "manager_notification_recipient": _clean_optional(
             source_payload.get("manager_notification_recipient"),
             100,
