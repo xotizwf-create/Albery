@@ -2,7 +2,8 @@
 
 Deliberately ISOLATED from the main albery.service: its own process, long polling, no Flask
 import — the production web app is never touched or restarted by this feature. LLM turns reuse
-the proven b24bot pattern (`hermes -z … -t albery,web --yolo` subprocess), one at a time.
+the proven b24bot pattern (`hermes -z … -t albery,web --yolo` subprocess) through a small,
+memory-bounded pool.
 
 What it does (phase 1, owner-approved 2026-07-09):
   * private chat with the OWNER (whitelist TG_AGENT_OWNER_IDS): questions go to the brain with
@@ -52,7 +53,10 @@ BUSINESS_LOG_PATH = APP_ROOT / ".tg_business_log.jsonl"
 _state_lock = threading.Lock()
 # Сколько ходов мозга идёт одновременно. Не «сколько влезет»: на боксе 2 ГБ, каждый ход — это
 # отдельный процесс hermes, и без предела поток лидов положил бы службу целиком.
-_HERMES_PARALLEL = max(1, int(os.getenv("TG_AGENT_PARALLEL_TURNS", "3") or 3))
+_HERMES_PARALLEL = max(
+    1,
+    min(3, int(os.getenv("TG_AGENT_PARALLEL_TURNS", "3") or 3)),
+)
 _hermes_slots = threading.BoundedSemaphore(_HERMES_PARALLEL)
 # Сообщения ОДНОГО человека обрабатываются строго по очереди: иначе два его сообщения подряд
 # уходят в два параллельных хода, и второй не видит, что ответил первый.

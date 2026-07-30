@@ -83,12 +83,19 @@ def test_merge_comment_is_added_once_when_timeline_has_no_exact_match():
 
 
 def test_calculator_form_completion_confirms_and_calls_manager(monkeypatch):
-    cursor = FakeCursor([{"form_deal_id": 264, "telegram_id": 555}])
+    cursor = FakeCursor(
+        [{"form_deal_id": 264, "target_deal_id": 284, "telegram_id": 555}]
+    )
     monkeypatch.setattr(db, "connect", lambda: FakeConnection(cursor))
     monkeypatch.setattr(
         store,
         "find_conversation",
         lambda **_kwargs: {"id": 311},
+    )
+    monkeypatch.setattr(
+        store,
+        "get_conversation",
+        lambda _conversation_id: {"display_name": "Александр Никитенко"},
     )
     monkeypatch.setattr(
         store,
@@ -104,7 +111,7 @@ def test_calculator_form_completion_confirms_and_calls_manager(monkeypatch):
     calls: list[tuple] = []
     monkeypatch.setattr(
         gateway,
-        "_reply_and_hand_over",
+        "_reply_to_client",
         lambda conversation_id, text, **kwargs: (
             calls.append((conversation_id, text, kwargs))
             or {"message": {"id": 99}}
@@ -116,28 +123,37 @@ def test_calculator_form_completion_confirms_and_calls_manager(monkeypatch):
     conversation_id, text, kwargs = calls[0]
     assert conversation_id == 311
     assert text == bot.CALCULATOR_FORM_RECEIVED
-    assert kwargs["event"] == "calculator_form_received"
-    assert kwargs["metadata"] == {
-        "form_deal_id": 264,
-        "calculator_origin": True,
-    }
-    assert kwargs["reply_markup"] == bot.remove_keyboard()
+    assert kwargs["metadata"]["iu_event"] == "calculator_form_received"
+    assert kwargs["metadata"]["manager_notification_kind"] == "form_completed"
+    assert kwargs["metadata"]["manager_notification_form_deal_id"] == 284
+    assert kwargs["metadata"]["form_deal_id"] == 264
+    assert kwargs["metadata"]["calculator_origin"] is True
+    assert kwargs["metadata"]["escalate_after_delivery"] is True
+    assert kwargs["metadata"]["answered_client"] is True
+    assert kwargs["reply_markup"] == bot.main_menu()
     assert cursor.updates[-1] == ("", "", 264)
 
 
 def test_regular_form_completion_also_notifies_manager(monkeypatch):
-    cursor = FakeCursor([{"form_deal_id": 265, "telegram_id": 556}])
+    cursor = FakeCursor(
+        [{"form_deal_id": 265, "target_deal_id": 285, "telegram_id": 556}]
+    )
     monkeypatch.setattr(db, "connect", lambda: FakeConnection(cursor))
     monkeypatch.setattr(
         store,
         "find_conversation",
         lambda **_kwargs: {"id": 312},
     )
+    monkeypatch.setattr(
+        store,
+        "get_conversation",
+        lambda _conversation_id: {"display_name": "Александр Никитенко"},
+    )
     monkeypatch.setattr(store, "list_messages", lambda *_args, **_kwargs: [])
     calls: list[tuple] = []
     monkeypatch.setattr(
         gateway,
-        "_reply_and_hand_over",
+        "_reply_to_client",
         lambda conversation_id, text, **kwargs: (
             calls.append((conversation_id, text, kwargs))
             or {"message": {"id": 100}}
@@ -149,6 +165,11 @@ def test_regular_form_completion_also_notifies_manager(monkeypatch):
     conversation_id, text, kwargs = calls[0]
     assert conversation_id == 312
     assert text == bot.FORM_RECEIVED
-    assert kwargs["event"] == "form_received"
-    assert kwargs["metadata"] == {"form_deal_id": 265}
-    assert kwargs["reply_markup"] == bot.remove_keyboard()
+    assert kwargs["metadata"]["iu_event"] == "form_received"
+    assert kwargs["metadata"]["manager_notification_kind"] == "form_completed"
+    assert kwargs["metadata"]["manager_notification_form_deal_id"] == 285
+    assert kwargs["metadata"]["form_deal_id"] == 265
+    assert kwargs["metadata"]["escalate_after_delivery"] is True
+    assert kwargs["metadata"]["answered_client"] is True
+    assert kwargs["reply_markup"] == bot.main_menu()
+    assert cursor.updates[-1] == ("", "", 265)

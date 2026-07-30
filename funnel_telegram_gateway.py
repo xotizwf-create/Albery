@@ -22,10 +22,11 @@ import socket
 import threading
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 import requests
 
@@ -161,16 +162,21 @@ def start_workers() -> list[threading.Thread]:
                 recover()
             except Exception:  # noqa: BLE001 - loops will retry after migrations/connectivity recover
                 log.warning("workspace recovery failed", exc_info=True)
-        specs = (
+        specs: list[tuple[str, Any]] = [
             ("business-updates", _update_loop),
             ("bot-updates", _bot_update_loop),
-            ("ai", _ai_loop),
+        ]
+        specs.extend(
+            (f"ai-{number}", _ai_loop)
+            for number in range(1, ai_worker_count() + 1)
+        )
+        specs.extend((
             ("outbox", _outbox_loop),
             ("crm-actions", _crm_action_loop),
             ("iu-reminders", _reminder_loop),
             ("iu-manager-wait", _manager_wait_loop),
             ("maintenance", _maintenance_loop),
-        )
+        ))
         _threads[:] = []
         for suffix, target in specs:
             thread = threading.Thread(
@@ -268,17 +274,41 @@ def ai_worker_needed() -> bool:
     return ai_enabled() or (iu_client_bot.enabled() and iu_client_bot.ai_answers_enabled())
 
 
+def ai_worker_count() -> int:
+    """Bounded parallelism for independent customer conversations.
+
+    One worker used to lease three jobs and execute all model calls serially.  At the
+    observed production latency of tens of seconds that made the tenth customer wait
+    minutes before their turn even started.  PostgreSQL already elects independent jobs
+    with ``SKIP LOCKED`` and the Hermes layer has its own memory guard, so a small fixed
+    pool is both safe and materially faster.
+    """
+
+    try:
+        return max(
+            1,
+            min(
+                3,
+                int(os.getenv("FUNNEL_WORKSPACE_AI_WORKERS", "3") or 3),
+            ),
+        )
+    except (TypeError, ValueError):
+        return 3
+
+
 def _ai_loop() -> None:
-    worker_id = f"{_worker_prefix}-ai"
+    worker_id = f"{_worker_prefix}-{threading.current_thread().name}"
     while not _stop_event.is_set():
         count = 0
         if ai_worker_needed():
             try:
-                count = process_ai_jobs_once(worker_id=worker_id)
+                # One lease per worker keeps the pool balanced.  Leasing batches here made
+                # one thread reserve work that another idle thread could already execute.
+                count = process_ai_jobs_once(worker_id=worker_id, limit=1)
             except Exception:  # noqa: BLE001
                 log.exception("workspace AI worker failed")
         if not count:
-            _loop_wait(_poll_seconds("FUNNEL_WORKSPACE_JOB_POLL_SECONDS", 1.0))
+            _loop_wait(_poll_seconds("FUNNEL_WORKSPACE_JOB_POLL_SECONDS", 0.25))
 
 
 def _outbox_loop() -> None:
@@ -290,7 +320,7 @@ def _outbox_loop() -> None:
             log.exception("workspace outbox worker failed")
             count = 0
         if not count:
-            _loop_wait(_poll_seconds("FUNNEL_WORKSPACE_OUTBOX_POLL_SECONDS", 1.0))
+            _loop_wait(_poll_seconds("FUNNEL_WORKSPACE_OUTBOX_POLL_SECONDS", 0.25))
 
 
 def _crm_action_loop() -> None:
@@ -2057,6 +2087,51 @@ def process_ai_jobs_once(*, worker_id: str, limit: int = 3) -> int:
     return len(jobs)
 
 
+@contextmanager
+def _typing_indicator(conversation: Mapping[str, Any]):
+    """Keep Telegram's typing indicator alive while the model is working."""
+
+    chat_id = _as_int(conversation.get("external_chat_id"))
+    if chat_id is None:
+        yield
+        return
+    stop = threading.Event()
+
+    def _pulse() -> None:
+        import tg_agent
+
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "action": "typing",
+            "http_timeout": 5,
+        }
+        business_id = str(conversation.get("business_connection_id") or "").strip()
+        if business_id:
+            params["business_connection_id"] = business_id
+        while not stop.is_set():
+            try:
+                tg_agent.api("sendChatAction", **params)
+            except Exception as exc:  # noqa: BLE001 - indication is cosmetic
+                log.debug(
+                    "typing indicator failed for conversation %s: %s",
+                    conversation.get("id"),
+                    _safe_error(exc),
+                )
+            stop.wait(4.0)
+
+    thread = threading.Thread(
+        target=_pulse,
+        daemon=True,
+        name=f"funnel-typing-{conversation.get('id')}",
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(0.2)
+
+
 def _process_ai_job(job: Mapping[str, Any], *, worker_id: str) -> None:
     store = _store()
     job_id = int(job["id"])
@@ -2115,12 +2190,13 @@ def _process_ai_job(job: Mapping[str, Any], *, worker_id: str) -> None:
     try:
         import iu_runtime
 
-        facts, outcome = iu_runtime.decide_turn(
-            author,
-            list(turn.texts),
-            deal_id=_as_int(conversation.get("deal_id")),
-            history=turn.history,
-        )
+        with _typing_indicator(conversation):
+            facts, outcome = iu_runtime.decide_turn(
+                author,
+                list(turn.texts),
+                deal_id=_as_int(conversation.get("deal_id")),
+                history=turn.history,
+            )
         if outcome is None:
             raise RuntimeError("ИУ runtime returned no outcome")
         prepared = prepare_reply(
@@ -2843,6 +2919,20 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
                 f"{client_label} позвал менеджера в "
                 f"[URL={dialog_url}]диалоге[/URL]"
             )
+        elif notification_kind == "form_completed":
+            form_deal_id = _as_int(
+                payload.get("manager_notification_form_deal_id")
+            )
+            form_url = _bitrix_deal_url(form_deal_id)
+            form_label = (
+                f"[URL={form_url}]Заполнил анкету[/URL]"
+                if form_url
+                else "Заполнил анкету"
+            )
+            notification_text = (
+                f"{client_label} {form_label}. И далее требуется ответ менеджера в "
+                f"[URL={dialog_url}]диалоге[/URL]"
+            )
         else:
             notification_text = (
                 f"{client_label}: требуется ответ менеджера в "
@@ -2895,6 +2985,22 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
         "manager_notified": manager_notified,
         "manager_notification_deferred": manager_notification_deferred,
     }
+
+
+def _bitrix_deal_url(deal_id: int | None) -> str:
+    """Stable CRM card URL without exposing the webhook credentials."""
+
+    if deal_id is None or deal_id <= 0:
+        return ""
+    base = ""
+    for env_name in ("BITRIX_WEBHOOK_BASE", "B24_TESTBOT_WEBHOOK_BASE"):
+        base = str(os.getenv(env_name) or "").strip()
+        if base:
+            break
+    host = urlsplit(base).hostname
+    if not host:
+        return ""
+    return f"https://{host}/crm/deal/details/{deal_id}/"
 
 
 def _safe_error(exc: BaseException) -> str:

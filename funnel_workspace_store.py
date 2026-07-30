@@ -4265,6 +4265,9 @@ def _enqueue_delivery_effect_action_cursor(
             source_payload.get("manager_notification_client_name"),
             300,
         ),
+        "manager_notification_form_deal_id": _optional_int(
+            source_payload.get("manager_notification_form_deal_id")
+        ),
         "provider_message_id": _clean_optional(
             outbox.get("provider_message_id"),
             300,

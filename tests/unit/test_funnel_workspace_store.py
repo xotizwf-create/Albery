@@ -1137,6 +1137,7 @@ def test_confirmed_delivery_enqueues_crm_stage_in_same_transaction():
             "escalate_after_delivery": False,
             "answered_client": True,
             "manager_notification_kind": "manager_needed",
+            "manager_notification_form_deal_id": 284,
         },
     }
     delivery_action = {
@@ -1200,6 +1201,7 @@ def test_confirmed_delivery_enqueues_crm_stage_in_same_transaction():
     persisted_payload = delivery_insert[3].obj
     assert persisted_payload["answered_client"] is True
     assert persisted_payload["manager_notification_kind"] == "manager_needed"
+    assert persisted_payload["manager_notification_form_deal_id"] == 284
 
 
 def test_crm_action_enqueue_is_idempotent_and_rejects_payload_drift():

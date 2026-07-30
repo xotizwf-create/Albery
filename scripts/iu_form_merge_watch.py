@@ -109,7 +109,7 @@ def notify_bot_clients() -> int:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT form_deal_id, telegram_id
+                SELECT form_deal_id, target_deal_id, telegram_id
                   FROM iu_form_merges
                  WHERE bot_notified_at IS NULL
                    AND telegram_id IS NOT NULL
@@ -132,34 +132,57 @@ def notify_bot_clients() -> int:
             if not conversation:
                 raise RuntimeError("Telegram-диалог клиента не найден")
             conversation_id = int(conversation["id"])
+            target_deal_id = int(
+                row.get("target_deal_id")
+                or conversation.get("deal_id")
+                or 0
+            )
             calculator_pending = iu_bot_state.calculator_discussion_pending(
                 list(store.list_messages(conversation_id, limit=500) or [])
             )
+            event = (
+                "calculator_form_received"
+                if calculator_pending
+                else "form_received"
+            )
+            reason = (
+                "Клиент вернулся из калькулятора и заполнил анкету — "
+                "требуется ответ менеджера."
+                if calculator_pending
+                else "Клиент заполнил анкету — требуется ответ менеджера."
+            )
+            metadata = gateway._manager_request_metadata(
+                event,
+                conversation_id,
+                notification_kind="form_completed",
+            )
+            metadata.update(
+                {
+                    "form_deal_id": form_id,
+                    "manager_notification_form_deal_id": target_deal_id,
+                    # После подтверждённой доставки обращение попадёт в очередь
+                    # «Нужен ответ менеджера», но останется под управлением ИИ.
+                    "escalate_after_delivery": True,
+                    "answered_client": True,
+                    "escalation_reason": reason,
+                    **({"calculator_origin": True} if calculator_pending else {}),
+                }
+            )
             if calculator_pending:
-                queued = gateway._reply_and_hand_over(
+                queued = gateway._reply_to_client(
                     conversation_id,
                     iu_client_bot.CALCULATOR_FORM_RECEIVED,
                     idempotency_key=f"iu-form-filled:{form_id}",
-                    event="calculator_form_received",
-                    reason=(
-                        "Клиент вернулся из калькулятора и заполнил анкету — "
-                        "нужно подключиться к диалогу."
-                    ),
-                    reply_markup=iu_client_bot.remove_keyboard(),
-                    metadata={
-                        "form_deal_id": form_id,
-                        "calculator_origin": True,
-                    },
+                    reply_markup=iu_client_bot.main_menu(),
+                    metadata=metadata,
                 )
             else:
-                queued = gateway._reply_and_hand_over(
+                queued = gateway._reply_to_client(
                     conversation_id,
                     iu_client_bot.FORM_RECEIVED,
                     idempotency_key=f"iu-form-filled:{form_id}",
-                    event="form_received",
-                    reason="Клиент заполнил анкету — менеджеру нужно связаться с ним.",
-                    reply_markup=iu_client_bot.remove_keyboard(),
-                    metadata={"form_deal_id": form_id},
+                    reply_markup=iu_client_bot.main_menu(),
+                    metadata=metadata,
                 )
             if not queued:
                 raise RuntimeError("уведомление не удалось поставить в очередь")

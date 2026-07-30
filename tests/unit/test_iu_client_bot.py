@@ -199,6 +199,33 @@ def test_support_entry_sends_faq_and_prompt_as_one_message(monkeypatch):
     assert "keyboard" in store.queued[0]["metadata"]["reply_markup"]
 
 
+def test_free_text_outside_support_always_gets_the_question_hint(monkeypatch):
+    store = FakeStore(control_mode="ai", messages=[])
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message_update("Подскажите, пожалуйста"))
+
+    assert store.ingested[0]["schedule_ai"] is False
+    assert len(store.queued) == 1
+    assert store.queued[0]["text"] == bot.STRICT_QUESTION_HINT
+    assert store.queued[0]["metadata"]["iu_event"] == "strict_question_hint"
+    assert store.transitions == []
+
+
+def test_free_text_does_not_wake_bot_after_a_real_manager_took_over(monkeypatch):
+    store = FakeStore(control_mode="human", messages=[])
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message_update("Менеджер, вы здесь?"))
+
+    assert store.ingested[0]["schedule_ai"] is False
+    assert store.queued == []
+
+
 def test_file_handover_notifies_without_claiming_an_explicit_manager_call(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)

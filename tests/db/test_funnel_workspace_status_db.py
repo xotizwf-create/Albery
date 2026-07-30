@@ -178,6 +178,58 @@ def test_ai_escalation_is_not_recorded_as_an_explicit_client_request():
         _cleanup(source_key)
 
 
+def test_unread_stays_zero_under_ai_and_starts_after_explicit_operator_call():
+    suffix = uuid4().hex[:12]
+    source_key = f"test-unread-owner-{suffix}"
+    chat_id = "700000214"
+    try:
+        store.ensure_source(source_key, source_type="test", display_name="unread owner")
+        first = _ingest(
+            source_key,
+            chat_id,
+            author="client",
+            text="Первое сообщение",
+            message_id=f"{suffix}-1",
+        )
+        conversation_id = int(first["conversation"]["id"])
+        assert int(first["conversation"]["unread_count"]) == 0
+
+        store.flag_needs_human(
+            conversation_id,
+            reason="Менеджеру нужно знать об анкете, но разговор ведёт ИИ.",
+        )
+        second = _ingest(
+            source_key,
+            chat_id,
+            author="client",
+            text="Текст вне режима поддержки",
+            message_id=f"{suffix}-2",
+            schedule_ai=False,
+        )
+        assert second["conversation"]["control_mode"] == "ai"
+        assert int(second["conversation"]["unread_count"]) == 0
+
+        requested = store.mark_waiting_human(
+            conversation_id,
+            expected_version=int(second["conversation"]["state_version"]),
+            reason="Клиент явно позвал оператора.",
+            manager_requested=True,
+            permanent_human=True,
+        )
+        assert requested["control_mode"] == "human"
+        third = _ingest(
+            source_key,
+            chat_id,
+            author="client",
+            text="Сообщение менеджеру",
+            message_id=f"{suffix}-3",
+            schedule_ai=False,
+        )
+        assert int(third["conversation"]["unread_count"]) == 1
+    finally:
+        _cleanup(source_key)
+
+
 def test_closing_question_clears_the_manager_request_badge():
     suffix = uuid4().hex[:12]
     source_key = f"test-manager-close-{suffix}"

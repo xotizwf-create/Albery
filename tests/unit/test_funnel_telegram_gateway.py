@@ -3,11 +3,73 @@ from __future__ import annotations
 # Синхронизация этапа: статус обращения обязан догонять сделку, которую двигают в CRM.
 
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import requests
 
 import funnel_telegram_gateway as gateway
+
+
+def test_ai_worker_count_is_bounded_and_defaults_to_three(monkeypatch):
+    monkeypatch.delenv("FUNNEL_WORKSPACE_AI_WORKERS", raising=False)
+    assert gateway.ai_worker_count() == 3
+
+    monkeypatch.setenv("FUNNEL_WORKSPACE_AI_WORKERS", "30")
+    assert gateway.ai_worker_count() == 3
+
+    monkeypatch.setenv("FUNNEL_WORKSPACE_AI_WORKERS", "broken")
+    assert gateway.ai_worker_count() == 3
+
+
+def test_thirty_independent_ai_jobs_are_processed_in_parallel(monkeypatch):
+    jobs = [{"id": number, "conversation_id": number} for number in range(1, 31)]
+    jobs_lock = threading.Lock()
+    running = 0
+    peak = 0
+    completed: list[int] = []
+    metrics_lock = threading.Lock()
+
+    class FakeStore:
+        def claim_ai_jobs(self, *, worker_id, limit, lease_seconds):
+            del worker_id, lease_seconds
+            assert limit == 1
+            with jobs_lock:
+                return [jobs.pop(0)] if jobs else []
+
+    def process(job, *, worker_id):
+        del worker_id
+        nonlocal running, peak
+        with metrics_lock:
+            running += 1
+            peak = max(peak, running)
+        time.sleep(0.04)
+        with metrics_lock:
+            running -= 1
+            completed.append(int(job["id"]))
+
+    monkeypatch.setattr(gateway, "_store", lambda: FakeStore())
+    monkeypatch.setattr(gateway, "_process_ai_job", process)
+    started = time.monotonic()
+
+    def worker(number: int) -> None:
+        while gateway.process_ai_jobs_once(worker_id=f"load-{number}", limit=1):
+            pass
+
+    threads = [
+        threading.Thread(target=worker, args=(number,))
+        for number in range(3)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2)
+
+    elapsed = time.monotonic() - started
+    assert sorted(completed) == list(range(1, 31))
+    assert peak == 3
+    assert elapsed < 0.65
 
 
 def test_nonempty_malformed_ai_allowlist_fails_closed(monkeypatch):
@@ -1014,6 +1076,56 @@ def test_automatic_ai_escalation_does_not_claim_that_client_called_manager(
         "[URL=https://www.m4s.ru/agent-funnels/311]диалоге[/URL]"
     )
     assert "позвал менеджера" not in calls[0][1]["text"]
+
+
+def test_form_completion_notification_links_crm_form_and_workspace_dialog(
+    monkeypatch,
+):
+    calls = []
+    tg = SimpleNamespace(
+        _terms_already_sent=lambda _telegram_id: True,
+        _mark_terms_sent=lambda _telegram_id: None,
+        _invite_already_sent=lambda _telegram_id: True,
+        _mark_invited=lambda _telegram_id: None,
+        mcp_call=lambda tool, arguments: calls.append((tool, arguments))
+        or {"sent": True},
+    )
+    monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: True)
+    monkeypatch.setenv(
+        "B24_TESTBOT_WEBHOOK_BASE",
+        "https://portal.example/rest/22/secret",
+    )
+    import funnel_workspace
+
+    monkeypatch.setattr(
+        funnel_workspace,
+        "conversation_url",
+        lambda conversation_id: f"https://www.m4s.ru/agent-funnels/{conversation_id}",
+    )
+
+    result = gateway._apply_delivery_effects(
+        {
+            "id": 77,
+            "conversation_id": 311,
+            "action_type": "delivery_effects",
+            "payload": {
+                "author_type": "agent",
+                "notify_manager_after_delivery": True,
+                "manager_notification_kind": "form_completed",
+                "manager_notification_form_deal_id": 284,
+                "manager_notification_client_name": "Александр Никитенко",
+            },
+        }
+    )
+
+    assert result["manager_notified"] is True
+    assert calls[0][1]["text"] == (
+        "Клиент Александр Никитенко "
+        "[URL=https://portal.example/crm/deal/details/284/]Заполнил анкету[/URL]. "
+        "И далее требуется ответ менеджера в "
+        "[URL=https://www.m4s.ru/agent-funnels/311]диалоге[/URL]"
+    )
 
 
 def test_night_delivery_defers_immediate_manager_notification(monkeypatch):
