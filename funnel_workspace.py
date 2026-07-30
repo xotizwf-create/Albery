@@ -93,26 +93,31 @@ def _client_ip() -> str:
 
 
 def _rate_limit_settings() -> tuple[int, int]:
+    """Окно и число попыток до блокировки.
+
+    Единое правило владельца для всех форм пароля Albery (30.07.2026): пять неверных
+    паролей — час блокировки. Раньше здесь было шесть попыток за 15 минут.
+    """
     try:
         window = int(
             os.getenv(
                 "FUNNEL_WORKSPACE_AUTH_RATE_LIMIT_WINDOW_SECONDS",
-                os.getenv("FUNNEL_WORKSPACE_AUTH_WINDOW_SECONDS", "900"),
+                os.getenv("FUNNEL_WORKSPACE_AUTH_WINDOW_SECONDS", "3600"),
             )
-            or "900"
+            or "3600"
         )
     except ValueError:
-        window = 900
+        window = 3600
     try:
         attempts = int(
             os.getenv(
                 "FUNNEL_WORKSPACE_AUTH_RATE_LIMIT_ATTEMPTS",
-                os.getenv("FUNNEL_WORKSPACE_AUTH_ATTEMPTS", "6"),
+                os.getenv("FUNNEL_WORKSPACE_AUTH_ATTEMPTS", "5"),
             )
-            or "6"
+            or "5"
         )
     except ValueError:
-        attempts = 6
+        attempts = 5
     return max(60, min(window, 86_400)), max(2, min(attempts, 100))
 
 
@@ -247,8 +252,27 @@ def _workspace_ai_allowed(conversation: Mapping[str, Any]) -> bool:
     )
 
 
+def admin_session_valid() -> bool:
+    """Действителен ли вход администратора — по правилам самой панели.
+
+    Голого флага в cookie мало: панель дополнительно сверяет отпечаток пароля и возраст
+    входа, и без этой сверки смена ADMIN_PASSWORD_HASH закрывала бы админку, но оставляла
+    бы открытым рабочее окно — то есть всю переписку с клиентами. Импорт ленивый: `app`
+    подключает это окно сам, и модульный импорт замкнул бы круг.
+    """
+    if not session.get("admin_authenticated"):
+        return False
+    try:
+        import app as app_module
+
+        return bool(app_module.authenticated())
+    except Exception:  # noqa: BLE001 — панель недоступна: остаётся вход по паролю окна
+        logger.warning("не удалось проверить сессию администратора", exc_info=True)
+        return False
+
+
 def workspace_authenticated() -> bool:
-    if session.get("admin_authenticated"):
+    if admin_session_valid():
         return True
     if not session.get(SESSION_AUTH_KEY):
         return False
