@@ -148,6 +148,24 @@ def test_manager_takeover_removes_keyboard_without_visible_join_message(monkeypa
     assert "Менеджер подключился" not in queued["text"]
 
 
+def test_closed_manager_question_restores_the_main_menu(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+
+    gateway.restore_client_menu_after_closed_question(5, state_version=9)
+
+    queued = store.queued[0]
+    assert queued["text"] == bot.MENU_PROMPT
+    assert queued["metadata"]["iu_event"] == "manager_question_closed"
+    keyboard = queued["metadata"]["reply_markup"]["keyboard"]
+    assert [row[0]["text"] for row in keyboard] == [
+        bot.BUTTON_TERMS,
+        bot.BUTTON_JOIN,
+        bot.BUTTON_CALCULATOR,
+        bot.BUTTON_ASK,
+    ]
+
+
 def test_terms_button_sends_the_real_terms(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)

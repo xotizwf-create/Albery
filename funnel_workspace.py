@@ -1023,6 +1023,13 @@ def message_create(conversation_id: int) -> tuple[Response, int]:
 def conversation_control(conversation_id: int) -> tuple[Response, int]:
     body = _json_body()
     mode = str(body.get("mode") or "").strip().lower()
+    restore_main_menu = body.get("restore_main_menu") is True
+    if restore_main_menu and mode != "ai":
+        return _error(
+            "Главное меню возвращается только вместе с передачей диалога ИИ.",
+            400,
+            "invalid_menu_restore",
+        )
     if mode == "ai":
         current = store.get_conversation(conversation_id)
         if not _workspace_ai_allowed(current):
@@ -1055,6 +1062,19 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
         import funnel_telegram_gateway
 
         queued = funnel_telegram_gateway.hide_client_menu_for_manager(
+            conversation_id,
+            state_version=int(conversation.get("state_version") or 0),
+        )
+        if queued and isinstance(queued.get("conversation"), dict):
+            conversation = queued["conversation"]
+    elif (
+        mode == "ai"
+        and restore_main_menu
+        and str(conversation.get("source_key") or "") == "telegram_bot"
+    ):
+        import funnel_telegram_gateway
+
+        queued = funnel_telegram_gateway.restore_client_menu_after_closed_question(
             conversation_id,
             state_version=int(conversation.get("state_version") or 0),
         )

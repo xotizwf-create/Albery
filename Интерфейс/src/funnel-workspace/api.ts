@@ -342,6 +342,8 @@ export const funnelWorkspaceApi = {
       mode: "human" | "ai";
       /** Полный перехват: ИИ не вернётся сам, пока оператор не отдаст диалог обратно. */
       permanent?: boolean;
+      /** После «Вопрос закрыт» снова показать клиенту главное меню Telegram. */
+      restore_main_menu?: boolean;
       expected_version: number;
       csrf_token: string;
     },

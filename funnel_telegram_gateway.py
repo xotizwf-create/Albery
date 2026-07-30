@@ -894,6 +894,27 @@ def hide_client_menu_for_manager(
     )
 
 
+def restore_client_menu_after_closed_question(
+    conversation_id: int,
+    *,
+    state_version: int,
+) -> Mapping[str, Any] | None:
+    """Return the main scenario keyboard after a manager closes the question."""
+
+    import iu_client_bot
+
+    return _reply_to_client(
+        conversation_id,
+        iu_client_bot.MENU_PROMPT,
+        idempotency_key=(
+            f"iu-bot:manager-question-closed:{conversation_id}:{state_version}"
+        ),
+        reply_markup=iu_client_bot.main_menu(),
+        metadata={"iu_event": "manager_question_closed"},
+        service=True,
+    )
+
+
 def _send_terms_documents(conversation_id: int, *, idempotency_key: str) -> None:
     import iu_bot_documents
     import iu_client_bot

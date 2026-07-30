@@ -950,6 +950,73 @@ def test_takeover_hides_the_client_reply_keyboard(client, monkeypatch):
     assert hidden == {"conversation_id": 41, "state_version": 4}
 
 
+def test_close_question_restores_the_client_main_menu(client, monkeypatch):
+    import funnel_telegram_gateway
+
+    restored = {}
+
+    def transition(conversation_id, **_kwargs):
+        return {
+            "id": conversation_id,
+            "control_mode": "ai",
+            "resume_at": None,
+            "state_version": 4,
+            "status": "open",
+            "source_key": "telegram_bot",
+            "external_chat_id": "9001",
+            "external_user_id": 9001,
+        }
+
+    def restore(conversation_id, *, state_version):
+        restored.update(conversation_id=conversation_id, state_version=state_version)
+        return {
+            "conversation": {
+                "id": conversation_id,
+                "control_mode": "ai",
+                "resume_at": None,
+                "state_version": 5,
+                "status": "open",
+                "source_key": "telegram_bot",
+                "external_chat_id": "9001",
+                "external_user_id": 9001,
+            }
+        }
+
+    session_payload = login(client)
+    monkeypatch.setattr(
+        workspace.store,
+        "get_conversation",
+        lambda conversation_id: {
+            "id": conversation_id,
+            "source_key": "telegram_bot",
+            "external_user_id": 9001,
+        },
+    )
+    monkeypatch.setattr(workspace, "_workspace_ai_allowed", lambda _row: True)
+    monkeypatch.setattr(workspace.store, "transition_control", transition)
+    monkeypatch.setattr(
+        funnel_telegram_gateway,
+        "restore_client_menu_after_closed_question",
+        restore,
+    )
+    response = client.post(
+        "/api/funnel-workspace/conversations/41/control",
+        json={
+            "mode": "ai",
+            "restore_main_menu": True,
+            "expected_version": 3,
+        },
+        headers={
+            "Origin": ORIGIN,
+            "X-CSRF-Token": session_payload["csrf_token"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert restored == {"conversation_id": 41, "state_version": 4}
+    assert response.get_json()["conversation"]["state_version"] == 5
+
+
 def test_lead_note_is_saved_and_mirrored_to_the_deal(client, monkeypatch):
     """Комментарий по лиду сохраняется у нас и уходит в ленту сделки Битрикса."""
     saved = {}

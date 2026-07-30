@@ -22,6 +22,7 @@ def test_close_question_returns_the_active_dialog_to_ai_instead_of_closing_it():
 
     assert "setConversationControl(" in handler
     assert '"ai"' in handler
+    assert "restoreMainMenu: true" in handler
     assert "loadConversations(true, true)" in handler
     assert "funnelWorkspaceApi.setStatus" not in handler
     assert 'status: "closed"' not in handler

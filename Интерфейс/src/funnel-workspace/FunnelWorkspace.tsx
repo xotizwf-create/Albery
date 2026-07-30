@@ -3195,9 +3195,13 @@ function OperatorWorkspace({
     conversation: Conversation | null,
     mode: "human" | "ai",
     permanent = false,
-    successMessage?: string,
-    force = false,
+    options: {
+      successMessage?: string;
+      force?: boolean;
+      restoreMainMenu?: boolean;
+    } = {},
   ) => {
+    const { successMessage, force = false, restoreMainMenu = false } = options;
     if (!conversation || controlBusy) return false;
     // Полный перехват из режима «человек» — не смена режима, а снятие срока возврата,
     // поэтому одинаковый режим здесь блокировать нельзя.
@@ -3222,6 +3226,7 @@ function OperatorWorkspace({
       await funnelWorkspaceApi.setControl(conversation.id, {
         mode,
         permanent,
+        ...(restoreMainMenu ? { restore_main_menu: true } : {}),
         expected_version: conversation.state_version,
         csrf_token: csrfToken(),
       });
@@ -3257,8 +3262,12 @@ function OperatorWorkspace({
       conversation,
       "ai",
       false,
-      "Вопрос закрыт. Запрос менеджера снят, диалог возвращён ИИ.",
-      true,
+      {
+        successMessage:
+          "Вопрос закрыт. Запрос менеджера снят, диалог возвращён ИИ.",
+        force: true,
+        restoreMainMenu: true,
+      },
     );
     if (returnedToAi) {
       await loadConversations(true, true);
