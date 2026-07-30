@@ -327,11 +327,31 @@ def is_calculator_discussion(text: str) -> bool:
     отправить клиента в строгую подсказку вместо сценария подключения.
     """
 
-    normalized = re.sub(r"\s+", " ", str(text or "")).strip().casefold()
-    return normalized in {
-        CALCULATOR_DISCUSSION_TEXT.casefold(),
-        CALCULATOR_DISCUSSION_LEGACY_TEXT.casefold(),
-    }
+    normalized = _title_key(text)
+    if normalized in {
+        _title_key(CALCULATOR_DISCUSSION_TEXT),
+        _title_key(CALCULATOR_DISCUSSION_LEGACY_TEXT),
+    }:
+        return True
+
+    # Telegram lets the client edit the prepared message before sending it. A typo in the
+    # greeting or removed punctuation must not turn the calculator CTA into free text. Keep
+    # the match deliberately narrow: both business-specific parts must still be present.
+    calculated_iu = any(
+        marker in normalized
+        for marker in (
+            "я рассчитал экономику иу",
+            "я расчитал экономику иу",
+        )
+    )
+    discusses_connection = any(
+        marker in normalized
+        for marker in (
+            "хочу обсудить условия подключения",
+            "хочу обсудить сотрудничество",
+        )
+    )
+    return calculated_iu and discusses_connection
 
 
 def should_offer_operator(agent_replies: int, *, control_mode: str = "ai") -> bool:

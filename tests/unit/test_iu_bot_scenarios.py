@@ -313,4 +313,11 @@ def test_calculator_discussion_state_survives_until_form_confirmation():
 def test_calculator_discussion_accepts_current_and_cached_page_copy():
     assert bot.is_calculator_discussion(bot.CALCULATOR_DISCUSSION_TEXT) is True
     assert bot.is_calculator_discussion(bot.CALCULATOR_DISCUSSION_LEGACY_TEXT) is True
+    assert (
+        bot.is_calculator_discussion(
+            "здравтвуйте я рассчитал экономику ИУ и хочу обсудить "
+            "условия подключения"
+        )
+        is True
+    )
     assert bot.is_calculator_discussion("Хочу просто задать вопрос") is False

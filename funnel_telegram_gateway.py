@@ -733,10 +733,17 @@ LEGACY_REPEAT_JOIN_HANDOFF_REASON = (
     "Клиент повторно открыл подключение к ИУ при уже заполненной анкете — "
     "ему требуется ответ менеджера."
 )
+LEGACY_CALCULATOR_HANDOFF_REASON = (
+    "Клиент вернулся из калькулятора, хочет обсудить условия; анкета заполнена."
+)
 
 
-def _legacy_repeat_join_hold(conversation: Mapping[str, Any]) -> bool:
-    """An unhandled permanent hold created by the removed repeat-join behaviour."""
+def _unhandled_legacy_hold(
+    conversation: Mapping[str, Any],
+    *,
+    reason: str,
+) -> bool:
+    """An unassigned, still-unhandled hold created by a removed bot behaviour."""
 
     if (
         str(conversation.get("source_key") or "") != BOT_SOURCE_KEY
@@ -747,13 +754,29 @@ def _legacy_repeat_join_hold(conversation: Mapping[str, Any]) -> bool:
     metadata = conversation.get("metadata") or {}
     if not isinstance(metadata, Mapping):
         return False
-    if str(metadata.get("manager_request_reason") or "") != (
-        LEGACY_REPEAT_JOIN_HANDOFF_REASON
-    ):
+    if str(metadata.get("manager_request_reason") or "") != reason:
         return False
     requested_at = str(metadata.get("manager_requested_at") or "")
     handled_at = str(metadata.get("manager_request_handled_at") or "")
     return bool(requested_at) and (not handled_at or requested_at > handled_at)
+
+
+def _legacy_repeat_join_hold(conversation: Mapping[str, Any]) -> bool:
+    """An unhandled permanent hold created by the removed repeat-join behaviour."""
+
+    return _unhandled_legacy_hold(
+        conversation,
+        reason=LEGACY_REPEAT_JOIN_HANDOFF_REASON,
+    )
+
+
+def _legacy_calculator_hold(conversation: Mapping[str, Any]) -> bool:
+    """An unhandled permanent hold created by the removed calculator CTA behaviour."""
+
+    return _unhandled_legacy_hold(
+        conversation,
+        reason=LEGACY_CALCULATOR_HANDOFF_REASON,
+    )
 
 
 def _restore_ai_after_service_reply(
@@ -1156,6 +1179,7 @@ def ingest_bot_message(
     previous_messages = _bot_messages(existing_id) if existing_id else []
     previous_support = iu_bot_state.support_state(previous_messages)
     legacy_repeat_join_hold = _legacy_repeat_join_hold(previous_conversation)
+    legacy_calculator_hold = _legacy_calculator_hold(previous_conversation)
     manager_window_open = _manager_notifications_open()
     is_command = text.strip().startswith("/")
     # Пункт меню приходит обычным текстом. Это выбор действия, а не вопрос: отвечает
@@ -1257,14 +1281,17 @@ def ingest_bot_message(
             reply_markup=iu_client_bot.remove_keyboard(),
             metadata={"iu_event": "stop"},
         )
-    elif (
-        calculator_discussion
-        and previous_conversation.get("control_mode") != "human"
-    ):
+    elif calculator_discussion:
         _handle_calculator_discussion(
             conversation_id,
             idempotency_key=f"iu-bot:calculator-discussion:{chat_id}:{external_message_id}",
         )
+        if legacy_calculator_hold:
+            _restore_ai_after_service_reply(
+                conversation_id,
+                None,
+                reason="Снят старый автоматический handoff сообщения из калькулятора.",
+            )
     elif action:
         run_menu_action(
             action,
@@ -1472,54 +1499,14 @@ def _handle_calculator_discussion(
     *,
     idempotency_key: str,
 ) -> None:
-    """Continue calculator conversion in the bot, gated by the live CRM form state."""
+    """Treat the prepared calculator CTA exactly like «Присоединиться к ИУ»."""
 
-    import iu_bot_state
     import iu_client_bot
 
-    messages = _bot_messages(conversation_id)
-    repeated = (
-        iu_bot_state.action_count(messages, iu_client_bot.BUTTON_JOIN) > 0
-        or iu_bot_state.calculator_discussion_pending(messages)
-    )
-    body, form_filled = _join_body(conversation_id, repeated=repeated)
-    if form_filled:
-        _reply_and_hand_over(
-            conversation_id,
-            iu_client_bot.CALCULATOR_MANAGER_READY,
-            idempotency_key=idempotency_key,
-            event="calculator_discussion_filled",
-            reason=(
-                "Клиент вернулся из калькулятора, хочет обсудить условия; анкета заполнена."
-            ),
-            manager_requested=True,
-            reply_markup=iu_client_bot.remove_keyboard(),
-            metadata={"calculator_origin": True},
-        )
-        return
-    if body == iu_client_bot.JOIN_STUB:
-        _reply_and_hand_over(
-            conversation_id,
-            body,
-            idempotency_key=idempotency_key,
-            event="calculator_discussion_unavailable",
-            reason=(
-                "Клиент вернулся из калькулятора, но персональную ссылку на анкету "
-                "не удалось подготовить."
-            ),
-            reply_markup=iu_client_bot.remove_keyboard(),
-            metadata={"calculator_origin": True},
-        )
-        return
-    _reply_to_client(
-        conversation_id,
-        body,
+    run_menu_action(
+        iu_client_bot.CB_JOIN,
+        conversation_id=conversation_id,
         idempotency_key=idempotency_key,
-        reply_markup=iu_client_bot.main_menu(),
-        metadata={
-            "iu_event": "calculator_discussion_unfilled",
-            "calculator_origin": True,
-        },
     )
 
 

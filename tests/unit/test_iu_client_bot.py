@@ -297,8 +297,8 @@ def test_file_handover_notifies_without_claiming_an_explicit_manager_call(monkey
     assert store.transitions[0]["permanent_human"] is True
 
 
-def test_calculator_message_requests_form_without_starting_ai(monkeypatch):
-    store = FakeStore()
+def test_calculator_message_uses_join_form_even_while_dialog_is_human(monkeypatch):
+    store = FakeStore(control_mode="human")
     monkeypatch.setattr(gateway, "_store", lambda: store)
     monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
     monkeypatch.setattr(
@@ -315,12 +315,14 @@ def test_calculator_message_requests_form_without_starting_ai(monkeypatch):
 
     assert store.ingested[0]["schedule_ai"] is False
     assert "https://www.m4s.ru/iu/personal" in store.queued[0]["text"]
-    assert store.queued[0]["metadata"]["iu_event"] == "calculator_discussion_unfilled"
+    assert store.queued[0]["metadata"]["iu_event"] == "join_unfilled"
     assert store.transitions == []
 
 
-def test_calculator_message_with_filled_form_calls_manager(monkeypatch):
-    store = FakeStore()
+def test_calculator_message_with_filled_form_shows_join_choices_without_handover(
+    monkeypatch,
+):
+    store = FakeStore(control_mode="human")
     monkeypatch.setattr(gateway, "_store", lambda: store)
     monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
     monkeypatch.setattr(gateway, "_join_body", lambda *_a, **_k: ("filled", True))
@@ -328,11 +330,12 @@ def test_calculator_message_with_filled_form_calls_manager(monkeypatch):
 
     gateway.route_captured_update(_message_update(bot.CALCULATOR_DISCUSSION_TEXT))
 
-    assert store.queued[0]["text"] == bot.CALCULATOR_MANAGER_READY
-    assert store.queued[0]["metadata"]["notify_manager_after_delivery"] is True
-    assert store.queued[0]["metadata"]["iu_event"] == "calculator_discussion_filled"
-    assert store.transitions[0]["manager_requested"] is True
-    assert store.queued[0]["metadata"]["manager_notification_kind"] == "client_called"
+    assert store.queued[0]["text"] == "filled"
+    assert store.queued[0]["metadata"]["iu_event"] == "join_filled"
+    assert store.queued[0]["metadata"]["join_filled_choice_pending"] is True
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.join_filled_menu()
+    assert "notify_manager_after_delivery" not in store.queued[0]["metadata"]
+    assert store.transitions == []
 
 
 def _pending_form_message(*, calculator_origin=False):
@@ -487,6 +490,14 @@ def _legacy_repeat_join_metadata():
     }
 
 
+def _legacy_calculator_metadata():
+    return {
+        "manager_requested_at": "2026-07-30T19:55:38+00:00",
+        "manager_request_reason": gateway.LEGACY_CALCULATOR_HANDOFF_REASON,
+        "manager_request_handled_at": "2026-07-30T19:21:27+00:00",
+    }
+
+
 def test_legacy_hold_detector_does_not_override_a_handled_or_assigned_dialog():
     base = {
         "source_key": "telegram_bot",
@@ -506,6 +517,28 @@ def test_legacy_hold_detector_does_not_override_a_handled_or_assigned_dialog():
     assigned = {**base, "assigned_to": "Александр"}
     assert gateway._legacy_repeat_join_hold(handled) is False
     assert gateway._legacy_repeat_join_hold(assigned) is False
+
+
+def test_calculator_cta_recovers_its_old_unassigned_hold_after_join_reply(
+    monkeypatch,
+):
+    store = FakeStore(
+        control_mode="human",
+        metadata=_legacy_calculator_metadata(),
+    )
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    monkeypatch.setattr(gateway, "_join_body", lambda *_a, **_k: ("filled", True))
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message_update(bot.CALCULATOR_DISCUSSION_TEXT))
+
+    assert store.queued[0]["text"] == "filled"
+    assert store.queued[0]["metadata"]["iu_event"] == "join_filled"
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.join_filled_menu()
+    assert store.transitions[0]["kind"] == "control"
+    assert store.transitions[0]["mode"] == "ai"
+    assert "калькулятора" in store.transitions[0]["reason"]
 
 
 def test_legacy_repeat_join_hold_gets_hint_and_returns_to_ai(monkeypatch):
