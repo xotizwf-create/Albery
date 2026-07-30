@@ -33,6 +33,7 @@ from psycopg.types.json import Jsonb
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash
 
+from auth_lockout import admin_lockout
 from shared.db import connect as pg_connection, database_url, normalize_postgres_url as shared_normalize_postgres_url
 from utils import (  # noqa: F401 — re-exported; moved verbatim out of app.py 2026-07-02
     STATUS_LABELS,
@@ -16138,6 +16139,16 @@ def generate_ai_chat_report(dialog_id: str, target_date: date, force: bool = Fal
 _INSECURE_SESSION_SECRET = "change-this-secret"
 
 
+def auth_session_days() -> int:
+    """Сколько дней живёт вход администратора (границы — от суток до 90)."""
+
+    try:
+        days = int(os.getenv("AUTH_SESSION_DAYS", "30") or "30")
+    except ValueError:
+        days = 30
+    return min(90, max(1, days))
+
+
 def session_signing_secret() -> str:
     """Use the configured key or an unguessable, process-local fallback."""
 
@@ -16153,11 +16164,14 @@ def session_signing_secret() -> str:
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = session_signing_secret()
-app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=int(os.getenv("AUTH_SESSION_DAYS", "30") or "30"))
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=auth_session_days())
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = os.getenv("SESSION_COOKIE_SAMESITE", "Lax")
-session_cookie_secure_default = "1" if os.getenv("CANONICAL_WEB_HOST", "").strip() else "0"
-app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", session_cookie_secure_default).strip().lower() not in {"0", "false", "no"}
+# Cookie сессии уходит только по HTTPS. Раньше признак включался лишь при заданном
+# CANONICAL_WEB_HOST — на проде он не задан, и cookie администратора уходила бы открытым
+# текстом при первом же обращении по http:// (до 301 на https). Признак снимается только
+# явным SESSION_COOKIE_SECURE=0 — это для локальной разработки без сертификата.
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "1").strip().lower() not in {"0", "false", "no"}
 app.jinja_env.filters["dt_ru"] = format_datetime_ru
 if os.getenv("MCP_ALLOW_UNAUTHENTICATED", "").strip() == "1":
     app.logger.warning("MCP_ALLOW_UNAUTHENTICATED=1 is enabled; MCP endpoints are open without a shared secret.")
@@ -16185,7 +16199,6 @@ def handle_unhandled_exception(exc: Exception):
 
 
 MCP_SSE_SESSIONS: dict[str, Queue[str]] = {}
-LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 AUTH_EXEMPT_ROUTES = frozenset({
     "/login",
     "/logout",
@@ -16242,25 +16255,57 @@ def request_client_ip() -> str:
     return request.remote_addr or "unknown"
 
 
-def login_rate_limited(client_ip: str) -> bool:
-    window_seconds = int(os.getenv("AUTH_RATE_LIMIT_WINDOW_SECONDS", "900") or "900")
-    max_attempts = int(os.getenv("AUTH_RATE_LIMIT_ATTEMPTS", "6") or "6")
-    now = time.time()
-    attempts = [ts for ts in LOGIN_ATTEMPTS.get(client_ip, []) if now - ts < window_seconds]
-    LOGIN_ATTEMPTS[client_ip] = attempts
-    return len(attempts) >= max_attempts
+def login_rate_limited(client_ip: str) -> tuple[bool, int]:
+    """(заблокирован ли адрес, сколько секунд до разблокировки).
+
+    По умолчанию: 5 неверных паролей — час блокировки. Счётчик общий и переживает
+    перезапуск сервиса, подробности — в `auth_lockout.py`.
+    """
+
+    return admin_lockout.check(client_ip)
 
 
 def record_failed_login(client_ip: str) -> None:
-    LOGIN_ATTEMPTS.setdefault(client_ip, []).append(time.time())
+    admin_lockout.record_failure(client_ip)
 
 
 def clear_failed_logins(client_ip: str) -> None:
-    LOGIN_ATTEMPTS.pop(client_ip, None)
+    admin_lockout.clear(client_ip)
+
+
+def admin_password_fingerprint() -> str:
+    """Отпечаток действующего пароля — им помечается выданная сессия."""
+
+    configured = configured_admin_password_hash()
+    if not configured:
+        return ""
+    return hashlib.sha256(configured.encode("utf-8")).hexdigest()
 
 
 def authenticated() -> bool:
-    return bool(session.get("admin_authenticated"))
+    """Действителен ли вход администратора прямо сейчас.
+
+    Проверяется не только флаг в cookie, но и две вещи, без которых смена пароля не
+    закрывала бы доступ: отпечаток пароля, под которым выдавалась сессия (сменили
+    ADMIN_PASSWORD_HASH — все прежние cookie мертвы), и возраст входа (cookie Flask
+    продлевается при каждом запросе, поэтому абсолютный срок считается отдельно).
+    """
+
+    if not session.get("admin_authenticated"):
+        return False
+    expected_fingerprint = admin_password_fingerprint()
+    session_fingerprint = str(session.get("admin_password_fingerprint") or "")
+    if not expected_fingerprint or not hmac.compare_digest(expected_fingerprint, session_fingerprint):
+        session.clear()
+        return False
+    try:
+        authenticated_at = float(session.get("admin_authenticated_at") or 0)
+    except (TypeError, ValueError):
+        authenticated_at = 0.0
+    if authenticated_at <= 0 or time.time() - authenticated_at > auth_session_days() * 86_400:
+        session.clear()
+        return False
+    return True
 
 
 def auth_exempt_path(path: str) -> bool:
@@ -16450,18 +16495,30 @@ def login_submit():
     password_hash = configured_admin_password_hash()
     if not password_hash:
         return Response(login_page("ADMIN_PASSWORD_HASH не задан в .env."), status=503, mimetype="text/html")
-    if login_rate_limited(client_ip):
-        return Response(login_page("Слишком много попыток входа. Повторите позже."), status=429, mimetype="text/html")
+    limited, retry_after = login_rate_limited(client_ip)
+    if limited:
+        minutes = max(1, (retry_after + 59) // 60)
+        logging.getLogger(__name__).warning("вход в панель заблокирован для %s ещё %s с", client_ip, retry_after)
+        response = Response(
+            login_page(f"Слишком много неверных попыток. Вход с этого адреса закрыт ещё на {minutes} мин."),
+            status=429,
+            mimetype="text/html",
+        )
+        response.headers["Retry-After"] = str(retry_after)
+        return response
 
     password = request.form.get("password", "")
     if not check_password_hash(password_hash, password):
         record_failed_login(client_ip)
+        logging.getLogger(__name__).warning("неверный пароль в панель с %s", client_ip)
         return Response(login_page("Неверный пароль."), status=401, mimetype="text/html")
 
     clear_failed_logins(client_ip)
     session.clear()
     session.permanent = True
     session["admin_authenticated"] = True
+    session["admin_password_fingerprint"] = admin_password_fingerprint()
+    session["admin_authenticated_at"] = time.time()
     safe_next_url = next_url if next_url.startswith("/") and not next_url.startswith("//") else "/main"
     return redirect(safe_next_url, code=302)
 
