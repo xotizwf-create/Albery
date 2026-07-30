@@ -2468,7 +2468,9 @@ def agent_center_agent_config_save(slug: str):
     pool = _agent_allowed_pool(agent)
     fixed = MANDATORY_AGENT_TOOLS & pool
     # Tools: keep only real registry names; the mandatory baseline is always included.
-    requested_tools = {str(t) for t in (body.get("tools") or []) if str(t)}
+    # Замыкание применяется и при сохранении, чтобы в карточке агента был виден тот же набор,
+    # который реально отдаёт коннектор (иначе галочки и поведение расходятся).
+    requested_tools = _with_companion_tools({str(t) for t in (body.get("tools") or []) if str(t)})
     enabled_tools = sorted((requested_tools & pool) | fixed)
     # Only OPTIONAL instructions are per-agent connections; universal ones are always
     # on and never stored in a manifest. Keep the manifest to real, meaningful links.
@@ -2635,6 +2637,27 @@ MANDATORY_AGENT_TOOLS: set[str] = {
     "search_company_knowledge",
 }
 
+# Инструмент, который создаёт объект, бесполезен без инструментов, которые его читают и меняют:
+# агент делает половину работы и объясняет остаток как отсутствие возможности. Именно так вышло
+# 30.07.2026 — read/edit Google-документов уже были в реестре, в CORE и в OPS, но замороженные
+# белые списки пяти агентов собирались раньше, поэтому tools/list их не отдавал, и агент отвечал
+# «в текущем наборе нет действия для записи изменений». Замыкание применяется к белому списку ДО
+# пересечения с разрешённым пулом, поэтому кап манифеста строгих клиентских агентов оно не обходит.
+_TOOL_COMPANIONS: dict[str, tuple[str, ...]] = {
+    "create_google_doc": ("read_google_doc", "edit_google_doc"),
+    "create_google_sheet": ("get_google_sheet_meta", "read_google_sheet_values",
+                            "write_google_sheet_values"),
+}
+
+
+def _with_companion_tools(names: set[str]) -> set[str]:
+    """Добавить к набору инструменты чтения и изменения для тех объектов, которые он умеет создавать."""
+    closed = set(names)
+    for trigger, companions in _TOOL_COMPANIONS.items():
+        if trigger in closed:
+            closed.update(companions)
+    return closed
+
 
 def _agent_manifest_tool_cap(agent: dict[str, Any]) -> set[str] | None:
     """Versioned connector cap, or ``None`` for a legacy uncapped manifest."""
@@ -2687,7 +2710,7 @@ def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
     pool = _agent_allowed_pool(agent)
     fixed = MANDATORY_AGENT_TOOLS & pool
     if agent.get("tools_customized"):
-        whitelist = {t for t in (agent.get("tools") or []) if t}
+        whitelist = _with_companion_tools({t for t in (agent.get("tools") or []) if t})
         if _agent_manifest_tool_cap(agent) is not None:
             return whitelist & pool
         return fixed | (whitelist & pool)
