@@ -249,6 +249,29 @@ def test_session_older_than_the_limit_is_refused(client, admin_env, monkeypatch)
     assert "/login" in response.headers.get("Location", "")
 
 
+def test_stale_admin_cookie_does_not_open_the_operator_workspace(admin_env, monkeypatch):
+    """Смена пароля закрывает и рабочее окно операторов, а не только админку.
+
+    Рабочее окно — отдельная область входа, и раньше оно верило голому флагу в cookie:
+    после смены ADMIN_PASSWORD_HASH админка закрывалась, а вся переписка с клиентами
+    оставалась доступной по той же украденной cookie.
+    """
+    import funnel_workspace
+
+    import app as app_module
+
+    with app_module.app.test_request_context("/api/funnel-workspace/conversations"):
+        from flask import session as flask_session
+
+        flask_session["admin_authenticated"] = True
+        flask_session["admin_password_fingerprint"] = "отпечаток-старого-пароля"
+        flask_session["admin_authenticated_at"] = time.time()
+
+        monkeypatch.setenv("ADMIN_PASSWORD_HASH", generate_password_hash("новый-пароль"))
+        assert not funnel_workspace.admin_session_valid()
+        assert not funnel_workspace.workspace_authenticated()
+
+
 def test_session_without_a_password_fingerprint_is_refused(client, admin_env):
     """Cookie, выданная до этой правки (без отпечатка), не считается входом."""
     with client.session_transaction() as session_data:

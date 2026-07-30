@@ -310,7 +310,7 @@ def workspace_operator_name() -> str:
             configured_operator_name()
             or str(session.get(SESSION_OPERATOR_KEY) or "Оператор")
         )
-    if session.get("admin_authenticated"):
+    if admin_session_valid():
         return str(session.get("admin_name") or "Администратор")
     return ""
 
@@ -418,7 +418,7 @@ def workspace_request_gate() -> tuple[Response, int] | None:
         # Logout must remain possible while the traffic feature flag is off.
         return None
     if request.path == f"{API_PREFIX}/configure-password":
-        if not session.get("admin_authenticated"):
+        if not admin_session_valid():
             return _error(
                 "Настроить отдельный пароль может только администратор.",
                 403,
@@ -507,11 +507,11 @@ def _session_payload() -> dict[str, Any]:
     payload: dict[str, Any] = {
         "authenticated": authenticated,
         "operator_name": workspace_operator_name() if authenticated else None,
-        "admin_session": bool(session.get("admin_authenticated")),
+        "admin_session": admin_session_valid(),
         "workspace_enabled": store.enabled(),
         "configured": bool(_configured_password_hash()),
         "can_configure": bool(
-            session.get("admin_authenticated")
+            admin_session_valid()
             and not _password_managed_by_environment()
         ),
         "configured_operator_name": configured_operator_name(),
@@ -533,7 +533,7 @@ def get_workspace_session() -> tuple[Response, int]:
 
 @funnel_workspace_bp.post(f"{API_PREFIX}/session")
 def create_workspace_session() -> tuple[Response, int]:
-    if session.get("admin_authenticated"):
+    if admin_session_valid():
         return _json(_session_payload())
     if request.content_length is not None and request.content_length > 16_384:
         return _error("Запрос входа слишком большой.", 413, "request_too_large")
