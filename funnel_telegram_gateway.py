@@ -779,6 +779,15 @@ def _legacy_calculator_hold(conversation: Mapping[str, Any]) -> bool:
     )
 
 
+def _explicit_manager_dialog_active(conversation: Mapping[str, Any]) -> bool:
+    """Whether the client explicitly handed this bot dialog to a manager."""
+
+    if str(conversation.get("control_mode") or "") != "human":
+        return False
+    metadata = conversation.get("metadata") or {}
+    return isinstance(metadata, Mapping) and bool(metadata.get("manager_requested_at"))
+
+
 def _restore_ai_after_service_reply(
     conversation_id: int,
     queued: Mapping[str, Any] | None,
@@ -943,11 +952,12 @@ def _reply_and_hand_over(
                 "after_hours": True,
             }
         )
-        text = iu_manager_response_watch.AFTER_HOURS_CLIENT_REPLY
-        idempotency_key = iu_manager_response_watch.after_hours_period_key(
-            conversation_id
-        )
-        reply_options["reply_markup"] = iu_client_bot.remove_keyboard()
+        if manager_requested:
+            text = iu_manager_response_watch.AFTER_HOURS_CLIENT_REPLY
+            idempotency_key = iu_manager_response_watch.after_hours_period_key(
+                conversation_id
+            )
+            reply_options["reply_markup"] = iu_client_bot.remove_keyboard()
     queued = _reply_to_client(
         conversation_id,
         text,
@@ -966,12 +976,21 @@ def _reply_and_hand_over(
         duplicate_already_handed_over = (
             str(current_conversation.get("control_mode") or "") == "human"
         )
-    if not duplicate_already_handed_over:
+    if manager_requested and not duplicate_already_handed_over:
         _hand_over_to_human(
             conversation_id,
             reason,
             manager_requested=manager_requested,
         )
+    elif not manager_requested:
+        try:
+            _store().flag_needs_human(conversation_id, reason=reason)
+        except Exception as exc:  # noqa: BLE001 - уведомление уже стоит в durable outbox
+            log.warning(
+                "iu client bot: non-blocking manager flag failed for %s: %s",
+                conversation_id,
+                _safe_error(exc),
+            )
     return queued
 
 
@@ -1180,7 +1199,7 @@ def ingest_bot_message(
     previous_support = iu_bot_state.support_state(previous_messages)
     legacy_repeat_join_hold = _legacy_repeat_join_hold(previous_conversation)
     legacy_calculator_hold = _legacy_calculator_hold(previous_conversation)
-    manager_window_open = _manager_notifications_open()
+    explicit_manager_dialog = _explicit_manager_dialog_active(previous_conversation)
     is_command = text.strip().startswith("/")
     # Пункт меню приходит обычным текстом. Это выбор действия, а не вопрос: отвечает
     # сценарий, модель не вызывается вовсе.
@@ -1201,7 +1220,6 @@ def ingest_bot_message(
     if schedule_ai is None:
         schedule_ai = (
             iu_client_bot.ai_answers_enabled()
-            and manager_window_open
             and not is_command
             and not action
             and not calculator_discussion
@@ -1250,28 +1268,56 @@ def ingest_bot_message(
     if command == "/start":
         queued = _reply_to_client(
             conversation_id,
-            iu_client_bot.WELCOME if not previous_messages else iu_client_bot.WELCOME_BACK,
+            (
+                iu_client_bot.MANAGER_DIALOG_CANCELLED
+                if explicit_manager_dialog
+                else (
+                    iu_client_bot.WELCOME
+                    if not previous_messages
+                    else iu_client_bot.WELCOME_BACK
+                )
+            ),
             idempotency_key=f"iu-bot:start:{chat_id}:{external_message_id}",
             reply_markup=iu_client_bot.main_menu(),
-            metadata={"iu_event": "start"},
+            metadata={
+                "iu_event": (
+                    "manager_dialog_cancelled" if explicit_manager_dialog else "start"
+                )
+            },
         )
         _restore_ai_after_service_reply(
             conversation_id,
             queued,
-            reason="Клиент перезапустил сценарий командой /start.",
+            reason=(
+                "Клиент отменил ожидание менеджера командой /start."
+                if explicit_manager_dialog
+                else "Клиент перезапустил сценарий командой /start."
+            ),
         )
     elif command == "/menu":
         queued = _reply_to_client(
             conversation_id,
-            iu_client_bot.MENU_PROMPT,
+            (
+                iu_client_bot.MANAGER_DIALOG_CANCELLED
+                if explicit_manager_dialog
+                else iu_client_bot.MENU_PROMPT
+            ),
             idempotency_key=f"iu-bot:menu-command:{chat_id}:{external_message_id}",
             reply_markup=iu_client_bot.main_menu(),
-            metadata={"iu_event": "menu"},
+            metadata={
+                "iu_event": (
+                    "manager_dialog_cancelled" if explicit_manager_dialog else "menu"
+                )
+            },
         )
         _restore_ai_after_service_reply(
             conversation_id,
             queued,
-            reason="Клиент вернулся в главное меню командой /menu.",
+            reason=(
+                "Клиент отменил ожидание менеджера и вернулся в главное меню."
+                if explicit_manager_dialog
+                else "Клиент вернулся в главное меню командой /menu."
+            ),
         )
     elif command == "/stop":
         _reply_to_client(
@@ -1298,50 +1344,6 @@ def ingest_bot_message(
             conversation_id=conversation_id,
             idempotency_key=f"iu-bot:menu:{chat_id}:{external_message_id}",
         )
-    elif (
-        not manager_window_open
-        and not iu_bot_state.bot_stopped(previous_messages)
-    ):
-        import iu_manager_response_watch
-
-        queued = _reply_and_hand_over(
-            conversation_id,
-            iu_manager_response_watch.AFTER_HOURS_CLIENT_REPLY,
-            idempotency_key=iu_manager_response_watch.after_hours_period_key(
-                conversation_id
-            ),
-            event="manager_after_hours",
-            reason=(
-                "Клиент написал вне рабочего окна менеджеров ИУ "
-                "(09:00–18:00 МСК)."
-            ),
-            metadata={
-                "manager_notification_deferred": True,
-                "after_hours": True,
-            },
-            reply_markup=iu_client_bot.remove_keyboard(),
-        )
-        if not queued or bool(queued.get("duplicate")):
-            fallback = _reply_to_client(
-                conversation_id,
-                iu_client_bot.STRICT_QUESTION_HINT,
-                idempotency_key=(
-                    f"iu-bot:after-hours-hint:{chat_id}:{external_message_id}"
-                ),
-                reply_markup=iu_client_bot.main_menu(),
-                metadata={
-                    "iu_event": "strict_question_hint",
-                    "after_hours_fallback": True,
-                },
-            )
-            if legacy_repeat_join_hold:
-                _restore_ai_after_service_reply(
-                    conversation_id,
-                    fallback,
-                    reason=(
-                        "Снят старый автоматический handoff повторного открытия анкеты."
-                    ),
-                )
     elif (
         media_type != "text"
         and not has_media_caption
@@ -1384,6 +1386,7 @@ def ingest_bot_message(
         and previous_conversation.get("control_mode") != "human"
         and not iu_bot_state.bot_stopped(previous_messages)
     ):
+        current_support = iu_bot_state.support_state(all_messages)
         _reply_and_hand_over(
             conversation_id,
             iu_client_bot.FILE_SENT_TO_MANAGER,
@@ -1392,7 +1395,15 @@ def ingest_bot_message(
             reason=(
                 "Клиент прислал файл с пояснением — требуется ручной разбор содержимого."
             ),
-            reply_markup=iu_client_bot.remove_keyboard(),
+            reply_markup=(
+                iu_client_bot.support_menu(
+                    offer_operator=iu_client_bot.should_offer_operator(
+                        iu_bot_state.support_agent_replies(all_messages)
+                    )
+                )
+                if current_support.mode in {"active", "quiet"}
+                else iu_client_bot.main_menu()
+            ),
         )
     elif (
         not schedule_ai
@@ -1702,20 +1713,34 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
             },
         )
     elif action == iu_client_bot.CB_JOIN_MENU:
+        conversation = _store().get_conversation(conversation_id) or {}
+        manager_dialog = _explicit_manager_dialog_active(conversation)
         queued = _reply_to_client(
             conversation_id,
-            iu_client_bot.MENU_PROMPT,
+            (
+                iu_client_bot.MANAGER_DIALOG_CANCELLED
+                if manager_dialog
+                else iu_client_bot.MENU_PROMPT
+            ),
             idempotency_key=idempotency_key,
             reply_markup=iu_client_bot.main_menu(),
             metadata={
-                "iu_event": "join_filled_menu",
+                "iu_event": (
+                    "manager_dialog_cancelled"
+                    if manager_dialog
+                    else "join_filled_menu"
+                ),
                 "join_filled_choice": "menu",
             },
         )
         _restore_ai_after_service_reply(
             conversation_id,
             queued,
-            reason="Клиент выбрал возврат из анкеты в главное меню.",
+            reason=(
+                "Клиент отменил ожидание менеджера и вернулся в главное меню."
+                if manager_dialog
+                else "Клиент выбрал возврат из анкеты в главное меню."
+            ),
         )
 
 
@@ -2965,11 +2990,11 @@ def _after_delivery(
                 if result == "unknown"
                 else "Ответ ИИ не доставлен."
             )
-        # Клиент получил ответ по существу, а без ответа осталась только часть вопроса —
-        # разговор у ИИ не забираем: обращение поднимается в очередь оператора, но клиент
-        # может спрашивать дальше и получать ответы. Полная передача остаётся там, где
-        # агент не ответил вовсе или ответ не доставлен.
-        if result == "sent" and payload.get("answered_client"):
+        # Клиентский бот остаётся у ИИ при любой автоматической эскалации. Только явное
+        # действие клиента «Позвать менеджера» переводит его в human; сбой/неуверенность
+        # поднимают обращение в очередь, не ломая следующий ход.
+        bot_dialog = str(outbox.get("source_key") or "") == BOT_SOURCE_KEY
+        if bot_dialog or (result == "sent" and payload.get("answered_client")):
             try:
                 _store().flag_needs_human(conversation_id, reason=reason)
             except Exception as exc:  # noqa: BLE001 — пометка не важнее уже доставленного ответа
@@ -3221,9 +3246,25 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
             payload.get("escalation_reason")
             or "После доставленного ответа ИИ нужен ответ человека."
         )
-        # Ответ по существу клиент получил, без ответа осталась часть вопроса — обращение
-        # поднимается в очередь оператора, но разговор остаётся у ИИ (владелец, 28.07.2026).
-        if payload.get("answered_client"):
+        # В клиентском боте автоматическая эскалация не меняет исполнителя: разговор
+        # прекращает вести ИИ только после явного вызова менеджера клиентом.
+        source_key = str(payload.get("source_key") or "")
+        if not source_key:
+            # Совместимость с delivery actions, созданными до сохранения source_key:
+            # после выкладки очередь может ещё содержать старую строку.
+            try:
+                conversation = (
+                    _store().get_conversation(int(action["conversation_id"])) or {}
+                )
+                source_key = str(conversation.get("source_key") or "")
+            except Exception as exc:  # noqa: BLE001 - старый generic-путь остаётся безопасным
+                log.warning(
+                    "workspace delivery action %s source lookup failed: %s",
+                    action.get("id"),
+                    _safe_error(exc),
+                )
+        bot_dialog = source_key == BOT_SOURCE_KEY
+        if bot_dialog or payload.get("answered_client"):
             try:
                 _store().flag_needs_human(int(action["conversation_id"]), reason=reason)
             except Exception as exc:  # noqa: BLE001 — пометка не важнее доставленного ответа

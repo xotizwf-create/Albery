@@ -4284,6 +4284,7 @@ def _enqueue_delivery_effect_action_cursor(
     idempotency_key = f"delivery-effects:outbox:{outbox_id}"
     action_payload = {
         "trigger": "telegram_delivery",
+        "source_key": str(outbox.get("source_key") or ""),
         "asset": asset if asset in {"terms", "form"} else "",
         "telegram_id": _clean_optional(outbox.get("external_chat_id"), 200),
         "author_type": str(outbox.get("author_type") or ""),

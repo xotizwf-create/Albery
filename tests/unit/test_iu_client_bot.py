@@ -30,6 +30,7 @@ class FakeStore:
         self.ingested: list[dict] = []
         self.queued: list[dict] = []
         self.transitions: list[dict] = []
+        self.human_flags: list[dict] = []
         self.agent_replies = agent_replies
         self.control_mode = control_mode
         self.messages = list(messages or [])
@@ -66,6 +67,10 @@ class FakeStore:
     def mark_waiting_human(self, conversation_id, **kwargs):
         self.transitions.append({"conversation_id": conversation_id, **kwargs})
         return {"conversation": {"id": conversation_id, "status": "waiting"}}
+
+    def flag_needs_human(self, conversation_id, **kwargs):
+        self.human_flags.append({"conversation_id": conversation_id, **kwargs})
+        return self.get_conversation(conversation_id)
 
     def transition_control(self, conversation_id, **kwargs):
         self.transitions.append(
@@ -114,12 +119,25 @@ def _callback_update(data):
     }
 
 
-def _message_update(text: str = "", *, document: dict | None = None, caption: str = ""):
+def _message_update(
+    text: str = "",
+    *,
+    document: dict | None = None,
+    caption: str = "",
+    message_id: int = 3,
+    first_name: str = "Пётр",
+    last_name: str = "",
+):
     message = {
-        "message_id": 3,
+        "message_id": message_id,
         "date": 1785600200,
         "chat": {"id": 555, "type": "private"},
-        "from": {"id": 555, "first_name": "Пётр", "username": "petr"},
+        "from": {
+            "id": 555,
+            "first_name": first_name,
+            "last_name": last_name,
+            "username": "petr",
+        },
     }
     if text:
         message["text"] = text
@@ -293,8 +311,40 @@ def test_file_handover_notifies_without_claiming_an_explicit_manager_call(monkey
     assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
     assert store.queued[0]["metadata"]["manager_notification_client_name"] == "Пётр Иванов"
     assert store.queued[0]["metadata"]["manager_notification_kind"] == "manager_needed"
-    assert store.transitions[0]["manager_requested"] is False
-    assert store.transitions[0]["permanent_human"] is True
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.main_menu()
+    assert store.transitions == []
+    assert store.human_flags == [
+        {
+            "conversation_id": 5,
+            "reason": "Клиент прислал файл с пояснением — требуется ручной разбор содержимого.",
+        }
+    ]
+
+
+def test_after_hours_file_review_keeps_menu_and_ai_control(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: False)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(
+        _message_update(
+            document={
+                "file_id": "document-id",
+                "file_unique_id": "document-unique",
+                "file_name": "договор.pdf",
+                "mime_type": "application/pdf",
+            },
+            caption="Проверьте, пожалуйста, пункт про комиссию.",
+        )
+    )
+
+    assert store.queued[0]["text"] == bot.FILE_SENT_TO_MANAGER
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.main_menu()
+    assert store.queued[0]["metadata"]["manager_notification_deferred"] is True
+    assert store.transitions == []
+    assert store.human_flags
 
 
 def test_calculator_message_uses_join_form_even_while_dialog_is_human(monkeypatch):
@@ -559,34 +609,16 @@ def test_legacy_repeat_join_hold_gets_hint_and_returns_to_ai(monkeypatch):
     assert store.transitions[0]["mode"] == "ai"
 
 
-def test_repeated_after_hours_message_falls_back_to_hint_instead_of_silence(
+def test_legacy_hold_after_hours_gets_hint_and_returns_to_ai(
     monkeypatch,
 ):
-    import iu_manager_response_watch as watch
-
-    class DuplicateNightStore(FakeStore):
-        def enqueue_outgoing_agent(self, conversation_id, **kwargs):
-            if str(kwargs.get("idempotency_key") or "").startswith("night:"):
-                return {
-                    "duplicate": True,
-                    "conversation": self.get_conversation(conversation_id),
-                    "message": {"id": 10},
-                    "outbox": {"id": 11},
-                }
-            return super().enqueue_outgoing_agent(conversation_id, **kwargs)
-
-    store = DuplicateNightStore(
+    store = FakeStore(
         control_mode="human",
         metadata=_legacy_repeat_join_metadata(),
     )
     monkeypatch.setattr(gateway, "_store", lambda: store)
     monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
     monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: False)
-    monkeypatch.setattr(
-        watch,
-        "after_hours_period_key",
-        lambda conversation_id: f"night:{conversation_id}:2026-07-30",
-    )
     monkeypatch.setattr(gateway, "_cancel_bot_reminders", lambda *_a, **_k: None)
     _tg(monkeypatch)
 
@@ -594,10 +626,83 @@ def test_repeated_after_hours_message_falls_back_to_hint_instead_of_silence(
 
     assert len(store.queued) == 1
     assert store.queued[0]["text"] == bot.STRICT_QUESTION_HINT
-    assert store.queued[0]["metadata"]["after_hours_fallback"] is True
     assert store.transitions[0]["kind"] == "control"
     assert store.transitions[0]["mode"] == "ai"
     assert all("permanent_human" not in item for item in store.transitions)
+
+
+def test_alexander_nikitenko_question_is_answered_by_ai_after_hours(monkeypatch):
+    messages = [
+        {
+            "id": 863,
+            "author_type": "agent",
+            "direction": "outbound",
+            "delivery_status": "sent",
+            "text": bot.FORM_RECEIVED,
+            "metadata": {"iu_event": "form_received", "service_reply": True},
+        },
+        {
+            "id": 864,
+            "author_type": "client",
+            "direction": "inbound",
+            "text": bot.BUTTON_FORM_QUESTIONS_YES,
+            "metadata": {},
+        },
+        {
+            "id": 866,
+            "author_type": "client",
+            "direction": "inbound",
+            "text": bot.BUTTON_ASK,
+            "metadata": {},
+        },
+        {
+            "id": 867,
+            "author_type": "agent",
+            "direction": "outbound",
+            "delivery_status": "sent",
+            "text": bot.ASK_PROMPT,
+            "metadata": {"iu_event": "support_enter", "service_reply": True},
+        },
+    ]
+    store = FakeStore(control_mode="ai", messages=messages)
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: False)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(
+        _message_update(
+            "Какая у вас комиссия?",
+            message_id=868,
+            first_name="Александр",
+            last_name="Никитенко",
+        )
+    )
+
+    assert store.ingested[0]["display_name"] == "Александр Никитенко"
+    assert store.ingested[0]["schedule_ai"] is True
+    assert store.queued == []
+    assert store.transitions == []
+    assert store.human_flags == []
+
+
+def test_menu_cancels_an_explicit_manager_dialog_and_restores_ai(monkeypatch):
+    store = FakeStore(
+        control_mode="human",
+        metadata={"manager_requested_at": "2026-07-30T20:17:32+00:00"},
+    )
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message_update("/menu", message_id=900))
+
+    assert store.queued[0]["text"] == bot.MANAGER_DIALOG_CANCELLED
+    assert store.queued[0]["metadata"]["iu_event"] == "manager_dialog_cancelled"
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.main_menu()
+    assert store.transitions[0]["kind"] == "control"
+    assert store.transitions[0]["mode"] == "ai"
+    assert "отменил ожидание менеджера" in store.transitions[0]["reason"]
 
 
 def test_any_ai_escalation_enqueues_the_same_bitrix_manager_alert(monkeypatch):
@@ -711,6 +816,25 @@ def test_calling_the_operator_hands_the_dialog_to_a_human(monkeypatch):
     assert store.queued[0]["metadata"]["manager_notification_recipient"] == "chat2714"
     assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
     assert store.queued[0]["metadata"]["manager_notification_kind"] == "client_called"
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.remove_keyboard()
+
+
+def test_calling_the_operator_after_hours_still_waits_for_a_human(monkeypatch):
+    import iu_manager_response_watch as watch
+
+    store = FakeStore(agent_replies=3)
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: False)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_callback_update(bot.CB_OPERATOR))
+
+    assert store.queued[0]["text"] == watch.AFTER_HOURS_CLIENT_REPLY
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.remove_keyboard()
+    assert store.queued[0]["metadata"]["manager_notification_deferred"] is True
+    assert store.transitions[0]["manager_requested"] is True
+    assert store.transitions[0]["permanent_human"] is True
 
 
 def test_third_ai_reply_carries_support_exit_and_operator(monkeypatch):

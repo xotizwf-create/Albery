@@ -1129,6 +1129,7 @@ def test_confirmed_delivery_enqueues_crm_stage_in_same_transaction():
         "delivery_status": "sent",
         "provider_message_id": "712",
         "external_chat_id": "9001",
+        "source_key": "telegram_bot",
         "conversation_version": 8,
         "author_type": "agent",
         "payload": {
@@ -1199,6 +1200,7 @@ def test_confirmed_delivery_enqueues_crm_stage_in_same_transaction():
         and "'delivery_effects'" in sql
     )
     persisted_payload = delivery_insert[3].obj
+    assert persisted_payload["source_key"] == "telegram_bot"
     assert persisted_payload["answered_client"] is True
     assert persisted_payload["manager_notification_kind"] == "manager_needed"
     assert persisted_payload["manager_notification_form_deal_id"] == 284

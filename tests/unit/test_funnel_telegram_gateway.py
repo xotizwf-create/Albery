@@ -1464,8 +1464,8 @@ def test_partial_answer_flags_a_human_without_taking_the_dialog_away(monkeypatch
     assert waiting == [], "разговор у ИИ не забираем — клиент получил ответ по существу"
 
 
-def test_answer_that_did_not_happen_still_hands_the_dialog_over(monkeypatch):
-    """Агент не ответил вовсе — полная передача человеку остаётся как была."""
+def test_business_answer_that_did_not_happen_still_hands_the_dialog_over(monkeypatch):
+    """В переписке менеджера полный сбой ответа по-прежнему ставит диалог на паузу."""
     flagged = []
     waiting = []
     tg = SimpleNamespace(
@@ -1501,3 +1501,49 @@ def test_answer_that_did_not_happen_still_hands_the_dialog_over(monkeypatch):
 
     assert flagged == []
     assert waiting == [(12, {"expected_version": 5, "reason": "В знаниях нет ответа"})]
+
+
+def test_bot_ai_failure_flags_manager_without_stopping_future_ai(monkeypatch):
+    flagged = []
+    waiting = []
+    tg = SimpleNamespace(
+        _terms_already_sent=lambda _telegram_id: True,
+        _mark_terms_sent=lambda _telegram_id: None,
+        _invite_already_sent=lambda _telegram_id: True,
+        _mark_invited=lambda _telegram_id: None,
+    )
+    monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    monkeypatch.setattr(
+        gateway,
+        "_mark_waiting_if_current",
+        lambda conversation_id, **kwargs: waiting.append((conversation_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_store",
+        lambda: SimpleNamespace(
+            get_conversation=lambda _conversation_id: {
+                "source_key": gateway.BOT_SOURCE_KEY
+            },
+            flag_needs_human=lambda conversation_id, *, reason: flagged.append(
+                (conversation_id, reason)
+            )
+        ),
+    )
+    action = {
+        "id": 75,
+        "conversation_id": 13,
+        "action_type": "delivery_effects",
+        "payload": {
+            "author_type": "agent",
+            "conversation_version": 6,
+            "escalate_after_delivery": True,
+            "escalation_reason": "Модель временно недоступна",
+            "answered_client": False,
+        },
+    }
+
+    gateway._apply_delivery_effects(action)
+
+    assert flagged == [(13, "Модель временно недоступна")]
+    assert waiting == []

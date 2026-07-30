@@ -14,12 +14,13 @@ import iu_client_bot as bot
 
 
 class FakeStore:
-    def __init__(self, *, agent_replies=0, control_mode="ai"):
+    def __init__(self, *, agent_replies=0, control_mode="ai", metadata=None):
         self.ingested: list[dict] = []
         self.queued: list[dict] = []
         self.transitions: list[dict] = []
         self.agent_replies = agent_replies
         self.control_mode = control_mode
+        self.metadata = dict(metadata or {})
 
     def ingest_business_message(self, **kwargs):
         self.ingested.append(kwargs)
@@ -27,7 +28,8 @@ class FakeStore:
 
     def get_conversation(self, conversation_id):
         return {"id": conversation_id, "state_version": 7,
-                "control_mode": self.control_mode, "source_key": "telegram_bot"}
+                "control_mode": self.control_mode, "source_key": "telegram_bot",
+                "metadata": self.metadata}
 
     def count_agent_replies(self, conversation_id):
         return self.agent_replies
@@ -39,6 +41,13 @@ class FakeStore:
     def mark_waiting_human(self, conversation_id, **kwargs):
         self.transitions.append({"conversation_id": conversation_id, **kwargs})
         return {"conversation": {"id": conversation_id, "status": "waiting"}}
+
+    def transition_control(self, conversation_id, **kwargs):
+        self.transitions.append(
+            {"kind": "control", "conversation_id": conversation_id, **kwargs}
+        )
+        self.control_mode = kwargs["mode"]
+        return self.get_conversation(conversation_id)
 
 
 def _tg(monkeypatch, *, owner=False):
@@ -259,30 +268,21 @@ def test_repeated_free_question_outside_support_does_not_call_operator(monkeypat
     assert store.queued[-1]["text"] == bot.STRICT_QUESTION_HINT
 
 
-def test_any_free_question_gets_one_after_hours_acknowledgement(monkeypatch):
-    import iu_manager_response_watch as watch
-
+def test_after_hours_free_text_outside_support_keeps_the_normal_menu_gate(monkeypatch):
     store = FakeStore(control_mode="ai")
     monkeypatch.setattr(gateway, "_store", lambda: store)
     monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda _chat_id: 5)
     monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: False)
-    monkeypatch.setattr(
-        watch,
-        "after_hours_period_key",
-        lambda conversation_id: f"night:{conversation_id}:2026-07-30",
-    )
     monkeypatch.setattr(gateway, "_cancel_bot_reminders", lambda _conversation_id: None)
     _tg(monkeypatch)
 
     gateway.route_captured_update(_message("Когда мне ответит менеджер?"))
 
     assert len(store.queued) == 1
-    assert store.queued[0]["text"] == watch.AFTER_HOURS_CLIENT_REPLY
-    assert store.queued[0]["idempotency_key"] == "night:5:2026-07-30"
-    assert store.queued[0]["metadata"]["after_hours"] is True
-    assert store.queued[0]["metadata"]["reply_markup"] == bot.remove_keyboard()
+    assert store.queued[0]["text"] == bot.STRICT_QUESTION_HINT
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.main_menu()
     assert store.ingested[0]["schedule_ai"] is False
-    assert store.transitions[0]["permanent_human"] is True
+    assert store.transitions == []
 
 
 def test_service_reply_retries_once_after_state_version_race(monkeypatch):
