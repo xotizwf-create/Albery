@@ -223,6 +223,28 @@ def test_api_maps_durable_names_to_frontend_contract(client, monkeypatch):
     assert "file_id" not in messages["messages"][0]["attachment"]
 
 
+def test_message_payload_exposes_safe_delete_and_hidden_flags_only():
+    payload = workspace._message_payload(
+        {
+            "id": 10,
+            "author_type": "agent",
+            "direction": "outbound",
+            "occurred_at": datetime(2026, 7, 26, tzinfo=timezone.utc),
+            "text": "[Сообщение удалено]",
+            "metadata": {
+                "telegram_deleted": True,
+                "delete_after_delivery": True,
+                "provider_secret": "must-not-leak",
+            },
+        }
+    )
+
+    assert payload["deleted"] is True
+    assert payload["hidden"] is True
+    assert "metadata" not in payload
+    assert "provider_secret" not in payload
+
+
 def test_mutation_requires_csrf_and_origin(client, monkeypatch):
     payload = login(client)
     called = {}

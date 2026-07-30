@@ -1814,6 +1814,32 @@ def test_message_that_never_reached_the_client_is_removed_not_tombstoned():
     assert result["conversation"]["last_message_id"] == 95
 
 
+def test_transient_keyboard_message_is_purged_after_provider_deletion():
+    statements: list[str] = []
+
+    def respond(sql, _params):
+        statements.append(sql)
+        if sql.startswith("SELECT m.*, c.external_chat_id"):
+            return message_row(
+                metadata={
+                    "service_reply": True,
+                    "delete_after_delivery": True,
+                }
+            )
+        if sql.startswith("DELETE FROM funnel_workspace_messages"):
+            return None
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            return conversation(id=41, last_message_id=54, last_message_text="Вопрос")
+        raise AssertionError(sql)
+
+    connect, _connection = connect_factory(respond)
+    result = store.purge_transient_service_message(55, now=NOW, connect=connect)
+
+    assert result["purged"] is True
+    assert result["conversation"]["last_message_id"] == 54
+    assert any(sql.startswith("DELETE FROM funnel_workspace_messages") for sql in statements)
+
+
 def test_delivered_message_is_never_purged_from_the_journal():
     """У клиента сообщение осталось — вычистить его у себя значит соврать оператору."""
     def respond(sql, _params):

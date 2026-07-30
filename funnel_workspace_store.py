@@ -726,6 +726,53 @@ def purge_undelivered_message(
     }
 
 
+def purge_transient_service_message(
+    message_id: Any,
+    *,
+    now: datetime | None = None,
+    connect: ConnectFactory | None = None,
+) -> dict[str, Any]:
+    """Remove a delivered zero-width service message after Telegram removed it.
+
+    Telegram needs one message with ``ReplyKeyboardRemove`` to hide the client's
+    scenario keyboard.  That transport-only message must not become part of the
+    conversation transcript or replace its preview.
+    """
+
+    item_id = _positive_int(message_id, "message_id")
+    timestamp = _now(now)
+    with _connection(connect) as conn:
+        with conn.cursor() as cur:
+            row = _message_with_chat(cur, item_id)
+            metadata = row.get("metadata") or {}
+            if not (
+                isinstance(metadata, Mapping)
+                and metadata.get("delete_after_delivery") is True
+                and metadata.get("service_reply") is True
+            ):
+                raise WorkspaceControlError(
+                    "Удалить без следа можно только временное служебное сообщение.",
+                    details={"message_id": item_id},
+                )
+            conversation_id = int(row["conversation_id"])
+            cur.execute(
+                "DELETE FROM funnel_workspace_messages WHERE id = %s",
+                (item_id,),
+            )
+            conversation = _rebuild_conversation_counters_cursor(
+                cur,
+                conversation_id,
+                timestamp,
+            )
+    return {
+        "deleted": True,
+        "purged": True,
+        "message_id": item_id,
+        "conversation_id": conversation_id,
+        "conversation": conversation,
+    }
+
+
 def _rebuild_conversation_counters_cursor(
     cur: Any,
     conversation_id: int,

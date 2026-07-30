@@ -237,6 +237,12 @@ def test_silent_ai_lead_is_escalated_but_a_delivered_ai_answer_closes_wait():
                     """,
                     (int(answer["message"]["id"]),),
                 )
+        # A separate manager-needed badge must not retroactively erase the AI
+        # answer and make an old /start or menu action look unanswered.
+        store.flag_needs_human(
+            conversation_id,
+            reason="Нужна дополнительная проверка менеджера.",
+        )
 
         watch.sync_due_alerts(
             now=start + timedelta(minutes=30),

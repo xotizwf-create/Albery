@@ -85,9 +85,6 @@ const FALLBACK_STAGES = [
 // Цвет по месту в воронке: от «только пришёл» к «договор подписан».
 const STAGE_COLORS = ["#7c3aed", "#2563eb", "#0891b2", "#d97706", "#16a34a"];
 
-// Состояния доставки, при которых судьба сообщения ещё не решена.
-const IN_FLIGHT_DELIVERY = new Set(["pending", "queued", "sending", "leased"]);
-
 const URGENT_AFTER_MINUTES_DEFAULT = 10;
 
 /** Дата и время комментария — коротко и по-московски, как везде в окне. */
@@ -1629,6 +1626,100 @@ function MessageAttachment({
   );
 }
 
+type TelegramInlineMatch = {
+  index: number;
+  length: number;
+  kind: "bold" | "link";
+  content: string;
+  url?: string;
+};
+
+function firstTelegramInlineMatch(text: string): TelegramInlineMatch | null {
+  const patterns: Array<{
+    kind: TelegramInlineMatch["kind"];
+    regex: RegExp;
+    contentGroup: number;
+    urlGroup?: number;
+  }> = [
+    { kind: "link", regex: /\[URL=(https?:\/\/[^\]\s]+)\]([\s\S]*?)\[\/URL\]/i, contentGroup: 2, urlGroup: 1 },
+    { kind: "link", regex: /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/, contentGroup: 1, urlGroup: 2 },
+    { kind: "bold", regex: /\[b\]([\s\S]*?)\[\/b\]/i, contentGroup: 1 },
+    { kind: "bold", regex: /<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>/i, contentGroup: 1 },
+    { kind: "bold", regex: /\*\*([\s\S]*?)\*\*/, contentGroup: 1 },
+  ];
+  let selected: TelegramInlineMatch | null = null;
+  patterns.forEach(({ kind, regex, contentGroup, urlGroup }) => {
+    const match = regex.exec(text);
+    if (!match) return;
+    const candidate: TelegramInlineMatch = {
+      index: match.index,
+      length: match[0].length,
+      kind,
+      content: match[contentGroup] || "",
+      url: urlGroup ? match[urlGroup] : undefined,
+    };
+    if (!selected || candidate.index < selected.index) selected = candidate;
+  });
+  return selected;
+}
+
+function plainTelegramText(text: string): string {
+  return text
+    .replace(/\[\/?b\]/gi, "")
+    .replace(/<\/?(?:b|strong)>/gi, "")
+    .replace(/(^|\s)\/b(?=\s|$)/gi, "$1");
+}
+
+function renderTelegramInline(text: string, keyPrefix: string, depth = 0): ReactNode[] {
+  if (!text || depth > 12) return [plainTelegramText(text)];
+  const match = firstTelegramInlineMatch(text);
+  if (!match) return [plainTelegramText(text)];
+
+  const before = text.slice(0, match.index);
+  const after = text.slice(match.index + match.length);
+  const nodes: ReactNode[] = [];
+  if (before) nodes.push(...renderTelegramInline(before, `${keyPrefix}-before`, depth + 1));
+  if (match.kind === "bold") {
+    nodes.push(
+      <strong key={`${keyPrefix}-bold-${match.index}`} className="font-bold">
+        {renderTelegramInline(match.content, `${keyPrefix}-bold-content`, depth + 1)}
+      </strong>,
+    );
+  } else {
+    nodes.push(
+      <a
+        key={`${keyPrefix}-link-${match.index}`}
+        href={match.url}
+        target="_blank"
+        rel="noreferrer noopener"
+        className="font-medium text-sky-600 underline decoration-sky-300 underline-offset-2 hover:text-sky-700"
+      >
+        {plainTelegramText(match.content)}
+      </a>,
+    );
+  }
+  if (after) nodes.push(...renderTelegramInline(after, `${keyPrefix}-after`, depth + 1));
+  return nodes;
+}
+
+function TelegramMessageText({ text }: { text: string }) {
+  const lines = String(text || "").split("\n");
+  return (
+    <>
+      {lines.map((line, index) => {
+        const heading = /^\s*\S.{0,79}:\s*$/.test(plainTelegramText(line));
+        const content = renderTelegramInline(line, `line-${index}`);
+        return (
+          <span key={`line-${index}`}>
+            {heading ? <strong className="font-bold">{content}</strong> : content}
+            {index < lines.length - 1 && <br />}
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
 function MessageBubble({
   message,
   onRetry,
@@ -1703,7 +1794,14 @@ function MessageBubble({
             </span>
           </div>
           {message.attachment && <MessageAttachment attachment={message.attachment} />}
-          <div className="whitespace-pre-wrap break-words text-[14px] leading-[21px]">{message.text}</div>
+          <div
+            className={cn(
+              "whitespace-pre-wrap break-words text-[14px] leading-[21px]",
+              message.deleted && "italic text-slate-400",
+            )}
+          >
+            {incoming ? message.text : <TelegramMessageText text={message.text} />}
+          </div>
           <div className="mt-1.5 flex items-center justify-end gap-1.5 text-[10px] font-medium text-slate-400">
             <span>{formatClock(message.created_at)}</span>
             {!incoming && <DeliveryStatus message={message} />}
@@ -1783,6 +1881,7 @@ function ChatPanel({
         : conversation?.ai_available
           ? "ai"
           : null;
+  const visibleMessages = messages.filter((message) => !message.hidden);
 
   useEffect(() => {
     setDraft("");
@@ -1797,7 +1896,7 @@ function ChatPanel({
       if (node) node.scrollTop = node.scrollHeight;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [messages.length, selectedKey]);
+  }, [visibleMessages.length, selectedKey]);
 
   // С файлом сообщение осмысленно и без текста, а подпись к документу Telegram
   // обрезает на 1024 символах — поэтому лимит поля зависит от того, есть ли файл.
@@ -1961,7 +2060,7 @@ function ChatPanel({
               Загружаем переписку…
             </div>
           </div>
-        ) : messages.length === 0 ? (
+        ) : visibleMessages.length === 0 ? (
           <div className="flex h-full min-h-64 items-center justify-center px-6 text-center">
             <div>
               <span className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-white text-slate-400 shadow-sm ring-1 ring-slate-200">
@@ -1985,8 +2084,8 @@ function ChatPanel({
                 </button>
               </div>
             )}
-            {messages.map((message, index) => {
-              const previous = messages[index - 1];
+            {visibleMessages.map((message, index) => {
+              const previous = visibleMessages[index - 1];
               const showDay =
                 !previous || messageDayKey(previous.created_at) !== messageDayKey(message.created_at);
               return (
@@ -2826,25 +2925,15 @@ function OperatorWorkspace({
       const sequence = ++messageRequestSequenceRef.current;
       if (options.showLoading) setMessagesLoading(true);
       try {
-        const existing = reset ? [] : messagesRef.current.filter((message) => !message.optimistic && message.id > 0);
-        // Инкрементальный опрос по after_id приносит только НОВЫЕ сообщения, поэтому
-        // статус уже показанного письма («Отправляется») никогда не перечитывался и
-        // висел до переключения диалога. Пока хоть одно сообщение в пути, перечитываем
-        // окно целиком — сервер отмечает доставку меньше чем за секунду.
-        const deliveryInFlight = existing.some((message) =>
-          IN_FLIGHT_DELIVERY.has(String(message.delivery_status || "")),
-        );
-        const afterId =
-          existing.length && !deliveryInFlight
-            ? Math.max(...existing.map((message) => message.id))
-            : undefined;
+        // Telegram can edit or delete an EXISTING message without creating a new id.
+        // Therefore polling only with after_id leaves stale text/status until a full
+        // page refresh. Re-read the current 200-message window and merge it with any
+        // older page that the operator loaded manually.
         const payload = await funnelWorkspaceApi.getMessages(
           conversationId,
           options.beforeId
             ? { beforeId: options.beforeId, limit: 200 }
-            : reset
-              ? { limit: 200 }
-              : { afterId, limit: 200 },
+            : { limit: 200 },
         );
         if (
           sequence !== messageRequestSequenceRef.current ||
@@ -3240,6 +3329,15 @@ function OperatorWorkspace({
         csrfToken(),
       );
       setPendingMessageDelete(null);
+      setMessages((current) =>
+        result.purged
+          ? current.filter((message) => message.id !== target.id)
+          : current.map((message) =>
+              message.id === target.id && result.message
+                ? result.message
+                : message,
+            ),
+      );
       await refreshSelected();
       setToast({
         message:

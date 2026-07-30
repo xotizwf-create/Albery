@@ -135,6 +135,19 @@ def test_start_creates_a_lead_and_shows_the_menu(monkeypatch):
     ]
 
 
+def test_manager_takeover_removes_keyboard_without_visible_join_message(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+
+    gateway.hide_client_menu_for_manager(5, state_version=8)
+
+    queued = store.queued[0]
+    assert queued["text"] == "\u2063"
+    assert queued["metadata"]["reply_markup"] == {"remove_keyboard": True}
+    assert queued["metadata"]["delete_after_delivery"] is True
+    assert "Менеджер подключился" not in queued["text"]
+
+
 def test_terms_button_sends_the_real_terms(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)
@@ -246,7 +259,7 @@ def test_file_handover_notifies_without_claiming_an_explicit_manager_call(monkey
 
     assert store.queued[0]["text"] == bot.FILE_SENT_TO_MANAGER
     assert store.queued[0]["metadata"]["notify_manager_after_delivery"] is True
-    assert store.queued[0]["metadata"]["manager_notification_recipient"] == "16"
+    assert store.queued[0]["metadata"]["manager_notification_recipient"] == "chat2714"
     assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
     assert store.queued[0]["metadata"]["manager_notification_client_name"] == "Пётр Иванов"
     assert store.queued[0]["metadata"]["manager_notification_kind"] == "manager_needed"
@@ -320,7 +333,7 @@ def test_any_ai_escalation_enqueues_the_same_bitrix_manager_alert(monkeypatch):
     )
 
     assert prepared.metadata["notify_manager_after_delivery"] is True
-    assert prepared.metadata["manager_notification_recipient"] == "16"
+    assert prepared.metadata["manager_notification_recipient"] == "chat2714"
     assert prepared.metadata["manager_notification_bot_id"] == 86
     assert prepared.metadata["manager_notification_kind"] == "manager_needed"
 
@@ -400,7 +413,7 @@ def test_calling_the_operator_hands_the_dialog_to_a_human(monkeypatch):
     assert store.transitions[0]["permanent_human"] is True
     assert "менеджер" in store.queued[0]["text"].lower()
     assert store.queued[0]["metadata"]["notify_manager_after_delivery"] is True
-    assert store.queued[0]["metadata"]["manager_notification_recipient"] == "16"
+    assert store.queued[0]["metadata"]["manager_notification_recipient"] == "chat2714"
     assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
     assert store.queued[0]["metadata"]["manager_notification_kind"] == "client_called"
 

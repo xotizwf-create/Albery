@@ -368,9 +368,7 @@ def _notify_iu_manager(text: str) -> dict[str, Any]:
         "notify_iu_group",
         {
             "text": text,
-            "dialog_id": str(
-                os.getenv("IU_MANAGER_NOTIFY_BITRIX_USER_ID", "16")
-            ).strip(),
+            "dialog_id": _manager_notification_recipient(),
             "bot_id": _as_int(os.getenv("IU_AGENT_BOT_ID", "86")) or 86,
         },
     )
@@ -393,6 +391,16 @@ def _manager_notifications_open(now: datetime | None = None) -> bool:
     import iu_manager_response_watch
 
     return iu_manager_response_watch.manager_notifications_open(now)
+
+
+def _manager_notification_recipient() -> str:
+    """Bitrix dialog that receives all IU manager calls and wait alerts."""
+
+    return str(
+        os.getenv("IU_MANAGER_NOTIFY_BITRIX_DIALOG_ID")
+        or os.getenv("IU_MANAGER_NOTIFY_BITRIX_USER_ID")
+        or "chat2714"
+    ).strip()
 
 
 def process_iu_reminders_once(*, worker_id: str, limit: int = 20) -> int:
@@ -798,9 +806,7 @@ def _manager_request_metadata(
     return {
         "iu_event": event,
         "notify_manager_after_delivery": True,
-        "manager_notification_recipient": os.getenv(
-            "IU_MANAGER_NOTIFY_BITRIX_USER_ID", "16"
-        ),
+        "manager_notification_recipient": _manager_notification_recipient(),
         "manager_notification_bot_id": (
             _as_int(os.getenv("IU_AGENT_BOT_ID", "86")) or 86
         ),
@@ -877,10 +883,13 @@ def hide_client_menu_for_manager(
 
     return _reply_to_client(
         conversation_id,
-        "Менеджер подключился к диалогу.",
+        "\u2063",
         idempotency_key=f"iu-bot:manager-takeover:{conversation_id}:{state_version}",
         reply_markup=iu_client_bot.remove_keyboard(),
-        metadata={"iu_event": "manager_takeover"},
+        metadata={
+            "iu_event": "manager_takeover",
+            "delete_after_delivery": True,
+        },
         service=True,
     )
 
@@ -2661,6 +2670,31 @@ def _after_delivery(
     conversation_id = int(outbox["conversation_id"])
 
     if result == "sent":
+        if payload.get("delete_after_delivery"):
+            delivered = dict(outbox)
+            delivered.update(dict(finished.get("outbox") or {}))
+            provider_message_id = _as_int(delivered.get("provider_message_id"))
+            try:
+                if provider_message_id is None:
+                    raise RuntimeError(
+                        "Telegram did not return an id for the transient message."
+                    )
+                tg_agent.api(
+                    "deleteMessage",
+                    chat_id=int(delivered["external_chat_id"]),
+                    message_id=provider_message_id,
+                )
+                store = _store()
+                if hasattr(store, "purge_transient_service_message"):
+                    store.purge_transient_service_message(
+                        int(delivered["message_id"])
+                    )
+            except Exception as exc:  # noqa: BLE001 - keyboard was already removed
+                log.warning(
+                    "iu client bot: transient keyboard-removal message was not deleted: %s",
+                    _safe_error(exc),
+                )
+            return
         if outbox.get("author_type") == "operator":
             try:
                 handled_at = outbox.get("created_at")
@@ -2897,7 +2931,7 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
             dialog_url = f"https://www.m4s.ru{dialog_url}"
         recipient = str(
             payload.get("manager_notification_recipient")
-            or os.getenv("IU_MANAGER_NOTIFY_BITRIX_USER_ID", "16")
+            or _manager_notification_recipient()
         ).strip()
         bot_id = (
             _as_int(payload.get("manager_notification_bot_id"))

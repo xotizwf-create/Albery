@@ -122,37 +122,26 @@ def _waiting_rows(
                                       answer.author_type = 'operator'
                                       OR (
                                           answer.author_type = 'agent'
-                                          AND c.control_mode <> 'human'
-                                           AND NOT (
-                                               (
-                                                   c.metadata
-                                                       ->> 'manager_requested_at'
-                                                   IS NOT NULL
-                                                   AND (
-                                                       c.metadata
-                                                           ->> 'manager_request_handled_at'
-                                                       IS NULL
-                                                       OR c.metadata
-                                                           ->> 'manager_request_handled_at'
-                                                          < c.metadata
-                                                           ->> 'manager_requested_at'
-                                                   )
-                                               )
-                                               OR (
-                                                   c.metadata
-                                                       ->> 'needs_human_at'
-                                                   IS NOT NULL
-                                                   AND (
-                                                       c.metadata
-                                                           ->> 'needs_human_handled_at'
-                                                       IS NULL
-                                                       OR c.metadata
-                                                           ->> 'needs_human_handled_at'
-                                                          < c.metadata
-                                                           ->> 'needs_human_at'
-                                                   )
-                                               )
-                                           )
+                                          -- Real bot answers remain answers even if a
+                                          -- later action flags the lead for a manager or
+                                          -- transfers control.  Otherwise a current
+                                          -- handoff made an old /start look unanswered.
+                                          -- Only transport acknowledgements of the
+                                          -- handoff itself are excluded.
+                                          AND COALESCE(
+                                              answer.metadata ->> 'iu_event',
+                                              ''
+                                          ) NOT IN (
+                                              'manager_takeover',
+                                              'terms_unavailable',
+                                              'manager_after_hours',
+                                              'file_handover',
+                                              'form_edit_handover',
+                                              'calculator_discussion_filled',
+                                              'calculator_discussion_unavailable',
+                                              'join_unavailable',
+                                              'operator_called'
+                                          )
                                       )
                                   )
                                   AND answer.direction = 'outbound'

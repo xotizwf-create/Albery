@@ -119,6 +119,8 @@ export interface ConversationMessage {
   error: string | null;
   idempotency_key?: string | null;
   optimistic?: boolean;
+  deleted?: boolean;
+  hidden?: boolean;
   attachment?: ConversationAttachment | null;
 }
 

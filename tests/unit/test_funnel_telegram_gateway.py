@@ -803,6 +803,46 @@ def test_post_delivery_stage_is_not_called_synchronously(monkeypatch):
     assert calls == []
 
 
+def test_transient_keyboard_removal_is_deleted_from_telegram_and_transcript(
+    monkeypatch,
+):
+    calls = []
+    purged = []
+    tg = SimpleNamespace(
+        api=lambda method, **kwargs: calls.append((method, kwargs)) or True,
+    )
+    store = SimpleNamespace(
+        purge_transient_service_message=lambda message_id: purged.append(message_id),
+    )
+    monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+
+    gateway._after_delivery(
+        {
+            "conversation_id": 7,
+            "conversation_version": 4,
+            "message_id": 88,
+            "author_type": "agent",
+            "source_key": "telegram_bot",
+            "external_chat_id": "123",
+            "payload": {"delete_after_delivery": True},
+        },
+        result="sent",
+        finished={
+            "outbox": {
+                "message_id": 88,
+                "external_chat_id": "123",
+                "provider_message_id": "456",
+            }
+        },
+    )
+
+    assert calls == [
+        ("deleteMessage", {"chat_id": 123, "message_id": 456})
+    ]
+    assert purged == [88]
+
+
 class FakeStoreForCrmActions:
     class WorkspaceConflictError(RuntimeError):
         pass
@@ -982,7 +1022,7 @@ def test_delivery_effects_replay_terms_and_escalation_idempotently(monkeypatch):
     ]
 
 
-def test_operator_request_notifies_alexander_from_iu_agent_with_dialog_link(
+def test_operator_request_notifies_iu_test_group_from_agent_with_dialog_link(
     monkeypatch,
 ):
     calls = []
@@ -1011,7 +1051,7 @@ def test_operator_request_notifies_alexander_from_iu_agent_with_dialog_link(
             "author_type": "agent",
             "notify_manager_after_delivery": True,
             "manager_notification_kind": "client_called",
-            "manager_notification_recipient": "16",
+            "manager_notification_recipient": "chat2714",
             "manager_notification_bot_id": 86,
             "manager_notification_client_name": "Александр Никитенко",
         },
@@ -1028,7 +1068,7 @@ def test_operator_request_notifies_alexander_from_iu_agent_with_dialog_link(
                     "Клиент Александр Никитенко позвал менеджера в "
                     "[URL=https://www.m4s.ru/agent-funnels/311]диалоге[/URL]"
                 ),
-                "dialog_id": "16",
+                "dialog_id": "chat2714",
                 "bot_id": 86,
             },
         )

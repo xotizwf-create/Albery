@@ -828,14 +828,18 @@ def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 def _message_payload(row: dict[str, Any]) -> dict[str, Any]:
     payload = dict(row)
+    metadata = payload.get("metadata")
+    safe_metadata = metadata if isinstance(metadata, Mapping) else {}
     attachment = workspace_media.attachment_descriptor(
-        payload.get("metadata"),
+        metadata,
         payload.get("id"),
     )
     # Provider file identifiers stay server-side.  The browser receives only a
     # same-origin proxy URL and display-safe attachment fields.
     payload.pop("metadata", None)
     payload["attachment"] = attachment
+    payload["deleted"] = bool(safe_metadata.get("telegram_deleted"))
+    payload["hidden"] = bool(safe_metadata.get("delete_after_delivery"))
     payload["author_type_internal"] = payload.get("author_type")
     payload["direction_internal"] = payload.get("direction")
     payload["author_type"] = {
