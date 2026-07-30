@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -25,6 +28,25 @@ def client(monkeypatch):
     app.config.update(TESTING=True)
     workspace.register_funnel_workspace(app)
     return app.test_client()
+
+
+def grant_admin_session(client, monkeypatch):
+    """Сессия администратора в том виде, в каком её выдаёт вход в панель.
+
+    Одного флага в cookie мало с 30.07.2026: панель сверяет отпечаток действующего пароля
+    и время входа, а рабочее окно опирается на ту же проверку — иначе смена пароля
+    закрывала бы админку, но оставляла бы открытой переписку с клиентами.
+    """
+    password_hash = os.getenv("ADMIN_PASSWORD_HASH", "").strip()
+    if not password_hash:
+        password_hash = generate_password_hash("current admin password")
+        monkeypatch.setenv("ADMIN_PASSWORD_HASH", password_hash)
+    with client.session_transaction() as browser_session:
+        browser_session["admin_authenticated"] = True
+        browser_session["admin_password_fingerprint"] = hashlib.sha256(
+            password_hash.encode("utf-8")
+        ).hexdigest()
+        browser_session["admin_authenticated_at"] = time.time()
 
 
 def login(client, *, operator_name="Александр"):
@@ -151,8 +173,7 @@ def test_admin_session_is_accepted(client, monkeypatch):
         "list_conversations",
         lambda **_kwargs: {"items": [], "total": 0, "limit": 100, "offset": 0},
     )
-    with client.session_transaction() as browser_session:
-        browser_session["admin_authenticated"] = True
+    grant_admin_session(client, monkeypatch)
 
     response = client.get("/api/funnel-workspace/conversations")
 
@@ -545,8 +566,7 @@ def test_password_bootstrap_works_when_the_page_was_opened_before_admin_login(
     opened_before_login = client.get("/api/funnel-workspace/session").get_json()
     csrf_token = opened_before_login["csrf_token"]
 
-    with client.session_transaction() as browser_session:
-        browser_session["admin_authenticated"] = True
+    grant_admin_session(client, monkeypatch)
 
     response = client.post(
         "/api/funnel-workspace/configure-password",
@@ -577,8 +597,7 @@ def test_admin_can_bootstrap_only_scrypt_hash_without_secret_in_response(
         captured["hash"] = value
 
     monkeypatch.setattr(workspace.store, "set_workspace_password_hash", save_hash)
-    with client.session_transaction() as browser_session:
-        browser_session["admin_authenticated"] = True
+    grant_admin_session(client, monkeypatch)
 
     session_response = client.get("/api/funnel-workspace/session")
     session_payload = session_response.get_json()
