@@ -729,6 +729,73 @@ def _reply_to_client(
     return queued
 
 
+LEGACY_REPEAT_JOIN_HANDOFF_REASON = (
+    "Клиент повторно открыл подключение к ИУ при уже заполненной анкете — "
+    "ему требуется ответ менеджера."
+)
+
+
+def _legacy_repeat_join_hold(conversation: Mapping[str, Any]) -> bool:
+    """An unhandled permanent hold created by the removed repeat-join behaviour."""
+
+    if (
+        str(conversation.get("source_key") or "") != BOT_SOURCE_KEY
+        or str(conversation.get("control_mode") or "") != "human"
+        or str(conversation.get("assigned_to") or "").strip()
+    ):
+        return False
+    metadata = conversation.get("metadata") or {}
+    if not isinstance(metadata, Mapping):
+        return False
+    if str(metadata.get("manager_request_reason") or "") != (
+        LEGACY_REPEAT_JOIN_HANDOFF_REASON
+    ):
+        return False
+    requested_at = str(metadata.get("manager_requested_at") or "")
+    handled_at = str(metadata.get("manager_request_handled_at") or "")
+    return bool(requested_at) and (not handled_at or requested_at > handled_at)
+
+
+def _restore_ai_after_service_reply(
+    conversation_id: int,
+    queued: Mapping[str, Any] | None,
+    *,
+    reason: str,
+) -> Mapping[str, Any] | None:
+    """Return an explicit bot/menu action to AI without answering the button via AI."""
+
+    store = _store()
+    if not hasattr(store, "transition_control"):
+        return None
+    current = dict((queued or {}).get("conversation") or {})
+    if not current:
+        current = dict(store.get_conversation(conversation_id) or {})
+    if (
+        str(current.get("source_key") or "") != BOT_SOURCE_KEY
+        or str(current.get("control_mode") or "") == "ai"
+        or not ai_allowed_in_channel(current, current.get("external_user_id"))
+    ):
+        return current or None
+    try:
+        restored = store.transition_control(
+            conversation_id,
+            mode="ai",
+            expected_version=current.get("state_version"),
+            actor_type="agent",
+            actor_name=AGENT_NAME,
+            reason=reason,
+        )
+        _wake_event.set()
+        return restored
+    except Exception as exc:  # noqa: BLE001 - служебный ответ уже поставлен в очередь
+        log.warning(
+            "iu client bot: AI control was not restored for %s: %s",
+            conversation_id,
+            _safe_error(exc),
+        )
+        return None
+
+
 def _conversation_for_bot_chat(chat_id: Any) -> int | None:
     """Обращение, заведённое для этого чата с ботом."""
 
@@ -866,11 +933,22 @@ def _reply_and_hand_over(
         **reply_options,
     )
     _cancel_bot_reminders(conversation_id)
-    _hand_over_to_human(
-        conversation_id,
-        reason,
-        manager_requested=manager_requested,
-    )
+    duplicate_already_handed_over = False
+    if bool((queued or {}).get("duplicate")):
+        queued_conversation = dict((queued or {}).get("conversation") or {})
+        current_conversation = (
+            queued_conversation
+            or dict(_store().get_conversation(conversation_id) or {})
+        )
+        duplicate_already_handed_over = (
+            str(current_conversation.get("control_mode") or "") == "human"
+        )
+    if not duplicate_already_handed_over:
+        _hand_over_to_human(
+            conversation_id,
+            reason,
+            manager_requested=manager_requested,
+        )
     return queued
 
 
@@ -953,6 +1031,11 @@ def _enter_support(
             reply_markup=iu_client_bot.support_menu(),
             metadata={"iu_event": "support_enter", "faq_unavailable": True},
         )
+    _restore_ai_after_service_reply(
+        conversation_id,
+        queued,
+        reason="Клиент явно открыл режим «Задать вопрос».",
+    )
     anchor = _as_int(((queued or {}).get("message") or {}).get("id"))
     try:
         iu_bot_reminders.schedule_waiting_question(
@@ -1072,6 +1155,7 @@ def ingest_bot_message(
     )
     previous_messages = _bot_messages(existing_id) if existing_id else []
     previous_support = iu_bot_state.support_state(previous_messages)
+    legacy_repeat_join_hold = _legacy_repeat_join_hold(previous_conversation)
     manager_window_open = _manager_notifications_open()
     is_command = text.strip().startswith("/")
     # Пункт меню приходит обычным текстом. Это выбор действия, а не вопрос: отвечает
@@ -1100,6 +1184,7 @@ def ingest_bot_message(
             and media_type == "text"
             and not awaiting_file_context
             and previous_support.mode in {"active", "quiet"}
+            and not legacy_repeat_join_hold
         )
     command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower() if text.strip() else ""
     start_payload = ""
@@ -1139,20 +1224,30 @@ def ingest_bot_message(
     if not handle_scenario:
         return conversation_id, _as_int(journaled.get("id"))
     if command == "/start":
-        _reply_to_client(
+        queued = _reply_to_client(
             conversation_id,
             iu_client_bot.WELCOME if not previous_messages else iu_client_bot.WELCOME_BACK,
             idempotency_key=f"iu-bot:start:{chat_id}:{external_message_id}",
             reply_markup=iu_client_bot.main_menu(),
             metadata={"iu_event": "start"},
         )
+        _restore_ai_after_service_reply(
+            conversation_id,
+            queued,
+            reason="Клиент перезапустил сценарий командой /start.",
+        )
     elif command == "/menu":
-        _reply_to_client(
+        queued = _reply_to_client(
             conversation_id,
             iu_client_bot.MENU_PROMPT,
             idempotency_key=f"iu-bot:menu-command:{chat_id}:{external_message_id}",
             reply_markup=iu_client_bot.main_menu(),
             metadata={"iu_event": "menu"},
+        )
+        _restore_ai_after_service_reply(
+            conversation_id,
+            queued,
+            reason="Клиент вернулся в главное меню командой /menu.",
         )
     elif command == "/stop":
         _reply_to_client(
@@ -1182,7 +1277,7 @@ def ingest_bot_message(
     ):
         import iu_manager_response_watch
 
-        _reply_and_hand_over(
+        queued = _reply_and_hand_over(
             conversation_id,
             iu_manager_response_watch.AFTER_HOURS_CLIENT_REPLY,
             idempotency_key=iu_manager_response_watch.after_hours_period_key(
@@ -1199,6 +1294,27 @@ def ingest_bot_message(
             },
             reply_markup=iu_client_bot.remove_keyboard(),
         )
+        if not queued or bool(queued.get("duplicate")):
+            fallback = _reply_to_client(
+                conversation_id,
+                iu_client_bot.STRICT_QUESTION_HINT,
+                idempotency_key=(
+                    f"iu-bot:after-hours-hint:{chat_id}:{external_message_id}"
+                ),
+                reply_markup=iu_client_bot.main_menu(),
+                metadata={
+                    "iu_event": "strict_question_hint",
+                    "after_hours_fallback": True,
+                },
+            )
+            if legacy_repeat_join_hold:
+                _restore_ai_after_service_reply(
+                    conversation_id,
+                    fallback,
+                    reason=(
+                        "Снят старый автоматический handoff повторного открытия анкеты."
+                    ),
+                )
     elif (
         media_type != "text"
         and not has_media_caption
@@ -1253,7 +1369,10 @@ def ingest_bot_message(
         )
     elif (
         not schedule_ai
-        and previous_conversation.get("control_mode") != "human"
+        and (
+            previous_conversation.get("control_mode") != "human"
+            or legacy_repeat_join_hold
+        )
         and not iu_bot_state.bot_stopped(previous_messages)
     ):
         if iu_bot_state.last_join_result(previous_messages) == "filled":
@@ -1269,13 +1388,21 @@ def ingest_bot_message(
             # Вне режима поддержки ИИ не отвечает по существу и не переводит клиента
             # к человеку самовольно. На каждое свободное сообщение напоминаем, какой
             # пункт меню открывает консультацию.
-            _reply_to_client(
+            queued = _reply_to_client(
                 conversation_id,
                 iu_client_bot.STRICT_QUESTION_HINT,
                 idempotency_key=f"iu-bot:strict-hint:{chat_id}:{external_message_id}",
                 reply_markup=iu_client_bot.main_menu(),
                 metadata={"iu_event": "strict_question_hint"},
             )
+            if legacy_repeat_join_hold:
+                _restore_ai_after_service_reply(
+                    conversation_id,
+                    queued,
+                    reason=(
+                        "Снят старый автоматический handoff повторного открытия анкеты."
+                    ),
+                )
     return conversation_id, _as_int(journaled.get("id"))
 
 
@@ -1588,7 +1715,7 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
             },
         )
     elif action == iu_client_bot.CB_JOIN_MENU:
-        _reply_to_client(
+        queued = _reply_to_client(
             conversation_id,
             iu_client_bot.MENU_PROMPT,
             idempotency_key=idempotency_key,
@@ -1597,6 +1724,11 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
                 "iu_event": "join_filled_menu",
                 "join_filled_choice": "menu",
             },
+        )
+        _restore_ai_after_service_reply(
+            conversation_id,
+            queued,
+            reason="Клиент выбрал возврат из анкеты в главное меню.",
         )
 
 

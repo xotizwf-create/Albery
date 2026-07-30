@@ -24,6 +24,8 @@ class FakeStore:
         control_mode="ai",
         messages=None,
         deal_id=284,
+        metadata=None,
+        assigned_to=None,
     ):
         self.ingested: list[dict] = []
         self.queued: list[dict] = []
@@ -32,6 +34,8 @@ class FakeStore:
         self.control_mode = control_mode
         self.messages = list(messages or [])
         self.deal_id = deal_id
+        self.metadata = dict(metadata or {})
+        self.assigned_to = assigned_to
 
     def ingest_business_message(self, **kwargs):
         self.ingested.append(kwargs)
@@ -45,6 +49,8 @@ class FakeStore:
             "source_key": "telegram_bot",
             "display_name": "Пётр Иванов",
             "deal_id": self.deal_id,
+            "metadata": self.metadata,
+            "assigned_to": self.assigned_to,
         }
 
     def count_agent_replies(self, conversation_id):
@@ -60,6 +66,16 @@ class FakeStore:
     def mark_waiting_human(self, conversation_id, **kwargs):
         self.transitions.append({"conversation_id": conversation_id, **kwargs})
         return {"conversation": {"id": conversation_id, "status": "waiting"}}
+
+    def transition_control(self, conversation_id, **kwargs):
+        self.transitions.append(
+            {"kind": "control", "conversation_id": conversation_id, **kwargs}
+        )
+        self.control_mode = kwargs["mode"]
+        return {
+            **self.get_conversation(conversation_id),
+            "state_version": 8,
+        }
 
 
 def _tg(monkeypatch, answered=None):
@@ -442,7 +458,11 @@ def test_filled_join_manager_choice_notifies_and_hands_over(monkeypatch):
 
 
 def test_filled_join_menu_choice_opens_menu_without_notification(monkeypatch):
-    store = FakeStore(messages=[_pending_filled_join_message()], deal_id=284)
+    store = FakeStore(
+        messages=[_pending_filled_join_message()],
+        deal_id=284,
+        control_mode="human",
+    )
     monkeypatch.setattr(gateway, "_store", lambda: store)
     monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
     _tg(monkeypatch)
@@ -454,7 +474,97 @@ def test_filled_join_menu_choice_opens_menu_without_notification(monkeypatch):
     assert queued["metadata"]["iu_event"] == "join_filled_menu"
     assert "notify_manager_after_delivery" not in queued["metadata"]
     assert queued["metadata"]["reply_markup"] == bot.main_menu()
-    assert store.transitions == []
+    assert store.transitions[0]["kind"] == "control"
+    assert store.transitions[0]["mode"] == "ai"
+    assert "главное меню" in store.transitions[0]["reason"]
+
+
+def _legacy_repeat_join_metadata():
+    return {
+        "manager_requested_at": "2026-07-30T18:39:56+00:00",
+        "manager_request_reason": gateway.LEGACY_REPEAT_JOIN_HANDOFF_REASON,
+        "manager_request_handled_at": "2026-07-30T18:38:48+00:00",
+    }
+
+
+def test_legacy_hold_detector_does_not_override_a_handled_or_assigned_dialog():
+    base = {
+        "source_key": "telegram_bot",
+        "control_mode": "human",
+        "assigned_to": None,
+        "metadata": _legacy_repeat_join_metadata(),
+    }
+    assert gateway._legacy_repeat_join_hold(base) is True
+
+    handled = {
+        **base,
+        "metadata": {
+            **_legacy_repeat_join_metadata(),
+            "manager_request_handled_at": "2026-07-30T18:40:00+00:00",
+        },
+    }
+    assigned = {**base, "assigned_to": "Александр"}
+    assert gateway._legacy_repeat_join_hold(handled) is False
+    assert gateway._legacy_repeat_join_hold(assigned) is False
+
+
+def test_legacy_repeat_join_hold_gets_hint_and_returns_to_ai(monkeypatch):
+    store = FakeStore(
+        control_mode="human",
+        metadata=_legacy_repeat_join_metadata(),
+    )
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message_update("Что происходит"))
+
+    assert store.ingested[0]["schedule_ai"] is False
+    assert store.queued[0]["text"] == bot.STRICT_QUESTION_HINT
+    assert store.queued[0]["metadata"]["iu_event"] == "strict_question_hint"
+    assert store.transitions[0]["kind"] == "control"
+    assert store.transitions[0]["mode"] == "ai"
+
+
+def test_repeated_after_hours_message_falls_back_to_hint_instead_of_silence(
+    monkeypatch,
+):
+    import iu_manager_response_watch as watch
+
+    class DuplicateNightStore(FakeStore):
+        def enqueue_outgoing_agent(self, conversation_id, **kwargs):
+            if str(kwargs.get("idempotency_key") or "").startswith("night:"):
+                return {
+                    "duplicate": True,
+                    "conversation": self.get_conversation(conversation_id),
+                    "message": {"id": 10},
+                    "outbox": {"id": 11},
+                }
+            return super().enqueue_outgoing_agent(conversation_id, **kwargs)
+
+    store = DuplicateNightStore(
+        control_mode="human",
+        metadata=_legacy_repeat_join_metadata(),
+    )
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    monkeypatch.setattr(gateway, "_manager_notifications_open", lambda: False)
+    monkeypatch.setattr(
+        watch,
+        "after_hours_period_key",
+        lambda conversation_id: f"night:{conversation_id}:2026-07-30",
+    )
+    monkeypatch.setattr(gateway, "_cancel_bot_reminders", lambda *_a, **_k: None)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(_message_update("Что происходит"))
+
+    assert len(store.queued) == 1
+    assert store.queued[0]["text"] == bot.STRICT_QUESTION_HINT
+    assert store.queued[0]["metadata"]["after_hours_fallback"] is True
+    assert store.transitions[0]["kind"] == "control"
+    assert store.transitions[0]["mode"] == "ai"
+    assert all("permanent_human" not in item for item in store.transitions)
 
 
 def test_any_ai_escalation_enqueues_the_same_bitrix_manager_alert(monkeypatch):
