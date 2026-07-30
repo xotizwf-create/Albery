@@ -199,7 +199,7 @@ def test_support_entry_sends_faq_and_prompt_as_one_message(monkeypatch):
     assert "keyboard" in store.queued[0]["metadata"]["reply_markup"]
 
 
-def test_file_handover_always_sets_badge_and_bitrix_notification(monkeypatch):
+def test_file_handover_notifies_without_claiming_an_explicit_manager_call(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)
     monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
@@ -222,8 +222,8 @@ def test_file_handover_always_sets_badge_and_bitrix_notification(monkeypatch):
     assert store.queued[0]["metadata"]["manager_notification_recipient"] == "16"
     assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
     assert store.queued[0]["metadata"]["manager_notification_client_name"] == "Пётр Иванов"
-    assert store.queued[0]["metadata"]["manager_notification_kind"] == "client_called"
-    assert store.transitions[0]["manager_requested"] is True
+    assert store.queued[0]["metadata"]["manager_notification_kind"] == "manager_needed"
+    assert store.transitions[0]["manager_requested"] is False
     assert store.transitions[0]["permanent_human"] is True
 
 
@@ -262,6 +262,7 @@ def test_calculator_message_with_filled_form_calls_manager(monkeypatch):
     assert store.queued[0]["metadata"]["notify_manager_after_delivery"] is True
     assert store.queued[0]["metadata"]["iu_event"] == "calculator_discussion_filled"
     assert store.transitions[0]["manager_requested"] is True
+    assert store.queued[0]["metadata"]["manager_notification_kind"] == "client_called"
 
 
 def test_any_ai_escalation_enqueues_the_same_bitrix_manager_alert(monkeypatch):
@@ -374,6 +375,7 @@ def test_calling_the_operator_hands_the_dialog_to_a_human(monkeypatch):
     assert store.queued[0]["metadata"]["notify_manager_after_delivery"] is True
     assert store.queued[0]["metadata"]["manager_notification_recipient"] == "16"
     assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
+    assert store.queued[0]["metadata"]["manager_notification_kind"] == "client_called"
 
 
 def test_third_ai_reply_carries_support_exit_and_operator(monkeypatch):

@@ -118,6 +118,7 @@ def test_night_handover_acknowledges_client_without_alerting_manager(monkeypatch
         idempotency_key="ordinary-handoff",
         event="operator_called",
         reason="Клиент позвал менеджера.",
+        manager_requested=True,
     )
 
     assert queued[0][1] == watch.AFTER_HOURS_CLIENT_REPLY

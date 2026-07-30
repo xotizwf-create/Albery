@@ -786,6 +786,7 @@ def _reply_and_hand_over(
     idempotency_key: str,
     event: str,
     reason: str,
+    manager_requested: bool = False,
     metadata: Mapping[str, Any] | None = None,
     **reply_options: Any,
 ) -> dict[str, Any] | None:
@@ -795,7 +796,15 @@ def _reply_and_hand_over(
 
     payload = dict(metadata or {})
     if _manager_notifications_open():
-        payload.update(_manager_request_metadata(event, conversation_id))
+        payload.update(
+            _manager_request_metadata(
+                event,
+                conversation_id,
+                notification_kind=(
+                    "client_called" if manager_requested else "manager_needed"
+                ),
+            )
+        )
     else:
         import iu_client_bot
 
@@ -822,7 +831,7 @@ def _reply_and_hand_over(
     _hand_over_to_human(
         conversation_id,
         reason,
-        manager_requested=True,
+        manager_requested=manager_requested,
     )
     return queued
 
@@ -1316,6 +1325,7 @@ def _handle_calculator_discussion(
             reason=(
                 "Клиент вернулся из калькулятора, хочет обсудить условия; анкета заполнена."
             ),
+            manager_requested=True,
             reply_markup=iu_client_bot.remove_keyboard(),
             metadata={"calculator_origin": True},
         )
@@ -1409,6 +1419,7 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
                 idempotency_key=idempotency_key,
                 event="operator_called",
                 reason="Клиент выбрал «Позвать оператора».",
+                manager_requested=True,
                 reply_markup=iu_client_bot.remove_keyboard(),
             )
     elif action == iu_client_bot.CB_EXIT_SUPPORT:
