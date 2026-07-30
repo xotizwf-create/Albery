@@ -287,6 +287,6 @@ def test_already_filled_answer_does_not_offer_the_form_again():
 
     assert filled is True
     assert "• Имя — Александр" in body
-    assert "Если всё верно - то пожалуйста, подождите" in body
-    assert "нужно изменить данные в анкете" in body
+    assert "Если нужно что-то исправить или обсудить" in body
+    assert "Если всё верно и помощь не требуется" in body
     assert "http" not in body

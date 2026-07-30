@@ -31,6 +31,8 @@ BUTTON_CONFIRM_YES = "✅ Да"
 BUTTON_CONFIRM_NO = "❌ Нет"
 BUTTON_FORM_QUESTIONS_YES = "Да"
 BUTTON_FORM_QUESTIONS_NO = "Нет"
+BUTTON_JOIN_MANAGER = "🙋 Позвать менеджера"
+BUTTON_JOIN_MENU = "↩️ Перейти в меню"
 
 CB_TERMS = "iu:terms"
 CB_JOIN = "iu:join"
@@ -42,6 +44,8 @@ CB_CONFIRM_YES = "iu:exit-yes"
 CB_CONFIRM_NO = "iu:exit-no"
 CB_FORM_QUESTIONS_YES = "iu:form-questions-yes"
 CB_FORM_QUESTIONS_NO = "iu:form-questions-no"
+CB_JOIN_MANAGER = "iu:join-manager"
+CB_JOIN_MENU = "iu:join-menu"
 
 #: После двух ответов ИИ кнопка показывается вместе с ответом на третий вопрос.
 OPERATOR_OFFER_AFTER_REPLIES = int(os.getenv("IU_CLIENT_BOT_OPERATOR_AFTER", "2") or "2")
@@ -104,9 +108,12 @@ JOIN_STUB = (
 #: Анкета уже заполнена: второй раз её давать нельзя (владелец 29.07.2026). Данные
 #: показываем те, что РЕАЛЬНО лежат в сделке, — «вот ваши данные» из его же формулировки.
 JOIN_FILLED_FOLLOWUP = (
-    "Если всё верно - то пожалуйста, подождите, менеджер с Вами скоро свяжется\n\n"
-    "Если у Вас есть срочный вопрос или нужно изменить данные в анкете - "
-    "напишите прямо сюда, я передам это менеджеру"
+    "Проверьте, пожалуйста, данные выше.\n\n"
+    "Если нужно что-то исправить или обсудить — нажмите «Позвать менеджера».\n\n"
+    "Если всё верно и помощь не требуется — нажмите «Перейти в меню»."
+)
+JOIN_MANAGER_CALLED = (
+    "Передал менеджеру — он подключится к диалогу и поможет обсудить или исправить данные."
 )
 FORM_RECEIVED = (
     "Анкету получили. Остались ли у Вас вопросы по подключению?"
@@ -250,6 +257,19 @@ def form_questions_menu() -> dict:
     }
 
 
+def join_filled_menu() -> dict:
+    """Choice shown every time a client opens an already completed form."""
+
+    return {
+        "keyboard": [
+            [{"text": BUTTON_JOIN_MANAGER}],
+            [{"text": BUTTON_JOIN_MENU}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
 def remove_keyboard() -> dict:
     return {"remove_keyboard": True}
 
@@ -293,6 +313,10 @@ def menu_action(text: str) -> str:
         return CB_FORM_QUESTIONS_YES
     if text == BUTTON_FORM_QUESTIONS_NO:
         return CB_FORM_QUESTIONS_NO
+    if text == BUTTON_JOIN_MANAGER:
+        return CB_JOIN_MANAGER
+    if text == BUTTON_JOIN_MENU:
+        return CB_JOIN_MENU
     return _MENU_BY_TITLE.get(_title_key(text), "")
 
 
@@ -337,4 +361,6 @@ def button_label(callback_data: str) -> str:
         CB_CONFIRM_NO: BUTTON_CONFIRM_NO,
         CB_FORM_QUESTIONS_YES: BUTTON_FORM_QUESTIONS_YES,
         CB_FORM_QUESTIONS_NO: BUTTON_FORM_QUESTIONS_NO,
+        CB_JOIN_MANAGER: BUTTON_JOIN_MANAGER,
+        CB_JOIN_MENU: BUTTON_JOIN_MENU,
     }.get(str(callback_data or ""), "")

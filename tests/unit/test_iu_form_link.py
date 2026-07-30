@@ -194,8 +194,8 @@ def test_answer_hides_the_link_when_the_real_anketa_exists():
 
     assert filled is True
     assert "• Категории товара — Одежда" in body
-    assert "Если всё верно - то пожалуйста, подождите" in body
-    assert "нужно изменить данные в анкете" in body
+    assert "Если нужно что-то исправить или обсудить" in body
+    assert "Если всё верно и помощь не требуется" in body
     assert "http" not in body
 
 

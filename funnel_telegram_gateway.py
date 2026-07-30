@@ -1424,24 +1424,19 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
                 _as_int(pending.get("manager_notification_form_deal_id"))
                 or _as_int(conversation.get("deal_id"))
             )
-            _reply_and_hand_over(
+            _reply_to_client(
                 conversation_id,
                 body,
                 idempotency_key=idempotency_key,
-                event="join_filled",
-                reason=(
-                    "Клиент повторно открыл подключение к ИУ при уже заполненной анкете — "
-                    "ему требуется ответ менеджера."
-                ),
-                manager_requested=True,
-                notification_kind="form_completed",
-                reply_markup=iu_client_bot.remove_keyboard(),
+                reply_markup=iu_client_bot.join_filled_menu(),
                 metadata={
+                    "iu_event": "join_filled",
                     **(
                         {"manager_notification_form_deal_id": form_deal_id}
                         if form_deal_id
                         else {}
                     ),
+                    "join_filled_choice_pending": True,
                     "repeat_join": True,
                 },
             )
@@ -1564,6 +1559,43 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
                     if pending.get("calculator_origin")
                     else {}
                 ),
+            },
+        )
+    elif action == iu_client_bot.CB_JOIN_MANAGER:
+        pending = iu_bot_state.pending_filled_join_choice(messages)
+        conversation = _store().get_conversation(conversation_id) or {}
+        form_deal_id = (
+            _as_int(pending.get("manager_notification_form_deal_id"))
+            or _as_int(conversation.get("deal_id"))
+        )
+        _reply_and_hand_over(
+            conversation_id,
+            iu_client_bot.JOIN_MANAGER_CALLED,
+            idempotency_key=idempotency_key,
+            event="join_filled_manager",
+            reason=(
+                "Клиент явно позвал менеджера с экрана заполненной анкеты."
+            ),
+            manager_requested=True,
+            reply_markup=iu_client_bot.remove_keyboard(),
+            metadata={
+                **(
+                    {"manager_notification_form_deal_id": form_deal_id}
+                    if form_deal_id
+                    else {}
+                ),
+                "join_filled_choice": "manager",
+            },
+        )
+    elif action == iu_client_bot.CB_JOIN_MENU:
+        _reply_to_client(
+            conversation_id,
+            iu_client_bot.MENU_PROMPT,
+            idempotency_key=idempotency_key,
+            reply_markup=iu_client_bot.main_menu(),
+            metadata={
+                "iu_event": "join_filled_menu",
+                "join_filled_choice": "menu",
             },
         )
 

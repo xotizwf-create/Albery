@@ -173,8 +173,8 @@ def test_join_copy_for_first_repeat_and_filled_states():
     )
     assert filled is True
     assert "• Категория — Одежда" in complete
-    assert "Если всё верно - то пожалуйста, подождите" in complete
-    assert "нужно изменить данные в анкете" in complete
+    assert "Если нужно что-то исправить или обсудить" in complete
+    assert "Если всё верно и помощь не требуется" in complete
     assert complete.count("Всё верно?") == 0
     assert "https://" not in complete
 
@@ -215,6 +215,10 @@ def test_approved_customer_copy_is_kept_exactly():
             {"text": "Да"},
             {"text": "Нет"},
         ]
+    ]
+    assert bot.join_filled_menu()["keyboard"] == [
+        [{"text": bot.BUTTON_JOIN_MANAGER}],
+        [{"text": bot.BUTTON_JOIN_MENU}],
     ]
     assert bot.EXIT_CONFIRM == "Вы уверены, что хотите выйти из окна поддержки?"
     assert bot.REMINDER_WAITING_QUESTION == (
@@ -258,6 +262,30 @@ def test_post_form_yes_clears_question_and_keeps_support_inactive():
         f"[калькуляторе ИУ]({bot.CALCULATOR_URL}), а также ознакомиться с примерным "
         "договором, прикрепленным ниже."
     )
+
+
+def test_filled_join_choice_is_durable_and_clears_after_selection():
+    prompt = agent(
+        1,
+        "Анкета",
+        event="join_filled",
+        metadata={
+            "join_filled_choice_pending": True,
+            "manager_notification_form_deal_id": 284,
+        },
+    )
+    assert state.pending_filled_join_choice([prompt])[
+        "manager_notification_form_deal_id"
+    ] == 284
+
+    manager_choice = agent(
+        2,
+        bot.JOIN_MANAGER_CALLED,
+        event="join_filled_manager",
+    )
+    menu_choice = agent(3, bot.MENU_PROMPT, event="join_filled_menu")
+    assert state.pending_filled_join_choice([prompt, manager_choice]) == {}
+    assert state.pending_filled_join_choice([prompt, menu_choice]) == {}
 
 
 def test_calculator_discussion_state_survives_until_form_confirmation():

@@ -259,6 +259,23 @@ def pending_form_questions(
     return pending
 
 
+def pending_filled_join_choice(
+    messages: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Metadata of the latest unanswered manager/menu choice for a completed form."""
+
+    pending: Mapping[str, Any] = {}
+    for message in messages:
+        event = event_of(message)
+        if event == "join_filled" and bool(
+            _metadata(message).get("join_filled_choice_pending")
+        ):
+            pending = _metadata(message)
+        elif event in {"join_filled_manager", "join_filled_menu"}:
+            pending = {}
+    return pending
+
+
 def calculator_discussion_pending(messages: Sequence[Mapping[str, Any]]) -> bool:
     """The calculator client still needs to finish the form before manager handover."""
 
