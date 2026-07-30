@@ -11,26 +11,43 @@ from html import escape
 from typing import Any
 
 _TTL_SECONDS = float(os.getenv("IU_BOT_PDF_CACHE_SECONDS", "300") or 300)
+_MAX_PDF_BYTES = int(os.getenv("IU_BOT_PDF_MAX_BYTES", "20000000") or 20000000)
+CONTRACT_DOCUMENT_NAME = os.getenv(
+    "IU_BOT_CONTRACT_DOCUMENT",
+    "Договор оферты",
+).strip()
+FAQ_DOCUMENT_NAME = os.getenv(
+    "IU_BOT_FAQ_DOCUMENT",
+    "Ответы на частые вопросы",
+).strip()
 _cache: dict[str, tuple[float, bytes]] = {}
 _attachment_cache: dict[str, tuple[str, dict[str, Any]]] = {}
 _lock = threading.Lock()
 
 
+def _company_file(name: str) -> dict[str, Any] | None:
+    from mcp import context_server as cs
+
+    listed = cs.TOOLS["list_company_files"]["handler"](
+        {"limit": 300, "include_empty": True}
+    ) or {}
+    items = listed.get("files") or listed.get("items") or []
+    wanted = name.strip().casefold()
+    matches = [
+        item
+        for item in items
+        if str(item.get("name") or "").strip().casefold() == wanted
+        and item.get("google_file_id")
+    ]
+    if len(matches) > 1:
+        raise RuntimeError(f"В базе знаний несколько документов «{name}».")
+    return dict(matches[0]) if matches else None
+
+
 def _company_document(name: str) -> str:
     from mcp import context_server as cs
 
-    listed = cs.TOOLS["list_company_files"]["handler"]({"limit": 300}) or {}
-    items = listed.get("files") or listed.get("items") or []
-    wanted = name.casefold()
-    match = next(
-        (
-            item
-            for item in items
-            if wanted in str(item.get("name") or "").casefold()
-            and item.get("google_file_id")
-        ),
-        None,
-    )
+    match = _company_file(name)
     if not match:
         raise RuntimeError(f"В базе знаний нет документа «{name}».")
     result = cs.TOOLS["get_company_file"]["handler"](
@@ -48,50 +65,119 @@ def _company_document(name: str) -> str:
     return body
 
 
+def _drive_client() -> Any:
+    from googleapiclient.discovery import build
+    from mcp import context_server as cs
+
+    return build(
+        "drive",
+        "v3",
+        credentials=cs._google_creds_for_fetch(),
+        cache_discovery=False,
+    )
+
+
+def _drive_pdf_source(name: str) -> tuple[Any, dict[str, Any]]:
+    """Найти ровно один утверждённый файл и вернуть Drive-клиент с метаданными.
+
+    Google Docs попадают в зеркало базы знаний вместе с текстом. Загруженный PDF
+    договора текста в зеркале не имеет, поэтому для него допустим точный поиск по
+    имени в Drive. Подстроки не принимаются: архив или черновик нельзя отправить
+    клиенту вместо утверждённого документа.
+    """
+
+    drive = _drive_client()
+    mirrored = _company_file(name)
+    if mirrored:
+        metadata = drive.files().get(
+            fileId=str(mirrored["google_file_id"]),
+            fields="id,name,mimeType,size,modifiedTime",
+            supportsAllDrives=True,
+        ).execute()
+        return drive, dict(metadata or {})
+
+    # Загруженный PDF ещё не имеет текстовой записи в зеркале. Ограничиваем
+    # поиск родительской папкой уже синхронизированного клиентского FAQ, чтобы
+    # одноимённый файл из личного Drive или архива никогда не ушёл клиенту.
+    anchor = _company_file(FAQ_DOCUMENT_NAME)
+    if not anchor:
+        raise RuntimeError(
+            f"Не удалось подтвердить папку базы знаний для файла «{name}»."
+        )
+    anchor_metadata = drive.files().get(
+        fileId=str(anchor["google_file_id"]),
+        fields="parents",
+        supportsAllDrives=True,
+    ).execute()
+    parent_ids = [
+        str(parent).strip()
+        for parent in (anchor_metadata.get("parents") or [])
+        if str(parent).strip()
+    ]
+    if not parent_ids:
+        raise RuntimeError(
+            f"У клиентского FAQ нет папки базы знаний; файл «{name}» не выбран."
+        )
+    escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+    parent_query = " or ".join(f"'{parent}' in parents" for parent in parent_ids)
+    response = drive.files().list(
+        q=f"name = '{escaped}' and trashed = false and ({parent_query})",
+        fields="files(id,name,mimeType,size,modifiedTime)",
+        pageSize=20,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    wanted = name.strip().casefold()
+    matches = [
+        dict(item)
+        for item in (response.get("files") or [])
+        if str(item.get("name") or "").strip().casefold() == wanted
+    ]
+    if not matches:
+        raise RuntimeError(f"В базе знаний нет файла «{name}».")
+    if len(matches) > 1:
+        raise RuntimeError(f"В Google Drive несколько файлов «{name}».")
+    return drive, matches[0]
+
+
+def _original_pdf_bytes(name: str) -> bytes:
+    drive, metadata = _drive_pdf_source(name)
+    file_id = str(metadata.get("id") or "").strip()
+    mime_type = str(metadata.get("mimeType") or "").strip().lower()
+    if not file_id:
+        raise RuntimeError(f"У файла «{name}» нет Google ID.")
+    if mime_type == "application/vnd.google-apps.document":
+        data = drive.files().export(
+            fileId=file_id,
+            mimeType="application/pdf",
+        ).execute()
+    elif mime_type == "application/pdf":
+        data = drive.files().get_media(
+            fileId=file_id,
+            supportsAllDrives=True,
+        ).execute()
+    else:
+        raise RuntimeError(
+            f"Файл «{name}» имеет неподдерживаемый тип {mime_type or 'без типа'}."
+        )
+    if not isinstance(data, bytes):
+        data = bytes(data or b"")
+    if len(data) > _MAX_PDF_BYTES:
+        raise RuntimeError(f"PDF «{name}» больше допустимых {_MAX_PDF_BYTES} байт.")
+    if not data.startswith(b"%PDF-"):
+        raise RuntimeError(f"Google Drive не вернул корректный PDF «{name}».")
+    return data
+
+
 def source_text(kind: str) -> str:
     if kind == "terms":
         import tg_agent
 
         return tg_agent.terms_text()
     if kind == "contract":
-        import contract
-
-        # Это именно пример: юридический текст берётся из утверждённого шаблона, а
-        # реквизиты конкретного клиента не подставляются.
-        try:
-            body = contract.load_template()
-        except Exception:
-            # Шаблон может быть временно исключён из зеркала базы знаний, оставаясь
-            # доступным владельцу на Drive. Читаем тот же утверждённый Google Doc,
-            # а не подменяем юридический текст встроенной копией.
-            from mcp import context_server as cs
-
-            url = (
-                "https://docs.google.com/document/d/"
-                f"{contract.TEMPLATE_DOC_ID}/edit"
-            )
-            fetched = cs.TOOLS["fetch_url"]["handler"](
-                {"url": url, "max_chars": 200000}
-            ) or {}
-            body = str(fetched.get("text") or "")
-            body = contract._SOURCE_HEADER_RE.sub("", body).strip()
-            if not body:
-                raise RuntimeError("Утверждённый шаблон договора недоступен.")
-        blank = "________________"
-        client = {
-            field: blank
-            for field in set(contract.CLIENT_PLACEHOLDERS.values())
-        }
-        return contract.fill_template(
-            body,
-            client,
-            "ПРИМЕР",
-            "«___» __________ 20__ г.",
-        )
+        return _company_document(CONTRACT_DOCUMENT_NAME)
     if kind == "faq":
-        import iu_runtime
-
-        return _company_document(iu_runtime.QA_DOC_NAME)
+        return _company_document(FAQ_DOCUMENT_NAME)
     raise ValueError(f"Неизвестный PDF ИУ: {kind}")
 
 
@@ -149,12 +235,14 @@ def pdf_bytes(kind: str) -> bytes:
         cached = _cache.get(kind)
         if cached and now - cached[0] < _TTL_SECONDS:
             return cached[1]
-    titles = {
-        "terms": "Условия присоединения к ИУ",
-        "contract": "Примерный договор ИУ",
-        "faq": "Ответы на частые вопросы",
-    }
-    data = render_pdf(titles[kind], source_text(kind))
+    if kind == "contract":
+        data = _original_pdf_bytes(CONTRACT_DOCUMENT_NAME)
+    elif kind == "faq":
+        data = _original_pdf_bytes(FAQ_DOCUMENT_NAME)
+    elif kind == "terms":
+        data = render_pdf("Условия присоединения к ИУ", source_text(kind))
+    else:
+        raise ValueError(f"Неизвестный PDF ИУ: {kind}")
     with _lock:
         _cache[kind] = (now, data)
     return data
@@ -165,7 +253,7 @@ def attachment(kind: str) -> dict[str, Any]:
 
     names = {
         "terms": "Условия присоединения к ИУ.pdf",
-        "contract": "Примерный договор ИУ.pdf",
+        "contract": "Договор оферты.pdf",
         "faq": "Ответы на частые вопросы.pdf",
     }
     data = pdf_bytes(kind)

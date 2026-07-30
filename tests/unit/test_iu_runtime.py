@@ -217,32 +217,36 @@ def test_deal_is_opened_only_for_our_topic():
     assert iu_runtime.about_our_product(outcome(iu_contract.SEND_TERMS))
 
 
-# --- знания собираются из ВСЕЙ папки, а не из одного документа ------------------------------
+# --- агент читает только свой документ -------------------------------------------------------
 
-def test_knowledge_cards_include_the_terms_document(monkeypatch):
-    """Албери отвечает лучше, потому что видит оба документа папки. Теперь их видит и агент.
-
-    Живой разбор 29.07.2026: на «когда выплаты?» Албери называл срок и еженедельный отчёт
-    комиссионера, а клиентский агент отправлял вопрос людям — этих фактов не было в его
-    знаниях, потому что читался только документ «Вопрос - ответ»."""
+def test_knowledge_cards_ignore_every_client_document(monkeypatch):
+    """Оферта, FAQ и условия отправляются клиенту, но не подмешиваются в промпт."""
     import sys
     import types
 
     documents = {
-        "Вопрос - ответ": "1. Какая комиссия?\n\nОтвет: Базовая комиссия 44%.",
-        "Условия ИУ — текст для клиента": (
-            "Как работает документ: текст ниже уходит клиенту дословно.\n"
-            "--- ТЕКСТ КЛИЕНТУ ---\n"
-            "Что входит в условия:\n\n"
-            "- Выплаты в течение 3 рабочих дней после поступления средств от Wildberries.\n"
+        "Вопрос - ответ для Агента": (
+            "1. Какая комиссия?\n\nОтвет: Базовая комиссия 44%."
         ),
+        "Ответы на частые вопросы": (
+            "1. Скрытый FAQ?\n\nОтвет: Этот текст агент читать не должен."
+        ),
+        "Условия ИУ — текст для клиента": (
+            "1. Скрытые условия?\n\nОтвет: Выплаты в течение 3 рабочих дней."
+        ),
+        "Договор оферты": "1. Скрытая оферта?\n\nОтвет: Юридический текст.",
     }
     files = [{"name": name, "google_file_id": name} for name in documents]
+    requested: list[str] = []
 
     fake_cs = types.SimpleNamespace(TOOLS={
         "list_company_files": {"handler": lambda args: {"files": files}},
         "get_company_file": {
-            "handler": lambda args: {"content": documents[args["google_file_id"]]}},
+            "handler": lambda args: (
+                requested.append(args["google_file_id"])
+                or {"content": documents[args["google_file_id"]]}
+            )
+        },
     })
     monkeypatch.setitem(sys.modules, "mcp.context_server", fake_cs)
     monkeypatch.setattr("mcp.context_server", fake_cs, raising=False)
@@ -251,12 +255,7 @@ def test_knowledge_cards_include_the_terms_document(monkeypatch):
     bodies = "\n".join(card.answer for card in cards)
 
     assert "Базовая комиссия 44%" in bodies
-    assert "3 рабочих дней" in bodies
-    # Инструкция владельца самому себе клиенту не нужна и в знания попасть не должна.
-    assert "уходит клиенту дословно" not in bodies
-
-
-def test_missing_terms_marker_does_not_poison_the_knowledge(monkeypatch):
-    """Документ без строки-маркера в знания не идёт: там служебный текст, а не факты."""
-    assert iu_runtime._terms_cards("Черновик условий без маркера.") == ()
-    assert iu_runtime._terms_cards("") == ()
+    assert "3 рабочих дней" not in bodies
+    assert "Юридический текст" not in bodies
+    assert "Этот текст агент читать не должен" not in bodies
+    assert requested == [iu_runtime.AGENT_QA_DOC_NAME]

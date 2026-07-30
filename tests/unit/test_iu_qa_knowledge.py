@@ -109,24 +109,29 @@ def test_empty_answer_stays_a_draft():
     assert by_title["Что ещё?"].approved is True
 
 
-def test_runtime_reads_both_documents(monkeypatch):
-    """Раздел «Вопрос — ответ» встаёт рядом с карточками, а не вместо них."""
+def test_runtime_reads_only_the_agent_question_answer_document(monkeypatch):
+    """Клиентские PDF не должны становиться скрытыми знаниями ИИ."""
 
     import sys
     from types import SimpleNamespace
 
     import iu_runtime
 
-    documents = {
-        "doc-cards": "### Комиссия\nОтвет: Единая комиссия 44%.\n",
-        "doc-qa": DOCUMENT,
-    }
+    requested: list[str] = []
+    documents = {"doc-agent": DOCUMENT}
     tools = {
         "list_company_files": {"handler": lambda _args: {"files": [
-            {"name": iu_runtime.KNOWLEDGE_DOC_NAME, "google_file_id": "doc-cards"},
-            {"name": iu_runtime.QA_DOC_NAME, "google_file_id": "doc-qa"},
+            {"name": iu_runtime.AGENT_QA_DOC_NAME, "google_file_id": "doc-agent"},
+            {"name": "Ответы на частые вопросы", "google_file_id": "doc-client-faq"},
+            {"name": "Условия ИУ — текст для клиента", "google_file_id": "doc-terms"},
+            {"name": "Договор оферты", "google_file_id": "doc-contract"},
         ]}},
-        "get_company_file": {"handler": lambda args: {"content": documents[args["google_file_id"]]}},
+        "get_company_file": {
+            "handler": lambda args: (
+                requested.append(args["google_file_id"])
+                or {"content": documents[args["google_file_id"]]}
+            )
+        },
     }
     monkeypatch.setitem(sys.modules, "mcp.context_server", SimpleNamespace(TOOLS=tools))
     monkeypatch.setitem(sys.modules, "mcp", SimpleNamespace(context_server=SimpleNamespace(TOOLS=tools)))
@@ -134,28 +139,35 @@ def test_runtime_reads_both_documents(monkeypatch):
     cards = iu_runtime.knowledge_cards(force=True)
 
     titles = [card.title for card in cards]
-    assert "Комиссия" in titles, "карточки основного документа никуда не делись"
-    assert "От какой суммы считается процент?" in titles, "вопросы раздела подключены"
+    assert "От какой суммы считается процент?" in titles
+    assert requested == ["doc-agent"]
 
 
-def test_missing_qa_document_does_not_break_the_rest(monkeypatch):
+def test_missing_agent_document_does_not_fall_back_to_client_files(monkeypatch):
     import sys
     from types import SimpleNamespace
 
     import iu_runtime
 
+    requested: list[str] = []
     tools = {
         "list_company_files": {"handler": lambda _args: {"files": [
-            {"name": iu_runtime.KNOWLEDGE_DOC_NAME, "google_file_id": "doc-cards"},
+            {"name": "Ответы на частые вопросы", "google_file_id": "doc-client-faq"},
         ]}},
-        "get_company_file": {"handler": lambda _args: {"content": "### Комиссия\nОтвет: 44%.\n"}},
+        "get_company_file": {
+            "handler": lambda args: (
+                requested.append(args["google_file_id"])
+                or {"content": DOCUMENT}
+            )
+        },
     }
     monkeypatch.setitem(sys.modules, "mcp.context_server", SimpleNamespace(TOOLS=tools))
     monkeypatch.setitem(sys.modules, "mcp", SimpleNamespace(context_server=SimpleNamespace(TOOLS=tools)))
 
     cards = iu_runtime.knowledge_cards(force=True)
 
-    assert [card.title for card in cards] == ["Комиссия"]
+    assert cards == ()
+    assert requested == []
 
 
 # Фрагмент документа владельца от 28.07.2026, второй список вопросов. Ответы под вопросами
