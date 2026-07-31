@@ -106,6 +106,7 @@ def test_migration_contains_durable_update_job_and_outbox_tables():
     assert "CREATE TABLE IF NOT EXISTS funnel_workspace_crm_actions" in migration
     assert "CREATE INDEX IF NOT EXISTS idx_fwu_business_head" in migration
     assert "CREATE INDEX IF NOT EXISTS idx_fwu_bot_head" in migration
+    assert "CREATE INDEX IF NOT EXISTS idx_fwm_text_trgm" in migration
     assert "action_type IN ('ensure_deal', 'delivery_effects', 'move_stage')" in migration
     assert "uq_fwca_ensure_conversation" in migration
     assert "WHERE processing_status = 'pending'" in migration
@@ -1091,7 +1092,7 @@ def test_retention_drains_the_backlog_instead_of_one_batch_per_run():
             return [{"conversation_id": 41}] * batch
         if sql.startswith("DELETE FROM") or "DELETE FROM" in sql:
             return []
-        if sql.startswith("UPDATE funnel_workspace_conversations"):
+        if sql.startswith("WITH base AS"):
             return []
         raise AssertionError(sql)
 
@@ -1100,8 +1101,36 @@ def test_retention_drains_the_backlog_instead_of_one_batch_per_run():
 
     assert remaining["messages"] == 0
     assert result["messages"] == 2500
-    # Каждая партия — своя транзакция, иначе чистка держит блокировки целиком.
-    assert connection.commits >= 3
+    message_deletes = [
+        sql
+        for sql, _params in connection.cursor_instance.executed
+        if "DELETE FROM funnel_workspace_messages m" in sql
+    ]
+    assert len(message_deletes) == 3
+
+
+def test_retention_honours_the_bounded_batch_cap():
+    def respond(sql, _params):
+        if "DELETE FROM funnel_workspace_messages m" in sql:
+            return [{"conversation_id": 41}]
+        if "DELETE FROM" in sql or sql.startswith("WITH base AS"):
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    result = store.retention_cleanup(
+        days=30,
+        batch_size=1,
+        max_batches=2,
+        now=NOW,
+        connect=connect,
+    )
+
+    assert result["messages"] == 2
+    assert sum(
+        "DELETE FROM funnel_workspace_messages m" in sql
+        for sql, _params in connection.cursor_instance.executed
+    ) == 2
 
 
 def test_retention_never_deletes_a_message_the_live_queues_still_need():
@@ -1113,10 +1142,14 @@ def test_retention_never_deletes_a_message_the_live_queues_still_need():
 
     assert "NOT EXISTS" in cleanup
     assert "funnel_workspace_outbox" in cleanup
-    assert "delivery_status NOT IN ('sent', 'cancelled')" in cleanup
+    assert "delivery_status IN ('pending', 'leased', 'sending', 'unknown')" in cleanup
+    assert "COALESCE(m.delivery_status, 'sent') NOT IN ('pending', 'unknown')" in cleanup
+    assert "funnel_workspace_updates" in cleanup
     assert "funnel_workspace_crm_actions" in cleanup
     assert "funnel_workspace_ai_jobs" in cleanup
     assert "processing_status IN ('pending', 'leased', 'retry')" in cleanup
+    assert "FOR UPDATE OF c" in cleanup
+    assert "FOR UPDATE OF m SKIP LOCKED" in cleanup
 
 
 def test_retention_rebuilds_conversation_counters_after_deleting_history():
@@ -1130,7 +1163,7 @@ def test_retention_rebuilds_conversation_counters_after_deleting_history():
             return []
         if "DELETE FROM" in sql:
             return []
-        if sql.startswith("UPDATE funnel_workspace_conversations"):
+        if sql.startswith("WITH base AS"):
             return []
         raise AssertionError(sql)
 
@@ -1140,7 +1173,7 @@ def test_retention_rebuilds_conversation_counters_after_deleting_history():
     refresh = [
         (sql, params)
         for sql, params in connection.cursor_instance.executed
-        if sql.startswith("UPDATE funnel_workspace_conversations")
+        if sql.startswith("WITH base AS")
     ]
     assert refresh, "счётчики диалога не пересобраны после удаления истории"
     sql, params = refresh[0]
@@ -1148,4 +1181,12 @@ def test_retention_rebuilds_conversation_counters_after_deleting_history():
     assert "last_message_id =" in sql
     assert "last_message_text =" in sql
     assert "last_read_message_id =" in sql
-    assert params[-1] == [41]
+    assert "max(rm.id)" in sql
+    assert "updated_at =" not in sql
+    assert params == ([41],)
+
+
+def test_retention_defaults_to_ninety_days(monkeypatch):
+    monkeypatch.delenv("FUNNEL_WORKSPACE_RETENTION_DAYS", raising=False)
+
+    assert store.retention_days() == 90

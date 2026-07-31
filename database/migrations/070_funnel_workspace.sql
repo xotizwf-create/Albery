@@ -110,6 +110,9 @@ CREATE INDEX IF NOT EXISTS idx_fwm_occurred
     ON funnel_workspace_messages (occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fwm_author
     ON funnel_workspace_messages (author_type, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fwm_text_trgm
+    ON funnel_workspace_messages
+    USING gin (text gin_trgm_ops);
 
 DO $$
 BEGIN
@@ -411,5 +414,5 @@ CREATE TABLE IF NOT EXISTS funnel_workspace_settings (
 INSERT INTO funnel_workspace_settings (setting_key, setting_value)
 VALUES
     ('human_lease_seconds', '120'::jsonb),
-    ('retention_days', '30'::jsonb)
+    ('retention_days', '90'::jsonb)
 ON CONFLICT (setting_key) DO NOTHING;

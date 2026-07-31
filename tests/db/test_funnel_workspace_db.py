@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from psycopg import sql
 
 import funnel_workspace_store as store
 from shared.db import connect
@@ -17,6 +19,7 @@ def test_workspace_tables_and_fk_indexes_exist():
     expected_tables = set(store.SCHEMA_TABLES)
     expected_indexes = {
         "idx_fwc_last_message",
+        "idx_fwm_text_trgm",
         "idx_fwu_conversation",
         "idx_fwu_message",
         "idx_fwu_business_head",
@@ -55,6 +58,56 @@ def test_workspace_tables_and_fk_indexes_exist():
 
     assert tables == expected_tables
     assert indexes == expected_indexes
+
+
+def test_migration_upgrades_the_early_outbox_check_constraint():
+    migration = (
+        Path(__file__).resolve().parents[2]
+        / "database"
+        / "migrations"
+        / "070_funnel_workspace.sql"
+    ).read_text(encoding="utf-8")
+    block_start = migration.index("DO $$\nDECLARE\n    old_check record;")
+    block_end = migration.index("\n$$;", block_start) + len("\n$$;")
+    upgrade_block = migration[block_start:block_end]
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT conname
+                  FROM pg_constraint
+                 WHERE conrelid = 'funnel_workspace_outbox'::regclass
+                   AND contype = 'c'
+                   AND lower(pg_get_constraintdef(oid)) LIKE '%delivery_status%'
+                """
+            )
+            constraint_name = cur.fetchone()["conname"]
+            cur.execute(
+                sql.SQL(
+                    "ALTER TABLE funnel_workspace_outbox DROP CONSTRAINT {}"
+                ).format(sql.Identifier(constraint_name))
+            )
+            cur.execute(
+                sql.SQL(
+                    "ALTER TABLE funnel_workspace_outbox ADD CONSTRAINT {} "
+                    "CHECK (delivery_status IN "
+                    "('pending', 'leased', 'sent', 'failed', 'unknown', 'cancelled'))"
+                ).format(sql.Identifier(constraint_name))
+            )
+            cur.execute(upgrade_block)
+            cur.execute(
+                """
+                SELECT lower(pg_get_constraintdef(oid)) AS definition
+                  FROM pg_constraint
+                 WHERE conrelid = 'funnel_workspace_outbox'::regclass
+                   AND conname = %s
+                """,
+                (constraint_name,),
+            )
+            definition = cur.fetchone()["definition"]
+
+    assert "sending" in definition
 
 
 def test_update_lanes_keep_business_head_of_line_without_bot_blocking():
@@ -447,6 +500,225 @@ def test_search_finds_old_history_and_retention_spares_queued_work():
                     cur.execute(
                         "DELETE FROM funnel_workspace_conversations WHERE id = %s",
                         (conversation_id,),
+                    )
+                cur.execute(
+                    "DELETE FROM funnel_workspace_sources WHERE source_key = %s",
+                    (source_key,),
+                )
+
+
+def test_retention_rebuilds_read_state_and_holds_every_live_queue():
+    suffix = uuid4().hex
+    source_key = f"test-retention-holds-{suffix}"
+    state_conversation_id: int | None = None
+    queue_conversation_id: int | None = None
+    try:
+        store.ensure_source(
+            source_key,
+            source_type="test",
+            display_name="Retention legal-hold DB test",
+        )
+        state_conversation = store.ensure_conversation(
+            source_key=source_key,
+            external_chat_id=f"state-{suffix}",
+            business_connection_id=f"connection-{suffix}",
+            external_user_id=9_000_000_003,
+            display_name="Retention state test",
+        )
+        queue_conversation = store.ensure_conversation(
+            source_key=source_key,
+            external_chat_id=f"queues-{suffix}",
+            business_connection_id=f"connection-{suffix}",
+            external_user_id=9_000_000_004,
+            display_name="Retention queue test",
+        )
+        state_conversation_id = int(state_conversation["id"])
+        queue_conversation_id = int(queue_conversation["id"])
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO funnel_workspace_messages (
+                        conversation_id, external_message_id, author_type,
+                        direction, text, delivery_status, occurred_at
+                    )
+                    VALUES
+                        (%s, %s, 'client', 'inbound', 'прочитанное остаётся', 'sent', now()),
+                        (%s, %s, 'client', 'inbound', 'старый read cursor', 'sent',
+                         now() - interval '400 days'),
+                        (%s, %s, 'client', 'inbound', 'новое непрочитанное остаётся', 'sent', now()),
+                        (%s, %s, 'operator', 'outbound', 'старое превью удаляется', 'sent',
+                         now() - interval '399 days')
+                    RETURNING id
+                    """,
+                    (
+                        state_conversation_id, f"state-1-{suffix}",
+                        state_conversation_id, f"state-2-{suffix}",
+                        state_conversation_id, f"state-3-{suffix}",
+                        state_conversation_id, f"state-4-{suffix}",
+                    ),
+                )
+                state_ids = [int(row["id"]) for row in cur.fetchall()]
+                cur.execute(
+                    """
+                    UPDATE funnel_workspace_conversations
+                       SET last_read_message_id = %s,
+                           unread_count = 99,
+                           last_message_id = %s,
+                           last_message_at = now() - interval '399 days',
+                           last_message_text = 'старое превью удаляется',
+                           last_author_type = 'operator'
+                     WHERE id = %s
+                    """,
+                    (state_ids[1], state_ids[3], state_conversation_id),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO funnel_workspace_messages (
+                        conversation_id, external_message_id, author_type,
+                        direction, text, delivery_status, occurred_at
+                    )
+                    VALUES
+                        (%s, %s, 'client', 'inbound', 'pending update', 'sent',
+                         now() - interval '400 days'),
+                        (%s, %s, 'client', 'inbound', 'pending AI', 'sent',
+                         now() - interval '400 days'),
+                        (%s, %s, 'agent', 'outbound', 'unknown outbox', 'unknown',
+                         now() - interval '400 days'),
+                        (%s, %s, 'client', 'inbound', 'retry CRM', 'sent',
+                         now() - interval '400 days'),
+                        (%s, %s, 'system', 'system', 'terminal row', 'sent',
+                         now() - interval '400 days')
+                    RETURNING id
+                    """,
+                    (
+                        queue_conversation_id, f"queue-update-{suffix}",
+                        queue_conversation_id, f"queue-ai-{suffix}",
+                        queue_conversation_id, f"queue-outbox-{suffix}",
+                        queue_conversation_id, f"queue-crm-{suffix}",
+                        queue_conversation_id, f"queue-terminal-{suffix}",
+                    ),
+                )
+                queue_ids = [int(row["id"]) for row in cur.fetchall()]
+                cur.execute(
+                    """
+                    INSERT INTO funnel_workspace_updates (
+                        source_key, external_update_id, payload,
+                        processing_status, conversation_id, message_id, received_at
+                    )
+                    VALUES (%s, %s, '{"business_message": {}}'::jsonb,
+                            'pending', %s, %s, now() - interval '400 days')
+                    """,
+                    (
+                        source_key,
+                        f"update-{suffix}",
+                        queue_conversation_id,
+                        queue_ids[0],
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO funnel_workspace_ai_jobs (
+                        conversation_id, trigger_message_id, expected_version,
+                        processing_status, created_at
+                    )
+                    VALUES (%s, %s, %s, 'pending', now() - interval '400 days')
+                    """,
+                    (
+                        queue_conversation_id,
+                        queue_ids[1],
+                        int(queue_conversation["state_version"]),
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO funnel_workspace_outbox (
+                        conversation_id, message_id, source_key,
+                        external_chat_id, business_connection_id, author_type,
+                        text, idempotency_key, conversation_version,
+                        delivery_status, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, 'agent', 'unknown outbox',
+                            %s, %s, 'unknown', now() - interval '400 days')
+                    """,
+                    (
+                        queue_conversation_id,
+                        queue_ids[2],
+                        source_key,
+                        f"queues-{suffix}",
+                        f"connection-{suffix}",
+                        f"unknown-{suffix}",
+                        int(queue_conversation["state_version"]),
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO funnel_workspace_crm_actions (
+                        conversation_id, message_id, action_type,
+                        idempotency_key, processing_status, created_at
+                    )
+                    VALUES (%s, %s, 'ensure_deal', %s, 'retry',
+                            now() - interval '400 days')
+                    """,
+                    (
+                        queue_conversation_id,
+                        queue_ids[3],
+                        f"ensure-{suffix}",
+                    ),
+                )
+
+        store.retention_cleanup(
+            days=30,
+            batch_size=1,
+            max_batches=20,
+        )
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                      FROM funnel_workspace_messages
+                     WHERE conversation_id = %s
+                     ORDER BY id
+                    """,
+                    (state_conversation_id,),
+                )
+                remaining_state = [int(row["id"]) for row in cur.fetchall()]
+                cur.execute(
+                    """
+                    SELECT id
+                      FROM funnel_workspace_messages
+                     WHERE conversation_id = %s
+                     ORDER BY id
+                    """,
+                    (queue_conversation_id,),
+                )
+                remaining_queue = [int(row["id"]) for row in cur.fetchall()]
+
+        assert remaining_state == [state_ids[0], state_ids[2]]
+        refreshed = store.get_conversation(state_conversation_id)
+        assert int(refreshed["last_read_message_id"]) == state_ids[0]
+        assert int(refreshed["unread_count"]) == 1
+        assert int(refreshed["last_message_id"]) == state_ids[2]
+        assert refreshed["last_message_text"] == "новое непрочитанное остаётся"
+        assert refreshed["last_author_type"] == "client"
+
+        assert remaining_queue == queue_ids[:4]
+    finally:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                if state_conversation_id is not None:
+                    cur.execute(
+                        "DELETE FROM funnel_workspace_conversations WHERE id = %s",
+                        (state_conversation_id,),
+                    )
+                if queue_conversation_id is not None:
+                    cur.execute(
+                        "DELETE FROM funnel_workspace_conversations WHERE id = %s",
+                        (queue_conversation_id,),
                     )
                 cur.execute(
                     "DELETE FROM funnel_workspace_sources WHERE source_key = %s",

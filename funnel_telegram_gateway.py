@@ -9,8 +9,9 @@ that process and adds a bounded set of durable workers around it:
 * operator/agent replies leave through one transactional outbox.
 * confirmed deliveries enqueue separately leased, bounded CRM actions.
 
-The web process never calls Telegram.  That single-owner rule avoids competing ``getUpdates``
-consumers, preserves message order and makes every visible reply auditable in the same journal.
+The web process never sends to Telegram (its authenticated media proxy may perform read-only
+``getFile`` downloads).  That single-sender rule avoids competing ``getUpdates`` consumers,
+preserves message order and makes every visible reply auditable in the same journal.
 """
 
 from __future__ import annotations

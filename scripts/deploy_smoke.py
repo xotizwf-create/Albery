@@ -164,6 +164,8 @@ customer_slug = (
     os.getenv("FUNNEL_WORKSPACE_CUSTOMER_TOOLSET_SLUG", "iu-customer-runtime").strip()
     or "iu-customer-runtime"
 )
+connector_url = ""
+connector_url_valid = False
 try:
     with connect() as conn:
         with conn.cursor() as cur:
@@ -201,22 +203,43 @@ try:
             else:
                 connector_url = str(connector.get("url") or "").strip()
                 parsed = urllib.parse.urlparse(connector_url)
-                expected_path = f"/mcp-agent/{customer_slug}/{connector_token}"
+                public_base = os.getenv("AGENT_MCP_PUBLIC_BASE", "").strip()
+                expected_base = urllib.parse.urlparse(public_base)
+                expected_path = (
+                    f"{expected_base.path.rstrip('/')}/mcp-agent/"
+                    f"{customer_slug}/{connector_token}"
+                )
+                public_base_valid = bool(
+                    public_base
+                    and expected_base.scheme.lower() == "https"
+                    and expected_base.netloc
+                    and expected_base.username is None
+                    and expected_base.password is None
+                    and not expected_base.params
+                    and not expected_base.query
+                    and not expected_base.fragment
+                )
                 if connector.get("enabled") is not True:
                     failures.append(
                         f"agent-{customer_slug}: connector выключен в Hermes config"
                     )
+                elif not public_base_valid:
+                    failures.append(
+                        "AGENT_MCP_PUBLIC_BASE: нужен явный публичный HTTPS base"
+                    )
                 elif (
-                    parsed.scheme not in {"http", "https"}
-                    or not parsed.netloc
+                    parsed.scheme.lower() != "https"
+                    or parsed.netloc.casefold() != expected_base.netloc.casefold()
                     or parsed.path.rstrip("/") != expected_path
+                    or parsed.params
                     or parsed.query
                     or parsed.fragment
                 ):
                     failures.append(
-                        f"agent-{customer_slug}: connector URL не совпадает с DB token"
+                        f"agent-{customer_slug}: connector URL не совпадает с public base/DB token"
                     )
                 else:
+                    connector_url_valid = True
                     print(
                         f"agent-{customer_slug}: Hermes config OK "
                         "(URL/token скрыты)"
@@ -227,32 +250,34 @@ try:
                 f"agent-{customer_slug}: Hermes config не читается "
                 f"({type(exc).__name__})"
             )
-        try:
-            status, body = post_json(
-                (
-                    f"{APP_URL}/mcp-agent/{customer_slug}/"
-                    f"{connector_token}"
-                ),
-                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-            )
-            tools = (body.get("result") or {}).get("tools") or []
-            if status != 200 or tools:
-                failures.append(
-                    f"agent-{customer_slug}: status={status}, tools={len(tools)} (ожидалось 0)"
+        if connector_url_valid:
+            try:
+                status, body = post_json(
+                    connector_url,
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                 )
-            else:
-                print(f"agent-{customer_slug}: OK, 0 инструментов")
-        except Exception as exc:  # noqa: BLE001
-            # Never stringify the request URL here: it contains the connector token.
-            failures.append(
-                f"agent-{customer_slug}: tools/list не прошёл ({type(exc).__name__})"
-            )
+                tools = (body.get("result") or {}).get("tools") or []
+                if status != 200 or tools:
+                    failures.append(
+                        f"agent-{customer_slug}: status={status}, "
+                        f"tools={len(tools)} (ожидалось 0)"
+                    )
+                else:
+                    print(f"agent-{customer_slug}: public connector OK, 0 инструментов")
+            except Exception as exc:  # noqa: BLE001
+                # Never stringify the request URL here: it contains the connector token.
+                failures.append(
+                    f"agent-{customer_slug}: public tools/list не прошёл "
+                    f"({type(exc).__name__})"
+                )
 except Exception as exc:  # noqa: BLE001
     failures.append(f"agent-{customer_slug}: DB-проверка не прошла ({type(exc).__name__})")
 
 # The two long-lived workers are part of the workspace data path.  Keep this
 # production-only so a local/container smoke without systemd remains useful.
-if Path("/run/systemd/system").is_dir():
+systemd_detected = Path("/run/systemd/system").is_dir()
+service_main_pids: dict[str, int] = {}
+if systemd_detected:
     for service_name in ("albery-tg.service", "hermes-gateway.service"):
         try:
             check = subprocess.run(
@@ -265,7 +290,29 @@ if Path("/run/systemd/system").is_dir():
             if check.returncode:
                 failures.append(f"{service_name}: service не active")
             else:
-                print(f"{service_name}: active")
+                pid_check = subprocess.run(
+                    [
+                        "systemctl",
+                        "show",
+                        "--property",
+                        "MainPID",
+                        "--value",
+                        service_name,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                try:
+                    main_pid = int(pid_check.stdout.strip())
+                except (TypeError, ValueError):
+                    main_pid = 0
+                if pid_check.returncode or main_pid <= 0:
+                    failures.append(f"{service_name}: MainPID не определён")
+                else:
+                    service_main_pids[service_name] = main_pid
+                    print(f"{service_name}: active")
         except Exception as exc:  # noqa: BLE001
             failures.append(
                 f"{service_name}: status не проверен ({type(exc).__name__})"
@@ -354,6 +401,37 @@ except ValueError:
 if not 1 <= reply_window_hours <= 48:
     failures.append("FUNNEL_WORKSPACE_REPLY_WINDOW_HOURS должен быть целым от 1 до 48")
 
+transport_state: dict = {}
+try:
+    transport_state = json.loads(
+        (BASE / ".tg_agent_state.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(transport_state, dict):
+        transport_state = {}
+except (OSError, ValueError):
+    if systemd_detected:
+        failures.append("albery-tg.service: runtime marker не читается")
+
+if systemd_detected:
+    runtime = transport_state.get("workspace_runtime") or {}
+    if not isinstance(runtime, dict):
+        runtime = {}
+    runtime_pid = runtime.get("pid")
+    try:
+        runtime_pid = int(runtime_pid)
+    except (TypeError, ValueError):
+        runtime_pid = 0
+    if runtime.get("enabled") is not workspace_enabled:
+        failures.append(
+            "albery-tg.service запущен с другим FUNNEL_WORKSPACE_ENABLED; "
+            "нужен контролируемый restart"
+        )
+    expected_pid = service_main_pids.get("albery-tg.service")
+    if expected_pid and runtime_pid != expected_pid:
+        failures.append(
+            "albery-tg.service runtime marker не соответствует текущему MainPID"
+        )
+
 crm_id_field = os.getenv("FUNNEL_WORKSPACE_CRM_TELEGRAM_ID_FIELD", "").strip()
 legacy_username_field = os.getenv(
     "CRM_TELEGRAM_FIELD", "UF_CRM_1784296997"
@@ -398,14 +476,13 @@ if workspace_enabled:
         failures.append("workspace включён без отдельного password hash")
 
     try:
-        state = json.loads((BASE / ".tg_agent_state.json").read_text(encoding="utf-8"))
         connected = any(
             info
             and info.get("enabled") is True
             and info.get("can_reply") is True
-            for info in (state.get("business") or {}).values()
+            for info in (transport_state.get("business") or {}).values()
         )
-    except (OSError, ValueError):
+    except (AttributeError, TypeError):
         connected = False
     if not connected:
         failures.append("workspace включён, но Telegram Business не может отвечать")

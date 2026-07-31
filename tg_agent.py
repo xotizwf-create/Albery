@@ -468,6 +468,26 @@ def save_state(state: dict) -> None:
         pass
 
 
+def record_workspace_runtime(workspace_mode: bool) -> dict:
+    """Persist the mode/PID actually loaded by the long-lived Telegram process.
+
+    Deploy smoke compares this marker with systemd ``MainPID`` and the current
+    ``.env``.  Changing the feature flag without restarting the service can then
+    never look like a successful cutover.
+    """
+
+    runtime = {
+        "enabled": bool(workspace_mode),
+        "pid": os.getpid(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _state_lock:
+        state = load_state()
+        state["workspace_runtime"] = runtime
+        save_state(state)
+    return runtime
+
+
 def api(method: str, http_timeout: int = 35, **params):
     resp = requests.post(f"https://api.telegram.org/bot{bot_token()}/{method}",
                          json=params, timeout=http_timeout)
@@ -3008,6 +3028,7 @@ def poll_forever() -> None:
         # Сторож ожиданий: без него «задача закрыта → сообщение клиенту» не срабатывало никогда —
         # check_finished_tasks существовал, но его никто не вызывал (владелец, 23.07.2026).
         start_task_watchdog()
+    record_workspace_runtime(workspace_mode)
     me = api("getMe")
     log.info("bot: @%s (id %s)", me.get("username"), me.get("id"))
     offset = int(load_state().get("offset") or 0)

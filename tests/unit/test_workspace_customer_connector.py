@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import tg_agent
@@ -93,6 +95,16 @@ def test_customer_runtime_rejects_broad_role_agent_connector(monkeypatch):
 
     with pytest.raises(RuntimeError, match="not capped to zero tools"):
         tg_agent.customer_toolsets()
+
+
+def test_runtime_marker_records_the_mode_loaded_by_the_service(monkeypatch, tmp_path):
+    monkeypatch.setattr(tg_agent, "STATE_PATH", tmp_path / "tg-state.json")
+
+    marker = tg_agent.record_workspace_runtime(True)
+
+    assert marker["enabled"] is True
+    assert marker["pid"] == os.getpid()
+    assert tg_agent.load_state()["workspace_runtime"] == marker
 
 
 def test_existing_unrelated_agent_row_is_never_repurposed():
