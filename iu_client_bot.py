@@ -221,6 +221,21 @@ def manager_handoff_reply(
     body = str(reply or "").strip()
     body = re.sub(r"\bу коллег\b", "у менеджера", body, flags=re.IGNORECASE)
     body = re.sub(r"\bу команды\b", "у менеджера", body, flags=re.IGNORECASE)
+    # Модель может честно назвать неизвестный пункт, но написать просто «уточню»
+    # или «уточню отдельно». Это уже тот же handoff: называем исполнителя прямо,
+    # чтобы ниже не дописывать второй, дублирующий список неизвестных пунктов.
+    body = re.sub(
+        r"\bуточню\s+отдельно\b",
+        "уточню у менеджера",
+        body,
+        flags=re.IGNORECASE,
+    )
+    body = re.sub(
+        r"\bуточню\b(?!\s+у\s+менеджера\b)",
+        "уточню у менеджера",
+        body,
+        flags=re.IGNORECASE,
+    )
     body = re.sub(
         r"\s*(?:,?\s*и\s+)?вернусь(?:\s+к\s+вам)?(?:\s+с\s+ответом)?",
         "",

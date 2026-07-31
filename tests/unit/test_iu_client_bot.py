@@ -816,6 +816,28 @@ def test_full_ai_escalation_uses_fixed_manager_handoff_and_removes_menu(monkeypa
     assert "команд" not in prepared.text.casefold()
 
 
+def test_alexander_partial_handoff_names_manager_once_without_duplicate_unknowns():
+    reply = (
+        "[b]FBS и экономика[/b]\n"
+        "Расходы на логистику влияют на маржинальность.\n\n"
+        "[b]Джемперы[/b]\n"
+        "Текущую ситуацию по СПП именно для джемперов уточню отдельно."
+    )
+
+    text = bot.manager_handoff_reply(
+        reply,
+        answered_client=True,
+        reason="остались без ответа: текущая СПП по джемперам",
+    )
+
+    assert "Расходы на логистику влияют" in text
+    assert "уточню у менеджера" in text
+    assert "уточню отдельно" not in text
+    assert "По остальным пунктам" not in text
+    assert text.casefold().count("текущ") == 1
+    assert text.endswith(bot.AI_PARTIAL_MANAGER_HANDOFF_TAIL)
+
+
 def test_long_partial_answer_never_truncates_the_manager_handoff_tail(monkeypatch):
     import iu_contract
 
