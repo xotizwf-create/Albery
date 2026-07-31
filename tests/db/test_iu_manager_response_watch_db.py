@@ -96,6 +96,7 @@ def test_alerts_fire_once_at_10_30_60_and_ignore_bot_acknowledgements():
             idempotency_key=f"test-ack-{suffix}",
             metadata={"service_reply": True},
             service=True,
+            now=start + timedelta(minutes=1),
         )
 
         for minute, expected in ((10, "10 минут"), (30, "30 минут"), (60, "60 минут")):
@@ -161,6 +162,7 @@ def test_real_operator_reply_cancels_a_pending_alert():
             expected_version=int(current["state_version"]),
             idempotency_key=f"test-operator-{suffix}",
             operator_name="Менеджер",
+            now=start + timedelta(minutes=11),
         )
         with connect() as connection:
             with connection.cursor() as cur:
@@ -226,6 +228,7 @@ def test_silent_ai_lead_is_escalated_but_a_delivered_ai_answer_closes_wait():
             text="Теперь ответ доставлен.",
             expected_version=int(current["state_version"]),
             idempotency_key=f"test-ai-answer-{suffix}",
+            now=start + timedelta(minutes=11),
         )
         with connect() as connection:
             with connection.cursor() as cur:
@@ -279,6 +282,7 @@ def test_stop_command_suppresses_manager_wait_notifications():
             idempotency_key=f"test-stop-{suffix}",
             metadata={"iu_event": "stop"},
             service=True,
+            now=start + timedelta(minutes=1),
         )
 
         assert (
