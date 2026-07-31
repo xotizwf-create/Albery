@@ -41,6 +41,7 @@ import client_message      # единственная сборка сообще�
 import decision_log        # трасса решений: что решили, по какому правилу и на каких фактах
 import funnel_rules        # правила воронки как данные: факты → решение + его причина
 import funnel_scenario     # настроенный владельцем сценарий воронки (кабинет)
+import handoff_store       # durable owner/SLA/status + idempotent delivery outcomes
 import iu_turn_policy      # тема ИУ != согласие на документ/анкету
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -493,7 +494,11 @@ def set_channels(names: list[str]) -> None:
 # --- LLM turn (the b24bot-proven hermes CLI pattern, one at a time) ------------------------
 
 _HERMES_ERROR_RE = re.compile(
-    r"^(API call failed|Ошибка LLM|Error:|Traceback \(most recent call last\))", re.IGNORECASE)
+    r"^(?:API call failed|Ошибка LLM|Error:|Traceback \(most recent call last\)|"
+    r"Internal Server Error|Service Unavailable|Bad Gateway|Gateway Timeout|"
+    r"HTTP\s*[45]\d\d\b|<!doctype\s+html|<html\b|\{\s*[\"']error[\"']\s*:)",
+    re.IGNORECASE,
+)
 
 
 def channel_toolsets(channel: str) -> str | None:
@@ -789,6 +794,15 @@ def telegram_send_as_account(who: str, text: str) -> dict:
             user={"id": target, "username": (entry or {}).get("username"),
                   "first_name": (entry or {}).get("name")},
             meta={"relay": True, "via": "bitrix"})
+    try:
+        handoff_store.resolve_for_dialog(
+            _db,
+            bot=MANAGER_CHANNEL,
+            dialog_id=target,
+            resolution_code="human_reply_delivered",
+        )
+    except Exception:  # noqa: BLE001 — ответ уже доставлен; очередь догонит следующий проход
+        log.warning("ответ клиенту %s доставлен, но handoff не закрыт", target, exc_info=True)
     return {"sent": True, "to_id": target,
             "to": ("@" + entry["username"]) if (entry and entry.get("username")) else str(target),
             "from": "аккаунт владельца (Telegram Business)", "chars": len(text)}
@@ -1085,6 +1099,18 @@ def terms_text() -> str:
 TELEGRAM_SAFE_TEXT_LIMIT = 3500
 
 
+class CustomerAssetError(RuntimeError):
+    """Bounded postcondition for a customer document/CTA failure."""
+
+    def __init__(self, message: str, *, error_code: str = "asset_unavailable",
+                 delivery_attempted: bool = False,
+                 customer_already_visible: bool = False):
+        super().__init__(message)
+        self.error_code = str(error_code or "asset_unavailable")[:100]
+        self.delivery_attempted = bool(delivery_attempted)
+        self.customer_already_visible = bool(customer_already_visible)
+
+
 def _single_message_fits(body_html: str, plain: str) -> bool:
     """`send_html` не должен молча отрезать документ или CTA перед отметкой доставки."""
     return max(len(body_html), len(plain)) <= TELEGRAM_SAFE_TEXT_LIMIT
@@ -1110,7 +1136,10 @@ def send_terms(deal_id: int, telegram_id: int, *, offer_form: bool = False,
                                      follow_up="" if invite_now or not ask_follow_up
                                      else TERMS_QUESTION)
     if not client_message.verbatim_intact(message, body):
-        raise RuntimeError("Условия не отправлены: текст документа изменился при сборке")
+        raise CustomerAssetError(
+            "Условия не отправлены: текст документа изменился при сборке",
+            error_code="asset_invalid",
+        )
     invite_plain = FORM_TAIL_PLAIN.format(url=LEAD_FORM_URL) if invite_now else ""
     invite_html = FORM_TAIL.format(url=LEAD_FORM_URL) if invite_now else ""
     plain = message + invite_plain
@@ -1122,13 +1151,18 @@ def send_terms(deal_id: int, telegram_id: int, *, offer_form: bool = False,
         plain = message
         html = as_html(message)
     if not _single_message_fits(html, plain):
-        raise RuntimeError(
+        raise CustomerAssetError(
             "Условия не отправлены: документ превышает безопасный размер Telegram; "
-            "обрезать утверждённый текст запрещено"
+            "обрезать утверждённый текст запрещено",
+            error_code="asset_too_large",
         )
     ok, err = send_html(int(telegram_id), html, plain)
     if not ok:
-        raise RuntimeError(f"Условия не отправлены: {err}")
+        raise CustomerAssetError(
+            f"Условия не отправлены: {err}",
+            error_code=_delivery_error_code(err),
+            delivery_attempted=True,
+        )
     journal(MANAGER_CHANNEL, telegram_id, "out", plain, kind="lead_chat",
             meta={"terms": True, "invited": bool(invite_now and not split_invite),
                   "deal_id": int(deal_id) if deal_id else None})
@@ -1151,10 +1185,19 @@ def send_terms(deal_id: int, telegram_id: int, *, offer_form: bool = False,
         form_plain = invite_plain.lstrip()
         form_html = invite_html.lstrip()
         if not _single_message_fits(form_html, form_plain):
-            raise RuntimeError("Анкета не отправлена: CTA превышает безопасный размер Telegram")
+            raise CustomerAssetError(
+                "Анкета не отправлена: CTA превышает безопасный размер Telegram",
+                error_code="asset_too_large",
+                customer_already_visible=True,
+            )
         ok, err = send_html(int(telegram_id), form_html, form_plain)
         if not ok:
-            raise RuntimeError(f"Анкета не отправлена после условий: {err}")
+            raise CustomerAssetError(
+                f"Анкета не отправлена после условий: {err}",
+                error_code=_delivery_error_code(err),
+                delivery_attempted=True,
+                customer_already_visible=True,
+            )
         journal(MANAGER_CHANNEL, telegram_id, "out", form_plain, kind="lead_chat",
                 meta={"terms": False, "invited": True,
                       "deal_id": int(deal_id) if deal_id else None})
@@ -2448,11 +2491,35 @@ def send_html(user_id: int, body_html: str, plain: str) -> tuple[bool, str]:
     log.warning("HTML-режим отклонён (%s) — шлём обычным текстом", err[:120])
     return send_as_account(user_id, plain[:3500])
 
-# Мозг отвечает этим маркером, когда ответа в базе знаний нет. Тогда вопрос уходит живым людям
-# в группу «Работа с ИУ», а клиенту агент НЕ пишет ничего (владелец, 22.07.2026): отписка
-# «уточню у коллег и вернусь» обещает ответ, который агент сам дать не может, и клиент считает
-# минуты. Пауза без обещания честнее — а сотрудник тем временем отвечает по-настоящему.
+# Мозг отвечает этим маркером, когда ответа в базе знаний нет. Вопрос становится долговечным
+# handoff, а клиент видит короткую честную квитанцию без выдуманного ответа и срока.
 ESCALATION_MARKER = "НУЖЕН_ЧЕЛОВЕК"
+HUMAN_HANDOFF_REPLY = "Вижу ваш вопрос. Здесь нужен ответ менеджера — передаю ему сообщение."
+MODEL_FAILURE_REPLY = (
+    "Вижу ваше сообщение. Сейчас произошёл технический сбой — передаю вопрос менеджеру."
+)
+CRM_FAILURE_REPLY = (
+    "Вижу ваше сообщение. Сейчас не могу проверить данные обращения — передаю его менеджеру."
+)
+ASSET_FAILURE_REPLY = (
+    "Вижу ваш запрос. Сейчас не могу отправить нужный материал — передаю вопрос менеджеру."
+)
+HANDOFF_OWNER_ID = (os.getenv("IU_HANDOFF_OWNER_ID") or "iu-group").strip() or "iu-group"
+HANDOFF_OWNER_NAME = (
+    (os.getenv("IU_HANDOFF_OWNER_NAME") or "Группа «Работа с ИУ»").strip()
+    or "Группа «Работа с ИУ»"
+)
+
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+HANDOFF_SLA_SECONDS = _bounded_int_env("IU_HANDOFF_SLA_SECONDS", 300, 30, 86_400)
 # Второй случай: агенту ЕСТЬ что ответить по существу (порядок работы, уточняющий вопрос), но
 # конкретики — цифр, сроков, гарантий — в базе нет. Молчать здесь неправильно: новый лид
 # остался бы совсем без ответа. Тогда агент отвечает клиенту И отдельной строкой просит людей
@@ -2469,9 +2536,9 @@ TERMS_REQUEST_MARKER = "ПОКАЖИ_УСЛОВИЯ"
 # не ответил и людям его не передал. Решение владельца: документ один раз; вопрос, ответа на
 # который в документе нет, уносим людям И пишем клиенту одну строку, чтобы он не сидел в тишине
 # (тот же случай, что был с Георгием: молчание оставляет клиента без понимания, ответят ли ему).
-TERMS_ASK_HUMAN_REPLY = "Уточню это у команды и вернусь с ответом."
+TERMS_ASK_HUMAN_REPLY = "Передаю этот вопрос менеджеру — здесь нужен его точный ответ."
 # Часть вопросов агент ответил сам, часть ушла людям — клиент должен об этом знать честно.
-TERMS_PENDING_NOTE = "По остальному уточню у команды и вернусь с ответом."
+TERMS_PENDING_NOTE = "Остальную часть вопроса передаю менеджеру — здесь нужен его точный ответ."
 # А это — на случай, когда маркер условий сработал вхолостую: человек НИЧЕГО не спросил, он
 # просто подтвердил анкету («Все верно»), а модель всё равно вернула маркер. 24.07.2026 Александр
 # получил на «Все верно» ответ «Уточню это у команды» — тупик вместо разговора. Живой менеджер в
@@ -2506,7 +2573,8 @@ def _wants_terms_again(text: str) -> bool:
 
 
 def _answer_from_sources(author: dict, text: str, deal_id: int | None,
-                         texts_to_journal: list[str] | None = None) -> bool:
+                         texts_to_journal: list[str] | None = None,
+                         source_message_ids: list[int] | None = None) -> bool:
     """Ответить на вопросы клиента по источникам; что осталось — унести людям.
 
     Владелец 25.07.2026: «если он знает ответ на несколько вопросов, пусть отвечает на них, а на
@@ -2528,18 +2596,49 @@ def _answer_from_sources(author: dict, text: str, deal_id: int | None,
     note = TERMS_PENDING_NOTE if pending else ""
     body = answering.client_text(results, pending_note=note)
     message = client_message.compose(body, name=_name_for_uid(uid), greet=_first_contact(uid))
-    ok, err = send_html(uid, as_html(message), message)
     if pending:
-        escalate_to_human(author, "клиент спросил, а в источниках этого нет: "
-                                  + "; ".join(pending)[:200], text, answered=True)
+        _visible_handoff(
+            author,
+            text,
+            "часть вопроса отсутствует в утверждённых источниках",
+            body,
+            reason_code="knowledge_gap",
+            deal_id=deal_id,
+            answered=True,
+            meta={"multi_intent": True},
+            texts_to_journal=texts_to_journal,
+            source_message_ids=source_message_ids,
+        )
+        log.info("лид %s: ответил на %d из %d вопросов, людям ушло %d",
+                 uid, len(known), len(results), len(pending))
+        # Вопрос обработан даже при физическом отказе Telegram: delivery failure уже записан
+        # в том же handoff, повторная ветка не должна создать вторую карточку.
+        return True
+
+    ok, err = send_html(uid, as_html(message), message)
     for t in texts_to_journal or []:
         journal(MANAGER_CHANNEL, uid, "in", t, kind="lead_chat", user=author)
     journal(MANAGER_CHANNEL, uid, "out", message if ok else f"{message}\n\n[не доставлено: {err}]",
             kind="lead_chat", user=author, status="ok" if ok else "error",
             meta={"deal_id": deal_id, "answered": len(known), "escalated": bool(pending)})
+    if not ok:
+        _visible_handoff(
+            author,
+            text,
+            "содержательный ответ не доставлен клиенту",
+            body,
+            reason_code="delivery_failure",
+            deal_id=deal_id,
+            priority="urgent",
+            answered=True,
+            meta={"delivery_failure": True},
+            source_message_ids=source_message_ids,
+            deliver_customer=False,
+            customer_error_code=_delivery_error_code(err),
+        )
     log.info("лид %s: ответил на %d из %d вопросов, людям ушло %d",
              uid, len(known), len(results), len(pending))
-    return ok
+    return True
 
 
 def _ask_model(prompt: str) -> str:
@@ -2561,41 +2660,257 @@ def _retry_after_model_failure(call) -> str:
         return ""
 
 
-def _model_failure_to_humans(author: dict, text: str, deal_id: int | None, exc) -> None:
-    """Модель недоступна — вопрос клиента уносим людям, а не оставляем тишину.
+def _customer_answer_with_retry(call) -> tuple[str, Exception | None]:
+    """Run one customer model turn twice at most and reject provider/error payloads."""
+    last_error: Exception | None = None
+    for attempt in range(2):
+        if attempt:
+            time.sleep(_MODEL_RETRY_PAUSE_S)
+        try:
+            answer = str(call() or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            log.warning("customer model attempt %s failed: %s", attempt + 1, str(exc)[:200])
+            continue
+        if answer and not _HERMES_ERROR_RE.match(answer):
+            return answer, None
+        last_error = RuntimeError("empty_or_error_payload")
+        log.warning("customer model attempt %s returned no safe answer", attempt + 1)
+    return "", last_error
 
-    Клиенту при этом НЕ пишем: обещать ответ, которого агент дать не может, владелец запретил
-    (22.07.2026). Но человек в группе видит карточку и отвечает сам — именно этого не хватило
-    25.07.2026, когда три хода упали на 500/503 и клиент ждал впустую."""
+
+def _delivery_error_code(error: str) -> str:
+    """Bounded operational code: raw Telegram/network errors do not enter handoff storage."""
+    low = str(error or "").lower()
+    if "peer_id_invalid" in low or "chat not found" in low or "blocked" in low:
+        return "recipient_unreachable"
+    if "business" in low and ("not configured" in low or "не настро" in low):
+        return "business_connection_missing"
+    if "timeout" in low or "timed out" in low:
+        return "timeout"
+    if "parse" in low or "entity" in low:
+        return "format_rejected"
+    if "network" in low or "connection" in low or "сети" in low:
+        return "network_error"
+    return "telegram_error"
+
+
+def _handoff_event_key(author: dict, client_text: str, reason_code: str, *,
+                       deal_id: int | None = None,
+                       source_message_ids: list[int] | None = None) -> str:
+    """Stable non-PII idempotency key for one source event."""
+    ids = sorted({
+        int(value) for value in (source_message_ids or [])
+        if to_int_safe(value) is not None
+    })
+    source = ",".join(str(value) for value in ids)
+    if not source:
+        source = hashlib.sha256(str(client_text or "").encode("utf-8")).hexdigest()
+    payload = "|".join((
+        MANAGER_CHANNEL,
+        str(author.get("id") or ""),
+        source,
+    ))
+    return "iu-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:40]
+
+
+def _handoff_meta(meta: dict | None) -> dict:
+    """Allow only non-message operational facts into the handoff tables."""
+    allowed = {
+        "channel", "stranger", "crm_down", "model_down", "source_error",
+        "multi_intent", "delivery_failure",
+    }
+    return {
+        key: value for key, value in (meta or {}).items()
+        if key in allowed and isinstance(value, (str, int, float, bool, type(None)))
+    }
+
+
+def _visible_handoff(author: dict, client_text: str, question: str, reply: str, *,
+                     reason_code: str = "knowledge_gap",
+                     deal_id: int | None = None,
+                     priority: str = "normal",
+                     answered: bool = False,
+                     meta: dict | None = None,
+                     texts_to_journal: list[str] | None = None,
+                     source_message_ids: list[int] | None = None,
+                     deliver_customer: bool = True,
+                     customer_error_code: str = "",
+                     customer_already_visible: bool = False) -> bool:
+    """Persist first, then independently deliver the client receipt and owner card.
+
+    A duplicate Telegram event reuses the stored delivery outcomes.  If PostgreSQL itself is
+    unavailable, the two best-effort deliveries still run; that degraded path is logged and
+    never restores model guessing.
+    """
     uid = author.get("id")
-    escalate_to_human(author, f"модель недоступна ({str(exc)[:80]}) — ответьте клиенту сами",
-                      text)
-    journal(MANAGER_CHANNEL, uid, "out",
-            f"мозг не ответил ({str(exc)[:120]}) — вопрос унесён людям в группу «Работа с ИУ»",
-            kind="lead_chat", user=author, status="error",
-            meta={"deal_id": deal_id, "escalated": True, "model_down": True})
+    safe_meta = _handoff_meta(meta)
+    source_message_id = next(iter(source_message_ids or []), None)
+    event_key = _handoff_event_key(
+        author, client_text, reason_code, deal_id=deal_id,
+        source_message_ids=source_message_ids,
+    )
+    try:
+        handoff = handoff_store.open_handoff_event(
+            _db,
+            bot=MANAGER_CHANNEL,
+            dialog_id=uid,
+            event_key=event_key,
+            reason_code=reason_code,
+            deal_id=deal_id,
+            source_message_id=source_message_id,
+            priority=priority,
+            owner_id=HANDOFF_OWNER_ID,
+            owner_name=HANDOFF_OWNER_NAME,
+            sla_seconds=HANDOFF_SLA_SECONDS,
+            meta=safe_meta,
+        )
+    except Exception:  # noqa: BLE001 — клиентский fallback не зависит от доступности БД
+        log.warning("handoff не записан для диалога %s", uid, exc_info=True)
+        handoff = {
+            "handoff_id": None,
+            "event_id": None,
+            "event_created": True,
+            "customer_delivery_status": "pending",
+            "internal_delivery_status": "pending",
+            "owner_id": HANDOFF_OWNER_ID,
+            "owner_name": HANDOFF_OWNER_NAME,
+            "due_at": None,
+        }
+
+    event_id = handoff.get("event_id")
+    if handoff.get("event_created"):
+        for item in texts_to_journal or []:
+            journal(
+                MANAGER_CHANNEL, uid, "in", item, kind="lead_chat", user=author,
+                meta={"deal_id": deal_id} if deal_id is not None else None,
+            )
+
+    customer_claimed = True
+    if event_id:
+        try:
+            customer_claimed = handoff_store.claim_delivery(
+                _db, int(event_id), target="customer",
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("не удалось захватить customer delivery handoff %s",
+                        handoff.get("handoff_id"), exc_info=True)
+            customer_claimed = True
+    customer_ok = handoff.get("customer_delivery_status") == "sent"
+    if customer_claimed:
+        message = client_message.compose(
+            reply, name=_name_for_uid(uid), greet=_first_contact(uid),
+        )
+        if deliver_customer:
+            customer_ok, customer_error = send_html(uid, as_html(message), message)
+            error_code = "" if customer_ok else _delivery_error_code(customer_error)
+        else:
+            customer_ok = False
+            error_code = str(customer_error_code or "delivery_failed")[:100]
+        if event_id:
+            try:
+                handoff_store.complete_delivery(
+                    _db, int(event_id), target="customer", sent=customer_ok,
+                    error_code=error_code,
+                )
+            except Exception:  # noqa: BLE001
+                log.warning("customer outcome handoff %s не записан",
+                            handoff.get("handoff_id"), exc_info=True)
+        journal(
+            MANAGER_CHANNEL, uid, "out",
+            message if customer_ok else f"{message}\n\n[не доставлено: {error_code}]",
+            kind="lead_chat", user=author, status="ok" if customer_ok else "error",
+            meta={
+                "deal_id": deal_id,
+                "customer_visible": bool(customer_ok),
+                "escalated": True,
+                "handoff_id": handoff.get("handoff_id"),
+                "handoff_event_id": event_id,
+                "reason_code": reason_code,
+            },
+        )
+
+    internal_claimed = True
+    if event_id:
+        try:
+            internal_claimed = handoff_store.claim_delivery(
+                _db, int(event_id), target="internal",
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("не удалось захватить internal delivery handoff %s",
+                        handoff.get("handoff_id"), exc_info=True)
+            internal_claimed = True
+    if internal_claimed:
+        outcome = escalate_to_human(
+            author,
+            question,
+            client_text,
+            answered=answered,
+            handoff_id=handoff.get("handoff_id"),
+            owner_name=str(handoff.get("owner_name") or HANDOFF_OWNER_NAME),
+            due_at=handoff.get("due_at"),
+            customer_notified=bool(customer_ok or customer_already_visible),
+        ) or {}
+        internal_ok = bool(outcome.get("sent"))
+        internal_error = str(outcome.get("error_code") or (
+            "" if internal_ok else "notification_failed"
+        ))
+        if event_id:
+            try:
+                handoff_store.complete_delivery(
+                    _db, int(event_id), target="internal", sent=internal_ok,
+                    destination=str(outcome.get("destination") or ""),
+                    external_message_id=outcome.get("message_id") or "",
+                    error_code=internal_error,
+                )
+            except Exception:  # noqa: BLE001
+                log.warning("internal outcome handoff %s не записан",
+                            handoff.get("handoff_id"), exc_info=True)
+    return bool(customer_ok or customer_already_visible)
+
+
+def _model_failure_to_humans(author: dict, text: str, deal_id: int | None, exc=None, *,
+                             texts_to_journal: list[str] | None = None,
+                             source_message_ids: list[int] | None = None) -> bool:
+    """Persistent model failure: one fixed client receipt plus a durable urgent handoff."""
+    uid = author.get("id")
+    ok = _visible_handoff(
+        author,
+        text,
+        "модель не сформировала безопасный ответ после повторной попытки",
+        MODEL_FAILURE_REPLY,
+        reason_code="model_failure",
+        deal_id=deal_id,
+        priority="urgent",
+        meta={"model_down": True},
+        texts_to_journal=texts_to_journal,
+        source_message_ids=source_message_ids,
+    )
     log.warning("сбой модели по лиду %s унесён людям", uid)
+    return ok
 
 
 def _terms_question_to_humans(author: dict, client_text: str,
                               texts_to_journal: list[str] | None = None,
-                              meta: dict | None = None) -> None:
+                              meta: dict | None = None,
+                              source_message_ids: list[int] | None = None) -> bool:
     """Условия уже высылали, человек спрашивает дальше — вопрос людям, клиенту одна строка."""
     uid = author.get("id")
-    escalate_to_human(author,
-                      f"условия клиент уже получил, в документе ответа на это нет; ему написано "
-                      f"«{TERMS_ASK_HUMAN_REPLY}». Нужен ваш ответ на: {client_text[:150]}",
-                      client_text, answered=True)
-    reply = client_message.compose(TERMS_ASK_HUMAN_REPLY, name=_name_for_uid(uid),
-                                   greet=_first_contact(uid))
-    ok, err = send_html(uid, as_html(reply), reply)
-    for t in texts_to_journal or []:
-        journal(MANAGER_CHANNEL, uid, "in", t, kind="lead_chat", user=author)
-    journal(MANAGER_CHANNEL, uid, "out",
-            reply if ok else f"{reply}\n\n[не доставлено: {err}]",
-            kind="lead_chat", user=author, status="ok" if ok else "error",
-            meta={"escalated": True, **(meta or {})})
+    deal_id = to_int_safe((meta or {}).get("deal_id"))
+    ok = _visible_handoff(
+        author,
+        client_text,
+        "в утверждённых источниках нет точного ответа на вопрос клиента",
+        TERMS_ASK_HUMAN_REPLY,
+        reason_code="knowledge_gap",
+        deal_id=deal_id,
+        answered=False,
+        meta=meta,
+        texts_to_journal=texts_to_journal,
+        source_message_ids=source_message_ids,
+    )
     log.info("вопрос поверх уже отправленных условий от %s унесён людям", uid)
+    return ok
 
 # Правила для разговора с тем, кого ещё нет в воронке. У лида шаг задаёт сделка, а у
 # незнакомца сценария не было вовсе — отсюда импровизация и обещания, которых агент не
@@ -2814,7 +3129,9 @@ IU_AGENT_NAME = os.getenv("IU_AGENT_NAME", "Агент по работе с ИУ
 
 
 def escalate_to_human(author: dict, question: str, client_text: str,
-                      answered: bool = False) -> None:
+                      answered: bool = False, *, handoff_id: int | None = None,
+                      owner_name: str = "", due_at=None,
+                      customer_notified: bool = False) -> dict:
     """Принести вопрос лида живым людям в группу Битрикса «Работа с ИУ».
 
     Ответ сотрудника в той же группе агент передаёт клиенту сам — поэтому в карточке есть
@@ -2827,11 +3144,19 @@ def escalate_to_human(author: dict, question: str, client_text: str,
     uname = author.get("username") or ""
     name = " ".join(x for x in (author.get("first_name"), author.get("last_name")) if x).strip()
     # Оформление — по стандарту компании: блоки через пустую строку, заголовки [b]…[/b].
-    # Клиент в этот момент СИДИТ БЕЗ ОТВЕТА, поэтому карточка начинается со срочности: сотрудник
-    # должен понять это с первой строки, а не вычитать из середины.
-    card = (("[b]Клиенту отвечено по существу, но нужна конкретика от вас[/b]\n"
-             if answered else
-             "[b]⚠️ Клиент ждёт ответа — ему пока НИЧЕГО не отвечено[/b]\n")
+    # Первая строка отражает реальный postcondition доставки, а не намерение кода.
+    if answered:
+        state_line = "[b]Клиенту отвечено по существу, но нужна конкретика от вас[/b]\n"
+    elif customer_notified:
+        state_line = "[b]Клиент получил подтверждение передачи и ждёт ответа менеджера[/b]\n"
+    else:
+        state_line = "[b]⚠️ Клиенту не доставлено подтверждение — нужен ручной ответ[/b]\n"
+    due_text = str(due_at or "")[:25] or "SLA не удалось прочитать"
+    card = (state_line
+            + (f"\n[b]Handoff #{handoff_id}[/b]\n" if handoff_id else
+               "\n[b]Handoff не записан — проверьте БД[/b]\n")
+            + f"Ответственный: {owner_name or HANDOFF_OWNER_NAME}\n"
+            f"SLA: {due_text}\n"
             + f"\n"
             f"Пользователь задал вопрос: «{client_text[:600]}»\n"
             f"Что мне на него ответить?\n"
@@ -2851,20 +3176,42 @@ def escalate_to_human(author: dict, question: str, client_text: str,
             raise RuntimeError(str(res)[:200])
         log.info("вопрос лида %s принесён в группу «Работа с ИУ» (сообщение %s)",
                  uid, res.get("message_id"))
-        return
+        return {
+            "sent": True,
+            "destination": "bitrix:iu-group",
+            "message_id": res.get("message_id"),
+            "error_code": "",
+        }
     except Exception as exc:  # noqa: BLE001
         log.warning("группа недоступна (%s) — дублирую вопрос в Telegram", str(exc)[:200])
     # Запасной канал: вопрос клиента не должен потеряться из-за сбоя Битрикса.
     chat_id = (os.getenv("TG_ESCALATION_CHAT_ID") or "").strip() or _business_owner_id()
     if not chat_id:
         log.warning("эскалация некуда: группа недоступна и TG_ESCALATION_CHAT_ID не задан")
-        return
+        return {
+            "sent": False,
+            "destination": "",
+            "message_id": "",
+            "error_code": "no_notification_destination",
+        }
     try:
         # BB-коды живут только в Битриксе; в Telegram они дошли бы до человека как мусор.
-        api("sendMessage", chat_id=chat_id, text=_strip_markup(card))
+        result = api("sendMessage", chat_id=chat_id, text=_strip_markup(card))
         log.info("эскалация по %s ушла в Telegram (запасной канал)", uid)
+        return {
+            "sent": True,
+            "destination": "telegram:escalation",
+            "message_id": (result or {}).get("message_id"),
+            "error_code": "",
+        }
     except Exception as exc:  # noqa: BLE001
         log.warning("эскалация не доставлена вообще: %s", str(exc)[:200])
+        return {
+            "sent": False,
+            "destination": "telegram:escalation",
+            "message_id": "",
+            "error_code": _delivery_error_code(str(exc)),
+        }
 
 
 def split_side_question(author: dict, answer: str, client_text: str) -> str:
