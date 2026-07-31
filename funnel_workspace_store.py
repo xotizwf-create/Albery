@@ -1838,6 +1838,10 @@ def mark_waiting_human(
                             {
                                 "manager_requested_at": timestamp.isoformat(),
                                 "manager_request_reason": clean_reason,
+                                # Сильное состояние диалога с менеджером заменяет прежнюю
+                                # мягкую пометку «нужен человек». Иначе одна карточка
+                                # одновременно попадала бы в две операторские очереди.
+                                "needs_human_handled_at": timestamp.isoformat(),
                             }
                             if manager_requested
                             else {

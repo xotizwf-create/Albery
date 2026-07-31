@@ -301,6 +301,50 @@ def test_explicit_manager_request_is_a_permanent_human_takeover():
         _cleanup(source_key)
 
 
+def test_explicit_manager_request_replaces_an_earlier_needs_human_flag():
+    suffix = uuid4().hex[:12]
+    source_key = f"test-manager-single-state-{suffix}"
+    chat_id = "700000208"
+    try:
+        store.ensure_source(
+            source_key,
+            source_type="test",
+            display_name="single manager state",
+        )
+        first = _ingest(
+            source_key,
+            chat_id,
+            author="client",
+            text="Какие комиссии известны?",
+            message_id=f"{suffix}-1",
+        )
+        conversation_id = int(first["conversation"]["id"])
+        flagged = store.flag_needs_human(
+            conversation_id,
+            reason="Часть ответа нужно уточнить.",
+        )
+
+        requested = store.mark_waiting_human(
+            conversation_id,
+            expected_version=int(flagged["state_version"]),
+            reason="ИИ уже позвал менеджера для недостающей части ответа.",
+            manager_requested=True,
+            permanent_human=True,
+        )
+
+        assert requested["control_mode"] == "human"
+        assert (
+            requested["metadata"]["needs_human_handled_at"]
+            >= requested["metadata"]["needs_human_at"]
+        )
+        assert (
+            requested["metadata"]["manager_requested_at"]
+            > requested["metadata"].get("manager_request_handled_at", "")
+        )
+    finally:
+        _cleanup(source_key)
+
+
 def test_returning_dialog_to_ai_clears_the_manager_request_badge():
     suffix = uuid4().hex[:12]
     source_key = f"test-manager-ai-{suffix}"
