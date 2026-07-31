@@ -1059,7 +1059,6 @@ def _enter_support(
     conversation_id: int,
     *,
     idempotency_key: str,
-    messages: list[dict[str, Any]],
 ) -> None:
     import iu_bot_documents
     import iu_bot_reminders
@@ -1097,7 +1096,6 @@ def _enter_support(
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("iu client bot: support reminder was not scheduled: %s", _safe_error(exc))
-    _schedule_existing_question(conversation_id, messages)
 
 
 def handle_bot_callback(callback: Mapping[str, Any]) -> tuple[int | None, int | None]:
@@ -1622,7 +1620,6 @@ def run_menu_action(action: str, *, conversation_id: int, idempotency_key: str) 
         _enter_support(
             conversation_id,
             idempotency_key=idempotency_key,
-            messages=messages,
         )
     elif action == iu_client_bot.CB_OPERATOR:
         replies = iu_bot_state.support_agent_replies(messages)

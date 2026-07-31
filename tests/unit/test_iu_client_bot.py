@@ -29,6 +29,7 @@ class FakeStore:
     ):
         self.ingested: list[dict] = []
         self.queued: list[dict] = []
+        self.ai_jobs: list[dict] = []
         self.transitions: list[dict] = []
         self.human_flags: list[dict] = []
         self.agent_replies = agent_replies
@@ -63,6 +64,10 @@ class FakeStore:
     def enqueue_outgoing_agent(self, conversation_id, **kwargs):
         self.queued.append({"conversation_id": conversation_id, **kwargs})
         return {"outbox": {"id": 90}, "message": {"id": 91}}
+
+    def schedule_ai_job(self, conversation_id, **kwargs):
+        self.ai_jobs.append({"conversation_id": conversation_id, **kwargs})
+        return {"id": 92}
 
     def mark_waiting_human(self, conversation_id, **kwargs):
         self.transitions.append({"conversation_id": conversation_id, **kwargs})
@@ -226,7 +231,31 @@ def test_terms_button_sends_the_real_terms(monkeypatch):
 
 
 def test_support_entry_sends_faq_and_prompt_as_one_message(monkeypatch):
-    store = FakeStore()
+    store = FakeStore(
+        messages=[
+            {
+                "id": 48,
+                "author_type": "client",
+                "direction": "inbound",
+                "text": "Подскажите, пожалуйста",
+                "metadata": {},
+            },
+            {
+                "id": 49,
+                "author_type": "agent",
+                "direction": "outbound",
+                "text": bot.STRICT_QUESTION_HINT,
+                "metadata": {"iu_event": "strict_question_hint"},
+            },
+            {
+                "id": 50,
+                "author_type": "client",
+                "direction": "inbound",
+                "text": bot.BUTTON_ASK,
+                "metadata": {},
+            },
+        ]
+    )
     monkeypatch.setattr(gateway, "_store", lambda: store)
     monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
     _tg(monkeypatch)
@@ -258,6 +287,7 @@ def test_support_entry_sends_faq_and_prompt_as_one_message(monkeypatch):
     assert store.queued[0]["attachment"]["file_name"] == "faq.pdf"
     assert store.queued[0]["metadata"]["iu_event"] == "support_enter"
     assert "keyboard" in store.queued[0]["metadata"]["reply_markup"]
+    assert store.ai_jobs == []
 
 
 def test_free_text_outside_support_always_gets_the_question_hint(monkeypatch):
