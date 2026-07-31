@@ -59,6 +59,14 @@ MENU_PROMPT = "Главное меню:"
 MANAGER_DIALOG_CANCELLED = (
     "Диалог с менеджером отменён. Вы вернулись в главное меню."
 )
+MANAGER_QUESTION_CLOSED = "Если у Вас будут вопросы — обращайтесь!"
+AI_FULL_MANAGER_HANDOFF = (
+    "Вопрос требует живого присутствия менеджера — я уже передал ему это, "
+    "и он скоро подключится к диалогу!"
+)
+AI_PARTIAL_MANAGER_HANDOFF_TAIL = (
+    "Кстати, я уже его позвал — он скоро подключится к диалогу!"
+)
 STOPPED = (
     "Поддержка и напоминания остановлены. Чтобы начать снова, используйте /start "
     "или вернитесь в меню командой /menu."
@@ -184,12 +192,55 @@ TERMS_REPLY = (
 )
 
 OPERATOR_CALLED = (
-    "Передал ваш вопрос менеджеру — он ответит здесь же, в этом чате."
+    "Передал Ваш запрос менеджеру — сейчас он подключится к диалогу."
 )
 
 TERMS_FALLBACK = (
     "Условия сейчас уточняет менеджер — он пришлёт их вам в этот чат."
 )
+
+
+def manager_handoff_reply(
+    reply: str,
+    *,
+    answered_client: bool,
+    reason: str = "",
+) -> str:
+    """Build the only two honest client-visible forms of an AI handoff.
+
+    The model supplies the useful, grounded part of a partial answer.  The code,
+    which actually performs the state transition and manager notification,
+    supplies the promise that the manager has been called.  This prevents old
+    model wording such as «уточню у коллег и вернусь» from claiming a future
+    action while leaving the dialog under AI control.
+    """
+
+    if not answered_client:
+        return AI_FULL_MANAGER_HANDOFF
+
+    body = str(reply or "").strip()
+    body = re.sub(r"\bу коллег\b", "у менеджера", body, flags=re.IGNORECASE)
+    body = re.sub(r"\bу команды\b", "у менеджера", body, flags=re.IGNORECASE)
+    body = re.sub(
+        r"\s*(?:,?\s*и\s+)?вернусь(?:\s+к\s+вам)?(?:\s+с\s+ответом)?",
+        "",
+        body,
+        flags=re.IGNORECASE,
+    )
+    body = re.sub(r"[ \t]+([.,!?])", r"\1", body)
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+
+    if "уточню у менеджера" not in body.casefold():
+        unresolved_prefix = "остались без ответа:"
+        unresolved = str(reason or "").strip()
+        if unresolved.casefold().startswith(unresolved_prefix):
+            unresolved = unresolved[len(unresolved_prefix):].strip()
+        if unresolved:
+            body = (
+                f"{body}\n\n" if body else ""
+            ) + f"По остальным пунктам — {unresolved.rstrip('.')} — уточню у менеджера."
+
+    return f"{body}\n\n{AI_PARTIAL_MANAGER_HANDOFF_TAIL}".strip()
 
 
 def enabled() -> bool:

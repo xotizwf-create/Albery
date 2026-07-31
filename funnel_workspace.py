@@ -1030,13 +1030,39 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
             400,
             "invalid_menu_restore",
         )
+    current = store.get_conversation(conversation_id) if mode == "ai" else None
     if mode == "ai":
-        current = store.get_conversation(conversation_id)
         if not _workspace_ai_allowed(current):
             return _error(
                 "ИИ не включён для этого Telegram-канала.",
                 409,
                 "ai_rollout_disabled",
+            )
+        metadata = (
+            dict(current.get("metadata") or {})
+            if isinstance(current, Mapping)
+            else {}
+        )
+        requested_at = metadata.get("manager_requested_at")
+        handled_at = metadata.get("manager_request_handled_at")
+        manager_dialog_active = bool(
+            requested_at
+            and (not handled_at or str(handled_at) < str(requested_at))
+        )
+        if restore_main_menu and (
+            str((current or {}).get("source_key") or "") != "telegram_bot"
+            or not manager_dialog_active
+        ):
+            return _error(
+                "Кнопка «Вопрос закрыт» доступна только когда клиент позвал менеджера.",
+                409,
+                "manager_dialog_not_active",
+            )
+        if manager_dialog_active and not restore_main_menu:
+            return _error(
+                "Сначала закройте вопрос: клиент получит уведомление, а главное меню вернётся автоматически.",
+                409,
+                "manager_dialog_requires_close",
             )
     permanent = bool(body.get("permanent"))
     default_reason = (
@@ -1057,6 +1083,9 @@ def conversation_control(conversation_id: int) -> tuple[Response, int]:
             else None
         ),
         permanent=permanent,
+        # Закрытие вопроса завершает уже обработанный ход. Старый вопрос клиента
+        # нельзя заново ставить ИИ в очередь одновременно с возвратом меню.
+        schedule_ai=not restore_main_menu,
     )
     if (
         mode == "ai"

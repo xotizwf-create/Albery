@@ -157,7 +157,9 @@ def test_composite_sample_appears_only_for_a_list_of_questions():
 
     built = p.build(p.Context(message=NINE_QUESTIONS))
     assert "4–5. Доступ к карточкам и ценам" in built
-    assert "уточню у коллег и вернусь с ответом" in built
+    assert "Точный срок договора уточню у менеджера" in built
+    assert "уточню у коллег" not in built
+    assert "вернусь с ответом" not in built
 
 
 def test_many_questions_recognises_both_shapes():

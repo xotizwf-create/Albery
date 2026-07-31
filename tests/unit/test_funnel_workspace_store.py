@@ -877,6 +877,46 @@ def test_control_return_to_ai_clears_operator_unread_queue():
     assert result["unread_count"] == 0
 
 
+def test_question_close_does_not_reschedule_the_old_client_question():
+    before = conversation(
+        state_version=7,
+        control_mode="human",
+        unread_count=1,
+        last_message_id=91,
+    )
+    after = conversation(
+        state_version=8,
+        control_mode="ai",
+        unread_count=0,
+        last_read_message_id=91,
+    )
+
+    def respond(sql, _params):
+        if sql.startswith("SELECT * FROM funnel_workspace_conversations"):
+            return before
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            return after
+        if sql.startswith("INSERT INTO funnel_workspace_control_events"):
+            return None
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    store.transition_control(
+        41,
+        mode="ai",
+        expected_version=7,
+        actor_name="Александр",
+        schedule_ai=False,
+        now=NOW,
+        connect=connect,
+    )
+
+    assert not any(
+        sql.startswith("SELECT client.id")
+        for sql, _params in connection.cursor_instance.executed
+    )
+
+
 def test_human_takeover_rejects_an_ai_send_already_at_provider_boundary():
     before = conversation(state_version=7, control_mode="ai")
 

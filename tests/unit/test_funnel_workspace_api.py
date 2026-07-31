@@ -745,7 +745,7 @@ def test_control_badge_says_who_runs_the_conversation():
     assert _payload(control_mode="paused")["control_label"] == "Ответы приостановлены"
 
 
-def test_manager_request_badge_stays_until_operator_reply():
+def test_manager_request_badge_stays_until_an_explicit_handled_marker():
     requested = "2026-07-29T12:00:00+00:00"
     assert _payload(
         metadata={"manager_requested_at": requested}
@@ -955,8 +955,10 @@ def test_close_question_restores_the_client_main_menu(client, monkeypatch):
     import funnel_telegram_gateway
 
     restored = {}
+    transitioned = {}
 
-    def transition(conversation_id, **_kwargs):
+    def transition(conversation_id, **kwargs):
+        transitioned.update(conversation_id=conversation_id, **kwargs)
         return {
             "id": conversation_id,
             "control_mode": "ai",
@@ -991,6 +993,9 @@ def test_close_question_restores_the_client_main_menu(client, monkeypatch):
             "id": conversation_id,
             "source_key": "telegram_bot",
             "external_user_id": 9001,
+            "metadata": {
+                "manager_requested_at": "2026-07-31T07:30:00+00:00",
+            },
         },
     )
     monkeypatch.setattr(workspace, "_workspace_ai_allowed", lambda _row: True)
@@ -1014,8 +1019,73 @@ def test_close_question_restores_the_client_main_menu(client, monkeypatch):
     )
 
     assert response.status_code == 200
+    assert transitioned["schedule_ai"] is False
     assert restored == {"conversation_id": 41, "state_version": 4}
     assert response.get_json()["conversation"]["state_version"] == 5
+
+
+def test_close_question_is_rejected_without_an_active_manager_dialog(
+    client, monkeypatch
+):
+    session_payload = login(client)
+    monkeypatch.setattr(
+        workspace.store,
+        "get_conversation",
+        lambda conversation_id: {
+            "id": conversation_id,
+            "source_key": "telegram_bot",
+            "external_user_id": 9001,
+            "metadata": {},
+        },
+    )
+    monkeypatch.setattr(workspace, "_workspace_ai_allowed", lambda _row: True)
+
+    response = client.post(
+        "/api/funnel-workspace/conversations/41/control",
+        json={
+            "mode": "ai",
+            "restore_main_menu": True,
+            "expected_version": 3,
+        },
+        headers={
+            "Origin": ORIGIN,
+            "X-CSRF-Token": session_payload["csrf_token"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["error"]["code"] == "manager_dialog_not_active"
+
+
+def test_active_manager_dialog_can_return_to_ai_only_through_question_close(
+    client, monkeypatch
+):
+    session_payload = login(client)
+    monkeypatch.setattr(
+        workspace.store,
+        "get_conversation",
+        lambda conversation_id: {
+            "id": conversation_id,
+            "source_key": "telegram_bot",
+            "external_user_id": 9001,
+            "metadata": {
+                "manager_requested_at": "2026-07-31T07:30:00+00:00",
+            },
+        },
+    )
+    monkeypatch.setattr(workspace, "_workspace_ai_allowed", lambda _row: True)
+
+    response = client.post(
+        "/api/funnel-workspace/conversations/41/control",
+        json={"mode": "ai", "expected_version": 3},
+        headers={
+            "Origin": ORIGIN,
+            "X-CSRF-Token": session_payload["csrf_token"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["error"]["code"] == "manager_dialog_requires_close"
 
 
 def test_lead_note_is_saved_and_mirrored_to_the_deal(client, monkeypatch):

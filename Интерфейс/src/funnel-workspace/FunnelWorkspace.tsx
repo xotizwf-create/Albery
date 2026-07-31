@@ -1885,7 +1885,9 @@ function ChatPanel({
   const lease = conversation ? formatLease(conversation.resume_at, now) : null;
   const canReply = conversation?.can_reply !== false;
   const controlTarget =
-    conversation?.control_mode === "ai"
+    conversation?.manager_requested
+      ? null
+      : conversation?.control_mode === "ai"
       ? "human"
       : conversation?.control_mode === "paused"
         ? "human"
@@ -1993,7 +1995,17 @@ function ChatPanel({
           <button
             type="button"
             onClick={() => controlTarget && onControl(controlTarget)}
-            disabled={controlBusy || !canReply || !controlTarget}
+            disabled={
+              controlBusy ||
+              !canReply ||
+              !controlTarget ||
+              Boolean(conversation.manager_requested)
+            }
+            title={
+              conversation.manager_requested
+                ? "Завершите диалог кнопкой «Вопрос закрыт»"
+                : undefined
+            }
             className={cn(
               "hidden h-10 items-center justify-center gap-2 rounded-xl px-3 text-xs font-bold transition sm:inline-flex",
               conversation.control_mode === "ai"
@@ -2302,7 +2314,9 @@ function ConversationDetails({
   const lease = formatLease(conversation.resume_at, now);
   const canReply = conversation.can_reply !== false;
   const primaryControlTarget =
-    conversation.control_mode === "ai"
+    conversation.manager_requested
+      ? null
+      : conversation.control_mode === "ai"
       ? "human"
       : conversation.control_mode === "paused"
         ? "human"
@@ -2440,7 +2454,17 @@ function ConversationDetails({
           <button
             type="button"
             onClick={() => primaryControlTarget && onControl(primaryControlTarget)}
-            disabled={controlBusy || !canReply || !primaryControlTarget}
+            disabled={
+              controlBusy ||
+              !canReply ||
+              !primaryControlTarget ||
+              Boolean(conversation.manager_requested)
+            }
+            title={
+              conversation.manager_requested
+                ? "Завершите диалог кнопкой «Вопрос закрыт»"
+                : undefined
+            }
             className={cn(
               "mt-4 inline-flex h-10 w-full items-center justify-center gap-2 rounded-xl text-xs font-bold transition disabled:opacity-60",
               conversation.control_mode === "ai"
@@ -3642,7 +3666,8 @@ function OperatorWorkspace({
                   icon: <Bot className="h-3.5 w-3.5" />,
                   disabled:
                     contextMenu.conversation.can_reply === false ||
-                    !contextMenu.conversation.ai_available,
+                    !contextMenu.conversation.ai_available ||
+                    Boolean(contextMenu.conversation.manager_requested),
                   onSelect: () =>
                     void setConversationControl(contextMenu.conversation, "ai"),
                 },
@@ -3661,7 +3686,9 @@ function OperatorWorkspace({
               label: "Вопрос закрыт",
               icon: <CheckCheck className="h-3.5 w-3.5" />,
               disabled:
-                controlBusy || contextMenu.conversation.status === "closed",
+                controlBusy ||
+                contextMenu.conversation.status === "closed" ||
+                !contextMenu.conversation.manager_requested,
               onSelect: () =>
                 void closeConversationQuestion(contextMenu.conversation),
             },

@@ -803,6 +803,36 @@ def test_post_delivery_stage_is_not_called_synchronously(monkeypatch):
     assert calls == []
 
 
+def test_bot_operator_reply_keeps_manager_dialog_active_until_explicit_close(
+    monkeypatch,
+):
+    handled = []
+    monkeypatch.setitem(sys.modules, "tg_agent", SimpleNamespace())
+    monkeypatch.setattr(
+        gateway,
+        "_store",
+        lambda: SimpleNamespace(
+            mark_manager_request_handled=lambda *args, **kwargs: handled.append(
+                (args, kwargs)
+            )
+        ),
+    )
+
+    gateway._after_delivery(
+        {
+            "conversation_id": 7,
+            "conversation_version": 3,
+            "author_type": "operator",
+            "source_key": gateway.BOT_SOURCE_KEY,
+            "payload": {},
+        },
+        result="sent",
+        finished={},
+    )
+
+    assert handled == []
+
+
 def test_transient_keyboard_removal_is_deleted_from_telegram_and_transcript(
     monkeypatch,
 ):
@@ -1503,7 +1533,7 @@ def test_business_answer_that_did_not_happen_still_hands_the_dialog_over(monkeyp
     assert waiting == [(12, {"expected_version": 5, "reason": "В знаниях нет ответа"})]
 
 
-def test_bot_ai_failure_flags_manager_without_stopping_future_ai(monkeypatch):
+def test_bot_ai_failure_hands_dialog_to_manager_and_stops_future_ai(monkeypatch):
     flagged = []
     waiting = []
     tg = SimpleNamespace(
@@ -1545,5 +1575,113 @@ def test_bot_ai_failure_flags_manager_without_stopping_future_ai(monkeypatch):
 
     gateway._apply_delivery_effects(action)
 
-    assert flagged == [(13, "Модель временно недоступна")]
-    assert waiting == []
+    assert flagged == []
+    assert waiting == [
+        (
+            13,
+            {
+                "expected_version": 6,
+                "reason": "Модель временно недоступна",
+                "manager_requested": True,
+                "permanent_human": True,
+            },
+        )
+    ]
+
+
+def test_bot_partial_answer_enters_the_same_single_manager_dialog(monkeypatch):
+    waiting = []
+    tg = SimpleNamespace(
+        _terms_already_sent=lambda _telegram_id: True,
+        _mark_terms_sent=lambda _telegram_id: None,
+        _invite_already_sent=lambda _telegram_id: True,
+        _mark_invited=lambda _telegram_id: None,
+    )
+    monkeypatch.setitem(sys.modules, "tg_agent", tg)
+    monkeypatch.setattr(gateway, "_cancel_bot_reminders", lambda _conversation_id: None)
+    monkeypatch.setattr(
+        gateway,
+        "_mark_waiting_if_current",
+        lambda conversation_id, **kwargs: waiting.append((conversation_id, kwargs)),
+    )
+
+    gateway._apply_delivery_effects(
+        {
+            "id": 76,
+            "conversation_id": 13,
+            "action_type": "delivery_effects",
+            "payload": {
+                "source_key": gateway.BOT_SOURCE_KEY,
+                "author_type": "agent",
+                "conversation_version": 6,
+                "escalate_after_delivery": True,
+                "escalation_reason": (
+                    "остались без ответа: текущие значения СПП по джемперам"
+                ),
+                "answered_client": True,
+            },
+        }
+    )
+
+    assert waiting == [
+        (
+            13,
+            {
+                "expected_version": 6,
+                "reason": (
+                    "остались без ответа: текущие значения СПП по джемперам"
+                ),
+                "manager_requested": True,
+                "permanent_human": True,
+            },
+        )
+    ]
+
+
+def test_delivered_explicit_handoff_repairs_a_missed_synchronous_transition(
+    monkeypatch,
+):
+    waiting = []
+    monkeypatch.setitem(
+        sys.modules,
+        "tg_agent",
+        SimpleNamespace(
+            _terms_already_sent=lambda _telegram_id: True,
+            _mark_terms_sent=lambda _telegram_id: None,
+            _invite_already_sent=lambda _telegram_id: True,
+            _mark_invited=lambda _telegram_id: None,
+        ),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_mark_waiting_if_current",
+        lambda conversation_id, **kwargs: waiting.append((conversation_id, kwargs)),
+    )
+
+    result = gateway._apply_delivery_effects(
+        {
+            "id": 77,
+            "conversation_id": 14,
+            "action_type": "delivery_effects",
+            "payload": {
+                "source_key": gateway.BOT_SOURCE_KEY,
+                "author_type": "agent",
+                "conversation_version": 8,
+                "manager_dialog_after_delivery": True,
+                "manager_dialog_reason": "Клиент выбрал «Позвать оператора».",
+            },
+        }
+    )
+
+    assert result["manager_dialog_repaired"] is True
+    assert waiting == [
+        (
+            14,
+            {
+                "expected_version": 8,
+                "reason": "Клиент выбрал «Позвать оператора».",
+                "manager_requested": True,
+                "permanent_human": True,
+            },
+        )
+    ]

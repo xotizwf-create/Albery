@@ -185,7 +185,7 @@ def test_closed_manager_question_restores_the_main_menu(monkeypatch):
     gateway.restore_client_menu_after_closed_question(5, state_version=9)
 
     queued = store.queued[0]
-    assert queued["text"] == bot.MENU_PROMPT
+    assert queued["text"] == bot.MANAGER_QUESTION_CLOSED
     assert queued["metadata"]["iu_event"] == "manager_question_closed"
     keyboard = queued["metadata"]["reply_markup"]["keyboard"]
     assert [row[0]["text"] for row in keyboard] == [
@@ -310,18 +310,17 @@ def test_file_handover_notifies_without_claiming_an_explicit_manager_call(monkey
     assert store.queued[0]["metadata"]["manager_notification_recipient"] == "chat2714"
     assert store.queued[0]["metadata"]["manager_notification_bot_id"] == 86
     assert store.queued[0]["metadata"]["manager_notification_client_name"] == "Пётр Иванов"
-    assert store.queued[0]["metadata"]["manager_notification_kind"] == "manager_needed"
-    assert store.queued[0]["metadata"]["reply_markup"] == bot.main_menu()
-    assert store.transitions == []
-    assert store.human_flags == [
-        {
-            "conversation_id": 5,
-            "reason": "Клиент прислал файл с пояснением — требуется ручной разбор содержимого.",
-        }
-    ]
+    assert store.queued[0]["metadata"]["manager_notification_kind"] == "client_called"
+    assert store.queued[0]["metadata"]["manager_dialog_after_delivery"] is True
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.remove_keyboard()
+    assert store.transitions[0]["manager_requested"] is True
+    assert store.transitions[0]["permanent_human"] is True
+    assert store.human_flags == []
 
 
-def test_after_hours_file_review_keeps_menu_and_ai_control(monkeypatch):
+def test_after_hours_file_review_uses_the_same_manager_dialog_state(monkeypatch):
+    import iu_manager_response_watch as watch
+
     store = FakeStore()
     monkeypatch.setattr(gateway, "_store", lambda: store)
     monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
@@ -340,11 +339,12 @@ def test_after_hours_file_review_keeps_menu_and_ai_control(monkeypatch):
         )
     )
 
-    assert store.queued[0]["text"] == bot.FILE_SENT_TO_MANAGER
-    assert store.queued[0]["metadata"]["reply_markup"] == bot.main_menu()
+    assert store.queued[0]["text"] == watch.AFTER_HOURS_CLIENT_REPLY
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.remove_keyboard()
     assert store.queued[0]["metadata"]["manager_notification_deferred"] is True
-    assert store.transitions == []
-    assert store.human_flags
+    assert store.transitions[0]["manager_requested"] is True
+    assert store.transitions[0]["permanent_human"] is True
+    assert store.human_flags == []
 
 
 def test_calculator_message_uses_join_form_even_while_dialog_is_human(monkeypatch):
@@ -705,6 +705,43 @@ def test_menu_cancels_an_explicit_manager_dialog_and_restores_ai(monkeypatch):
     assert "отменил ожидание менеджера" in store.transitions[0]["reason"]
 
 
+def test_old_menu_button_text_does_not_interrupt_an_active_manager_dialog(
+    monkeypatch,
+):
+    store = FakeStore(
+        control_mode="human",
+        metadata={"manager_requested_at": "2026-07-30T20:17:32+00:00"},
+    )
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.route_captured_update(
+        _message_update(bot.BUTTON_ASK, message_id=901)
+    )
+
+    assert store.ingested[0]["schedule_ai"] is False
+    assert store.queued == []
+    assert store.transitions == []
+
+
+def test_old_inline_menu_button_cancels_an_active_manager_dialog(monkeypatch):
+    store = FakeStore(
+        control_mode="human",
+        metadata={"manager_requested_at": "2026-07-30T20:17:32+00:00"},
+    )
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    monkeypatch.setattr(gateway, "_conversation_for_bot_chat", lambda *_a, **_k: 5)
+    _tg(monkeypatch)
+
+    gateway.handle_bot_callback(_callback_update(bot.CB_JOIN_MENU)["callback_query"])
+
+    assert store.queued[0]["text"] == bot.MANAGER_DIALOG_CANCELLED
+    assert store.queued[0]["metadata"]["reply_markup"] == bot.main_menu()
+    assert store.transitions[0]["kind"] == "control"
+    assert store.transitions[0]["mode"] == "ai"
+
+
 def test_any_ai_escalation_enqueues_the_same_bitrix_manager_alert(monkeypatch):
     import iu_contract
 
@@ -712,7 +749,11 @@ def test_any_ai_escalation_enqueues_the_same_bitrix_manager_alert(monkeypatch):
     monkeypatch.setattr(gateway, "_store", lambda: store)
     _tg(monkeypatch)
     outcome = SimpleNamespace(
-        reply="Передал вопрос менеджеру.",
+        reply=(
+            "[b]FBS и экономика[/b]\n"
+            "Расходы на логистику влияют на маржинальность.\n\n"
+            "Текущие значения СПП по джемперам уточню у коллег и вернусь с ответом."
+        ),
         action=iu_contract.REPLY_ONLY,
         escalate=True,
         reason="Нужна ручная проверка.",
@@ -736,6 +777,74 @@ def test_any_ai_escalation_enqueues_the_same_bitrix_manager_alert(monkeypatch):
     assert prepared.metadata["manager_notification_recipient"] == "chat2714"
     assert prepared.metadata["manager_notification_bot_id"] == 86
     assert prepared.metadata["manager_notification_kind"] == "manager_needed"
+    assert "уточню у менеджера" in prepared.text
+    assert "у коллег" not in prepared.text
+    assert "вернусь с ответом" not in prepared.text
+    assert prepared.text.endswith(bot.AI_PARTIAL_MANAGER_HANDOFF_TAIL)
+    assert prepared.metadata["reply_markup"] == bot.remove_keyboard()
+
+
+def test_full_ai_escalation_uses_fixed_manager_handoff_and_removes_menu(monkeypatch):
+    import iu_contract
+
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    _tg(monkeypatch)
+    outcome = SimpleNamespace(
+        reply="Уточню это у команды и вернусь с ответом.",
+        action=iu_contract.HANDOFF,
+        escalate=True,
+        reason="В знаниях нет актуальной СПП.",
+        stage_move="",
+        answered_client=False,
+        sources=(),
+        trace={},
+    )
+
+    prepared = gateway.prepare_reply(
+        outcome,
+        telegram_user_id=555,
+        conversation={
+            "id": 5,
+            "source_key": gateway.BOT_SOURCE_KEY,
+            "control_mode": "ai",
+        },
+    )
+
+    assert prepared.text == bot.AI_FULL_MANAGER_HANDOFF
+    assert prepared.metadata["reply_markup"] == bot.remove_keyboard()
+    assert "команд" not in prepared.text.casefold()
+
+
+def test_long_partial_answer_never_truncates_the_manager_handoff_tail(monkeypatch):
+    import iu_contract
+
+    store = FakeStore()
+    monkeypatch.setattr(gateway, "_store", lambda: store)
+    _tg(monkeypatch)
+    outcome = SimpleNamespace(
+        reply=("Полезный подтверждённый факт. " * 300) + "Остальное уточню у коллег.",
+        action=iu_contract.REPLY_ONLY,
+        escalate=True,
+        reason="остались без ответа: остаток вопроса",
+        stage_move="",
+        answered_client=True,
+        sources=("knowledge-card",),
+        trace={},
+    )
+
+    prepared = gateway.prepare_reply(
+        outcome,
+        telegram_user_id=555,
+        conversation={
+            "id": 5,
+            "source_key": gateway.BOT_SOURCE_KEY,
+            "control_mode": "ai",
+        },
+    )
+
+    assert len(prepared.text) <= gateway._TEXT_LIMIT
+    assert prepared.text.endswith(bot.AI_PARTIAL_MANAGER_HANDOFF_TAIL)
 
 
 def test_vague_help_request_neither_calls_nor_notifies_manager(monkeypatch):

@@ -79,7 +79,7 @@ export interface Conversation {
   control_label?: string;
   /** Диалог забран человеком насовсем: ИИ сам не вернётся. */
   control_permanent?: boolean;
-  /** Клиент явно нажал «Позвать оператора», а менеджер ещё не ответил. */
+  /** Клиенту обещано подключение менеджера; состояние живёт до «Вопрос закрыт» или /menu. */
   manager_requested?: boolean;
   manager_requested_at?: string | null;
   /** Постоянный адрес обращения: /agent-funnels/<id>. */

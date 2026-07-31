@@ -921,7 +921,7 @@ def _reply_and_hand_over(
     idempotency_key: str,
     event: str,
     reason: str,
-    manager_requested: bool = False,
+    manager_requested: bool = True,
     notification_kind: str | None = None,
     metadata: Mapping[str, Any] | None = None,
     **reply_options: Any,
@@ -931,6 +931,17 @@ def _reply_and_hand_over(
     import iu_manager_response_watch
 
     payload = dict(metadata or {})
+    if manager_requested:
+        import iu_client_bot
+
+        # Любая реплика «передал менеджеру» означает один и тот же режим: меню
+        # скрыто, ИИ остановлен, в UI активен запрос менеджера до явного закрытия.
+        reply_options["reply_markup"] = iu_client_bot.remove_keyboard()
+        # Синхронный переход ниже даёт статус сразу. Этот delivery-effect — страховка:
+        # если процесс упадёт между постановкой ответа в outbox и сменой режима,
+        # подтверждённая доставка повторит переход идемпотентно.
+        payload["manager_dialog_after_delivery"] = True
+        payload["manager_dialog_reason"] = reason[:1000]
     if _manager_notifications_open():
         payload.update(
             _manager_request_metadata(
@@ -1005,7 +1016,7 @@ def restore_client_menu_after_closed_question(
 
     return _reply_to_client(
         conversation_id,
-        iu_client_bot.MENU_PROMPT,
+        iu_client_bot.MANAGER_QUESTION_CLOSED,
         idempotency_key=(
             f"iu-bot:manager-question-closed:{conversation_id}:{state_version}"
         ),
@@ -1130,6 +1141,22 @@ def handle_bot_callback(callback: Mapping[str, Any]) -> tuple[int | None, int | 
         return None, None
 
     key = f"iu-bot:{chat_id}:{callback.get('id')}"
+    conversation = dict(_store().get_conversation(conversation_id) or {})
+    if _explicit_manager_dialog_active(conversation):
+        if data == iu_client_bot.CB_JOIN_MENU:
+            queued = _reply_to_client(
+                conversation_id,
+                iu_client_bot.MANAGER_DIALOG_CANCELLED,
+                idempotency_key=f"{key}:manager-dialog-cancelled",
+                reply_markup=iu_client_bot.main_menu(),
+                metadata={"iu_event": "manager_dialog_cancelled"},
+            )
+            _restore_ai_after_service_reply(
+                conversation_id,
+                queued,
+                reason="Клиент отменил ожидание менеджера кнопкой меню.",
+            )
+        return conversation_id, None
     run_menu_action(
         data,
         conversation_id=conversation_id,
@@ -1199,7 +1226,11 @@ def ingest_bot_message(
     previous_support = iu_bot_state.support_state(previous_messages)
     legacy_repeat_join_hold = _legacy_repeat_join_hold(previous_conversation)
     legacy_calculator_hold = _legacy_calculator_hold(previous_conversation)
-    explicit_manager_dialog = _explicit_manager_dialog_active(previous_conversation)
+    explicit_manager_dialog = (
+        _explicit_manager_dialog_active(previous_conversation)
+        and not legacy_repeat_join_hold
+        and not legacy_calculator_hold
+    )
     is_command = text.strip().startswith("/")
     # Пункт меню приходит обычным текстом. Это выбор действия, а не вопрос: отвечает
     # сценарий, модель не вызывается вовсе.
@@ -1227,6 +1258,7 @@ def ingest_bot_message(
             and not awaiting_file_context
             and previous_support.mode in {"active", "quiet"}
             and not legacy_repeat_join_hold
+            and not explicit_manager_dialog
         )
     command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower() if text.strip() else ""
     start_payload = ""
@@ -1319,6 +1351,11 @@ def ingest_bot_message(
                 else "Клиент вернулся в главное меню командой /menu."
             ),
         )
+    elif explicit_manager_dialog:
+        # В едином режиме менеджера любые новые тексты, файлы и старые подписи кнопок
+        # только пополняют переписку для человека. Выйти из режима клиент может лишь
+        # через /menu (/start ведёт туда же), иначе сценарий не вмешивается.
+        pass
     elif command == "/stop":
         _reply_to_client(
             conversation_id,
@@ -2230,12 +2267,14 @@ def prepare_reply(
     """Turn an ИУ decision into one atomic Telegram text for the durable outbox."""
 
     import iu_contract
+    import iu_client_bot
     import tg_agent
 
     # В боте жирный доезжает до клиента (собирается в разметку при отправке), в переписке
     # бизнес-аккаунта сообщение уходит обычным текстом от лица менеджера — там вычищаем всё.
-    keep_bold = bool(conversation) and str(
+    bot_dialog = bool(conversation) and str(
         (conversation or {}).get("source_key") or "") == BOT_SOURCE_KEY
+    keep_bold = bot_dialog
     body = tg_agent._strip_markup(str(outcome.reply or "").strip(), keep_bold=keep_bold)
     action = str(outcome.action or iu_contract.REPLY_ONLY)
     escalate = bool(outcome.escalate)
@@ -2251,7 +2290,7 @@ def prepare_reply(
             body = combined
             asset = "terms"
         except Exception as exc:  # noqa: BLE001
-            body = "Уточню это у команды и вернусь с ответом."
+            body = iu_client_bot.AI_FULL_MANAGER_HANDOFF
             escalate = True
             reason = f"Не удалось безопасно подготовить условия: {_safe_error(exc)}"
     elif action == iu_contract.SEND_FORM:
@@ -2276,11 +2315,28 @@ def prepare_reply(
         reason = "Договор требует подтверждения и отправки оператором из workspace."
 
     if not body:
-        body = "Уточню это у команды и вернусь с ответом."
+        body = iu_client_bot.AI_FULL_MANAGER_HANDOFF
         escalate = True
         reason = reason or "ИИ не сформировал безопасный ответ."
+    if bot_dialog and escalate:
+        body = iu_client_bot.manager_handoff_reply(
+            body,
+            answered_client=bool(outcome.answered_client),
+            reason=reason,
+        )
     if len(body) > _TEXT_LIMIT:
-        body = body[:_TEXT_LIMIT].rstrip()
+        if (
+            bot_dialog
+            and escalate
+            and bool(outcome.answered_client)
+            and body.endswith(iu_client_bot.AI_PARTIAL_MANAGER_HANDOFF_TAIL)
+        ):
+            tail = iu_client_bot.AI_PARTIAL_MANAGER_HANDOFF_TAIL
+            core = body[: -len(tail)].rstrip()
+            core_limit = max(0, _TEXT_LIMIT - len(tail) - 2)
+            body = f"{core[:core_limit].rstrip()}\n\n{tail}".strip()
+        else:
+            body = body[:_TEXT_LIMIT].rstrip()
 
     # Владелец 30.07.2026 отключил неявные переходы из ответов и доставок. Сам факт,
     # что бот отправил условия либо ссылку на анкету, сделку не двигает. Единственное
@@ -2308,13 +2364,16 @@ def prepare_reply(
         )
     # Клиенту, который уже несколько раз спросил у ИИ, показываем прямой путь к человеку.
     # В переписке менеджера кнопки не нужны: там и так отвечает человек.
-    if conversation and str(conversation.get("source_key") or "") == BOT_SOURCE_KEY:
-        import iu_client_bot
+    if bot_dialog:
         import iu_bot_state
 
         messages = _bot_messages(int(conversation["id"]))
         state = iu_bot_state.support_state(messages)
-        if state.mode in {"active", "quiet"}:
+        if escalate:
+            metadata["reply_markup"] = iu_client_bot.remove_keyboard()
+            if state.mode in {"active", "quiet"}:
+                metadata["iu_event"] = "support_answer"
+        elif state.mode in {"active", "quiet"}:
             replies = iu_bot_state.support_agent_replies(messages)
             metadata["reply_markup"] = iu_client_bot.support_menu(
                 offer_operator=iu_client_bot.should_offer_operator(
@@ -2943,7 +3002,10 @@ def _after_delivery(
                     _safe_error(exc),
                 )
             return
-        if outbox.get("author_type") == "operator":
+        if (
+            outbox.get("author_type") == "operator"
+            and str(outbox.get("source_key") or "") != BOT_SOURCE_KEY
+        ):
             try:
                 handled_at = outbox.get("created_at")
                 _store().mark_manager_request_handled(
@@ -2990,11 +3052,25 @@ def _after_delivery(
                 if result == "unknown"
                 else "Ответ ИИ не доставлен."
             )
-        # Клиентский бот остаётся у ИИ при любой автоматической эскалации. Только явное
-        # действие клиента «Позвать менеджера» переводит его в human; сбой/неуверенность
-        # поднимают обращение в очередь, не ломая следующий ход.
         bot_dialog = str(outbox.get("source_key") or "") == BOT_SOURCE_KEY
-        if bot_dialog or (result == "sent" and payload.get("answered_client")):
+        if bot_dialog:
+            _cancel_bot_reminders(conversation_id)
+            try:
+                _mark_waiting_if_current(
+                    conversation_id,
+                    expected_version=int(outbox["conversation_version"]),
+                    reason=reason,
+                    manager_requested=True,
+                    permanent_human=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - durable delivery-effect повторит переход
+                log.warning(
+                    "iu client bot: immediate manager handover failed for %s: %s",
+                    conversation_id,
+                    _safe_error(exc),
+                )
+            return
+        if result == "sent" and payload.get("answered_client"):
             try:
                 _store().flag_needs_human(conversation_id, reason=reason)
             except Exception as exc:  # noqa: BLE001 — пометка не важнее уже доставленного ответа
@@ -3015,6 +3091,8 @@ def _mark_waiting_if_current(
     *,
     expected_version: int,
     reason: str,
+    manager_requested: bool = False,
+    permanent_human: bool = False,
 ) -> None:
     store = _store()
     try:
@@ -3022,9 +3100,8 @@ def _mark_waiting_if_current(
             conversation_id,
             expected_version=expected_version,
             reason=(reason or "Нужен ответ человека.")[:1000],
-            # Автоматическая эскалация не означает, что клиент сам позвал менеджера.
-            # Явные вызовы проходят через _reply_and_hand_over и ставят отдельный бейдж.
-            manager_requested=False,
+            manager_requested=manager_requested,
+            permanent_human=permanent_human,
         )
     except (
         store.WorkspaceConflictError,
@@ -3246,8 +3323,6 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
             payload.get("escalation_reason")
             or "После доставленного ответа ИИ нужен ответ человека."
         )
-        # В клиентском боте автоматическая эскалация не меняет исполнителя: разговор
-        # прекращает вести ИИ только после явного вызова менеджера клиентом.
         source_key = str(payload.get("source_key") or "")
         if not source_key:
             # Совместимость с delivery actions, созданными до сохранения source_key:
@@ -3264,7 +3339,16 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
                     _safe_error(exc),
                 )
         bot_dialog = source_key == BOT_SOURCE_KEY
-        if bot_dialog or payload.get("answered_client"):
+        if bot_dialog:
+            _cancel_bot_reminders(int(action["conversation_id"]))
+            _mark_waiting_if_current(
+                int(action["conversation_id"]),
+                expected_version=int(payload.get("conversation_version") or 0),
+                reason=reason,
+                manager_requested=True,
+                permanent_human=True,
+            )
+        elif payload.get("answered_client"):
             try:
                 _store().flag_needs_human(int(action["conversation_id"]), reason=reason)
             except Exception as exc:  # noqa: BLE001 — пометка не важнее доставленного ответа
@@ -3276,6 +3360,18 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
                 expected_version=int(payload.get("conversation_version") or 0),
                 reason=reason,
             )
+    manager_dialog_repaired = bool(payload.get("manager_dialog_after_delivery"))
+    if manager_dialog_repaired and not escalated:
+        _mark_waiting_if_current(
+            int(action["conversation_id"]),
+            expected_version=int(payload.get("conversation_version") or 0),
+            reason=str(
+                payload.get("manager_dialog_reason")
+                or "Клиенту обещано подключение менеджера."
+            ),
+            manager_requested=True,
+            permanent_human=True,
+        )
     return {
         "conversation_id": int(action["conversation_id"]),
         "status": "applied",
@@ -3283,6 +3379,7 @@ def _apply_delivery_effects(action: Mapping[str, Any]) -> dict[str, Any]:
         "escalated": escalated,
         "manager_notified": manager_notified,
         "manager_notification_deferred": manager_notification_deferred,
+        "manager_dialog_repaired": manager_dialog_repaired,
     }
 
 

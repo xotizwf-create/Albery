@@ -1667,6 +1667,7 @@ def transition_control(
     reason: str | None = None,
     lease_seconds: int | None = None,
     permanent: bool = False,
+    schedule_ai: bool = True,
     now: datetime | None = None,
     connect: ConnectFactory | None = None,
 ) -> dict[str, Any]:
@@ -1771,7 +1772,7 @@ def transition_control(
                 from_version=current_version,
                 to_version=next_version,
             )
-            if clean_mode == "ai":
+            if clean_mode == "ai" and schedule_ai:
                 trigger_message_id = _latest_unanswered_client_message_id(
                     cur,
                     int(row["id"]),
@@ -1801,9 +1802,10 @@ def mark_waiting_human(
 ) -> dict[str, Any]:
     """Поставить обращение в очередь человеку.
 
-    ``permanent_human=True`` означает явный вызов менеджера клиентом: управление сразу
-    передаётся человеку без двухминутной аренды и не вернётся ИИ само. Обычная
-    эскалация без этого флага остаётся на паузе до решения оркестратора/оператора.
+    ``permanent_human=True`` означает, что клиенту уже обещано подключение менеджера:
+    управление сразу передаётся человеку без двухминутной аренды и не вернётся ИИ
+    само. Обычная внутренняя эскалация без этого флага остаётся на паузе до решения
+    оркестратора/оператора.
     """
 
     timestamp = _now(now)
@@ -4271,9 +4273,10 @@ def _enqueue_delivery_effect_action_cursor(
     asset = str(source_payload.get("asset") or "").strip()
     escalate = bool(source_payload.get("escalate_after_delivery"))
     notify_manager = bool(source_payload.get("notify_manager_after_delivery"))
+    manager_dialog = bool(source_payload.get("manager_dialog_after_delivery"))
     if asset not in {"terms", "form"} and not (
         outbox.get("author_type") == "agent" and escalate
-    ) and not notify_manager:
+    ) and not notify_manager and not manager_dialog:
         return None
     outbox_id = _positive_int(outbox.get("id"), "outbox_id")
     conversation_id = _positive_int(
@@ -4298,6 +4301,11 @@ def _enqueue_delivery_effect_action_cursor(
             1000,
         ),
         "notify_manager_after_delivery": notify_manager,
+        "manager_dialog_after_delivery": manager_dialog,
+        "manager_dialog_reason": _clean_optional(
+            source_payload.get("manager_dialog_reason"),
+            1000,
+        ),
         "manager_notification_kind": _clean_optional(
             source_payload.get("manager_notification_kind"),
             100,
