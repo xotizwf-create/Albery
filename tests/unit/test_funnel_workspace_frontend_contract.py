@@ -8,6 +8,10 @@ FRONTEND = (
     / "funnel-workspace"
     / "FunnelWorkspace.tsx"
 )
+FRONTEND_ROOT = FRONTEND.parents[2]
+INDEX_HTML = FRONTEND_ROOT / "index.html"
+MAIN_TSX = FRONTEND_ROOT / "src" / "main.tsx"
+ROOT_ERROR_BOUNDARY = FRONTEND_ROOT / "src" / "RootErrorBoundary.tsx"
 
 
 def test_login_uses_the_server_bound_operator_name_for_button_and_submit():
@@ -45,3 +49,25 @@ def test_close_question_returns_the_active_dialog_to_ai_instead_of_closing_it():
     assert "loadConversations(true, true)" in handler
     assert "funnelWorkspaceApi.setStatus" not in handler
     assert 'status: "closed"' not in handler
+
+
+def test_russian_spa_disables_browser_translation_that_mutates_react_dom():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert '<html lang="ru" translate="no" class="notranslate">' in html
+    assert '<meta name="google" content="notranslate" />' in html
+    assert '<body translate="no" class="notranslate">' in html
+    assert '<div id="root" translate="no" class="notranslate"></div>' in html
+
+
+def test_root_render_and_bootstrap_failures_never_leave_a_blank_page():
+    main = MAIN_TSX.read_text(encoding="utf-8")
+    boundary = ROOT_ERROR_BOUNDARY.read_text(encoding="utf-8")
+
+    assert "<RootErrorBoundary>" in main
+    assert "</RootErrorBoundary>" in main
+    assert "bootstrap().catch(showBootstrapFailure)" in main
+    assert 'data-ui-recovery="render"' in boundary
+    assert 'page.dataset.uiRecovery = "bootstrap"' in boundary
+    assert "Обновить страницу" in boundary
+    assert "root.replaceChildren(page)" in boundary

@@ -1,6 +1,7 @@
 import {StrictMode} from 'react';
 import {createRoot} from 'react-dom/client';
 import './index.css';
+import {RootErrorBoundary, showBootstrapFailure} from './RootErrorBoundary.tsx';
 
 async function bootstrap() {
   const pathname = window.location.pathname.replace(/\/+$/, '') || '/';
@@ -12,11 +13,18 @@ async function bootstrap() {
     ? (await import('./funnel-workspace/FunnelWorkspace.tsx')).FunnelWorkspace
     : (await import('./App.tsx')).default;
 
-  createRoot(document.getElementById('root')!).render(
+  const rootElement = document.getElementById('root');
+  if (!rootElement) {
+    throw new Error('Не найден корневой элемент интерфейса.');
+  }
+
+  createRoot(rootElement).render(
     <StrictMode>
-      <RootComponent />
+      <RootErrorBoundary>
+        <RootComponent />
+      </RootErrorBoundary>
     </StrictMode>,
   );
 }
 
-void bootstrap();
+void bootstrap().catch(showBootstrapFailure);
