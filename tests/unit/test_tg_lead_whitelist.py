@@ -74,22 +74,48 @@ def test_user_without_username_gets_no_generated_reply(tg, monkeypatch):
     assert calls == []
 
 
-def test_crm_unavailable_means_total_silence(tg, monkeypatch):
-    """Если воронку не прочитать, лида не отличить от незнакомца — не пишем НИЧЕГО.
-
-    Иначе при сбое Bitrix живой лид получил бы приглашение заполнить анкету, которую он уже
-    заполнил."""
+def test_crm_unavailable_creates_managed_handoff_for_iu_request(tg, monkeypatch):
+    """CRM outage must not turn a deterministic IU request into unexplained silence."""
     monkeypatch.setenv("TG_LEAD_INVITE", "1")
     tg._LEADS_CACHE.update({"at": 0.0, "map": {}, "ok": False})
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {})
-    calls, sent = [], []
+    calls, handoffs = [], []
     monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
-    monkeypatch.setattr(tg, "send_as_account",
-                        lambda uid, t, parse_mode="": sent.append(t) or (True, ""))
+    monkeypatch.setattr(
+        tg,
+        "_visible_handoff",
+        lambda author, client_text, question, reply, **kw:
+        handoffs.append({"reply": reply, **kw}) or True,
+    )
 
-    tg.maybe_autoreply(_msg())
+    tg.maybe_autoreply(_msg(text="Здравствуйте, интересуют условия ИУ"))
 
-    assert calls == [] and sent == []
+    assert calls == []
+    assert len(handoffs) == 1
+    assert handoffs[0]["reason_code"] == "crm_unavailable"
+    assert handoffs[0]["deliver_customer"] is True
+    assert "не могу проверить данные" in handoffs[0]["reply"]
+
+
+def test_crm_unavailable_unscoped_contact_is_only_queued_for_manual_triage(tg, monkeypatch):
+    """A live account's supplier/friend is not auto-messaged when CRM cannot identify them."""
+    monkeypatch.setenv("TG_LEAD_INVITE", "1")
+    tg._LEADS_CACHE.update({"at": 0.0, "map": {}, "ok": False})
+    monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {})
+    handoffs = []
+    monkeypatch.setattr(
+        tg,
+        "_visible_handoff",
+        lambda author, client_text, question, reply, **kw:
+        handoffs.append(kw) or False,
+    )
+
+    tg.maybe_autoreply(_msg(text="Привет, это личный вопрос"))
+
+    assert len(handoffs) == 1
+    assert handoffs[0]["reason_code"] == "crm_unavailable"
+    assert handoffs[0]["deliver_customer"] is False
+    assert handoffs[0]["customer_error_code"] == "identity_unverified"
 
 
 def test_deal_number_is_given_to_the_agent(tg, monkeypatch):

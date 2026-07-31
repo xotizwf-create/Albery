@@ -155,6 +155,30 @@ def test_long_terms_split_the_form_and_mark_only_delivered_assets(tg, monkeypatc
     assert terms_marked == [555] and invited == [555]
 
 
+def test_split_form_failure_preserves_the_delivered_terms_postcondition(tg, monkeypatch):
+    calls, terms_marked, invited = [], [], []
+    monkeypatch.setattr(tg, "terms_text", lambda: "X" * 3300)
+
+    def send(_uid, _html, plain):
+        calls.append(plain)
+        return (True, "") if len(calls) == 1 else (False, "network timeout")
+
+    monkeypatch.setattr(tg, "send_html", send)
+    monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
+    monkeypatch.setattr(tg, "_invite_already_sent", lambda uid: False)
+    monkeypatch.setattr(tg, "_mark_terms_sent", lambda uid: terms_marked.append(uid))
+    monkeypatch.setattr(tg, "_mark_invited", lambda uid: invited.append(uid))
+
+    with pytest.raises(tg.CustomerAssetError) as raised:
+        tg.send_terms(0, 555, offer_form=True)
+
+    assert len(calls) == 2
+    assert terms_marked == [555] and invited == []
+    assert raised.value.customer_already_visible is True
+    assert raised.value.delivery_attempted is True
+    assert raised.value.error_code == "timeout"
+
+
 def test_oversized_terms_are_not_truncated_or_marked_as_sent(tg, monkeypatch):
     sent, terms_marked, invited = [], [], []
     monkeypatch.setattr(tg, "terms_text", lambda: "X" * 3490)
@@ -288,8 +312,6 @@ def test_requisites_remain_terms_evidence_after_explicit_field_is_configured(tg,
 
 def _stranger(tg, monkeypatch, answer, client_text="какие условия подключения?"):
     """Незнакомец пишет в личку; ловим, что уйдёт клиенту."""
-    import json as _json
-
     box = []
     monkeypatch.setenv("TG_BUSINESS_AUTOREPLY", "1")
     monkeypatch.setenv("TG_LEAD_INVITE", "1")
@@ -297,6 +319,9 @@ def _stranger(tg, monkeypatch, answer, client_text="какие условия п
     monkeypatch.setattr(tg, "save_state", lambda s: None)
     monkeypatch.setattr(tg, "crm_lead_usernames", lambda force=False: {})
     monkeypatch.setattr(tg, "crm_leads_reachable", lambda: True)
+    monkeypatch.setattr(tg, "_open_lead_deal", lambda *a, **kw: 90)
+    monkeypatch.setattr(tg, "_deal_has_form", lambda deal_id: False)
+    monkeypatch.setattr(tg, "_move_deal_stage", lambda *a, **kw: None)
     monkeypatch.setattr(tg, "journal", lambda *a, **k: None)
     monkeypatch.setattr(tg, "hermes_answer", lambda p, s, toolsets=None: answer)
     monkeypatch.setattr(tg, "send_as_account",
@@ -362,7 +387,9 @@ def test_stranger_oversized_terms_are_never_truncated_or_marked(tg, monkeypatch)
 
     box = _stranger(tg, monkeypatch, tg.TERMS_REQUEST_MARKER)
 
-    assert box == []
+    assert len(box) == 1
+    assert "не могу отправить нужный материал" in box[0]
+    assert "X" * 100 not in box[0] and tg.LEAD_FORM_URL not in box[0]
     assert terms_marked == [] and invited == []
 
 
@@ -455,7 +482,9 @@ def _lead_turn(tg, monkeypatch, client_text, state_extra=None, answer=None,
     monkeypatch.setattr(tg, "hermes_answer",
                         lambda p, s, toolsets=None: answer or tg.TERMS_REQUEST_MARKER)
     monkeypatch.setattr(tg, "escalate_to_human",
-                        lambda author, q, ctext, answered=False: to_humans.append(q))
+                        lambda author, q, ctext, **kw:
+                        to_humans.append(f"{q} | {ctext}") or
+                        {"sent": True, "destination": "test", "message_id": 1})
     monkeypatch.setattr(tg, "send_html",
                         lambda uid, html, plain: sent.append(plain) or (True, ""))
     # Отметку в сделке подменяем: проверяем поведение с клиентом, а не поход в Битрикс.

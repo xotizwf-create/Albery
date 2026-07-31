@@ -50,7 +50,9 @@ def _turn(tg, monkeypatch, answers):
     monkeypatch.setattr(tg, "hermes_answer", model)
     monkeypatch.setattr(tg, "send_html", lambda uid, html, plain: sent.append(plain) or (True, ""))
     monkeypatch.setattr(tg, "escalate_to_human",
-                        lambda author, q, ctext, answered=False: to_humans.append(q))
+                        lambda author, q, ctext, **kw:
+                        to_humans.append(q) or
+                        {"sent": True, "destination": "test", "message_id": 1})
     tg.maybe_autoreply({"business_connection_id": "C1", "chat": {"id": 555, "type": "private"},
                         "from": {"id": 555, "username": "lead", "first_name": "Пётр"},
                         "text": "Да, актуально."})
@@ -75,12 +77,14 @@ def test_persistent_failure_goes_to_humans_not_to_silence(tg, monkeypatch):
 
     assert len(calls) == 2
     assert to_humans, "вопрос клиента обязан уйти живым людям"
-    assert "модель недоступна" in to_humans[0]
-    assert sent == [], "клиенту пустых обещаний не пишем — правило владельца от 22.07.2026"
+    assert "модель не сформировала" in to_humans[0]
+    assert len(sent) == 1
+    assert "технический сбой" in sent[0] and "HTTP 500" not in sent[0]
 
 
 def test_empty_model_answer_also_reaches_humans(tg, monkeypatch):
     """Модель ответила пустотой — для клиента это та же тишина."""
     calls, sent, to_humans = _turn(tg, monkeypatch, [RuntimeError("HTTP 503"), ""])
 
-    assert to_humans and sent == []
+    assert to_humans and len(sent) == 1
+    assert "передаю вопрос менеджеру" in sent[0].lower()

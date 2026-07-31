@@ -32,6 +32,15 @@ def tg(monkeypatch, tmp_path):
     # CRM доступна, в воронке один лид — все остальные считаются незнакомцами.
     tg_agent._LEADS_CACHE.update({"at": 0.0, "map": {}, "ok": True})
     monkeypatch.setattr(tg_agent, "crm_lead_usernames", lambda force=False: {"griaznov.d": 82})
+    # Happy-path dialog tests are not CRM transport tests. A separate test below covers the
+    # managed fallback when creation fails.
+    monkeypatch.setattr(
+        tg_agent,
+        "_open_lead_deal",
+        lambda username, telegram_id, name="": 91 if username else None,
+    )
+    monkeypatch.setattr(tg_agent, "_deal_has_form", lambda deal_id: False)
+    monkeypatch.setattr(tg_agent, "_move_deal_stage", lambda *a, **kw: None)
     return tg_agent
 
 
@@ -307,27 +316,29 @@ def test_broken_markup_still_reaches_the_client(tg, monkeypatch):
     assert tries[1]["mode"] == "" and tries[1]["text"] == "обычный текст"
 
 
-def test_client_gets_nothing_while_the_question_goes_to_people(tg, sent, to_group, monkeypatch):
-    """Требование владельца 22.07.2026: никаких «уточню у коллег и вернусь».
-
-    Отписка обещает ответ, которого у агента нет, и клиент считает минуты. Правильно —
-    промолчать в чате и немедленно принести вопрос людям."""
+def test_client_gets_one_receipt_while_the_question_goes_to_people(
+        tg, sent, to_group, monkeypatch):
+    """Unknown facts never become silence or a fabricated answer."""
     _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про сроки")
 
     tg.maybe_autoreply(_msg(text="Как быстро подключите?"))
 
-    assert sent == [], "клиенту не должно уйти ничего — ни отписки, ни анкеты"
+    assert len(sent) == 1
+    assert "передаю ему сообщение" in sent[0]["text"].lower()
+    assert "НУЖЕН_ЧЕЛОВЕК" not in sent[0]["text"]
     assert len(to_group) == 1, "вопрос обязан уйти людям в тот же момент"
 
 
-def test_lead_question_also_goes_to_people_silently(tg, sent, to_group, monkeypatch):
+def test_lead_question_also_gets_one_receipt_and_goes_to_people(
+        tg, sent, to_group, monkeypatch):
     """Дыра до 22.07.2026: маркер обрабатывался только у незнакомцев, и ЛИД воронки
     получал служебную строку «НУЖЕН_ЧЕЛОВЕК: …» прямо в чат."""
     _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про комиссию")
 
     tg.maybe_autoreply(_msg(username="griaznov.d", uid=555, text="Какая комиссия?"))
 
-    assert sent == [], "лид тем более не должен видеть служебный маркер"
+    assert len(sent) == 1
+    assert "НУЖЕН_ЧЕЛОВЕК" not in sent[0]["text"]
     assert len(to_group) == 1 and "Какая комиссия?" in to_group[0]["text"]
 
 
@@ -350,25 +361,25 @@ def test_escalation_card_is_short_without_the_chat_dump(tg, sent, to_group, monk
 
 
 def test_escalation_card_says_the_client_is_still_waiting(tg, sent, to_group, monkeypatch):
-    """Сотрудник должен с первой строки понять, что человек сидит без ответа."""
+    """Сотрудник видит фактическую клиентскую доставку и необходимость точного ответа."""
     _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: спрашивает про сроки")
 
     tg.maybe_autoreply(_msg(text="Как быстро подключите?"))
 
     card = to_group[0]["text"]
-    assert "ждёт ответа" in card and "НИЧЕГО не отвечено" in card
-    assert "уже отвечено" not in card, "старое обещание клиенту снято — не вводим людей в заблуждение"
+    assert "получил подтверждение передачи" in card and "ждёт ответа менеджера" in card
+    assert "не доставлено подтверждение" not in card
 
 
-def test_escalation_failure_still_leaves_the_client_unanswered(tg, sent, monkeypatch):
-    """Сбой доставки не повод выдумывать ответ клиенту: он ждёт человека, а не отписку."""
+def test_escalation_failure_does_not_remove_the_client_receipt(tg, sent, monkeypatch):
+    """Owner-channel failure is independent from the already delivered safe receipt."""
     monkeypatch.setattr(tg, "api", lambda method, **p: (_ for _ in ()).throw(RuntimeError("нет сети")))
     monkeypatch.setenv("TG_ESCALATION_CHAT_ID", "8715335144")
     _brain(tg, monkeypatch, "НУЖЕН_ЧЕЛОВЕК: что-то непонятное")
 
     tg.maybe_autoreply(_msg(text="вопрос"))
 
-    assert sent == []
+    assert len(sent) == 1 and "передаю ему сообщение" in sent[0]["text"].lower()
 
 
 def test_formatting_rules_are_delivered_to_the_agent(tg, sent, monkeypatch):
@@ -512,7 +523,7 @@ def test_undelivered_reply_does_not_burn_the_invite(tg, monkeypatch):
     assert tg._invite_already_sent(999) is False
 
 
-def test_brain_failure_leaves_no_reply_and_no_crash(tg, sent, monkeypatch):
+def test_brain_failure_gets_one_safe_reply_and_no_crash(tg, sent, monkeypatch):
     def boom(p, s, toolsets=None):
         raise RuntimeError("мозг недоступен")
 
@@ -520,7 +531,9 @@ def test_brain_failure_leaves_no_reply_and_no_crash(tg, sent, monkeypatch):
 
     tg.maybe_autoreply(_msg())      # не должно бросить исключение
 
-    assert sent == []
+    assert len(sent) == 1
+    assert "технический сбой" in sent[0]["text"]
+    assert "мозг недоступен" not in sent[0]["text"]
 
 
 def test_reply_is_plain_text_without_markup(tg, sent, monkeypatch):

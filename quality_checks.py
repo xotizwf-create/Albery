@@ -89,20 +89,32 @@ def check_dialog(messages: list[dict]) -> list[Issue]:
     seen_out = False
     for msg in messages:
         text = (msg.get("text") or "").strip()
-        if msg.get("direction") != "out":
+        if msg.get("direction") != "out" or msg.get("customer_visible") is False:
             continue
         issues += check_message(text, first_in_dialog=not seen_out,
                                is_verbatim_block=bool(msg.get("verbatim")))
         seen_out = True
 
-    # Вопрос клиента без ответа — самый дорогой провал: человек сидит и ждёт.
+    # Internal/error journal rows are not customer replies. A visible handoff receipt prevents
+    # unexplained silence, but it is not a substantive answer until a manager actually replies.
     for i, msg in enumerate(messages):
         if msg.get("direction") != "in" or "?" not in (msg.get("text") or ""):
             continue
-        if not any(m.get("direction") == "out" for m in messages[i + 1:]):
+        visible = [
+            m for m in messages[i + 1:]
+            if m.get("direction") == "out" and m.get("customer_visible") is not False
+        ]
+        if not visible:
             issues.append(Issue("вопрос без ответа",
                                 f"клиент спросил «{(msg.get('text') or '')[:60]}» и ответа не "
                                 "получил (случай Георгия, 22.07.2026)"))
+            break
+        if not any(m.get("substantive") is not False for m in visible):
+            issues.append(Issue(
+                "ожидает менеджера",
+                f"клиент получил подтверждение по вопросу «{(msg.get('text') or '')[:60]}», "
+                "но содержательного ответа менеджера ещё нет",
+            ))
             break
     return issues
 

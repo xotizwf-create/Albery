@@ -55,19 +55,37 @@ def _dialogs(hours: int) -> dict[str, list[dict]]:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT dialog_id, direction, text, meta, created_at"
+                "SELECT dialog_id, direction, text, status, meta, created_at"
                 " FROM telegram_bot_messages WHERE kind = 'lead_chat' AND created_at > %s"
                 " ORDER BY id", (since,))
             rows = list(cur.fetchall())
     out: dict[str, list[dict]] = {}
     for r in rows:
         meta = r["meta"] or {}
-        if meta.get("escalated") and r["direction"] == "out" and not (r["text"] or "").strip():
-            continue
+        text = r["text"] or ""
+        if "customer_visible" in meta:
+            customer_visible = bool(meta.get("customer_visible"))
+        else:
+            # Backward compatibility for pre-handoff rows: an explicit failed status or the old
+            # internal marker is not proof that Telegram showed anything to the customer.
+            customer_visible = bool(
+                r["status"] == "ok"
+                and "клиенту не отвечено" not in text.lower()
+            )
+        substantive = bool(
+            customer_visible
+            and not (
+                meta.get("handoff_id")
+                and meta.get("escalated")
+                and not meta.get("answered")
+            )
+        )
         out.setdefault(str(r["dialog_id"]), []).append({
-            "direction": r["direction"], "text": r["text"] or "",
+            "direction": r["direction"], "text": text,
             # Дословный документ владельца судить по длине и числу вопросов нельзя.
             "verbatim": bool(meta.get("terms") or meta.get("anketa")),
+            "customer_visible": customer_visible,
+            "substantive": substantive,
             "at": str(r["created_at"])[:19],
         })
     return out
@@ -101,8 +119,14 @@ def main() -> int:
             problems.append(f"диалог {dialog_id}: " + qc.summary(issues))
             for issue in issues[:3]:
                 problems.append(f"    — {issue.kind}: {issue.detail}")
-        outgoing += [m["text"] for m in messages
-                     if m["direction"] == "out" and not m["verbatim"] and m["text"].strip()]
+        outgoing += [
+            m["text"] for m in messages
+            if m["direction"] == "out"
+            and m["customer_visible"]
+            and m["substantive"]
+            and not m["verbatim"]
+            and m["text"].strip()
+        ]
 
     scores = _judge(outgoing[-JUDGE_LIMIT:])
     low: list[str] = []

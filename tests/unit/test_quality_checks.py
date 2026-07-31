@@ -81,6 +81,56 @@ def test_answered_dialog_is_clean():
     assert issues == []
 
 
+def test_internal_error_row_does_not_mask_customer_silence():
+    issues = qc.check_dialog([
+        {"direction": "in", "text": "А какая комиссия?"},
+        {
+            "direction": "out",
+            "text": "вопрос унесён людям",
+            "customer_visible": False,
+            "substantive": False,
+        },
+    ])
+
+    assert "вопрос без ответа" in kinds(issues)
+
+
+def test_handoff_receipt_is_visible_but_not_a_substantive_answer():
+    issues = qc.check_dialog([
+        {"direction": "in", "text": "А какая комиссия?"},
+        {
+            "direction": "out",
+            "text": "Передаю вопрос менеджеру.",
+            "customer_visible": True,
+            "substantive": False,
+        },
+    ])
+
+    assert "вопрос без ответа" not in kinds(issues)
+    assert "ожидает менеджера" in kinds(issues)
+
+
+def test_human_reply_after_handoff_closes_the_quality_gap():
+    issues = qc.check_dialog([
+        {"direction": "in", "text": "А какая комиссия?"},
+        {
+            "direction": "out",
+            "text": "Передаю вопрос менеджеру.",
+            "customer_visible": True,
+            "substantive": False,
+        },
+        {
+            "direction": "out",
+            "text": "Комиссия 12%.",
+            "customer_visible": True,
+            "substantive": True,
+        },
+    ])
+
+    assert "вопрос без ответа" not in kinds(issues)
+    assert "ожидает менеджера" not in kinds(issues)
+
+
 def test_summary_counts_by_kind():
     issues = qc.check_message("ПОКАЖИ_УСЛОВИЯ Какая категория? А оборот?", first_in_dialog=True)
 
