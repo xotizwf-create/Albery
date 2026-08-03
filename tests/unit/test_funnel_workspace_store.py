@@ -343,6 +343,74 @@ def test_ingest_does_not_schedule_ai_without_explicit_rollout_flag():
     )
 
 
+def _capture_conversation_insert_params(business_connection_id):
+    """Прогнать входящее сообщение клиента и вернуть params INSERT-а разговора.
+
+    ``reply_deadline_at`` лежит на позиции 6 в VALUES (source, chat, user, business,
+    username, display, deadline, metadata, author).
+    """
+    conv_before = conversation(state_version=1, status="new")
+    conv_after = conversation(state_version=2, status="new")
+    message = {"id": 51, "conversation_id": 41, "author_type": "client", "text": "Привет"}
+
+    def respond(sql, _params):
+        if sql.startswith("INSERT INTO funnel_workspace_sources"):
+            return None
+        if sql.startswith("INSERT INTO funnel_workspace_conversations"):
+            return conv_before
+        if sql.startswith("SELECT * FROM funnel_workspace_messages"):
+            return None
+        if sql.startswith("INSERT INTO funnel_workspace_messages"):
+            return message
+        if "UPDATE funnel_workspace_outbox" in sql:
+            return None
+        if sql.startswith("UPDATE funnel_workspace_ai_jobs"):
+            return None
+        if sql.startswith("UPDATE funnel_workspace_conversations"):
+            return conv_after
+        if sql.startswith("INSERT INTO funnel_workspace_crm_actions"):
+            return {
+                "id": 71,
+                "conversation_id": 41,
+                "message_id": 51,
+                "action_type": "ensure_deal",
+                "processing_status": "pending",
+            }
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    kwargs = dict(
+        external_chat_id="9001",
+        external_message_id="100",
+        text="Привет",
+        author_type="client",
+        occurred_at=NOW,
+        connect=connect,
+    )
+    if business_connection_id is not None:
+        kwargs["business_connection_id"] = business_connection_id
+    store.ingest_business_message(**kwargs)
+    for sql, params in connection.cursor_instance.executed:
+        if sql.startswith("INSERT INTO funnel_workspace_conversations"):
+            return params
+    raise AssertionError("INSERT INTO funnel_workspace_conversations was not executed")
+
+
+def test_public_bot_client_message_gets_no_reply_window():
+    # Публичный бот (пустой business_connection_id): у Telegram нет 24ч-окна для обычного
+    # бота, поэтому дедлайн ответа ставиться НЕ должен — иначе живые лиды ложно «протухают».
+    params = _capture_conversation_insert_params(business_connection_id="")
+    assert params[6] is None
+
+
+def test_business_client_message_keeps_reply_window():
+    # Business-подключение: 24ч-окно Telegram реально существует, дедлайн обязан ставиться.
+    from datetime import timedelta
+
+    params = _capture_conversation_insert_params(business_connection_id="bc-1")
+    assert params[6] == NOW + timedelta(hours=store.reply_window_hours())
+
+
 def test_ingest_schedules_debounced_ai_when_explicitly_enabled():
     conv_before = conversation(state_version=1, status="new")
     conv_after = conversation(state_version=2, status="new")

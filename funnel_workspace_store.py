@@ -2264,9 +2264,14 @@ def ingest_business_message(
     business_id = str(business_connection_id or "").strip()[:300]
     user_id = int(external_user_id) if external_user_id not in (None, "") else None
     clean_metadata = dict(metadata or {})
+    # Окно ответа — ограничение Telegram Business (там мессенджер сам откажет писать спустя
+    # 24 ч после последнего сообщения клиента). У публичного бота (пустой
+    # business_connection_id) такого лимита нет: бот может ответить нажавшему /start в любой
+    # момент. Поэтому дедлайн ставим ТОЛЬКО для Business-диалогов, иначе живые лиды из
+    # публичного бота ложно «протухают» и оператор не может ответить.
     deadline = (
         timestamp + timedelta(hours=reply_window_hours())
-        if clean_author == "client" and not is_edit
+        if clean_author == "client" and not is_edit and business_id
         else None
     )
     direction = "inbound" if clean_author == "client" else (
