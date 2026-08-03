@@ -98,10 +98,16 @@ DIGEST_PROMPT_HEAD = (
 def run_digest(notify_chat=None) -> str:
     tg_agent._load_env_file()
     names = tg_agent.channels()
-    targets = [notify_chat] if notify_chat else tg_agent.delivery_targets()
-    if not targets:
-        log.warning("digest: no delivery targets yet (owner has not written to the bot)")
-        return "no targets"
+
+    def _deliver(text: str) -> None:
+        """Обзор уходит в Bitrix-группу «Уведомления» (chat728), не в личный Telegram владельца.
+        notify_chat позволяет переопределить целевой Bitrix-диалог (например при ручном /digest)."""
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+        import b24_chat_notify
+        ok, err = b24_chat_notify.notify(text, dialog_id=notify_chat)
+        if not ok:
+            log.warning("digest: доставка в Bitrix не удалась: %s", err)
     days = int(os.getenv("TG_DIGEST_DAYS", "7"))
     since = datetime.now(timezone.utc) - timedelta(days=days)
     sections, problems = [], []
@@ -124,10 +130,8 @@ def run_digest(notify_chat=None) -> str:
             use_userbot = False
     if not use_userbot:
         if not names:
-            for chat in targets:
-                tg_agent.send_text(chat, "Еженедельный обзор: сессия менеджер-аккаунта не подключена "
-                                         "и список каналов пуст — добавьте каналы (/add_channel) "
-                                         "или подключите сессию.")
+            _deliver("Еженедельный обзор: сессия менеджер-аккаунта не подключена "
+                     "и список каналов пуст — добавьте каналы (/add_channel) или подключите сессию.")
             return "no channels"
         for name in names:
             posts, err = fetch_channel_posts(name, since)
@@ -139,9 +143,7 @@ def run_digest(notify_chat=None) -> str:
             else:
                 problems.append(f"t.me/{name} — за {days} дн. новых постов нет")
     if not sections:
-        text = "Еженедельный обзор: свежих постов нет.\n" + "\n".join(problems)
-        for chat in targets:
-            tg_agent.send_text(chat, text)
+        _deliver("Еженедельный обзор: свежих постов нет.\n" + "\n".join(problems))
         return "no posts"
 
     corpus = "\n\n".join(sections)[:60000]
@@ -150,8 +152,7 @@ def run_digest(notify_chat=None) -> str:
                                     timeout_s=int(os.getenv("TG_DIGEST_HERMES_TIMEOUT", "540")))
     header = f"📰 Обзор каналов за {days} дн. ({datetime.now().strftime('%d.%m.%Y')})\n\n"
     footer = ("\n\n⚠️ Не прочитал: " + "; ".join(problems)) if problems else ""
-    for chat in targets:
-        tg_agent.send_text(chat, header + answer + footer)
+    _deliver(header + answer + footer)
     return "ok"
 
 

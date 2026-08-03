@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Digest of employee error reports from the Bitrix bot, each linked to the dialogue that preceded
-it, delivered to Telegram. Optionally enriches each report with a short Mozg-generated likely-cause
-/ how-to-fix note. Dedup via a watermark (max digested report id) so it can run weekly OR on demand.
+it, delivered to the Bitrix «Уведомления» group (chat728). Optionally enriches each report with a
+short Mozg-generated likely-cause / how-to-fix note. Dedup via a watermark (max digested report id)
+so it can run weekly OR on demand.
 
 Usage (on the box, from /var/www/albery):
     .venv/bin/python scripts/error_report_digest.py            # new reports since last digest
@@ -9,9 +10,9 @@ Usage (on the box, from /var/www/albery):
     .venv/bin/python scripts/error_report_digest.py --dry-run  # print, do not send / advance
     .venv/bin/python scripts/error_report_digest.py --no-llm   # skip the Mozg cause/fix analysis
 
-Config (env / .env): ALBERY_ERROR_DIGEST_TG_CHAT (default owner DM 1451982360),
-ALBERY_TG_BOT_TOKEN (else Hermes bot token from /root/.hermes/.env), ALBERY_ERROR_DIGEST_DAYS (7),
-ALBERY_ERROR_DIGEST_LLM_TIMEOUT (90), ALBERY_ERROR_DIGEST_STATE (state file path)."""
+Config (env / .env): ALBERY_BITRIX_NOTIFY_CHAT (default chat728, see scripts/b24_chat_notify.py),
+ALBERY_ERROR_DIGEST_DAYS (7), ALBERY_ERROR_DIGEST_LLM_TIMEOUT (90),
+ALBERY_ERROR_DIGEST_STATE (state file path)."""
 from __future__ import annotations
 
 import argparse
@@ -24,7 +25,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import psycopg
-import requests
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
 
@@ -37,40 +37,6 @@ def db_dsn() -> str:
     load_dotenv(ROOT / ".env")
     dsn = os.getenv("DATABASE_URL", "").strip()
     return re.sub(r"^postgresql\+psycopg2?://", "postgresql://", dsn)
-
-
-def tg_token() -> str:
-    token = os.getenv("ALBERY_TG_BOT_TOKEN", "").strip()
-    if token:
-        return token
-    try:
-        for line in Path("/root/.hermes/.env").read_text(encoding="utf-8").splitlines():
-            if line.startswith("TELEGRAM_BOT_TOKEN="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return ""
-
-
-def tg_send(text: str, chat_id: str) -> tuple[bool, str | None]:
-    """Send to Telegram, chunking under the 4096-char hard limit. Returns (ok, error)."""
-    token = tg_token()
-    if not token or not chat_id:
-        return False, "telegram token/chat not configured"
-    ok_all, err = True, None
-    for i in range(0, len(text), 3900):
-        try:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": text[i:i + 3900], "disable_web_page_preview": True},
-                timeout=25,
-            )
-            data = resp.json() if resp.content else {}
-            if not (isinstance(data, dict) and data.get("ok")):
-                ok_all, err = False, str(data.get("description") if isinstance(data, dict) else resp.text)[:300]
-        except Exception as exc:  # noqa: BLE001
-            ok_all, err = False, str(exc)[:300]
-    return ok_all, err
 
 
 def bitrix_send(text: str) -> tuple[bool, str | None]:
@@ -138,7 +104,6 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="print, do not send or advance watermark")
     args = ap.parse_args(argv)
 
-    chat = os.getenv("ALBERY_ERROR_DIGEST_TG_CHAT", "1451982360").strip()
     watermark = 0 if args.all else load_watermark()
     with psycopg.connect(db_dsn()) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -188,12 +153,12 @@ def main(argv=None) -> int:
     if args.dry_run:
         print(text)
         return 0
-    ok, err = tg_send(text, chat)
+    # Уведомления перенесены в Bitrix-группу «Уведомления» (chat728) — в личный Telegram
+    # владельца дайджест больше не отправляем.
+    ok, err = bitrix_send(text)
     if ok and rows:
         save_watermark(max_id)
-    b24_ok, b24_err = bitrix_send(text)
-    print(f"sent={ok} err={err} bitrix={b24_ok} bitrix_err={b24_err} "
-          f"reports={len(rows)} watermark->{max_id if ok else watermark}")
+    print(f"bitrix_sent={ok} err={err} reports={len(rows)} watermark->{max_id if ok else watermark}")
     return 0 if ok else 1
 
 
