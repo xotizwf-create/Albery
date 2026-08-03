@@ -97,3 +97,24 @@ def test_undelivered_messages_are_surfaced_to_the_owner(app_module, monkeypatch)
     assert "Не доставлено" in sent["text"]
     assert "Евгений Палей" in sent["text"]
     task_checkin._UNDELIVERED.clear()
+
+
+def test_checkin_report_goes_to_notifications_group(app_module, monkeypatch):
+    """Отчёт «обход задач — рекомендации ушли» уходит в Bitrix-группу «Уведомления»
+    (ALBERY_BITRIX_NOTIFY_CHAT), а не в личный ЛС (раньше дефолт был '22')."""
+    import task_checkin
+
+    task_checkin._UNDELIVERED.clear()
+    monkeypatch.delenv("B24_CHECKIN_REPORT_TO", raising=False)
+    monkeypatch.setenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat730")
+    captured = {}
+
+    import b24bot
+    monkeypatch.setattr(b24bot, "_albery_bitrix_notify",
+                        lambda text, **kw: (captured.update(kw), (True, None))[1])
+    monkeypatch.setattr("mcp.context_server._task_deep_link", lambda tid: f"https://b24/{tid}",
+                        raising=False)
+
+    task_checkin._report_to_owner({"scanned": 1}, {}, [], [], 24)
+
+    assert captured.get("dialog_id") == "chat730"

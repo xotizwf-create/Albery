@@ -414,11 +414,13 @@ def _send_nudges(exclude_uids: set[int], main_bot_id: Any) -> list[str]:
 
 def _report_to_owner(report: dict[str, Any], offers_by_user: dict[int, list[dict[str, Any]]],
                      dm_names: list[str], nudged: list[str], main_bot_id: Any) -> bool:
-    """The owner's DM after every live run: which tasks got recommendations, who was DMed —
-    the log the owner asked for («и всё это у нас должно логироваться»)."""
+    """Отчёт после каждого прогона: какие задачи получили рекомендации, кому написали в ЛС —
+    лог, который просил владелец. Уходит в Bitrix-группу «Уведомления» (chat728), а не в личный
+    ЛС: владелец попросил собрать статус-уведомления в одной группе."""
     import b24bot
     from mcp.context_server import _task_deep_link
-    target = os.getenv("B24_CHECKIN_REPORT_TO", "22").strip()
+    target = os.getenv("B24_CHECKIN_REPORT_TO",
+                       os.getenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat728")).strip()
     if not target:
         return False
     lines = ["[b]🤖 Ежедневный обход задач — отчёт[/b]"]
