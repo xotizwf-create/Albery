@@ -354,7 +354,10 @@ def _b24_testbot_exec_tool(client: BitrixClient, name: str, args: dict[str, Any]
             text = str(args.get("text") or "").strip()
             if not user_id or not text:
                 return json.dumps({"error": "user_id и text обязательны"}, ensure_ascii=False)
-            _b24_testbot_call(client, "im.message.add", {"DIALOG_ID": str(user_id), "MESSAGE": text})
+            # ОТ БОТА (imbot.message.add), а не от пользователя «ИИ Агент» (rest/22).
+            ok, err = _albery_bitrix_notify(text, dialog_id=str(user_id))
+            if not ok:
+                return json.dumps({"error": f"send failed: {err}"}, ensure_ascii=False)
             return json.dumps({"sent_to": user_id}, ensure_ascii=False)
 
         return json.dumps({"error": f"неизвестный инструмент {name}"}, ensure_ascii=False)

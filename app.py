@@ -13058,32 +13058,18 @@ def send_bitrix_personal_message(
     text = str(message_text or "").strip()
     if not text:
         raise ValueError("message_text must be a non-empty string.")
-    client = bitrix_webhook_client()
-    try:
-        response = client.call_with_fallback(
-            "im.message.add",
-            {"DIALOG_ID": str(user_id), "MESSAGE": text},
-            prefer_api=True,
-        )
-        return {
-            "user_id": user_id,
-            "channel": "bitrix_im",
-            "response": response.get("result") if isinstance(response, dict) else response,
-        }
-    except Exception as exc:  # noqa: BLE001
-        if not is_bitrix_no_access_error(exc):
-            raise
-        response = client.call_with_fallback(
-            "im.notify.personal.add",
-            {"USER_ID": user_id, "MESSAGE": text},
-            prefer_api=True,
-        )
-        return {
-            "user_id": user_id,
-            "channel": "bitrix_notification",
-            "response": response.get("result") if isinstance(response, dict) else response,
-            "im_message_error": str(exc),
-        }
+    # Личное сообщение сотруднику уходит ОТ БОТА (imbot.message.add), а не от пользователя
+    # «ИИ Агент» (входящий вебхук rest/22): владелец не хочет, чтобы агент писал в ЛС как
+    # обычный человек. Через imbot в диалоге видно, что пишет БОТ, а не юзер.
+    from b24bot import _albery_bitrix_notify
+    ok, err = _albery_bitrix_notify(text, dialog_id=str(user_id))
+    if not ok:
+        raise RuntimeError(f"Bitrix imbot send failed: {err}")
+    return {
+        "user_id": user_id,
+        "channel": "bitrix_imbot",
+        "response": {"ok": True},
+    }
 
 
 def reportlab_font_paths() -> tuple[str, str]:

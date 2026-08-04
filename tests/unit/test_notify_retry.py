@@ -118,3 +118,26 @@ def test_checkin_report_goes_to_notifications_group(app_module, monkeypatch):
     task_checkin._report_to_owner({"scanned": 1}, {}, [], [], 24)
 
     assert captured.get("dialog_id") == "chat730"
+
+
+def test_personal_message_to_employee_goes_from_bot_not_user_account(app_module, monkeypatch):
+    """Личное сообщение сотруднику в ЛС уходит ОТ БОТА (imbot.message.add), а НЕ от юзера
+    «ИИ Агент» (входящий вебхук rest/22, im.message.add). Раньше сотрудник видел сообщение
+    от «обычного пользователя»."""
+    import app
+    import b24bot
+
+    sent = {}
+    monkeypatch.setattr(b24bot, "_albery_bitrix_notify",
+                        lambda text, **kw: (sent.update(text=text, kw=kw), (True, None))[1])
+
+    def _webhook_must_not_be_used(*_a, **_k):
+        raise AssertionError("bitrix_webhook_client вызван — личное сообщение обязано идти "
+                             "через imbot (бот), а не через юзера 22")
+    monkeypatch.setattr(app, "bitrix_webhook_client", _webhook_must_not_be_used)
+
+    result = app.send_bitrix_personal_message(30, "Наталья, привет")
+
+    assert result["channel"] == "bitrix_imbot"
+    assert sent["text"] == "Наталья, привет"
+    assert sent["kw"].get("dialog_id") == "30"
