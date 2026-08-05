@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -31,8 +32,42 @@ MSK = ZoneInfo("Europe/Moscow")
 DIALOG_SCAN_LIMIT = 1000
 
 
-def session_ready() -> bool:
-    return SESSION_FILE.is_file()
+_AUTH_PROBE: dict[str, tuple[float, bool]] = {}
+AUTH_PROBE_TTL_S = 300
+
+
+def _probe_authorized() -> bool:
+    """Живая проверка: сессия действительно вошла в аккаунт (нужен один сетевой вызов)."""
+    async def go():
+        client = _client()
+        await client.connect()
+        try:
+            return bool(await client.is_user_authorized())
+        finally:
+            await client.disconnect()
+    return asyncio.run(go())
+
+
+def session_ready(max_age_s: int = AUTH_PROBE_TTL_S) -> bool:
+    """Сессия есть И она авторизована.
+
+    Одного файла мало: telethon создаёт .tg_userbot.session при первом же подключении — даже
+    если вход не завершён. 05.08.2026 незаконченная попытка входа оставила такой пустой файл,
+    и проверка «файл есть» стала бы враньём: инструменты рапортовали бы о готовности и падали
+    бы на первом же запросе внутренней ошибкой вместо внятного «сессия не подключена».
+    Авторизация проверяется сетевым вызовом, поэтому ответ кэшируется на max_age_s.
+    """
+    if not SESSION_FILE.is_file():
+        return False
+    cached = _AUTH_PROBE.get("state")
+    if cached and (time.time() - cached[0]) < max_age_s:
+        return cached[1]
+    try:
+        authorized = _probe_authorized()
+    except Exception:  # noqa: BLE001 — сеть/ключи недоступны: считаем, что сессии нет
+        authorized = False
+    _AUTH_PROBE["state"] = (time.time(), authorized)
+    return authorized
 
 
 def require_session() -> None:
@@ -40,8 +75,9 @@ def require_session() -> None:
     if not session_ready():
         raise RuntimeError(
             "Сессия аккаунта @AlberyAIManager не подключена, поэтому закрытые каналы и "
-            "закрытые групповые чаты недоступны. Подключение делается на сервере в два шага: "
-            "scripts/tg_userbot_login.py request <телефон> и confirm <код из Telegram>."
+            "закрытые групповые чаты недоступны. Подключение делается на сервере: "
+            "scripts/tg_userbot_login.py request <телефон> + confirm <код из Telegram>, "
+            "либо qr — привязкой устройства."
         )
 
 

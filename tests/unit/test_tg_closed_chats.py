@@ -138,6 +138,8 @@ def userbot(monkeypatch, tmp_path):
     session = tmp_path / ".tg_userbot.session"
     session.write_text("fake", encoding="utf-8")
     monkeypatch.setattr(tg_userbot, "SESSION_FILE", session)
+    monkeypatch.setattr(tg_userbot, "_probe_authorized", lambda: True)
+    monkeypatch.setattr(tg_userbot, "_AUTH_PROBE", {})
     client = FakeClient(DIALOGS, MESSAGES)
     monkeypatch.setattr(tg_userbot, "_client", lambda: client)
     tg_userbot.last_client = client
@@ -149,6 +151,20 @@ def no_session(monkeypatch, tmp_path):
     import tg_userbot
 
     monkeypatch.setattr(tg_userbot, "SESSION_FILE", tmp_path / "absent.session")
+    monkeypatch.setattr(tg_userbot, "_AUTH_PROBE", {})
+    return tg_userbot
+
+
+@pytest.fixture
+def half_login(monkeypatch, tmp_path):
+    """Файл сессии есть, но вход не завершён — так выглядит прерванная попытка входа."""
+    import tg_userbot
+
+    session = tmp_path / ".tg_userbot.session"
+    session.write_text("sqlite-but-not-signed-in", encoding="utf-8")
+    monkeypatch.setattr(tg_userbot, "SESSION_FILE", session)
+    monkeypatch.setattr(tg_userbot, "_probe_authorized", lambda: False)
+    monkeypatch.setattr(tg_userbot, "_AUTH_PROBE", {})
     return tg_userbot
 
 
@@ -227,6 +243,35 @@ class TestReading:
 
         assert "не подключена" in str(err.value)
         assert "tg_userbot_login" in str(err.value), "агент обязан сказать, ЧТО сделать"
+
+    def test_unfinished_login_does_not_count_as_a_session(self, half_login):
+        """telethon создаёт .session при первом же подключении — файл ещё не значит вход.
+
+        05.08.2026 прерванная попытка входа оставила такой файл. Проверка «файл есть» после
+        этого рапортовала бы о готовности, и вместо честного «сессии нет» человек получил бы
+        внутреннюю ошибку на первом же запросе."""
+        assert half_login.session_ready() is False
+
+        with pytest.raises(RuntimeError) as err:
+            half_login.read_chat("-1001111111111")
+
+        assert "не подключена" in str(err.value)
+
+    def test_authorization_probe_is_cached(self, monkeypatch, tmp_path):
+        """Проверка авторизации — сетевой вызов; он не должен идти на каждый чих."""
+        import tg_userbot
+
+        session = tmp_path / ".tg_userbot.session"
+        session.write_text("fake", encoding="utf-8")
+        monkeypatch.setattr(tg_userbot, "SESSION_FILE", session)
+        monkeypatch.setattr(tg_userbot, "_AUTH_PROBE", {})
+        calls = []
+        monkeypatch.setattr(tg_userbot, "_probe_authorized",
+                            lambda: calls.append(1) or True)
+
+        assert tg_userbot.session_ready() and tg_userbot.session_ready()
+
+        assert len(calls) == 1, "второй вызов обязан прийти из кэша"
 
 
 # --- источник недельного обзора ------------------------------------------------------------
