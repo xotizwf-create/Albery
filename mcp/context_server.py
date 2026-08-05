@@ -7833,6 +7833,87 @@ def tool_list_telegram_contacts(_: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"list_telegram_contacts failed: {exc}") from exc
 
 
+# --- Закрытые каналы и закрытые групповые чаты аккаунта @AlberyAIManager ------------------------
+# У закрытого чата нет @username, значит нет ни ссылки t.me/<имя>, ни веб-превью t.me/s/<имя>,
+# которым живёт get_tg_news. Прочитать его может только MTProto-сессия самого аккаунта
+# (tg_userbot). Эти три инструмента — единственный путь агента к таким чатам.
+
+def _userbot():
+    import tg_userbot  # lazy: отдельный модуль, telethon подгружается только при вызове
+
+    return tg_userbot
+
+
+def _userbot_call(what: str, run):
+    try:
+        return run()
+    except LookupError as exc:
+        raise McpError(-32602, str(exc)) from exc
+    except RuntimeError as exc:
+        raise McpError(-32000, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"{what} failed: {exc}") from exc
+
+
+def tool_list_telegram_chats(args: dict[str, Any]) -> dict[str, Any]:
+    """Все чаты аккаунта менеджера, включая закрытые каналы и закрытые группы."""
+    ub = _userbot()
+    kinds = [str(k).strip().lower() for k in (args.get("types") or []) if str(k).strip()]
+    unknown = [k for k in kinds if k not in {"channel", "group", "private"}]
+    if unknown:
+        raise McpError(-32602, f"types: допустимы channel, group, private (получено {unknown}).")
+    rows = _userbot_call("list_telegram_chats", lambda: ub.list_dialogs(
+        kinds=kinds or None,
+        only_closed=bool(args.get("only_closed")),
+        query=str(args.get("query") or "").strip() or None,
+    ))
+    limit = max(1, min(int(args.get("limit") or 200), 500))
+    closed = [r for r in rows if r["closed"]]
+    return {
+        "total": len(rows),
+        "closed_count": len(closed),
+        "by_type": {kind: sum(1 for r in rows if r["type"] == kind)
+                    for kind in ("channel", "group", "private")},
+        "chats": rows[:limit],
+        "truncated": len(rows) > limit,
+        "note": ("closed=true — закрытый канал/чат: публичной ссылки у него нет, читается только "
+                 "через read_telegram_chat по id или названию. Для чтения назови чат его id."),
+    }
+
+
+def tool_read_telegram_chat(args: dict[str, Any]) -> dict[str, Any]:
+    """Сообщения одного чата — закрытого канала или закрытой группы в том числе."""
+    ub = _userbot()
+    chat = str(args.get("chat") or args.get("chat_id") or args.get("title") or "").strip()
+    if not chat:
+        raise McpError(-32602, "Укажи chat — id, @username или название чата "
+                               "(список: list_telegram_chats).")
+    days = args.get("days")
+    result = _userbot_call("read_telegram_chat", lambda: ub.read_chat(
+        chat,
+        limit=int(args.get("limit") or 50),
+        since_days=int(days) if days else None,
+        query=str(args.get("query") or "").strip() or None,
+        chars=int(args.get("message_chars") or 1200),
+    ))
+    result["note"] = ("Сообщения по возрастанию времени, время московское. Пусто при заданном "
+                      "days — за этот период в чате ничего не писали.")
+    return result
+
+
+def tool_join_telegram_chat(args: dict[str, Any]) -> dict[str, Any]:
+    """Вступить в закрытый чат по ссылке-приглашению — иначе его не прочитать вообще."""
+    ub = _userbot()
+    invite = str(args.get("invite") or args.get("link") or "").strip()
+    if not invite:
+        raise McpError(-32602, "Нужна ссылка-приглашение (t.me/+…) или @имя публичного канала.")
+    result = _userbot_call("join_telegram_chat", lambda: ub.join_chat(invite))
+    result["note"] = ("Аккаунт @AlberyAIManager теперь участник этого чата — читай его через "
+                      "read_telegram_chat." if result["joined"] else
+                      "Аккаунт уже был участником этого чата.")
+    return result
+
+
 def tool_list_dialog_errors(args: dict[str, Any]) -> dict[str, Any]:
     """Сбои в диалогах: что упало, когда и разобрано ли это."""
     rows = app_workflow_function("list_dialog_errors")(
@@ -8903,20 +8984,66 @@ def _tg_watchlist() -> list[str]:
         return []
 
 
+def _tg_news_via_userbot(names: list[str], days: int, max_posts: int, post_chars: int,
+                         include_groups: bool) -> dict[str, Any]:
+    """Тот же ответ, но источник — сессия аккаунта: видит и ЗАКРЫТЫЕ каналы, у которых
+    публичного превью не существует. Пустой watchlist здесь означает «все каналы аккаунта»."""
+    ub = _userbot()
+    chats, problems = _userbot_call("get_tg_news", lambda: ub.collect_posts(
+        only_names=names or None, since_days=days, post_chars=post_chars,
+        include_groups=include_groups))
+    channels_out, budget, total_posts = [], 90000, 0
+    for chat in chats:
+        fresh = [f"[{p['date']}] {p['text']}" for p in chat["posts"][-max_posts:]]
+        piece_len = sum(len(p) for p in fresh)
+        if budget - piece_len < 0:
+            problems.append(f"{chat['name']} — не влез в лимит ответа "
+                            f"(запроси его отдельно через channels=['{chat['id']}'])")
+            continue
+        budget -= piece_len
+        total_posts += len(fresh)
+        channels_out.append({
+            "channel": chat["name"], "chat_id": chat["id"], "closed": chat["closed"],
+            "url": f"https://t.me/{chat['username']}" if chat["username"] else None,
+            "posts_count": len(fresh), "posts": fresh})
+    requested = {n for n in names}
+    covered = {str(c["chat_id"]) for c in channels_out} | {c["channel"] for c in channels_out}
+    return {
+        "period_days": days,
+        "source": "аккаунт @AlberyAIManager (видны и закрытые каналы)",
+        "channels_with_posts": len(channels_out),
+        "total_posts": total_posts,
+        "channels": channels_out,
+        "empty_channels": sorted(requested - covered),
+        "problems": problems,
+        "note": ("Посты за период по каждому каналу (старые выше), время московское. Нужен полный "
+                 "текст постов конкретного канала — вызови ещё раз с channels=['id или название'] "
+                 "и большим post_chars. Закрытый канал помечен closed=true."),
+    }
+
+
 def tool_get_tg_news(args: dict[str, Any]) -> dict[str, Any]:
     import tg_digest  # lazy: standalone module, no Flask/циркулярок
 
     days = max(1, min(int(args.get("days") or 7), 30))
     only = [str(c).strip().lstrip("@") for c in (args.get("channels") or []) if str(c).strip()]
     names = only or _tg_watchlist()
+    max_posts = max(1, min(int(args.get("max_posts_per_channel") or 12), 50))
+    post_chars = max(200, min(int(args.get("post_chars") or 700), 2000))
+    # Сессия аккаунта — основной источник: она читает и закрытые каналы, которых в публичном
+    # превью попросту нет. Публичный скрапер остаётся фолбэком на случай неподключённой сессии.
+    if _userbot().session_ready():
+        return _tg_news_via_userbot(names, days, max_posts, post_chars,
+                                    bool(args.get("include_groups")))
     if not names:
         raise McpError(-32000, "Список отслеживаемых каналов пуст (владелец наполняет его через "
                                "TG-бота командой /add_channel).")
-    max_posts = max(1, min(int(args.get("max_posts_per_channel") or 12), 50))
-    post_chars = max(200, min(int(args.get("post_chars") or 700), 2000))
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
     def _one(name: str) -> tuple[str, list[str], str | None]:
+        if not re.fullmatch(r"[A-Za-z0-9_]{4,64}", name):
+            return name, [], ("закрытый чат: публичного превью у него нет, читается только "
+                              "сессией аккаунта @AlberyAIManager — она не подключена")
         cached = ttl_cache_get(("tg_news", name, days))
         if cached is not None:
             return name, cached[0], cached[1]
@@ -8948,6 +9075,7 @@ def tool_get_tg_news(args: dict[str, Any]) -> dict[str, Any]:
                              "posts_count": len(fresh), "posts": fresh})
     return {
         "period_days": days,
+        "source": "публичные веб-превью t.me/s/ (сессия аккаунта не подключена)",
         "channels_with_posts": len(channels_out),
         "total_posts": total_posts,
         "channels": channels_out,
@@ -9659,6 +9787,68 @@ TOOLS: dict[str, dict[str, Any]] = {
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "handler": tool_list_telegram_contacts,
+    },
+    "list_telegram_chats": {
+        "description": (
+            "ЧАТЫ аккаунта компании @AlberyAIManager: каналы, группы и личные переписки, которые "
+            "видит сам аккаунт — В ТОМ ЧИСЛЕ ЗАКРЫТЫЕ каналы и закрытые групповые чаты (у них нет "
+            "ссылки t.me и нет публичного превью, поэтому больше ниоткуда они не читаются). "
+            "Начинай отсюда любой вопрос «что в закрытом канале/чате X», «какие у нас закрытые "
+            "каналы», «покажи чаты аккаунта»: возьми здесь id нужного чата и прочитай его через "
+            "read_telegram_chat. only_closed=true — только закрытые. Только чтение."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "types": {"type": "array", "items": {"type": "string", "enum": ["channel", "group", "private"]},
+                          "description": "Оставить только эти типы чатов. Пусто = все."},
+                "only_closed": {"type": "boolean", "description": "Только закрытые каналы и группы (без публичной ссылки)."},
+                "query": {"type": "string", "description": "Часть названия или @username — отфильтровать список."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Сколько чатов вернуть (по умолчанию 200)."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_list_telegram_chats,
+    },
+    "read_telegram_chat": {
+        "description": (
+            "СООБЩЕНИЯ одного чата Telegram глазами аккаунта @AlberyAIManager — закрытого канала "
+            "и закрытой группы тоже. chat = id (надёжнее всего, бери из list_telegram_chats), "
+            "@username или название. days — за сколько дней, query — поиск по тексту внутри чата. "
+            "Отвечай по тому, что реально вернул инструмент: ничего не додумывай и не пересказывай "
+            "по памяти. Только чтение — сообщения в чат этот инструмент не пишет."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "chat": {"type": "string", "description": "id, @username или название чата (id надёжнее)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 300, "description": "Сколько последних сообщений (по умолчанию 50)."},
+                "days": {"type": "integer", "minimum": 1, "maximum": 365, "description": "Не старше стольких дней."},
+                "query": {"type": "string", "description": "Искать сообщения с этим текстом внутри чата."},
+                "message_chars": {"type": "integer", "minimum": 100, "maximum": 4000, "description": "Обрезка текста сообщения (по умолчанию 1200)."},
+            },
+            "required": ["chat"],
+            "additionalProperties": False,
+        },
+        "handler": tool_read_telegram_chat,
+    },
+    "join_telegram_chat": {
+        "description": (
+            "Вступить аккаунтом @AlberyAIManager в чат по ссылке-приглашению (t.me/+…) или в "
+            "публичный канал по @имени. Нужно ровно в одном случае: закрытый канал/группу нельзя "
+            "прочитать, не будучи участником. Если чат уже есть в list_telegram_chats — вступать "
+            "не надо. Это действие от лица живого аккаунта компании: вызывай только по прямой "
+            "просьбе человека с конкретной ссылкой, сам ссылки не придумывай."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "invite": {"type": "string", "description": "Ссылка-приглашение t.me/+hash или @имя публичного канала."},
+            },
+            "required": ["invite"],
+            "additionalProperties": False,
+        },
+        "handler": tool_join_telegram_chat,
     },
     "list_dialog_errors": {
         "description": (
@@ -12251,6 +12441,11 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
     "send_telegram_message",
     "list_telegram_contacts",
     "get_telegram_dialog",
+    # Личные переписки и закрытые чаты аккаунта компании — тем более не для публичных
+    # коннекторов: это всё, что видит живой человек в своём Telegram.
+    "list_telegram_chats",
+    "read_telegram_chat",
+    "join_telegram_chat",
     "send_contract",
     "delete_dialog",
     # Employee dossiers are internal management data — never on the public scoped connectors.

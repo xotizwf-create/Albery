@@ -598,14 +598,20 @@ def send_text(chat_id, text: str) -> None:
 # --- channel watchlist ---------------------------------------------------------------------
 
 _CHANNEL_RE = re.compile(r"^[A-Za-z0-9_]{4,64}$")
+_CHAT_ID_RE = re.compile(r"^-?\d{5,20}$")
 
 
 def normalize_channel(raw: str) -> str | None:
-    """'@name' / 'https://t.me/name' / 't.me/s/name?x=1' / 'name' -> 'name' (None if invalid)."""
+    """'@name' / 'https://t.me/name' / 't.me/s/name?x=1' / 'name' -> 'name'; '-100…' -> id
+    закрытого чата (None if invalid)."""
     s = (raw or "").strip().rstrip("/").split("?", 1)[0]
     s = re.sub(r"^https?://", "", s, flags=re.IGNORECASE)
     s = re.sub(r"^(t\.me|telegram\.me)/(s/)?", "", s, flags=re.IGNORECASE)
     s = s.lstrip("@").strip()
+    # У закрытого канала публичного имени нет — сослаться на него можно только числовым id
+    # (его печатает /chats). Читает такие каналы сессия аккаунта, публичное превью — нет.
+    if _CHAT_ID_RE.match(s):
+        return s
     # joinchat/+invite links are private chats — the public-preview digest cannot read those
     if s.startswith("+") or s.lower().startswith("joinchat"):
         return None
@@ -793,12 +799,12 @@ HELP_TEXT = (
     "Я — ИИ-агент Албери в Telegram.\n\n"
     "Команды:\n"
     "/channels — список каналов еженедельного обзора\n"
-    "/add_channel <@канал или ссылка, можно несколько> — следить только за этими\n"
+    "/add_channel <@канал, ссылка или id закрытого чата из /chats> — следить только за этими\n"
     "/del_channel <канал> — убрать из списка\n"
     "/id — добавить человека в справочник (кнопка выбора контакта → его числовой id)\n"
     "/contacts — известные контакты и их id\n"
     "/write @username текст — написать человеку ОТ ЛИЦА вашего аккаунта\n"
-    "/chats — что видит подключённая сессия аккаунта (каналы/группы/чаты)\n"
+    "/chats — что видит подключённая сессия аккаунта (каналы/группы/чаты, id закрытых)\n"
     "/digest — собрать обзор прямо сейчас\n"
     "/new — начать новую сессию (забыть историю)\n\n"
     "Любое другое сообщение — вопрос к агенту (инструменты компании + веб).\n\n"
@@ -2197,8 +2203,9 @@ def handle_command(chat_id, text: str) -> bool:
                           else f"Не отправилось: {err}")
     elif cmd == "/channels":
         names = channels()
-        send_text(chat_id, ("Каналы обзора:\n" + "\n".join(f"• t.me/{n}" for n in names))
-                  if names else "Список пуст. Добавьте: /add_channel @канал (можно несколько).")
+        send_text(chat_id, ("Каналы обзора:\n" + "\n".join(
+            f"• {'закрытый чат id ' + n if _CHAT_ID_RE.match(n) else 't.me/' + n}" for n in names))
+            if names else "Список пуст. Добавьте: /add_channel @канал (можно несколько).")
     elif cmd == "/add_channel":
         good, bad = [], []
         for raw in re.split(r"[\s,;]+", args.strip()):
@@ -2212,7 +2219,8 @@ def handle_command(chat_id, text: str) -> bool:
         if good:
             reply.append("Добавил: " + ", ".join(good))
         if bad:
-            reply.append("Не понял (нужен публичный @канал или ссылка t.me): " + ", ".join(bad[:5]))
+            reply.append("Не понял (нужен публичный @канал, ссылка t.me или числовой id "
+                         "закрытого чата из /chats): " + ", ".join(bad[:5]))
         send_text(chat_id, "\n".join(reply) or "Укажите канал: /add_channel @канал")
     elif cmd == "/del_channel":
         name = normalize_channel(args)
@@ -2232,11 +2240,16 @@ def handle_command(chat_id, text: str) -> bool:
                 kinds = {"channel": [], "group": [], "private": []}
                 for d in dialogs:
                     kinds.get(d["type"], kinds["private"]).append(d)
+                closed = [d for d in dialogs if d.get("closed")]
                 lines = [f"Сессия видит {len(dialogs)} диалогов: "
                          f"{len(kinds['channel'])} каналов, {len(kinds['group'])} групп, "
-                         f"{len(kinds['private'])} личных чатов.", "", "Каналы:"]
-                lines += [f"• {d['name']}" + (f" (t.me/{d['username']})" if d.get("username") else "")
-                          for d in kinds["channel"][:60]]
+                         f"{len(kinds['private'])} личных чатов. Закрытых из них: {len(closed)}.",
+                         "", "Каналы и группы (id нужен, чтобы добавить закрытый в обзор):"]
+                # У закрытого чата нет @username, поэтому единственный способ сослаться на
+                # него — числовой id: его и печатаем, /add_channel такой id принимает.
+                for d in (kinds["channel"] + kinds["group"])[:80]:
+                    where = f"t.me/{d['username']}" if d.get("username") else f"закрытый, id {d['id']}"
+                    lines.append(f"• {d['name']} — {where}")
                 send_text(chat_id, "\n".join(lines))
         except Exception as exc:  # noqa: BLE001
             log.exception("chats command failed")

@@ -1,10 +1,12 @@
-"""Weekly digest of the watched public Telegram channels for the owner (albery-tg-digest.timer).
+"""Weekly digest of the watched Telegram channels for the owner (albery-tg-digest.timer).
 
-Reads each channel's public web preview (https://t.me/s/<name> — no account or membership
-needed, works for public channels with preview enabled), keeps the posts of the last
-DIGEST_DAYS days, and asks the brain for an Albery-focused review: маркетплейсы/WB,
-оргрешения и управленческие практики, конкретные «предлагаю внедрить/обновить у нас».
-The result goes to the owner's chat via the tg_agent bot. Run directly or via /digest.
+Primary source is the manager account's MTProto session (tg_userbot): it sees ЗАКРЫТЫЕ каналы
+too, and closed groups when TG_DIGEST_INCLUDE_GROUPS=1. Without that session the digest falls
+back to the public web preview (https://t.me/s/<name> — no account needed, but public channels
+only). Keeps the posts of the last DIGEST_DAYS days and asks the brain for an Albery-focused
+review: маркетплейсы/WB, оргрешения и управленческие практики, конкретные «предлагаю
+внедрить/обновить у нас». The result goes to the Bitrix «Уведомления» group. Run directly or
+via /digest.
 """
 from __future__ import annotations
 
@@ -120,7 +122,10 @@ def run_digest(notify_chat=None) -> str:
         os.getenv("TG_DIGEST_USERBOT", "1").strip().lower() not in {"0", "false", "no", "off"}
     if use_userbot:
         try:
-            chats, ub_problems = tg_userbot.fetch_posts(since_days=days, only_names=names)
+            include_groups = os.getenv("TG_DIGEST_INCLUDE_GROUPS", "0").strip().lower() \
+                in {"1", "true", "yes", "on"}
+            chats, ub_problems = tg_userbot.fetch_posts(since_days=days, only_names=names,
+                                                        include_groups=include_groups)
             problems.extend(ub_problems)
             for label, posts in chats:
                 sections.append(f"=== {label} ({len(posts)} постов) ===\n" + "\n\n".join(posts))
@@ -134,6 +139,10 @@ def run_digest(notify_chat=None) -> str:
                      "и список каналов пуст — добавьте каналы (/add_channel) или подключите сессию.")
             return "no channels"
         for name in names:
+            if re.fullmatch(r"-?\d{5,20}", name):
+                problems.append(f"закрытый чат id {name} — читается только сессией аккаунта, "
+                                "а она не подключена")
+                continue
             posts, err = fetch_channel_posts(name, since)
             if err:
                 problems.append(f"t.me/{name} — {err}")
