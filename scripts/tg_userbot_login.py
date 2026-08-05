@@ -26,6 +26,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -109,16 +110,22 @@ async def qr(minutes: int = 15) -> None:
         print(f"Уже авторизован: @{me.username}")
         return
     qr_login = await client.qr_login()
-    deadline = asyncio.get_event_loop().time() + minutes * 60
+    deadline = time.time() + minutes * 60
     try:
-        while asyncio.get_event_loop().time() < deadline:
-            QR_URL.write_text(qr_login.url, encoding="utf-8")
+        while time.time() < deadline:
+            # Рядом со ссылкой пишем момент её протухания: тот, кто рисует QR, обязан знать,
+            # сколько времени у владельца осталось. Токен пересоздаётся ТОЛЬКО перед самым
+            # истечением — иначе показанный код успевает устареть раньше, чем его отсканируют,
+            # и Telegram отвечает «неверный QR» (напоролись 05.08.2026).
+            QR_URL.write_text(f"{qr_login.url}|{int(qr_login.expires.timestamp())}",
+                              encoding="utf-8")
             os.chmod(QR_URL, 0o600)
             try:
-                await qr_login.wait(25)
+                await qr_login.wait(10)
                 break
             except asyncio.TimeoutError:
-                await qr_login.recreate()
+                if qr_login.expires.timestamp() - time.time() < 12:
+                    await qr_login.recreate()
         else:
             QR_URL.write_text("EXPIRED", encoding="utf-8")
             print("Время ожидания вышло — никто не отсканировал QR.")
