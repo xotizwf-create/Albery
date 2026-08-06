@@ -39,7 +39,8 @@ SSH_OPTS = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=30"]
 def plan_prune(names_newest_first: list[str], keep: int) -> list[str]:
     """Какие файлы удалить, чтобы осталось keep самых свежих.
 
-    keep<1 не бывает: даже при кривом env нельзя вычистить приёмник досуха.
+    Обычная подрезка, после успешной отправки. keep<1 не бывает: даже при кривом env
+    нельзя вычистить приёмник досуха.
     """
     return list(names_newest_first[max(1, keep):])
 
@@ -51,6 +52,32 @@ def prune_before_send(free_mb: int, dump_mb: int) -> bool:
     мегабайте, оставит битый файл и мы потеряем и новую копию, и старую.
     """
     return free_mb < dump_mb * 1.1
+
+
+def plan_free_space(
+    entries_newest_first: list[tuple[str, int]], needed_mb: int, free_mb: int, keep: int,
+) -> tuple[list[str], int, bool]:
+    """Кого снести с приёмника, чтобы новый дамп ВЛЕЗ. Возвращает (кого, сколько станет свободно, вынужденно ли).
+
+    Тонкость, на которой этот скрипт уже один раз сломался вживую (06.08.2026): при
+    OFFSITE_KEEP=1 обычная подрезка «оставь keep самых свежих» не освобождает НИЧЕГО —
+    единственная лежащая копия и есть эти keep. Место не появляется, rsync падает ровно
+    так же, как падал старый крон, и починка оказывается фиктивной.
+
+    Поэтому здесь считаем по месту, а не по количеству: идём от самых старых, пока не
+    наберём needed_mb. Если для этого пришлось тронуть файлы из зоны keep — возвращаем
+    forced=True, чтобы вызывающий сказал об этом в лог: несколько секунд без целой
+    оффсайт-копии лучше, чем ночь за ночью не уехавший бэкап, но молчать об этом нельзя.
+    """
+    doomed: list[str] = []
+    free = free_mb
+    surplus = max(0, len(entries_newest_first) - max(1, keep))
+    for name, size_mb in reversed(entries_newest_first):
+        if free >= needed_mb:
+            break
+        doomed.append(name)
+        free += size_mb
+    return doomed, free, len(doomed) > surplus
 
 
 def _log(msg: str) -> None:
@@ -65,14 +92,32 @@ def _ssh(command: str) -> str:
     return out.stdout.strip()
 
 
+def _remote_entries() -> list[tuple[str, int]]:
+    """Что лежит на приёмнике: (имя, размер в МБ), новые сверху."""
+    listing = _ssh(
+        f"cd '{REMOTE_DIR}' 2>/dev/null && "
+        f"find . -maxdepth 1 -name 'albery_*.dump' -printf '%T@ %f %s\\n' | sort -rn || true"
+    )
+    entries: list[tuple[str, int]] = []
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) == 3:
+            entries.append((parts[1], int(parts[2]) // 1024 // 1024))
+    return entries
+
+
+def _remote_delete(names: list[str]) -> None:
+    if not names:
+        return
+    quoted = " ".join(f"'{n}'" for n in names)
+    _ssh(f"cd '{REMOTE_DIR}' && rm -f {quoted}")
+
+
 def _remote_prune(keep: int) -> None:
-    listing = _ssh(f"cd '{REMOTE_DIR}' 2>/dev/null && ls -1t albery_*.dump 2>/dev/null || true")
-    names = [n for n in listing.splitlines() if n.strip()]
-    doomed = plan_prune(names, keep)
+    doomed = plan_prune([n for n, _ in _remote_entries()], keep)
     if not doomed:
         return
-    quoted = " ".join(f"'{n}'" for n in doomed)
-    _ssh(f"cd '{REMOTE_DIR}' && rm -f {quoted}")
+    _remote_delete(doomed)
     _log(f"на приёмнике удалено устаревших копий: {len(doomed)}")
 
 
@@ -92,11 +137,25 @@ def main() -> int:
     free_mb = int(_ssh(f"df -Pm '{REMOTE_DIR}' | tail -1 | awk '{{print $4}}'"))
 
     if prune_before_send(free_mb, dump_mb):
+        needed = int(dump_mb * 1.1)
         _log(f"на приёмнике {free_mb} МБ при дампе {dump_mb} МБ — освобождаю место до отправки")
-        _remote_prune(OFFSITE_KEEP - 1 if OFFSITE_KEEP > 1 else 1)
-        # keep=1 при OFFSITE_KEEP=1: оставляем предыдущую копию до последнего, rsync
-        # перезапишет её только если имя совпадёт (одинаковая дата) — иначе она уйдёт
-        # на втором проходе подрезки, уже после успешной сверки.
+        doomed, free_after_prune, forced = plan_free_space(
+            _remote_entries(), needed, free_mb, OFFSITE_KEEP,
+        )
+        if forced:
+            _log(
+                "ВЫНУЖДЕННО снимаю копии из зоны хранения — места нет иначе. "
+                "Несколько секунд приёмник будет без целой копии; локальные 10 дампов на месте."
+            )
+        _remote_delete(doomed)
+        if doomed:
+            _log(f"освобождено удалением {len(doomed)} шт., ожидаемо свободно {free_after_prune} МБ")
+        if free_after_prune < needed:
+            _log(
+                f"НЕ ХВАТАЕТ МЕСТА даже после расчистки: {free_after_prune} МБ при нужных {needed} МБ. "
+                "Копия не отправлена — расширяйте диск приёмника или уменьшайте базу."
+            )
+            return 1
 
     _log(f"отправляю {latest.name} ({dump_mb} МБ) на {REMOTE_HOST}")
     subprocess.run(

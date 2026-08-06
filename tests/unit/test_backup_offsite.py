@@ -12,7 +12,7 @@ rsync стал падать с «No space left on device», последняя �
 """
 import pytest
 
-from scripts.backup_offsite import plan_prune, prune_before_send
+from scripts.backup_offsite import plan_free_space, plan_prune, prune_before_send
 
 # Реальный листинг приёмника на утро 06.08.2026, новые сверху.
 REAL_OFFSITE = [
@@ -30,6 +30,9 @@ REAL_OFFSITE = [
 
 REAL_DUMP_MB = 735  # albery_20260806_031501.dump
 REAL_FREE_MB = 494  # столько осталось на 217 после первой расчистки
+
+# Тот же листинг с размерами, как его видит plan_free_space (новые сверху).
+REAL_ENTRIES = [(name, 300) for name in REAL_OFFSITE]
 
 
 def test_prune_keeps_only_newest():
@@ -76,6 +79,53 @@ def test_healthy_box_sends_first_and_prunes_after():
 ])
 def test_headroom_boundary(free_mb, expected):
     assert prune_before_send(free_mb, REAL_DUMP_MB) is expected
+
+
+def test_keep1_forced_prune_actually_frees_space():
+    """Живой прогон 06.08.2026: при OFFSITE_KEEP=1 расчистка не освобождала НИЧЕГО.
+
+    На приёмнике лежала одна копия (734 МБ), свободно было 494 МБ, шёл новый дамп 740 МБ.
+    Подрезка «оставь 1 самую свежую» находила ровно эту копию и не трогала её — место не
+    появлялось, rsync упал бы точно так же, как падал старый крон. Тесты этого не поймали,
+    потому что проверяли решение о расчистке и саму расчистку по отдельности.
+    """
+    on_receiver = [("albery_20260806_031501.dump", 734)]
+    doomed, free_after, forced = plan_free_space(
+        on_receiver, needed_mb=int(740 * 1.1), free_mb=494, keep=1,
+    )
+    assert doomed == ["albery_20260806_031501.dump"], "старая копия обязана уйти, иначе места не будет"
+    assert free_after == 494 + 734
+    assert free_after >= 740 * 1.1, "после расчистки новый дамп должен помещаться"
+    assert forced is True, "снятие последней копии — вынужденное, о нём обязан быть отдельный лог"
+
+
+def test_free_space_stops_as_soon_as_it_fits():
+    """Лишнего не удаляем: расчистка идёт от старых и останавливается, как только влезает."""
+    on_receiver = [(f"albery_2026080{i}_031501.dump", 700) for i in (6, 5, 4, 3)]
+    doomed, free_after, forced = plan_free_space(
+        on_receiver, needed_mb=800, free_mb=200, keep=1,
+    )
+    assert doomed == ["albery_20260803_031501.dump"], "хватило одной самой старой"
+    assert free_after == 900
+    assert forced is False, "файлы сверх keep — это плановая подрезка, не вынужденная"
+
+
+def test_free_space_noop_when_it_already_fits():
+    doomed, free_after, forced = plan_free_space(REAL_ENTRIES, needed_mb=500, free_mb=3000, keep=3)
+    assert doomed == []
+    assert free_after == 3000
+    assert forced is False
+
+
+def test_free_space_reports_shortfall_instead_of_lying():
+    """Диск слишком мал даже пустой — надо честно вернуть нехватку, а не делать вид, что влезло."""
+    on_receiver = [("albery_20260806_031501.dump", 100)]
+    doomed, free_after, forced = plan_free_space(
+        on_receiver, needed_mb=5000, free_mb=200, keep=1,
+    )
+    assert doomed == ["albery_20260806_031501.dump"]
+    assert free_after == 300
+    assert free_after < 5000, "вызывающий обязан увидеть, что места всё равно не хватило"
 
 
 def test_one_file_leaves_at_most_one_file():
