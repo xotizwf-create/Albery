@@ -37,6 +37,7 @@ from app import (
 )
 from shared.db import load_env_value as shared_load_env_value
 from utils import to_int
+from shared.role import background_jobs_enabled
 
 _DIALOGS_LIMIT_DEFAULT = 100
 _MESSAGES_LIMIT_DEFAULT = 200
@@ -1508,7 +1509,9 @@ def _health_watchdog_loop() -> None:
         time.sleep(_WATCHDOG_INTERVAL_S)
 
 
-if os.getenv("AGENT_HEALTH_WATCHDOG", "1").strip() != "0":
+# Сторож здоровья — фоновое расписание: крутится РОВНО в роли бота, иначе веб-
+# и MCP-службы завели бы вторую и третью копию (двойные уведомления людям).
+if os.getenv("AGENT_HEALTH_WATCHDOG", "1").strip() != "0" and background_jobs_enabled():
     import threading
 
     threading.Thread(target=_health_watchdog_loop, daemon=True, name="agent-health-watchdog").start()

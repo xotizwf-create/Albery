@@ -1,0 +1,37 @@
+[Unit]
+# Роль MCP: единственная дверь агентов к данным компании (mcp.m4s.ru). Отделена от роли бота
+# 07.08.2026: раньше падение или зависание в обработке разговора уносило вместе с собой и
+# инструменты агентов, из-за чего модель начинала ретраить до таймаута моста в 600 с.
+# Фоновые расписания здесь НЕ крутятся — они за ALBERY_ROLE, см. shared/role.py.
+Description=Albery MCP tools (gunicorn, role=mcp)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/albery
+Environment=ALBERY_ROLE=mcp
+# Вызов инструмента — это почти всегда ожидание базы, Битрикса, Google или Zoom, поэтому
+# потоки, а не процессы. Пул соединений к Postgres общий по 10 на процесс, так что двух
+# воркеров по четыре потока коробка выдерживает.
+ExecStart=/var/www/albery/.venv/bin/gunicorn \
+    --workers 2 \
+    --threads 4 \
+    --preload \
+    --bind 127.0.0.1:5004 \
+    --timeout 620 \
+    --graceful-timeout 30 \
+    --keep-alive 5 \
+    --access-logfile - \
+    --error-logfile - \
+    wsgi:application
+# Таймаут воркера заведомо больше 600 с моста MCP: инструмент, который честно работает
+# девять минут, не должен быть убит своим же сервером.
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

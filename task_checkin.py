@@ -34,6 +34,7 @@ from datetime import timedelta
 from typing import Any
 
 from app import MSK_TZ, msk_now, pg_connect
+from shared.role import background_jobs_enabled
 
 _CHECKIN_HOUR = int(os.getenv("B24_TASK_CHECKIN_HOUR", "12"))
 _OFFER_CAP = int(os.getenv("B24_TASK_CHECKIN_OFFER_CAP", "15"))
@@ -606,5 +607,7 @@ def _loop() -> None:
         time.sleep(120)
 
 
-if os.getenv("B24_TASK_CHECKIN", "1").strip() != "0":
+# Обход чекина по задачам — фоновое расписание: крутится РОВНО в роли бота, иначе веб-
+# и MCP-службы завели бы вторую и третью копию (двойные уведомления людям).
+if os.getenv("B24_TASK_CHECKIN", "1").strip() != "0" and background_jobs_enabled():
     threading.Thread(target=_loop, daemon=True, name="task-checkin").start()

@@ -32,6 +32,7 @@ from flask import request
 from typing import Any
 import requests
 
+from shared.role import background_jobs_enabled
 from shared.run_slots import build_default as build_run_slots
 
 from app import (  # noqa: E501 — single home for shared helpers until services/ split
@@ -1778,7 +1779,9 @@ def _b24_idle_watch_loop() -> None:
         time.sleep(120)
 
 
-if os.getenv("B24_SESSION_IDLE_WATCH", "1").strip() != "0":
+# Обход простаивающих сессий — фоновое расписание: крутится РОВНО в роли бота, иначе веб-
+# и MCP-службы завели бы вторую и третью копию (двойные уведомления людям).
+if os.getenv("B24_SESSION_IDLE_WATCH", "1").strip() != "0" and background_jobs_enabled():
     threading.Thread(target=_b24_idle_watch_loop, daemon=True, name="b24-session-idle-watch").start()
 
 

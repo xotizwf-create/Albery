@@ -23,6 +23,7 @@ from datetime import timedelta
 from typing import Any
 
 from app import MSK_TZ, msk_now, pg_connect
+from shared.role import background_jobs_enabled
 
 _RETRY_DELAY_S = int(os.getenv("RECURRING_TASKS_RETRY_DELAY_S", "300"))
 _BOOT_DELAY_S = int(os.getenv("RECURRING_TASKS_BOOT_DELAY_S", "90"))
@@ -184,5 +185,7 @@ def _loop() -> None:
         time.sleep(15)
 
 
-if os.getenv("RECURRING_TASKS_SCHEDULER", "1").strip() != "0":
+# Повторяющиеся задачи — фоновое расписание: крутится РОВНО в роли бота, иначе веб-
+# и MCP-службы завели бы вторую и третью копию (двойные уведомления людям).
+if os.getenv("RECURRING_TASKS_SCHEDULER", "1").strip() != "0" and background_jobs_enabled():
     threading.Thread(target=_loop, daemon=True, name="recurring-tasks-scheduler").start()

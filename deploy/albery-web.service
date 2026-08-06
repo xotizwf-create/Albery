@@ -1,0 +1,38 @@
+[Unit]
+# Роль ВЕБ: сайт, API, Центр Агента, отчёты. Отделена от роли бота 07.08.2026, чтобы
+# зависший ход мозга (до 10 минут в отдельном процессе hermes) не задерживал выдачу страниц
+# и API. Фоновые расписания здесь НЕ крутятся — они за ALBERY_ROLE, см. shared/role.py.
+Description=Albery web/API (gunicorn, role=web)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/albery
+Environment=ALBERY_ROLE=web
+# Воркеров два, потоков по четыре: работа здесь почти вся ожидание базы и Битрикса, а не
+# счёт, поэтому потоки дешевле процессов на коробке с 2 ГБ. --preload делит память кода
+# между воркерами (copy-on-write): загрузка кода стоит около 55 МБ, и платить за неё дважды
+# незачем. Ограничение: с --preload воркеры наследуют состояние импорта, поэтому фоновые
+# потоки в них подниматься не должны — это и обеспечивает ALBERY_ROLE=web.
+ExecStart=/var/www/albery/.venv/bin/gunicorn \
+    --workers 2 \
+    --threads 4 \
+    --preload \
+    --bind 127.0.0.1:5003 \
+    --timeout 620 \
+    --graceful-timeout 30 \
+    --keep-alive 5 \
+    --access-logfile - \
+    --error-logfile - \
+    wsgi:application
+# 620 с против 600 с у nginx: воркер должен умирать ПОЗЖЕ, чем прокси отдаст таймаут клиенту,
+# иначе пользователь получит 502 вместо честного таймаута.
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

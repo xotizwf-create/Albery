@@ -33,6 +33,7 @@ from flask import jsonify, request
 
 from app import MSK_TZ, app, msk_now, pg_connect
 import cron_schedule
+from shared.role import background_jobs_enabled
 
 _AUTOMATION_TIMEOUT_S = int(os.getenv("AGENT_AUTOMATION_TIMEOUT_S", "300"))
 # A 'running' row older than timeout+retry window+slack means the process restarted
@@ -834,7 +835,9 @@ def _scheduler_loop() -> None:
         time.sleep(15)
 
 
-if os.getenv("AGENT_AUTOMATIONS", "1").strip() != "0":
+# Автоматизации агентов — фоновое расписание: крутится РОВНО в роли бота, иначе веб-
+# и MCP-службы завели бы вторую и третью копию (двойные уведомления людям).
+if os.getenv("AGENT_AUTOMATIONS", "1").strip() != "0" and background_jobs_enabled():
     threading.Thread(target=_scheduler_loop, daemon=True, name="agent-automations-scheduler").start()
     for _n in range(_AUTOMATION_WORKERS):
         threading.Thread(target=_worker_loop, daemon=True, name=f"agent-automations-worker-{_n}").start()
