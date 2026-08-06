@@ -1,0 +1,15 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Оффсайт-копия свежего дампа PostgreSQL на резервный сервер.
+#
+# Заменила прежнюю строку `rsync -a /var/backups/albery/postgres/ ...` (06.08.2026):
+# локально держится 10 дампов, дамп вырос до 735 МБ, и вся папка перестала помещаться
+# на приёмник с диском 15 ГБ. Он забился на 100%, rsync начал падать, и оффсайт-копия
+# МОЛЧА не обновлялась 18 дней — при живых локальных копиях, поэтому мониторинг молчал.
+#
+# Скрипт шлёт ровно один файл, сверяет md5 и сам подрезает историю на приёмнике.
+# OFFSITE_KEEP=1 — временно: на 217 сейчас нет места под две копии. Поднять до 3
+# после того, как база похудеет (retention/партиционирование bitrix_task_snapshots).
+# Разбор — в шапке scripts/backup_offsite.py.
+45 3 * * * root OFFSITE_KEEP=1 /var/www/albery/.venv/bin/python /var/www/albery/scripts/backup_offsite.py >> /var/log/albery-backup-offsite.log 2>&1
