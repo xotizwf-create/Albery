@@ -32,6 +32,8 @@ from flask import request
 from typing import Any
 import requests
 
+from shared.run_slots import build_default as build_run_slots
+
 from app import (  # noqa: E501 — single home for shared helpers until services/ split
     BitrixClient,
     MSK_TZ,
@@ -3052,7 +3054,11 @@ def _b24_recent_history(dialog_id: str, limit: int = 6,
 # of simultaneous users would swap/OOM the whole server.
 _HERMES_MAX_CONCURRENCY = max(1, int(os.getenv("B24_HERMES_MAX_CONCURRENCY", "3")))
 _HERMES_QUEUE_WAIT_S = int(os.getenv("B24_HERMES_QUEUE_WAIT_S", "180"))
-_HERMES_RUN_SLOTS = threading.BoundedSemaphore(_HERMES_MAX_CONCURRENCY)
+# Ограничитель ОБЩИЙ для всех процессов приложения (advisory-локи PostgreSQL), а не счётчик
+# в памяти. До 06.08.2026 здесь стоял threading.BoundedSemaphore — он ограничивает только
+# свой процесс, и при переходе на многопроцессный appserver каждый воркер разрешал бы свои
+# 3 хода по ~250 МБ: четыре воркера = 3 ГБ на коробке с 2 ГБ. Подробности — shared/run_slots.py.
+_HERMES_RUN_SLOTS = build_run_slots()
 # Live turn registry for cancellation: «Новая сессия» must STOP a running brain turn of that
 # (agent, dialog) — kill its hermes subprocess — instead of letting it finish into a session
 # the user already reset. Keyed by _b24_scope; the worker sees `cancelled` and drops the turn.
@@ -3169,7 +3175,8 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
     append `retry_prompt_suffix` to the -z prompt so the second attempt runs LEANER (fewer web
     pages, one export call) — heavy multi-step turns are exactly what breaks the connection."""
     backoff_s = float(os.getenv("B24_HERMES_RETRY_BACKOFF_S", "6") or "6")
-    if not _HERMES_RUN_SLOTS.acquire(timeout=_HERMES_QUEUE_WAIT_S):
+    slot = _HERMES_RUN_SLOTS.acquire(timeout=_HERMES_QUEUE_WAIT_S)
+    if slot is None:
         logging.warning("b24 testbot: hermes slot wait exceeded %ss dialog_id=%s tier=%s user_id=%s",
                         _HERMES_QUEUE_WAIT_S, dialog_id, tier, from_user_id)
         _b24_ops_alert(
@@ -3233,7 +3240,7 @@ def _hermes_run_guarded(cmd: list, timeout_s: int, dialog_id: Any, tier: str,
                 entries.remove(entry)
             if not entries:
                 _LIVE_TURNS.pop(scope, None)
-        _HERMES_RUN_SLOTS.release()
+        slot.release()
 
 
 # «Вопросы о возможностях и доступе» добавлена 29.07.2026: именно она задаёт, КАК агент

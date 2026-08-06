@@ -50,9 +50,18 @@ def test_turns_of_different_people_run_in_parallel(tg, monkeypatch):
 
 
 def test_parallelism_is_capped(tg):
-    """Без предела поток лидов положил бы службу: на боксе 2 ГБ, каждый ход — свой процесс."""
-    assert tg._HERMES_PARALLEL >= 1
-    assert tg._hermes_slots._initial_value == tg._HERMES_PARALLEL
+    """Без предела поток лидов положил бы службу: на боксе 2 ГБ, каждый ход — свой процесс.
+
+    С 06.08.2026 предел ОБЩИЙ с appserver'ом, а не свой у этой службы. Раньше здесь стоял
+    собственный BoundedSemaphore(3), и b24bot держал ещё один такой же — то есть коробка
+    могла поднять 6 процессов hermes (~1.5 ГБ) при заявленном лимите 3. Память принадлежит
+    железу, а не отдельной службе, поэтому счёт теперь один на всех.
+    """
+    from shared.run_slots import build_default
+
+    assert tg._HERMES_PARALLEL >= 1, "пул обработчиков апдейтов остаётся"
+    assert tg._hermes_slots.limit >= 1, "предел ходов мозга есть"
+    assert tg._hermes_slots is build_default(), "пул обязан быть ОБЩИМ, а не собственным"
 
 
 def test_messages_of_one_person_are_batched_not_interleaved(tg, monkeypatch):

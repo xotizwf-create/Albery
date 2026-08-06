@@ -43,6 +43,7 @@ import decision_log        # трасса решений: что решили, �
 import funnel_rules        # правила воронки как данные: факты → решение + его причина
 import funnel_scenario     # настроенный владельцем сценарий воронки (кабинет)
 import iu_client_bot       # единые тексты передачи диалога живому менеджеру
+from shared.run_slots import build_default as build_run_slots  # общий с appserver лимит ходов
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -58,7 +59,14 @@ _HERMES_PARALLEL = max(
     1,
     min(3, int(os.getenv("TG_AGENT_PARALLEL_TURNS", "3") or 3)),
 )
-_hermes_slots = threading.BoundedSemaphore(_HERMES_PARALLEL)
+# Пул ОБЩИЙ с appserver'ом, а не свой. До 06.08.2026 здесь стоял собственный
+# threading.BoundedSemaphore(3), и b24bot держал ещё один такой же — то есть коробка с 2 ГБ
+# могла поднять 6 процессов hermes по ~250 МБ (1.5 ГБ) при заявленном лимите 3. Память
+# принадлежит железу, а не отдельной службе, поэтому счёт теперь один на всех
+# (advisory-локи PostgreSQL, см. shared/run_slots.py). _HERMES_PARALLEL остаётся размером
+# пула обработчиков апдейтов — лёгкой работы, не ходов мозга.
+_hermes_slots = build_run_slots()
+_HERMES_SLOT_WAIT_S = int(os.getenv("TG_AGENT_SLOT_WAIT_S", "180") or "180")
 # Сообщения ОДНОГО человека обрабатываются строго по очереди: иначе два его сообщения подряд
 # уходят в два параллельных хода, и второй не видит, что ответил первый.
 _dialog_locks: dict[str, threading.Lock] = {}
@@ -733,11 +741,11 @@ def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
     # бы минуты. Теперь параллельно идут несколько ходов; предел держим осознанно — на боксе
     # 2 ГБ памяти, и неограниченный параллелизм убил бы службу вместе с ответами всем.
     waited = time.monotonic()
-    with _hermes_slots:
+    with _hermes_slots.held(_HERMES_SLOT_WAIT_S) as slot:
         queued = time.monotonic() - waited
         if queued > 5:
-            log.info("ход ждал очереди %.0f c (занято %s из %s слотов)",
-                     queued, _HERMES_PARALLEL - _hermes_slots._value, _HERMES_PARALLEL)
+            log.info("ход ждал очереди %.0f c (слот %s из %s, пул общий с appserver)",
+                     queued, slot.index, _hermes_slots.limit)
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     answer = (proc.stdout or "").strip()
     if proc.returncode != 0 or not answer or _HERMES_ERROR_RE.match(answer):
