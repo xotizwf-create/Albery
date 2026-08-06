@@ -1858,6 +1858,73 @@ def build_task_record(client: BitrixClient, base_task: dict[str, Any]) -> dict[s
             "details": details,
         },
     }
+# Поля, ради которых снимок состояния вообще существует. Всё остальное (заголовок, описание,
+# чек-листы) в снимок не входило и раньше — оно есть в bitrix_tasks и в журнале изменений.
+SNAPSHOT_TRACKED_FIELDS = ("status", "priority", "responsible_id", "deadline_at", "closed_at_bitrix")
+
+
+def snapshot_differs(previous: dict[str, Any] | None, current: dict[str, Any]) -> bool:
+    """Изменилось ли то, ради чего делается снимок.
+
+    До 06.08.2026 снимок писался на КАЖДЫЙ прогон синхронизации — 18 раз в сутки по всем
+    937 задачам, ~17 000 строк в день. Реальных изменений задач при этом 32 в сутки
+    (bitrix_task_events, OnTaskUpdate за 42 дня), то есть 99.8% строк были дублями предыдущей.
+    Таблица набрала 2453 МБ за 42 дня и росла на 100 МБ в сутки, не будучи прочитанной ни разу.
+    """
+    if previous is None:
+        return True
+    return any(previous.get(field) != current.get(field) for field in SNAPSHOT_TRACKED_FIELDS)
+
+
+def _history_value_text(value: Any) -> str | None:
+    """Значение поля из истории — в текст. Битрикс кладёт туда и числа, и строки, и null."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def task_history_rows(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Родная история изменений задачи из Битрикса → строки журнала.
+
+    `tasks.task.history.list` уже вызывается синхронизацией на каждую задачу
+    (см. BitrixClient.get_task_history), а ответ до 06.08.2026 просто оседал в raw_json,
+    откуда его никто не доставал. Это авторитетный аудит портала: кто, какое поле,
+    из чего в что, когда — то есть ровно то, чего не хватало для ответа на вопрос
+    «кто просрачивал задачи». Восстанавливается задним числом за всё время жизни задачи,
+    без единого дополнительного обращения к порталу.
+    """
+    items = ((record.get("history") or {}).get("items")) or []
+    bitrix_task_id = to_int(record.get("task_id"))
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        history_id = to_int(item.get("id"))
+        field = item.get("field")
+        if history_id is None or not field:
+            continue
+        value = item.get("value") if isinstance(item.get("value"), dict) else {}
+        user = item.get("user") if isinstance(item.get("user"), dict) else {}
+        full_name = " ".join(
+            part for part in (user.get("lastName"), user.get("name"), user.get("secondName")) if part
+        ).strip()
+        rows.append(
+            {
+                "bitrix_history_id": history_id,
+                "bitrix_task_id": bitrix_task_id,
+                "field": str(field),
+                "value_from": _history_value_text(value.get("from")),
+                "value_to": _history_value_text(value.get("to")),
+                "changed_by_bitrix_user_id": to_int(user.get("id")),
+                "changed_by_name": full_name or None,
+                "changed_at": parse_datetime(item.get("createdDate")),
+            }
+        )
+    return rows
+
+
 def upsert_task_records(records: list[dict[str, Any]], sync_run_id: int | None = None) -> None:
     now = datetime.now()
     with pg_connect() as conn:
@@ -1928,28 +1995,65 @@ def upsert_task_records(records: list[dict[str, Any]], sync_run_id: int | None =
                         },
                     )
                     bitrix_task_uuid = cur.fetchone()["id"]
-                    if sync_run_id:
+
+                    # Журнал изменений: родная история портала, дедуп по её собственному id —
+                    # история перечитывается каждой синхронизацией, без ключа плодились бы дубли.
+                    for history_row in task_history_rows(record):
                         cur.execute(
                             """
-                            INSERT INTO bitrix_task_snapshots (
-                                task_id, bitrix_task_id, sync_run_id, snapshot_date, status,
-                                priority, responsible_id, deadline_at, closed_at_bitrix, raw_json
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (task_id, sync_run_id) DO NOTHING
+                            INSERT INTO bitrix_task_history (
+                                bitrix_history_id, bitrix_task_id, task_id, field,
+                                value_from, value_to, changed_by_bitrix_user_id,
+                                changed_by_name, changed_at
+                            ) VALUES (
+                                %(bitrix_history_id)s, %(bitrix_task_id)s, %(task_id)s, %(field)s,
+                                %(value_from)s, %(value_to)s, %(changed_by_bitrix_user_id)s,
+                                %(changed_by_name)s, %(changed_at)s
+                            )
+                            ON CONFLICT (bitrix_history_id) DO NOTHING
                             """,
-                            (
-                                bitrix_task_uuid,
-                                task_id,
-                                sync_run_id,
-                                date.today(),
-                                str(status.get("code")) if status.get("code") is not None else None,
-                                record.get("priority"),
-                                responsible_id,
-                                parse_datetime(record.get("deadline")),
-                                parse_datetime(record.get("closed_date")),
-                                pg_json(record),
-                            ),
+                            {**history_row, "task_id": bitrix_task_uuid},
                         )
+
+                    if sync_run_id:
+                        current_state = {
+                            "status": str(status.get("code")) if status.get("code") is not None else None,
+                            "priority": record.get("priority"),
+                            "responsible_id": responsible_id,
+                            "deadline_at": parse_datetime(record.get("deadline")),
+                            "closed_at_bitrix": parse_datetime(record.get("closed_date")),
+                        }
+                        cur.execute(
+                            """
+                            SELECT status, priority, responsible_id, deadline_at, closed_at_bitrix
+                            FROM bitrix_task_snapshots
+                            WHERE bitrix_task_id = %s
+                            ORDER BY created_at DESC
+                            LIMIT 1
+                            """,
+                            (task_id,),
+                        )
+                        if snapshot_differs(cur.fetchone(), current_state):
+                            cur.execute(
+                                """
+                                INSERT INTO bitrix_task_snapshots (
+                                    task_id, bitrix_task_id, sync_run_id, snapshot_date, status,
+                                    priority, responsible_id, deadline_at, closed_at_bitrix
+                                ) VALUES (
+                                    %(task_uuid)s, %(bitrix_task_id)s, %(sync_run_id)s,
+                                    %(snapshot_date)s, %(status)s, %(priority)s,
+                                    %(responsible_id)s, %(deadline_at)s, %(closed_at_bitrix)s
+                                )
+                                ON CONFLICT (task_id, sync_run_id) DO NOTHING
+                                """,
+                                {
+                                    **current_state,
+                                    "task_uuid": bitrix_task_uuid,
+                                    "bitrix_task_id": task_id,
+                                    "sync_run_id": sync_run_id,
+                                    "snapshot_date": date.today(),
+                                },
+                            )
                     for role, user_uuid, bitrix_id in (
                         ("creator", creator_id, creator_bitrix_id),
                         ("responsible", responsible_id, responsible_bitrix_id),

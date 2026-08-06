@@ -502,9 +502,13 @@ def tool_get_context_guide(args: dict[str, Any] | None = None) -> dict[str, Any]
                 "use_for": ["people", "roles", "managers", "departments", "Bitrix user ids"],
             },
             "bitrix_tasks": {
-                "tools": ["search_tasks", "list_overdue_tasks", "get_task_comments", "add_bitrix_task_comment", "create_bitrix_task", "reopen_bitrix_task", "delete_bitrix_task"],
-                "tables": ["bitrix_tasks", "bitrix_task_members", "bitrix_task_snapshots"],
-                "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "task discussion and comments", "adding Bitrix task comments", "creating Bitrix tasks with required title/responsible/deadline", "reopening completed tasks with reason/comment", "deleting Bitrix tasks only after exact id lookup and explicit confirmation"],
+                "tools": ["search_tasks", "list_overdue_tasks", "get_task_history", "report_overdue_discipline", "get_task_comments", "add_bitrix_task_comment", "create_bitrix_task", "reopen_bitrix_task", "delete_bitrix_task"],
+                # bitrix_task_snapshots здесь НЕ упоминается намеренно: до 06.08.2026 она стояла
+                # в этом списке, хотя ни один инструмент её не отдаёт — подсказка обещала модели
+                # данные, которых у неё нет. История изменений теперь в bitrix_task_history и
+                # доступна через get_task_history / report_overdue_discipline.
+                "tables": ["bitrix_tasks", "bitrix_task_members", "bitrix_task_history"],
+                "use_for": ["task ownership", "deadlines", "statuses", "overdue work", "responsibility", "who moved a deadline and when", "who chronically misses deadlines", "task change history", "task discussion and comments", "adding Bitrix task comments", "creating Bitrix tasks with required title/responsible/deadline", "reopening completed tasks with reason/comment", "deleting Bitrix tasks only after exact id lookup and explicit confirmation"],
             },
             "funnel_workspace": {
                 "tools": [
@@ -1767,6 +1771,23 @@ def _task_deep_link(task_id: Any) -> str | None:
     if not base or tid <= 0:
         return None
     return f"{base}/company/personal/user/0/tasks/task/view/{tid}/"
+
+
+def _unix_text_to_msk(value: Any) -> str | None:
+    """Срок из истории Битрикса — в читаемый московский вид.
+
+    В tasks.task.history.list значения DEADLINE приходят unix-секундами В ВИДЕ СТРОКИ
+    («1785916800»); показывать их модели и человеку как есть бессмысленно."""
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text.isdigit():
+        return text
+    try:
+        moment = datetime.fromtimestamp(int(text), tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return text
+    return _to_msk(moment).strftime("%d.%m.%Y %H:%M")
 
 
 def _task_deadline_change_count(task_id: Any) -> int | None:
@@ -3814,6 +3835,172 @@ def tool_list_overdue_tasks(args: dict[str, Any]) -> dict[str, Any]:
             "Пустой список — это ДОСТОВЕРНЫЙ ответ «просроченных задач нет», так и напиши; "
             "не пиши, что данных не хватает. Номер задачи показывай кликабельной ссылкой "
             "[URL=<task_url>]<номер>[/URL], рядом дедлайн и ответственного."
+        ),
+    }
+
+
+def tool_get_task_history(args: dict[str, Any]) -> dict[str, Any]:
+    """Кто, что и когда менял в конкретной задаче — родной аудит Битрикса.
+
+    До 06.08.2026 ответить на это было нечем: история приходила в синхронизации
+    (tasks.task.history.list) и оседала в raw_json, откуда её никто не доставал, а снимки
+    состояния не хранили автора изменения вовсе. Теперь она лежит в bitrix_task_history."""
+    task_id = args.get("bitrix_task_id")
+    if task_id in (None, ""):
+        raise ValueError("bitrix_task_id обязателен")
+    fields = args.get("fields") or None
+    limit = parse_limit(args)
+
+    filters = ["h.bitrix_task_id = %s"]
+    params: list[Any] = [int(task_id)]
+    if fields:
+        filters.append("h.field = ANY(%s)")
+        params.append([str(f).upper() for f in fields])
+    params.append(limit)
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT h.field, h.value_from, h.value_to, h.changed_by_bitrix_user_id,
+                       h.changed_by_name, h.changed_at
+                FROM bitrix_task_history h
+                WHERE {' AND '.join(filters)}
+                ORDER BY h.changed_at DESC NULLS LAST
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+            cur.execute(
+                "SELECT title, deadline_at, closed_at_bitrix FROM bitrix_tasks WHERE bitrix_task_id = %s",
+                (int(task_id),),
+            )
+            task = cur.fetchone()
+
+    for row in rows:
+        # В истории Битрикса сроки лежат unix-секундами строкой — показываем по-человечески.
+        if row.get("field") == "DEADLINE":
+            row["value_from_readable"] = _unix_text_to_msk(row.get("value_from"))
+            row["value_to_readable"] = _unix_text_to_msk(row.get("value_to"))
+
+    return {
+        "bitrix_task_id": int(task_id),
+        "task_url": _task_deep_link(int(task_id)),
+        "title": (task or {}).get("title"),
+        "deadline_at": (task or {}).get("deadline_at"),
+        "closed_at_bitrix": (task or {}).get("closed_at_bitrix"),
+        "items": rows,
+        "total": len(rows),
+        "display_rule": (
+            "Пустой список — достоверный ответ «задачу не меняли», так и напиши. "
+            "Для поля DEADLINE показывай value_from_readable → value_to_readable, а не unix-числа. "
+            "Номер задачи давай ссылкой [URL=<task_url>]<номер>[/URL]."
+        ),
+    }
+
+
+def tool_report_overdue_discipline(args: dict[str, Any]) -> dict[str, Any]:
+    """Кто просрачивал задачи за период и кому при этом двигали сроки.
+
+    Отвечает на вопрос владельца, на который система раньше ответить не могла: list_overdue_tasks
+    показывает только текущую просрочку, а перенос дедлайна её прячет — задача закрывается
+    «в срок» после того, как срок подвинули. Здесь просрочка считается по ФАКТИЧЕСКОМУ закрытию
+    относительно дедлайна, а переносы показываются отдельно с автором."""
+    date_from = parse_date_arg(args, "date_from", required=False)
+    date_to = parse_date_arg(args, "date_to", required=False)
+    responsible = args.get("responsible_bitrix_user_id")
+    limit = parse_limit(args)
+
+    filters = ["t.deadline_at IS NOT NULL"]
+    params: list[Any] = []
+    if date_from:
+        filters.append("(t.deadline_at AT TIME ZONE 'Europe/Moscow')::date >= %s")
+        params.append(date_from)
+    if date_to:
+        filters.append("(t.deadline_at AT TIME ZONE 'Europe/Moscow')::date <= %s")
+        params.append(date_to)
+    if responsible not in (None, ""):
+        filters.append("t.responsible_bitrix_user_id = %s")
+        params.append(int(responsible))
+    params.append(limit)
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH moves AS (
+                    SELECT bitrix_task_id,
+                           count(*) AS deadline_moves,
+                           array_agg(DISTINCT changed_by_name)
+                               FILTER (WHERE changed_by_name IS NOT NULL) AS moved_by,
+                           sum(
+                               (NULLIF(value_to, '')::bigint - NULLIF(value_from, '')::bigint)
+                           ) FILTER (
+                               WHERE value_from ~ '^[0-9]+$' AND value_to ~ '^[0-9]+$'
+                           ) AS shift_seconds
+                    FROM bitrix_task_history
+                    WHERE field = 'DEADLINE'
+                    GROUP BY bitrix_task_id
+                )
+                SELECT t.bitrix_task_id, t.title, t.status, t.status_name,
+                       t.deadline_at, t.closed_at_bitrix,
+                       ru.bitrix_user_id AS responsible_bitrix_user_id,
+                       ru.full_name AS responsible_name,
+                       COALESCE(m.deadline_moves, 0) AS deadline_moves,
+                       m.moved_by,
+                       ROUND(m.shift_seconds / 86400.0, 1) AS deadline_shifted_days,
+                       CASE
+                           WHEN t.closed_at_bitrix IS NOT NULL AND t.closed_at_bitrix > t.deadline_at
+                               THEN ROUND(EXTRACT(epoch FROM t.closed_at_bitrix - t.deadline_at) / 86400.0, 1)
+                           WHEN t.closed_at_bitrix IS NULL AND t.deadline_at < now()
+                               THEN ROUND(EXTRACT(epoch FROM now() - t.deadline_at) / 86400.0, 1)
+                       END AS days_late
+                FROM bitrix_tasks t
+                LEFT JOIN users ru ON ru.id = t.responsible_id
+                LEFT JOIN moves m ON m.bitrix_task_id = t.bitrix_task_id
+                WHERE {' AND '.join(filters)}
+                ORDER BY t.deadline_at DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+    by_person: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        row["task_url"] = _task_deep_link(row.get("bitrix_task_id"))
+        row["was_late"] = row.get("days_late") is not None
+        row["still_open"] = row.get("closed_at_bitrix") is None
+        name = row.get("responsible_name") or "не назначен"
+        bucket = by_person.setdefault(
+            name,
+            {"responsible_name": name, "tasks": 0, "late": 0, "still_open_late": 0,
+             "deadline_moved": 0, "max_days_late": None},
+        )
+        bucket["tasks"] += 1
+        if row["was_late"]:
+            bucket["late"] += 1
+            if row["still_open"]:
+                bucket["still_open_late"] += 1
+            late_days = float(row["days_late"])
+            if bucket["max_days_late"] is None or late_days > bucket["max_days_late"]:
+                bucket["max_days_late"] = late_days
+        if (row.get("deadline_moves") or 0) > 0:
+            bucket["deadline_moved"] += 1
+
+    return {
+        "items": rows,
+        "total": len(rows),
+        "by_responsible": sorted(by_person.values(), key=lambda b: (-b["late"], -b["tasks"])),
+        "period": {"date_from": date_from, "date_to": date_to},
+        "display_rule": (
+            "Пустой список — достоверный ответ «задач с дедлайном за период нет». "
+            "days_late считается от ФАКТИЧЕСКОГО закрытия: положительное значение = просрочка, "
+            "пусто = уложились. deadline_moves>0 значит срок ДВИГАЛИ (moved_by — кто именно), "
+            "и это надо назвать отдельно: закрытие «в срок» после переноса просрочкой не считается "
+            "автоматически, но владельцу важно видеть оба факта. Номера задач давай ссылками "
+            "[URL=<task_url>]<номер>[/URL]."
         ),
     }
 
@@ -10087,6 +10274,51 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_get_org_structure,
     },
+    "get_task_history": {
+        "description": (
+            "История изменений задачи Битрикса: КТО, какое поле, из чего в что и когда. "
+            "Родной аудит портала. Отвечает на «двигали ли срок», «кто переназначил», "
+            "«когда реально закрыли». Для срока значения показывай из value_from_readable / "
+            "value_to_readable — в сырых полях unix-секунды. Пустой список = задачу не меняли."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bitrix_task_id": {"type": "integer", "description": "Номер задачи на портале."},
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Фильтр по полям, например ['DEADLINE','RESPONSIBLE_ID','STATUS'].",
+                },
+                "limit": {"type": "integer"},
+            },
+            "required": ["bitrix_task_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_get_task_history,
+    },
+    "report_overdue_discipline": {
+        "description": (
+            "Дисциплина сроков за период: кто просрачивал задачи и кому двигали дедлайны. "
+            "Отличие от list_overdue_tasks: тот показывает только ТЕКУЩУЮ просрочку, а перенос "
+            "срока её прячет — задача закрывается «в срок» после того, как срок подвинули. Здесь "
+            "просрочка считается от фактического закрытия относительно дедлайна (days_late), а "
+            "переносы видны отдельно с автором (deadline_moves, moved_by, deadline_shifted_days). "
+            "Сводка по людям — в by_responsible. Для вопросов «кто срывает сроки», «у кого "
+            "хронические просрочки», «кому переносили дедлайны»."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "YYYY-MM-DD: дедлайн не раньше этой даты."},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD: дедлайн не позже этой даты."},
+                "responsible_bitrix_user_id": {"type": "integer", "description": "Только по одному сотруднику."},
+                "limit": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_report_overdue_discipline,
+    },
     "search_tasks": {
         "description": (
             "Search Bitrix tasks by id, period, text, or responsible user. When the request mentions a task "
@@ -12487,6 +12719,8 @@ CORE_TOOL_NAMES: set[str] = {
     # tasks
     "search_tasks",
     "list_overdue_tasks",
+    "get_task_history",
+    "report_overdue_discipline",
     "get_task_comments",
     "add_bitrix_task_comment",
     "create_bitrix_task",

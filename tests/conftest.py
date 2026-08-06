@@ -53,11 +53,17 @@ def app_module():
 
 
 @pytest.fixture(scope="session")
-def bitrix_module():
+def bitrix_module(app_module):
     """The Bitrix integration module (extracted from app.py 2026-07-02).
 
     Sync orchestration lives here now, and it holds its own bindings of
-    BitrixClient/pg_connect — patch THIS module, not app, to affect it."""
+    BitrixClient/pg_connect — patch THIS module, not app, to affect it.
+
+    Depends on app_module ON PURPOSE: app.py imports bitrix at the bottom and re-imports
+    18 names back into its own namespace, so importing `bitrix` FIRST leaves it partially
+    initialised and app's re-import explodes with ImportError. Until then this only worked
+    by accident — the one file using the fixture happened to touch app_module in an earlier
+    test. A test file that asks for bitrix_module alone used to fail on import (06.08.2026)."""
     import bitrix as bitrix_module
 
     return bitrix_module

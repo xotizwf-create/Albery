@@ -25,6 +25,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "ai_instruction_folders": "015_ai_instruction_folders.sql",
     "chat_day_syncs": "016_chat_day_syncs.sql",
     "bitrix_task_events": "018_bitrix_task_events.sql",
+    "bitrix_task_history": "081_task_history_and_lean_snapshots.sql",
     "funnel_task_watch": "063_funnel_task_watch.sql",
     "agent_decisions": "064_agent_decisions.sql",
     "funnel_scenarios": "065_funnel_scenarios.sql",
@@ -133,6 +134,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "079_iu_manager_wait_alerts.sql",
     # Owner disabled all delivery/form-driven stage transitions.
     "080_disable_automatic_stage_transitions.sql",
+    # История изменений задач (кто/что/из чего/когда) + снимки без дублирующего raw_json.
+    "081_task_history_and_lean_snapshots.sql",
 ]
 
 
