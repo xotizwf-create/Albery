@@ -13,13 +13,14 @@ User=root
 WorkingDirectory=/var/www/albery
 Environment=ALBERY_ROLE=mcp
 # Вызов инструмента — это почти всегда ожидание базы, Битрикса, Google или Zoom, поэтому
-# потоки, а не процессы. Пул соединений к Postgres по 10 на воркера.
+# потоки, а не процессы. Воркер один — на коробке с 2 ГБ память нужна ходам мозга,
+# см. разбор в albery-web.service.
 #
 # --preload НЕ ставить — см. разбор в albery-web.service: приложение ходит в базу на импорте,
 # пул успевает создаться в мастере и не переживает раздвоения, все запросы падают с PoolTimeout.
 ExecStart=/var/www/albery/.venv/bin/gunicorn \
-    --workers 2 \
-    --threads 4 \
+    --workers 1 \
+    --threads 8 \
     --bind 127.0.0.1:5004 \
     --timeout 620 \
     --graceful-timeout 30 \
