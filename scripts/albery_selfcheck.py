@@ -99,9 +99,21 @@ def _telegram_fallback(text: str) -> None:
         logging.error("selfcheck: telegram fallback failed: %s", exc)
 
 
+# Режим проверки самого монитора: считает всё как обычно, но НЕ шлёт людям и не трогает
+# состояние антиспама. Появился 07.08.2026: монитор, который нельзя прогнать не потревожив
+# команду, никто и не прогоняет — а молчащий монитор ничем не отличается от сломанного,
+# пока не случится авария. Теперь «поймает ли он поломку» проверяется до того, как она нужна.
+DRY_RUN = "--dry-run" in sys.argv
+
+
 def notify(text: str) -> None:
     """Алерт → Bitrix-группа «Уведомления» (chat730). Telegram — резерв на случай, когда сам
     Bitrix недоступен (его мы тоже мониторим), чтобы сообщение об этом не потерялось."""
+    if DRY_RUN:
+        print("--- ТАК ВЫГЛЯДЕЛ БЫ АЛЕРТ (dry-run, никому не отправлено) ---")
+        print(text)
+        print("--- конец алерта ---")
+        return
     bitrix_ok = False
     try:
         sys.path.insert(0, str(BASE / "scripts"))
@@ -366,8 +378,11 @@ if problems:
         text = head + "\n" + "\n".join(f"- {p}" for p in problems) + \
             "\n\nДетали: journalctl -u albery (сервер 186)."
         notify(text)
-        state["last_digest"] = digest
-        state["last_alert_ts"] = time.time()
+        if not DRY_RUN:
+            # В dry-run состояние антиспама не трогаем: проверка монитора не должна
+            # заглушить настоящий алерт, который придёт через минуту.
+            state["last_digest"] = digest
+            state["last_alert_ts"] = time.time()
         logging.warning("selfcheck: %s problem(s) reported (critical=%s)", len(problems), critical)
     else:
         logging.warning("selfcheck: %s problem(s), alert suppressed (unchanged)", len(problems))

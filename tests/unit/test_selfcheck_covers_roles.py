@@ -57,6 +57,26 @@ def test_wrong_role_is_reported():
     assert 'health.get("role")' in source, "мониторинг обязан сверять объявленную роль"
 
 
+def test_monitor_can_be_rehearsed_without_alerting_people():
+    """Монитор, который нельзя прогнать не потревожив команду, никто не прогоняет.
+
+    А молчащий монитор ничем не отличается от сломанного, пока не случится авария. Режим
+    --dry-run позволяет проверить «поймает ли он поломку» ДО того, как это понадобится.
+    """
+    source = _source()
+    assert 'DRY_RUN = "--dry-run" in sys.argv' in source
+    assert "if DRY_RUN:" in source, "notify обязан молчать в режиме проверки"
+
+
+def test_rehearsal_does_not_swallow_the_next_real_alert():
+    """В dry-run нельзя трогать антиспам-паузу: иначе проверка заглушит настоящую тревогу."""
+    source = _source()
+    assert "if not DRY_RUN:" in source, (
+        "состояние антиспама в режиме проверки обновлять нельзя — следующий НАСТОЯЩИЙ "
+        "алерт был бы подавлен как повторный"
+    )
+
+
 def test_role_ports_match_the_unit_files():
     """Порты в мониторинге и в unit-файлах разъезжаются молча — сверяем механически."""
     source = _source()
