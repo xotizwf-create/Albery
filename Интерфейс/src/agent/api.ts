@@ -115,12 +115,19 @@ const toAgent = (a: RawAgent): AgentConfig => ({
 
 // --- Subagents ---
 
+// Historic column, kept only so old rows deserialise. It no longer decides anything:
+// what an agent can do is its toolset (ToolsMode below) plus its linked instructions.
 export type AgentLevel = "faq" | "ops" | "developer";
 
-export const LEVEL_LABELS: Record<AgentLevel, string> = {
-  faq: "База знаний",
-  ops: "Все функции",
-  developer: "Разработчик",
+// Откуда берётся набор инструментов агента — это и есть настоящее «чем он отличается».
+// 'legacy' присылается для строки старше миграции 082 (режим ещё не выбран).
+export type ToolsMode = "base" | "max" | "custom" | "legacy";
+
+export const TOOLS_MODE_LABELS: Record<ToolsMode, string> = {
+  base: "базовый набор",
+  max: "максимальный набор",
+  custom: "настроенный набор",
+  legacy: "набор не выбран",
 };
 
 export interface AgentDetail {
@@ -236,6 +243,8 @@ export interface AgentConfigKnowledge {
 export interface AgentCapabilityConfig {
   slug: string;
   tier: AgentLevel;
+  tools_mode: ToolsMode;
+  base_tools: string[];
   tools_customized: boolean;
   tools: AgentConfigTool[];
   tools_total: number;
@@ -605,19 +614,16 @@ export async function fetchUsage(period: string): Promise<UsageData> {
   return (await fetchJsonSafe(`/api/agent-center/usage?${search}`, undefined, 30000)) as UsageData;
 }
 
-// --- Team access (existing /api/agent-access CRUD, shared with the Настройки tab) ---
-
-export type AccessTier = "admin" | "ops" | "faq";
-
-export const TIER_LABELS: Record<AccessTier, string> = {
-  admin: "Полный доступ",
-  ops: "Все функции",
-  faq: "Доступ к FAQ",
-};
+// --- Доступ сотрудников (/api/agent-access) ---
+//
+// У человека НЕТ уровня. Есть один вопрос: пускать его к агенту или нет. Что он сможет
+// сделать, решает набор инструментов и подключённые инструкции того агента, к которому он
+// обратился (владелец 07.08.2026). Прежние четыре уровня были обещанием без последствий:
+// с единым коннектором главного агента все допущенные получали один и тот же набор.
 
 export interface AccessMember {
   bitrix_user_id: number;
-  tier: AccessTier;
+  has_access: boolean;
   display_name: string;
 }
 
@@ -630,11 +636,13 @@ export interface BitrixUser {
 
 export async function fetchAccessMembers(): Promise<AccessMember[]> {
   const data = await fetchJsonSafe("/api/agent-access", undefined, 30000);
+  // Строка со значением "none" — единственный явный запрет; любое другое историческое
+  // значение означает, что доступ есть.
   return ((data.rows || []) as Array<{ bitrix_user_id: number; tier: string; display_name: string | null }>)
-    .filter((r) => r.tier === "admin" || r.tier === "ops" || r.tier === "faq")
+    .filter((r) => r.tier !== "none")
     .map((r) => ({
       bitrix_user_id: r.bitrix_user_id,
-      tier: r.tier as AccessTier,
+      has_access: true,
       display_name: r.display_name || `#${r.bitrix_user_id}`,
     }));
 }
@@ -644,14 +652,19 @@ export async function fetchBitrixUsers(): Promise<BitrixUser[]> {
   return (data.users || []) as BitrixUser[];
 }
 
-// Bot semantics: no row = default «faq»; an explicit "none" row is the only real deny.
-export async function upsertAccess(userId: number, tier: AccessTier | "none", displayName?: string): Promise<void> {
+// Выдать или снять доступ. Никаких уровней: "ops" здесь означает просто «доступ есть» —
+// значение сохранено для совместимости со строками, которые уже лежат в базе.
+export async function setAccess(userId: number, hasAccess: boolean, displayName?: string): Promise<void> {
   await fetchJsonSafe(
     "/api/agent-access",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ bitrix_user_id: userId, tier, display_name: displayName }),
+      body: JSON.stringify({
+        bitrix_user_id: userId,
+        access: hasAccess,
+        display_name: displayName,
+      }),
     },
     30000,
   );

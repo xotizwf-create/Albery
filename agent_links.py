@@ -94,7 +94,7 @@ def _has_access(slug: str, requester_id: Any) -> bool | None:
         if members:
             return uid in members
         # Empty member list = open to everyone not globally denied ('none').
-        return _b._b24_tier_for(uid) != "none"
+        return _b._b24_has_access(uid)
     except Exception:  # noqa: BLE001
         logging.exception("get_agent_link: access check failed slug=%s", slug)
         return None

@@ -1624,6 +1624,10 @@ def _load_agents_full() -> list[dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id::text AS id, slug, name, role_prompt, position, tier, tools, tools_customized,"
+                # tools_mode появился миграцией 082. Читаем через to_jsonb, чтобы код пережил
+                # базу, где колонки ещё нет: тогда придёт NULL и режим будет 'legacy',
+                # то есть прежнее поведение, а не молчаливое обнищание набора.
+                " (to_jsonb(agents) ->> 'tools_mode') AS tools_mode,"
                 " bitrix_bot_id, telegram_username, telegram_bot_user_id,"
                 # Канал = телеграмный, если у агента есть @username бота. Токен есть только у
                 # агентов с собственным ботом; два встроенных канала работают на общем токене
@@ -1948,15 +1952,15 @@ def agent_center_create_agent():
                     return jsonify({"error": f"Агент со slug «{slug}» уже есть — назовите иначе."}), 409
                 cur.execute("SELECT COUNT(*) AS n FROM agents")
                 color = _AGENT_COLORS[int(cur.fetchone()["n"]) % len(_AGENT_COLORS)]
-                # Новый агент стартует ЧИСТЫМ: tools_customized=TRUE с пустым списком оставляет
-                # только обязательный минимум. Раньше он получал весь пресет уровня — сотню
-                # инструментов, которыми не пользуется, и это делало настройку бессмысленной
-                # (владелец 22.07.2026). Нужные инструменты подключает владелец в кабинете или
-                # агент-разработчик через set_agent_tools.
+                # Новый агент стартует с БАЗОВЫМ набором. Раньше он получал весь пресет своего
+                # уровня — сотню инструментов, которыми не пользуется, и это делало настройку
+                # бессмысленной (владелец 22.07.2026). Нужные инструменты подключает владелец
+                # в кабинете или агент-разработчик через set_agent_tools; первое же сохранение
+                # переводит режим в 'custom'.
                 cur.execute(
                     "INSERT INTO agents (slug, name, role_prompt, position, tier, mcp_token,"
-                    " color, tools, tools_customized)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE) RETURNING id::text AS id",
+                    " color, tools, tools_customized, tools_mode)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, 'base') RETURNING id::text AS id",
                     (slug, name, role_prompt, position, tier, token, color, []),
                 )
                 agent_id = cur.fetchone()["id"]
@@ -2409,7 +2413,7 @@ def agent_center_agent_config(slug: str):
         return jsonify({"error": "Не удалось загрузить инструменты."}), 500
     pool = _agent_allowed_pool(agent)          # what this agent may hold
     enabled = _agent_tool_names(agent)          # effective set the connector serves
-    fixed = MANDATORY_AGENT_TOOLS & pool
+    fixed = BASE_AGENT_TOOLS & pool
     # The whole registry is available to the constructor; legacy tier is a preset, not a cap.
     tools = []
     for name in sorted(TOOLS):
@@ -2451,7 +2455,11 @@ def agent_center_agent_config(slug: str):
     return jsonify({
         "slug": slug,
         "tier": agent["tier"],
+        # Откуда берётся набор: это и есть настоящее «чем агент отличается от соседа».
+        # tier остаётся в ответе для совместимости, но возможностей больше не определяет.
+        "tools_mode": _agent_tools_mode(agent),
         "tools_customized": bool(agent.get("tools_customized")),
+        "base_tools": sorted(BASE_AGENT_TOOLS),
         "tools": tools,
         "tools_total": len(TOOLS),
         "instructions": instructions,
@@ -2469,7 +2477,7 @@ def agent_center_agent_config_save(slug: str):
         return jsonify({"error": "Агент не найден."}), 404
     body = request.get_json(silent=True) or {}
     pool = _agent_allowed_pool(agent)
-    fixed = MANDATORY_AGENT_TOOLS & pool
+    fixed = BASE_AGENT_TOOLS & pool
     # Tools: keep only real registry names; the mandatory baseline is always included.
     # Замыкание применяется и при сохранении, чтобы в карточке агента был виден тот же набор,
     # который реально отдаёт коннектор (иначе галочки и поведение расходятся).
@@ -2491,7 +2499,8 @@ def agent_center_agent_config_save(slug: str):
                 agent_id = row["id"]
                 # Tools stay operational config in the DB (already enforced per-connector).
                 cur.execute(
-                    "UPDATE agents SET tools = %s, tools_customized = TRUE, updated_at = now() WHERE id = %s",
+                    "UPDATE agents SET tools = %s, tools_customized = TRUE, tools_mode = 'custom',"
+                    " updated_at = now() WHERE id = %s",
                     (enabled_tools, agent_id),
                 )
         # Instruction/skill connections -> GitHub registry manifest (versioned source of
@@ -2629,11 +2638,12 @@ def _agent_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, Any]
     raise ValueError(f"Неизвестный инструмент: {name}")
 
 
-# Fixed baseline: tools EVERY agent always keeps, no matter how its tools are
-# customized — the minimum needed to read its own instructions, orient itself and
-# answer from company knowledge. Intersected with the tier set below, so a faq agent
-# never gains an ops tool through the baseline. Shown locked-on in the UI.
-MANDATORY_AGENT_TOOLS: set[str] = {
+# БАЗОВЫЙ НАБОР: инструменты, которые есть у любого агента, как бы ни настроили остальное —
+# минимум, чтобы прочитать свои инструкции, сориентироваться и ответить по базе знаний.
+# Агент без него не «ограничен», он сломан: он не может даже узнать, что ему поручено.
+# Пересекается с разрешённым пулом, поэтому у строгого клиентского агента с пустым капом
+# манифеста базовый набор не появляется. В интерфейсе показан включённым и неотключаемым.
+BASE_AGENT_TOOLS: set[str] = {
     "start_here_always_read_ai_instructions",
     "get_context_guide",
     "get_ai_instructions",
@@ -2690,9 +2700,16 @@ def _agent_allowed_pool(agent: dict[str, Any]) -> set[str]:
     return pool & cap
 
 
+TOOLS_MODES = ("base", "max", "custom")
+
+
 def _agent_preset_default(agent: dict[str, Any]) -> set[str]:
-    """Enabled set for an agent that was never customized — seeded from the legacy preset:
-    база знаний → read-only faq set, все функции → operational set, разработчик → everything."""
+    """УСТАРЕВШЕЕ: набор по колонке tier для строки старше миграции 082.
+
+    Оставлено ровно для одного случая — база, где колонка tools_mode ещё не появилась.
+    Тогда агент обязан вести себя ТОЧНО как до правки, иначе выкладка кода молча меняет
+    возможности живого агента. Как только миграция применена, эта ветка недостижима.
+    """
     from mcp.context_server import FAQ_TOOL_NAMES, OPS_TOOL_NAMES, TOOLS
     tier = agent.get("tier")
     if tier == "developer":
@@ -2702,25 +2719,51 @@ def _agent_preset_default(agent: dict[str, Any]) -> set[str]:
     return set(FAQ_TOOL_NAMES)
 
 
-def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
-    """Tools the agent's connector actually serves. Selection is from the FULL registry
-    (legacy tier is only a creation/default preset, not an access gate), intersected with
-    the registry and an optional manifest cap so stale/forbidden names disappear. The
-    mandatory baseline is forced on only inside that security cap. Default (never
-    customized) = the preset chosen at creation time.
-    This is the hard gate: tools/list over the connector returns exactly this set, so a
-    disabled tool is invisible and uncallable regardless of the prompt."""
-    pool = _agent_allowed_pool(agent)
-    fixed = MANDATORY_AGENT_TOOLS & pool
+def _agent_tools_mode(agent: dict[str, Any]) -> str:
+    """Откуда берётся набор агента: 'base', 'max', 'custom' или 'legacy'.
+
+    'legacy' — строка старше миграции 082: режим ещё не проставлен, и единственное
+    безопасное поведение — считать набор по-старому (см. _agent_preset_default).
+    """
+    mode = str(agent.get("tools_mode") or "").strip().lower()
+    if mode in TOOLS_MODES:
+        return mode
     if agent.get("tools_customized"):
+        return "custom"
+    return "legacy"
+
+
+def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
+    """Инструменты, которые коннектор агента реально отдаёт. Это ЖЁСТКИЙ гейт: tools/list
+    возвращает ровно этот набор, поэтому отключённый инструмент невидим и невызываем — что
+    бы ни было написано в промпте и что бы ни попросил собеседник.
+
+    Набор определяется РЕЖИМОМ агента, а не уровнем доступа человека и не колонкой tier:
+      base   — только базовый набор;
+      max    — весь разрешённый пул, включая инструменты, добавленные в реестр завтра;
+      custom — явный список владельца плюс базовый набор.
+
+    Поверх режима действует кап манифеста — верхняя граница, которую нельзя расширить.
+    Внутри капа базовый набор НЕ навязывается: строгий клиентский агент обязан оставаться
+    с нулём инструментов, иначе недоверенный текст клиента получил бы доступ к базе знаний.
+    """
+    pool = _agent_allowed_pool(agent)
+    capped = _agent_manifest_tool_cap(agent) is not None
+    base = BASE_AGENT_TOOLS & pool
+    mode = _agent_tools_mode(agent)
+
+    if mode == "max":
+        return set(pool)
+    if mode == "base":
+        return set() if capped else base
+    if mode == "custom":
         whitelist = _with_companion_tools({t for t in (agent.get("tools") or []) if t})
-        if _agent_manifest_tool_cap(agent) is not None:
+        if capped:
             return whitelist & pool
-        return fixed | (whitelist & pool)
+        return base | (whitelist & pool)
+
     preset = _agent_preset_default(agent) & pool
-    if _agent_manifest_tool_cap(agent) is not None:
-        return preset
-    return preset | fixed
+    return preset if capped else preset | base
 
 
 def _mcp_agent_auth(slug: str, path_token: str | None) -> dict[str, Any] | None:

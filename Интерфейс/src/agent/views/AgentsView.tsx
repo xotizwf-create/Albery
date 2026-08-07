@@ -14,16 +14,13 @@ import {
 } from "lucide-react";
 import {
   AccessMember,
-  AccessTier,
   AgentCapabilityConfig,
   AgentConfigKnowledge,
   AgentConfigTool,
   AgentDetail,
   AgentLevel,
   BitrixUser,
-  LEVEL_LABELS,
   McpTool,
-  TIER_LABELS,
   TelegramAccessAgent,
   TelegramAccessUser,
   createTelegramAgent,
@@ -35,6 +32,7 @@ import {
   deleteAgentInstruction,
   promoteAgentInstruction,
   fetchAccessMembers,
+  TOOLS_MODE_LABELS,
   fetchAgentConfig,
   fetchAgentDetail,
   fetchAgents,
@@ -45,7 +43,6 @@ import {
   saveAgentConfig,
   setInstructionScope,
   updateAgent,
-  upsertAccess,
 } from "../api";
 import { AgentConfig, KnowledgeItem } from "../types";
 import { agentSubSegments, setAgentPath } from "../route";
@@ -369,8 +366,12 @@ const AgentCapabilityPanel: React.FC<{ slug: string; version: number }> = ({ slu
         <div>
           <h3 className="text-[15px] font-bold text-gray-900">Возможности агента</h3>
           <p className="text-[12.5px] font-medium text-gray-500 mt-0.5">
-            Что агент видит и чем может пользоваться. Отключённое недоступно ему физически. Уровень:{" "}
-            {LEVEL_LABELS[config.tier]}.
+            Что агент видит и чем может пользоваться. Отключённое недоступно ему физически.{" "}
+            Сейчас у него {TOOLS_MODE_LABELS[config.tools_mode] ?? "настроенный набор"}
+            {config.tools_mode === "max"
+              ? " — весь реестр, новые инструменты подключаются сами"
+              : ` — ${config.tools.filter((t) => t.enabled).length} из ${config.tools_total}`}
+            .
           </p>
         </div>
         <div className="flex items-center gap-3">

@@ -148,14 +148,29 @@ def agent_access_bitrix_users():
 
 @app.post("/api/agent-access")
 def agent_access_upsert():
+    """Выдать или снять доступ сотруднику. Уровней нет — только «пускать / не пускать».
+
+    Принимает новое поле `access` (true/false). Старое `tier` продолжает приниматься, чтобы
+    не сломать вызовы, ушедшие раньше выкладки нового интерфейса: любое значение кроме
+    'none' означает «доступ есть». В базу пишем 'ops' как «есть» — историческое значение,
+    на поведение оно уже не влияет, а менять хранимые строки без нужды опаснее, чем оставить.
+    """
     body = request.get_json(silent=True) or {}
     uid = to_int(body.get("bitrix_user_id"))
-    tier = str(body.get("tier") or "").strip().lower()
     name = (str(body.get("display_name")).strip() or None) if body.get("display_name") else None
     if not uid or uid < 1:
         return jsonify({"error": "Укажите корректный Bitrix user ID."}), 400
-    if tier not in ("none", "admin", "ops", "faq"):
-        return jsonify({"error": "Уровень должен быть none, faq, ops или admin."}), 400
+
+    if "access" in body:
+        if not isinstance(body.get("access"), bool):
+            return jsonify({"error": "Поле access должно быть true или false."}), 400
+        tier = "ops" if body["access"] else "none"
+    else:
+        legacy = str(body.get("tier") or "").strip().lower()
+        if legacy not in ("none", "admin", "ops", "faq"):
+            return jsonify({"error": "Передайте access: true или false."}), 400
+        tier = "none" if legacy == "none" else "ops"
+
     try:
         _agent_access_set(uid, tier, name)
     except Exception:  # noqa: BLE001
@@ -1422,15 +1437,27 @@ def _agent_access_remove(bitrix_user_id: int) -> None:
     _agent_access_map(force=True)
 
 
-def _b24_tier_for(from_user_id: Any) -> str:
-    """Access tier from the Bitrix-trusted sender id (cannot be spoofed in chat):
-    'admin' = full incl. instruction/settings edits + deletes; 'ops' = full operational access
-    minus the admin tools; 'faq' = knowledge base; 'none' = no access (the bot does not respond).
-    The agent_access table (managed from the "Настройки Агента" tab) decides; a user with no row
-    defaults to 'faq' (knowledge base). 'none' is an explicit stored deny. No id is hard-pinned —
-    every level, including the owner's, is editable from the UI."""
-    tier = _agent_access_map().get(to_int(from_user_id))
-    return tier if tier in ("admin", "ops", "faq", "none") else "faq"
+def _b24_has_access(from_user_id: Any) -> bool:
+    """Есть ли у человека доступ к агенту. Отвечает на ОДИН вопрос — пускать или нет.
+
+    Что человек сможет сделать, решает НЕ он, а набор инструментов и инструкций того агента,
+    к которому он обратился (владелец 07.08.2026). Раньше здесь был уровень из четырёх
+    значений, и он же выбирал набор — но с включённым UNIVERSAL_MAIN_AGENT все допущенные
+    сотрудники всё равно ходили через один коннектор agent-main и получали его набор
+    целиком. То есть интерфейс обещал три разных уровня, а по факту был один: расхождение
+    между обещанием и поведением, а не работающее ограничение.
+
+    Строка в agent_access со значением 'none' — единственный явный запрет; любое другое
+    значение (включая исторические 'admin'/'ops'/'faq') означает «доступ есть». Отсутствие
+    строки трактуется как доступ: так было и раньше, а вход к главному агенту дополнительно
+    закрыт явным списком команды (_b24_main_allows).
+    """
+    return _agent_access_map().get(to_int(from_user_id)) != "none"
+
+
+def _b24_access_label(from_user_id: Any) -> str:
+    """Пометка доступа для журнала обращений. Только запись, на поведение не влияет."""
+    return "ok" if _b24_has_access(from_user_id) else "none"
 
 
 def _b24_main_allows(from_user_id: Any) -> bool:
@@ -3317,39 +3344,74 @@ def _turn_outcome_get() -> tuple:
     return getattr(_TURN_OUTCOME, "status", "ok"), getattr(_TURN_OUTCOME, "error", None)
 
 
-def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_user_id: Any = "",
+def _acting_agent_tools(agent: dict[str, Any] | None) -> set[str]:
+    """Набор инструментов агента, который сейчас отвечает. Пустое множество = «неизвестно».
+
+    Нужен, чтобы подсказки в промпте зависели от того, что у агента РЕАЛЬНО есть, а не от
+    уровня доступа собеседника. Пустой ответ трактуется вызывающим как «не знаем» и ничего
+    не отключает: подсказка лишней быть не может, а вот молча пропавшая — может (агент
+    начинает просить у человека то, что умеет достать сам).
+    """
+    try:
+        from agent_center import _agent_by_slug, _agent_tool_names, MAIN_AGENT_SLUG
+        target = agent if agent is not None else _agent_by_slug(MAIN_AGENT_SLUG)
+        if not target:
+            return set()
+        return set(_agent_tool_names(target))
+    except Exception:  # noqa: BLE001 — подсказки в промпте не повод уронить ход
+        logging.debug("b24: не удалось прочитать набор агента для промпта", exc_info=True)
+        return set()
+
+
+def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "", from_user_id: Any = "",
                         agent: dict[str, Any] | None = None) -> str | None:
-    """Run one turn through the local Hermes brain. Toolset is chosen by access tier:
-    admin → full MCP `albery` (incl. instruction/settings edits + deletes); ops → `albery-ops`
-    (operational, no admin tools); everyone else → read-only `albery-faq`. A subagent turn
-    (`agent` profile from agent_center) uses the agent's OWN connector `agent-<slug>` —
-    its tier toolset plus personal self-learning tools, scoped to that agent only.
-    Session lifecycle (idle reset + cap rotation + carried summary) is handled by
-    _b24_session_prepare. All session/history keying is scoped to this agent (agent_slug)."""
+    """Один ход мозга.
+
+    Набор инструментов определяет АГЕНТ, а не уровень доступа собеседника: ход всегда идёт
+    на личном коннекторе агента `agent-<slug>`, который отдаёт ровно его набор. Для главного
+    бота агент — строка `main`. Раньше здесь выбирался один из трёх общих коннекторов по
+    уровню человека; с включённым UNIVERSAL_MAIN_AGENT этот выбор всё равно не применялся,
+    и уровень оставался обещанием без последствий (владелец 07.08.2026).
+
+    `tier` больше ни на что не влияет и принимается только для журнала обращений.
+
+    Аварийный путь. Если коннектор главного агента не готов (строки нет, выключен, нет в
+    конфиге Hermes), ход идёт на общий операционный коннектор — ОДИН, а не три по уровню.
+    Это сознательный компромисс: остаться без ответа хуже, чем ответить на прежнем контуре,
+    а событие видно в журнале.
+
+    Жизненный цикл сессии (сброс по простою, ротация по лимиту ходов, перенос выжимки) —
+    в _b24_session_prepare; вся история и сессии скоупятся slug'ом агента.
+    """
     agent_slug = (agent or {}).get("slug")
     _turn_outcome_reset()
     session, seed = _b24_session_prepare(dialog_id, agent_slug)
-    toolset = {"admin": "albery", "ops": "albery-ops"}.get(tier, "albery-faq")
-    core_toolset = tier in ("admin", "ops") and os.getenv("B24_CORE_TOOLSET", "").strip() == "1"
-    if core_toolset:
-        # Two-stage tools: the bot registers a curated core + find_tool/call_tool (fast turns,
-        # small context); the full connectors stay untouched for cron agents.
-        toolset = {"admin": "albery-core", "ops": "albery-ops-core"}[tier]
-    # Universal (main) agent: when enabled, the main bot runs on ONE configurable набор
-    # (its own /mcp-agent/main connector) for everyone allowed, instead of per-user tiers —
-    # capped at ops (no admin). Guarded + falls back to the classic connectors if not ready.
-    if agent is None:
+    core_toolset = False
+    if agent is not None:
+        toolset = f"agent-{agent['slug']}"
+    else:
         try:
             from agent_center import universal_main_connector
             universal = universal_main_connector()
         except Exception:  # noqa: BLE001
             universal = None
         if universal:
-            tier = "ops"
-            core_toolset = False
             toolset = universal
-    if agent is not None:
-        toolset = f"agent-{agent['slug']}"
+        else:
+            # Коннектор главного агента недоступен — это авария, а не штатный режим.
+            toolset = "albery-ops"
+            core_toolset = os.getenv("B24_CORE_TOOLSET", "").strip() == "1"
+            if core_toolset:
+                toolset = "albery-ops-core"
+            logging.warning(
+                "b24: коннектор главного агента недоступен, ход идёт на запасной %s "
+                "(dialog_id=%s user=%s)", toolset, dialog_id, from_user_id,
+            )
+    acting_tools = _acting_agent_tools(agent)
+
+    def _has_tool(name: str) -> bool:
+        """Есть ли инструмент у отвечающего агента. Набор неизвестен → считаем, что есть."""
+        return not acting_tools or name in acting_tools
     timeout_s = int(os.getenv("B24_TESTBOT_HERMES_TIMEOUT", "170"))
     fmt = (
         " СТИЛЬ И ФОРМАТ ОТВЕТА (важно): пиши КРАТКО и по делу, но КРАСИВО и удобно для чтения — "
@@ -3414,27 +3476,19 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
                 + "». ТВОЯ РОЛЬ: " + role + " Работай СТРОГО в рамках своей роли: по вопросам вне её "
                 "вежливо скажи, что этим занимается Основной агент Албери, и не пытайся выполнить сам. "
                 "Отвечай по-русски." + access_rule + fmt + "]")
-    elif tier == "admin":
-        head = ("[Канал: Битрикс24. Уровень доступа пользователя: ПОЛНЫЙ — доступны все инструменты, "
-                "включая изменение настроек/инструкций. Любое изменение данных сначала подтверждай. "
-                "Отвечай по-русски." + access_rule + fmt + "]")
-    elif tier == "ops":
-        head = ("[Канал: Битрикс24. Уровень доступа пользователя: ВСЕ ФУНКЦИИ — можешь искать/ставить/"
-                "закрывать задачи, готовить отчёты, писать сотрудникам, а также СОЗДАВАТЬ и "
-                "РЕДАКТИРОВАТЬ Google-таблицы и Google-документы (вносить данные, формулы, оформление, "
-                "автоматизацию — используй инструменты и навык работы с Google Sheets через Google "
-                "Sheets/Apps Script API). Любое изменение данных сначала подтверждай. Недоступно "
-                "только изменение собственных настроек/инструкций. Отвечай по-русски."
+    else:
+        # Главный агент. Возможности НЕ описываются словами про «уровень доступа» — их задаёт
+        # набор инструментов, который агенту выдан. Прежний текст обещал собеседнику «ПОЛНЫЙ»
+        # или «ВСЕ ФУНКЦИИ» по его уровню, хотя набор у всех был один и тот же: агент то
+        # обещал лишнее, то отказывал в том, что умеет.
+        head = ("[Канал: Битрикс24. Ты — основной агент компании «Албери». ТВОИ ВОЗМОЖНОСТИ "
+                "РАВНЫ ТВОЕМУ НАБОРУ ИНСТРУМЕНТОВ: что есть в наборе — делай, чего в нём нет — "
+                "честно скажи, что этого не умеешь, и не предлагай обходных путей вместо ответа. "
+                "Любое изменение данных сначала подтверждай. Отвечай по-русски."
                 + access_rule + fmt + "]")
-    else:  # faq
-        head = ("[Канал: Битрикс24. Уровень доступа пользователя: СПРАВКА (только знания и чтение). "
-                "Тебе доступно: отвечать на вопросы по компании, регламентам, оргструктуре, базе знаний, "
-                "разбирать Zoom-созвоны. Тебе НЕдоступны любые ДЕЙСТВИЯ: редактировать Google-таблицы, "
-                "ставить/закрывать задачи, отправлять сообщения, что-либо менять в системах. "
-                "Отвечай по-русски." + access_rule + fmt + "]")
     parts = [head]
-    # Who is asking — available to EVERY tier/agent (the detailed ops/admin block below adds
-    # task-authoring hints on top). get_agent_link needs this id to check the asker's access.
+    # Кто спрашивает — нужно ЛЮБОМУ агенту: get_agent_link проверяет по этому id доступ
+    # спрашивающего, а блок постановщика задач ниже подставляет его автором.
     if str(from_user_id).strip():
         parts.append(
             "ТЕКУЩИЙ СОБЕСЕДНИК (кто пишет тебе сейчас): " + _b24_requester_name(from_user_id)
@@ -3546,7 +3600,10 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
             "'delete task', 'zoom report', 'drive folder'), возьми из результата точное имя и "
             "схему аргументов и выполни действие через call_tool(name=..., arguments={...})."
         )
-    if tier in ("admin", "ops"):
+    # Подсказка про собственную память нужна тому, кто РЕАЛЬНО умеет её поднять.
+    # Раньше условием был уровень собеседника, из-за чего профильный агент с этими
+    # инструментами в наборе всё равно просил человека «прислать ещё раз».
+    if _has_tool("get_bitrix_bot_chat"):
         parts.append(
             "ПАМЯТЬ И КОНТЕКСТ (важно). Это диалог Битрикса dialog_id=`" + str(dialog_id) + "`. У тебя "
             "ЕСТЬ полный доступ ко всей твоей прошлой работе в ЭТОМ диалоге, включая ПРОШЛЫЕ и уже "
@@ -3565,7 +3622,7 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
         )
     # Document + forwarded-message recall — applies to EVERY agent (incl. tier=faq юрист), so the
     # agent can always reach earlier context, including Word/PDF sent in a past/reset session.
-    if agent is not None or tier in ("admin", "ops"):
+    if _has_tool("get_attachment_text") or _has_tool("get_bitrix_bot_chat"):
         parts.append(
             "ПАМЯТЬ О ДОКУМЕНТАХ И ПЕРЕСЛАННЫХ СООБЩЕНИЯХ (важно). Это диалог dialog_id=`"
             + str(dialog_id) + "`. Ты можешь поднять ВСЁ, что было в этом диалоге раньше — включая "
@@ -3579,7 +3636,7 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "faq", from_
             "его сразу; если он только процитирован/переслан — подними его из истории по attachment_id. "
             "НИКОГДА не проси прислать заново то, что уже было в этом диалоге."
         )
-    if tier in ("ops", "admin") and str(from_user_id).strip():
+    if _has_tool("create_bitrix_task") and str(from_user_id).strip():
         parts.append(
             "ПОСТАНОВЩИК ЗАДАЧ (важно): по умолчанию постановщик создаваемой задачи — "
             "ТЕКУЩИЙ собеседник, его Bitrix id=" + str(from_user_id) + ". При вызове "
@@ -3932,7 +3989,8 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
                      user_text: str, message_id: Any = "", from_user_id: Any = "",
                      agent: dict[str, Any] | None = None) -> None:
     started = time.monotonic()
-    tier = str(agent["tier"]) if agent is not None else _b24_tier_for(from_user_id)
+    # Только для журнала обращений: на выбор набора и на поведение не влияет.
+    tier = str(agent.get("slug") or "") if agent is not None else _b24_access_label(from_user_id)
     status, error = "ok", None
     # Live progress: one status message edited in place while the brain works, plus the native
     # 'typing…' indicator (it fades after ~30s on its own and the bot would look frozen).
@@ -4662,7 +4720,8 @@ def _b24_handle_task_comment_event(task_id: int, comment_id: int) -> dict[str, A
             agent = agent_for_bot_id(target["bot_id"])
         except Exception:  # noqa: BLE001
             logging.warning("b24 task-mention: agent resolve failed slug=%s", target["slug"], exc_info=True)
-    tier = "ops" if target["is_main"] else str((agent or {}).get("tier") or "faq")
+    # Только для журнала обращений (см. выше).
+    tier = "main" if target["is_main"] else str((agent or {}).get("slug") or "")
 
     ctx = _b24_task_context_text(task_id)
     requester = _b24_portal_user_directory().get(to_int(author_id), {}).get("name") or f"id {author_id}"
@@ -4745,7 +4804,7 @@ def _b24_task_subagent_allows(slug: str | None, author_id: Any) -> bool:
         return False
     if members:
         return to_int(author_id) in members
-    return _b24_tier_for(author_id) != "none"
+    return _b24_has_access(author_id)
 
 
 def _bitrix_imbot_app_event():
@@ -4836,7 +4895,7 @@ def _bitrix_imbot_app_event():
         uid = to_int(user_id)
         if members:
             return uid in members
-        return _b24_tier_for(user_id) != "none"
+        return _b24_has_access(user_id)
 
     # Self-heal: ensure the /new command is registered (background, one-time, no-op after) for the
     # addressed bot, AND once per process for EVERY bot (main + subagents) so subagent buttons are
@@ -4902,10 +4961,10 @@ def _bitrix_imbot_app_event():
             _b24_start_error_report(endpoint, access_token, bot_id, cmd_dialog, message_id)
         elif cmd_dialog and command in ("help", "обучение", "onboarding", "помощь"):
             _b24_send_onboarding(endpoint, access_token, bot_id, cmd_dialog, 1,
-                                 _b24_tier_for(cmd_user), message_id)
+                                 _b24_access_label(cmd_user), message_id)
         elif cmd_dialog and command == "onb_next":
             _b24_send_onboarding(endpoint, access_token, bot_id, cmd_dialog,
-                                 _b24_onboarding_step(bot_id, cmd_dialog) + 1, _b24_tier_for(cmd_user), message_id)
+                                 _b24_onboarding_step(bot_id, cmd_dialog) + 1, _b24_access_label(cmd_user), message_id)
         elif cmd_dialog and command in ("new", "reset", "новая", "сброс"):
             _b24_do_reset(endpoint, access_token, bot_id, cmd_dialog, message_id,
                           agent_slug=(agent or {}).get("slug"))

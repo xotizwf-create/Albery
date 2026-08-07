@@ -136,6 +136,12 @@ ALWAYS_APPLY_MIGRATIONS = [
     "080_disable_automatic_stage_transitions.sql",
     # История изменений задач (кто/что/из чего/когда) + снимки без дублирующего raw_json.
     "081_task_history_and_lean_snapshots.sql",
+    # Режим набора инструментов агента вместо пресета по колонке tier. Идемпотентно:
+    # ADD COLUMN IF NOT EXISTS, бэкфилл только строк, где режим ещё не выбран, и
+    # array_remove у главного агента, который на вычищенном списке ничего не делает.
+    # ВАЖНО: перед первым применением на живой базе выполняется
+    # scripts/materialize_agent_toolsets.py — иначе агент, ехавший на пресете, обеднеет.
+    "082_agent_tools_mode.sql",
 ]
 
 
