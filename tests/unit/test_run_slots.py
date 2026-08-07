@@ -193,6 +193,50 @@ def test_pool_limit_comes_from_one_env_var(monkeypatch):
     assert build_default().limit == 5
 
 
+# Замерено на проде 07.08.2026: живой ход обработки зум-созвона занял 396 МБ.
+# Раньше в расчётах фигурировали 250 МБ — заниженная цифра, из-за неё лимит стоял 3.
+HEAVY_TURN_MB = 396
+FREE_MEMORY_MB = 890  # свободно на коробке 2 ГБ при спокойной работе всех служб
+
+
+def test_default_limit_fits_the_memory_budget(monkeypatch):
+    """Лимит по умолчанию обязан помещаться в память коробки по ТЯЖЁЛОМУ ходу.
+
+    Считать по среднему нельзя: именно так лимит и оказался равен 3 при потребности
+    1188 МБ на 890 МБ свободных. Убийств по памяти не случилось только потому, что
+    нагрузка редкая (пик 10 ходов в час) и три одновременных ни разу не совпали —
+    это везение, а не запас.
+    """
+    monkeypatch.setattr(run_slots_module, "_default", None)
+    monkeypatch.delenv("B24_HERMES_MAX_CONCURRENCY", raising=False)
+    limit = build_default().limit
+
+    assert limit * HEAVY_TURN_MB <= FREE_MEMORY_MB, (
+        f"лимит {limit} × {HEAVY_TURN_MB} МБ = {limit * HEAVY_TURN_MB} МБ при "
+        f"{FREE_MEMORY_MB} МБ свободных — коробка уйдёт в своп. Поднимать лимит можно "
+        "только вместе с памятью или после замера, что ходы стали легче."
+    )
+    assert limit >= 2, "меньше двух — очередь из одного человека, это уже деградация"
+
+
+def test_both_places_declare_the_same_default():
+    """b24bot и пул обязаны иметь ОДНО умолчание.
+
+    Разъедутся — и лимит будет зависеть от того, чей код спросили первым, а заметить это
+    можно будет только по свопу под нагрузкой.
+    """
+    import re
+    from pathlib import Path
+
+    defaults = set()
+    for name in ("b24bot.py", "shared/run_slots.py"):
+        source = Path(name).read_text(encoding="utf-8")
+        found = re.findall(r'B24_HERMES_MAX_CONCURRENCY",\s*"(\d+)"', source)
+        assert found, f"{name}: умолчание лимита не найдено"
+        defaults.update(found)
+    assert len(defaults) == 1, f"умолчания разъехались: {defaults}"
+
+
 # --- контекстный менеджер ---------------------------------------------------
 
 

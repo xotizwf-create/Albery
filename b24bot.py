@@ -3055,7 +3055,10 @@ def _b24_recent_history(dialog_id: str, limit: int = 6,
 # --- Brain-run guard rails: concurrency cap, one retry, owner alerts ------------------------
 # Each turn spawns a separate `hermes` CLI process (~250MB) on a 2GB box, so an unbounded burst
 # of simultaneous users would swap/OOM the whole server.
-_HERMES_MAX_CONCURRENCY = max(1, int(os.getenv("B24_HERMES_MAX_CONCURRENCY", "3")))
+# Умолчание 2 (было 3 до 07.08.2026): замер на проде показал, что тяжёлый ход мозга занимает
+# до 396 МБ, а не 250. Три таких хода = 1188 МБ при ~890 МБ свободных. Полный расчёт бюджета —
+# в shared/run_slots.build_default(). Значение обязано совпадать с умолчанием там.
+_HERMES_MAX_CONCURRENCY = max(1, int(os.getenv("B24_HERMES_MAX_CONCURRENCY", "2")))
 _HERMES_QUEUE_WAIT_S = int(os.getenv("B24_HERMES_QUEUE_WAIT_S", "180"))
 # Ограничитель ОБЩИЙ для всех процессов приложения (advisory-локи PostgreSQL), а не счётчик
 # в памяти. До 06.08.2026 здесь стоял threading.BoundedSemaphore — он ограничивает только
