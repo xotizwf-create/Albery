@@ -100,6 +100,27 @@ def test_worker_timeout_outlives_the_proxy_timeout():
         )
 
 
+@pytest.mark.parametrize("unit_name", ["deploy/albery-web.service", "deploy/albery-mcp.service"])
+def test_units_never_use_preload(unit_name):
+    """--preload положил Центр Агента 07.08.2026 — этот тест не даёт вернуть его случайно.
+
+    Приложение обращается к базе уже НА ИМПОРТЕ (ensure_builtin_telegram_agents и другие),
+    поэтому с --preload пул psycopg успевает создаться в мастере ДО раздвоения на воркеров.
+    Пул раздвоения не переживает: воркеры получают пул, ссылающийся на чужие соединения, и
+    КАЖДЫЙ запрос падает через 30 секунд с PoolTimeout.
+
+    Коварство в том, что служба при этом выглядит живой: порт слушает, /login отдаёт 200,
+    /mcp отдаёт 401 — эти два адреса до базы не доходят. Поэтому мало запретить флаг, надо
+    ещё и проверять после выкладки адрес, который РЕАЛЬНО читает базу (см. scripts/deploy_smoke.py).
+    """
+    unit = Path(unit_name).read_text(encoding="utf-8")
+    exec_start = unit.split("ExecStart=", 1)[1].split("\nRestart", 1)[0]
+    assert "--preload" not in exec_start, (
+        f"{unit_name}: --preload ломает пул соединений при раздвоении воркеров "
+        "(PoolTimeout на каждом запросе, служба при этом выглядит живой)"
+    )
+
+
 @pytest.mark.parametrize("unit_name, expected_role", [
     ("deploy/albery-web.service", "web"),
     ("deploy/albery-mcp.service", "mcp"),

@@ -19108,6 +19108,7 @@ import agent_center  # noqa: E402,F401
 import wb_cabinet  # noqa: E402,F401  — WB-кабинет: /api/wb-cab/*
 import funnel_view  # noqa: E402,F401  — воронка ИУ в кабинете: /api/agent-center/funnel/*
 import iu_form_link  # noqa: E402,F401  — персональная ссылка на анкету ИУ: /iu/<токен>
+import healthz  # noqa: E402,F401  — /healthz: проверка, что процесс ДОХОДИТ до базы
 
 
 if __name__ == "__main__":
