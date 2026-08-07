@@ -60,7 +60,19 @@ def main() -> int:
     import psycopg
     from psycopg.rows import dict_row
 
+    # Порядок импорта здесь ЗНАЧИМ, и это не стиль. mcp.context_server замораживает
+    # OPS_TOOL_NAMES в момент своего импорта, а write_company_sheet регистрируется в реестре
+    # позже — при импорте agent_center. Импортируешь agent_center первым — снимок ops
+    # получается на один инструмент шире (135 вместо 134), и материализация записала бы
+    # агенту возможность, которой у него сейчас нет. Живая служба инструментов импортирует
+    # именно в этом порядке, поэтому здесь он повторяется буквально.
+    import mcp.context_server as _cs  # noqa: F401,PLC0415 — импорт ради порядка, см. выше
+
     from agent_center import _agent_tool_names  # noqa: PLC2701 — внутренний резолвер и есть истина
+
+    print(f"Реестр инструментов: {len(_cs.TOOLS)}, операционный пресет: {len(_cs.OPS_TOOL_NAMES)}.")
+    print("Ожидается 159 и 134 — как отдаёт живая служба. Другие числа означают, что порядок")
+    print("импорта разъехался: остановитесь и разберитесь, не записывая ничего.\n")
 
     with psycopg.connect(database_url(), row_factory=dict_row) as conn:
         with conn.cursor() as cur:
