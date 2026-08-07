@@ -10,7 +10,10 @@ Signals:
 - available RAM below 150 MB (the box has 2 GB and has been OOM-killed before);
 - батч-синк run_daily_sync: последний run_finished старше 2 часов или упал;
 - systemd failed units и заполнение диска / от 85% (>=92% — КРИТИЧНО, без анти-спам-паузы);
-- КРИТИЧНО: критичные сервисы не active (albery, albery-tg, hermes-gateway, nginx, postgresql);
+- КРИТИЧНО: критичные сервисы не active (albery, albery-tg, albery-web, albery-mcp,
+  hermes-gateway, nginx, postgresql);
+- КРИТИЧНО: роль web или mcp не отвечает на /healthz либо не видит базу (проверка идёт через
+  реальное соединение с БД, а не через «слушает ли порт» — см. разбор простоя 07.08.2026);
 - КРИТИЧНО: PostgreSQL не отвечает на SELECT 1;
 - MCP-серверы gateway, которые не подключаются (agent-*);
 - внешний доступ (раз в час): Bitrix OAuth, Google OAuth (Drive/Sheets), Zoom OAuth;
@@ -28,6 +31,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -41,7 +45,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 STATE_PATH = Path("/var/log/albery/selfcheck_state.json")
 SYNC_LOG = Path(os.getenv("ALBERY_DAILY_SYNC_LOG", "/var/log/albery/daily-sync.log"))
 HERMES = "/usr/local/bin/hermes" if Path("/usr/local/bin/hermes").exists() else "hermes"
-CRITICAL_SERVICES = ["albery", "albery-tg", "hermes-gateway", "nginx", "postgresql"]
+CRITICAL_SERVICES = ["albery", "albery-tg", "albery-web", "albery-mcp",
+                     "hermes-gateway", "nginx", "postgresql"]
+
+# Роли, разделённые 07.08.2026, и их порты. Проверяются НЕ на «слушает ли порт», а на
+# /healthz — он реально берёт соединение с базой. Именно эта разница стоила простоя Центра
+# Агента: службы поднялись, порт отвечал, /login отдавал 200, а пул соединений был сломан
+# (gunicorn --preload создавал его до раздвоения процесса), и всё легло на первом же
+# обращении к данным. «Процесс жив» и «процесс умеет работать» — разные вещи.
+ROLE_ENDPOINTS = {"web": 5003, "mcp": 5004}
+HEALTHZ_TIMEOUT_S = 20
 EXTERNAL_CHECK_EVERY_S = 3600  # внешние доступы (Google/Zoom/Bitrix) — раз в час, чтобы не ловить лимиты
 
 
@@ -188,6 +201,29 @@ inactive = [s for s in CRITICAL_SERVICES if not is_active(s)]
 if inactive:
     problems.append(f"КРИТИЧНО: сервисы не работают: {', '.join(inactive)}")
     critical = True
+
+# --- Роли реально доходят до базы --------------------------------------------------------
+# Проверяем не «слушает ли порт», а /healthz: он берёт соединение из пула и выполняет запрос.
+# Служба со сломанным пулом слушает порт и отдаёт 200 на страницах, не требующих данных —
+# снаружи выглядит здоровой, а любая работа с данными падает через 30 секунд (07.08.2026).
+for role_name, role_port in ROLE_ENDPOINTS.items():
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{role_port}/healthz", timeout=HEALTHZ_TIMEOUT_S
+        ) as response:
+            health = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"КРИТИЧНО: роль {role_name} не отвечает на /healthz ({type(exc).__name__})")
+        critical = True
+        continue
+    if health.get("database") != "ok":
+        problems.append(f"КРИТИЧНО: роль {role_name} не видит базу (/healthz: {health.get('database')})")
+        critical = True
+    elif health.get("role") != role_name:
+        # Неверная роль = второй комплект фоновых расписаний = двойные уведомления людям.
+        problems.append(
+            f"роль на порту {role_port} объявлена как {health.get('role')!r}, ожидалась {role_name!r}"
+        )
 
 # --- PostgreSQL принимает подключения ----------------------------------------------------
 pg_answer = sh(["sudo", "-u", "postgres", "psql", "albery", "-tAc", "SELECT 1"]).strip()
