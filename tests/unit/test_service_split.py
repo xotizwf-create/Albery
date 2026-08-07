@@ -100,6 +100,28 @@ def test_worker_timeout_outlives_the_proxy_timeout():
         )
 
 
+def test_healthz_is_reachable_without_login(app_module):
+    """Проверка живости обязана работать из скрипта, иначе её просто не будут делать.
+
+    07.08.2026 /healthz увело на страницу входа, и проверка получила 200 со страницей логина —
+    то есть «здорово» там, где база была недоступна. Адрес наружу отдаёт только «база отвечает»
+    и роль процесса.
+    """
+    assert app_module.auth_exempt_path("/healthz") is True
+
+
+def test_healthz_actually_touches_the_database():
+    """Смысл адреса — дойти до базы. Проверка без обращения к ней ничего не доказывает.
+
+    Именно на этом и погорела выкладка: /login отдавал 200, /mcp отдавал 401, а пул соединений
+    был сломан — оба адреса до базы не доходят.
+    """
+    source = Path("healthz.py").read_text(encoding="utf-8")
+    assert "pg_connect()" in source, "healthz обязан брать соединение с базой"
+    assert "SELECT 1" in source, "healthz обязан выполнить запрос, а не только открыть соединение"
+    assert "503" in source, "недоступная база обязана давать 503, а не 200"
+
+
 @pytest.mark.parametrize("unit_name", ["deploy/albery-web.service", "deploy/albery-mcp.service"])
 def test_units_never_use_preload(unit_name):
     """--preload положил Центр Агента 07.08.2026 — этот тест не даёт вернуть его случайно.

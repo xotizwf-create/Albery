@@ -29,11 +29,26 @@ SLOW_SECONDS = 5.0          # здоровый /healthz укладывается
 CONCURRENT_PROBES = 8       # больше, чем потоков у одного воркера
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Не ходить за редиректом.
+
+    urllib по умолчанию идёт по 302 и отдаёт 200 со страницей входа — проверка тогда видит
+    «200, всё хорошо» там, где на деле адрес перехвачен авторизацией. Редирект здесь сам по
+    себе провал, и он должен быть виден как редирект.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102, ARG002
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _get(port: int, path: str, timeout: float = 40.0) -> tuple[int, str, float]:
     started = time.monotonic()
     request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             return response.status, response.read().decode("utf-8", "replace"), time.monotonic() - started
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8", "replace"), time.monotonic() - started
@@ -54,7 +69,19 @@ def main() -> int:
             print(f"           {body[:200]}")
             continue
 
-        payload = json.loads(body)
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            # 200 с HTML вместо JSON — это перехват сторонним обработчиком, например уводом
+            # на страницу входа. Проверка обязана назвать это провалом, а не упасть сама:
+            # упавшая проверка на глаз неотличима от «всё хорошо» (07.08.2026).
+            failures.append(
+                f"{role}: /healthz отдал не JSON — вероятно, перехвачен авторизацией или SPA. "
+                f"Первые 120 символов: {body[:120]!r}"
+            )
+            print(f"  [ПРОВАЛ] /healthz вернул не JSON: {body[:120]!r}")
+            continue
+
         print(f"  [OK  ] /healthz: {status} за {elapsed:.2f}с, база: {payload.get('database')}")
 
         if payload.get("database") != "ok":
