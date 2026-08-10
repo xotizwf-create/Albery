@@ -114,8 +114,8 @@ def test_novinki_merge_may_converge_on_fourth_round(monkeypatch):
 def test_novinki_main_keeps_source_files_when_synthesis_fails(monkeypatch):
     """A provider/schema failure must abort before any source-file cleanup."""
     import sys
-    import googleapiclient.discovery
-    import gdrive
+    import types
+    __import__("app")  # main() deliberately imports the initialized runtime
     import novinki_watch as nw
 
     class Request:
@@ -134,8 +134,15 @@ def test_novinki_main_keeps_source_files_when_synthesis_fails(monkeypatch):
             return Files()
 
     drive = Drive()
-    monkeypatch.setattr(googleapiclient.discovery, "build", lambda name, *a, **k: drive if name == "drive" else object())
-    monkeypatch.setattr(gdrive, "_google_user_credentials", lambda: object())
+    discovery = types.ModuleType("googleapiclient.discovery")
+    discovery.build = lambda name, *a, **k: drive if name == "drive" else object()
+    googleapiclient = types.ModuleType("googleapiclient")
+    googleapiclient.discovery = discovery
+    fake_gdrive = types.ModuleType("gdrive")
+    fake_gdrive._google_user_credentials = lambda: object()
+    monkeypatch.setitem(sys.modules, "googleapiclient", googleapiclient)
+    monkeypatch.setitem(sys.modules, "googleapiclient.discovery", discovery)
+    monkeypatch.setitem(sys.modules, "gdrive", fake_gdrive)
     monkeypatch.setattr(nw, "_extract_text", lambda *a, **k: ("text", "useful source text"))
     monkeypatch.setattr(nw, "_score_candidates", lambda *a, **k: [_candidate(1)])
     monkeypatch.setattr(nw, "_synthesize", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("schema failure")))
