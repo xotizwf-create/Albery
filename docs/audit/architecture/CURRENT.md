@@ -4,9 +4,9 @@ Last reviewed: 2026-08-10.
 
 ## Verified production state
 
-At the time this record was created, production still used the pre-change model routing described in [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md): Groq participated in task offers, task check-in classification, and Novinki analysis. The new routing is not considered current until the change record reaches `verified`.
+Production server 186 runs commit `0f2070996f7ee51af1287be80ff4a26ec37527bd`. The model routing below was deployed and live-verified on 2026-08-10 under [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md).
 
-## Accepted target state
+## Verified runtime shape
 
 ```mermaid
 flowchart LR

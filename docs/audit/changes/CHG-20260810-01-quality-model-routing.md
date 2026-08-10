@@ -1,9 +1,9 @@
 # CHG-20260810-01: Quality model routing
 
-- Status: implemented_local
+- Status: verified
 - Date opened: 2026-08-10
 - Related decision: [ADR-0002](../decisions/ADR-0002-codex-reasoning-groq-media.md)
-- Bitrix engineering task: pending deployment verification
+- Bitrix engineering task: 2666; result comment 42730
 
 ## Goal
 
@@ -56,13 +56,19 @@ Completed locally:
 - Full predeploy suite: `1863 passed, 43 skipped`; production-style imports completed. The local import check logged the expected missing-`DATABASE_URL` background warning but exited successfully.
 - Changed Python modules pass `pyflakes`; both audit skills and all edited YAML manifests validate.
 
-Pending before `verified`:
+Production evidence:
 
-- final diff and secret checks;
-- GitHub CI green;
-- production backup, pull, compile, zero-tool self-check, safe restart, deploy smoke, and journal review;
-- synthetic live Codex JSON call and relevant non-mutating scenario checks;
-- closed Bitrix engineering task with result and commit.
+- GitHub tests workflow: green; final commit security/tests workflows also green.
+- Backup: `/var/backups/albery/code/pre-quality-routing-20260810_135802.tar.gz`; SHA-256 `384b2cf76d6a219c2a3c6b90fcb662ea4643ad7ec29016eddc9bf7cc1085e293`.
+- Production fast-forwarded to `0f20709`; changed modules compiled.
+- Hermes runner self-check: `tool_count=0`.
+- Synthetic quality call returned the requested Codex JSON object.
+- Task check-in dry-run: scanned 86, passed deterministic filters 8, picked 1, writes 0.
+- Synthetic legal task offer: valid agent selection and 134-character message; no Bitrix post.
+- Synthetic Novinki analysis completed with valid empty output and no file or external writes.
+- Safe bot-role restart occurred with `inflight=0` and `running_automations=0`.
+- `deploy_smoke.py`: `SMOKE OK`; all three health endpoints reported `database=ok`; five services active; fresh error journal empty.
+- Closed Bitrix task 2666 contains the implementation, verification, backup, commit, and rollback evidence.
 
 ## Risks
 
@@ -76,4 +82,4 @@ Set `QUALITY_LLM_ENABLED=0` for immediate containment, then revert the implement
 
 ## Known gaps
 
-Production still runs the previous routing until this record is updated to `deployed` and then `verified` with live evidence.
+The one-shot runner uses a private Hermes helper and must retain its deploy self-check when Hermes is upgraded. Novinki may legitimately return an empty recommendation set for evidence that does not meet its strict threshold.
