@@ -79,9 +79,12 @@ Production evidence:
 - Compatibility/private implementation commit: `e2df63c315965f3632c86094ff41291e7d39ea13`.
 - Final source commit with the path-token route physically removed:
   `a09e64c8120687807ad8e1ac3fe49e6841982e80`.
+- Final perimeter hardening commit with no Nginx proxy to the MCP role:
+  `1e0c3f87e5791570e4b6d08b3394c56d37b3575c`.
 - GitHub Actions: tests `31396642964` passed on frontend, Python 3.12/PostgreSQL 16 and Python
   3.10/PostgreSQL 14; security audit `31396642760` passed. The first-phase runs `31395304088`
   and `31395303987` also passed.
+- Final hardening CI: tests `31397960636` and security audit `31397961188` passed.
 - Migration rotated all ten active agent credentials, removed five shared Hermes connectors and
   atomically installed ten loopback/header connectors in a mode-`0600` config.
 - Live `tools/list` matched the exact DB/manifest-derived set for every active agent: counts were
@@ -112,6 +115,9 @@ Backups created before mutation:
   `3f57cfd8bf224d25e9402d3a71846ac50770efc8103ff83cb0b419c3848ab484`;
 - migration also created `/root/.hermes/config.yaml.bak-private-mcp-20260810_170526` immediately
   before replacing connector configuration.
+- final dark-host Nginx backup:
+  `/etc/nginx/sites-available/albery.bak-pre-dark-mcp-20260810_172623`, SHA-256
+  `cb0932a83c5fb72704b8029ebd9b55cbdb4609996572e526c654a9ff1516adb2`.
 
 ## Risks
 
