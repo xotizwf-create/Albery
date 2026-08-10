@@ -1,10 +1,10 @@
 # CHG-20260810-03: Independent acceptance hardening
 
-- Status: implemented_local
+- Status: verified
 - Date opened: 2026-08-10
 - Trigger: owner's request for an independent end-to-end re-verification
 - Related decision: [ADR-0002](../decisions/ADR-0002-codex-reasoning-groq-media.md)
-- Bitrix engineering task: pending deployment verification
+- Bitrix engineering task: 2670; result comment 42760
 
 ## Goal
 
@@ -51,6 +51,35 @@ Re-test every path introduced by CHG-20260810-01, correct any discrepancy found 
   missing local `DATABASE_URL` background warning is expected and non-fatal.
 - The first red test run produced `10 failed, 24 passed`, proving that the new cases detected the
   original defects before the fixes.
+
+## CI and production evidence
+
+- Implementation commits: `8cf9ec6` and dependency-isolation follow-up `f2669ed`.
+- The first CI run exposed a test-only dependency on optional `googleapiclient` in Python 3.10;
+  the test was isolated with module stubs. The final Security audit, frontend, Python
+  3.10/PostgreSQL 14, and Python 3.12/PostgreSQL 16 jobs all passed.
+- Pre-change archive:
+  `/var/backups/albery/code/pre-acceptance-hardening-20260810_143444.tar.gz`; SHA-256
+  `e96f4f09cee76b674bf03f28f27d16ed2f7628e6b278176660c684843113c564`.
+- Production fast-forwarded to `f2669ed`; changed modules compiled. The service was restarted only
+  after `bitrix_inflight_turns=0` and running automations reached zero.
+- One-shot deploy self-check: `tool_count=0`. A synthetic prompt-injection probe returned the
+  contracted JSON without tools, and the kill switch stopped before execution.
+- Task offers: a synthetic legal task selected the configured lawyer; a physical task produced no
+  offer. No Bitrix post occurred.
+- Live task check-in dry-run: scanned 86, passed deterministic filters 8, picked 1, writes 0. With
+  the quality contour disabled, classification returned an empty fail-closed result.
+- Novinki: malformed schema failed closed; synthetic batch/final synthesis returned a valid result;
+  live Drive dry-run found the folder empty and made no writes or deletes.
+- Media: real Groq-first vision read the synthetic OCR marker without invoking Codex fallback; Groq
+  Whisper accurately transcribed a natural synthetic sentence. A separate spelled-number probe
+  normalized “four eight two seven” as “V827”, documenting that exact alphanumeric fidelity is a
+  provider/model limitation rather than a routing failure.
+- Before/after counters stayed `bitrix_task_agent_offers=207` and `task_checkin_runs=21`.
+  Final state: inflight 0, running automations 0, heavy slots held 0, five services active,
+  `deploy_smoke.py` reported `SMOKE OK`, and the fresh error journal was empty.
+- Closed Bitrix task 2670 and result comment 42760 contain the implementation, tests, deployment,
+  backup, and rollback evidence.
 
 ## Rollback
 

@@ -4,6 +4,7 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-10
 
+- `verified` — [CHG-20260810-03](changes/CHG-20260810-03-independent-acceptance-hardening.md): final CI matrices, production probes, no-write counters, media checks, smoke, backup, and Bitrix task 2670 confirmed.
 - `implemented_local` — [CHG-20260810-03](changes/CHG-20260810-03-independent-acceptance-hardening.md): adversarial tests now pass; schema, boolean, agent binding, environment isolation, and Groq-primary vision routing are hardened.
 - `approved` — [CHG-20260810-03](changes/CHG-20260810-03-independent-acceptance-hardening.md): adversarial re-verification found schema, boolean, environment-isolation, and media-routing gaps.
 - `verified` — [CHG-20260810-02](changes/CHG-20260810-02-nanoid-security-update.md): security gate, production deployment, and Bitrix task 2668 confirmed.

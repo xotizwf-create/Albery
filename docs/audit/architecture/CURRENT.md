@@ -4,7 +4,11 @@ Last reviewed: 2026-08-10.
 
 ## Verified production state
 
-Production server 186 runs commit `0f2070996f7ee51af1287be80ff4a26ec37527bd`. The model routing below was deployed and live-verified on 2026-08-10 under [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md).
+Production server 186 runs implementation commit `f2669ed343d7888a29a92c531c835e31c889002f`.
+The model routing was deployed under
+[CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
+re-verified/hardened under
+[CHG-20260810-03](../changes/CHG-20260810-03-independent-acceptance-hardening.md).
 
 ## Verified runtime shape
 
