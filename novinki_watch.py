@@ -183,9 +183,19 @@ FINAL_PROMPT = """Ты главный редактор рекомендаций 
 
 
 def _valid_recommendations(data):
-    rows = data.get("recommendations") if isinstance(data, dict) else []
-    return [r for r in (rows or []) if isinstance(r, dict)
-            and r.get("recommendation") and r.get("category")]
+    if not isinstance(data, dict) or "recommendations" not in data:
+        raise RuntimeError("novinki schema: recommendations array is missing")
+    rows = data.get("recommendations")
+    if not isinstance(rows, list):
+        raise RuntimeError("novinki schema: recommendations must be an array")
+    out = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"novinki schema: recommendation {index} must be an object")
+        if not str(row.get("category") or "").strip() or not str(row.get("recommendation") or "").strip():
+            raise RuntimeError(f"novinki schema: recommendation {index} lacks required fields")
+        out.append(row)
+    return out
 
 
 def _synthesize(cands):
@@ -221,9 +231,11 @@ def _synthesize(cands):
                 retries=1,
             )
             merged.extend(_valid_recommendations(final))
-        if len(merged) >= len(recs) or merge_round >= 4:
+        if len(merged) >= len(recs):
             raise QualityLLMError("novinki_final: hierarchical merge did not converge")
         recs = merged
+        if len(recs) > CODEX_FINAL_CAP and merge_round >= 4:
+            raise QualityLLMError("novinki_final: hierarchical merge exceeded four rounds")
 
     if recs:
         final_input = json.dumps(recs, ensure_ascii=False)

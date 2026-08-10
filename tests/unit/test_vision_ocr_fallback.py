@@ -106,8 +106,8 @@ def test_model_list_is_configurable(bot):
     assert isinstance(bot._B24_VISION_MODELS, list) and bot._B24_VISION_MODELS
 
 
-def test_our_codex_account_is_preferred_by_default(app_module, monkeypatch):
-    """Владелец просил распознавать своим агентом, а не сторонними нейронками."""
+def test_groq_media_provider_is_preferred_by_default(app_module, monkeypatch):
+    """Решение 10.08.2026: Groq обрабатывает медиа, Codex сохраняется как fallback."""
     import b24bot
 
     monkeypatch.delenv("B24_VISION_ORDER", raising=False)
@@ -119,25 +119,25 @@ def test_our_codex_account_is_preferred_by_default(app_module, monkeypatch):
 
     out = b24bot._b24_vision_ocr(b"PNG", "s.png")
 
-    assert out == "текст со скрина"
-    assert calls == ["codex"], "к стороннему провайдеру не идём, пока свой отвечает"
+    assert out == "groq-текст"
+    assert calls == ["groq"]
 
 
-def test_groq_takes_over_when_codex_is_not_logged_in(app_module, monkeypatch):
-    """Сейчас codex на сервере не залогинен — пользователь не должен это замечать."""
+def test_codex_takes_over_when_groq_is_unavailable(app_module, monkeypatch):
+    """Сбой media provider не должен сделать агента слепым."""
     import b24bot
 
     monkeypatch.delenv("B24_VISION_ORDER", raising=False)
     calls = []
-    monkeypatch.setattr(b24bot, "_b24_vision_ocr_codex",
-                        lambda data, name="": calls.append("codex") or "")
     monkeypatch.setattr(b24bot, "_b24_vision_ocr_groq",
-                        lambda data, name="": calls.append("groq") or "текст со скрина")
+                        lambda data, name="": calls.append("groq") or "")
+    monkeypatch.setattr(b24bot, "_b24_vision_ocr_codex",
+                        lambda data, name="": calls.append("codex") or "текст со скрина")
 
     out = b24bot._b24_vision_ocr(b"PNG", "s.png")
 
     assert out == "текст со скрина"
-    assert calls == ["codex", "groq"]
+    assert calls == ["groq", "codex"]
 
 
 def test_codex_absent_binary_is_safe(app_module, monkeypatch):
@@ -188,3 +188,32 @@ def test_codex_auth_verdict_is_cached(app_module, monkeypatch):
     b24bot._b24_codex_logged_in()
 
     assert len(runs) == 1, "проверка входа кешируется, а не дёргается на каждую картинку"
+
+
+def test_audio_transcription_uses_groq_whisper(app_module, monkeypatch):
+    """Audio remains in the Groq media contour and never enters the Codex quality runner."""
+    import b24bot
+
+    calls = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"text": "test phrase 4827"}
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr(b24bot, "_b24_groq_api_key", lambda: "test-key")
+    monkeypatch.setattr(b24bot.requests, "post", fake_post)
+
+    out = b24bot._b24_transcribe_audio(b"WAVE", "voice.wav")
+
+    assert out == "test phrase 4827"
+    assert calls[0][0] == "https://api.groq.com/openai/v1/audio/transcriptions"
+    assert calls[0][1]["data"]["model"] == "whisper-large-v3"
+    assert calls[0][1]["files"]["file"] == ("voice.wav", b"WAVE")

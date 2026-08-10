@@ -28,14 +28,20 @@ flowchart LR
 
 - Calls the installed Hermes/Codex runtime through a dedicated one-shot process.
 - Receives untrusted task/file text through standard input, never through command arguments.
+- Receives only allowlisted runtime/provider environment variables; Albery business-system
+  credentials are not inherited by the one-shot process.
 - Has zero MCP, web, shell, or application tools; deploy self-check asserts this invariant.
 - Produces JSON only, uses the shared global run-slot limiter, has bounded timeout and retry.
 - Can be disabled immediately with `QUALITY_LLM_ENABLED=0`.
-- Task check-in fails closed. Novinki retains source files if any AI batch fails. Task offers use a deterministic non-generative fallback.
+- Task check-in strictly validates JSON booleans/IDs and fails closed. Novinki strictly validates
+  the response schema and retains source files if any AI batch fails. Task offers use a
+  deterministic non-generative fallback bound to a real configured agent.
 
 ### Media contour
 
-Groq remains responsible for high-speed audio transcription and screenshot/OCR workloads. It is not a generative fallback for the three quality-reasoning scenarios above.
+Groq Whisper handles audio transcription. Screenshot/OCR uses Groq first and Codex only as a
+resilience fallback. Neither media path is a generative fallback for the three quality-reasoning
+scenarios above.
 
 ### Audit visibility
 

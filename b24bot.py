@@ -1965,8 +1965,8 @@ def _b24_vision_ocr_codex(image_bytes: bytes, name: str = "") -> str:
 
 
 def _b24_vision_ocr(image_bytes: bytes, name: str = "") -> str:
-    """Распознать изображение. Порядок провайдеров — B24_VISION_ORDER (по умолчанию сначала наш
-    агент на Codex, затем Groq).
+    """Распознать изображение. Порядок провайдеров — B24_VISION_ORDER (по умолчанию Groq
+    как media-контур, затем Codex для отказоустойчивости).
 
     NOTE: api.groq.com blocks urllib's default User-Agent with Cloudflare 1010 — a browser UA
     passes (same gotcha as the STT path).
@@ -1976,7 +1976,7 @@ def _b24_vision_ocr(image_bytes: bytes, name: str = "") -> str:
     обязан сказать об этом агенту, иначе картинка молча исчезнет из разговора."""
     if not image_bytes:
         return ""
-    order = [p.strip().lower() for p in os.getenv("B24_VISION_ORDER", "codex,groq").split(",") if p.strip()]
+    order = [p.strip().lower() for p in os.getenv("B24_VISION_ORDER", "groq,codex").split(",") if p.strip()]
     for provider in order:
         if provider == "codex":
             text = _b24_vision_ocr_codex(image_bytes, name)
@@ -1990,7 +1990,7 @@ def _b24_vision_ocr(image_bytes: bytes, name: str = "") -> str:
 
 
 def _b24_vision_ocr_groq(image_bytes: bytes, name: str = "") -> str:
-    """Запасной провайдер распознавания — Groq."""
+    """Основной media-провайдер распознавания — Groq."""
     key = _b24_groq_api_key()
     if not key or not image_bytes:
         return ""

@@ -34,6 +34,10 @@ def test_quality_runner_uses_stdin_global_slot_and_no_prompt_in_argv(monkeypatch
     monkeypatch.setattr(ql.subprocess, "run", fake_run)
     monkeypatch.setenv("QUALITY_LLM_PYTHON", "/hermes/python")
     monkeypatch.setenv("QUALITY_LLM_RUNNER", "/app/quality_runner.py")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://must-not-leak")
+    monkeypatch.setenv("GROQ_API_KEY", "must-not-leak")
+    monkeypatch.setenv("BITRIX_WEBHOOK_BASE", "must-not-leak")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-key")
 
     result = ql.run_quality_json("SECRET TASK CONTENT", purpose="task_checkin", retries=0)
 
@@ -45,6 +49,10 @@ def test_quality_runner_uses_stdin_global_slot_and_no_prompt_in_argv(monkeypatch
     assert "SECRET TASK CONTENT" not in " ".join(command)
     assert "SECRET TASK CONTENT" in kwargs["input"]
     assert kwargs["cwd"] == "/tmp"
+    assert kwargs["env"]["OPENAI_API_KEY"] == "provider-key"
+    assert "DATABASE_URL" not in kwargs["env"]
+    assert "GROQ_API_KEY" not in kwargs["env"]
+    assert "BITRIX_WEBHOOK_BASE" not in kwargs["env"]
 
 
 def test_quality_runner_retries_then_fails_closed(monkeypatch):
@@ -72,6 +80,10 @@ def test_quality_runner_retries_then_fails_closed(monkeypatch):
 def test_quality_runner_kill_switch(monkeypatch):
     import quality_llm as ql
 
+    calls = []
+    monkeypatch.setattr(ql, "build_default", lambda: calls.append("slot"))
+    monkeypatch.setattr(ql.subprocess, "run", lambda *a, **k: calls.append("run"))
     monkeypatch.setenv("QUALITY_LLM_ENABLED", "0")
     with pytest.raises(ql.QualityLLMError, match="disabled"):
         ql.run_quality_json("prompt", purpose="unit_test")
+    assert calls == [], "kill switch must stop before acquiring a slot or spawning a process"

@@ -12,6 +12,13 @@ Groq was used both for media processing and for quality-sensitive reasoning: com
 
 Use an isolated Codex/Hermes one-shot runner for task offers, task check-in classification, and Novinki analysis. Keep Groq for audio transcription, screenshot understanding, and OCR/media workloads.
 
+Routing clarification accepted during the 2026-08-10 independent acceptance review:
+
+- screenshot/OCR uses Groq as the primary provider and Codex as a resilience fallback;
+- audio/STT uses Groq Whisper;
+- the Codex vision fallback is media extraction only and is not the generative fallback for task
+  offers, task check-in, or Novinki reasoning.
+
 The quality runner must:
 
 - expose zero tools and verify that invariant with a deploy self-check;
@@ -34,3 +41,5 @@ Failure policy:
 - Tool isolation limits prompt-injection impact from task and file content.
 - Groq remains valuable for fast, cost-effective media extraction.
 - The runner depends on the installed Hermes environment and requires an explicit self-check after deploy.
+- Groq is the normal screenshot path, while a Groq outage can consume Codex capacity through the
+  explicit vision fallback.

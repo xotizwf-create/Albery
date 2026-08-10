@@ -71,12 +71,15 @@ def test_classifier_parsing_tolerates_junk(monkeypatch):
     import task_checkin as tc
     monkeypatch.setattr(tc, "run_quality_json", lambda *a, **k: {
         "tasks": [{"id": 1, "help": True, "reason": "соберу анализ"},
-                  {"id": "2", "help": False, "reason": ""}, {"id": "junk"}],
+                  {"id": "2", "help": False, "reason": ""},
+                  {"id": 3, "help": "false", "reason": "строка не boolean"},
+                  {"id": 4, "help": 1, "reason": "число не boolean"},
+                  {"id": "junk"}],
     }, raising=False)
-    out = tc.classify_tasks([_t(1, "Анализ"), _t(2, "Оплата")])
+    out = tc.classify_tasks([_t(1, "Анализ"), _t(2, "Оплата"), _t(3, "Строка"), _t(4, "Число")])
     assert {"id": 1, "help": True, "reason": "соберу анализ"} in out
     assert any(v["id"] == 2 and v["help"] is False for v in out)
-    assert len(out) == 2  # the junk row is dropped
+    assert len(out) == 2  # malformed ids and non-boolean verdicts are dropped
 
     # Codex down -> post nothing (fail closed).
     monkeypatch.setattr(tc, "run_quality_json",

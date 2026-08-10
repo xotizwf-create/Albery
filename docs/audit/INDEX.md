@@ -23,6 +23,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | --- | --- | --- |
 | [CHG-20260810-01](changes/CHG-20260810-01-quality-model-routing.md) | verified | Move offers, task check-in, and Novinki analysis from Groq to isolated Codex |
 | [CHG-20260810-02](changes/CHG-20260810-02-nanoid-security-update.md) | verified | Update locked nanoid after the mandatory security gate detected a high-severity advisory |
+| [CHG-20260810-03](changes/CHG-20260810-03-independent-acceptance-hardening.md) | implemented_local | Independently re-test and harden all quality-routing paths |
 
 ## Status rule
 

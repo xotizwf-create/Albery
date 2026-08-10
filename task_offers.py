@@ -289,12 +289,15 @@ def compose_offer(task: dict[str, Any], candidates: list[dict[str, Any]],
         )
         msg = str(data.get("message") or "").strip()[:_OFFER_MAX_CHARS]
         slug = str(data.get("agent") or "main").strip()
-        agent = next((c for c in candidates if (c["slug"] or "main") == slug), fallback_agent)
-        if msg and not _CJK_RE.search(msg):
-            return agent, msg
         if "message" in data and not msg:
             logging.info("task offers: Codex found no honest agent contribution")
-            return agent, ""
+            return fallback_agent, ""
+        agent = next((c for c in candidates if (c["slug"] or "main") == slug), None)
+        if agent is None:
+            logging.warning("task offers: Codex returned unknown agent slug %r", slug[:80])
+            return fallback_agent, fallback_msg
+        if msg and not _CJK_RE.search(msg):
+            return agent, msg
         logging.warning("task offers: Codex quality contour returned unusable text")
     except Exception as exc:  # noqa: BLE001 - an optional offer must degrade deterministically
         logging.warning("task offers: Codex quality compose failed: %s", repr(exc)[:160])

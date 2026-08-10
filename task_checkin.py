@@ -207,7 +207,14 @@ def classify_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
         for r in rows:
             try:
-                out.append({"id": int(r.get("id")), "help": bool(r.get("help")),
+                raw_id = r.get("id")
+                help_value = r.get("help")
+                if isinstance(raw_id, bool) or not isinstance(help_value, bool):
+                    continue
+                task_id = int(raw_id)
+                if task_id <= 0:
+                    continue
+                out.append({"id": task_id, "help": help_value,
                             "reason": str(r.get("reason") or "")[:300]})
             except (TypeError, ValueError):
                 continue
