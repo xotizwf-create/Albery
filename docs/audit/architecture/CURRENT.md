@@ -81,7 +81,8 @@ flowchart LR
 - Hermes stores loopback URLs and Bearer headers in a mode-`0600` configuration. All ten agent
   credentials were rotated during migration.
 - Ports `5002`, `5003`, and `5004` listen on `127.0.0.1` only. Nginx returns 404 for `/mcp*` and
-  `/sse*` on both public hosts while forwarding authenticated Bitrix, Zoom, and Drive webhooks.
+  `/sse*` on both public hosts; the legacy MCP hostname also returns 404 for every default route,
+  including health/login/API, while forwarding only Bitrix, Zoom, and Drive webhooks.
 - Owner Telegram uses `agent-main,web`. Deterministic Telegram/CRM operations use an in-process
   allowlist rather than a shared HTTP MCP credential. Missing main-agent wiring fails closed.
 - Dialogue summaries and diagnostic digests use the isolated zero-tool Codex quality contour;

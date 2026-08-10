@@ -219,7 +219,10 @@ if active_agents:
     )
     expect_status(f"{PUBLIC_MCP_BASE}/mcp-agent/{sample_slug}", 404, method="POST")
     expect_status(f"{PUBLIC_MCP_BASE}/mcp", 404, method="POST")
-    print("path-token, forwarded and public MCP access: 404")
+    expect_status(f"{PUBLIC_MCP_BASE}/healthz", 404)
+    expect_status(f"{PUBLIC_MCP_BASE}/zoom/events/not-a-secret", 403)
+    expect_status(f"{PUBLIC_MCP_BASE}/bitrix/imbot/not-a-secret", 403)
+    print("path-token, forwarded and public MCP host access: 404; webhooks reach auth")
 
 # The two long-lived workers are part of the workspace data path.  Keep this
 # production-only so a local/container smoke without systemd remains useful.

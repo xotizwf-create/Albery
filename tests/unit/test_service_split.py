@@ -71,20 +71,22 @@ def test_imbot_webhook_is_never_load_balanced():
     assert BOT_PREFIX_RE.match("/bitrix/imbot/anysecret")
 
 
-def test_nginx_conf_declares_all_three_upstreams():
+def test_nginx_conf_exposes_only_bot_and_web_upstreams():
     conf = _conf_text()
-    for port, role in ((PORT_BOT, "бот"), (PORT_WEB, "веб"), (PORT_MCP, "MCP")):
+    for port, role in ((PORT_BOT, "бот"), (PORT_WEB, "веб")):
         assert f"127.0.0.1:{port}" in conf, f"в конфиге нет роли {role} (порт {port})"
+    assert f"127.0.0.1:{PORT_MCP}" not in conf
 
 
-def test_mcp_host_goes_to_the_mcp_role():
-    """mcp.m4s.ru обязан вести в отдельную службу, а не обратно в бота."""
+def test_mcp_host_is_dark_except_for_bot_webhooks():
+    """Legacy MCP host must never expose the MCP-role process."""
     conf = _conf_text()
     mcp_block = conf.split("server_name mcp.m4s.ru;", 1)
     assert len(mcp_block) == 2, "блок mcp.m4s.ru не найден"
     tail = mcp_block[1].split("server {", 1)[0]
-    assert f"127.0.0.1:{PORT_MCP}" in tail
-    assert f"127.0.0.1:{PORT_BOT}" not in tail, "MCP не должен ходить в роль бота"
+    assert f"127.0.0.1:{PORT_MCP}" not in tail
+    assert f"127.0.0.1:{PORT_BOT}" in tail
+    assert "location /" in tail and "return 404;" in tail
 
 
 def test_worker_timeout_outlives_the_proxy_timeout():

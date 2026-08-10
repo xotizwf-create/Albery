@@ -88,9 +88,10 @@ Production evidence:
   `110, 137, 166, 109, 10, 0, 0, 116, 141, 20` in slug order reported by deploy smoke.
 - `scripts/deploy_smoke.py` passed after both production phases: 53 workflow references, retired
   shared/SSE routes, path-token, forwarded/public access, site, calculator, workspace and services.
-- Both public hosts returned 404 for `/mcp`, `/mcp-agent/main` and `/sse`; MCP-host health and site
-  login returned 200. Invalid Zoom/Bitrix webhook probes reached application authentication and
-  returned 403, proving the Nginx block did not swallow webhook paths.
+- Both public hosts returned 404 for `/mcp`, `/mcp-agent/main` and `/sse`; the legacy MCP host's
+  default route, including `/healthz`, also returned 404 while site login remained 200. Invalid
+  Zoom/Bitrix webhook probes reached application authentication and returned 403, proving the
+  allowlist did not swallow required callback paths.
 - Ports `5002`, `5003`, and `5004` listened only on `127.0.0.1`; all six relevant services were
   active and five-minute error journals were empty.
 - A synthetic zero-tool Codex text run passed; owner routing returned `agent-main,web`; the new

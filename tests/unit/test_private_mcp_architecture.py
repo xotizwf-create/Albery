@@ -86,4 +86,7 @@ def test_nginx_blocks_mcp_on_both_public_hosts_without_logging_paths():
     source = (Path(__file__).resolve().parents[2] / "deploy" / "nginx-albery.conf").read_text(encoding="utf-8")
     marker = "location ~ ^/(?:mcp(?:-|/|$)|sse(?:-|/|$))"
     assert source.count(marker) == 2
-    assert source.count("access_log off;") >= 2
+    webhook_marker = "location ~ ^/(bitrix/|zoom/events/|google-drive/events/)"
+    assert source.count(webhook_marker) == 2
+    assert "proxy_pass http://127.0.0.1:5004" not in source
+    assert source.count("access_log off;") >= 3
