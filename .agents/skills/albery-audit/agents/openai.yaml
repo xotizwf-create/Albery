@@ -1,0 +1,4 @@
+interface:
+  display_name: "Albery Audit"
+  short_description: "Albery architecture decisions and audit"
+  default_prompt: "Use $albery-audit to record and verify this Albery architecture change."

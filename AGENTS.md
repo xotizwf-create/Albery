@@ -124,3 +124,13 @@ brain-dirty-watchdog), поэтому origin/main может уйти вперё
    деплоя), как albery-tg.service.
 8. **Координируйся через задачи Bitrix + changelog.** Запиши своё изменение сразу (правило
    инженерного журнала), чтобы другой агент увидел его в общей ленте.
+
+## 12. Versioned architecture audit
+
+For every non-trivial code, configuration, prompt, model-routing, integration, database,
+deployment, security, or architecture change, use `.agents/skills/albery-audit/SKILL.md`.
+Read `docs/audit/INDEX.md` before work, create or update a `CHG-*` record, and create an
+`ADR-*` when an architectural boundary or invariant changes. Keep verified production
+state separate from approved or locally implemented target state. Record tests, live
+evidence, backup, rollback, commit, known gaps, and the closed Bitrix engineering task.
+Never place secrets or unnecessary user content in the audit base.

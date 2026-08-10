@@ -1,5 +1,4 @@
-"""Unit tests for task_offers (offer comments on agent-created tasks): decline detection and
-the deterministic no-Groq fallback of the composer. DB/network-free."""
+"""Unit tests for task_offers: decline detection and deterministic Codex fallback."""
 from __future__ import annotations
 
 
@@ -30,13 +29,12 @@ def test_extract_json_handles_fences_and_prose():
     assert to._extract_json("") == {}
 
 
-def test_compose_offer_falls_back_without_groq(monkeypatch):
+def test_compose_offer_falls_back_when_codex_is_unavailable(monkeypatch):
     import app  # noqa: F401
 
     import task_offers as to
 
-    monkeypatch.setattr(to, "_codex_chat", _raise)
-    monkeypatch.setattr(to, "_groq_chat", lambda prompt: "")
+    monkeypatch.setattr(to, "run_quality_json", _raise)
     candidates = [
         {"slug": None, "name": "Агент Албери", "bot_id": 24, "role": "универсальный", "is_main": True},
         {"slug": "agent-sklad", "name": "Агент-юрист", "bot_id": 70, "role": "юрист", "is_main": False},
@@ -49,18 +47,16 @@ def test_compose_offer_falls_back_without_groq(monkeypatch):
     assert "могу помочь выполнить и закрыть" in msg
 
 
-def test_compose_offer_uses_groq_when_codex_down(monkeypatch):
-    import json
-
+def test_compose_offer_uses_codex_quality_result(monkeypatch):
     import app  # noqa: F401
 
     import task_offers as to
 
-    monkeypatch.setattr(to, "_codex_chat", _raise)
-    monkeypatch.setattr(to, "_groq_chat", lambda prompt: json.dumps(
-        {"agent": "agent-sklad", "message": "Артур, могу помочь выполнить и закрыть вам эту задачу. "
-                                            "Могу подготовить договор — начать? Ответьте прямо здесь — я увижу ваше сообщение."},
-        ensure_ascii=False))
+    monkeypatch.setattr(to, "run_quality_json", lambda *a, **k: {
+        "agent": "agent-sklad",
+        "message": "Артур, могу помочь выполнить и закрыть вам эту задачу. "
+                   "Могу подготовить договор — начать? Ответьте прямо здесь — я увижу ваше сообщение.",
+    })
     candidates = [
         {"slug": None, "name": "Агент Албери", "bot_id": 24, "role": "универсальный", "is_main": True},
         {"slug": "agent-sklad", "name": "Агент-юрист", "bot_id": 70, "role": "юрист", "is_main": False},
@@ -69,6 +65,19 @@ def test_compose_offer_uses_groq_when_codex_down(monkeypatch):
                                   candidates, "Артур Степанян")
     assert agent["slug"] == "agent-sklad"
     assert "Ответьте прямо здесь" in msg
+
+
+def test_compose_offer_respects_explicit_no_help(monkeypatch):
+    import app  # noqa: F401
+
+    import task_offers as to
+
+    monkeypatch.setattr(to, "run_quality_json", lambda *a, **k: {"agent": "main", "message": ""})
+    candidates = [
+        {"slug": None, "name": "Агент Албери", "bot_id": 24, "role": "универсальный", "is_main": True},
+    ]
+    _, msg = to.compose_offer({"title": "Физически отвезти коробки"}, candidates, "Артур")
+    assert msg == ""
 
 
 def test_schedule_offer_disabled_or_bad_ids_is_noop(monkeypatch):

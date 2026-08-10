@@ -1,16 +1,16 @@
 """Daily task check-in + per-employee agent dossier (владелец 2026-07-11, задача 1304).
 
 Once a day (12:00 МСК) the pipeline scans OPEN tasks created by people and finds the ones the
-agent can genuinely accelerate — not background noise. Centralized and cheap by design:
+agent can genuinely accelerate — not background noise. Centralized and bounded by design:
 
   stage 0  deterministic filters (free): responsible has agent access; not an agent/cron task
            (those get an offer at creation already); not a mass hand-out (same title to ≥3
            people); no physical/decision stop-words (оплатить/замерить/ознакомиться/…);
            not a test task; no offer in this task yet.
-  stage 1  ONE Groq batch call (free): «может ли агент сделать ≥50% работы своими реальными
+  stage 1  ONE tool-free Codex batch call: «может ли агент сделать ≥50% работы своими реальными
            инструментами?» per task, with a one-line reason.
-  stage 2  Codex writes a personal offer comment (task_offers pipeline) — only for the winners,
-           capped per run, so the expensive model spends a handful of turns a day.
+  stage 2  the isolated Codex offer composer writes a personal comment only for the winners,
+           capped per run, so quality turns remain bounded.
 
 After posting, the run refreshes the per-employee DOSSIER (who works with the agent, who
 ignores it, which of their tasks are automatable) and DMs the people it offered to — the first
@@ -34,11 +34,12 @@ from datetime import timedelta
 from typing import Any
 
 from app import MSK_TZ, msk_now, pg_connect
+from quality_llm import run_quality_json
 from shared.role import background_jobs_enabled
 
 _CHECKIN_HOUR = int(os.getenv("B24_TASK_CHECKIN_HOUR", "12"))
 _OFFER_CAP = int(os.getenv("B24_TASK_CHECKIN_OFFER_CAP", "15"))
-_CLASSIFY_CAP = 40   # tasks per Groq batch — plenty for this portal's volume
+_CLASSIFY_CAP = 40   # tasks per Codex batch — plenty for this portal's volume
 
 # Tasks the agent itself produced (its own digests / recommendation lists). Never offer help on
 # our own output — matched anywhere in the text.
@@ -146,12 +147,10 @@ def filter_tasks(tasks: list[dict[str, Any]], offered_ids: set[int],
 # --- stage 1: one cheap batch classification ----------------------------------------------------
 
 def classify_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One Groq call for the whole batch: can the agent do >=50% of the work with its REAL
-    tools? Returns [{id, help, reason}]. On failure returns [] (the run posts nothing —
-    честнее, чем спамить наугад)."""
+    """One tool-free Codex turn: can the agent do >=50% of the work with its REAL tools?
+    Returns [{id, help, reason}]. On failure returns [] (fail closed, never spam at random)."""
     if not tasks:
         return []
-    from task_offers import _groq_chat
     def _line(t: dict[str, Any]) -> str:
         # Judging on the title alone made the classifier blind: give it a real slice of the
         # description plus what is already attached to the task.
@@ -203,10 +202,7 @@ def classify_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "премию), живой разговор (позвонить, договориться лично), согласование отпуска или "
         "отсутствия, личное управленческое решение руководителя."
     )
-    from task_offers import _codex_chat, _extract_json
-
-    def _parse(raw: str) -> list[dict[str, Any]]:
-        data = _extract_json(raw)
+    def _parse(data: dict[str, Any]) -> list[dict[str, Any]]:
         rows = data.get("tasks") if isinstance(data.get("tasks"), list) else []
         out = []
         for r in rows:
@@ -217,22 +213,16 @@ def classify_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
         return out
 
-    # Engine chain like the offer composer: Groq (free, one batch call a day) with a couple of
-    # spaced retries for a transient 429, then Codex once (reliable) if Groq is exhausted. Only
-    # a total failure of both returns [] («post nothing» — safe but skips the day).
-    last_exc = None
-    for attempt in range(3):
-        try:
-            return _parse(_groq_chat(prompt))
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt < 2:
-                time.sleep(int(os.getenv("B24_CHECKIN_CLASSIFY_BACKOFF_S", "25")))
-    logging.warning("task checkin: Groq classify failed (%s), trying Codex", repr(last_exc)[:120])
     try:
-        return _parse(_codex_chat(prompt))
+        data = run_quality_json(
+            prompt,
+            purpose="task_checkin",
+            timeout_s=int(os.getenv("B24_CHECKIN_CODEX_TIMEOUT_S", "180") or "180"),
+            retries=1,
+        )
+        return _parse(data)
     except Exception as exc:  # noqa: BLE001
-        logging.warning("task checkin: classification failed on both engines: %s", repr(exc)[:160])
+        logging.warning("task checkin: Codex classification failed closed: %s", repr(exc)[:160])
         return []
 
 

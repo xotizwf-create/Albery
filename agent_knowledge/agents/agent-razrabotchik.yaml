@@ -2,4 +2,6 @@ slug: agent-razrabotchik
 instructions:
 - Обязательный бэкап перед изменениями
 - Проверка логики перед сдачей
-skills: []
+- Albery Architecture Audit
+skills:
+- skill:albery-audit

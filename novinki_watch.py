@@ -9,7 +9,7 @@
      Google Docs/Sheets), сообщения-кандидаты отбираются скорингом «советов»
      (те же критерии, что в ручном анализе 17.07: паттерны рекомендаций + доменные
      темы WB/Ozon + числа/списки, анти-спам).
-  4. Groq синтезирует из кандидатов конкретные рекомендации (реклама WB, цены/СПП,
+  4. Изолированный Codex-контур синтезирует из кандидатов конкретные рекомендации (реклама WB, цены/СПП,
      выкупы/отзывы, логистика, налоги, маркировка, регуляторика, импорт, аналитика,
      Ozon, оргпроцессы). Реклама услуг и болтовня отбрасываются.
   5. Рекомендации, уже покрытые базой знаний «О компании» (FTS по чанкам), отбрасываются.
@@ -31,7 +31,6 @@ import json
 import time
 import hashlib
 import logging
-import urllib.request
 from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("B24_TASK_OFFER", "0")
@@ -52,8 +51,8 @@ NATALIA_ID = 30
 CREATOR_ID = 22
 RESPONSIBLE_ID = int(os.getenv("NOVINKI_TEST_RESPONSIBLE", "0") or NATALIA_ID)
 MAX_CANDIDATES = 400
-GROQ_BATCH = 15
-GROQ_MODELS = ("openai/gpt-oss-120b", "llama-3.3-70b-versatile")
+CODEX_BATCH = max(10, int(os.getenv("NOVINKI_CODEX_BATCH", "40") or "40"))
+CODEX_FINAL_CAP = max(20, int(os.getenv("NOVINKI_CODEX_FINAL_CAP", "120") or "120"))
 
 STRONG = re.compile(
     r"лайфхак|делюсь опыт|рекоменду|совету[юе]|инструкци|алгоритм|чек.?лист|"
@@ -157,31 +156,6 @@ def _score_candidates(per_file_msgs):
     return cands[:MAX_CANDIDATES]
 
 
-def _groq(prompt):
-    from b24bot import _b24_groq_api_key
-    key = _b24_groq_api_key()
-    if not key:
-        raise RuntimeError("нет GROQ_API_KEY")
-    last = None
-    for model in GROQ_MODELS:
-        payload = {"model": model, "max_tokens": 4000, "temperature": 0.2,
-                   "response_format": {"type": "json_object"},
-                   "messages": [{"role": "user", "content": prompt}]}
-        req = urllib.request.Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
-                     "User-Agent": "Mozilla/5.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=90) as r:
-                d = json.loads(r.read().decode("utf-8", "ignore"))
-            return ((d.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "")
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-            time.sleep(3)
-    raise RuntimeError(f"Groq недоступен: {last}")
-
-
 SYNTH_PROMPT = """Ты аналитик компании-селлера Wildberries/Ozon. Ниже сообщения из отраслевого чата продавцов.
 Выдели ТОЛЬКО реально годные ПРАКТИЧЕСКИЕ рекомендации по улучшениям: организационные улучшения, работа с WB/Ozon
 (реклама, цены/акции/СПП, выкупы/отзывы, логистика/склады/штрафы), налоги и учёт селлера, маркировка «Честный знак»,
@@ -197,20 +171,70 @@ SYNTH_PROMPT = """Ты аналитик компании-селлера Wildberr
 """
 
 
+FINAL_PROMPT = """Ты главный редактор рекомендаций для компании-селлера WB/Ozon.
+Ниже черновые рекомендации, уже извлечённые Codex из отдельных групп сообщений.
+Объедини смысловые дубли, отбрось общие слова и рекламные советы, сохрани конкретные цифры,
+обоснования и источники. Не добавляй фактов, которых нет во входе.
+Ответ строго JSON той же схемы: {"recommendations":[{"category":"...","recommendation":"...",
+"rationale":"...","source":"...","keywords":["..."]}]}. Если годного нет — пустой список.
+
+ЧЕРНОВЫЕ РЕКОМЕНДАЦИИ:
+"""
+
+
+def _valid_recommendations(data):
+    rows = data.get("recommendations") if isinstance(data, dict) else []
+    return [r for r in (rows or []) if isinstance(r, dict)
+            and r.get("recommendation") and r.get("category")]
+
+
 def _synthesize(cands):
+    """Analyze every deterministic candidate with Codex; any failed batch aborts the run.
+
+    Aborting is deliberate: main() then leaves every Drive source untouched, instead of
+    confusing «analysis failed» with «there were no recommendations» and deleting evidence.
+    """
+    from quality_llm import QualityLLMError, run_quality_json
+
     recs = []
-    for i in range(0, len(cands), GROQ_BATCH):
-        batch = cands[i:i + GROQ_BATCH]
+    for i in range(0, len(cands), CODEX_BATCH):
+        batch = cands[i:i + CODEX_BATCH]
         lines = [f"[{fname} | {d or '?'} | {a or '?'}] {t}" for _, fname, d, a, t in batch]
-        try:
-            out = _groq(SYNTH_PROMPT + "\n".join(lines))
-            data = json.loads(out)
-            for r in data.get("recommendations") or []:
-                if r.get("recommendation") and r.get("category"):
-                    recs.append(r)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("groq batch %s failed: %s", i, str(exc)[:150])
-        time.sleep(2)
+        data = run_quality_json(
+            SYNTH_PROMPT + "\n".join(lines),
+            purpose="novinki_batch",
+            timeout_s=int(os.getenv("NOVINKI_CODEX_TIMEOUT_S", "240") or "240"),
+            retries=1,
+        )
+        recs.extend(_valid_recommendations(data))
+
+    merge_round = 0
+    while len(recs) > CODEX_FINAL_CAP:
+        merge_round += 1
+        merged = []
+        for i in range(0, len(recs), CODEX_FINAL_CAP):
+            final_input = json.dumps(recs[i:i + CODEX_FINAL_CAP], ensure_ascii=False)
+            final = run_quality_json(
+                FINAL_PROMPT + final_input,
+                purpose="novinki_final",
+                timeout_s=int(os.getenv("NOVINKI_CODEX_TIMEOUT_S", "240") or "240"),
+                retries=1,
+            )
+            merged.extend(_valid_recommendations(final))
+        if len(merged) >= len(recs) or merge_round >= 4:
+            raise QualityLLMError("novinki_final: hierarchical merge did not converge")
+        recs = merged
+
+    if recs:
+        final_input = json.dumps(recs, ensure_ascii=False)
+        final = run_quality_json(
+            FINAL_PROMPT + final_input,
+            purpose="novinki_final",
+            timeout_s=int(os.getenv("NOVINKI_CODEX_TIMEOUT_S", "240") or "240"),
+            retries=1,
+        )
+        recs = _valid_recommendations(final)
+
     # дедуп по началу текста рекомендации
     seen, out = set(), []
     for r in recs:
@@ -279,7 +303,7 @@ def _make_sheet(cs, drive, sheets, recs, files_info, date_label):
                ["Источник", "Google Drive, папка «Новинки» (ежедневная автоматизация novinki_watch)"],
                ["Файлов обработано", str(len(files_info))],
                ["Рекомендаций (новых для базы знаний)", str(len(recs))],
-               ["Метод", "Извлечение текста → скоринг советов (критерии владельца) → синтез Groq → фильтр дублей с базой «О компании» (FTS)"],
+               ["Метод", "Извлечение текста → скоринг советов → синтез Codex без инструментов → фильтр дублей с базой «О компании» (FTS)"],
                ["Обработанные файлы", "удалены из папки после анализа"]]
     sheets.spreadsheets().values().update(spreadsheetId=sid, range=f"'Документы ({len(files_info)})'!A1",
                                           valueInputOption="RAW", body={"values": doc_rows}).execute()
@@ -344,7 +368,7 @@ def main():
         return
 
     from googleapiclient.discovery import build
-    import app  # noqa: F401
+    __import__("app")  # initialize shared Flask/runtime wiring before connector imports
     import gdrive
     from mcp import context_server as cs
     creds = gdrive._google_user_credentials()
