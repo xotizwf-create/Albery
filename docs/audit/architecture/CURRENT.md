@@ -4,7 +4,7 @@ Last reviewed: 2026-08-10.
 
 ## Verified production state
 
-Production server 186 runs implementation commit `f2669ed343d7888a29a92c531c835e31c889002f`.
+Production server 186 runs implementation commit `a09e64c8120687807ad8e1ac3fe49e6841982e80`.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
@@ -53,11 +53,10 @@ scenarios above.
 - Runtime agents receive `skill:albery-audit` plus the optional architecture-audit instruction.
 - Durable decisions and change evidence live in `docs/audit/`.
 
-## Approved target: private per-agent MCP
+## Verified private per-agent MCP
 
-This target is approved under [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md) and tracked
-by [CHG-20260810-04](../changes/CHG-20260810-04-private-per-agent-mcp.md). It is not verified
-production state until that change reaches `verified`.
+This production state is accepted under [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md)
+and verified by [CHG-20260810-04](../changes/CHG-20260810-04-private-per-agent-mcp.md).
 
 ```mermaid
 flowchart LR
@@ -74,3 +73,16 @@ flowchart LR
     R --> Q[Zero-tool Codex contour]
     Q --> S[Summaries and quality reasoning]
 ```
+
+- There are ten active model-facing MCP endpoints, exactly one for each active agent. Their tool
+  sets are computed from database switches intersected with the versioned manifest cap.
+- The five former shared connectors and all legacy SSE routes are removed. URL-token routes do not
+  exist; changing an environment flag cannot restore them.
+- Hermes stores loopback URLs and Bearer headers in a mode-`0600` configuration. All ten agent
+  credentials were rotated during migration.
+- Ports `5002`, `5003`, and `5004` listen on `127.0.0.1` only. Nginx returns 404 for `/mcp*` and
+  `/sse*` on both public hosts while forwarding authenticated Bitrix, Zoom, and Drive webhooks.
+- Owner Telegram uses `agent-main,web`. Deterministic Telegram/CRM operations use an in-process
+  allowlist rather than a shared HTTP MCP credential. Missing main-agent wiring fails closed.
+- Dialogue summaries and diagnostic digests use the isolated zero-tool Codex quality contour;
+  Groq remains responsible for audio and primary screenshot/OCR processing.

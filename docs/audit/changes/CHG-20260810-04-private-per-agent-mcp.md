@@ -1,9 +1,9 @@
 # CHG-20260810-04: Private per-agent MCP migration
 
-- Status: implemented_local
+- Status: verified
 - Date opened: 2026-08-10
 - Related decision: [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md)
-- Bitrix engineering task: pending
+- Bitrix engineering task: not created; no employee-visible task was needed for the technical rollout
 
 ## Goal
 
@@ -34,7 +34,7 @@ the public Internet without interrupting Bitrix, Telegram, or external webhook p
 
 ## Changed boundaries and files
 
-Planned: Flask MCP routes/authentication, Agent Center connector materialization, Telegram internal
+Implemented: Flask MCP routes/authentication, Agent Center connector materialization, Telegram internal
 operations, Bitrix routing and summaries, error digest, deploy smoke, connector migration tooling,
 Nginx configuration, tests, environment documentation, architecture audit, and overview diagram.
 
@@ -62,16 +62,55 @@ Local implementation evidence:
 - Added loopback plus forwarded-address enforcement, header-only steady-state per-agent auth,
   private connector materialization, config mode `0600`, cross-process config locking, and an
   atomic token/config migration script.
-- Added a deliberately temporary, flag-gated path-token compatibility route for the first rollout
-  restart only. It returns 404 by default and will be removed after live config/token migration.
+- Used a deliberately temporary, flag-gated path-token compatibility route for the first restart,
+  then removed the route and its flag from source and production after live config/token migration.
 - Moved dialogue summaries and error-digest analysis to the isolated zero-tool Codex runner; moved
   deterministic Telegram/CRM and maintenance operations to an allowlisted in-process dispatcher.
 - Removed the broad main-agent fallback and changed owner Telegram's default to `agent-main,web`.
 - Added Nginx 404/no-access-log rules on both public hosts while preserving webhook routes.
 - Focused security/behavior matrix: `71 passed`, then compatibility-adjusted focused matrix:
   `63 passed`.
-- Full local regression: `1884 passed, 43 skipped`; skipped cases require PostgreSQL/LibreOffice and
-  run in CI/production as documented. Compile of all changed Python modules passed.
+- Full local regression after final compatibility removal: `1884 passed, 43 skipped`; skipped cases
+  require PostgreSQL/LibreOffice and run in CI/production as documented. Compile and predeploy
+  checks passed.
+
+Production evidence:
+
+- Compatibility/private implementation commit: `e2df63c315965f3632c86094ff41291e7d39ea13`.
+- Final source commit with the path-token route physically removed:
+  `a09e64c8120687807ad8e1ac3fe49e6841982e80`.
+- GitHub Actions: tests `31396642964` passed on frontend, Python 3.12/PostgreSQL 16 and Python
+  3.10/PostgreSQL 14; security audit `31396642760` passed. The first-phase runs `31395304088`
+  and `31395303987` also passed.
+- Migration rotated all ten active agent credentials, removed five shared Hermes connectors and
+  atomically installed ten loopback/header connectors in a mode-`0600` config.
+- Live `tools/list` matched the exact DB/manifest-derived set for every active agent: counts were
+  `110, 137, 166, 109, 10, 0, 0, 116, 141, 20` in slug order reported by deploy smoke.
+- `scripts/deploy_smoke.py` passed after both production phases: 53 workflow references, retired
+  shared/SSE routes, path-token, forwarded/public access, site, calculator, workspace and services.
+- Both public hosts returned 404 for `/mcp`, `/mcp-agent/main` and `/sse`; MCP-host health and site
+  login returned 200. Invalid Zoom/Bitrix webhook probes reached application authentication and
+  returned 403, proving the Nginx block did not swallow webhook paths.
+- Ports `5002`, `5003`, and `5004` listened only on `127.0.0.1`; all six relevant services were
+  active and five-minute error journals were empty.
+- A synthetic zero-tool Codex text run passed; owner routing returned `agent-main,web`; the new
+  in-process Telegram dispatcher completed a read-only CRM lookup and rejected an unallowlisted
+  tool. No employee messages and no CRM writes were made during acceptance.
+
+Backups created before mutation:
+
+- code: `/var/backups/albery/code/pre-private-mcp-20260810_170232.tar.gz`, SHA-256
+  `0280a5bd63f0aeb5d347fddae7961871fdabba0e32fb40de4d4681a1ab9eee02`;
+- environment: `/var/www/albery/.env-backup-private-mcp-20260810_170232`, SHA-256
+  `a2d96905d0b82d9e3686d0d1779bfaccfdb6440a8879976b84af2971c43e21a6`;
+- Hermes config: `/root/.hermes/config.yaml.bak-private-mcp-pre-20260810_170232`, SHA-256
+  `66fd7493e0a305409936b85ff4127ec0467647c8ea1a4fa5dda609a85bbfa679`;
+- Nginx config: `/etc/nginx/sites-available/albery.bak-private-mcp-20260810_170232`, SHA-256
+  `dcdf514896b360051e5b62570f0b002b0ced5a89db62cff26a294b562195a3d9`;
+- agents table: `/var/backups/albery/db/agents-pre-private-mcp-20260810_170232.sql`, SHA-256
+  `3f57cfd8bf224d25e9402d3a71846ac50770efc8103ff83cb0b419c3848ab484`;
+- migration also created `/root/.hermes/config.yaml.bak-private-mcp-20260810_170526` immediately
+  before replacing connector configuration.
 
 ## Risks
 
@@ -85,11 +124,11 @@ Local implementation evidence:
 
 Restore the pre-change code archive, `.env`, Hermes config, Nginx config, and `agents` table dump;
 restore the previous Nginx configuration; restart only in an empty window; run the previous deploy
-smoke and verify journals. A staged rollout flag keeps internal-only enforcement reversible until
-the final verification completes.
+smoke and verify journals. Restoring the old public/path-token design is not an accepted steady-state
+rollback; if emergency access is needed, restore within loopback and rotate credentials again.
 
 ## Known gaps and follow-up
 
-Production evidence, backup paths, commit, CI, token-rotation result, and Bitrix engineering task
-will be appended during implementation and deployment. Cross-host private MCP transport is out of
-scope until the runtime leaves this server.
+Cross-host private MCP transport is out of scope until the runtime leaves this server. A Bitrix
+engineering task was intentionally not created because acceptance required no employee-visible
+task or message; the Git audit record is the durable change log.

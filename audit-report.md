@@ -33,7 +33,7 @@
 - **2026-05-26, 3.1:** `request_client_ip()` больше не доверяет левому клиентскому `X-Forwarded-For`; сначала берёт nginx-controlled `X-Real-IP`, затем правый элемент XFF.
 - **2026-05-26, 3.3:** добавил startup warnings для небезопасных состояний `FLASK_SECRET_KEY=change-this-secret` и `MCP_ALLOW_UNAUTHENTICATED=1`.
 - **2026-05-26, 3.4:** выставил session cookie флаги `HttpOnly`, `SameSite=Lax`, `Secure` для HTTPS-конфигурации с override через `SESSION_COOKIE_SECURE` и добавил Origin/Referer-проверку для state-changing `/api/*` запросов.
-- **2026-05-26, 3.2 / 3.6:** MCP/FAQ секреты сравниваются через `hmac.compare_digest`; URL path-token больше не принимается по умолчанию и оставлен только как явный legacy-режим `MCP_ALLOW_PATH_TOKEN=1`.
+- **2026-08-10, 3.2 / 3.6:** пять общих MCP-классов и URL path-token маршруты удалены; остались только персональные loopback-коннекторы с Bearer-заголовком и `hmac.compare_digest`.
 - **2026-05-26, 3.7:** добавил security headers в HTTPS server-блоки nginx: HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`.
 - **2026-05-26, 3.8:** удалил инъекцию `process.env.OPENAI_API_KEY` из Vite-бандла и убрал неиспользуемые фронтовые зависимости `@google/genai`, `dotenv`, `express`, `@types/express`.
 - **2026-05-26, 3.9:** добавил GitHub Actions workflow `.github/workflows/security-audit.yml` с `pip-audit -r requirements.txt` и `npm audit --omit=dev`; локально оба аудита завершились без найденных уязвимостей.
@@ -231,7 +231,7 @@
 ### [x] 3.2. MCP-секрет передаётся в URL-пути
 **Где:** `/mcp/<path_token>` и `/mcp-faq/<path_token>` ([app.py:20699](app.py#L20699)), поддомен `mcp.m4s.ru` ([nginx:57-74](deploy/nginx-albery.conf#L57)). Секрет попадает в access-логи/реферер/историю; за ним — весь корпоративный контекст.
 **Исправление:** принимать секрет только из `Authorization: Bearer`; путь-вариант убрать или вырезать токен из логов nginx.
-**Сделано:** path-token больше не принимается по умолчанию; основной способ — `Authorization: Bearer`. Для контролируемой обратной совместимости оставлен явный env-флаг `MCP_ALLOW_PATH_TOKEN=1`.
+**Сделано:** path-token и пять общих MCP-маршрутов удалены из кода без compatibility-флага. Hermes обращается только к `127.0.0.1:5004/mcp-agent/<slug>` и передаёт персональный токен в `Authorization: Bearer`; Nginx возвращает 404 на публичные `/mcp*` и `/sse*`.
 
 ### [x] 3.3. «Тихие» небезопасные конфиг-состояния без guard
 **Где:** `MCP_ALLOW_UNAUTHENTICATED=1` при пустом `MCP_SHARED_SECRET` открывает MCP всем ([app.py:20660](app.py#L20660)); `FLASK_SECRET_KEY` дефолтит на `"change-this-secret"` ([app.py:20429](app.py#L20429)) — при незаданном env подписи сессий подделываемы.

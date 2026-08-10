@@ -4,6 +4,7 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-10
 
+- `verified` — [CHG-20260810-04](changes/CHG-20260810-04-private-per-agent-mcp.md): ten rotated per-agent connectors are loopback/header-only; five shared and all path-token/SSE routes are removed; CI, live tool matrices, public negative probes, Codex quality, in-process Telegram reads, webhooks, health and journals passed.
 - `implemented_local` — [CHG-20260810-04](changes/CHG-20260810-04-private-per-agent-mcp.md): shared endpoints removed, private header transport and atomic credential migration implemented; local regression passed.
 - `approved` — [CHG-20260810-04](changes/CHG-20260810-04-private-per-agent-mcp.md): migrate to private header-authenticated per-agent MCP and retire fixed shared connector classes.
 - `accepted` — [ADR-0003](decisions/ADR-0003-private-per-agent-mcp.md): loopback-only per-agent MCP is the sole model capability boundary.
