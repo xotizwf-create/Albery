@@ -1,6 +1,8 @@
 # Employee Context MCP
 
-Read-only MCP server for Claude Code / Claude Desktop. It exposes the local PostgreSQL analytics database through domain tools instead of unrestricted SQL.
+Domain-tool registry for Albery agents and local stdio development. It exposes PostgreSQL-backed
+business operations instead of unrestricted SQL. Production model access is private and scoped to
+the current agent; there is no public shared HTTP connector.
 
 ## Tools
 
@@ -63,7 +65,7 @@ When the user asks an underspecified question, the agent should ask a clarifying
 '@ | .\.venv\Scripts\python.exe .\mcp\context_server.py
 ```
 
-## Claude Code
+## Local Claude Code
 
 This repo includes `.mcp.json`, so Claude Code should discover the server when opened from the project root. In Claude Code, run:
 
@@ -92,7 +94,9 @@ Use employee-context search_zoom_transcripts query "платежный кале�
 ## Notes
 
 - The server reads `DATABASE_URL` from the environment first, then from the project `.env`.
-- For the Flask HTTP endpoint, set `MCP_SHARED_SECRET` and connect Claude Web to `/mcp/<secret>`.
-- The same secret is also accepted as `Authorization: Bearer <secret>`.
+- Production Hermes uses `http://127.0.0.1:5004/mcp-agent/<slug>` with the agent token in an
+  Authorization header. The mode-0600 config is materialized on the server; do not copy it.
+- Public `/mcp*` and `/sse*` routes return 404. URL credentials and shared connector classes are
+  intentionally unsupported.
 - It does not expose arbitrary SQL.
 - Zoom calls are read from `zoom_calls`, `zoom_call_participants`, and `zoom_call_transcript_segments`.

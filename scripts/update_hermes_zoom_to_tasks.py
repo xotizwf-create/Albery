@@ -68,23 +68,17 @@ def main() -> None:
             call_id = str(uuid.UUID(args.reset_and_run))
         except ValueError:
             parser.error("--reset-and-run requires a UUID zoom_call_id")
-        # 1. Delete report via MCP
+        # 1. Delete report through the allowlisted in-process maintenance dispatcher.
         delete_payload = json.dumps({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "delete_zoom_call_report",
-                "arguments": {"call_id": call_id, "confirm": True},
-            },
+            "tool": "delete_zoom_call_report",
+            "arguments": {"call_id": call_id, "confirm": True},
         }, separators=(",", ":"))
         del_cmd = (
-            "secret=$(awk -F= '/^MCP_SHARED_SECRET=/{sub(/^[^=]*=/,\"\"); print; exit}' /var/www/albery/.env); "
-            "curl -sS -X POST http://127.0.0.1:5002/mcp/$secret "
-            "-H 'Content-Type: application/json' "
-            f"-d {shlex.quote(delete_payload)}"
+            "cd /var/www/albery && "
+            f"printf '%s' {shlex.quote(delete_payload)} | "
+            ".venv/bin/python internal_tools.py --profile maintenance"
         )
-        print(f"\nDelete saved report for {call_id} via MCP")
+        print(f"\nDelete saved report for {call_id} through internal dispatcher")
         _, out, err = cli.exec_command(del_cmd, timeout=60)
         print(out.read().decode("utf-8", "replace").rstrip())
         e = err.read().decode("utf-8", "replace")

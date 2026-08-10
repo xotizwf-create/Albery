@@ -15,12 +15,14 @@ def test_replace_connector_block_adds_under_mcp_servers():
         connector.connector_block(
             "iu-customer-runtime",
             "secret-token",
-            "https://mcp.example.test/",
+            "http://127.0.0.1:5004/",
         ),
     )
 
     assert "mcp_servers:\n  agent-iu-customer-runtime:" in result
-    assert "https://mcp.example.test/mcp-agent/iu-customer-runtime/secret-token" in result
+    assert "url: http://127.0.0.1:5004/mcp-agent/iu-customer-runtime" in result
+    assert 'Authorization: "Bearer secret-token"' in result
+    assert "secret-token" not in next(line for line in result.splitlines() if "url:" in line and "mcp-agent" in line)
     assert result.count("agent-iu-customer-runtime:") == 1
 
 
@@ -37,14 +39,14 @@ def test_replace_connector_block_is_idempotent_and_updates_token():
     block = connector.connector_block(
         "iu-customer-runtime",
         "new",
-        "https://mcp.test",
+        "http://127.0.0.1:5004",
     )
 
     first = connector.replace_connector_block(old, "iu-customer-runtime", block)
     second = connector.replace_connector_block(first, "iu-customer-runtime", block)
 
     assert "/old" not in first
-    assert "/new" in first
+    assert 'Authorization: "Bearer new"' in first
     assert first == second
     assert "  other:" in first
 
@@ -54,14 +56,15 @@ def test_replace_connector_block_is_idempotent_and_updates_token():
     (
         "",
         "http://mcp.example.test",
-        "https://user:secret@mcp.example.test",
-        "https://mcp.example.test?target=other",
-        "https://mcp.example.test/#fragment",
-        "https://mcp.example.test/\n  injected: true",
+        "https://127.0.0.1:5004",
+        "http://user:secret@127.0.0.1:5004",
+        "http://127.0.0.1:5004?target=other",
+        "http://127.0.0.1:5004/#fragment",
+        "http://127.0.0.1:5004/\n  injected: true",
     ),
 )
-def test_connector_block_rejects_unsafe_or_implicit_public_base(public_base):
-    with pytest.raises(RuntimeError, match="explicit HTTPS base"):
+def test_connector_block_rejects_non_loopback_or_unsafe_base(public_base):
+    with pytest.raises(RuntimeError, match="explicit loopback HTTP base"):
         connector.connector_block(
             "iu-customer-runtime",
             "secret-token",
@@ -69,24 +72,24 @@ def test_connector_block_rejects_unsafe_or_implicit_public_base(public_base):
         )
 
 
-def test_public_base_is_read_from_the_env_file_not_only_the_process(monkeypatch, tmp_path):
+def test_internal_base_is_read_from_the_env_file_not_only_the_process(monkeypatch, tmp_path):
     # Скрипт запускают руками при деплое, без окружения приложения: значение живёт в .env.
-    monkeypatch.delenv("AGENT_MCP_PUBLIC_BASE", raising=False)
+    monkeypatch.delenv("AGENT_MCP_INTERNAL_BASE", raising=False)
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "DATABASE_URL=postgresql://ignored/db\nAGENT_MCP_PUBLIC_BASE=https://mcp.example.test\n",
+        "DATABASE_URL=postgresql://ignored/db\nAGENT_MCP_INTERNAL_BASE=http://127.0.0.1:5004\n",
         encoding="utf-8",
     )
 
-    assert connector.public_base(env_file) == "https://mcp.example.test"
+    assert connector.internal_base(env_file) == "http://127.0.0.1:5004"
 
 
-def test_public_base_prefers_an_explicit_process_variable(monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENT_MCP_PUBLIC_BASE", "https://explicit.example.test")
+def test_internal_base_prefers_an_explicit_process_variable(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_MCP_INTERNAL_BASE", "http://127.0.0.1:5005")
     env_file = tmp_path / ".env"
-    env_file.write_text("AGENT_MCP_PUBLIC_BASE=https://from-file.example.test\n", encoding="utf-8")
+    env_file.write_text("AGENT_MCP_INTERNAL_BASE=http://127.0.0.1:5004\n", encoding="utf-8")
 
-    assert connector.public_base(env_file) == "https://explicit.example.test"
+    assert connector.internal_base(env_file) == "http://127.0.0.1:5005"
 
 
 def test_committed_manifest_is_zero_tool():

@@ -40,7 +40,7 @@ def test_customer_toolset_never_includes_web(monkeypatch):
 def test_owner_turn_uses_distinct_trusted_connector(monkeypatch):
     seen = {}
 
-    monkeypatch.setenv("TG_AGENT_OWNER_TOOLSETS", "albery,web")
+    monkeypatch.setenv("TG_AGENT_OWNER_TOOLSETS", "agent-main,web")
     monkeypatch.setattr(tg, "_history", lambda _chat_id: [])
     monkeypatch.setattr(tg, "_remember", lambda *_args: None)
 
@@ -51,7 +51,7 @@ def test_owner_turn_uses_distinct_trusted_connector(monkeypatch):
     monkeypatch.setattr(tg, "hermes_answer", fake_answer)
 
     assert tg.owner_turn(7, "покажи задачи") == "ok"
-    assert seen["toolsets"] == "albery,web"
+    assert seen["toolsets"] == "agent-main,web"
     assert seen["toolsets"] != f"agent-{tg.MANAGER_CHANNEL}"
     assert seen["session_prefix"] == "tg-owner-7"
 
@@ -89,7 +89,7 @@ def test_customer_turn_fails_closed_to_dedicated_zero_tool_connector(monkeypatch
         seen["command"] = command
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
-    monkeypatch.setenv("TG_AGENT_TOOLSETS", "albery,web")
+    monkeypatch.setenv("TG_AGENT_TOOLSETS", "agent-main,web")
     monkeypatch.setattr(
         tg,
         "customer_toolsets",

@@ -276,7 +276,9 @@ def tool_get_runtime_status(_: dict[str, Any]) -> dict[str, Any]:
         "database_url": safe_url,
         "server_time": row["server_time"],
         "legacy_http_api_enabled": os.getenv("ALLOW_LEGACY_HTTP_API", "").strip() == "1",
-        "path_token_auth_enabled": os.getenv("MCP_ALLOW_PATH_TOKEN", "").strip() == "1",
+        "mcp_transport": "loopback_http_bearer_per_agent",
+        "mcp_internal_only": os.getenv("MCP_INTERNAL_ONLY", "1").strip().lower()
+        not in {"0", "false", "no", "off"},
         "reference_cache_ttl_seconds": REFERENCE_CACHE_TTL_SECONDS,
         "rules": [
             "Use MCP tools as the primary interface for AI agents.",
@@ -12655,8 +12657,8 @@ FAQ_TOOL_NAMES: set[str] = {
 }
 
 
-# Tools that change global configuration or destroy data. Public scoped connectors (/mcp-ops,
-# /mcp-faq, core variants) never receive these. Per-agent connectors are different: the agent's
+# Tools that change global configuration or destroy data. Non-developer agent profiles never
+# receive these. Per-agent connectors use the agent's
 # own whitelist is the capability boundary, so an owner/destructive tool can be exposed there
 # only when it is explicitly enabled for that particular agent.
 OWNER_ONLY_TOOL_NAMES: set[str] = {
@@ -12693,15 +12695,12 @@ OWNER_ONLY_TOOL_NAMES: set[str] = {
 # тиры Bitrix-доступа не совпадают с этим списком (у Александра admin, но менять оргструктуру
 # ему не разрешено).
 
-# Operational-full connector: every registered tool EXCEPT the admin-only ones above.
+# Legacy operational preset metadata: every registered tool except the admin-only ones above.
 OPS_TOOL_NAMES: set[str] = set(TOOLS) - OWNER_ONLY_TOOL_NAMES
 
-# --- Core toolset: two-stage tool loading for the chat bot (/mcp-core, /mcp-ops-core) --------
-# The chat bot registers only this curated core (picked from real usage stats in the Hermes
-# session DB: ~82% of all historical calls, plus every tool the bot prompt names explicitly)
-# and two meta-tools. Everything else is discovered via find_tool and invoked via call_tool.
-# Cron agents keep the full /mcp and /mcp-ops connectors, so their scripted tool names are
-# unaffected by this list.
+# --- Legacy core metadata retained for migration/UI tests; no production HTTP connector --------
+# Per-agent turns receive their exact dynamically computed tool list. This curated list remains
+# only for historical two-stage behavior and compatibility tests while old preset metadata exists.
 CORE_TOOL_NAMES: set[str] = {
     # entry / self-knowledge
     "start_here_always_read_ai_instructions",
@@ -13127,8 +13126,8 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
                 if core:
                     raise McpError(-32601, f"Unknown or unavailable tool: {name}. Найди точное имя через find_tool.")
                 raise McpError(-32601, f"Unknown or unavailable tool: {name}")
-            # Public scoped connectors (/mcp-ops, /mcp-faq, core variants) must never expose
-            # owner/destructive tools. Per-agent connectors pass allow_owner_tools=True: their
+            # Non-developer scoped calls must never expose owner/destructive tools. Per-agent
+            # connectors pass allow_owner_tools=True: their
             # security boundary is the exact agent whitelist from _agent_tool_names().
             if name in OWNER_ONLY_TOOL_NAMES and tool_names is not None and not allow_owner_tools:
                 raise McpError(-32601, f"Unknown or unavailable tool: {name}")

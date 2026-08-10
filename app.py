@@ -8,13 +8,13 @@ import urllib.parse
 import urllib.error
 import hmac
 import html
+import ipaddress
 import logging
 import mimetypes
 import os
 import secrets
 import subprocess
 import threading
-from queue import Empty, Queue
 import re
 import time
 from collections import Counter
@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, abort, has_request_context, jsonify, redirect, request, send_file, send_from_directory, session, stream_with_context, url_for
+from flask import Flask, Response, abort, has_request_context, jsonify, redirect, request, send_file, send_from_directory, session, url_for
 import psycopg
 from psycopg.types.json import Jsonb
 from werkzeug.exceptions import HTTPException
@@ -16145,8 +16145,6 @@ app.config["SESSION_COOKIE_SAMESITE"] = os.getenv("SESSION_COOKIE_SAMESITE", "La
 session_cookie_secure_default = "1" if os.getenv("CANONICAL_WEB_HOST", "").strip() else "0"
 app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", session_cookie_secure_default).strip().lower() not in {"0", "false", "no"}
 app.jinja_env.filters["dt_ru"] = format_datetime_ru
-if os.getenv("MCP_ALLOW_UNAUTHENTICATED", "").strip() == "1":
-    app.logger.warning("MCP_ALLOW_UNAUTHENTICATED=1 is enabled; MCP endpoints are open without a shared secret.")
 if not postgres_enabled():
     init_db()
     repair_db_chat_columns()
@@ -16170,7 +16168,6 @@ def handle_unhandled_exception(exc: Exception):
     return Response("Internal server error.", status=500, mimetype="text/plain")
 
 
-MCP_SSE_SESSIONS: dict[str, Queue[str]] = {}
 LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 AUTH_EXEMPT_ROUTES = frozenset({
     "/login",
@@ -16180,14 +16177,6 @@ AUTH_EXEMPT_ROUTES = frozenset({
     # сломанным пулом соединений («порт слушает, /login отдаёт 200» ничего не доказывает).
     # Наружу не отдаётся ничего, кроме «база отвечает» и роли процесса. См. healthz.py.
     "/healthz",
-    "/mcp",
-    "/mcp-faq",
-    "/mcp-ops",
-    "/mcp-core",
-    "/mcp-ops-core",
-    "/sse",
-    "/sse-faq",
-    "/sse-ops",
     "/favicon.ico",
     "/favicon.svg",
     "/favicon-16x16.png",
@@ -16197,15 +16186,7 @@ AUTH_EXEMPT_ROUTES = frozenset({
 })
 AUTH_EXEMPT_PREFIXES = (
     "/assets/",
-    "/mcp/",
-    "/mcp-faq/",
-    "/mcp-ops/",
-    "/mcp-core/",
-    "/mcp-ops-core/",
     "/mcp-agent/",
-    "/sse/",
-    "/sse-faq/",
-    "/sse-ops/",
     "/bitrix/events/",
     "/bitrix/imbot/",
     "/zoom/events/",
@@ -16217,6 +16198,41 @@ AUTH_EXEMPT_PREFIXES = (
     # доступа в кабинет. Страница ничего не отдаёт, кроме перехода на анкету.
     "/iu/",
 )
+
+RETIRED_MCP_ROUTES = frozenset({
+    "/mcp", "/mcp-faq", "/mcp-ops", "/mcp-core", "/mcp-ops-core",
+    "/sse", "/sse-faq", "/sse-ops",
+})
+
+
+def retired_mcp_path(path: str) -> bool:
+    return any(path == route or path.startswith(route + "/") for route in RETIRED_MCP_ROUTES)
+
+
+def mcp_internal_request_ok() -> bool:
+    """MCP is a same-host transport; forwarded/public requests fail closed.
+
+    `request.remote_addr` alone is insufficient behind Nginx because every proxied request appears
+    to originate from loopback. A forwarded address therefore invalidates an MCP request unless
+    every advertised hop is itself loopback. `MCP_INTERNAL_ONLY=0` exists only as a staged-deploy
+    rollback switch and must not be the steady production state.
+    """
+    if os.getenv("MCP_INTERNAL_ONLY", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return True
+
+    addresses = [str(request.remote_addr or "").strip()]
+    addresses.extend(
+        part.strip()
+        for header in (request.headers.get("X-Real-IP", ""), request.headers.get("X-Forwarded-For", ""))
+        for part in header.split(",")
+        if part.strip()
+    )
+    if not addresses or not addresses[0]:
+        return False
+    try:
+        return all(ipaddress.ip_address(address).is_loopback for address in addresses)
+    except ValueError:
+        return False
 
 
 def configured_admin_password_hash() -> str:
@@ -16259,7 +16275,10 @@ def auth_exempt_path(path: str) -> bool:
 
 
 def internal_api_auth_ok() -> bool:
-    expected = os.getenv("MCP_SHARED_SECRET", "").strip()
+    expected = (
+        os.getenv("INTERNAL_API_SHARED_SECRET", "").strip()
+        or os.getenv("MCP_SHARED_SECRET", "").strip()  # rollout compatibility; remove after rotation
+    )
     if not expected:
         return False
     provided = first_non_empty(
@@ -16319,6 +16338,8 @@ def require_admin_auth():
         return redirect_response
 
     path = request.path
+    if retired_mcp_path(path):
+        abort(404)
     # The operator workspace is a separate authentication realm. Route it before the legacy
     # /api kill switch and before the site's admin session gate; a workspace login never grants
     # access to the rest of Albery.
@@ -16463,46 +16484,6 @@ def logout():
     return redirect(url_for("login"), code=302)
 
 
-def mcp_auth_ok(path_token: str | None = None) -> bool:
-    expected = os.getenv("MCP_SHARED_SECRET", "").strip()
-    if not expected:
-        return os.getenv("MCP_ALLOW_UNAUTHENTICATED", "").strip() == "1"
-    if path_token and os.getenv("MCP_ALLOW_PATH_TOKEN", "").strip() == "1" and hmac.compare_digest(path_token, expected):
-        return True
-    auth_header = request.headers.get("Authorization", "").strip()
-    return hmac.compare_digest(auth_header, f"Bearer {expected}")
-
-
-def faq_mcp_auth_ok(path_token: str | None = None) -> bool:
-    expected = os.getenv("MCP_FAQ_SHARED_SECRET", "").strip()
-    if not expected:
-        return False
-    if path_token and os.getenv("MCP_ALLOW_PATH_TOKEN", "").strip() == "1" and hmac.compare_digest(path_token, expected):
-        return True
-    auth_header = request.headers.get("Authorization", "").strip()
-    return hmac.compare_digest(auth_header, f"Bearer {expected}")
-
-
-def ops_mcp_auth_ok(path_token: str | None = None) -> bool:
-    """Auth for the operational-full MCP connector (/mcp-ops): all tools EXCEPT the admin-only
-    ones (instruction/capability edits, destructive deletes — see OWNER_ONLY_TOOL_NAMES)."""
-    expected = os.getenv("MCP_OPS_SHARED_SECRET", "").strip()
-    if not expected:
-        return False
-    if path_token and os.getenv("MCP_ALLOW_PATH_TOKEN", "").strip() == "1" and hmac.compare_digest(path_token, expected):
-        return True
-    auth_header = request.headers.get("Authorization", "").strip()
-    return hmac.compare_digest(auth_header, f"Bearer {expected}")
-
-
-def mcp_auth_error():
-    return jsonify({
-        "jsonrpc": "2.0",
-        "id": None,
-        "error": {"code": -32001, "message": "MCP authentication required."},
-    }), 401
-
-
 def mcp_status_code(response: dict[str, Any]) -> int:
     # Streamable-HTTP MCP clients (the official SDK, used by Hermes) only read
     # the JSON-RPC body of 2xx responses: a tool error shipped as HTTP 4xx/5xx
@@ -16513,392 +16494,6 @@ def mcp_status_code(response: dict[str, Any]) -> int:
     if "error" not in response:
         return 200
     return 200 if response.get("id") is not None else 400
-
-
-def mcp_sse_event(event: str, data: str) -> str:
-    lines = [f"event: {event}"]
-    lines.extend(f"data: {line}" for line in data.splitlines() or [""])
-    return "\n".join(lines) + "\n\n"
-
-
-@app.get("/mcp")
-@app.get("/mcp/<path:path_token>")
-def mcp_info(path_token: str | None = None):
-    if not mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    return jsonify({
-        "name": "employee-analytics-context",
-        "transport": "http-json-rpc",
-        "endpoint": "/mcp",
-        "auth": "shared-secret" if os.getenv("MCP_SHARED_SECRET", "").strip() else "none",
-        "methods": ["initialize", "tools/list", "tools/call"],
-    })
-
-
-@app.post("/mcp")
-@app.post("/mcp/<path:path_token>")
-def mcp_http(path_token: str | None = None):
-    if not mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    from mcp.context_server import handle_request
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32700, "message": "Request body must be JSON."},
-        }), 400
-
-    response = handle_request(payload)
-    if response is None:
-        return ("", 202)
-    return jsonify(response), mcp_status_code(response)
-
-
-@app.get("/mcp-faq")
-@app.get("/mcp-faq/<path:path_token>")
-def mcp_faq_info(path_token: str | None = None):
-    if not faq_mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    from mcp.context_server import FAQ_TOOL_NAMES
-
-    return jsonify({
-        "name": "employee-analytics-context-faq",
-        "transport": "http-json-rpc",
-        "endpoint": "/mcp-faq",
-        "auth": "shared-secret",
-        "scope": "read-only company knowledge, Zoom calls, and org structure",
-        "methods": ["initialize", "tools/list", "tools/call"],
-        "tools": sorted(FAQ_TOOL_NAMES),
-    })
-
-
-@app.post("/mcp-faq")
-@app.post("/mcp-faq/<path:path_token>")
-def mcp_faq_http(path_token: str | None = None):
-    if not faq_mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    from mcp.context_server import FAQ_TOOL_NAMES, handle_request
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32700, "message": "Request body must be JSON."},
-        }), 400
-
-    response = handle_request(payload, tool_names=FAQ_TOOL_NAMES)
-    if response is None:
-        return ("", 202)
-    return jsonify(response), mcp_status_code(response)
-
-
-@app.get("/mcp-ops")
-@app.get("/mcp-ops/<path:path_token>")
-def mcp_ops_info(path_token: str | None = None):
-    if not ops_mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    from mcp.context_server import OPS_TOOL_NAMES
-
-    return jsonify({
-        "name": "employee-analytics-context-ops",
-        "transport": "http-json-rpc",
-        "endpoint": "/mcp-ops",
-        "auth": "shared-secret",
-        "scope": "full operational access EXCEPT admin tools (AI instruction/capability edits, destructive deletes)",
-        "methods": ["initialize", "tools/list", "tools/call"],
-        "tools": sorted(OPS_TOOL_NAMES),
-    })
-
-
-@app.post("/mcp-ops")
-@app.post("/mcp-ops/<path:path_token>")
-def mcp_ops_http(path_token: str | None = None):
-    if not ops_mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    from mcp.context_server import OPS_TOOL_NAMES, handle_request
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32700, "message": "Request body must be JSON."},
-        }), 400
-
-    response = handle_request(payload, tool_names=OPS_TOOL_NAMES)
-    if response is None:
-        return ("", 202)
-    return jsonify(response), mcp_status_code(response)
-
-
-# --- Core connectors: curated tool core + find_tool/call_tool (two-stage loading). Used by the
-# Bitrix chat bot to keep per-turn context small; cron agents keep the full /mcp and /mcp-ops
-# connectors, so their scripted tool names are unaffected.
-@app.get("/mcp-core")
-@app.get("/mcp-core/<path:path_token>")
-def mcp_core_info(path_token: str | None = None):
-    if not mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    return jsonify({
-        "name": "employee-analytics-context-core",
-        "transport": "http-json-rpc",
-        "endpoint": "/mcp-core",
-        "auth": "shared-secret",
-        "scope": "curated core of the full connector + find_tool/call_tool for the rest",
-        "methods": ["initialize", "tools/list", "tools/call"],
-    })
-
-
-@app.post("/mcp-core")
-@app.post("/mcp-core/<path:path_token>")
-def mcp_core_http(path_token: str | None = None):
-    if not mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    from mcp.context_server import handle_request
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32700, "message": "Request body must be JSON."},
-        }), 400
-
-    response = handle_request(payload, core=True)
-    if response is None:
-        return ("", 202)
-    return jsonify(response), mcp_status_code(response)
-
-
-@app.get("/mcp-ops-core")
-@app.get("/mcp-ops-core/<path:path_token>")
-def mcp_ops_core_info(path_token: str | None = None):
-    if not ops_mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    return jsonify({
-        "name": "employee-analytics-context-ops-core",
-        "transport": "http-json-rpc",
-        "endpoint": "/mcp-ops-core",
-        "auth": "shared-secret",
-        "scope": "curated core of the ops connector + find_tool/call_tool for the rest",
-        "methods": ["initialize", "tools/list", "tools/call"],
-    })
-
-
-@app.post("/mcp-ops-core")
-@app.post("/mcp-ops-core/<path:path_token>")
-def mcp_ops_core_http(path_token: str | None = None):
-    if not ops_mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    from mcp.context_server import OPS_TOOL_NAMES, handle_request
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32700, "message": "Request body must be JSON."},
-        }), 400
-
-    response = handle_request(payload, tool_names=OPS_TOOL_NAMES, core=True)
-    if response is None:
-        return ("", 202)
-    return jsonify(response), mcp_status_code(response)
-
-
-@app.get("/sse")
-@app.get("/sse/<path:path_token>")
-def mcp_sse(path_token: str | None = None):
-    if not mcp_auth_ok(path_token):
-        return mcp_auth_error()
-
-    session_id = uuid4().hex
-    queue: Queue[str] = Queue()
-    MCP_SSE_SESSIONS[session_id] = queue
-    if path_token:
-        endpoint = url_for("mcp_sse_messages", session_id=session_id, path_token=path_token)
-    else:
-        endpoint = url_for("mcp_sse_messages", session_id=session_id)
-
-    @stream_with_context
-    def stream():
-        yield mcp_sse_event("endpoint", endpoint)
-        try:
-            while True:
-                try:
-                    yield queue.get(timeout=15)
-                except Empty:
-                    yield ": keepalive\n\n"
-        finally:
-            MCP_SSE_SESSIONS.pop(session_id, None)
-
-    return Response(
-        stream(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-store",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.get("/sse-faq")
-@app.get("/sse-faq/<path:path_token>")
-def mcp_faq_sse(path_token: str | None = None):
-    if not faq_mcp_auth_ok(path_token):
-        return mcp_auth_error()
-
-    session_id = uuid4().hex
-    queue: Queue[str] = Queue()
-    MCP_SSE_SESSIONS[session_id] = queue
-    if path_token:
-        endpoint = url_for("mcp_faq_sse_messages", session_id=session_id, path_token=path_token)
-    else:
-        endpoint = url_for("mcp_faq_sse_messages", session_id=session_id)
-
-    @stream_with_context
-    def stream():
-        yield mcp_sse_event("endpoint", endpoint)
-        try:
-            while True:
-                try:
-                    yield queue.get(timeout=15)
-                except Empty:
-                    yield ": keepalive\n\n"
-        finally:
-            MCP_SSE_SESSIONS.pop(session_id, None)
-
-    return Response(
-        stream(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-store",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.post("/mcp/messages/<session_id>")
-@app.post("/mcp/messages/<session_id>/<path:path_token>")
-def mcp_sse_messages(session_id: str, path_token: str | None = None):
-    if not mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    queue = MCP_SSE_SESSIONS.get(session_id)
-    if queue is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32004, "message": "Unknown MCP SSE session."},
-        }), 404
-
-    from mcp.context_server import handle_request
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32700, "message": "Request body must be JSON."},
-        }), 400
-
-    response = handle_request(payload)
-    if response is not None:
-        queue.put(mcp_sse_event("message", json.dumps(response, ensure_ascii=False)))
-    return ("", 202)
-
-
-@app.post("/mcp-faq/messages/<session_id>")
-@app.post("/mcp-faq/messages/<session_id>/<path:path_token>")
-def mcp_faq_sse_messages(session_id: str, path_token: str | None = None):
-    if not faq_mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    queue = MCP_SSE_SESSIONS.get(session_id)
-    if queue is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32004, "message": "Unknown MCP SSE session."},
-        }), 404
-
-    from mcp.context_server import FAQ_TOOL_NAMES, handle_request
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32700, "message": "Request body must be JSON."},
-        }), 400
-
-    response = handle_request(payload, tool_names=FAQ_TOOL_NAMES)
-    if response is not None:
-        queue.put(mcp_sse_event("message", json.dumps(response, ensure_ascii=False)))
-    return ("", 202)
-
-
-@app.get("/sse-ops")
-@app.get("/sse-ops/<path:path_token>")
-def mcp_ops_sse(path_token: str | None = None):
-    if not ops_mcp_auth_ok(path_token):
-        return mcp_auth_error()
-
-    session_id = uuid4().hex
-    queue: Queue[str] = Queue()
-    MCP_SSE_SESSIONS[session_id] = queue
-    if path_token:
-        endpoint = url_for("mcp_ops_sse_messages", session_id=session_id, path_token=path_token)
-    else:
-        endpoint = url_for("mcp_ops_sse_messages", session_id=session_id)
-
-    @stream_with_context
-    def stream():
-        yield mcp_sse_event("endpoint", endpoint)
-        try:
-            while True:
-                try:
-                    yield queue.get(timeout=15)
-                except Empty:
-                    yield ": keepalive\n\n"
-        finally:
-            MCP_SSE_SESSIONS.pop(session_id, None)
-
-    return Response(
-        stream(),
-        mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache, no-store", "X-Accel-Buffering": "no"},
-    )
-
-
-@app.post("/mcp-ops/messages/<session_id>")
-@app.post("/mcp-ops/messages/<session_id>/<path:path_token>")
-def mcp_ops_sse_messages(session_id: str, path_token: str | None = None):
-    if not ops_mcp_auth_ok(path_token):
-        return mcp_auth_error()
-    queue = MCP_SSE_SESSIONS.get(session_id)
-    if queue is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32004, "message": "Unknown MCP SSE session."},
-        }), 404
-
-    from mcp.context_server import OPS_TOOL_NAMES, handle_request
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32700, "message": "Request body must be JSON."},
-        }), 400
-
-    response = handle_request(payload, tool_names=OPS_TOOL_NAMES)
-    if response is not None:
-        queue.put(mcp_sse_event("message", json.dumps(response, ensure_ascii=False)))
-    return ("", 202)
 
 
 @app.get("/")

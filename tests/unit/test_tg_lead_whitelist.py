@@ -101,44 +101,46 @@ def test_username_normalisation(tg):
     assert tg._norm_username("не username с пробелами") == ""
 
 
-def test_funnel_usernames_are_read_through_local_mcp(tg, monkeypatch):
-    """Вебхук Bitrix не имеет прав на CRM — список берётся через MCP приложения."""
+def test_funnel_usernames_are_read_through_allowlisted_internal_dispatch(tg, monkeypatch):
+    """The standalone service reuses the CRM handler without a network MCP credential."""
+    import internal_tools
+
     captured = {}
 
-    class Resp:
-        text = json.dumps({"result": {"contacts": [
+    def fake_call(name, arguments, *, allowed):
+        captured.update(name=name, arguments=arguments, allowed=allowed)
+        return {"contacts": [
             {"username": "griaznov.d", "deal_id": 82},
             {"username": "", "deal_id": 80},
-        ]}})
+        ]}
 
-    monkeypatch.setenv("MCP_SHARED_SECRET", "secret")
-    monkeypatch.setattr(tg.requests, "post",
-                        lambda url, json=None, headers=None, timeout=0:
-                        captured.update(url=url, body=json, headers=headers) or Resp())
+    monkeypatch.setattr(internal_tools, "call_internal_tool", fake_call)
 
     out = tg.crm_lead_usernames(force=True)
 
     assert out == {"griaznov.d": 82}, "пустые значения не попадают в список"
-    assert captured["body"]["params"]["name"] == "list_crm_lead_contacts"
-    assert captured["headers"]["Authorization"].startswith("Bearer ")
+    assert captured["name"] == "list_crm_lead_contacts"
+    assert captured["arguments"] == {}
+    assert captured["allowed"] == internal_tools.TELEGRAM_RUNTIME_TOOLS
 
 
-def test_sse_wrapped_answer_is_understood(tg, monkeypatch):
-    """MCP может ответить потоком — иначе список молча окажется пустым."""
-    body = json.dumps({"result": {"contacts": [{"username": "lead_one", "deal_id": 5}]}})
+def test_internal_result_is_understood(tg, monkeypatch):
+    import internal_tools
 
-    class Resp:
-        text = "event: message\ndata: " + body + "\n\n"
-
-    monkeypatch.setenv("MCP_SHARED_SECRET", "secret")
-    monkeypatch.setattr(tg.requests, "post", lambda *a, **kw: Resp())
+    monkeypatch.setattr(
+        internal_tools,
+        "call_internal_tool",
+        lambda *args, **kwargs: {"contacts": [{"username": "lead_one", "deal_id": 5}]},
+    )
 
     assert tg.crm_lead_usernames(force=True) == {"lead_one": 5}
 
 
-def test_no_secret_means_no_whitelist(tg, monkeypatch):
-    monkeypatch.delenv("MCP_SHARED_SECRET", raising=False)
-    assert tg.crm_lead_usernames(force=True) == {}
+def test_unallowlisted_internal_tool_is_rejected():
+    import internal_tools
+
+    with pytest.raises(internal_tools.InternalToolError, match="not allowed"):
+        internal_tools.call_internal_tool("delete_bitrix_task", {}, allowed=internal_tools.TELEGRAM_RUNTIME_TOOLS)
 
 
 def test_crm_failure_falls_back_to_cached_list(tg, monkeypatch):
@@ -148,8 +150,8 @@ def test_crm_failure_falls_back_to_cached_list(tg, monkeypatch):
     def boom(*a, **kw):
         raise RuntimeError("сеть недоступна")
 
-    monkeypatch.setenv("MCP_SHARED_SECRET", "secret")
-    monkeypatch.setattr(tg.requests, "post", boom)
+    import internal_tools
+    monkeypatch.setattr(internal_tools, "call_internal_tool", boom)
 
     assert tg.crm_lead_usernames(force=True) == {"griaznov.d": 82}
 

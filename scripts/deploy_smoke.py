@@ -8,8 +8,9 @@ Checks:
 1. Every workflow name referenced by mcp/context_server.py via app_workflow_function("...")
    actually resolves. (2026-07-02 incident: a move-only refactor step relocated
    bitrix_method_call out of app.py and silently broke task creation for a day.)
-2. Core MCP endpoints answer tools/list with sane tool counts.
-3. The dedicated customer connector is active and exposes exactly zero tools.
+2. Every active agent connector is loopback-only, header-authenticated and exposes exactly its
+   database/manifest-derived tool set.
+3. Shared, path-token, forwarded and public MCP access is closed.
 4. The site and standalone funnel workspace routes are wired.
 5. When the workspace is enabled, its password, at least one Telegram transport and
    rollout flags are coherent.
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 import yaml
@@ -36,14 +38,10 @@ from shared.db import assert_tables_exist, connect  # noqa: E402
 load_dotenv(BASE / ".env")
 
 APP_URL = "http://127.0.0.1:5002"
-MIN_TOOLS = {"/mcp": 60, "/mcp-ops": 55, "/mcp-faq": 10, "/mcp-core": 20, "/mcp-ops-core": 20}
-TOKEN_ENV = {
-    "/mcp": "MCP_SHARED_SECRET",
-    "/mcp-ops": "MCP_OPS_SHARED_SECRET",
-    "/mcp-faq": "MCP_FAQ_SHARED_SECRET",
-    "/mcp-core": "MCP_SHARED_SECRET",
-    "/mcp-ops-core": "MCP_OPS_SHARED_SECRET",
-}
+MCP_APP_URL = os.getenv("MCP_INTERNAL_BASE_URL", "http://127.0.0.1:5004").rstrip("/")
+PUBLIC_MCP_BASE = os.getenv("MCP_PUBLIC_PROBE_BASE", "https://mcp.m4s.ru").rstrip("/")
+RETIRED_CONNECTORS = {"albery", "albery-faq", "albery-ops", "albery-core", "albery-ops-core"}
+RETIRED_PATHS = ("/mcp", "/mcp-faq", "/mcp-ops", "/mcp-core", "/mcp-ops-core", "/sse", "/sse-faq", "/sse-ops")
 
 failures: list[str] = []
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -113,143 +111,115 @@ def looks_like_password_hash(value: object) -> bool:
     return text.startswith(("scrypt:", "pbkdf2:"))
 
 
-# 2. MCP endpoints must list their tools.
-for path, min_tools in MIN_TOOLS.items():
-    token = os.getenv(TOKEN_ENV[path], "").strip()
-    if not token:
-        failures.append(f"{path}: секрет {TOKEN_ENV[path]} не найден в env")
-        continue
-    try:
-        status, body = post_json(
-            f"{APP_URL}{path}", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-            {"Authorization": f"Bearer {token}"},
-        )
-        tools = (body.get("result") or {}).get("tools") or []
-        if status != 200 or len(tools) < min_tools:
-            failures.append(f"{path}: status={status}, tools={len(tools)} (ожидалось >={min_tools})")
-        else:
-            print(f"{path}: OK, {len(tools)} инструментов")
-    except Exception as exc:  # noqa: BLE001
-        failures.append(f"{path}: {exc}")
-
-# 2b. Two-stage tools on the core connectors must actually work.
-def call_mcp(path: str, tool: str, arguments: dict) -> dict:
-    token = os.getenv(TOKEN_ENV[path], "").strip()
-    _status, body = post_json(
-        f"{APP_URL}{path}",
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-         "params": {"name": tool, "arguments": arguments}},
-        {"Authorization": f"Bearer {token}"},
-    )
-    return body
-
-
+# 2. Every active agent must have one exact private connector.
+config_path = Path(os.getenv("HERMES_CONFIG", "/root/.hermes/config.yaml")).expanduser()
+active_agents: list[dict] = []
 try:
-    body = call_mcp("/mcp-core", "find_tool", {"query": "delete task"})
-    text = json.dumps(body, ensure_ascii=False)
-    if "delete_bitrix_task" not in text:
-        failures.append(f"/mcp-core find_tool('delete task') не нашёл delete_bitrix_task: {text[:200]}")
-    else:
-        print("/mcp-core find_tool: OK")
-    body = call_mcp("/mcp-ops-core", "call_tool", {"name": "health", "arguments": {}})
-    text = json.dumps(body, ensure_ascii=False)
-    if "error" in body or "ok" not in text.lower():
-        failures.append(f"/mcp-ops-core call_tool(health) не прошёл: {text[:200]}")
-    else:
-        print("/mcp-ops-core call_tool: OK")
+    config_mode = config_path.stat().st_mode & 0o777
+    if config_mode != 0o600:
+        failures.append(f"Hermes config mode={oct(config_mode)}, ожидалось 0o600")
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    mcp_servers = config.get("mcp_servers") or {}
+    stale = sorted(RETIRED_CONNECTORS & set(mcp_servers))
+    if stale:
+        failures.append(f"Hermes config содержит retired connectors: {', '.join(stale)}")
 except Exception as exc:  # noqa: BLE001
-    failures.append(f"core meta-tools: {exc}")
+    config = {}
+    mcp_servers = {}
+    failures.append(f"Hermes config не читается ({type(exc).__name__})")
 
-# 3. Customer text must reach a valid connector with no callable tools.
-customer_slug = (
-    os.getenv("FUNNEL_WORKSPACE_CUSTOMER_TOOLSET_SLUG", "iu-customer-runtime").strip()
-    or "iu-customer-runtime"
-)
 try:
+    from agent_center import _agent_by_slug, _agent_self_tool_names, _agent_tool_names
+
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT mcp_token, is_active, bitrix_bot_id, telegram_bot_token
-                  FROM agents
-                 WHERE slug = %s
-                """,
-                (customer_slug,),
-            )
-            customer_agent = cur.fetchone()
-    if not customer_agent:
-        failures.append(f"agent-{customer_slug}: DB row отсутствует")
-    elif not customer_agent["is_active"]:
-        failures.append(f"agent-{customer_slug}: выключен")
-    elif customer_agent.get("bitrix_bot_id") or customer_agent.get("telegram_bot_token"):
-        failures.append(f"agent-{customer_slug}: не должен иметь Bitrix/Telegram bridge")
-    elif not str(customer_agent.get("mcp_token") or "").strip():
-        failures.append(f"agent-{customer_slug}: connector token отсутствует")
-    else:
-        connector_token = str(customer_agent["mcp_token"]).strip()
-        config_path = Path(
-            os.getenv("HERMES_CONFIG", "/root/.hermes/config.yaml")
-        ).expanduser()
-        try:
-            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            connector = (config.get("mcp_servers") or {}).get(
-                f"agent-{customer_slug}"
-            )
-            if not isinstance(connector, dict):
-                failures.append(
-                    f"agent-{customer_slug}: connector отсутствует в Hermes config"
-                )
-            else:
-                connector_url = str(connector.get("url") or "").strip()
-                parsed = urllib.parse.urlparse(connector_url)
-                expected_path = f"/mcp-agent/{customer_slug}/{connector_token}"
-                if connector.get("enabled") is not True:
-                    failures.append(
-                        f"agent-{customer_slug}: connector выключен в Hermes config"
-                    )
-                elif (
-                    parsed.scheme not in {"http", "https"}
-                    or not parsed.netloc
-                    or parsed.path.rstrip("/") != expected_path
-                    or parsed.query
-                    or parsed.fragment
-                ):
-                    failures.append(
-                        f"agent-{customer_slug}: connector URL не совпадает с DB token"
-                    )
-                else:
-                    print(
-                        f"agent-{customer_slug}: Hermes config OK "
-                        "(URL/token скрыты)"
-                    )
-        except Exception as exc:  # noqa: BLE001
-            # The config contains connector secrets; report only the exception class.
-            failures.append(
-                f"agent-{customer_slug}: Hermes config не читается "
-                f"({type(exc).__name__})"
-            )
+            cur.execute("SELECT slug, mcp_token FROM agents WHERE is_active ORDER BY slug")
+            active_agents = [dict(row) for row in cur.fetchall()]
+    for row in active_agents:
+        slug = str(row["slug"])
+        token = str(row.get("mcp_token") or "").strip()
+        connector = mcp_servers.get(f"agent-{slug}")
+        if not token:
+            failures.append(f"agent-{slug}: DB token отсутствует")
+            continue
+        if not isinstance(connector, dict):
+            failures.append(f"agent-{slug}: connector отсутствует в Hermes config")
+            continue
+        connector_url = str(connector.get("url") or "").strip()
+        parsed = urllib.parse.urlparse(connector_url)
+        headers = connector.get("headers") if isinstance(connector.get("headers"), dict) else {}
+        auth = str(headers.get("Authorization") or "")
+        if (
+            connector.get("enabled") is not True
+            or parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
+            or parsed.path.rstrip("/") != f"/mcp-agent/{slug}"
+            or parsed.query
+            or parsed.fragment
+            or token in connector_url
+            or auth != f"Bearer {token}"
+        ):
+            failures.append(f"agent-{slug}: connector не соответствует private/header contract")
+            continue
+
+        agent = _agent_by_slug(slug)
+        expected = _agent_tool_names(agent) | _agent_self_tool_names(agent)
         try:
             status, body = post_json(
-                (
-                    f"{APP_URL}/mcp-agent/{customer_slug}/"
-                    f"{connector_token}"
-                ),
+                connector_url,
                 {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                {"Authorization": auth},
             )
-            tools = (body.get("result") or {}).get("tools") or []
-            if status != 200 or tools:
+            actual = {tool.get("name") for tool in ((body.get("result") or {}).get("tools") or [])}
+            if status != 200 or actual != expected:
                 failures.append(
-                    f"agent-{customer_slug}: status={status}, tools={len(tools)} (ожидалось 0)"
+                    f"agent-{slug}: status={status}, tools={len(actual)}, ожидалось={len(expected)}"
                 )
             else:
-                print(f"agent-{customer_slug}: OK, 0 инструментов")
+                print(f"agent-{slug}: private header auth OK, tools={len(actual)}")
         except Exception as exc:  # noqa: BLE001
-            # Never stringify the request URL here: it contains the connector token.
-            failures.append(
-                f"agent-{customer_slug}: tools/list не прошёл ({type(exc).__name__})"
-            )
+            failures.append(f"agent-{slug}: tools/list не прошёл ({type(exc).__name__})")
 except Exception as exc:  # noqa: BLE001
-    failures.append(f"agent-{customer_slug}: DB-проверка не прошла ({type(exc).__name__})")
+    failures.append(f"active agent connector check: {type(exc).__name__}")
+
+
+def expect_status(url: str, status: int, *, method: str = "GET", headers: dict | None = None) -> None:
+    request = urllib.request.Request(url, method=method, headers=headers or {})
+    if method == "POST":
+        request.data = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            actual = response.status
+    except urllib.error.HTTPError as exc:
+        actual = exc.code
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"private MCP negative probe failed ({type(exc).__name__})")
+        return
+    if actual != status:
+        failures.append(f"private MCP negative probe: status={actual}, ожидалось={status}")
+
+
+# 3. Retired/shared paths do not exist even on loopback; Nginx hides all MCP paths publicly.
+for path in RETIRED_PATHS:
+    expect_status(f"{MCP_APP_URL}{path}", 404)
+print(f"retired shared/SSE routes: checked {len(RETIRED_PATHS)}")
+
+if active_agents:
+    sample = active_agents[0]
+    sample_slug = str(sample["slug"])
+    sample_token = str(sample["mcp_token"])
+    safe_url = f"{MCP_APP_URL}/mcp-agent/{sample_slug}"
+    expect_status(f"{safe_url}/{sample_token}", 404, method="POST")
+    expect_status(
+        safe_url,
+        404,
+        method="POST",
+        headers={"Authorization": f"Bearer {sample_token}", "X-Real-IP": "203.0.113.10"},
+    )
+    expect_status(f"{PUBLIC_MCP_BASE}/mcp-agent/{sample_slug}", 404, method="POST")
+    expect_status(f"{PUBLIC_MCP_BASE}/mcp", 404, method="POST")
+    print("path-token, forwarded and public MCP access: 404")
 
 # The two long-lived workers are part of the workspace data path.  Keep this
 # production-only so a local/container smoke without systemd remains useful.

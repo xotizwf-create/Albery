@@ -21,8 +21,9 @@ import pytest
 # Stable env defaults so importing app.py / context_server is deterministic and
 # never blocks on missing secrets. Set before the modules are imported.
 os.environ.setdefault("FLASK_SECRET_KEY", "test-secret-key")
-os.environ.setdefault("MCP_SHARED_SECRET", "test-mcp-secret")
-os.environ.setdefault("MCP_FAQ_SHARED_SECRET", "test-faq-secret")
+os.environ.setdefault("MCP_INTERNAL_ONLY", "1")
+os.environ.setdefault("MCP_ALLOW_PATH_TOKEN", "0")
+os.environ.setdefault("AGENT_MCP_INTERNAL_BASE", "http://127.0.0.1:5004")
 
 
 @pytest.fixture(autouse=True)

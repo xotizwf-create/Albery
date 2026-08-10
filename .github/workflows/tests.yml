@@ -33,8 +33,8 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/albery_test
       DATABASE_ADMIN_URL: postgresql://postgres:postgres@localhost:5432/postgres
       FLASK_SECRET_KEY: test-secret-key
-      MCP_SHARED_SECRET: test-mcp-secret
-      MCP_FAQ_SHARED_SECRET: test-faq-secret
+      MCP_INTERNAL_ONLY: "1"
+      AGENT_MCP_INTERNAL_BASE: http://127.0.0.1:5004
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -77,13 +76,14 @@ def mozg_fix_hint(report_text: str, context_turns: list[dict]) -> str:
         "(инструкция для ИИ / промпт / код / данные). Без воды."
     )
     try:
-        proc = subprocess.run(
-            ["hermes", "-z", prompt, "-t", "albery-faq", "--yolo"],
-            capture_output=True, text=True,
-            timeout=int(os.getenv("ALBERY_ERROR_DIGEST_LLM_TIMEOUT", "90")),
-            cwd="/root", env={**os.environ, "HOME": "/root"},
+        sys.path.insert(0, str(ROOT))
+        from quality_llm import run_quality_text
+        return run_quality_text(
+            prompt,
+            purpose="error_digest",
+            timeout_s=int(os.getenv("ALBERY_ERROR_DIGEST_LLM_TIMEOUT", "90")),
+            retries=1,
         )
-        return (proc.stdout or "").strip()
     except Exception:  # noqa: BLE001
         return ""
 

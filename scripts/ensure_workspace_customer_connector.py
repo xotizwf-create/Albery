@@ -9,6 +9,7 @@ reuse a row that unexpectedly has one.  The committed manifest is the hard tool 
 from __future__ import annotations
 
 import os
+import ipaddress
 import re
 import secrets
 import shutil
@@ -121,29 +122,34 @@ def ensure_database_agent(slug: str) -> str:
             return token
 
 
-def public_base(env_path: Path | None = None) -> str:
-    """Публичный HTTPS-базис коннектора.
+def internal_base(env_path: Path | None = None) -> str:
+    """Explicit loopback base for the private connector transport.
 
     Скрипт запускают вручную при деплое, вне окружения приложения, поэтому значение
     обычно есть только в `.env` — читаем его так же, как scripts/ensure_postgres.py.
     Явная переменная процесса всё равно главнее файла.
     """
-    value = os.getenv("AGENT_MCP_PUBLIC_BASE", "").strip()
+    value = os.getenv("AGENT_MCP_INTERNAL_BASE", "").strip()
     if value:
         return value
     load_dotenv(env_path or REPO_ROOT / ".env")
-    return os.getenv("AGENT_MCP_PUBLIC_BASE", "").strip()
+    return os.getenv("AGENT_MCP_INTERNAL_BASE", "http://127.0.0.1:5004").strip()
 
 
-def connector_block(slug: str, token: str, public_base: str) -> str:
-    raw_base = str(public_base or "").strip()
+def connector_block(slug: str, token: str, private_base: str) -> str:
+    raw_base = str(private_base or "").strip()
     parsed = urllib.parse.urlparse(raw_base)
+    try:
+        loopback = bool(parsed.hostname and ipaddress.ip_address(parsed.hostname).is_loopback)
+    except ValueError:
+        loopback = parsed.hostname == "localhost"
     if (
         not raw_base
         or "\r" in raw_base
         or "\n" in raw_base
-        or parsed.scheme.lower() != "https"
+        or parsed.scheme.lower() != "http"
         or not parsed.netloc
+        or not loopback
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -151,15 +157,17 @@ def connector_block(slug: str, token: str, public_base: str) -> str:
         or parsed.params
     ):
         raise RuntimeError(
-            "AGENT_MCP_PUBLIC_BASE must be an explicit HTTPS base without credentials, "
+            "AGENT_MCP_INTERNAL_BASE must be an explicit loopback HTTP base without credentials, "
             "query or fragment."
         )
     base = urllib.parse.urlunparse(
-        ("https", parsed.netloc, parsed.path.rstrip("/"), "", "", "")
+        ("http", parsed.netloc, parsed.path.rstrip("/"), "", "", "")
     )
     return (
         f"  agent-{slug}:\n"
-        f"    url: {base}/mcp-agent/{slug}/{token}\n"
+        f"    url: {base}/mcp-agent/{slug}\n"
+        "    headers:\n"
+        f"      Authorization: \"Bearer {token}\"\n"
         "    enabled: true\n"
         "    timeout: 300\n"
     )
@@ -200,7 +208,7 @@ def ensure_hermes_config(slug: str, token: str) -> Path:
     updated = replace_connector_block(
         original,
         slug,
-        connector_block(slug, token, public_base()),
+        connector_block(slug, token, internal_base()),
     )
     yaml.safe_load(updated)
     if updated == original:

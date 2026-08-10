@@ -51,8 +51,9 @@ def test_calculator_returns_to_the_client_bot_with_the_recognized_draft():
 def test_auth_exemptions_require_a_real_route_boundary(app_module):
     assert app_module.auth_exempt_path("/login") is True
     assert app_module.auth_exempt_path("/login/anything") is False
-    assert app_module.auth_exempt_path("/mcp") is True
-    assert app_module.auth_exempt_path("/mcp/messages/abc") is True
+    assert app_module.auth_exempt_path("/mcp") is False
+    assert app_module.auth_exempt_path("/mcp/messages/abc") is False
+    assert app_module.auth_exempt_path("/mcp-agent/example") is True
     assert app_module.auth_exempt_path("/mcp-malicious") is False
     assert app_module.auth_exempt_path("/Калькулятор/assets/app.js") is True
     assert app_module.auth_exempt_path("/Калькулятор-черновик") is False

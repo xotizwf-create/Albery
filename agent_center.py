@@ -13,6 +13,7 @@ behind the site's admin session login + /api gate (require_admin_auth in app.py)
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import os
 import re
@@ -1520,13 +1521,13 @@ if os.getenv("AGENT_HEALTH_WATCHDOG", "1").strip() != "0" and background_jobs_en
 # --- Subagents ------------------------------------------------------------------------------
 # A subagent = its own Bitrix bot (registered through the SAME local application via
 # imbot.register — no new app needed), its own hermes connector (mcp_servers entry in
-# /root/.hermes/config.yaml pointing at /mcp-agent/<slug>/<token>; the bot's CLI runs
+# /root/.hermes/config.yaml pointing at loopback /mcp-agent/<slug> with a Bearer header; the bot's CLI runs
 # read the config fresh every turn, so no gateway restart), a member allowlist and a
 # personal instruction store the agent extends itself (self-learning, scoped by the
 # connector URL so an agent can only ever write to ITS OWN store).
 
 _HERMES_CONFIG = Path(os.getenv("HERMES_CONFIG", "/root/.hermes/config.yaml"))
-_AGENT_MCP_PUBLIC_BASE = os.getenv("AGENT_MCP_PUBLIC_BASE", "https://mcp.m4s.ru")
+_AGENT_MCP_INTERNAL_BASE = os.getenv("AGENT_MCP_INTERNAL_BASE", "http://127.0.0.1:5004").rstrip("/")
 _AGENT_SELF_INSTRUCTIONS_MAX = int(os.getenv("AGENT_SELF_INSTRUCTIONS_MAX", "30"))
 # 24k: the legal-contract skill alone is ~10k, and a silent cut here disabled the
 # lawyer's whole formatting guide (2026-07-14). Truncation must never be silent.
@@ -1741,8 +1742,8 @@ def ensure_main_agent() -> dict[str, Any] | None:
 
 
 def universal_main_connector() -> str | None:
-    """Toolset name for the universal main turn, or None if not ready (→ classic fallback).
-    Ready = the row exists AND its connector line is present in the Hermes config, AND the
+    """Toolset name for the universal main turn, or None if not safely ready.
+    Ready = the row exists AND its private connector/header match the database token, AND the
     UNIVERSAL_MAIN_AGENT flag is on. Read live each call so the flag can be flipped via env
     without a code deploy (safe rollout: deploy dormant → verify connector → flip → verify bot)."""
     if os.getenv("UNIVERSAL_MAIN_AGENT", "0").strip() != "1":
@@ -1751,9 +1752,23 @@ def universal_main_connector() -> str | None:
     if not agent or not agent.get("is_active"):
         return None
     try:
-        if f"  agent-{MAIN_AGENT_SLUG}:" not in _HERMES_CONFIG.read_text(encoding="utf-8"):
+        import urllib.parse
+        import yaml
+
+        config = yaml.safe_load(_HERMES_CONFIG.read_text(encoding="utf-8")) or {}
+        connector = (config.get("mcp_servers") or {}).get(f"agent-{MAIN_AGENT_SLUG}")
+        if not isinstance(connector, dict) or connector.get("enabled") is not True:
             return None
-    except OSError:
+        parsed = urllib.parse.urlparse(str(connector.get("url") or ""))
+        headers = connector.get("headers") if isinstance(connector.get("headers"), dict) else {}
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
+            or parsed.path.rstrip("/") != f"/mcp-agent/{MAIN_AGENT_SLUG}"
+            or str(headers.get("Authorization") or "") != f"Bearer {agent['mcp_token']}"
+        ):
+            return None
+    except (OSError, ValueError, TypeError):
         return None
     return f"agent-{MAIN_AGENT_SLUG}"
 
@@ -1850,32 +1865,82 @@ def _main_bot_name() -> str | None:
 
 # --- Hermes connector management (textual config edit, comments preserved) ------------------
 
-def _hermes_connector_add(slug: str, token: str) -> None:
-    """Insert an mcp_servers entry `agent-<slug>` right after the `mcp_servers:` line.
-    Textual edit (no yaml re-dump) keeps the hand-tuned config comments intact; the
-    result is validated by parsing, with an automatic backup restore on failure."""
+def _hermes_connector_add_unlocked(slug: str, token: str) -> None:
+    """Create or replace a private header-authenticated `agent-<slug>` connector.
+
+    The token used to live in a public URL. It now exists only in the mode-0600 Hermes config and
+    is supplied as an Authorization header to a loopback endpoint. Textual editing preserves the
+    hand-tuned config comments; YAML is validated before an atomic replacement.
+    """
     if not _HERMES_CONFIG.exists():
         raise RuntimeError(f"Hermes config не найден: {_HERMES_CONFIG}")
+    import urllib.parse
+    parsed_base = urllib.parse.urlparse(_AGENT_MCP_INTERNAL_BASE)
+    try:
+        loopback = bool(parsed_base.hostname and ipaddress.ip_address(parsed_base.hostname).is_loopback)
+    except ValueError:
+        loopback = parsed_base.hostname == "localhost"
+    if (
+        parsed_base.scheme != "http"
+        or not loopback
+        or parsed_base.username is not None
+        or parsed_base.password is not None
+        or parsed_base.query
+        or parsed_base.fragment
+        or "\r" in _AGENT_MCP_INTERNAL_BASE
+        or "\n" in _AGENT_MCP_INTERNAL_BASE
+    ):
+        raise RuntimeError("AGENT_MCP_INTERNAL_BASE must be an explicit loopback HTTP base")
     text = _HERMES_CONFIG.read_text(encoding="utf-8")
     marker = f"  agent-{slug}:"
-    if marker in text:
-        return
     lines = text.splitlines(keepends=True)
-    insert_at = next((i + 1 for i, line in enumerate(lines) if line.rstrip() == "mcp_servers:"), None)
-    if insert_at is None:
-        raise RuntimeError("В hermes config нет секции mcp_servers")
     block = (
         f"  agent-{slug}:\n"
-        f"    url: {_AGENT_MCP_PUBLIC_BASE}/mcp-agent/{slug}/{token}\n"
+        f"    url: {_AGENT_MCP_INTERNAL_BASE}/mcp-agent/{slug}\n"
+        "    headers:\n"
+        f"      Authorization: \"Bearer {token}\"\n"
         f"    enabled: true\n"
         f"    timeout: 300\n"
     )
+    if marker in text:
+        start = next(i for i, line in enumerate(lines) if line.rstrip() == marker)
+        end = start + 1
+        while end < len(lines) and (lines[end].startswith("    ") or not lines[end].strip()):
+            end += 1
+        new_text = "".join(lines[:start]) + block + "".join(lines[end:])
+    else:
+        insert_at = next((i + 1 for i, line in enumerate(lines) if line.rstrip() == "mcp_servers:"), None)
+        if insert_at is None:
+            raise RuntimeError("В hermes config нет секции mcp_servers")
+        new_text = "".join(lines[:insert_at]) + block + "".join(lines[insert_at:])
+    if new_text == text:
+        return
     backup = _HERMES_CONFIG.with_name(f"config.yaml.bak-agent-{slug}-{int(time.time())}")
     backup.write_text(text, encoding="utf-8")
-    new_text = "".join(lines[:insert_at]) + block + "".join(lines[insert_at:])
     import yaml
     yaml.safe_load(new_text)  # validate before touching the live file
-    _HERMES_CONFIG.write_text(new_text, encoding="utf-8")
+    temporary = _HERMES_CONFIG.with_name(f".{_HERMES_CONFIG.name}.tmp-{os.getpid()}")
+    temporary.write_text(new_text, encoding="utf-8")
+    temporary.chmod(0o600)
+    os.replace(temporary, _HERMES_CONFIG)
+    _HERMES_CONFIG.chmod(0o600)
+
+
+def _hermes_connector_add(slug: str, token: str) -> None:
+    """Serialize connector materialization across bot/web/MCP service processes."""
+    if os.name == "nt":
+        _hermes_connector_add_unlocked(slug, token)
+        return
+    import fcntl
+
+    lock_path = _HERMES_CONFIG.with_name(f".{_HERMES_CONFIG.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        lock_path.chmod(0o600)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            _hermes_connector_add_unlocked(slug, token)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _hermes_connector_remove(slug: str) -> None:
@@ -2550,7 +2615,7 @@ def agent_selected_knowledge(agent: dict[str, Any]) -> dict[str, list[dict[str, 
     return {"instructions": instructions, "skills": skills}
 
 
-# --- Per-agent MCP endpoint (/mcp-agent/<slug>/<token>) with self-learning ------------------
+# --- Private per-agent MCP endpoint (/mcp-agent/<slug>, Bearer header) with self-learning -----
 # The agent's ONLY connector. Tool scope = its exact enabled whitelist, PLUS
 # self-learning tools handled RIGHT HERE with the slug from the URL — so an agent
 # can read/write exclusively its own instruction store, never global instructions,
@@ -2766,14 +2831,23 @@ def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
     return preset if capped else preset | base
 
 
-def _mcp_agent_auth(slug: str, path_token: str | None) -> dict[str, Any] | None:
+def _mcp_agent_auth(slug: str, legacy_path_token: str | None = None) -> dict[str, Any] | None:
     import hmac as _hmac
     agent = _agent_by_slug(slug)
-    if not agent or not path_token:
+    if not agent:
         return None
-    if not _hmac.compare_digest(str(path_token), str(agent["mcp_token"])):
-        return None
-    return agent
+    auth_header = request.headers.get("Authorization", "").strip()
+    if _hmac.compare_digest(auth_header, f"Bearer {agent['mcp_token']}"):
+        return agent
+    # Staged migration only: old Hermes configs can survive the first compatibility restart.
+    # Final production keeps this flag off, rotates every token, and Nginx blocks the route.
+    if (
+        legacy_path_token
+        and os.getenv("MCP_ALLOW_PATH_TOKEN", "0").strip() == "1"
+        and _hmac.compare_digest(str(legacy_path_token), str(agent["mcp_token"]))
+    ):
+        return agent
+    return None
 
 
 def _agent_self_tool_names(agent: dict[str, Any]) -> set[str]:
@@ -2789,9 +2863,15 @@ def _agent_self_tool_names(agent: dict[str, Any]) -> set[str]:
     return set(_SELF_TOOL_SPECS) & cap
 
 
-@app.get("/mcp-agent/<slug>/<path:path_token>")
-def mcp_agent_info(slug: str, path_token: str | None = None):
-    agent = _mcp_agent_auth(slug, path_token)
+@app.get("/mcp-agent/<slug>")
+@app.get("/mcp-agent/<slug>/<path:legacy_path_token>")
+def mcp_agent_info(slug: str, legacy_path_token: str | None = None):
+    from app import mcp_internal_request_ok
+    if not mcp_internal_request_ok():
+        return jsonify({"error": "not found"}), 404
+    if legacy_path_token and os.getenv("MCP_ALLOW_PATH_TOKEN", "0").strip() != "1":
+        return jsonify({"error": "not found"}), 404
+    agent = _mcp_agent_auth(slug, legacy_path_token)
     if not agent:
         return jsonify({"error": "forbidden"}), 403
     return jsonify({
@@ -2804,9 +2884,15 @@ def mcp_agent_info(slug: str, path_token: str | None = None):
     })
 
 
-@app.post("/mcp-agent/<slug>/<path:path_token>")
-def mcp_agent_http(slug: str, path_token: str | None = None):
-    agent = _mcp_agent_auth(slug, path_token)
+@app.post("/mcp-agent/<slug>")
+@app.post("/mcp-agent/<slug>/<path:legacy_path_token>")
+def mcp_agent_http(slug: str, legacy_path_token: str | None = None):
+    from app import mcp_internal_request_ok
+    if not mcp_internal_request_ok():
+        return jsonify({"error": "not found"}), 404
+    if legacy_path_token and os.getenv("MCP_ALLOW_PATH_TOKEN", "0").strip() != "1":
+        return jsonify({"error": "not found"}), 404
+    agent = _mcp_agent_auth(slug, legacy_path_token)
     if not agent:
         return jsonify({"jsonrpc": "2.0", "id": None,
                         "error": {"code": -32001, "message": "forbidden"}}), 403

@@ -2,12 +2,12 @@
 
 Deliberately ISOLATED from the main albery.service: its own process, long polling, no Flask
 import — the production web app is never touched or restarted by this feature. LLM turns reuse
-the proven b24bot pattern (`hermes -z … -t albery,web --yolo` subprocess) through a small,
+the proven b24bot pattern (`hermes -z … -t agent-main,web --yolo` subprocess) through a small,
 memory-bounded pool.
 
 What it does (phase 1, owner-approved 2026-07-09):
   * private chat with the OWNER (whitelist TG_AGENT_OWNER_IDS): questions go to the brain with
-    the full albery MCP connector + web; strangers get a polite refusal and никакого LLM;
+    the individually configured main-agent connector + web; strangers get a polite refusal and никакого LLM;
   * channel watchlist (/add_channel /del_channel /channels) + weekly digest of the public
     channels' t.me/s/ previews (tg_digest.py, albery-tg-digest.timer) — WB news, org practices,
     «что внедрить/обновить у нас»; /digest runs it on demand;
@@ -187,7 +187,7 @@ def owner_toolsets() -> str:
     for value in (os.getenv("TG_AGENT_OWNER_TOOLSETS"), os.getenv("TG_AGENT_TOOLSETS")):
         if str(value or "").strip():
             return str(value).strip()
-    return "albery,web"
+    return "agent-main,web"
 
 
 def owner_usernames() -> set[str]:
@@ -726,9 +726,9 @@ def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
     if toolsets is None:
         # A database/connector lookup failure must not restore the broad default
         # for untrusted customer turns. The narrow connector may fail visibly,
-        # but the customer can never inherit ``albery,web``.
+        # but the customer can never inherit ``agent-main,web``.
         toolsets = (customer_toolsets() if customer_turn
-                    else os.getenv("TG_AGENT_TOOLSETS", "albery,web"))
+                    else os.getenv("TG_AGENT_TOOLSETS", "agent-main,web"))
     timeout_s = timeout_s or int(os.getenv("TG_AGENT_HERMES_TIMEOUT", "420"))
     # Fresh session per run (hermes >=0.17 resumes --continue sessions; memory is prompt-injected)
     run_session = f"{session_prefix}-r{uuid.uuid4().hex[:8]}"
@@ -2503,36 +2503,14 @@ def _squash(value: str) -> str:
 
 
 def mcp_call(tool: str, arguments: dict) -> dict:
-    """Вызвать инструмент Albery через локальный MCP приложения.
+    """Compatibility name for deterministic, in-process, allowlisted operations.
 
-    Вебхук Bitrix не имеет прав на CRM (insufficient_scope), а MCP работает по OAuth приложения —
-    тем же путём, что и все остальные инструменты системы. Импортировать app/b24bot в этот
-    процесс нельзя: их импорт запускает живые планировщики."""
-    secret = (os.getenv("MCP_SHARED_SECRET") or "").strip()
-    if not secret:
-        raise RuntimeError("MCP_SHARED_SECRET не задан")
-    url = os.getenv("ALBERY_MCP_URL", "http://127.0.0.1:5002/mcp").strip()
-    resp = requests.post(url, json={
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": tool, "arguments": arguments},
-    }, headers={"Authorization": "Bearer " + secret,
-                "Accept": "application/json, text/event-stream"}, timeout=45)
-    raw = resp.text or ""
-    if "data:" in raw[:200]:      # ответ может прийти потоком SSE
-        raw = "\n".join(l[5:].strip() for l in raw.splitlines() if l.startswith("data:"))
-    payload = json.loads(raw) if raw.strip() else {}
-    if payload.get("error"):
-        raise RuntimeError(str(payload["error"])[:300])
-    result = payload.get("result") or {}
-    content = result.get("structuredContent") or result
-    if isinstance(content.get("content"), list):      # текстовая обёртка MCP
-        for part in content["content"]:
-            if part.get("type") == "text":
-                try:
-                    return json.loads(part.get("text") or "{}")
-                except Exception:  # noqa: BLE001
-                    pass
-    return content
+    No HTTP MCP request or shared secret is involved. Keeping the local function name avoids a
+    risky mechanical rewrite of the funnel while the implementation boundary becomes private.
+    """
+    from internal_tools import TELEGRAM_RUNTIME_TOOLS, call_internal_tool
+
+    return call_internal_tool(tool, arguments, allowed=TELEGRAM_RUNTIME_TOOLS)
 
 
 def crm_lead_usernames(force: bool = False) -> dict[str, int]:

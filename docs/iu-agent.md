@@ -269,7 +269,7 @@ Bitrix24 (CRM, задачи) · Google Drive (база знаний) · PostgreS
 | `TERMS_DOC_NAME` | документ условий в базе знаний | «Условия ИУ — текст для клиента» |
 | `CONTRACT_EXECUTOR_*` | реквизиты Албери для договора | плейсхолдеры |
 | `B24_TESTBOT_WEBHOOK_BASE` | вебхук Битрикса для REST (статусы задач) | — |
-| `MCP_SHARED_SECRET`, `ALBERY_MCP_URL` | доступ tg-агента к MCP по HTTP | :5002/mcp |
+| — | детерминированные CRM-действия tg-агента | allowlisted Python handlers in-process, без HTTP MCP |
 
 Любая серверная запись в CRM перед выполнением проверяет `user.current` тем же REST-токеном.
 Если токен не принадлежит `CRM_AGENT_USER_ID`, изменение отклоняется: Bitrix вычисляет автора

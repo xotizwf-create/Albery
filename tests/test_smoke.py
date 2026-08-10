@@ -52,7 +52,13 @@ def test_agent_center_routes_registered(app_module):
     assert "/agent" in paths
     assert "/agent-dialogs" in paths
     assert "/api/agent-center/agents/<slug>" in paths
-    assert "/mcp-agent/<slug>/<path:path_token>" in paths
+    assert "/mcp-agent/<slug>" in paths
+    assert "/mcp-agent/<slug>/<path:legacy_path_token>" in paths  # staged rollout, disabled by default
+    assert "/mcp" not in paths
+    assert "/mcp-faq" not in paths
+    assert "/mcp-ops" not in paths
+    assert "/mcp-core" not in paths
+    assert "/mcp-ops-core" not in paths
 
 
 def test_mcp_imports_with_tools(ctx):

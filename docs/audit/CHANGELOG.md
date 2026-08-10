@@ -4,6 +4,9 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-10
 
+- `implemented_local` — [CHG-20260810-04](changes/CHG-20260810-04-private-per-agent-mcp.md): shared endpoints removed, private header transport and atomic credential migration implemented; local regression passed.
+- `approved` — [CHG-20260810-04](changes/CHG-20260810-04-private-per-agent-mcp.md): migrate to private header-authenticated per-agent MCP and retire fixed shared connector classes.
+- `accepted` — [ADR-0003](decisions/ADR-0003-private-per-agent-mcp.md): loopback-only per-agent MCP is the sole model capability boundary.
 - `verified` — [CHG-20260810-03](changes/CHG-20260810-03-independent-acceptance-hardening.md): final CI matrices, production probes, no-write counters, media checks, smoke, backup, and Bitrix task 2670 confirmed.
 - `implemented_local` — [CHG-20260810-03](changes/CHG-20260810-03-independent-acceptance-hardening.md): adversarial tests now pass; schema, boolean, agent binding, environment isolation, and Groq-primary vision routing are hardened.
 - `approved` — [CHG-20260810-03](changes/CHG-20260810-03-independent-acceptance-hardening.md): adversarial re-verification found schema, boolean, environment-isolation, and media-routing gaps.

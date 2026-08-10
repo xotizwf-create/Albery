@@ -1,5 +1,6 @@
-"""Upsert one Albery AI instruction from a local markdown file via the MCP
-endpoint on prod. Idempotent — re-runs replace the content.
+"""Upsert one Albery AI instruction through the private in-process maintenance dispatcher.
+
+Idempotent — re-runs replace the content.
 
 Usage:
     python scripts/upsert_albery_ai_instruction.py "Cron автоматизации/Zoom задачи — ответ ставь" scripts/ai_instruction_zoom_approval.md
@@ -41,15 +42,10 @@ def main() -> None:
     sftp = cli.open_sftp()
     remote_tmp = f"/tmp/ai_instruction_payload_{secrets.token_hex(8)}.json"
     payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "upsert_ai_instruction",
-            "arguments": {
-                "path": instruction_path,
-                "content": content,
-            },
+        "tool": "upsert_ai_instruction",
+        "arguments": {
+            "path": instruction_path,
+            "content": content,
         },
     }
     with sftp.file(remote_tmp, "wb") as f:
@@ -58,10 +54,8 @@ def main() -> None:
     sftp.close()
 
     cmd = (
-        "secret=$(awk -F= '/^MCP_SHARED_SECRET=/{sub(/^[^=]*=/,\"\"); print; exit}' /var/www/albery/.env); "
-        f"curl -sS -X POST http://127.0.0.1:5002/mcp/$secret "
-        f"-H 'Content-Type: application/json' "
-        f"-d @{remote_tmp}; "
+        "cd /var/www/albery && "
+        f".venv/bin/python internal_tools.py --profile maintenance < {remote_tmp}; "
         f"rm -f {remote_tmp}"
     )
     print(f"Upsert AI instruction: path={instruction_path}, content len={len(content)}")
@@ -70,10 +64,10 @@ def main() -> None:
     e = err.read().decode("utf-8", "replace")
     try:
         d = json.loads(o)
-        if "error" in d:
-            print("MCP error:", d["error"])
+        if not d.get("ok"):
+            print("Internal tool error:", d.get("error"))
             sys.exit(3)
-        result = d.get("result", {}).get("structuredContent") or d.get("result")
+        result = d.get("result")
         print(json.dumps(result, ensure_ascii=False, indent=2)[:1500])
     except Exception:
         print("Raw response:", o[:1500])

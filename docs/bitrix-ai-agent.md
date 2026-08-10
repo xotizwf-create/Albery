@@ -11,28 +11,22 @@
 
 ---
 
-## 1. Уровни доступа (admin / ops / faq / none)
+## 1. Доступ человека и возможности агента
 
-Доступ к агенту разделён на уровни по принципу **capability-based** (безопасность через
-отсутствие инструмента у коннектора, а не через запрет в промпте — устойчиво к prompt-injection).
+Это две независимые границы:
 
-| Уровень (UI-название) | MCP-коннектор | Что доступно |
-|---|---|---|
-| **admin** (Полный доступ) | `/mcp` (`MCP_SHARED_SECRET`) | всё, включая правку инструкций/настроек и удаление |
-| **ops** (Доступ ко всем функциям) | `/mcp-ops` (`MCP_OPS_SHARED_SECRET`) | всё операционное, кроме админ-инструментов |
-| **faq** (Доступ к базе знаний) | `/mcp-faq` (`MCP_FAQ_SHARED_SECRET`) | только чтение (знания, Zoom, оргструктура) |
-| **none** (Отсутствие доступа) | — | бот НЕ отвечает (системное уведомление) |
+- `agent_access` хранит только факт, может ли конкретный сотрудник обратиться к боту;
+- набор действий определяет карточка отвечающего агента: режим и переключатели инструментов из
+  БД пересекаются с верхней границей его versioned manifest.
 
-- `OWNER_ONLY_TOOL_NAMES` (только admin, в `context_server.py`): `upsert_ai_instruction`,
-  `update_ai_capabilities`, `delete_bitrix_task`, `delete_zoom_call_report`. Плюс
-  defense-in-depth guard в `handle_request` (эти инструменты отказываются на любом scoped-коннекторе).
-- `OPS_TOOL_NAMES = set(TOOLS) - OWNER_ONLY_TOOL_NAMES`. HTTP-эндпоинты `/mcp-ops` + `/sse-ops`
-  (зеркало `/mcp-faq`).
-- Hermes config (`/root/.hermes/config.yaml`): `mcp_servers.albery-ops` → `/mcp-ops/<secret>`.
-- Маршрутизация в боте: `_b24_tier_for(from_user_id)` (id из доверенного Bitrix-события, в чате
-  не подделать) → `hermes_brain_answer` выбирает toolset `albery` / `albery-ops` / `albery-faq`.
-- **Уровни хранятся в БД** (таблица `agent_access`), читаются с кэшем 20с. Дефолт (нет строки) =
-  `faq`. `none` — явный stored deny. Никто не захардкожен — даже владелец редактируется из UI.
+Каждый ход использует ровно один коннектор `agent-<slug>`. Для главного бота это `agent-main`.
+Если коннектор отсутствует или выключен, ход завершается видимой fail-closed ошибкой и ничего не
+выполняет. Перехода на общий или более широкий набор нет.
+
+HTTP-транспорт MCP доступен только на `127.0.0.1:5004/mcp-agent/<slug>`. Hermes передаёт
+индивидуальный токен в `Authorization: Bearer ...`; в URL токена нет. Публичные `/mcp*` и `/sse*`
+закрыты в Nginx и повторно защищены Flask-проверкой loopback/forwarded-адресов. Общие коннекторы
+`albery`, `albery-faq`, `albery-ops`, `albery-core`, `albery-ops-core` выведены из эксплуатации.
 
 ## 2. Веб-панель «Настройки Агента»
 
@@ -133,8 +127,9 @@
 **Таблицы:** `agent_access`, `bitrix_error_reports`, `access_requests`, `bitrix_bot_interactions`,
 `bitrix_bot_sessions`.
 
-**Env (`/var/www/albery/.env`):** `MCP_SHARED_SECRET`, `MCP_OPS_SHARED_SECRET`,
-`MCP_FAQ_SHARED_SECRET`, `B24_TESTBOT_OWNER_USER_IDS` (дефолт 16=Александр),
+**Env (`/var/www/albery/.env`):** `MCP_INTERNAL_ONLY=1`,
+`AGENT_MCP_INTERNAL_BASE=http://127.0.0.1:5004`, `MCP_ALLOW_PATH_TOKEN=0`,
+`B24_TESTBOT_OWNER_USER_IDS` (дефолт 16=Александр),
 `B24_TESTBOT_FULL_USER_IDS`, `B24_TESTBOT_IDLE_RESET_SECONDS` (дефолт 1800),
 `B24_TESTBOT_WEBHOOK_BASE` (b24-0xrp3s, для списка юзеров), `GOOGLE_APPS_SCRIPT_SYNC_URL`,
 `ALBERY_ALLOW_SHEET_WRITE=1`, `ALLOW_LEGACY_HTTP_API=1`, опц. `ALBERY_TG_BOT_TOKEN`,

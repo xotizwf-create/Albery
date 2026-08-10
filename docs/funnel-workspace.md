@@ -179,7 +179,7 @@ Hash сохраняется в `funnel_workspace_settings`; `FUNNEL_WORKSPACE_PA
 | `FUNNEL_WORKSPACE_CRM_TELEGRAM_ID_FIELD` | пусто | опциональный отдельный UF с numeric Telegram ID |
 | `TG_BUSINESS_AUTOREPLY` | `0` | старый прямой Telegram-ответчик обязан быть выключен |
 | `CANONICAL_WEB_HOST` | реальный host | защита cookie/origin для отдельного входа |
-| `AGENT_MCP_PUBLIC_BASE` | реальный HTTPS base | точный публичный host закрытого Hermes connector |
+| `AGENT_MCP_INTERNAL_BASE` | `http://127.0.0.1:5004` | loopback-only транспорт закрытого Hermes connector |
 
 Регламентная очистка запускается раз в сутки и разгребает накопленное партиями по 1000 строк
 (до 50 партий на таблицу за запуск), каждая партия — отдельная транзакция. Сообщение, за которое

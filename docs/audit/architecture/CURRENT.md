@@ -52,3 +52,25 @@ scenarios above.
 - Coding agents discover `.agents/skills/albery-audit/SKILL.md` and root `AGENTS.md`/`CLAUDE.md`.
 - Runtime agents receive `skill:albery-audit` plus the optional architecture-audit instruction.
 - Durable decisions and change evidence live in `docs/audit/`.
+
+## Approved target: private per-agent MCP
+
+This target is approved under [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md) and tracked
+by [CHG-20260810-04](../changes/CHG-20260810-04-private-per-agent-mcp.md). It is not verified
+production state until that change reaches `verified`.
+
+```mermaid
+flowchart LR
+    U[Bitrix and Telegram users] --> R[Albery runtime]
+    R --> H[Hermes on the same host]
+    H -->|127.0.0.1:5004<br/>Bearer header| P[/mcp-agent/slug]
+    P --> C[DB switches intersect manifest cap]
+    C --> T[Exact agent tool set]
+    T --> DB[(PostgreSQL)]
+    T --> EXT[Bitrix, Zoom, Drive, Wildberries]
+    INTERNET[Public Internet] --> N[Nginx]
+    N -->|/mcp* and /sse*: 404| X[No public MCP]
+    N -->|authenticated event routes| W[Bitrix, Zoom and Drive webhooks]
+    R --> Q[Zero-tool Codex contour]
+    Q --> S[Summaries and quality reasoning]
+```
