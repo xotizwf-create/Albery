@@ -22,7 +22,6 @@ import pytest
 # never blocks on missing secrets. Set before the modules are imported.
 os.environ.setdefault("FLASK_SECRET_KEY", "test-secret-key")
 os.environ.setdefault("MCP_INTERNAL_ONLY", "1")
-os.environ.setdefault("MCP_ALLOW_PATH_TOKEN", "0")
 os.environ.setdefault("AGENT_MCP_INTERNAL_BASE", "http://127.0.0.1:5004")
 
 

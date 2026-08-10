@@ -57,12 +57,6 @@ def test_path_token_is_not_a_route(client, private_agent):
     assert response.status_code == 404
 
 
-def test_path_token_compatibility_requires_explicit_rollout_flag(client, private_agent, monkeypatch):
-    monkeypatch.setenv("MCP_ALLOW_PATH_TOKEN", "1")
-    response = _tools_list(client, "/mcp-agent/private-test/agent-header-secret")
-    assert response.status_code == 200
-
-
 def test_forwarded_public_request_is_hidden_even_with_valid_header(client, private_agent):
     response = _tools_list(
         client,

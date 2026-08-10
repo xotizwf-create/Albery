@@ -128,7 +128,7 @@ HTTP-транспорт MCP доступен только на `127.0.0.1:5004/m
 `bitrix_bot_sessions`.
 
 **Env (`/var/www/albery/.env`):** `MCP_INTERNAL_ONLY=1`,
-`AGENT_MCP_INTERNAL_BASE=http://127.0.0.1:5004`, `MCP_ALLOW_PATH_TOKEN=0`,
+`AGENT_MCP_INTERNAL_BASE=http://127.0.0.1:5004`,
 `B24_TESTBOT_OWNER_USER_IDS` (дефолт 16=Александр),
 `B24_TESTBOT_FULL_USER_IDS`, `B24_TESTBOT_IDLE_RESET_SECONDS` (дефолт 1800),
 `B24_TESTBOT_WEBHOOK_BASE` (b24-0xrp3s, для списка юзеров), `GOOGLE_APPS_SCRIPT_SYNC_URL`,

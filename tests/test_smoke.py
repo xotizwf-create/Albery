@@ -53,7 +53,7 @@ def test_agent_center_routes_registered(app_module):
     assert "/agent-dialogs" in paths
     assert "/api/agent-center/agents/<slug>" in paths
     assert "/mcp-agent/<slug>" in paths
-    assert "/mcp-agent/<slug>/<path:legacy_path_token>" in paths  # staged rollout, disabled by default
+    assert "/mcp-agent/<slug>/<path:legacy_path_token>" not in paths
     assert "/mcp" not in paths
     assert "/mcp-faq" not in paths
     assert "/mcp-ops" not in paths

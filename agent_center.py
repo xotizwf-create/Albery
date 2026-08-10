@@ -2831,21 +2831,13 @@ def _agent_tool_names(agent: dict[str, Any]) -> set[str]:
     return preset if capped else preset | base
 
 
-def _mcp_agent_auth(slug: str, legacy_path_token: str | None = None) -> dict[str, Any] | None:
+def _mcp_agent_auth(slug: str) -> dict[str, Any] | None:
     import hmac as _hmac
     agent = _agent_by_slug(slug)
     if not agent:
         return None
     auth_header = request.headers.get("Authorization", "").strip()
     if _hmac.compare_digest(auth_header, f"Bearer {agent['mcp_token']}"):
-        return agent
-    # Staged migration only: old Hermes configs can survive the first compatibility restart.
-    # Final production keeps this flag off, rotates every token, and Nginx blocks the route.
-    if (
-        legacy_path_token
-        and os.getenv("MCP_ALLOW_PATH_TOKEN", "0").strip() == "1"
-        and _hmac.compare_digest(str(legacy_path_token), str(agent["mcp_token"]))
-    ):
         return agent
     return None
 
@@ -2864,14 +2856,11 @@ def _agent_self_tool_names(agent: dict[str, Any]) -> set[str]:
 
 
 @app.get("/mcp-agent/<slug>")
-@app.get("/mcp-agent/<slug>/<path:legacy_path_token>")
-def mcp_agent_info(slug: str, legacy_path_token: str | None = None):
+def mcp_agent_info(slug: str):
     from app import mcp_internal_request_ok
     if not mcp_internal_request_ok():
         return jsonify({"error": "not found"}), 404
-    if legacy_path_token and os.getenv("MCP_ALLOW_PATH_TOKEN", "0").strip() != "1":
-        return jsonify({"error": "not found"}), 404
-    agent = _mcp_agent_auth(slug, legacy_path_token)
+    agent = _mcp_agent_auth(slug)
     if not agent:
         return jsonify({"error": "forbidden"}), 403
     return jsonify({
@@ -2885,14 +2874,11 @@ def mcp_agent_info(slug: str, legacy_path_token: str | None = None):
 
 
 @app.post("/mcp-agent/<slug>")
-@app.post("/mcp-agent/<slug>/<path:legacy_path_token>")
-def mcp_agent_http(slug: str, legacy_path_token: str | None = None):
+def mcp_agent_http(slug: str):
     from app import mcp_internal_request_ok
     if not mcp_internal_request_ok():
         return jsonify({"error": "not found"}), 404
-    if legacy_path_token and os.getenv("MCP_ALLOW_PATH_TOKEN", "0").strip() != "1":
-        return jsonify({"error": "not found"}), 404
-    agent = _mcp_agent_auth(slug, legacy_path_token)
+    agent = _mcp_agent_auth(slug)
     if not agent:
         return jsonify({"jsonrpc": "2.0", "id": None,
                         "error": {"code": -32001, "message": "forbidden"}}), 403
