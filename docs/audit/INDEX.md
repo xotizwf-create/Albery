@@ -18,6 +18,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [ADR-0002](decisions/ADR-0002-codex-reasoning-groq-media.md) | accepted | Codex handles quality reasoning; Groq handles media |
 | [ADR-0003](decisions/ADR-0003-private-per-agent-mcp.md) | accepted | MCP is loopback-only, header-authenticated, and scoped per agent |
 | [ADR-0004](decisions/ADR-0004-durable-conflict-safe-agent-automations.md) | accepted | Agent automations use durable stages, the shared heavy-process limit and fail-closed idempotency |
+| [ADR-0005](decisions/ADR-0005-channel-neutral-agent-runtime.md) | accepted | Bitrix and employee Telegram are channel adapters for one logical agent profile |
 
 ## Changes
 
@@ -31,6 +32,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260811-06](changes/CHG-20260811-06-bitrix-agent-automation-diagram.md) | implemented_local | Document Bitrix per-agent routing and the independent agent-automation lane |
 | [CHG-20260811-07](changes/CHG-20260811-07-durable-conflict-safe-agent-automations.md) | implemented_local | Put agent automations under the shared limit and make queue, retry and effects durable/conflict-safe |
 | [CHG-20260811-08](changes/CHG-20260811-08-telegram-agent-architecture-audit.md) | implemented_local | Audit all Telegram contours, profile/permission mapping, delivery reliability and automation destinations |
+| [CHG-20260811-09](changes/CHG-20260811-09-channel-neutral-telegram-agents.md) | implemented_local | Implement one Bitrix/Telegram profile, closed access, durable Telegram delivery and typed automation destinations |
 
 ## Status rule
 

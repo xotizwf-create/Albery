@@ -293,6 +293,9 @@ export interface AgentAutomation {
   schedule_label: string;
   prompt: string;
   deliver_to: string;
+  delivery_channel: "bitrix" | "telegram";
+  delivery_profile: string;
+  delivery_conversation_id: string;
   kind: "agent" | "system" | "task";
   // kind='task' only — machine-readable schedule for the tab's day/time editor.
   period?: "daily" | "weekly" | "monthly";
@@ -320,7 +323,9 @@ export async function fetchAgentAutomations(slug: string): Promise<AgentAutomati
 
 export async function createAgentAutomation(
   slug: string,
-  body: { name: string; description?: string; schedule: string; prompt: string; deliver_to?: string },
+  body: { name: string; description?: string; schedule: string; prompt: string; deliver_to?: string;
+          delivery_channel?: "bitrix" | "telegram"; delivery_profile?: string;
+          delivery_conversation_id?: string },
 ): Promise<void> {
   await fetchJsonSafe(
     `/api/agent-center/agents/${slug}/automations`,
@@ -331,7 +336,9 @@ export async function createAgentAutomation(
 
 export async function updateAgentAutomation(
   id: number,
-  body: Partial<{ name: string; description: string; schedule: string; prompt: string; deliver_to: string; is_active: boolean }>,
+  body: Partial<{ name: string; description: string; schedule: string; prompt: string;
+                  deliver_to: string; delivery_channel: "bitrix" | "telegram";
+                  delivery_profile: string; delivery_conversation_id: string; is_active: boolean }>,
 ): Promise<void> {
   await fetchJsonSafe(
     `/api/agent-center/automations/${id}`,
@@ -474,6 +481,7 @@ export interface TelegramAccessUser {
   bot: string;
   username: string;
   tg_user_id: number | null;
+  bitrix_user_id: number | null;
   display_name: string | null;
   is_active: boolean;
 }
@@ -486,32 +494,30 @@ export interface TelegramAccessAgent {
   users: TelegramAccessUser[];
 }
 
-// Telegram-агент создаётся ТЕМ ЖЕ эндпоинтом, что и субагент Битрикса: это один и тот же
-// агент со своим коннектором, инструментами и знаниями — отличается только мост.
-export async function createTelegramAgent(params: {
-  name: string;
+export async function attachTelegramBridge(params: {
+  slug: string;
   telegram_username?: string;
   bot_token?: string;
-  role_prompt?: string;
-}): Promise<{ slug: string; warnings: string[] }> {
+  create_via_botfather?: boolean;
+}): Promise<{ slug: string; telegram_username: string; note: string }> {
   const data = await fetchJsonSafe(
-    "/api/agent-center/agents",
+    `/api/agent-center/agents/${encodeURIComponent(params.slug)}/telegram-bridge`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        name: params.name,
-        role_prompt: params.role_prompt || "",
-        // Обычный путь: даём @username, бота регистрирует сам агент через @BotFather.
         telegram_username: params.telegram_username || "",
         telegram_bot_token: params.bot_token || "",
-        tier: "ops",
+        create_via_botfather: Boolean(params.create_via_botfather),
       }),
     },
-    // Диалог с BotFather идёт в три шага с ожиданием ответа — минуты может не хватить.
     180000,
   );
-  return { slug: (data.slug || "") as string, warnings: (data.warnings || []) as string[] };
+  return {
+    slug: String(data.slug || params.slug),
+    telegram_username: String(data.telegram_username || ""),
+    note: String(data.note || ""),
+  };
 }
 
 export async function fetchTelegramAccess(): Promise<TelegramAccessAgent[]> {
@@ -523,6 +529,7 @@ export async function saveTelegramAccess(params: {
   bot: string;
   username: string;
   display_name?: string;
+  bitrix_user_id?: number | null;
   remove?: boolean;
 }): Promise<void> {
   await fetchJsonSafe(

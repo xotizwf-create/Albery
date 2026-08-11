@@ -1,12 +1,10 @@
-"""Telegram-агенты, заведённые владельцем в кабинете.
+"""Telegram transport for the same logical employee agents used by Bitrix.
 
-Основной бот (@Albery_AI2_Bot) обслуживается tg_agent.py и здесь НЕ трогается: он несёт
-бизнес-режим, лидов и воронку, и ломать его ради второго бота нельзя. Этот модуль поднимает
-по отдельному потоку опроса на каждого агента из таблицы telegram_agents — каждый со своим
-токеном, своим списком доступа и своей веткой журнала.
-
-Работает внутри службы albery-tg (запускается из tg_agent.poll_forever), поэтому здесь те же
-ограничения: никаких импортов app/b24bot — их импорт стартует живые планировщики.
+Profiles live in ``agents`` and own identity, role, instructions, skills and MCP rights.  This
+module owns only Telegram polling, channel-scoped history, explicit access/actor mapping and
+durable delivery.  The separate IU customer bot remains in ``tg_agent.py`` and is never exposed
+to employee tools.  The module runs inside ``albery-tg`` and therefore must not import
+``app``/``b24bot`` because those imports start unrelated schedulers.
 """
 from __future__ import annotations
 
@@ -16,18 +14,41 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import requests
 
 import tg_agent as core
+from shared.agent_channel_runtime import ChannelContext, build_agent_policy, load_profile_knowledge
 
 log = logging.getLogger("tg_multi")
 
 _POLL_TIMEOUT = 50
 _RELOAD_S = float(os.getenv("TG_MULTI_RELOAD_S", "60") or 60)
 _threads: dict[str, threading.Thread] = {}
-_offsets: dict[str, int] = {}
+_workers_started = False
+_legacy_offsets: dict[str, int] = {}
+_LEASE_S = int(os.getenv("TG_MULTI_LEASE_S", "240") or 240)
+_MAX_ATTEMPTS = int(os.getenv("TG_MULTI_MAX_ATTEMPTS", "3") or 3)
+_DELIVERY_ATTEMPTS = int(os.getenv("TG_MULTI_DELIVERY_ATTEMPTS", "5") or 5)
+_WORKER_POLL_S = float(os.getenv("TG_MULTI_WORKER_POLL_S", "1") or 1)
+_MEDIA_MAX_BYTES = int(os.getenv("TG_MEDIA_MAX_BYTES", str(20 * 1024 * 1024)) or 20 * 1024 * 1024)
+_MSK = timezone(timedelta(hours=3))
+
+
+class TelegramAPIError(RuntimeError):
+    def __init__(self, method: str, description: str, *, status_code: int = 0):
+        super().__init__(f"{method}: {description[:200]}")
+        self.status_code = int(status_code or 0)
+
+    @property
+    def retryable(self) -> bool:
+        return self.status_code == 429 or self.status_code >= 500
+
+
+class TelegramDeliveryAmbiguous(RuntimeError):
+    """The provider may have accepted the call; automatic replay could duplicate a reply."""
 
 
 def load_agents() -> list[dict]:
@@ -52,11 +73,17 @@ def load_agents() -> list[dict]:
 
 
 def api(token: str, method: str, http_timeout: int = 35, **params):
-    resp = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=params,
-                         timeout=http_timeout)
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=params,
+                             timeout=http_timeout)
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        # Do not expose the token-bearing request URL from requests' exception string.
+        raise TelegramDeliveryAmbiguous(f"{method}: network outcome is unknown") from exc
     data = resp.json() if resp.content else {}
     if not (isinstance(data, dict) and data.get("ok")):
-        raise RuntimeError(f"{method}: {str(data)[:200]}")
+        description = str(data.get("description") if isinstance(data, dict) else "Telegram rejected request")
+        status = int(data.get("error_code") or resp.status_code or 0) if isinstance(data, dict) else resp.status_code
+        raise TelegramAPIError(method, description, status_code=status)
     return data.get("result")
 
 
@@ -207,52 +234,572 @@ def _react(token: str, chat_id, message_id, emoji: str) -> None:
         log.debug("реакция %s не поставлена: %s", emoji, str(exc)[:120])
 
 
-def _answer(agent: dict, chat_id, sender: dict, text: str, message_id=None) -> None:
-    """Ход агента: доступ → мозг → ответ → журнал. Ошибки не роняют поток опроса."""
-    slug = agent["slug"]
-    allowed = core.access_usernames(slug)
-    uname = str(sender.get("username") or "").lower()
-    core.journal(slug, chat_id, "in", text, kind="bot_dm", user=sender)
-    if allowed and uname not in allowed:
-        refusal = ("Это внутренний агент компании Albery. Если вам нужен доступ — "
-                   "напишите Евгению.")
-        try:
-            api(agent["bot_token"], "sendMessage", chat_id=chat_id, text=refusal)
-        except Exception:  # noqa: BLE001
-            log.warning("отказ не доставлен", exc_info=True)
-        core.journal(slug, chat_id, "out", refusal, kind="bot_dm", user=sender,
-                     meta={"denied": True})
-        return
-    core.remember_access_user_id(slug, sender)
-    _react(agent["bot_token"], chat_id, message_id, "👀")
-    prompt = ((agent.get("role_prompt") or "").strip()
-              or "Ты — ИИ-агент компании Albery в Telegram. Отвечай по-русски, кратко и по делу, "
-                 "обычным текстом без разметки.")
-    # Личный коннектор агента — то же, на чём работают субагенты в Битриксе. Через него агент
-    # получает ИМЕННО свой набор MCP-инструментов, подключённые инструкции и знания; без него
-    # телеграмный агент был бы говорящей головой без инструментов.
-    toolsets = f"agent-{slug},{os.getenv('TG_MULTI_EXTRA_TOOLSETS', 'web').strip()}".rstrip(",")
+def _select_access_row(rows: list, tg_user_id, username: str):
+    """Prefer immutable Telegram identity; username is bootstrap-only.
+
+    Telegram usernames are mutable and can later belong to somebody else.  Once an allow-list
+    row has learned a numeric Telegram id, a matching username must never override a different
+    id.  A sender without a numeric id cannot be safely bootstrapped.
+    """
+    if tg_user_id is None:
+        return None
+    stable = next(
+        (r for r in rows if r["tg_user_id"] is not None
+         and str(r["tg_user_id"]) == str(tg_user_id)),
+        None,
+    )
+    if stable is not None or not username:
+        return stable
+    return next(
+        (r for r in rows if r["tg_user_id"] is None
+         and str(r["username"] or "").lower() == username),
+        None,
+    )
+
+
+def _access_identity(slug: str, sender: dict) -> dict:
+    """Resolve Telegram access and an optional explicit Bitrix actor mapping.
+
+    Empty, unavailable or non-matching access is fail-closed.  A username may bootstrap the
+    stable Telegram id once; delegated Bitrix writes still require ``bitrix_user_id``.
+    """
+    username = str(sender.get("username") or "").strip().lstrip("@").lower()
+    tg_user_id = sender.get("id")
     try:
-        answer = core.hermes_answer(f"{prompt}\n\nСообщение собеседника:\n{text}",
-                                    f"tg-{slug}-{chat_id}", toolsets=toolsets)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("мозг не ответил (%s): %s", slug, str(exc)[:200])
-        core.journal(slug, chat_id, "out", f"мозг не ответил: {str(exc)[:200]}", kind="bot_dm",
-                     user=sender, status="error")
-        return
-    answer = core._strip_markup((answer or "").strip())
-    if not answer:
-        return
-    ok = True
+        with core._db() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, username, tg_user_id, bitrix_user_id, display_name "
+                        "FROM telegram_bot_access WHERE bot = %s AND is_active ORDER BY id",
+                        (slug,),
+                    )
+                    rows = list(cur.fetchall())
+                    if not rows:
+                        return {"allowed": False, "reason": "access_not_configured"}
+                    match = _select_access_row(rows, tg_user_id, username)
+                    if match is None:
+                        return {"allowed": False, "reason": "user_not_allowed"}
+                    if tg_user_id is not None and match["tg_user_id"] is None:
+                        cur.execute(
+                            "UPDATE telegram_bot_access SET tg_user_id = %s, "
+                            "display_name = COALESCE(display_name, %s) WHERE id = %s",
+                            (int(tg_user_id), _display_name(sender) or None, match["id"]),
+                        )
+                    return {
+                        "allowed": True,
+                        "username": str(match["username"] or username),
+                        "display_name": str(match["display_name"] or _display_name(sender)),
+                        "bitrix_user_id": (
+                            int(match["bitrix_user_id"]) if match["bitrix_user_id"] is not None else None
+                        ),
+                    }
+    except Exception:  # noqa: BLE001
+        log.warning("Telegram access check failed closed for %s", slug, exc_info=True)
+        return {"allowed": False, "reason": "access_unavailable"}
+
+
+def _display_name(sender: dict) -> str:
+    return " ".join(
+        p for p in (str(sender.get("first_name") or "").strip(),
+                    str(sender.get("last_name") or "").strip()) if p
+    ).strip()
+
+
+def _recent_history(slug: str, chat_id, limit: int = 20) -> list[tuple[str, str]]:
+    try:
+        with core._db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT direction, text FROM telegram_bot_messages "
+                    "WHERE bot = %s AND dialog_id = %s AND status = 'ok' ORDER BY id DESC LIMIT %s",
+                    (slug, str(chat_id), max(1, min(int(limit), 50))),
+                )
+                rows = list(reversed(cur.fetchall()))
+    except Exception:  # noqa: BLE001
+        log.warning("Telegram history unavailable for %s", slug, exc_info=True)
+        return []
+    return [(str(r["direction"]), str(r["text"] or "")) for r in rows]
+
+
+def _run_agent_turn(agent: dict, chat_id, sender: dict, text: str, identity: dict,
+                    *, history: list[tuple[str, str]] | None = None) -> str:
+    slug = str(agent["slug"])
+    knowledge = load_profile_knowledge(slug)
+    context = ChannelContext(
+        channel="telegram",
+        conversation_id=str(chat_id),
+        requester_name=str(identity.get("display_name") or _display_name(sender)
+                           or sender.get("username") or ""),
+        requester_platform_id=str(sender.get("id") or ""),
+        requester_bitrix_user_id=identity.get("bitrix_user_id"),
+    )
+    parts = [
+        build_agent_policy(
+            agent,
+            context,
+            core_instructions=knowledge["core_instructions"],
+            selected_skills=knowledge["selected_skills"],
+            personal_instructions=knowledge["personal_instructions"],
+            now=datetime.now(_MSK),
+        )
+    ]
+    history = _recent_history(slug, chat_id) if history is None else history
+    if history:
+        rendered = []
+        for direction, body in history:
+            label = "Пользователь" if direction == "in" else "Ассистент"
+            rendered.append(f"{label}: {body[:6000]}")
+        parts.append("История этого Telegram-диалога:\n" + "\n".join(rendered))
+    parts.append("Текущее сообщение пользователя:\n" + str(text))
+    extra = os.getenv("TG_MULTI_EXTRA_TOOLSETS", "web").strip().strip(",")
+    connector = f"agent-{slug}"
+    toolsets = f"{connector},{extra}" if extra else connector
+    answer = core.hermes_answer("\n\n".join(parts), f"tg-{slug}-{chat_id}", toolsets=toolsets)
+    return core._strip_markup((answer or "").strip())
+
+
+def _denial_text(reason: str) -> str:
+    if reason == "access_not_configured":
+        return ("Этот внутренний агент пока закрыт: администратор ещё не настроил список доступа. "
+                "Ничего не было выполнено.")
+    if reason == "access_unavailable":
+        return ("Не удалось безопасно проверить доступ. Агент временно не выполняет запросы; "
+                "попробуйте позже.")
+    return ("У вас нет доступа к этому внутреннему агенту Albery. "
+            "Обратитесь к Александру Никитенко.")
+
+
+def _answer(agent: dict, chat_id, sender: dict, text: str, message_id=None) -> None:
+    """Compatibility synchronous path. Live channel-neutral mode uses the durable workers."""
+    slug = agent["slug"]
+    history = _recent_history(slug, chat_id)
+    core.journal(slug, chat_id, "in", text, kind="bot_dm", user=sender)
+    identity = _access_identity(slug, sender)
+    if not identity.get("allowed"):
+        answer = _denial_text(str(identity.get("reason") or ""))
+        status, denied = "ok", True
+    else:
+        denied = False
+        _react(agent["bot_token"], chat_id, message_id, "👀")
+        try:
+            answer = _run_agent_turn(agent, chat_id, sender, text, identity, history=history)
+            status = "ok" if answer else "error"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("мозг не ответил (%s): %s", slug, str(exc)[:200])
+            answer, status = "Агент временно не смог завершить ход. Попробуйте позже.", "error"
     try:
         api(agent["bot_token"], "sendMessage", chat_id=chat_id, text=answer[:4000])
+        if not denied and status == "ok":
+            _react(agent["bot_token"], chat_id, message_id, "👍")
     except Exception as exc:  # noqa: BLE001
-        ok = False
+        status = "error"
         log.warning("ответ не доставлен (%s): %s", slug, str(exc)[:200])
-    if ok:
-        _react(agent["bot_token"], chat_id, message_id, "👍")
-    core.journal(slug, chat_id, "out", answer, kind="bot_dm", user=sender,
-                 status="ok" if ok else "error")
+    core.journal(slug, chat_id, "out", answer, kind="bot_dm", user=sender, status=status,
+                 meta={"denied": True} if denied else None)
+
+
+def _durable_enabled() -> bool:
+    return os.getenv("TG_CHANNEL_NEUTRAL_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _next_offset(slug: str) -> int:
+    with core._db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT next_offset FROM telegram_agent_offsets WHERE agent_slug = %s", (slug,))
+            row = cur.fetchone()
+    return int(row["next_offset"] if row else 0)
+
+
+def _capture_updates(agent: dict, updates: list[dict]) -> int:
+    """Commit raw updates and the provider offset in one transaction."""
+    if not updates:
+        return 0
+    slug = str(agent["slug"])
+    next_offset = 0
+    inserted = 0
+    with core._db() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for update in updates:
+                    provider_id = int(update.get("update_id") or 0)
+                    if provider_id <= 0:
+                        continue
+                    cur.execute(
+                        "INSERT INTO telegram_agent_updates (agent_slug, provider_update_id, payload) "
+                        "VALUES (%s, %s, %s::jsonb) ON CONFLICT (agent_slug, provider_update_id) DO NOTHING",
+                        (slug, provider_id, json.dumps(update, ensure_ascii=False)),
+                    )
+                    inserted += int(cur.rowcount or 0)
+                    next_offset = max(next_offset, provider_id + 1)
+                if next_offset:
+                    cur.execute(
+                        "INSERT INTO telegram_agent_offsets (agent_slug, next_offset) VALUES (%s, %s) "
+                        "ON CONFLICT (agent_slug) DO UPDATE SET next_offset = "
+                        "GREATEST(telegram_agent_offsets.next_offset, EXCLUDED.next_offset), updated_at = now()",
+                        (slug, next_offset),
+                    )
+    return inserted
+
+
+def _claim_update(worker_id: str) -> dict | None:
+    with core._db() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "WITH picked AS (SELECT id FROM telegram_agent_updates "
+                    "WHERE status IN ('pending','retry') AND available_at <= now() "
+                    "ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) "
+                    "UPDATE telegram_agent_updates u SET status = 'brain_running', attempts = attempts + 1, "
+                    "locked_at = now(), locked_until = now() + (%s * interval '1 second'), "
+                    "locked_by = %s, updated_at = now() FROM picked WHERE u.id = picked.id RETURNING u.*",
+                    (_LEASE_S, worker_id),
+                )
+                row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _agent_for_slug(slug: str) -> dict | None:
+    return next((agent for agent in load_agents() if str(agent.get("slug")) == str(slug)), None)
+
+
+def _message_has_supported_content(message: dict) -> bool:
+    return bool(
+        str(message.get("text") or message.get("caption") or "").strip()
+        or message.get("photo")
+        or message.get("voice")
+        or message.get("audio")
+        or message.get("document")
+    )
+
+
+def _telegram_file_bytes(token: str, file_id: str, declared_size=None) -> bytes:
+    if declared_size is not None and int(declared_size or 0) > _MEDIA_MAX_BYTES:
+        raise ValueError("Telegram-файл превышает безопасный лимит размера")
+    meta = api(token, "getFile", http_timeout=25, file_id=file_id) or {}
+    file_path = str(meta.get("file_path") or "").strip()
+    if not file_path:
+        raise RuntimeError("Telegram не вернул путь к файлу")
+    try:
+        with requests.get(
+            f"https://api.telegram.org/file/bot{token}/{file_path}", stream=True, timeout=60
+        ) as response:
+            if response.status_code != 200:
+                raise RuntimeError(f"Telegram не отдал файл: HTTP {response.status_code}")
+            chunks = []
+            size = 0
+            for chunk in response.iter_content(65536):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > _MEDIA_MAX_BYTES:
+                    raise ValueError("Telegram-файл превышает безопасный лимит размера")
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        # Never include requests' token-bearing URL in an exception or log line.
+        raise RuntimeError("Не удалось безопасно скачать Telegram-файл") from exc
+
+
+def _telegram_message_text(agent: dict, message: dict, identity: dict) -> str:
+    """Turn Telegram media into channel-neutral text without giving Groq agent authority."""
+    base = str(message.get("text") or message.get("caption") or "").strip()
+    media = None
+    kind = ""
+    name = ""
+    mime = ""
+    photos = message.get("photo") or []
+    if photos:
+        media = photos[-1]
+        kind, name, mime = "image", "telegram-photo.jpg", "image/jpeg"
+    elif message.get("voice"):
+        media = message["voice"]
+        kind, name, mime = "audio", "telegram-voice.ogg", str(media.get("mime_type") or "audio/ogg")
+    elif message.get("audio"):
+        media = message["audio"]
+        name = str(media.get("file_name") or "telegram-audio.mp3")
+        kind, mime = "audio", str(media.get("mime_type") or "audio/mpeg")
+    elif message.get("document"):
+        media = message["document"]
+        name = str(media.get("file_name") or "telegram-document")
+        mime = str(media.get("mime_type") or "")
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if mime.startswith("image/") or ext in {"png", "jpg", "jpeg", "gif", "webp"}:
+            kind = "image"
+        elif mime.startswith("audio/") or ext in {
+            "mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "webm", "flac"
+        }:
+            kind = "audio"
+        else:
+            kind = "document"
+    if not media:
+        return base
+    data = _telegram_file_bytes(
+        str(agent["bot_token"]), str(media.get("file_id") or ""), media.get("file_size")
+    )
+    from shared.media_ingestion import extract_document, recognize_image, transcribe_audio
+    if kind == "image":
+        extracted = recognize_image(data, name)
+        label = "Распознанный скриншот/изображение"
+    elif kind == "audio":
+        extracted = transcribe_audio(data, name)
+        label = "Расшифровка голосового/аудио"
+    else:
+        extracted = extract_document(data, name)
+        label = "Извлечённый текст документа"
+    try:
+        import attachments
+        attachment_id = attachments.store_attachment(
+            data=data,
+            file_name=name,
+            kind=kind,
+            extracted_text=extracted or "",
+            agent_slug=str(agent["slug"]),
+            dialog_id=str((message.get("chat") or {}).get("id") or ""),
+            bitrix_user_id=identity.get("bitrix_user_id"),
+            mime=mime or None,
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("Telegram attachment store failed for %s", agent["slug"], exc_info=True)
+        attachment_id = None
+    if extracted:
+        media_block = f"[{label} «{name}»" + (
+            f", attachment_id={attachment_id}" if attachment_id else ""
+        ) + f"]\n{extracted[:12000]}"
+    else:
+        media_block = (
+            f"[Файл «{name}» получен, но прочитать его не удалось"
+            + (f", attachment_id={attachment_id}" if attachment_id else "")
+            + ". Честно сообщи об этом и не выдумывай содержимое.]"
+        )
+    return (base + "\n\n" + media_block).strip()
+
+
+def _finish_update(update: dict, *, chat_id, answer: str, review: bool = False,
+                   error: str | None = None) -> None:
+    status = "review" if review else "done"
+    idem = f"telegram-agent-update:{update['agent_slug']}:{update['provider_update_id']}"
+    with core._db() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO telegram_agent_outbox "
+                    "(agent_slug, update_id, chat_id, text, idempotency_key) "
+                    "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING",
+                    (update["agent_slug"], update["id"], str(chat_id), answer[:4000], idem),
+                )
+                cur.execute(
+                    "UPDATE telegram_agent_updates SET status = %s, locked_at = NULL, locked_until = NULL, "
+                    "locked_by = NULL, last_error = %s, completed_at = now(), updated_at = now() WHERE id = %s",
+                    (status, (error or "")[:500] or None, update["id"]),
+                )
+
+
+def _ignore_update(update_id: int, reason: str) -> None:
+    with core._db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE telegram_agent_updates SET status = 'ignored', last_error = %s, "
+                "locked_at = NULL, locked_until = NULL, locked_by = NULL, completed_at = now(), "
+                "updated_at = now() WHERE id = %s",
+                (reason[:500], update_id),
+            )
+
+
+def _process_update(update: dict) -> None:
+    payload = update.get("payload")
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    payload = payload if isinstance(payload, dict) else {}
+    msg = payload.get("message") or {}
+    chat = msg.get("chat") or {}
+    sender = msg.get("from") or {}
+    text_value = (msg.get("text") or msg.get("caption") or "").strip()
+    if chat.get("type") != "private" or not _message_has_supported_content(msg) or sender.get("is_bot"):
+        _ignore_update(int(update["id"]), "unsupported or empty update")
+        return
+    agent = _agent_for_slug(str(update["agent_slug"]))
+    if not agent:
+        _ignore_update(int(update["id"]), "agent disabled or removed")
+        return
+    chat_id = chat.get("id")
+    history = _recent_history(agent["slug"], chat_id)
+    core.journal(agent["slug"], chat_id, "in", text_value, kind="bot_dm", user=sender,
+                 meta={"provider_update_id": update["provider_update_id"]})
+    identity = _access_identity(agent["slug"], sender)
+    if not identity.get("allowed"):
+        _finish_update(update, chat_id=chat_id,
+                       answer=_denial_text(str(identity.get("reason") or "")))
+        return
+    try:
+        text_value = _telegram_message_text(agent, msg, identity)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Telegram media could not be prepared for %s: %s", agent["slug"], type(exc).__name__)
+        _finish_update(
+            update,
+            chat_id=chat_id,
+            answer=("Не удалось безопасно получить или прочитать вложение. Никаких действий по "
+                    "этому запросу не выполнено; пришлите файл ещё раз или продублируйте текстом."),
+            error="media preparation failed: " + type(exc).__name__,
+        )
+        return
+    try:
+        answer = _run_agent_turn(agent, chat_id, sender, text_value, identity, history=history)
+        if not answer:
+            raise RuntimeError("empty agent answer")
+    except Exception as exc:  # noqa: BLE001
+        # A live model turn may already have performed an external write. Never replay it after
+        # an unclassified failure; make the ambiguous outcome visible to the user and operator.
+        log.warning("durable Telegram brain needs review (%s): %s", agent["slug"], str(exc)[:200])
+        answer = ("Ход прервался после начала работы. Возможное действие не будет повторено "
+                  "автоматически. Не дублируйте запрос, пока не проверите результат.")
+        _finish_update(update, chat_id=chat_id, answer=answer, review=True, error=str(exc))
+        return
+    _finish_update(update, chat_id=chat_id, answer=answer)
+
+
+def _claim_outbox(worker_id: str) -> dict | None:
+    with core._db() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "WITH picked AS (SELECT id FROM telegram_agent_outbox "
+                    "WHERE status IN ('pending','retry') AND available_at <= now() "
+                    "ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) "
+                    "UPDATE telegram_agent_outbox o SET status = 'leased', locked_at = now(), "
+                    "locked_until = now() + (%s * interval '1 second'), locked_by = %s, "
+                    "updated_at = now() FROM picked WHERE o.id = picked.id RETURNING o.*",
+                    (_LEASE_S, worker_id),
+                )
+                row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _set_outbox_status(outbox_id: int, status: str, *, error: str | None = None,
+                       provider_message_id: str | None = None, delay_s: int = 0) -> None:
+    with core._db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE telegram_agent_outbox SET status = %s, last_error = %s, "
+                "provider_message_id = COALESCE(%s, provider_message_id), "
+                "available_at = now() + (%s * interval '1 second'), locked_at = NULL, "
+                "locked_until = NULL, locked_by = NULL, sent_at = CASE WHEN %s = 'sent' THEN now() "
+                "ELSE sent_at END, updated_at = now() WHERE id = %s",
+                (status, (error or "")[:500] or None, provider_message_id, delay_s, status, outbox_id),
+            )
+
+
+def _process_outbox(item: dict) -> None:
+    agent = _agent_for_slug(str(item["agent_slug"]))
+    if not agent:
+        _set_outbox_status(int(item["id"]), "error", error="agent disabled or removed")
+        return
+    with core._db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE telegram_agent_outbox SET status = 'sending', attempts = attempts + 1, "
+                "locked_until = now() + (%s * interval '1 second'), updated_at = now() WHERE id = %s",
+                (_LEASE_S, item["id"]),
+            )
+    try:
+        result = api(agent["bot_token"], "sendMessage", chat_id=item["chat_id"], text=item["text"])
+    except TelegramDeliveryAmbiguous as exc:
+        _set_outbox_status(int(item["id"]), "review", error=str(exc))
+        return
+    except TelegramAPIError as exc:
+        attempts = int(item.get("attempts") or 0) + 1
+        status = "retry" if exc.retryable and attempts < _DELIVERY_ATTEMPTS else "error"
+        _set_outbox_status(int(item["id"]), status, error=str(exc), delay_s=30 if status == "retry" else 0)
+        return
+    except Exception as exc:  # noqa: BLE001
+        _set_outbox_status(int(item["id"]), "review", error="unknown provider outcome")
+        log.warning("Telegram delivery outcome unknown for %s: %s", item["agent_slug"], type(exc).__name__)
+        return
+    provider_id = result.get("message_id") if isinstance(result, dict) else None
+    _set_outbox_status(int(item["id"]), "sent", provider_message_id=str(provider_id or "") or None)
+    core.journal(item["agent_slug"], item["chat_id"], "out", item["text"], kind="bot_dm",
+                 status="ok", meta={"durable_outbox_id": item["id"]})
+
+
+def _recover_durable() -> None:
+    """Recover only stages whose external outcome is known; ambiguous stages stop for review."""
+    with core._db() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE telegram_agent_outbox SET status = 'retry', available_at = now(), "
+                    "locked_at = NULL, locked_until = NULL, locked_by = NULL, updated_at = now() "
+                    "WHERE status = 'leased' AND locked_until < now()"
+                )
+                cur.execute(
+                    "UPDATE telegram_agent_outbox SET status = 'review', "
+                    "last_error = 'worker stopped during provider call; outcome unknown', "
+                    "locked_at = NULL, locked_until = NULL, locked_by = NULL, updated_at = now() "
+                    "WHERE status = 'sending' AND locked_until < now()"
+                )
+                cur.execute(
+                    "SELECT id, agent_slug, provider_update_id, payload FROM telegram_agent_updates "
+                    "WHERE status = 'brain_running' AND locked_until < now() FOR UPDATE"
+                )
+                stuck = list(cur.fetchall())
+                for row in stuck:
+                    payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
+                    chat_id = ((payload.get("message") or {}).get("chat") or {}).get("id")
+                    cur.execute(
+                        "UPDATE telegram_agent_updates SET status = 'review', "
+                        "last_error = 'worker stopped during model turn; external effects may exist', "
+                        "locked_at = NULL, locked_until = NULL, locked_by = NULL, updated_at = now() "
+                        "WHERE id = %s",
+                        (row["id"],),
+                    )
+                    if chat_id is not None:
+                        cur.execute(
+                            "INSERT INTO telegram_agent_outbox "
+                            "(agent_slug, update_id, chat_id, text, idempotency_key) "
+                            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING",
+                            (row["agent_slug"], row["id"], str(chat_id),
+                             "Ход был прерван. Возможное действие не повторяется автоматически; "
+                             "проверьте результат перед новым запросом.",
+                             f"telegram-agent-update:{row['agent_slug']}:{row['provider_update_id']}"),
+                        )
+
+
+def _brain_worker_loop() -> None:
+    worker_id = "tg-brain-" + uuid4().hex[:8]
+    while True:
+        try:
+            row = _claim_update(worker_id)
+            if row:
+                _process_update(row)
+            else:
+                time.sleep(_WORKER_POLL_S)
+        except Exception:  # noqa: BLE001
+            log.exception("Telegram durable brain worker failed")
+            time.sleep(_WORKER_POLL_S)
+
+
+def _outbox_worker_loop() -> None:
+    worker_id = "tg-outbox-" + uuid4().hex[:8]
+    while True:
+        try:
+            row = _claim_outbox(worker_id)
+            if row:
+                _process_outbox(row)
+            else:
+                time.sleep(_WORKER_POLL_S)
+        except Exception:  # noqa: BLE001
+            log.exception("Telegram durable outbox worker failed")
+            time.sleep(_WORKER_POLL_S)
+
+
+def _start_durable_workers() -> None:
+    global _workers_started
+    if _workers_started:
+        return
+    _recover_durable()
+    _workers_started = True
+    threading.Thread(target=_brain_worker_loop, daemon=True, name="tg-agent-brain").start()
+    threading.Thread(target=_outbox_worker_loop, daemon=True, name="tg-agent-outbox").start()
 
 
 def _is_wanted(slug: str, token: str | None = None) -> bool:
@@ -286,15 +833,28 @@ def _poll(agent: dict) -> None:
             _threads.pop(slug, None)
             return
         try:
+            offset = (_next_offset(slug) if _durable_enabled()
+                      else _legacy_offsets.get(slug, 0))
             updates = api(token, "getUpdates", http_timeout=_POLL_TIMEOUT + 15,
-                          timeout=_POLL_TIMEOUT, offset=_offsets.get(slug, 0),
+                          timeout=_POLL_TIMEOUT, offset=offset,
                           allowed_updates=["message"])
         except Exception as exc:  # noqa: BLE001
             log.warning("getUpdates (%s): %s", slug, str(exc)[:150])
             time.sleep(5)
             continue
+        if _durable_enabled():
+            try:
+                _capture_updates(agent, list(updates or []))
+            except Exception:  # noqa: BLE001
+                # The offset stays unchanged when capture fails; Telegram will replay and the DB
+                # unique key will deduplicate anything already committed.
+                log.exception("durable Telegram capture failed for %s", slug)
+                time.sleep(2)
+            continue
         for upd in updates or []:
-            _offsets[slug] = max(_offsets.get(slug, 0), int(upd.get("update_id", 0)) + 1)
+            _legacy_offsets[slug] = max(
+                _legacy_offsets.get(slug, 0), int(upd.get("update_id", 0)) + 1
+            )
             msg = upd.get("message") or {}
             chat = msg.get("chat") or {}
             text = (msg.get("text") or msg.get("caption") or "").strip()
@@ -315,6 +875,9 @@ def _poll(agent: dict) -> None:
 
 def start_all() -> None:
     """Поднять поток на каждого активного агента и следить за появлением новых."""
+    if _durable_enabled():
+        _start_durable_workers()
+
     def supervisor():
         while True:
             for agent in load_agents():

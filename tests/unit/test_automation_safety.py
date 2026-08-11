@@ -142,3 +142,22 @@ def test_delivery_stage_cannot_start_hermes_again():
     source = inspect.getsource(aa._process_delivery)
     assert "_hermes_once" not in source
     assert "subprocess" not in source
+
+
+def test_channel_neutral_telegram_migration_has_durable_ledgers_and_actor_mapping():
+    from pathlib import Path
+    from scripts import ensure_postgres
+
+    name = "084_channel_neutral_telegram_agents.sql"
+    assert name in ensure_postgres.ALWAYS_APPLY_MIGRATIONS
+    sql = (Path(__file__).resolve().parents[2] / "database" / "migrations" / name).read_text(
+        encoding="utf-8"
+    )
+    assert "telegram_agent_updates" in sql
+    assert "telegram_agent_offsets" in sql
+    assert "telegram_agent_outbox" in sql
+    assert "bitrix_user_id" in sql
+    assert "delivery_channel" in sql
+    assert "delivery_conversation_id" in sql
+    assert "UNIQUE (agent_slug, provider_update_id)" in sql
+    assert "idempotency_key" in sql

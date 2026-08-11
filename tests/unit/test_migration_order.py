@@ -32,3 +32,11 @@ def test_workspace_bot_source_runs_after_workspace_tables():
     assert migrations.index("070_funnel_workspace.sql") < migrations.index(
         "074_workspace_bot_source.sql"
     )
+
+
+def test_channel_neutral_telegram_runs_after_durable_automations():
+    migrations = ensure_postgres.ALWAYS_APPLY_MIGRATIONS
+
+    assert migrations.index("083_durable_agent_automation_runs.sql") < migrations.index(
+        "084_channel_neutral_telegram_agents.sql"
+    )

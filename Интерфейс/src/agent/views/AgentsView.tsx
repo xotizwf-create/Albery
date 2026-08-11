@@ -21,9 +21,8 @@ import {
   AgentLevel,
   BitrixUser,
   McpTool,
-  TelegramAccessAgent,
   TelegramAccessUser,
-  createTelegramAgent,
+  attachTelegramBridge,
   fetchTelegramAccess,
   saveTelegramAccess,
   addAgentInstruction,
@@ -598,6 +597,7 @@ const AgentEditor: React.FC<{
 }> = ({ slug, onChanged, onDeleted, isTelegram = false }) => {
   const [tgUsers, setTgUsers] = useState<TelegramAccessUser[]>([]);
   const [tgInput, setTgInput] = useState("");
+  const [tgBitrixUserId, setTgBitrixUserId] = useState("");
   const [tgBusy, setTgBusy] = useState(false);
   const [tgError, setTgError] = useState("");
 
@@ -612,13 +612,16 @@ const AgentEditor: React.FC<{
     reloadTgAccess();
   }, [reloadTgAccess]);
 
-  const changeTgAccess = async (username: string, remove: boolean) => {
+  const changeTgAccess = async (username: string, remove: boolean, bitrixUserId?: number | null) => {
     setTgBusy(true);
     setTgError("");
     try {
-      await saveTelegramAccess({ bot: slug, username, remove });
+      await saveTelegramAccess({ bot: slug, username, remove, bitrix_user_id: bitrixUserId });
       reloadTgAccess();
-      if (!remove) setTgInput("");
+      if (!remove) {
+        setTgInput("");
+        setTgBitrixUserId("");
+      }
     } catch (e) {
       setTgError((e as Error).message);
     } finally {
@@ -875,6 +878,9 @@ const AgentEditor: React.FC<{
                       <div className="text-[11.5px] text-gray-500 truncate">
                         {u.display_name || "—"}
                         {u.tg_user_id ? ` · id ${u.tg_user_id}` : " · id появится после первого сообщения"}
+                        {u.bitrix_user_id
+                          ? ` · Bitrix: ${users.find((person) => person.id === u.bitrix_user_id)?.name || `#${u.bitrix_user_id}`}`
+                          : " · без действий от лица сотрудника"}
                       </div>
                     </div>
                     <button
@@ -886,17 +892,31 @@ const AgentEditor: React.FC<{
                     </button>
                   </div>
                 ))}
-                <div className="flex gap-2">
+                <div className="grid grid-cols-1 md:grid-cols-[1fr_1fr_auto] gap-2">
                   <input
                     value={tgInput}
                     onChange={(e) => setTgInput(e.target.value)}
                     placeholder="@username"
                     className="flex-1 min-w-0 px-3 py-2 bg-white border border-gray-200/80 rounded-xl text-[13px] focus:outline-none focus:border-indigo-400"
                   />
+                  <select
+                    value={tgBitrixUserId}
+                    onChange={(e) => setTgBitrixUserId(e.target.value)}
+                    className="min-w-0 px-3 py-2 bg-white border border-gray-200/80 rounded-xl text-[13px] focus:outline-none focus:border-indigo-400"
+                  >
+                    <option value="">Без Bitrix identity</option>
+                    {users.map((person) => (
+                      <option key={person.id} value={person.id}>{person.name}</option>
+                    ))}
+                  </select>
                   <button
                     disabled={!tgInput.trim()}
                     onClick={() =>
-                      void changeTgAccess(tgInput.trim().replace(/^@/, "").toLowerCase(), false)
+                      void changeTgAccess(
+                        tgInput.trim().replace(/^@/, "").toLowerCase(),
+                        false,
+                        tgBitrixUserId ? Number(tgBitrixUserId) : null,
+                      )
                     }
                     className="px-3.5 py-2 text-[13px] font-bold rounded-xl bg-indigo-600 text-white disabled:opacity-40"
                   >
@@ -905,9 +925,9 @@ const AgentEditor: React.FC<{
                 </div>
                 {tgError && <div className="text-[12px] text-rose-600">{tgError}</div>}
                 <div className="text-[11.5px] text-gray-400 leading-snug">
-                  В Telegram нет прав портала — доступ решает этот список. Остальным агент
-                  отвечает отказом. Telegram не ищет людей по @username, поэтому числовой id
-                  запишется сам, когда человек напишет агенту.
+                  Пустой список закрывает бота для всех. Telegram id запишется после первого
+                  сообщения. Действия от лица сотрудника разрешены только при явной связи с его
+                  Bitrix identity.
                 </div>
               </div>
             </div>
@@ -1097,36 +1117,42 @@ const AgentEditor: React.FC<{
 };
 
 function CreateTelegramAgentModal({
+  agents,
   onClose,
   onCreated,
 }: {
+  agents: AgentConfig[];
   onClose: () => void;
   onCreated: (slug: string) => void;
 }) {
+  const available = agents.filter((agent) => !(agent.channels || []).includes("Telegram"));
+  const [slug, setSlug] = useState(available[0]?.id || "");
   const [username, setUsername] = useState("");
-  const [name, setName] = useState("");
-  const [role, setRole] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   const submit = async () => {
-    if (!name.trim()) {
-      setError("Укажите имя агента.");
+    if (!slug) {
+      setError("Сначала создайте профиль агента или выберите существующий.");
       return;
     }
     if (!username.trim().toLowerCase().replace(/^@/, "").endsWith("bot")) {
       setError("Telegram требует, чтобы @username бота заканчивался на «bot».");
       return;
     }
+    if (!window.confirm(
+      `Создать нового Telegram-бота @${username.trim().replace(/^@/, "")} и привязать его к профилю «${slug}»? ` +
+      "Создание бота у BotFather нельзя автоматически отменить; после подключения бот останется закрытым до настройки доступа.",
+    )) return;
     setBusy(true);
     setError("");
     try {
-      const created = await createTelegramAgent({
-        name: name.trim(),
+      const attached = await attachTelegramBridge({
+        slug,
         telegram_username: username.trim().replace(/^@/, ""),
-        role_prompt: role.trim(),
+        create_via_botfather: true,
       });
-      onCreated(created.slug);
+      onCreated(attached.slug);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -1140,11 +1166,22 @@ function CreateTelegramAgentModal({
         className="bg-white rounded-3xl shadow-xl w-full max-w-lg p-6"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="font-bold text-gray-900 text-[19px]">Новый Telegram-агент</h2>
+        <h2 className="font-bold text-gray-900 text-[19px]">Подключить Telegram к агенту</h2>
         <p className="text-[13px] text-gray-500 mt-1.5">
-          Бота зарегистрирует сам агент — проведёт диалог с <span className="font-bold">@BotFather</span> от
-          аккаунта компании. Вручную создавать ничего не нужно.
+          Это будет тот же профиль, что в Bitrix: одна роль, инструкции, знания и MCP-права.
+          Отличаться будут только история диалога и канал доставки.
         </p>
+
+        <label className="block mt-5 text-[13px] font-bold text-gray-700">Профиль агента</label>
+        <select
+          value={slug}
+          onChange={(e) => setSlug(e.target.value)}
+          className="mt-1.5 w-full px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400"
+        >
+          {available.map((agent) => (
+            <option key={agent.id} value={agent.id}>{agent.name} · {agent.id}</option>
+          ))}
+        </select>
 
         <label className="block mt-5 text-[13px] font-bold text-gray-700">@username бота</label>
         <input
@@ -1157,29 +1194,11 @@ function CreateTelegramAgentModal({
           Должен заканчиваться на «bot» и быть свободным — иначе Telegram откажет.
         </p>
 
-        <label className="block mt-4 text-[13px] font-bold text-gray-700">Имя агента</label>
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="Например: Агент по подключению"
-          className="mt-1.5 w-full px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400"
-        />
-
-        <label className="block mt-4 text-[13px] font-bold text-gray-700">Кем работает</label>
-        <textarea
-          value={role}
-          onChange={(e) => setRole(e.target.value)}
-          rows={3}
-          placeholder="Например: консультант по подключению к индивидуальным условиям WB."
-          className="mt-1.5 w-full px-3.5 py-2.5 text-[13.5px] rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400 resize-none"
-        />
-
         {error && <div className="mt-3 text-[12.5px] text-rose-600">{error}</div>}
 
         <div className="mt-4 text-[12px] text-gray-400 leading-snug">
-          Агент заработает в течение минуты — служба подхватывает новых сама. Инструменты,
-          инструкции и знания настраиваются потом в его карточке — так же, как у агентов
-          Битрикса. Дальше добавьте тех, кому можно ему писать: остальным он отвечает отказом.
+          После подключения бот намеренно закрыт для всех. Добавьте хотя бы одного разрешённого
+          пользователя и при необходимости свяжите его с сотрудником Bitrix для действий от его имени.
         </div>
 
         <div className="mt-5 flex gap-2 justify-end">
@@ -1187,12 +1206,12 @@ function CreateTelegramAgentModal({
             Отмена
           </button>
           <button
-            disabled={busy || !username.trim() || !name.trim()}
+            disabled={busy || !username.trim() || !slug}
             onClick={() => void submit()}
             className="px-4 py-2.5 text-[13.5px] font-bold rounded-xl bg-indigo-600 text-white disabled:opacity-40"
           >
             {/* Диалог с BotFather идёт в три шага с ожиданием ответа — это не мгновенно. */}
-            {busy ? "Регистрирую бота…" : "Создать"}
+            {busy ? "Подключаю бота…" : "Подключить"}
           </button>
         </div>
       </div>
@@ -1207,13 +1226,9 @@ export function AgentsView() {
   const [showCreate, setShowCreate] = useState(false);
   const [createNote, setCreateNote] = useState("");
   const [, setForceUpdate] = useState(0);
-  // Агенты живут в двух каналах и настраиваются по-разному: у битриксовых — состав команды и
-  // инструменты, у телеграмных — список тех, кто вообще может им писать.
+  // Один профиль владеет ролью, знаниями и инструментами во всех внутренних каналах.
+  // Канал меняет только транспорт, историю диалога и список допущенных к этому мосту людей.
   const [channel, setChannel] = useState<"Bitrix" | "Telegram">("Bitrix");
-  const [tgAccess, setTgAccess] = useState<TelegramAccessAgent[]>([]);
-  const [accessInput, setAccessInput] = useState("");
-  const [accessBusy, setAccessBusy] = useState(false);
-  const [accessError, setAccessError] = useState("");
 
   const reloadAgents = (selectFirst = false) =>
     fetchAgents()
@@ -1245,32 +1260,9 @@ export function AgentsView() {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
-  const reloadAccess = () =>
-    fetchTelegramAccess().then(setTgAccess).catch(() => setTgAccess([]));
-
-  useEffect(() => {
-    if (channel === "Telegram") void reloadAccess();
-  }, [channel]);
-
   const channelAgents = agents.filter((a) => (a.channels || []).includes(channel));
   const activeAgent =
     channelAgents.find((a) => a.id === activeAgentId) || channelAgents[0] || agents[0];
-  const activeAccess = tgAccess.find((a) => a.slug === activeAgent?.id) || null;
-
-  const submitAccess = async (username: string, remove: boolean) => {
-    if (!activeAccess) return;
-    setAccessBusy(true);
-    setAccessError("");
-    try {
-      await saveTelegramAccess({ bot: activeAccess.slug, username, remove });
-      await reloadAccess();
-      if (!remove) setAccessInput("");
-    } catch (e) {
-      setAccessError((e as Error).message);
-    } finally {
-      setAccessBusy(false);
-    }
-  };
 
   return (
     <div className="flex flex-col lg:flex-row items-start gap-6 h-[calc(100vh-14rem)] min-h-[560px]">
@@ -1300,7 +1292,7 @@ export function AgentsView() {
             className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 transition-all shadow-sm font-bold text-[14px]"
           >
             <Plus className="w-5 h-5" />
-            Создать агента
+            {channel === "Telegram" ? "Подключить Telegram к агенту" : "Создать агента"}
           </button>
           {createNote && (
             <div className="mt-2 text-[11.5px] font-bold text-amber-600 bg-amber-50 border border-amber-100 rounded-lg px-2.5 py-1.5">
@@ -1412,11 +1404,11 @@ export function AgentsView() {
 
       {showCreate && channel === "Telegram" && (
         <CreateTelegramAgentModal
+          agents={agents}
           onClose={() => setShowCreate(false)}
           onCreated={(slug) => {
             setShowCreate(false);
             void reloadAgents().then(() => setActiveAgentId(slug));
-            void reloadAccess();
           }}
         />
       )}

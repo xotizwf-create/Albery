@@ -133,6 +133,7 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
   const [fScheduleValid, setFScheduleValid] = useState(true);
   const [fPrompt, setFPrompt] = useState("");
   const [fDeliver, setFDeliver] = useState("");
+  const [fChannel, setFChannel] = useState<"bitrix" | "telegram">("bitrix");
 
   const load = () =>
     fetchAgentAutomations(slug)
@@ -181,7 +182,7 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
       <div className="flex items-center justify-between flex-wrap gap-3">
         <p className="text-[13px] font-medium text-gray-500 max-w-2xl">
           Всё регулярное у этого агента: автоматизации (агент выполняет по расписанию своими
-          инструментами и присылает результат в Битрикс) и регулярные задачи 📋 (приложение само
+          инструментами и присылает результат в настроенный канал) и регулярные задачи 📋 (приложение само
           создаёт задачу в Bitrix точно в срок). Агент ставит и то и другое из чата — просто попросите.
         </p>
         <button
@@ -214,11 +215,19 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
             className="w-full px-3.5 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13px] font-medium focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none resize-y shadow-sm"
           />
           <div className="flex gap-3 flex-wrap items-center">
+            <select
+              value={fChannel}
+              onChange={(e) => setFChannel(e.target.value as "bitrix" | "telegram")}
+              className="px-3.5 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13px] font-bold focus:outline-none focus:border-indigo-400"
+            >
+              <option value="bitrix">Bitrix</option>
+              <option value="telegram">Telegram</option>
+            </select>
             <input
               type="text"
               value={fDeliver}
               onChange={(e) => setFDeliver(e.target.value)}
-              placeholder="Куда слать: ID сотрудника или chatN (пусто — чат уведомлений)"
+              placeholder={fChannel === "telegram" ? "Telegram chat id" : "Bitrix dialog id или chatN"}
               className="flex-1 min-w-[260px] px-3.5 py-2.5 bg-white border border-gray-200/80 rounded-xl text-[13px] font-medium focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none shadow-sm"
             />
             <button
@@ -229,13 +238,16 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                     schedule: fSchedule.trim(),
                     prompt: fPrompt.trim(),
                     deliver_to: fDeliver.trim(),
+                    delivery_channel: fChannel,
+                    delivery_profile: slug,
+                    delivery_conversation_id: fDeliver.trim(),
                   });
                   setFName("");
                   setFPrompt("");
                   setShowForm(false);
                 })
               }
-              disabled={busyId !== null || !fName.trim() || !fPrompt.trim() || !fScheduleValid}
+              disabled={busyId !== null || !fName.trim() || !fPrompt.trim() || !fDeliver.trim() || !fScheduleValid}
               className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-[13px] font-bold hover:bg-indigo-700 shadow-sm transition-all disabled:opacity-50"
             >
               Создать
@@ -431,7 +443,8 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                       ) : (
                       <p>
                         <span className="font-bold text-gray-800">Доставка:</span>{" "}
-                        {a.deliver_to || "чат уведомлений Albery"}
+                        {(a.delivery_channel || "bitrix") === "telegram" ? "Telegram" : "Bitrix"}
+                        {" · "}{a.delivery_conversation_id || a.deliver_to || "не настроено"}
                       </p>
                       )}
                       <ScheduleEditor

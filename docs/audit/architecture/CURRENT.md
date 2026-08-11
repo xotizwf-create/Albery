@@ -144,9 +144,59 @@ flowchart TD
   rejected its configured token with HTTP 401. No current live health proof exists for each
   additional bot token.
 
-Required follow-up is a separate approved runtime change: channel-neutral identity binding,
-fail-closed Telegram access, durable additional-agent intake/delivery, per-bot health, and an
-explicit automation destination `{channel, profile, conversation_id}` with a Telegram adapter.
+### Locally implemented target under CHG-20260811-09
+
+The production description above remains authoritative until rollout. The following replacement is
+implemented and regression-tested locally under [ADR-0005](../decisions/ADR-0005-channel-neutral-agent-runtime.md)
+and [CHG-20260811-09](../changes/CHG-20260811-09-channel-neutral-telegram-agents.md):
+
+```mermaid
+flowchart TD
+    BP[Bitrix employee message] --> BC[Bitrix channel context]
+    TP[Allowed employee Telegram message] --> TC[Telegram channel context]
+    TC --> MED[Groq media to text when needed]
+    BC --> AP[One agents.slug profile]
+    MED --> AP
+    TC --> AP
+
+    AP --> CORE[Same identity, role, core rules, skills and personal learning]
+    CORE --> MCP[Same private agent-slug MCP plus web]
+    MCP --> H[Hermes/Codex decision and actions]
+
+    H --> BO[Bitrix adapter and bot identity]
+    H --> TO[(Telegram durable outbox and profile bot identity)]
+
+    H --> SA[schedule_my_automation]
+    SA --> AD[(Typed channel, profile, conversation)]
+    AD --> AQ[(Durable automation stages and shared run limit)]
+    AQ --> BO
+    AQ --> TO
+
+    IU[IU client and Business messages] --> ZERO[Separate zero-tool customer workspace]
+```
+
+- Agent Center no longer creates a Telegram-only logical agent. It creates the normal Bitrix
+  profile first and attaches a Telegram bot identity to that existing `agents.slug` through an
+  explicit bridge action. Replacing an existing bridge is rejected until it is explicitly detached.
+- Bitrix and employee Telegram call the shared profile policy and the exact same `agent-<slug>`
+  private MCP connector. Channel-specific state is limited to rendering, conversation history,
+  requester mapping and transport. The IU customer workspace remains separate and zero-tool.
+- Telegram access is fail-closed. Empty list, unknown user or unavailable PostgreSQL prevents the
+  model call. Username can bootstrap the stable Telegram id once; Bitrix on-behalf-of actions are
+  forbidden until that access row explicitly maps to a Bitrix employee id.
+- Raw provider updates and offsets commit atomically. Model results enter a PostgreSQL outbox.
+  Known provider failures retry only stored delivery; connection/timeouts and interrupted provider
+  calls stop for manual review. A stopped model turn is not blindly replayed because tools may have
+  produced an external effect.
+- Screenshots, voice/audio and common documents are downloaded only after access passes. Groq turns
+  image/audio into text; the same Hermes/Codex agent makes every business decision and tool call.
+- Agent automations now store `delivery_channel`, `delivery_profile` and
+  `delivery_conversation_id`. Telegram delivery uses the owning profile's token and re-checks that
+  the recipient still has active access; revoked recipients do not receive later scheduled output.
+- The target is feature-gated by `TG_CHANNEL_NEUTRAL_ENABLED`. Local evidence is `1745 passed,
+  1 skipped` plus frontend TypeScript success. It is not production state: SSH authentication to
+  server 186 was rejected, PostgreSQL integration was unavailable locally, live identities/jobs
+  were not reconciled and the feature flag remains off by default.
 
 ## Bitrix agent and automation split
 

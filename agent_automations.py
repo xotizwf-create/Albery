@@ -71,7 +71,8 @@ _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 # --- Storage ---------------------------------------------------------------------------------
 
-_COLS = ("id, agent_slug, name, description, schedule, prompt, deliver_to, kind, created_by, "
+_COLS = ("id, agent_slug, name, description, schedule, prompt, deliver_to, delivery_channel, "
+         "delivery_profile, delivery_conversation_id, kind, created_by, "
          "creator_label, is_active, last_run_at, last_status, last_result, last_error, created_at, "
          "system_key")
 
@@ -195,6 +196,9 @@ def _automation_json(r: dict[str, Any], names: dict[int, str] | None = None) -> 
         "can_run": system_manageable and (r.get("system_key") or "").partition(":")[0] != "app",
         "prompt": r["prompt"] or "",
         "deliver_to": r["deliver_to"] or "",
+        "delivery_channel": r.get("delivery_channel") or "bitrix",
+        "delivery_profile": r.get("delivery_profile") or r["agent_slug"],
+        "delivery_conversation_id": r.get("delivery_conversation_id") or r["deliver_to"] or "",
         "kind": r["kind"],
         "created_by": r["created_by"],
         "creator_label": r["creator_label"] or "",
@@ -445,17 +449,30 @@ def agent_automations_create(slug: str):
     problem = _validate(name, schedule, prompt, _OWNER_MAX_FIRES_PER_DAY)
     if problem:
         return jsonify({"error": problem}), 400
+    delivery_channel = str(body.get("delivery_channel") or "bitrix").strip().lower()
+    delivery_conversation_id = str(
+        body.get("delivery_conversation_id") or body.get("deliver_to") or ""
+    ).strip()
+    if delivery_channel not in {"bitrix", "telegram"}:
+        return jsonify({"error": "Канал доставки должен быть bitrix или telegram."}), 400
+    if not delivery_conversation_id:
+        return jsonify({"error": "Укажите диалог доставки."}), 400
     try:
         with pg_connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO agent_automations (agent_slug, name, description, schedule, "
-                        "prompt, deliver_to, kind, created_by, creator_label) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, 'agent', 'owner', 'владелец (панель)') "
+                        "prompt, deliver_to, delivery_channel, delivery_profile, "
+                        "delivery_conversation_id, kind, created_by, creator_label) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                        "'agent', 'owner', 'владелец (панель)') "
                         "ON CONFLICT (agent_slug, name) DO NOTHING RETURNING id",
                         (slug, name, str(body.get("description") or "").strip(), schedule,
-                         prompt, str(body.get("deliver_to") or "").strip()),
+                         prompt, delivery_conversation_id,
+                         delivery_channel,
+                         str(body.get("delivery_profile") or slug).strip(),
+                         delivery_conversation_id),
                     )
                     created = cur.fetchone()
         if not created:
@@ -521,6 +538,20 @@ def agent_automation_update(auto_id: int):
         return jsonify({"error": problem}), 400
     description = str(body.get("description") if body.get("description") is not None else row["description"]).strip()
     deliver_to = str(body.get("deliver_to") if body.get("deliver_to") is not None else row["deliver_to"]).strip()
+    delivery_channel = str(body.get("delivery_channel") if body.get("delivery_channel") is not None
+                           else row.get("delivery_channel") or "bitrix").strip().lower()
+    if delivery_channel not in {"bitrix", "telegram"}:
+        return jsonify({"error": "Канал доставки должен быть bitrix или telegram."}), 400
+    delivery_profile = str(body.get("delivery_profile") if body.get("delivery_profile") is not None
+                           else row.get("delivery_profile") or row["agent_slug"]).strip()
+    delivery_conversation_id = str(
+        body.get("delivery_conversation_id")
+        if body.get("delivery_conversation_id") is not None
+        else row.get("delivery_conversation_id") or deliver_to
+    ).strip()
+    if not delivery_conversation_id:
+        return jsonify({"error": "Укажите диалог доставки."}), 400
+    deliver_to = delivery_conversation_id
     is_active = bool(body.get("is_active")) if body.get("is_active") is not None else bool(row["is_active"])
     try:
         with pg_connect() as conn:
@@ -528,8 +559,11 @@ def agent_automation_update(auto_id: int):
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE agent_automations SET name = %s, description = %s, schedule = %s, "
-                        "prompt = %s, deliver_to = %s, is_active = %s, updated_at = now() WHERE id = %s",
-                        (name, description, schedule, prompt, deliver_to, is_active, auto_id),
+                        "prompt = %s, deliver_to = %s, delivery_channel = %s, "
+                        "delivery_profile = %s, delivery_conversation_id = %s, is_active = %s, "
+                        "updated_at = now() WHERE id = %s",
+                        (name, description, schedule, prompt, deliver_to, delivery_channel,
+                         delivery_profile, delivery_conversation_id, is_active, auto_id),
                     )
         return jsonify({"ok": True})
     except Exception:  # noqa: BLE001
@@ -585,7 +619,7 @@ def _automation_prompt(agent: dict[str, Any], row: dict[str, Any]) -> str:
     head = (
         "[Служебный запуск по расписанию — автоматизация «" + row["name"] + "» агента «"
         + str(agent.get("name") or agent["slug"]) + "». Это НЕ сообщение пользователя: молча выполни "
-        "задачу автоматизации и верни ГОТОВЫЙ текст, который будет отправлен сообщением в Битрикс "
+        "задачу автоматизации и верни ГОТОВЫЙ текст, который будет отправлен в настроенный канал "
         "от твоего имени. ИЗОЛЯЦИЯ: ты автономный агент со СВОИМ набором инструментов и инструкций — "
         "работай ТОЛЬКО ими; другие агенты, их задачи и автоматизации тебя не касаются, не ссылайся "
         "на них и не пытайся выполнять чужую работу."
@@ -660,6 +694,11 @@ def _run_snapshot(row: dict[str, Any]) -> dict[str, Any]:
         "name": row["name"],
         "prompt": row.get("prompt") or "",
         "deliver_to": row.get("deliver_to") or "",
+        "delivery_channel": row.get("delivery_channel") or "bitrix",
+        "delivery_profile": row.get("delivery_profile") or row["agent_slug"],
+        "delivery_conversation_id": (
+            row.get("delivery_conversation_id") or row.get("deliver_to") or ""
+        ),
     }
 
 
@@ -675,7 +714,8 @@ def _enqueue_run(row: dict[str, Any], trigger_kind: str, scheduled_for) -> int |
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, agent_slug, name, prompt, deliver_to, kind, is_active "
+                    "SELECT id, agent_slug, name, prompt, deliver_to, delivery_channel, "
+                    "delivery_profile, delivery_conversation_id, kind, is_active "
                     "FROM agent_automations WHERE id = %s FOR UPDATE",
                     (auto_id,),
                 )
@@ -803,8 +843,14 @@ def _hermes_once(cmd: list, timeout_s: int, tag: str) -> tuple[Any, str | None]:
 
 def _prepare_delivery(run: dict[str, Any], answer: str) -> None:
     snapshot = run["automation_snapshot"]
-    raw = (snapshot.get("deliver_to") or "").strip() or os.getenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat728")
+    channel = str(snapshot.get("delivery_channel") or "bitrix").strip().lower()
+    raw = str(snapshot.get("delivery_conversation_id") or snapshot.get("deliver_to") or "").strip()
+    if not raw and channel == "bitrix":
+        raw = os.getenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat728")
+    if channel not in {"bitrix", "telegram"} or not raw:
+        raise RuntimeError("некорректный типизированный адрес доставки")
     targets = [t.strip() for t in raw.replace(";", ",").split(",") if t.strip()]
+    profile_slug = str(snapshot.get("delivery_profile") or run["agent_slug"]).strip()
     with pg_connect() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -816,9 +862,10 @@ def _prepare_delivery(run: dict[str, Any], answer: str) -> None:
                 )
                 for target in targets:
                     cur.execute(
-                        "INSERT INTO agent_automation_deliveries (run_id, target) VALUES (%s, %s) "
+                        "INSERT INTO agent_automation_deliveries (run_id, target, channel, profile_slug) "
+                        "VALUES (%s, %s, %s, %s) "
                         "ON CONFLICT (run_id, target) DO NOTHING",
-                        (run["id"], target),
+                        (run["id"], target, channel, profile_slug),
                     )
 
 
@@ -907,7 +954,6 @@ def _process_delivery(run: dict[str, Any]) -> None:
     if not agent or not agent.get("is_active"):
         _set_run_status(run["id"], "error", "агент не найден или выключен перед доставкой")
         return
-    message = "[b]⏰ " + snapshot["name"] + "[/b]\n" + _bb_sanitize(run["result_text"] or "")
     with pg_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -916,7 +962,6 @@ def _process_delivery(run: dict[str, Any]) -> None:
                 (run["id"],),
             )
             deliveries = list(cur.fetchall())
-    from b24bot import _albery_bitrix_notify
     for delivery in deliveries:
         with pg_connect() as conn:
             with conn.transaction():
@@ -926,29 +971,70 @@ def _process_delivery(run: dict[str, Any]) -> None:
                         "lease_until = now() + (%s * interval '1 second'), updated_at = now() WHERE id = %s",
                         (_LEASE_S, delivery["id"]),
                     )
+        channel = str(delivery.get("channel") or "bitrix").lower()
+        ambiguous = False
+        known_retryable = channel == "bitrix"
         try:
-            ok, error = _albery_bitrix_notify(
-                message, dialog_id=delivery["target"], bot_id=agent.get("bitrix_bot_id"),
-                retry_transient=False,
-            )
+            if channel == "telegram":
+                import tg_multi
+                token = agent.get("telegram_bot_token")
+                if not token or str(delivery.get("profile_slug") or run["agent_slug"]) != str(agent["slug"]):
+                    raise tg_multi.TelegramAPIError(
+                        "sendMessage", "Telegram identity is not bound to this profile", status_code=400
+                    )
+                with pg_connect() as access_conn:
+                    with access_conn.cursor() as access_cur:
+                        access_cur.execute(
+                            "SELECT 1 FROM telegram_bot_access WHERE bot = %s AND is_active "
+                            "AND tg_user_id IS NOT NULL AND tg_user_id::text = %s LIMIT 1",
+                            (agent["slug"], str(delivery["target"])),
+                        )
+                        if not access_cur.fetchone():
+                            raise tg_multi.TelegramAPIError(
+                                "sendMessage", "Telegram recipient access is absent or revoked",
+                                status_code=403,
+                            )
+                message = "⏰ " + snapshot["name"] + "\n" + str(run["result_text"] or "")
+                tg_multi.api(token, "sendMessage", chat_id=delivery["target"], text=message[:4000])
+                ok, error = True, None
+            else:
+                from b24bot import _albery_bitrix_notify
+                message = "[b]⏰ " + snapshot["name"] + "[/b]\n" + _bb_sanitize(run["result_text"] or "")
+                ok, error = _albery_bitrix_notify(
+                    message, dialog_id=delivery["target"], bot_id=agent.get("bitrix_bot_id"),
+                    retry_transient=False,
+                )
         except Exception as exc:
+            try:
+                import tg_multi
+                if isinstance(exc, tg_multi.TelegramDeliveryAmbiguous):
+                    ambiguous = True
+                elif isinstance(exc, tg_multi.TelegramAPIError):
+                    known_retryable = exc.retryable
+                else:
+                    ambiguous = True
+            except Exception:  # noqa: BLE001
+                ambiguous = True
+            ok, error = False, str(exc)[:500]
+        if channel == "bitrix" and not ok and any(
+            marker in str(error or "").lower()
+            for marker in ("timed out", "timeout", "connection", "remote end closed")
+        ):
+            ambiguous = True
+        if ambiguous:
             with pg_connect() as conn:
                 with conn.transaction():
                     with conn.cursor() as cur:
                         cur.execute(
                             "UPDATE agent_automation_deliveries SET status = 'review', last_error = %s, "
                             "lease_until = NULL, updated_at = now() WHERE id = %s",
-                            (("неизвестен итог доставки: " + str(exc))[:500], delivery["id"]),
+                            (("неизвестен итог доставки: " + str(error))[:500], delivery["id"]),
                         )
             continue
         attempts = int(delivery["attempts"]) + 1
-        ambiguous = not ok and any(
-            marker in str(error or "").lower()
-            for marker in ("timed out", "timeout", "connection", "remote end closed")
-        )
         status = (
-            "delivered" if ok else "review" if ambiguous
-            else ("retry" if attempts < _MAX_DELIVERY_ATTEMPTS else "error")
+            "delivered" if ok
+            else ("retry" if known_retryable and attempts < _MAX_DELIVERY_ATTEMPTS else "error")
         )
         with pg_connect() as conn:
             with conn.transaction():
@@ -1162,13 +1248,14 @@ AUTOMATION_SELF_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": (
             "АВТОМАТИЗАЦИИ: поставь СЕБЕ регулярное ДЕЙСТВИЕ по расписанию (cron, время МСК) — отчёт, "
             "сводку, мониторинг. Каждый запуск — твой полноценный ход: ты выполнишь task своими "
-            "инструментами, и результат уйдёт сообщением в Битрикс. ⚠️ НЕ для регулярных ЗАДАЧ Bitrix: "
+            "инструментами, и результат уйдёт в явно указанный исходный канал. ⚠️ НЕ для регулярных ЗАДАЧ Bitrix: "
             "если просят «создавай задачу каждый день/неделю» — используй create_recurring_task (он "
             "создаёт задачи без хода агента и тоже виден во вкладке «Автоматизации»). ПЕРЕД созданием "
             "честно проверь, что твоих ИНСТРУМЕНТОВ хватает для задачи; если нет — НЕ создавай "
             "автоматизацию, а скажи пользователю, чего именно не хватает. schedule — 5 полей cron: "
             "«0 9 * * 1-5» = будни в 9:00, «30 18 * * 5» = пт в 18:30; чаще раза в час нельзя. "
-            "deliver_to — dialog_id, куда слать результат (обычно текущий диалог)."
+            "delivery_channel и delivery_conversation_id задают канал и текущий диалог; "
+            "никогда не угадывай канал по числовому id."
         ),
         "inputSchema": {
             "type": "object",
@@ -1176,11 +1263,16 @@ AUTOMATION_SELF_TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "name": {"type": "string", "description": "Короткое название (до 80 символов)."},
                 "schedule": {"type": "string", "description": "Cron из 5 полей, время МСК."},
                 "task": {"type": "string", "description": "Что делать при каждом запуске — подробная постановка."},
-                "deliver_to": {"type": "string", "description": "Bitrix dialog_id получателя результата (текущий диалог)."},
+                "delivery_channel": {"type": "string", "enum": ["bitrix", "telegram"],
+                                     "description": "Канал исходного диалога."},
+                "delivery_conversation_id": {"type": "string",
+                                             "description": "Идентификатор текущего диалога в этом канале."},
+                "deliver_to": {"type": "string", "description": "Устаревший Bitrix dialog_id; только для совместимости."},
                 "requested_by": {"type": "string", "description": "Имя сотрудника, который попросил автоматизацию (собеседник текущего диалога) — видно владельцу."},
                 "description": {"type": "string", "description": "Необязательное описание для владельца."},
             },
-            "required": ["name", "schedule", "task", "deliver_to", "requested_by"],
+            "required": ["name", "schedule", "task", "delivery_channel",
+                         "delivery_conversation_id", "requested_by"],
         },
     },
     "list_my_automations": {
@@ -1228,6 +1320,8 @@ def automation_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, 
                 {"name": r["name"], "schedule": r["schedule"],
                  "schedule_label": _schedule_view(r["schedule"], bool(r["is_active"]))[1],
                  "task": r["prompt"] or "", "deliver_to": r["deliver_to"] or "",
+                 "delivery_channel": r.get("delivery_channel") or "bitrix",
+                 "delivery_conversation_id": r.get("delivery_conversation_id") or r["deliver_to"] or "",
                  "active": bool(r["is_active"]),
                  "managed_by": ("Hermes (системная)" if r["kind"] == "system" else r["creator_label"] or r["created_by"]),
                  "last_status": r["last_status"] or "", "last_run": _when(r["last_run_at"])}
@@ -1249,8 +1343,16 @@ def automation_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, 
             raise ValueError(f"Достигнут потолок {_SELF_AUTOMATIONS_MAX} автоматизаций у этого агента "
                              "(защита от бесконтрольного роста). Удали неактуальную "
                              "(delete_my_automation) или объедини несколько в одну.")
+        channel = str(args.get("delivery_channel") or ("bitrix" if args.get("deliver_to") else "")).strip().lower()
+        conversation_id = str(
+            args.get("delivery_conversation_id") or args.get("deliver_to") or ""
+        ).strip()
+        if channel not in {"bitrix", "telegram"}:
+            raise ValueError("Укажите delivery_channel: bitrix или telegram.")
+        if not conversation_id:
+            raise ValueError("Укажите delivery_conversation_id текущего диалога.")
         label = f"агент «{agent.get('name') or slug}» (сам)"
-        requester = _requester_name(str(args.get("requested_by") or ""), str(args.get("deliver_to") or ""))
+        requester = _requester_name(str(args.get("requested_by") or ""), conversation_id)
         if requester:
             label += f" · по просьбе: {requester}"
         with pg_connect() as conn:
@@ -1258,14 +1360,18 @@ def automation_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, 
                 with conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO agent_automations (agent_slug, name, description, schedule, prompt, "
-                        "deliver_to, kind, created_by, creator_label) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, 'agent', 'self', %s) "
+                        "deliver_to, delivery_channel, delivery_profile, delivery_conversation_id, "
+                        "kind, created_by, creator_label) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'agent', 'self', %s) "
                         "ON CONFLICT (agent_slug, name) DO UPDATE SET schedule = EXCLUDED.schedule, "
                         "prompt = EXCLUDED.prompt, deliver_to = EXCLUDED.deliver_to, "
+                        "delivery_channel = EXCLUDED.delivery_channel, "
+                        "delivery_profile = EXCLUDED.delivery_profile, "
+                        "delivery_conversation_id = EXCLUDED.delivery_conversation_id, "
                         "description = EXCLUDED.description, is_active = TRUE, updated_at = now() "
                         "WHERE agent_automations.created_by = 'self' RETURNING id",
                         (slug, auto_name, str(args.get("description") or "").strip(), schedule, task,
-                         str(args.get("deliver_to") or "").strip(), label),
+                         conversation_id, channel, slug, conversation_id, label),
                     )
                     saved = cur.fetchone()
         if not saved:

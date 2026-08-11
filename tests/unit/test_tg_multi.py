@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import requests
 
 
 @pytest.fixture
@@ -55,7 +56,11 @@ def rows(multi, monkeypatch):
 
 def test_allowed_person_gets_an_answer(multi, sent, rows, monkeypatch):
     import tg_agent
-    monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: {"alexxandrn"})
+    monkeypatch.setattr(multi, "_access_identity", lambda slug, sender: {
+        "allowed": sender.get("username") == "alexxandrn",
+        "reason": "allowed" if sender.get("username") == "alexxandrn" else "denied",
+        "bitrix_user_id": 17,
+    })
     monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте! Слушаю вас.")
 
     multi._answer(AGENT, 555, {"id": 555, "username": "alexxandrn"}, "привет")
@@ -69,7 +74,11 @@ def test_allowed_person_gets_an_answer(multi, sent, rows, monkeypatch):
 def test_stranger_is_refused_and_the_brain_is_not_called(multi, sent, rows, monkeypatch):
     import tg_agent
     calls = []
-    monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: {"alexxandrn"})
+    monkeypatch.setattr(multi, "_access_identity", lambda slug, sender: {
+        "allowed": sender.get("username") == "alexxandrn",
+        "reason": "not_allowlisted",
+        "bitrix_user_id": None,
+    })
     monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "ответ")
 
     multi._answer(AGENT, 777, {"id": 777, "username": "chuzhoy"}, "пусти")
@@ -81,7 +90,9 @@ def test_stranger_is_refused_and_the_brain_is_not_called(multi, sent, rows, monk
 def test_role_prompt_reaches_the_brain(multi, sent, rows, monkeypatch):
     import tg_agent
     prompts = []
-    monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: set())
+    monkeypatch.setattr(multi, "_access_identity", lambda slug, sender: {
+        "allowed": True, "reason": "allowed", "bitrix_user_id": 17,
+    })
     monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: prompts.append((p, toolsets)) or "ок")
 
     multi._answer(AGENT, 555, {"id": 555, "username": "kto_ugodno"}, "вопрос")
@@ -95,7 +106,9 @@ def test_agent_runs_on_its_own_connector(multi, sent, rows, monkeypatch):
     был бы говорящей головой без инструментов — не то же самое, что агент в Битриксе."""
     import tg_agent
     seen = []
-    monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: set())
+    monkeypatch.setattr(multi, "_access_identity", lambda slug, sender: {
+        "allowed": True, "reason": "allowed", "bitrix_user_id": 17,
+    })
     monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: seen.append(toolsets) or "ок")
 
     multi._answer(AGENT, 555, {"id": 555, "username": "kto"}, "вопрос")
@@ -103,20 +116,26 @@ def test_agent_runs_on_its_own_connector(multi, sent, rows, monkeypatch):
     assert seen[0].startswith("agent-prodazhi-bot"), seen
 
 
-def test_empty_access_list_does_not_lock_everyone_out(multi, sent, rows, monkeypatch):
-    """Пустой список = ограничений нет. Иначе новый агент был бы нем сразу после создания."""
+def test_empty_access_list_fails_closed(multi, sent, rows, monkeypatch):
+    """Новый внутренний бот закрыт, пока администратор явно не выдаст доступ."""
     import tg_agent
-    monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: set())
-    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: "Здравствуйте!")
+    calls = []
+    monkeypatch.setattr(multi, "_access_identity", lambda slug, sender: {
+        "allowed": False, "reason": "empty_allowlist", "bitrix_user_id": None,
+    })
+    monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: calls.append(1) or "answer")
 
     multi._answer(AGENT, 555, {"id": 555, "username": "kto_ugodno"}, "привет")
 
-    assert any(r["direction"] == "out" and r.get("status", "ok") == "ok" for r in rows)
+    assert calls == []
+    assert rows[-1]["meta"]["denied"] is True
 
 
 def test_brain_failure_is_journalled_and_does_not_crash(multi, sent, rows, monkeypatch):
     import tg_agent
-    monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: set())
+    monkeypatch.setattr(multi, "_access_identity", lambda slug, sender: {
+        "allowed": True, "reason": "allowed", "bitrix_user_id": 17,
+    })
 
     def boom(p, s, toolsets=None):
         raise RuntimeError("мозг недоступен")
@@ -130,7 +149,9 @@ def test_brain_failure_is_journalled_and_does_not_crash(multi, sent, rows, monke
 
 def test_undelivered_answer_is_marked_as_error(multi, rows, monkeypatch):
     import tg_agent
-    monkeypatch.setattr(tg_agent, "access_usernames", lambda bot: set())
+    monkeypatch.setattr(multi, "_access_identity", lambda slug, sender: {
+        "allowed": True, "reason": "allowed", "bitrix_user_id": 17,
+    })
     monkeypatch.setattr(tg_agent, "hermes_answer", lambda p, s, toolsets=None: "ответ")
 
     def broken(token, method, http_timeout=35, **p):
@@ -141,6 +162,175 @@ def test_undelivered_answer_is_marked_as_error(multi, rows, monkeypatch):
     multi._answer(AGENT, 555, {"id": 555, "username": "kto"}, "вопрос")
 
     assert rows[-1]["status"] == "error"
+
+
+def test_network_timeout_is_ambiguous_and_never_leaks_bot_token(multi, monkeypatch):
+    secret = "123456:SUPER-SECRET-TOKEN"
+
+    def timeout(*_args, **_kwargs):
+        raise requests.Timeout("request URL contained a secret")
+
+    monkeypatch.setattr(multi.requests, "post", timeout)
+
+    with pytest.raises(multi.TelegramDeliveryAmbiguous) as caught:
+        multi.api(secret, "sendMessage", chat_id=1, text="test")
+
+    assert secret not in str(caught.value)
+
+
+def test_access_username_is_bootstrap_only_after_stable_id_is_bound(multi):
+    rows = [{
+        "id": 1,
+        "username": "anna",
+        "tg_user_id": 77,
+        "bitrix_user_id": 17,
+        "display_name": "Анна",
+    }]
+
+    assert multi._select_access_row(rows, 77, "anna") == rows[0]
+    assert multi._select_access_row(rows, 88, "anna") is None
+
+
+def test_access_username_can_bootstrap_only_a_row_without_telegram_id(multi):
+    rows = [{
+        "id": 1,
+        "username": "anna",
+        "tg_user_id": None,
+        "bitrix_user_id": 17,
+        "display_name": "Анна",
+    }]
+
+    assert multi._select_access_row(rows, 77, "anna") == rows[0]
+    assert multi._select_access_row(rows, None, "anna") is None
+
+
+def test_durable_turn_uses_same_profile_and_creates_delivery_once(multi, monkeypatch):
+    update = {
+        "id": 31,
+        "agent_slug": "prodazhi-bot",
+        "provider_update_id": 700,
+        "payload": {
+            "message": {
+                "message_id": 9,
+                "chat": {"id": 555, "type": "private"},
+                "from": {"id": 77, "username": "anna"},
+                "text": "проверь задачи",
+            }
+        },
+    }
+    finished = []
+    monkeypatch.setattr(multi, "_agent_for_slug", lambda slug: AGENT if slug == AGENT["slug"] else None)
+    monkeypatch.setattr(multi, "_access_identity", lambda slug, sender: {
+        "allowed": True, "reason": "allowed", "bitrix_user_id": 17,
+    })
+    monkeypatch.setattr(multi, "_run_agent_turn",
+                        lambda agent, chat, sender, text, identity, **_kw: "готово")
+    monkeypatch.setattr(multi, "_finish_update", lambda row, **kw: finished.append((row, kw)))
+    monkeypatch.setattr(multi.core, "journal", lambda *_args, **_kwargs: None)
+
+    multi._process_update(update)
+
+    assert len(finished) == 1
+    assert finished[0][0]["provider_update_id"] == 700
+    assert finished[0][1] == {"chat_id": 555, "answer": "готово"}
+
+
+def test_ambiguous_brain_turn_is_never_replayed_automatically(multi, monkeypatch):
+    update = {
+        "id": 32,
+        "agent_slug": "prodazhi-bot",
+        "provider_update_id": 701,
+        "payload": {"message": {
+            "chat": {"id": 555, "type": "private"},
+            "from": {"id": 77, "username": "anna"},
+            "text": "измени задачу",
+        }},
+    }
+    finished = []
+    monkeypatch.setattr(multi, "_agent_for_slug", lambda _slug: AGENT)
+    monkeypatch.setattr(multi, "_access_identity", lambda *_args: {
+        "allowed": True, "reason": "allowed", "bitrix_user_id": 17,
+    })
+    monkeypatch.setattr(multi, "_run_agent_turn", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("connection lost after tool call")
+    ))
+    monkeypatch.setattr(multi, "_finish_update", lambda row, **kw: finished.append(kw))
+    monkeypatch.setattr(multi.core, "journal", lambda *_args, **_kwargs: None)
+
+    multi._process_update(update)
+
+    assert len(finished) == 1
+    assert finished[0]["review"] is True
+    assert "connection lost" in finished[0]["error"]
+
+
+def test_photo_is_read_by_media_provider_then_sent_to_same_agent_profile(multi, monkeypatch):
+    import attachments
+    import shared.media_ingestion as media
+
+    update = {
+        "id": 33,
+        "agent_slug": "prodazhi-bot",
+        "provider_update_id": 702,
+        "payload": {"message": {
+            "message_id": 10,
+            "chat": {"id": 555, "type": "private"},
+            "from": {"id": 77, "username": "anna"},
+            "caption": "что на скрине?",
+            "photo": [{"file_id": "small"}, {"file_id": "large", "file_size": 100}],
+        }},
+    }
+    seen = []
+    finished = []
+    monkeypatch.setattr(multi, "_agent_for_slug", lambda _slug: AGENT)
+    monkeypatch.setattr(multi, "_access_identity", lambda *_args: {
+        "allowed": True, "reason": "allowed", "bitrix_user_id": 17,
+    })
+    monkeypatch.setattr(multi, "_telegram_file_bytes", lambda token, file_id, size: b"JPEG")
+    monkeypatch.setattr(media, "recognize_image", lambda data, name: "На скрине задача №42")
+    monkeypatch.setattr(attachments, "store_attachment", lambda **_kwargs: "att-42")
+    monkeypatch.setattr(multi, "_run_agent_turn", lambda agent, chat, sender, text, identity, **_kw: (
+        seen.append((agent["slug"], text, identity["bitrix_user_id"])) or "ответ"
+    ))
+    monkeypatch.setattr(multi, "_finish_update", lambda row, **kw: finished.append(kw))
+    monkeypatch.setattr(multi.core, "journal", lambda *_args, **_kwargs: None)
+
+    multi._process_update(update)
+
+    assert seen[0][0] == "prodazhi-bot"
+    assert "что на скрине?" in seen[0][1]
+    assert "На скрине задача №42" in seen[0][1]
+    assert "attachment_id=att-42" in seen[0][1]
+    assert seen[0][2] == 17
+    assert finished == [{"chat_id": 555, "answer": "ответ"}]
+
+
+def test_stranger_media_is_not_downloaded_or_sent_to_groq(multi, monkeypatch):
+    update = {
+        "id": 34,
+        "agent_slug": "prodazhi-bot",
+        "provider_update_id": 703,
+        "payload": {"message": {
+            "chat": {"id": 777, "type": "private"},
+            "from": {"id": 88, "username": "stranger"},
+            "voice": {"file_id": "secret", "file_size": 100},
+        }},
+    }
+    downloads = []
+    finished = []
+    monkeypatch.setattr(multi, "_agent_for_slug", lambda _slug: AGENT)
+    monkeypatch.setattr(multi, "_access_identity", lambda *_args: {
+        "allowed": False, "reason": "user_not_allowed", "bitrix_user_id": None,
+    })
+    monkeypatch.setattr(multi, "_telegram_file_bytes", lambda *_args: downloads.append(True) or b"VOICE")
+    monkeypatch.setattr(multi, "_finish_update", lambda row, **kw: finished.append(kw))
+    monkeypatch.setattr(multi.core, "journal", lambda *_args, **_kwargs: None)
+
+    multi._process_update(update)
+
+    assert downloads == []
+    assert len(finished) == 1
+    assert "нет доступа" in finished[0]["answer"]
 
 
 def test_database_outage_leaves_no_agents_instead_of_crashing(multi, monkeypatch):
@@ -229,6 +419,19 @@ def test_silent_botfather_does_not_hang_forever(multi, botfather, monkeypatch):
 
     with pytest.raises(RuntimeError, match="молчит"):
         multi.create_bot_via_botfather("Агент", "albery_x_bot")
+
+
+def test_telegram_can_only_attach_to_an_existing_logical_profile():
+    import app  # noqa: F401
+    import agent_center
+    import inspect
+
+    create_source = inspect.getsource(agent_center.agent_center_create_agent)
+    attach_source = inspect.getsource(agent_center.agent_center_agent_attach_telegram)
+
+    assert "create_bot_via_botfather" not in create_source
+    assert "telegram-bridge" in create_source
+    assert "create_bot_via_botfather" in attach_source
 
 
 # --- удаление агента ------------------------------------------------------------------------

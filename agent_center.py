@@ -194,15 +194,17 @@ def _tg_channel_meta() -> dict[str, dict[str, str]]:
 
     Имена берутся из Telegram, если он доступен, иначе запасные. Бизнес-аккаунт сюда приходит
     свойством бота (business_account), а не отдельной записью: аккаунт — не агент."""
-    live = _tg_identities()
+    neutral = os.getenv("TG_CHANNEL_NEUTRAL_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    live = {} if neutral else _tg_identities()
     meta = {}
-    for slug, base in TG_CHANNELS.items():
-        got = live.get(slug) or {}
-        meta[slug] = {**base,
-                      "name": got.get("name") or base["name"],
-                      "handle": got.get("handle") or base["handle"],
-                      "business_account": got.get("business_account", ""),
-                      "business_name": got.get("business_name", "")}
+    if not neutral:
+        for slug, base in TG_CHANNELS.items():
+            got = live.get(slug) or {}
+            meta[slug] = {**base,
+                          "name": got.get("name") or base["name"],
+                          "handle": got.get("handle") or base["handle"],
+                          "business_account": got.get("business_account", ""),
+                          "business_name": got.get("business_name", "")}
     for a in telegram_agents_list():
         if not a.get("is_active"):
             continue
@@ -406,6 +408,12 @@ def ensure_builtin_telegram_agents() -> None:
     раздел Telegram работал 1 в 1 как Битрикс, поэтому каналы становятся полноценными
     агентами. Токен им не прописывается: они работают на общем токене службы, и второй
     getUpdates на тот же токен запускать нельзя."""
+    if os.getenv("TG_CHANNEL_NEUTRAL_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        # The IU bot is a customer transport, not an employee agent profile. Existing historical
+        # duplicate rows are left untouched for an explicit inspected merge, never auto-deleted.
+        _sync_own_bot_identities()
+        _agent_cache_bust()
+        return
     import secrets
     live = _tg_identities()
     # Один встроенный агент — сам бот. Его бизнес-подключение к аккаунту компании
@@ -467,17 +475,18 @@ def _sync_own_bot_identities() -> None:
             who = tg_multi.describe(r["telegram_bot_token"])
         except Exception:  # noqa: BLE001
             continue        # бот недоступен — оставляем то, что знали
-        name = (who.get("name") or "").strip()
         username = (who.get("username") or "").strip()
-        if not username or (name == r["name"] and username == r["telegram_username"]):
+        if not username or username == r["telegram_username"]:
             continue
         try:
             with pg_connect() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE agents SET name = %s, telegram_username = %s,"
+                    # The logical profile name is shared with Bitrix and must not be overwritten
+                    # by a channel-specific BotFather display name.
+                    cur.execute("UPDATE agents SET telegram_username = %s,"
                                 " updated_at = now() WHERE slug = %s",
-                                (name or r["name"], username, r["slug"]))
-            logging.info("telegram identity synced: %s -> %s @%s", r["slug"], name, username)
+                                (username, r["slug"]))
+            logging.info("telegram identity synced: %s -> @%s", r["slug"], username)
         except Exception:  # noqa: BLE001
             logging.exception("telegram identity sync: update failed for %s", r["slug"])
 
@@ -512,7 +521,8 @@ def agent_center_telegram_access():
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, bot, username, tg_user_id, display_name, is_active, note"
+                cur.execute("SELECT id, bot, username, tg_user_id, bitrix_user_id, "
+                            "display_name, is_active, note"
                             " FROM telegram_bot_access ORDER BY bot, username")
                 rows = [dict(r) for r in cur.fetchall()]
     except Exception:  # noqa: BLE001
@@ -536,6 +546,14 @@ def agent_center_telegram_access_save():
     if not re.fullmatch(r"[a-z0-9_]{3,64}", username or ""):
         return jsonify({"error": "Укажите @username (латиница, цифры, подчёркивание)."}), 400
     remove = bool(body.get("remove"))
+    raw_bitrix_id = body.get("bitrix_user_id")
+    bitrix_user_id = None
+    if raw_bitrix_id not in (None, ""):
+        if not str(raw_bitrix_id).strip().isdigit() or int(raw_bitrix_id) <= 0:
+            return jsonify({"error": "Некорректный Bitrix user id."}), 400
+        bitrix_user_id = int(raw_bitrix_id)
+        if bitrix_user_id not in _user_names():
+            return jsonify({"error": "Сотрудник с таким Bitrix user id не найден."}), 400
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
@@ -544,11 +562,15 @@ def agent_center_telegram_access_save():
                                 (bot, username))
                 else:
                     cur.execute(
-                        "INSERT INTO telegram_bot_access (bot, username, display_name, note)"
-                        " VALUES (%s, %s, %s, %s)"
+                        "INSERT INTO telegram_bot_access "
+                        "(bot, username, bitrix_user_id, display_name, note)"
+                        " VALUES (%s, %s, %s, %s, %s)"
                         " ON CONFLICT (bot, username) DO UPDATE SET is_active = true,"
-                        " display_name = COALESCE(EXCLUDED.display_name, telegram_bot_access.display_name)",
-                        (bot, username, str(body.get("display_name") or "").strip() or None,
+                        " bitrix_user_id = EXCLUDED.bitrix_user_id,"
+                        " display_name = COALESCE(EXCLUDED.display_name, telegram_bot_access.display_name),"
+                        " note = COALESCE(EXCLUDED.note, telegram_bot_access.note)",
+                        (bot, username, bitrix_user_id,
+                         str(body.get("display_name") or "").strip() or None,
                          str(body.get("note") or "").strip() or None))
     except Exception:  # noqa: BLE001
         logging.exception("agent_center telegram access save failed")
@@ -974,7 +996,7 @@ def agent_center_agents():
         "name": _main_bot_name() or (main_row and main_row.get("name")) or _MAIN_AGENT_META["name"],
         "is_system": True,
         "is_active": True,
-        "channels": ["Bitrix"],
+        "channels": ["Bitrix"] + (["Telegram"] if main_row and main_row.get("telegram_bot_token") else []),
         "users_count": len(users),
         "users_preview": ", ".join(users[:3]) + (f" +{len(users) - 3}" if len(users) > 3 else ""),
         "turns_today": int(st.get("turns_today") or 0),
@@ -1629,7 +1651,7 @@ def _load_agents_full() -> list[dict[str, Any]]:
                 # базу, где колонки ещё нет: тогда придёт NULL и режим будет 'legacy',
                 # то есть прежнее поведение, а не молчаливое обнищание набора.
                 " (to_jsonb(agents) ->> 'tools_mode') AS tools_mode,"
-                " bitrix_bot_id, telegram_username, telegram_bot_user_id,"
+                " bitrix_bot_id, telegram_username, telegram_bot_user_id, telegram_bot_token,"
                 # Канал = телеграмный, если у агента есть @username бота. Токен есть только у
                 # агентов с собственным ботом; два встроенных канала работают на общем токене
                 # службы, и второй getUpdates на него запускать нельзя.
@@ -1987,32 +2009,15 @@ def agent_center_create_agent():
     name = str(body.get("name") or "").strip()
     if not name or len(name) > 60:
         return jsonify({"error": "Укажите имя агента (до 60 символов)."}), 400
+    if body.get("telegram_bot_token") or body.get("telegram_username"):
+        return jsonify({
+            "error": "Telegram больше не создаёт отдельный профиль. Сначала создайте обычного "
+                     "агента, затем подключите Telegram-мост к этому же профилю."
+        }), 400
     # No level selector any more: a new agent starts with the broad 'ops' preset (все функции,
     # без admin); the owner then narrows/extends its tools in the capability panel.
-    # Канал агента задаётся мостом: есть токен бота — агент живёт в Telegram, нет — в Битриксе.
-    # Токен проверяем ДО создания записи: битый токен не должен оставлять мёртвого агента.
-    tg_token = str(body.get("telegram_bot_token") or "").strip()
-    tg_username = str(body.get("telegram_username") or "").strip().lstrip("@")
-    tg_who: dict[str, Any] = {}
-    if tg_username and not tg_token:
-        # Бота регистрирует сам агент: аккаунт компании ведёт диалог /newbot с @BotFather —
-        # владельцу не нужно вручную создавать бота и переносить токен.
-        import tg_multi
-        try:
-            made = tg_multi.create_bot_via_botfather(str(body.get("name") or "").strip(),
-                                                     tg_username)
-        except Exception as exc:  # noqa: BLE001
-            logging.exception("botfather create failed")
-            return jsonify({"error": str(exc)[:400]}), 400
-        tg_token = made["token"]
-    if tg_token:
-        import tg_multi
-        try:
-            tg_who = tg_multi.describe(tg_token)
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": f"Telegram не принял токен: {str(exc)[:200]}"}), 400
-        if not tg_who.get("username"):
-            return jsonify({"error": "Telegram не вернул @username бота — проверьте токен."}), 400
+    # A profile is created once and registered in Bitrix. Telegram is attached later by the
+    # explicit /telegram-bridge endpoint; there is no longer a Telegram-only agent branch.
     tier = str(body.get("tier") or "ops").strip()
     if tier not in AGENT_LEVELS:
         tier = "ops"
@@ -2052,28 +2057,14 @@ def agent_center_create_agent():
 
     warnings = []
     bot_id = None
-    if tg_token:
-        # Телеграмный мост вместо битриксового. Всё остальное у агента такое же: свой коннектор
-        # agent-<slug>, набор инструментов, инструкции и знания — редактор возможностей общий.
-        try:
-            with pg_connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE agents SET telegram_bot_token = %s, telegram_username = %s,"
-                        " telegram_bot_user_id = %s, updated_at = now() WHERE id = %s",
-                        (tg_token, tg_who.get("username"), tg_who.get("bot_user_id"), agent_id))
-        except Exception as exc:  # noqa: BLE001
-            logging.exception("agent create: telegram bridge failed")
-            warnings.append(f"Telegram-мост не сохранён: {str(exc)[:200]}")
-    else:
-        try:
-            bot_id = _register_agent_bot(slug, name, color, position)
-            with pg_connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE agents SET bitrix_bot_id = %s, updated_at = now() WHERE id = %s", (bot_id, agent_id))
-        except Exception as exc:  # noqa: BLE001
-            logging.exception("agent create: bitrix bot registration failed")
-            warnings.append(f"Bitrix-бот не зарегистрирован: {str(exc)[:200]}")
+    try:
+        bot_id = _register_agent_bot(slug, name, color, position)
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE agents SET bitrix_bot_id = %s, updated_at = now() WHERE id = %s", (bot_id, agent_id))
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("agent create: bitrix bot registration failed")
+        warnings.append(f"Bitrix-бот не зарегистрирован: {str(exc)[:200]}")
     try:
         _hermes_connector_add(slug, token)
     except Exception as exc:  # noqa: BLE001
@@ -2302,6 +2293,93 @@ def agent_center_agent_update(slug: str):
         return jsonify({"error": "Не удалось сохранить изменения."}), 500
     _agent_cache_bust()
     return jsonify({"ok": True, "warnings": warnings})
+
+
+@app.post("/api/agent-center/agents/<slug>/telegram-bridge")
+def agent_center_agent_attach_telegram(slug: str):
+    """Attach a Telegram transport to an existing logical agent profile."""
+    agent = _agent_by_slug(slug)
+    if not agent:
+        return jsonify({"error": "Агент не найден."}), 404
+    body = request.get_json(silent=True) or {}
+    token = str(body.get("telegram_bot_token") or "").strip()
+    requested_username = str(body.get("telegram_username") or "").strip().lstrip("@")
+    if agent.get("telegram_bot_token"):
+        return jsonify({
+            "error": "У этого профиля уже есть Telegram-мост. Сначала явно отключите его; "
+                     "существующая identity не заменяется молча."
+        }), 409
+    if not token and bool(body.get("create_via_botfather")):
+        if not requested_username.lower().endswith("bot"):
+            return jsonify({"error": "Telegram @username должен заканчиваться на bot."}), 400
+        import tg_multi
+        try:
+            made = tg_multi.create_bot_via_botfather(agent["name"], requested_username)
+            token = str(made["token"])
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("existing agent Telegram bridge: BotFather failed")
+            return jsonify({"error": str(exc)[:400]}), 400
+    if not token:
+        return jsonify({"error": "Передайте bot token или явно выберите создание через BotFather."}), 400
+    import tg_multi
+    try:
+        identity = tg_multi.describe(token)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Telegram не принял токен: {str(exc)[:200]}"}), 400
+    username = str(identity.get("username") or "").strip()
+    bot_user_id = identity.get("bot_user_id")
+    if not username or not bot_user_id:
+        return jsonify({"error": "Telegram не вернул стабильную identity бота."}), 400
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT slug FROM agents WHERE slug <> %s AND "
+                        "(telegram_bot_user_id = %s OR lower(telegram_username) = lower(%s)) FOR UPDATE",
+                        (slug, bot_user_id, username),
+                    )
+                    duplicate = cur.fetchone()
+                    if duplicate:
+                        return jsonify({"error": "Этот Telegram-бот уже привязан к другому агенту."}), 409
+                    cur.execute(
+                        "UPDATE agents SET telegram_bot_token = %s, telegram_username = %s, "
+                        "telegram_bot_user_id = %s, updated_at = now() WHERE slug = %s",
+                        (token, username, bot_user_id, slug),
+                    )
+    except Exception:  # noqa: BLE001
+        logging.exception("existing agent Telegram bridge save failed for %s", slug)
+        return jsonify({"error": "Не удалось сохранить Telegram-мост."}), 500
+    _agent_cache_bust()
+    return jsonify({
+        "ok": True,
+        "slug": slug,
+        "telegram_username": username,
+        "access_required": True,
+        "note": "Бот закрыт до добавления хотя бы одного пользователя в список доступа.",
+    })
+
+
+@app.delete("/api/agent-center/agents/<slug>/telegram-bridge")
+def agent_center_agent_detach_telegram(slug: str):
+    """Stop Albery transport without deleting the external BotFather bot."""
+    if not _agent_by_slug(slug):
+        return jsonify({"error": "Агент не найден."}), 404
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE agents SET telegram_bot_token = NULL, telegram_username = NULL, "
+                        "telegram_bot_user_id = NULL, updated_at = now() WHERE slug = %s",
+                        (slug,),
+                    )
+                    cur.execute("DELETE FROM telegram_bot_access WHERE bot = %s", (slug,))
+    except Exception:  # noqa: BLE001
+        logging.exception("Telegram bridge detach failed for %s", slug)
+        return jsonify({"error": "Не удалось отключить Telegram-мост."}), 500
+    _agent_cache_bust()
+    return jsonify({"ok": True, "slug": slug, "external_bot_deleted": False})
 
 
 @app.post("/api/agent-center/agents/<slug>/register-bot")

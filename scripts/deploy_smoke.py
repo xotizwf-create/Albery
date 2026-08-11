@@ -364,6 +364,56 @@ try:
 except Exception as exc:  # noqa: BLE001
     failures.append(f"workspace tables: {exc}")
 
+# Employee Telegram is a channel adapter for the same logical agent profiles.  When the staged
+# rollout flag is on, the durable ledgers must exist, bot identities must be unique/valid and an
+# unconfigured access list must remain closed (reported, but not treated as a broken bot).
+telegram_agents_enabled = env_flag("TG_CHANNEL_NEUTRAL_ENABLED")
+if telegram_agents_enabled:
+    try:
+        assert_tables_exist(
+            ["telegram_agent_updates", "telegram_agent_offsets", "telegram_agent_outbox"],
+            hint="Apply migration 084_channel_neutral_telegram_agents.sql before cutover.",
+        )
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT telegram_bot_user_id, count(*) AS n FROM agents "
+                    "WHERE is_active AND telegram_bot_token IS NOT NULL "
+                    "GROUP BY telegram_bot_user_id HAVING count(*) > 1"
+                )
+                duplicate_ids = list(cur.fetchall())
+                cur.execute(
+                    "SELECT telegram_bot_token, count(*) AS n FROM agents "
+                    "WHERE is_active AND telegram_bot_token IS NOT NULL "
+                    "GROUP BY telegram_bot_token HAVING count(*) > 1"
+                )
+                duplicate_tokens = list(cur.fetchall())
+                cur.execute(
+                    "SELECT a.slug, a.telegram_bot_token, count(t.id) AS access_count "
+                    "FROM agents a LEFT JOIN telegram_bot_access t ON t.bot = a.slug AND t.is_active "
+                    "WHERE a.is_active AND a.telegram_bot_token IS NOT NULL "
+                    "GROUP BY a.slug, a.telegram_bot_token ORDER BY a.slug"
+                )
+                telegram_profiles = [dict(row) for row in cur.fetchall()]
+        if duplicate_ids or duplicate_tokens:
+            failures.append("employee Telegram: one bot identity is bound to multiple agent profiles")
+        import tg_multi
+        for profile in telegram_profiles:
+            slug = str(profile["slug"])
+            try:
+                identity = tg_multi.describe(str(profile["telegram_bot_token"]))
+                if not identity.get("bot_user_id") or not identity.get("username"):
+                    failures.append(f"employee Telegram {slug}: getMe identity incomplete")
+                elif int(profile["access_count"] or 0) == 0:
+                    print(f"employee Telegram {slug}: identity OK, CLOSED (access list empty)")
+                else:
+                    print(f"employee Telegram {slug}: identity OK, access entries={profile['access_count']}")
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"employee Telegram {slug}: getMe failed ({type(exc).__name__})")
+        print("employee Telegram durable tables: OK")
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"employee Telegram rollout: {exc}")
+
 # 5. Enabling the workspace is a cutover: the legacy sender must be off and at least
 # one real transport must be available. The workspace serves both Telegram Business
 # and the public IU bot, so requiring Business specifically produces a false alarm.

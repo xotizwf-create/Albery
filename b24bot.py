@@ -34,6 +34,7 @@ import requests
 
 from shared.role import background_jobs_enabled
 from shared.run_slots import build_default as build_run_slots
+from shared.agent_channel_runtime import ChannelContext, build_agent_policy
 
 from app import (  # noqa: E501 — single home for shared helpers until services/ split
     BitrixClient,
@@ -3486,6 +3487,30 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "", from_use
                 "честно скажи, что этого не умеешь, и не предлагай обходных путей вместо ответа. "
                 "Любое изменение данных сначала подтверждай. Отвечай по-русски."
                 + access_rule + fmt + "]")
+    # One behavioural core for every employee channel. Bitrix-specific rendering/history below
+    # remain adapters; identity, role, confirmation and automation rules come from this shared
+    # policy, which is also used by the durable Telegram profile worker.
+    policy_agent = agent
+    if policy_agent is None:
+        try:
+            from agent_center import MAIN_AGENT_SLUG, _agent_by_slug
+            policy_agent = _agent_by_slug(MAIN_AGENT_SLUG)
+        except Exception:  # noqa: BLE001
+            policy_agent = None
+    policy_agent = policy_agent or {
+        "slug": "main", "name": "Агент Албери", "role_prompt": "",
+    }
+    bitrix_uid = to_int(from_user_id) or None
+    head = build_agent_policy(
+        policy_agent,
+        ChannelContext(
+            channel="bitrix",
+            conversation_id=str(dialog_id),
+            requester_name=_b24_requester_name(from_user_id) if str(from_user_id).strip() else "",
+            requester_platform_id=str(from_user_id or ""),
+            requester_bitrix_user_id=bitrix_uid,
+        ),
+    )
     parts = [head]
     # Кто спрашивает — нужно ЛЮБОМУ агенту: get_agent_link проверяет по этому id доступ
     # спрашивающего, а блок постановщика задач ниже подставляет его автором.
@@ -3581,8 +3606,9 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "", from_use
         parts.append(
             "АВТОМАТИЗАЦИИ ПО РАСПИСАНИЮ: если сотрудник просит делать что-то РЕГУЛЯРНО («каждый "
             "день/неделю», «по расписанию», «присылай сводку», «напоминай») — настрой это инструментом "
-            "schedule_my_automation (cron, время МСК; deliver_to='" + str(dialog_id) + "' — текущий "
-            "диалог; requested_by — ИМЯ собеседника, который просит: владелец видит, кто поставил). "
+            "schedule_my_automation (cron, время МСК; delivery_channel='bitrix', "
+            "delivery_conversation_id='" + str(dialog_id) + "' — текущий диалог; requested_by — "
+            "ИМЯ собеседника, который просит: владелец видит, кто поставил). "
             "СНАЧАЛА проверь свои инструменты: если их для задачи не хватает — ЧЕСТНО скажи, "
             "чего именно не хватает, и автоматизацию НЕ создавай. Перед созданием подтверди у "
             "пользователя расписание и суть задачи. Посмотреть/удалить: list_my_automations / "

@@ -144,6 +144,7 @@ ALWAYS_APPLY_MIGRATIONS = [
     "082_agent_tools_mode.sql",
     # Durable staged agent-automation queue, delivery ledger and mutating-tool idempotency.
     "083_durable_agent_automation_runs.sql",
+    "084_channel_neutral_telegram_agents.sql",
 ]
 
 
