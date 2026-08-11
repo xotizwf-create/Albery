@@ -3,13 +3,13 @@
 Each agent (the universal/main one and every subagent) keeps its own list of cron
 automations in `agent_automations`. Two kinds:
   - kind='agent'  — executed HERE by a scheduler thread: one `hermes -z` turn on the
-    agent's own connector (`-t agent-<slug>`), so the run is bounded by exactly the
-    tools/instructions the owner enabled for that agent; the result is posted into a
-    Bitrix dialog as that agent's bot. Created by the owner in the UI or by the agent
-    itself from chat (schedule_my_automation self-tool).
-  - kind='system' — read-only mirror rows for the legacy Hermes cron jobs that live on
+    agent's automation alias (`-t automation-agent-<slug>`), so the run is bounded by
+    exactly the tools/instructions the owner enabled for that agent. PostgreSQL owns the
+    queue, stage leases, effect ledger and delivery retry; the Hermes subprocess consumes
+    the same global run-slot pool as live Bitrix/Telegram turns.
+  - kind='system' — mirror/control rows for legacy Hermes cron jobs that live on
     the box (`hermes cron list`: zoom-to-tasks, owner-daily, owner-weekly, leader-digest);
-    shown in the UI, never executed or edited by the app.
+    their external executors remain outside this durable agent-automation worker.
 
 Registers routes on the shared Flask `app` at import time (same pattern as b24bot /
 agent_center); agent_center imports this module at its bottom — app.py stays frozen.
@@ -19,12 +19,14 @@ circular-import rule.
 from __future__ import annotations
 
 import logging
+import json
 import os
-import queue
 import re
+import socket
 import subprocess
 import threading
 import time
+import uuid
 
 from datetime import timedelta
 from typing import Any
@@ -54,14 +56,17 @@ _NAME_MAX = 80
 _TASK_MAX = 4000
 _RESULT_KEEP = 2000
 
-# Automations run in their OWN lane, fully independent of live employee turns: a
-# dedicated worker pool draining a queue, with its own hermes subprocesses that never
-# touch b24bot's _HERMES_RUN_SLOTS. Employees can't starve automations and automations
-# can't eat employee slots — separate brains, separate roads. Every claimed fire is
-# eventually executed (queued, never dropped); transient failures get one delayed retry.
-_AUTOMATION_WORKERS = max(1, int(os.getenv("AGENT_AUTOMATION_CONCURRENCY", "1")))
+# PostgreSQL is the queue; one worker advances durable stages. The heavy Hermes stage uses
+# shared.run_slots, so the real host limit covers live Bitrix, Telegram and agent automation.
+# Delivery is a separate light stage and never repeats a successful brain/tool stage.
+_AUTOMATION_WORKERS = 1
 _RETRY_DELAY_S = int(os.getenv("AGENT_AUTOMATION_RETRY_DELAY_S", "120"))
-_work_q: "queue.Queue[tuple[dict[str, Any], int]]" = queue.Queue()
+_QUEUE_POLL_S = float(os.getenv("AGENT_AUTOMATION_QUEUE_POLL_S", "1"))
+_SLOT_WAIT_S = float(os.getenv("AGENT_AUTOMATION_SLOT_WAIT_S", "30"))
+_LEASE_S = _AUTOMATION_TIMEOUT_S + 120
+_MAX_BRAIN_ATTEMPTS = 2
+_MAX_DELIVERY_ATTEMPTS = 3
+_WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 
 # --- Storage ---------------------------------------------------------------------------------
@@ -85,20 +90,6 @@ def _load_rows(where: str = "", args: tuple = ()) -> list[dict[str, Any]]:
 def _row_by_id(auto_id: int) -> dict[str, Any] | None:
     rows = _load_rows("WHERE id = %s", (auto_id,))
     return rows[0] if rows else None
-
-
-def _finish_run(auto_id: int, status: str, result: str, error: str | None) -> None:
-    try:
-        with pg_connect() as conn:
-            with conn.transaction():
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE agent_automations SET last_run_at = now(), last_status = %s, "
-                        "last_result = %s, last_error = %s, updated_at = now() WHERE id = %s",
-                        (status, (result or "")[:_RESULT_KEEP], error, auto_id),
-                    )
-    except Exception:  # noqa: BLE001
-        logging.exception("agent automation %s: run status write failed", auto_id)
 
 
 def _when(dt: Any) -> str:
@@ -577,18 +568,14 @@ def agent_automation_run_now(auto_id: int):
             return jsonify({"error": problem}), 502
         return jsonify({"ok": True, "started": True,
                         "note": "Запуск передан исполнителю — статус обновится после завершения."})
-    if row["last_status"] == "running" and not _running_is_stale(row):
-        return jsonify({"error": "Уже выполняется."}), 409
     try:
-        with pg_connect() as conn:
-            with conn.transaction():
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE agent_automations SET last_status = 'running', "
-                                "last_run_at = now(), updated_at = now() WHERE id = %s", (auto_id,))
+        run_id = _enqueue_run(row, "manual", msk_now())
     except Exception:  # noqa: BLE001
-        logging.exception("agent automation %s: manual run mark failed", auto_id)
-    _work_q.put((row, 1))
-    return jsonify({"ok": True, "started": True})
+        logging.exception("agent automation %s: atomic manual enqueue failed", auto_id)
+        return jsonify({"error": "Не удалось поставить запуск в надёжную очередь."}), 500
+    if run_id is None:
+        return jsonify({"error": "Уже поставлена в очередь или выполняется."}), 409
+    return jsonify({"ok": True, "started": True, "run_id": run_id})
 
 
 # --- Execution -------------------------------------------------------------------------------
@@ -666,119 +653,438 @@ def _deliver(agent: dict[str, Any], row: dict[str, Any], text: str) -> tuple[boo
     return delivered_any, ("; ".join(errors) if errors else None)
 
 
-def _hermes_oneshot(cmd: list, timeout_s: int, tag: str) -> tuple[Any, str | None]:
-    """Run the hermes CLI in the AUTOMATION lane: two quick attempts, no shared
-    semaphores with employee turns (that's the whole point — a parallel brain).
-    Returns (proc, None) or (None, 'timeout'); like b24bot, an LLM error sentinel
-    or empty stdout triggers the in-place second attempt."""
-    from b24bot import _hermes_answer_is_error
-    proc = None
-    for attempt in (1, 2):
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout_s,
-                cwd="/root", env={**os.environ, "HOME": "/root"},
+def _run_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "agent_slug": row["agent_slug"],
+        "name": row["name"],
+        "prompt": row.get("prompt") or "",
+        "deliver_to": row.get("deliver_to") or "",
+    }
+
+
+def _enqueue_run(row: dict[str, Any], trigger_kind: str, scheduled_for) -> int | None:
+    """Atomically persist one manual or scheduled fire; None means duplicate/active."""
+    auto_id = int(row["id"])
+    if trigger_kind == "schedule":
+        minute = scheduled_for.replace(second=0, microsecond=0)
+        idem = f"schedule:{auto_id}:{minute.isoformat()}"
+    else:
+        idem = f"manual:{auto_id}:{uuid.uuid4().hex}"
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, agent_slug, name, prompt, deliver_to, kind, is_active "
+                    "FROM agent_automations WHERE id = %s FOR UPDATE",
+                    (auto_id,),
+                )
+                locked = cur.fetchone()
+                if not locked or locked["kind"] != "agent":
+                    return None
+                if trigger_kind == "schedule" and not locked["is_active"]:
+                    return None
+                snapshot = json.dumps(_run_snapshot(locked), ensure_ascii=False)
+                cur.execute(
+                    "INSERT INTO agent_automation_runs "
+                    "(automation_id, agent_slug, idempotency_key, trigger_kind, scheduled_for, "
+                    "automation_snapshot) VALUES (%s, %s, %s, %s, %s, %s::jsonb) "
+                    "ON CONFLICT DO NOTHING RETURNING id",
+                    (auto_id, locked["agent_slug"], idem, trigger_kind, scheduled_for, snapshot),
+                )
+                created = cur.fetchone()
+                if created is None:
+                    return None
+                cur.execute(
+                    "UPDATE agent_automations SET last_run_at = %s, last_status = 'queued', "
+                    "last_error = NULL, updated_at = now() WHERE id = %s",
+                    (scheduled_for, auto_id),
+                )
+                return int(created["id"])
+
+
+def _claim_due_run() -> dict[str, Any] | None:
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM agent_automation_runs "
+                    "WHERE status IN ('queued','brain_retry','delivery_pending','delivery_retry') "
+                    "AND available_at <= now() ORDER BY available_at, id "
+                    "FOR UPDATE SKIP LOCKED LIMIT 1"
+                )
+                run = cur.fetchone()
+                if not run:
+                    return None
+                brain = run["status"] in ("queued", "brain_retry")
+                claimed = "brain_running" if brain else "delivery_running"
+                counter = "brain_attempts" if brain else "delivery_attempts"
+                cur.execute(
+                    f"UPDATE agent_automation_runs SET status = %s, {counter} = {counter} + 1, "
+                    "claimed_by = %s, lease_until = now() + (%s * interval '1 second'), "
+                    "started_at = COALESCE(started_at, now()), updated_at = now() WHERE id = %s "
+                    "RETURNING *",
+                    (claimed, _WORKER_ID, _LEASE_S, run["id"]),
+                )
+                claimed_run = cur.fetchone()
+                cur.execute(
+                    "UPDATE agent_automations SET last_status = 'running', updated_at = now() "
+                    "WHERE id = %s",
+                    (claimed_run["automation_id"],),
+                )
+                claimed_run["claimed_stage"] = "brain" if brain else "delivery"
+                return claimed_run
+
+
+def active_automation_run_for_agent(agent_slug: str) -> int | None:
+    """Bind the static automation connector alias to one currently leased brain run."""
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM agent_automation_runs WHERE agent_slug = %s "
+                "AND status = 'brain_running' AND lease_until > now() ORDER BY id",
+                (agent_slug,),
             )
-        except subprocess.TimeoutExpired:
-            logging.warning("agent automation %s: hermes timed out after %ss (attempt %s/2)",
-                            tag, timeout_s, attempt)
-            return None, "timeout"
-        if (proc.returncode == 0 and (proc.stdout or "").strip()
-                and not _hermes_answer_is_error(proc.stdout.strip())):
-            return proc, None
-        logging.error("agent automation %s: hermes run failed (attempt %s/2): rc=%s err=%s answer=%s",
-                      tag, attempt, proc.returncode, (proc.stderr or "")[:200],
-                      (proc.stdout or "")[:120])
-    return proc, None
+            rows = list(cur.fetchall())
+    return int(rows[0]["id"]) if len(rows) == 1 else None
 
 
-def _run_automation(row: dict[str, Any], attempt: int = 1) -> None:
-    """One automation run: agent turn on its own connector → deliver to Bitrix.
-    A transient failure (timeout / LLM hiccup / delivery error) gets ONE delayed
-    re-run so a momentary glitch never costs the owner a scheduled report."""
-    status, result_text, error = "ok", "", None
+def _set_run_status(run_id: int, status: str, error: str | None = None,
+                    delay_s: int = 0) -> None:
+    terminal = status in ("done", "silent", "error", "review")
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE agent_automation_runs SET status = %s, last_error = %s, "
+                    "available_at = now() + (%s * interval '1 second'), lease_until = NULL, "
+                    "claimed_by = NULL, finished_at = CASE WHEN %s THEN now() ELSE finished_at END, "
+                    "updated_at = now() WHERE id = %s RETURNING automation_id, result_text",
+                    (status, (error or "")[:500] or None, delay_s, terminal, run_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return
+                parent_status = {
+                    "done": "ok", "silent": "silent", "error": "error", "review": "review",
+                    "brain_retry": "queued", "delivery_retry": "queued",
+                }.get(status, "running")
+                cur.execute(
+                    "UPDATE agent_automations SET last_status = %s, last_result = %s, "
+                    "last_error = %s, updated_at = now() WHERE id = %s",
+                    (parent_status, (row.get("result_text") or "")[:_RESULT_KEEP],
+                     (error or "")[:500] or None, row["automation_id"]),
+                )
+
+
+def _brain_failure(run: dict[str, Any], error: str) -> None:
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT had_mutating_effect FROM agent_automation_runs WHERE id = %s", (run["id"],))
+            state = cur.fetchone() or {}
+    if state.get("had_mutating_effect"):
+        _set_run_status(run["id"], "review", error + " — возможны уже выполненные действия")
+    elif int(run["brain_attempts"]) < _MAX_BRAIN_ATTEMPTS:
+        _set_run_status(run["id"], "brain_retry", error, _RETRY_DELAY_S)
+    else:
+        _set_run_status(run["id"], "error", error)
+
+
+def _hermes_once(cmd: list, timeout_s: int, tag: str) -> tuple[Any, str | None]:
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s,
+            cwd="/root", env={**os.environ, "HOME": "/root"},
+        ), None
+    except subprocess.TimeoutExpired:
+        logging.warning("agent automation %s: hermes timed out after %ss", tag, timeout_s)
+        return None, "timeout"
+
+
+def _prepare_delivery(run: dict[str, Any], answer: str) -> None:
+    snapshot = run["automation_snapshot"]
+    raw = (snapshot.get("deliver_to") or "").strip() or os.getenv("ALBERY_BITRIX_NOTIFY_CHAT", "chat728")
+    targets = [t.strip() for t in raw.replace(";", ",").split(",") if t.strip()]
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE agent_automation_runs SET result_text = %s, status = 'delivery_pending', "
+                    "brain_finished_at = now(), available_at = now(), lease_until = NULL, "
+                    "claimed_by = NULL, last_error = NULL, updated_at = now() WHERE id = %s",
+                    (answer, run["id"]),
+                )
+                for target in targets:
+                    cur.execute(
+                        "INSERT INTO agent_automation_deliveries (run_id, target) VALUES (%s, %s) "
+                        "ON CONFLICT (run_id, target) DO NOTHING",
+                        (run["id"], target),
+                    )
+
+
+def _process_brain(run: dict[str, Any]) -> None:
+    snapshot = run["automation_snapshot"]
     try:
         from agent_center import _agent_by_slug
-        agent = _agent_by_slug(row["agent_slug"])
+        agent = _agent_by_slug(run["agent_slug"])
         if not agent:
             raise RuntimeError("агент не найден")
         if not agent.get("is_active"):
             raise RuntimeError("агент выключен")
-        prompt = _automation_prompt(agent, row)
-        from b24bot import _hermes_answer_is_error
-        # Same default as live b24bot turns: the built-in `web` toolset rides along so
-        # automations can reach the internet too (terminal/file/exec stay off).
-        extra = os.getenv("B24_EXTRA_TOOLSETS", "web").strip().strip(",")
-        toolsets = f"agent-{agent['slug']},{extra}" if extra else f"agent-{agent['slug']}"
-        cmd = ["hermes", "-z", prompt, "-t", toolsets, "--yolo"]
-        proc, run_fail = _hermes_oneshot(cmd, _AUTOMATION_TIMEOUT_S, f"{row['id']}/{row['name']}")
-        if run_fail == "timeout":
+        from shared.run_slots import build_default
+        slot = build_default().acquire(_SLOT_WAIT_S)
+        if slot is None:
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE agent_automation_runs SET status = 'brain_retry', "
+                            "brain_attempts = GREATEST(brain_attempts - 1, 0), available_at = now() + "
+                            "interval '15 seconds', lease_until = NULL, claimed_by = NULL, "
+                            "last_error = 'ожидание общего слота Hermes', updated_at = now() WHERE id = %s",
+                            (run["id"],),
+                        )
+                        cur.execute(
+                            "UPDATE agent_automations SET last_status = 'queued', updated_at = now() "
+                            "WHERE id = %s",
+                            (run["automation_id"],),
+                        )
+            return
+        if slot.is_local_fallback:
+            # On a DB outage independent process-local semaphores are not a server-wide limit.
+            # Live employee turns retain their historic availability fallback; background work
+            # fails closed so it cannot create the unsafe "2 live + automation" combination.
+            slot.release()
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE agent_automation_runs SET status = 'brain_retry', "
+                            "brain_attempts = GREATEST(brain_attempts - 1, 0), available_at = now() + "
+                            "interval '30 seconds', lease_until = NULL, claimed_by = NULL, "
+                            "last_error = 'общий серверный лимит недоступен', updated_at = now() WHERE id = %s",
+                            (run["id"],),
+                        )
+                        cur.execute(
+                            "UPDATE agent_automations SET last_status = 'queued', updated_at = now() "
+                            "WHERE id = %s",
+                            (run["automation_id"],),
+                        )
+            return
+        try:
+            prompt = _automation_prompt(agent, snapshot)
+            extra = os.getenv("B24_EXTRA_TOOLSETS", "web").strip().strip(",")
+            connector = f"automation-agent-{agent['slug']}"
+            toolsets = f"{connector},{extra}" if extra else connector
+            proc, failure = _hermes_once(
+                ["hermes", "-z", prompt, "-t", toolsets, "--yolo"],
+                _AUTOMATION_TIMEOUT_S,
+                f"run={run['id']}/{snapshot['name']}",
+            )
+        finally:
+            slot.release()
+        if failure == "timeout":
             raise RuntimeError(f"таймаут {_AUTOMATION_TIMEOUT_S} с")
+        from b24bot import _hermes_answer_is_error
         answer = (proc.stdout or "").strip()
         if not answer:
             raise RuntimeError("пустой ответ мозга")
-        if _hermes_answer_is_error(answer):
+        if proc.returncode != 0 or _hermes_answer_is_error(answer):
             raise RuntimeError("ошибка LLM: " + answer[:200])
         if _is_silent(answer):
-            status = "silent"
+            _set_run_status(run["id"], "silent")
         else:
-            result_text = answer  # kept even on delivery failure so the owner can read it in the UI
-            delivered, derr = _deliver(agent, row, answer)
-            if not delivered:
-                raise RuntimeError(f"доставка в Битрикс не удалась: {derr}")
+            _prepare_delivery(run, answer)
     except Exception as exc:  # noqa: BLE001
-        status, error = "error", str(exc)[:500]
-        logging.warning("agent automation %s (%s) attempt %s failed: %s",
-                        row["id"], row["name"], attempt, error)
-        retriable = "агент не найден" not in error and "агент выключен" not in error
-        if attempt == 1 and retriable:
-            error += f" — повторю через {_RETRY_DELAY_S} с"
-            threading.Timer(_RETRY_DELAY_S, lambda: _work_q.put((row, 2))).start()
-    _finish_run(row["id"], status, result_text, error)
+        logging.warning("agent automation run %s brain stage failed: %s", run["id"], exc)
+        _brain_failure(run, str(exc)[:500])
 
 
-def _worker_loop() -> None:
-    while True:
-        row, attempt = _work_q.get()
-        try:
-            _run_automation(row, attempt)
-        except Exception:  # noqa: BLE001
-            logging.exception("agent automation worker crashed on row %s", row.get("id"))
-        finally:
-            _work_q.task_done()
-
-
-# --- Scheduler thread (same pattern as the agent_center health watchdog) ---------------------
-
-def _claim(auto_id: int, minute_start) -> bool:
-    """Atomically claim this minute's fire — survives restarts, blocks double-runs."""
-    try:
+def _process_delivery(run: dict[str, Any]) -> None:
+    snapshot = run["automation_snapshot"]
+    from agent_center import _agent_by_slug
+    agent = _agent_by_slug(run["agent_slug"])
+    if not agent or not agent.get("is_active"):
+        _set_run_status(run["id"], "error", "агент не найден или выключен перед доставкой")
+        return
+    message = "[b]⏰ " + snapshot["name"] + "[/b]\n" + _bb_sanitize(run["result_text"] or "")
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM agent_automation_deliveries WHERE run_id = %s "
+                "AND status IN ('pending','retry') AND available_at <= now() ORDER BY id",
+                (run["id"],),
+            )
+            deliveries = list(cur.fetchall())
+    from b24bot import _albery_bitrix_notify
+    for delivery in deliveries:
         with pg_connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE agent_automations SET last_run_at = %s, last_status = 'running', "
-                        "updated_at = now() WHERE id = %s "
-                        "AND (last_run_at IS NULL OR last_run_at < %s) RETURNING id",
-                        (minute_start, auto_id, minute_start),
+                        "UPDATE agent_automation_deliveries SET status = 'sending', attempts = attempts + 1, "
+                        "lease_until = now() + (%s * interval '1 second'), updated_at = now() WHERE id = %s",
+                        (_LEASE_S, delivery["id"]),
                     )
-                    return cur.fetchone() is not None
+        try:
+            ok, error = _albery_bitrix_notify(
+                message, dialog_id=delivery["target"], bot_id=agent.get("bitrix_bot_id"),
+                retry_transient=False,
+            )
+        except Exception as exc:
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE agent_automation_deliveries SET status = 'review', last_error = %s, "
+                            "lease_until = NULL, updated_at = now() WHERE id = %s",
+                            (("неизвестен итог доставки: " + str(exc))[:500], delivery["id"]),
+                        )
+            continue
+        attempts = int(delivery["attempts"]) + 1
+        ambiguous = not ok and any(
+            marker in str(error or "").lower()
+            for marker in ("timed out", "timeout", "connection", "remote end closed")
+        )
+        status = (
+            "delivered" if ok else "review" if ambiguous
+            else ("retry" if attempts < _MAX_DELIVERY_ATTEMPTS else "error")
+        )
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE agent_automation_deliveries SET status = %s, last_error = %s, "
+                        "available_at = now() + (%s * interval '1 second'), lease_until = NULL, "
+                        "delivered_at = CASE WHEN %s THEN now() ELSE delivered_at END, updated_at = now() "
+                        "WHERE id = %s",
+                        (status, (error or "")[:500] or None, _RETRY_DELAY_S, bool(ok), delivery["id"]),
+                    )
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status, count(*) AS n FROM agent_automation_deliveries "
+                "WHERE run_id = %s GROUP BY status",
+                (run["id"],),
+            )
+            counts = {r["status"]: int(r["n"]) for r in cur.fetchall()}
+    if counts.get("review") or counts.get("sending"):
+        _set_run_status(run["id"], "review", "итог одной из доставок требует ручной проверки")
+    elif counts.get("pending") or counts.get("retry"):
+        _set_run_status(run["id"], "delivery_retry", "повторяется только доставка", _RETRY_DELAY_S)
+    elif counts.get("delivered"):
+        _set_run_status(run["id"], "done", "часть получателей недоступна" if counts.get("error") else None)
+    else:
+        _set_run_status(run["id"], "error", "сообщение не доставлено ни одному получателю")
+
+
+def _worker_loop() -> None:
+    while True:
+        try:
+            run = _claim_due_run()
+            if run is None:
+                time.sleep(_QUEUE_POLL_S)
+            elif run["claimed_stage"] == "brain":
+                _process_brain(run)
+            else:
+                _process_delivery(run)
+        except Exception:  # noqa: BLE001
+            logging.exception("agent automation durable worker iteration failed")
+            time.sleep(_QUEUE_POLL_S)
+
+
+def _claim(auto_id: int, minute_start) -> bool:
+    """Persist one scheduled minute; the idempotency key blocks duplicates across restarts."""
+    row = _row_by_id(auto_id)
+    if not row:
+        return False
+    try:
+        return _enqueue_run(row, "schedule", minute_start) is not None
     except Exception:  # noqa: BLE001
-        logging.exception("agent automation %s: claim failed", auto_id)
+        logging.exception("agent automation %s: durable schedule enqueue failed", auto_id)
         return False
 
 
 def _scheduler_tick(minute_start) -> None:
+    _recover_durable_runs()
     rows = _load_rows("WHERE kind = 'agent' AND is_active")
     for row in rows:
         try:
             due = cron_schedule.matches(row["schedule"], minute_start)
         except ValueError:
             continue
-        if due and _claim(row["id"], minute_start):
-            # Queued, never dropped: the worker lane executes every claimed fire even
-            # if several automations land on the same minute.
-            _work_q.put((row, 1))
+        if due:
+            try:
+                _enqueue_run(row, "schedule", minute_start)
+            except Exception:  # noqa: BLE001
+                logging.exception("agent automation %s: scheduler enqueue failed", row["id"])
+
+
+def _recover_durable_runs() -> int:
+    """Recover expired leases without replaying an outcome that may already be external."""
+    recovered = 0
+    parent_states: dict[int, str] = {}
+    try:
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    # A brain with no recorded mutation is safe to recompute. Any recorded write
+                    # makes the outcome ambiguous and therefore manual-review only.
+                    cur.execute(
+                        "UPDATE agent_automation_runs SET status = CASE "
+                        "WHEN had_mutating_effect THEN 'review' ELSE 'brain_retry' END, "
+                        "available_at = now(), claimed_by = NULL, lease_until = NULL, "
+                        "last_error = CASE WHEN had_mutating_effect "
+                        "THEN 'запуск прерван после потенциального внешнего действия; нужна проверка' "
+                        "ELSE 'безопасное восстановление после прерывания до внешних действий' END, "
+                        "finished_at = CASE WHEN had_mutating_effect THEN now() ELSE finished_at END, "
+                        "updated_at = now() WHERE status = 'brain_running' AND lease_until < now() "
+                        "RETURNING automation_id, status"
+                    )
+                    brain_rows = list(cur.fetchall())
+                    recovered += len(brain_rows)
+                    parent_states.update({int(r["automation_id"]): r["status"] for r in brain_rows})
+                    # Sending is intentionally not retried: the process may have died after Bitrix
+                    # accepted the message but before Albery stored the acknowledgement.
+                    cur.execute(
+                        "UPDATE agent_automation_deliveries SET status = 'review', lease_until = NULL, "
+                        "last_error = 'неизвестен итог доставки после прерывания процесса', "
+                        "updated_at = now() WHERE status = 'sending' AND lease_until < now() RETURNING run_id"
+                    )
+                    ambiguous_delivery_runs = [r["run_id"] for r in cur.fetchall()]
+                    if ambiguous_delivery_runs:
+                        cur.execute(
+                            "UPDATE agent_automation_runs SET status = 'review', claimed_by = NULL, "
+                            "lease_until = NULL, finished_at = now(), "
+                            "last_error = 'итог доставки требует ручной проверки', updated_at = now() "
+                            "WHERE id = ANY(%s) RETURNING automation_id, status",
+                            (ambiguous_delivery_runs,),
+                        )
+                        parent_states.update({
+                            int(r["automation_id"]): r["status"] for r in cur.fetchall()
+                        })
+                    cur.execute(
+                        "UPDATE agent_automation_runs SET status = 'delivery_retry', available_at = now(), "
+                        "claimed_by = NULL, lease_until = NULL, "
+                        "last_error = 'доставка восстановлена после прерывания до отправки', "
+                        "updated_at = now() WHERE status = 'delivery_running' AND lease_until < now() "
+                        "AND NOT EXISTS (SELECT 1 FROM agent_automation_deliveries d "
+                        "WHERE d.run_id = agent_automation_runs.id AND d.status = 'review') "
+                        "RETURNING automation_id, status"
+                    )
+                    delivery_rows = list(cur.fetchall())
+                    recovered += len(delivery_rows) + len(ambiguous_delivery_runs)
+                    parent_states.update({
+                        int(r["automation_id"]): r["status"] for r in delivery_rows
+                    })
+                    for automation_id, run_status in parent_states.items():
+                        cur.execute(
+                            "UPDATE agent_automations SET last_status = %s, updated_at = now() WHERE id = %s",
+                            ("review" if run_status == "review" else "queued", automation_id),
+                        )
+    except Exception:  # noqa: BLE001
+        logging.exception("agent automations: durable lease recovery failed")
+    return recovered
 
 
 def _recover_interrupted_runs() -> int:
@@ -822,6 +1128,7 @@ def _recover_interrupted_runs() -> int:
 
 def _scheduler_loop() -> None:
     _recover_interrupted_runs()
+    _recover_durable_runs()
     time.sleep(120)  # let the app finish booting
     last_minute = None
     while True:

@@ -20,7 +20,9 @@ import { cn } from "../../lib/utils";
 
 const statusChip = (a: AgentAutomation): { text: string; cls: string } => {
   if (!a.last_status) return { text: "ещё не запускалась", cls: "bg-gray-100 text-gray-500 border-gray-200" };
+  if (a.last_status === "queued") return { text: "в очереди…", cls: "bg-indigo-50 text-indigo-600 border-indigo-100 animate-pulse" };
   if (a.last_status === "running") return { text: "выполняется…", cls: "bg-sky-50 text-sky-600 border-sky-100 animate-pulse" };
+  if (a.last_status === "review") return { text: `нужна проверка · ${a.last_run}`, cls: "bg-amber-50 text-amber-700 border-amber-200" };
   if (a.last_status === "interrupted") return { text: `прервана · ${a.last_run}`, cls: "bg-amber-50 text-amber-600 border-amber-100" };
   if (a.last_status === "skipped") return { text: `пропущена · ${a.last_run}`, cls: "bg-amber-50 text-amber-600 border-amber-100" };
   if (a.last_status === "error") return { text: `ошибка · ${a.last_run}`, cls: "bg-rose-50 text-rose-600 border-rose-100" };
@@ -334,7 +336,7 @@ export const AutomationsPanel: React.FC<{ slug: string }> = ({ slug }) => {
                             a.kind === "task" ? runRecurringTask(a.recurring_id!) : runAgentAutomation(a.id),
                           )
                         }
-                        disabled={busyId !== null || a.last_status === "running"}
+                        disabled={busyId !== null || ["queued", "running"].includes(a.last_status)}
                         title={a.kind === "task" ? "Создать задачу сейчас (проверка)" : "Запустить сейчас (проверка)"}
                         className="p-1.5 text-gray-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors disabled:opacity-40"
                       >

@@ -142,6 +142,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     # ВАЖНО: перед первым применением на живой базе выполняется
     # scripts/materialize_agent_toolsets.py — иначе агент, ехавший на пресете, обеднеет.
     "082_agent_tools_mode.sql",
+    # Durable staged agent-automation queue, delivery ledger and mutating-tool idempotency.
+    "083_durable_agent_automation_runs.sql",
 ]
 
 

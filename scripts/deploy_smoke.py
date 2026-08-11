@@ -140,16 +140,25 @@ try:
         slug = str(row["slug"])
         token = str(row.get("mcp_token") or "").strip()
         connector = mcp_servers.get(f"agent-{slug}")
+        automation_connector = mcp_servers.get(f"automation-agent-{slug}")
         if not token:
             failures.append(f"agent-{slug}: DB token отсутствует")
             continue
         if not isinstance(connector, dict):
             failures.append(f"agent-{slug}: connector отсутствует в Hermes config")
             continue
+        if not isinstance(automation_connector, dict):
+            failures.append(f"automation-agent-{slug}: connector отсутствует в Hermes config")
+            continue
         connector_url = str(connector.get("url") or "").strip()
         parsed = urllib.parse.urlparse(connector_url)
         headers = connector.get("headers") if isinstance(connector.get("headers"), dict) else {}
         auth = str(headers.get("Authorization") or "")
+        automation_url = str(automation_connector.get("url") or "").strip()
+        automation_headers = (
+            automation_connector.get("headers")
+            if isinstance(automation_connector.get("headers"), dict) else {}
+        )
         if (
             connector.get("enabled") is not True
             or parsed.scheme != "http"
@@ -161,6 +170,14 @@ try:
             or auth != f"Bearer {token}"
         ):
             failures.append(f"agent-{slug}: connector не соответствует private/header contract")
+            continue
+        if (
+            automation_connector.get("enabled") is not True
+            or automation_url != connector_url
+            or str(automation_headers.get("Authorization") or "") != auth
+            or str(automation_headers.get("X-Albery-Automation") or "") != "1"
+        ):
+            failures.append(f"automation-agent-{slug}: connector не соответствует private contract")
             continue
 
         agent = _agent_by_slug(slug)

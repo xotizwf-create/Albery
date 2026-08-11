@@ -30,6 +30,8 @@ def test_migration_retires_shared_connectors_and_moves_tokens_to_headers():
     assert "  albery-ops-core:" not in updated
     assert "url: http://127.0.0.1:5004/mcp-agent/main" in updated
     assert 'Authorization: "Bearer rotated-agent-token"' in updated
+    assert "  automation-agent-main:" in updated
+    assert 'X-Albery-Automation: "1"' in updated
     assert "rotated-agent-token" not in next(line for line in updated.splitlines() if "url:" in line and "agent/main" in line)
     assert "  external:" in updated
 

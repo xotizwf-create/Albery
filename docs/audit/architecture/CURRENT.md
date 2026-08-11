@@ -88,6 +88,77 @@ flowchart LR
 - Dialogue summaries and diagnostic digests use the isolated zero-tool Codex quality contour;
   Groq remains responsible for audio and primary screenshot/OCR processing.
 
+## Bitrix agent and automation split
+
+The profile ownership statements below are verified production behavior. The durable automation
+lane is implemented locally under [ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md)
+and [CHG-20260811-07](../changes/CHG-20260811-07-durable-conflict-safe-agent-automations.md),
+but is not production state until migration, connector materialization, CI and live smoke pass.
+
+```mermaid
+flowchart LR
+    B[Bitrix employee event] --> R[bot_id to agent_slug]
+    R --> P[Profile with matching bitrix_bot_id]
+    P --> C[Own identity, rules, knowledge and dialog history]
+    C --> H[Hermes live turn]
+    H --> M[Private MCP for this agent]
+    M --> O[Reply from this Bitrix bot]
+
+    S[Schedule or atomic Run now] --> Q[(PostgreSQL durable run queue)]
+    Q --> AS[Owning agent_slug]
+    AS --> AP[Same agent profile]
+    AP --> L{Shared two-slot<br/>heavy-process limit}
+    H --> L
+    L --> AH[Hermes automation subprocess]
+    AH --> AM[Automation alias of same private MCP plus web]
+    AM --> E[Per-run effect ledger and object lock]
+    E --> D[(Stored brain result)]
+    D --> AO[Bitrix delivery stage]
+    AO -->|known failure| DR[(Durable delivery retry)]
+    DR --> AO
+    AO -->|ambiguous outcome| RV[Manual review; no blind replay]
+```
+
+- The shared `agents` registry has ten active profiles across Bitrix, internal and Telegram
+  channels. For an employee Bitrix event, `bot_id` selects the profile with the matching
+  `bitrix_bot_id`; dialogue scope is the pair `(agent_slug, dialog_id)`. Every profile has its own
+  identity, instructions, knowledge, access rules and private MCP capability set, while channel
+  identities are optional and may be Bitrix, Telegram, both or internal-only.
+- An automation row belongs to exactly one profile through `agent_automations.agent_slug`. Its
+  prompt is assembled with that profile's role, skills and personal instructions; Hermes receives
+  the exact profile capability set, and delivery uses that profile's Bitrix bot identity.
+
+### Verified production behavior before CHG-20260811-07
+
+- Scheduled and manually launched agent automations do not enter through the inbound Bitrix
+  webhook. They currently use an independent in-process FIFO lane with one worker and therefore
+  do not consume the two shared live Bitrix/Telegram slots.
+- Queue and delayed retry are process memory. A delivery failure can repeat the whole Hermes turn.
+  `Run now` is not a single atomic claim, and an interrupted run is eventually displayed as
+  `interrupted` rather than resumed from a durable stage.
+
+### Locally implemented target under CHG-20260811-07
+
+- `agent_automation_runs` is the durable stage machine. Manual triggers are protected by a partial
+  unique active-run constraint under an automation row lock; scheduled triggers use
+  `schedule:<automation_id>:<minute>` keys. Due rows are claimed with `FOR UPDATE SKIP LOCKED` and
+  expiring leases.
+- Automation Hermes uses `automation-agent-<slug>,web`, a loopback alias of the same per-agent MCP.
+  It consumes `shared.run_slots.build_default()` exactly like live Bitrix, Telegram and quality
+  turns. Background work refuses the process-local fallback when PostgreSQL cannot enforce the
+  server-wide limit.
+- Brain output is committed before delivery. Recipient attempts live in
+  `agent_automation_deliveries`; known failures retry only the stored message. Timeout/connection
+  outcomes and expired `sending` leases become `review`, because automatic resend could duplicate
+  a message already accepted by Bitrix.
+- Unknown MCP tools are treated as mutating. Automation mutations are fingerprinted per run in
+  `agent_automation_tool_effects`; a completed duplicate returns the stored result and an
+  ambiguous prior effect fails closed. All model-facing mutating calls take a PostgreSQL advisory
+  lock derived from the identifiable business object, with a deliberately coarse per-tool fallback.
+- `kind='system'` Hermes/crond mirror rows remain outside this worker and require their own runtime
+  migration/audit. The actual automation inventory and business-output acceptance also remain a
+  separate controlled audit step.
+
 ## Current operational status
 
 - Outbound model/provider traffic is policy-routed through AmneziaWG exit `95.85.243.43`.

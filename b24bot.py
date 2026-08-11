@@ -4144,7 +4144,8 @@ def _albery_tg_notify(text: str, chat_id: str | None = None) -> tuple[bool, str 
 
 def _albery_bitrix_notify(text: str, dialog_id: str | None = None, *,
                           client_endpoint: str = "", access_token: str = "",
-                          bot_id: Any = None) -> tuple[bool, str | None]:
+                          bot_id: Any = None,
+                          retry_transient: bool = True) -> tuple[bool, str | None]:
     """Post a notification AS THE BOT into the Bitrix24 notifications chat ("Albery Уведомления")
     via imbot.message.add. During a live event the caller passes the event's fresh token; otherwise
     (a cron) we obtain one via _b24_app_access_token() (refresh_token grant — never expires while the
@@ -4166,7 +4167,8 @@ def _albery_bitrix_notify(text: str, dialog_id: str | None = None, *,
     # blip into a delivered message instead of a lost one; a 500 means the portal did not
     # accept the message, so a retry does not duplicate it.
     last_error = ""
-    for attempt, pause in enumerate((1, 3, 0), start=1):
+    pauses = (1, 3, 0) if retry_transient else (0,)
+    for attempt, pause in enumerate(pauses, start=1):
         try:
             _b24_app_call(client_endpoint, access_token, "imbot.message.add",
                           {"BOT_ID": bot_id, "DIALOG_ID": dialog_id, "MESSAGE": text})

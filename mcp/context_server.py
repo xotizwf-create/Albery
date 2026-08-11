@@ -13081,7 +13081,8 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
                    core: bool = False,
                    allow_owner_tools: bool = False,
                    instruction_scope: set[str] | list[str] | None = None,
-                   agent_slug: str | None = None) -> dict[str, Any] | None:
+                   agent_slug: str | None = None,
+                   automation_run_id: int | None = None) -> dict[str, Any] | None:
     request_id = request.get("id")
     method = request.get("method")
     available_tools = _allowed_tools(tool_names)
@@ -13158,8 +13159,31 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
             # so the row lands in THAT agent's «Автоматизации» tab.
             if agent_slug and name == "create_recurring_task":
                 args = {**args, "_agent_slug": agent_slug}
+            # Reject obviously unconfirmed destructive calls before taking a business lock or
+            # opening any integration connection. Handlers keep their detailed confirm gates;
+            # this is a central fail-fast backstop, not a replacement for them.
+            schema_required = set(available_tools[name].get("inputSchema", {}).get("required") or [])
+            destructive_action = str(args.get("action") or "").strip().lower() == "delete"
+            if (
+                ("confirm" in schema_required or str(name).startswith("delete_") or destructive_action)
+                and args.get("confirm") is not True
+            ):
+                raise McpError(-32602, "Без явного подтверждения действие запрещено; передайте confirm=true.")
             started = time.perf_counter()
-            result_payload = available_tools[name]["handler"](args)
+            from shared.automation_safety import (
+                AutomationEffectAmbiguous,
+                BusinessObjectBusy,
+                guarded_tool_call,
+            )
+            try:
+                result_payload = guarded_tool_call(
+                    name,
+                    args,
+                    available_tools[name]["handler"],
+                    automation_run_id=automation_run_id,
+                )
+            except (AutomationEffectAmbiguous, BusinessObjectBusy) as exc:
+                raise McpError(-32009, str(exc)) from exc
             duration_ms = round((time.perf_counter() - started) * 1000, 1)
             if duration_ms >= TOOL_LATENCY_LOG_MS:
                 result_size = len(json.dumps(json_safe(result_payload), ensure_ascii=False, default=json_default))

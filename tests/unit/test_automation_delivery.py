@@ -7,6 +7,7 @@ def _row(deliver_to):
 
 
 def test_deliver_fans_out_to_all_targets(monkeypatch):
+    import app  # noqa: F401 - production import order avoids agent_center circular bootstrap
     import agent_automations as aa
     import b24bot
 
@@ -19,6 +20,7 @@ def test_deliver_fans_out_to_all_targets(monkeypatch):
 
 
 def test_deliver_partial_failure_still_succeeds(monkeypatch):
+    import app  # noqa: F401
     import agent_automations as aa
     import b24bot
 
@@ -32,6 +34,7 @@ def test_deliver_partial_failure_still_succeeds(monkeypatch):
 
 
 def test_deliver_default_target_when_empty(monkeypatch):
+    import app  # noqa: F401
     import agent_automations as aa
     import b24bot
 

@@ -140,6 +140,14 @@ def userbot(monkeypatch, tmp_path):
     monkeypatch.setattr(tg_userbot, "SESSION_FILE", session)
     monkeypatch.setattr(tg_userbot, "_probe_authorized", lambda: True)
     monkeypatch.setattr(tg_userbot, "_AUTH_PROBE", {})
+    fixed_now = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        tg_userbot, "datetime", type("D", (), {"now": staticmethod(lambda tz=None: fixed_now)})
+    )
+    monkeypatch.setattr(
+        tg_userbot, "_msk_stamp",
+        lambda value: value.astimezone(tg_userbot.MSK).strftime("%d.%m.%Y %H:%M") if value else None,
+    )
     client = FakeClient(DIALOGS, MESSAGES)
     monkeypatch.setattr(tg_userbot, "_client", lambda: client)
     tg_userbot.last_client = client

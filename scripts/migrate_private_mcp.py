@@ -52,6 +52,29 @@ def remove_connector_block(text: str, name: str) -> str:
     return "".join(lines[:start]) + "".join(lines[end:])
 
 
+def automation_connector_block(slug: str, token: str, base: str) -> str:
+    return (
+        f"  automation-agent-{slug}:\n"
+        f"    url: {base.rstrip('/')}/mcp-agent/{slug}\n"
+        "    headers:\n"
+        f"      Authorization: \"Bearer {token}\"\n"
+        "      X-Albery-Automation: \"1\"\n"
+        "    enabled: true\n"
+        "    timeout: 300\n"
+    )
+
+
+def replace_named_connector_block(text: str, name: str, block: str) -> str:
+    without = remove_connector_block(text, name)
+    lines = without.splitlines(keepends=True)
+    insert_at = next(
+        (index + 1 for index, line in enumerate(lines) if line.rstrip() == "mcp_servers:"), None
+    )
+    if insert_at is None:
+        raise RuntimeError("Hermes config has no mcp_servers section")
+    return "".join(lines[:insert_at]) + block + "".join(lines[insert_at:])
+
+
 def private_config(original: str, agents: list[dict[str, str]], base: str) -> str:
     updated = original
     for name in SHARED_CONNECTORS:
@@ -61,6 +84,11 @@ def private_config(original: str, agents: list[dict[str, str]], base: str) -> st
             updated,
             agent["slug"],
             connector_block(agent["slug"], agent["token"], base),
+        )
+        updated = replace_named_connector_block(
+            updated,
+            f"automation-agent-{agent['slug']}",
+            automation_connector_block(agent["slug"], agent["token"], base),
         )
     parsed = yaml.safe_load(updated) or {}
     servers = parsed.get("mcp_servers") or {}
@@ -74,6 +102,16 @@ def private_config(original: str, agents: list[dict[str, str]], base: str) -> st
             raise RuntimeError(f"credential remained in URL for agent-{agent['slug']}")
         if (item.get("headers") or {}).get("Authorization") != f"Bearer {agent['token']}":
             raise RuntimeError(f"missing bearer header for agent-{agent['slug']}")
+        automation_item = servers.get(f"automation-agent-{agent['slug']}")
+        if not isinstance(automation_item, dict):
+            raise RuntimeError(f"missing automation connector for agent-{agent['slug']}")
+        automation_headers = automation_item.get("headers") or {}
+        if automation_headers.get("Authorization") != f"Bearer {agent['token']}":
+            raise RuntimeError(f"missing automation bearer header for agent-{agent['slug']}")
+        if str(automation_headers.get("X-Albery-Automation") or "") != "1":
+            raise RuntimeError(f"missing automation marker for agent-{agent['slug']}")
+        if automation_item.get("url") != item.get("url") or agent["token"] in str(automation_item.get("url") or ""):
+            raise RuntimeError(f"invalid automation URL for agent-{agent['slug']}")
     return updated
 
 

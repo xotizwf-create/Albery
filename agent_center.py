@@ -1866,7 +1866,7 @@ def _main_bot_name() -> str | None:
 # --- Hermes connector management (textual config edit, comments preserved) ------------------
 
 def _hermes_connector_add_unlocked(slug: str, token: str) -> None:
-    """Create or replace a private header-authenticated `agent-<slug>` connector.
+    """Create or replace live and automation aliases for one private agent connector.
 
     The token used to live in a public URL. It now exists only in the mode-0600 Hermes config and
     is supplied as an Authorization header to a loopback endpoint. Textual editing preserves the
@@ -1892,27 +1892,39 @@ def _hermes_connector_add_unlocked(slug: str, token: str) -> None:
     ):
         raise RuntimeError("AGENT_MCP_INTERNAL_BASE must be an explicit loopback HTTP base")
     text = _HERMES_CONFIG.read_text(encoding="utf-8")
-    marker = f"  agent-{slug}:"
-    lines = text.splitlines(keepends=True)
-    block = (
+    def replace_block(source: str, connector_name: str, block: str) -> str:
+        marker = f"  {connector_name}:"
+        lines = source.splitlines(keepends=True)
+        if marker in source:
+            start = next(i for i, line in enumerate(lines) if line.rstrip() == marker)
+            end = start + 1
+            while end < len(lines) and (lines[end].startswith("    ") or not lines[end].strip()):
+                end += 1
+            return "".join(lines[:start]) + block + "".join(lines[end:])
+        insert_at = next((i + 1 for i, line in enumerate(lines) if line.rstrip() == "mcp_servers:"), None)
+        if insert_at is None:
+            raise RuntimeError("В hermes config нет секции mcp_servers")
+        return "".join(lines[:insert_at]) + block + "".join(lines[insert_at:])
+
+    live_block = (
         f"  agent-{slug}:\n"
         f"    url: {_AGENT_MCP_INTERNAL_BASE}/mcp-agent/{slug}\n"
         "    headers:\n"
         f"      Authorization: \"Bearer {token}\"\n"
-        f"    enabled: true\n"
-        f"    timeout: 300\n"
+        "    enabled: true\n"
+        "    timeout: 300\n"
     )
-    if marker in text:
-        start = next(i for i, line in enumerate(lines) if line.rstrip() == marker)
-        end = start + 1
-        while end < len(lines) and (lines[end].startswith("    ") or not lines[end].strip()):
-            end += 1
-        new_text = "".join(lines[:start]) + block + "".join(lines[end:])
-    else:
-        insert_at = next((i + 1 for i, line in enumerate(lines) if line.rstrip() == "mcp_servers:"), None)
-        if insert_at is None:
-            raise RuntimeError("В hermes config нет секции mcp_servers")
-        new_text = "".join(lines[:insert_at]) + block + "".join(lines[insert_at:])
+    automation_block = (
+        f"  automation-agent-{slug}:\n"
+        f"    url: {_AGENT_MCP_INTERNAL_BASE}/mcp-agent/{slug}\n"
+        "    headers:\n"
+        f"      Authorization: \"Bearer {token}\"\n"
+        "      X-Albery-Automation: \"1\"\n"
+        "    enabled: true\n"
+        "    timeout: 300\n"
+    )
+    new_text = replace_block(text, f"agent-{slug}", live_block)
+    new_text = replace_block(new_text, f"automation-agent-{slug}", automation_block)
     if new_text == text:
         return
     backup = _HERMES_CONFIG.with_name(f"config.yaml.bak-agent-{slug}-{int(time.time())}")
@@ -1951,13 +1963,13 @@ def _hermes_connector_remove(slug: str) -> None:
     lines = text.splitlines(keepends=True)
     out, skipping = [], False
     for line in lines:
-        if line.rstrip() == f"  agent-{slug}:":
-            skipping = True
-            continue
         if skipping:
             if line.startswith("    ") or not line.strip():
                 continue
             skipping = False
+        if line.rstrip() in (f"  agent-{slug}:", f"  automation-agent-{slug}:"):
+            skipping = True
+            continue
         out.append(line)
     new_text = "".join(out)
     if new_text != text:
@@ -2892,8 +2904,21 @@ def mcp_agent_http(slug: str):
                         "error": {"code": -32700, "message": "Request body must be JSON."}}), 400
     method = str(payload.get("method") or "")
     req_id = payload.get("id")
+    automation_run_id = None
+    automation_context = request.headers.get("X-Albery-Automation", "").strip() == "1"
+    if automation_context:
+        from agent_automations import active_automation_run_for_agent
+        automation_run_id = active_automation_run_for_agent(slug)
+        if automation_run_id is None:
+            return jsonify({"jsonrpc": "2.0", "id": req_id,
+                            "error": {"code": -32010,
+                                      "message": "no uniquely leased automation run for agent"}}), 409
     tool_names = _agent_tool_names(agent)
     self_tool_names = _agent_self_tool_names(agent)
+    if automation_context:
+        # A scheduled turn may inspect its own registry, but may not create/delete schedules
+        # recursively. Those writes are owner/live-chat operations, not automation work.
+        self_tool_names &= {"list_my_automations"}
 
     if method == "tools/call":
         tool = str(((payload.get("params") or {}).get("name")) or "")
@@ -2923,6 +2948,7 @@ def mcp_agent_http(slug: str):
         allow_owner_tools=True,
         instruction_scope=instruction_scope,
         agent_slug=agent["slug"],
+        automation_run_id=automation_run_id,
     )
     if response is None:
         return ("", 202)
