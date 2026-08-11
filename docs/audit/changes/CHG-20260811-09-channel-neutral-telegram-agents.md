@@ -87,6 +87,11 @@ Implementation evidence:
   `b24bot.py` are unchanged pre-existing unused locals/import outside the CHG-09 diff.
 - `npm audit --omit=dev --audit-level=high`: `0 vulnerabilities`; no literal
   credential-shaped values were found in the changed implementation files.
+- Commit `6067b5c` was pushed to `origin/main`.
+- GitHub `tests` run `31490360688`: passed. It built the frontend and applied the complete
+  schema plus migration `084` before DB-marked tests on PostgreSQL 14/Python 3.10 and
+  PostgreSQL 16/Python 3.12.
+- GitHub `Security audit` run `31490361457`: passed.
 - The updated master SVG parses as valid XML and the regenerated `1800×2070` PNG was
   visually inspected; the diagram explicitly separates confirmed production from the
   feature-gated `implemented_local` target.
@@ -119,6 +124,7 @@ backups. Restart only through the empty-inflight safe gate.
 - Duplicate historical Telegram profiles need an inspected merge; automatic name-based merging is
   forbidden.
 - Native Hermes `kind='system'` cron inventory and migration remain explicit rollout gates.
-- Local PostgreSQL integration tests could not run because no local `DATABASE_URL` or Docker engine
-  is available; migration syntax/repeatability must therefore be proven on a disposable or
-  backup-restored PostgreSQL database before the production flag is enabled.
+- Local PostgreSQL integration could not run because no local `DATABASE_URL` or Docker engine is
+  available. Clean-database schema/migration and DB-marked tests passed in CI on PostgreSQL 14 and
+  16; a backup-restored production-shaped database is still required before the production flag is
+  enabled.

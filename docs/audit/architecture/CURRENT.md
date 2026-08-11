@@ -194,9 +194,9 @@ flowchart TD
   `delivery_conversation_id`. Telegram delivery uses the owning profile's token and re-checks that
   the recipient still has active access; revoked recipients do not receive later scheduled output.
 - The target is feature-gated by `TG_CHANNEL_NEUTRAL_ENABLED`. Local evidence is `1745 passed,
-  1 skipped` plus frontend TypeScript success. It is not production state: SSH authentication to
-  server 186 was rejected, PostgreSQL integration was unavailable locally, live identities/jobs
-  were not reconciled and the feature flag remains off by default.
+  1 skipped`; GitHub tests/security passed, including migration `084` and DB-marked tests on
+  PostgreSQL 14 and 16. It is not production state: SSH authentication to server 186 was rejected,
+  live identities/jobs were not reconciled and the feature flag remains off by default.
 
 ## Bitrix agent and automation split
 
