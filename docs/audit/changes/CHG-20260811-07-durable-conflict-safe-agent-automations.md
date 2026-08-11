@@ -104,9 +104,16 @@ Implemented local evidence on 2026-08-11:
   now shows one two-process global limit, PostgreSQL stages, delivery-only retry, action
   idempotency, business locks and manual review for ambiguous outcomes.
 
-Commit, push, CI, migration, connector materialization, production restart and live smoke are not
-yet evidence. Until they pass, production behavior remains the pre-change snapshot in
-CHG-20260811-06.
+- Implementation commit `971f0b808a57595b3563fb7ff2be396a5b716c58` was pushed to
+  `origin/main`.
+- GitHub tests run `31478731789` passed: frontend lint/build plus backend on Python 3.10/PostgreSQL
+  14 and Python 3.12/PostgreSQL 16. Both database jobs applied the full schema/migration chain
+  twice before running all DB-marked tests, including the atomic-trigger test.
+- GitHub security run `31478731850` passed both dependency audits.
+- Production migration, connector materialization, restart and live smoke are not evidence. Direct
+  SSH to `root@186.246.7.32` from this workspace is rejected (`Permission denied`), so deployment
+  stopped at the explicit access boundary. Until an authorized server credential/session is
+  provided, production behavior remains the pre-change snapshot in CHG-20260811-06.
 
 ## Risks
 
