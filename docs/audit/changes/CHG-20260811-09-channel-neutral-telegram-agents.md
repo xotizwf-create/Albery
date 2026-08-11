@@ -1,6 +1,6 @@
 # CHG-20260811-09: Channel-neutral Telegram agents
 
-- Status: implemented_local
+- Status: deployed
 - Date opened: 2026-08-11
 - Related decisions: [ADR-0005](../decisions/ADR-0005-channel-neutral-agent-runtime.md), [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md), [ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md)
 - Bitrix engineering task: pending
@@ -97,9 +97,46 @@ Implementation evidence:
   feature-gated `implemented_local` target.
 - Production read-only inspection was attempted with the configured server-186 credential and
   rejected during SSH authentication. No remote command ran and no production state changed.
-- Feature flag remains `TG_CHANNEL_NEUTRAL_ENABLED=0` by default. The migration, historical bot
-  reconciliation, current token `getMe`, automation inventory and live round trip must pass before
-  production cutover.
+- At the local-only checkpoint the feature flag default remained
+  `TG_CHANNEL_NEUTRAL_ENABLED=0`; migration, historical bot reconciliation and live probes were
+  still required before production cutover.
+
+Production deployment evidence on 2026-08-11:
+
+- The authorized rollout used the credential vault on server 217; no credential or bot token was
+  printed or copied into Git. Production was a clean fast-forward from `9cb40b1` to implementation
+  head `216dccb`; GitHub tests run `31490595463` and security run `31490595486` were green first.
+- A complete pre-change backup was verified under
+  `/var/backups/albery/pre-chg09-20260811_154147`: Git bundle/code archive, PostgreSQL custom dump
+  and schema, `.env`, systemd, Hermes configuration and the previous frontend bundle. Files are
+  mode `0600`; the previous frontend remains available as an explicit rollback directory.
+- Migrations `083` and `084` applied successfully and repeatably. Automation connector aliases
+  were materialized from the exact per-agent private MCP definitions; no public MCP route or URL
+  credential was added.
+- The inspected historical duplicate was reconciled explicitly, not by name: its single stable
+  Telegram access binding moved to active profile `main`; the legacy `albery-ai` row was unbound
+  and deactivated. No message history row required migration. The owner-approved user mapping was
+  not guessed: `bitrix_user_id` remains null until set explicitly in Agent Center.
+- Cutover ran behind an empty-inflight gate. The new frontend was swapped atomically, migrations
+  preceded worker activation, and `TG_CHANNEL_NEUTRAL_ENABLED=1` was then set atomically. Only
+  `albery.service` and `albery-tg.service` required controlled restarts; all three relevant services
+  are active and their post-cutover warning/error journals are empty.
+- Production assertions passed: the profile bot identity responds to `getMe`; the one active access
+  row has a stable Telegram id; the allowed stable identity is accepted, a wrong id with the same
+  username is denied, and an unknown identity is denied before Hermes. The migration tables,
+  durable offsets/update/outbox contract, workspace transport, Bitrix/workspace routes and all nine
+  active private MCP matrices passed smoke.
+- The first smoke sampled a brief VPN self-healing window. The existing hardened watchdog restored
+  the required rules without manual repair; the effective route is again table 200 via `awg0`, the
+  external address is the VPN exit and OpenAI returns the expected unauthenticated `401`. The
+  immediate repeat passed the VPN gate.
+- Full deploy smoke now fails only on the pre-existing, separate native
+  `hermes-gateway.service` Telegram platform state `retrying` (its old bot token is rejected). The
+  new channel-neutral employee bot, the IU workspace Telegram transport and all CHG-09 gates pass.
+- No real employee message, automation, task or other external write was created during acceptance.
+  Therefore the rollout is `deployed`, not `verified`: a named non-production recipient is still
+  required for a user-visible Telegram round trip, and an explicit Telegram-to-Bitrix employee
+  mapping is required before delegated Bitrix actions can be accepted.
 
 ## Risks
 
@@ -120,11 +157,9 @@ backups. Restart only through the empty-inflight safe gate.
 ## Known gaps and follow-up
 
 - A valid credential and explicit owner-approved recipient are required to replace and live-test the
-  degraded internal Telegram bot.
-- Duplicate historical Telegram profiles need an inspected merge; automatic name-based merging is
-  forbidden.
+  separate degraded native Hermes Telegram bot.
+- The inspected `albery-ai` duplicate was merged explicitly. Future duplicates must still be
+  inspected; automatic name-based merging remains forbidden.
 - Native Hermes `kind='system'` cron inventory and migration remain explicit rollout gates.
-- Local PostgreSQL integration could not run because no local `DATABASE_URL` or Docker engine is
-  available. Clean-database schema/migration and DB-marked tests passed in CI on PostgreSQL 14 and
-  16; a backup-restored production-shaped database is still required before the production flag is
-  enabled.
+- Production-shaped PostgreSQL migration and structural smoke passed before the flag was enabled.
+  A user-visible round trip was intentionally not sent without an approved recipient.

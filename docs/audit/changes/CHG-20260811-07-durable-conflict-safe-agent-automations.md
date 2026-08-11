@@ -1,6 +1,6 @@
 # CHG-20260811-07: Durable and conflict-safe agent automations
 
-- Status: implemented_local
+- Status: deployed
 - Date opened: 2026-08-11
 - Related decisions: [ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md)
 - Bitrix engineering task: pending
@@ -115,10 +115,33 @@ Implemented local evidence on 2026-08-11:
   14 and Python 3.12/PostgreSQL 16. Both database jobs applied the full schema/migration chain
   twice before running all DB-marked tests, including the atomic-trigger test.
 - GitHub security run `31478731850` passed both dependency audits.
-- Production migration, connector materialization, restart and live smoke are not evidence. Direct
-  SSH to `root@186.246.7.32` from this workspace is rejected (`Permission denied`), so deployment
-  stopped at the explicit access boundary. Until an authorized server credential/session is
-  provided, production behavior remains the pre-change snapshot in CHG-20260811-06.
+- At that checkpoint production migration, connector materialization, restart and live smoke were
+  not yet evidence because the stale direct credential was rejected. The later authorized rollout
+  used the documented server-217 credential vault; see the production evidence below.
+
+Production deployment evidence on 2026-08-11:
+
+- Production fast-forwarded cleanly to `216dccb` only after green CI. The complete CHG-09 backup
+  set at `/var/backups/albery/pre-chg09-20260811_154147` also covers this rollout's code, database,
+  service, environment, Hermes and frontend state.
+- Migration `083` created the durable run, delivery and effect ledgers on PostgreSQL 14. The
+  idempotent schema runner completed successfully, and deploy verification found every required
+  table.
+- `scripts/materialize_automation_connectors.py` first passed dry-run for all active profiles and
+  then applied exact loopback/header aliases. The previous Hermes configuration is retained at
+  `/root/.hermes/config.yaml.bak-automation-connectors-20260811_154705`.
+- Controlled restart happened only after zero Bitrix in-flight turns, zero legacy running agent
+  automations and zero durable running stages. `albery.service`, `albery-tg.service` and
+  `hermes-gateway.service` are active; application and employee-Telegram warning/error journals
+  after cutover are empty.
+- Production smoke passed all 53 workflow references, all nine active exact private connector
+  matrices, closed/public-route negative probes, durable automation tables, workspace/Bitrix UI
+  and API routes, VPN and both Albery Telegram transports. Durable queues were empty after cutover,
+  which is expected because acceptance deliberately created no live automation or external write.
+- This change is `deployed`, not `verified`: atomicity, contention, lease recovery, delivery-only
+  retry and action deduplication are covered by unit/CI PostgreSQL tests and production structure,
+  but a controlled production automation that performs and delivers a reversible business action
+  still needs an explicitly approved test object and recipient.
 
 ## Risks
 
@@ -149,4 +172,5 @@ forensics; they are additive and old code does not read them.
 - The business-object lock serializes individual mutating calls, not an entire multi-tool model
   conversation. External APIs with version/ETag support can later add optimistic concurrency.
 - Result/effect history retention requires a separate policy; no automatic deletion was introduced.
-- Production rollout depends on repository push/CI and authenticated access to server 186.
+- Production rollout is complete. Remaining acceptance is a controlled reversible live automation,
+  not another schema or runtime deployment.

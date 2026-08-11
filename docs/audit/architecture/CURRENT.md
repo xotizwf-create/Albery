@@ -4,7 +4,7 @@ Last reviewed: 2026-08-11.
 
 ## Verified production state
 
-Production server 186 runs implementation commit `d6ff01807818933c0efd56ae59fd69b9033fc0d7`.
+Production server 186 runs runtime implementation commit `216dccb`.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
@@ -74,12 +74,13 @@ flowchart LR
     Q --> S[Summaries and quality reasoning]
 ```
 
-- There are ten active model-facing MCP endpoints, exactly one for each active agent. Their tool
+- There are nine active model-facing MCP endpoints, exactly one for each active agent. Their tool
   sets are computed from database switches intersected with the versioned manifest cap.
 - The five former shared connectors and all legacy SSE routes are removed. URL-token routes do not
   exist; changing an environment flag cannot restore them.
-- Hermes stores loopback URLs and Bearer headers in a mode-`0600` configuration. All ten agent
-  credentials were rotated during migration.
+- Hermes stores loopback URLs and Bearer headers in a mode-`0600` configuration. The original ten
+  agent credentials were rotated during the private-MCP migration; the later merged legacy
+  Telegram profile is no longer an active connector, leaving nine active endpoints.
 - Ports `5002`, `5003`, and `5004` listen on `127.0.0.1` only. Nginx returns 404 for `/mcp*` and
   `/sse*` on both public hosts; the legacy MCP hostname also returns 404 for every default route,
   including health/login/API, while forwarding only Bitrix, Zoom, and Drive webhooks.
@@ -90,10 +91,10 @@ flowchart LR
 
 ## Telegram channel architecture
 
-The repository and inherited production evidence were audited under
-[CHG-20260811-08](../changes/CHG-20260811-08-telegram-agent-architecture-audit.md). No fresh live
-Telegram probe was possible on 2026-08-11 because the available SSH connection was rejected; the
-production-health statements below therefore retain the last usable CHG-20260811-05 evidence.
+The pre-change runtime was audited under
+[CHG-20260811-08](../changes/CHG-20260811-08-telegram-agent-architecture-audit.md), then the
+channel-neutral employee-agent runtime was deployed under
+[CHG-20260811-09](../changes/CHG-20260811-09-channel-neutral-telegram-agents.md).
 
 ```mermaid
 flowchart TD
@@ -106,48 +107,37 @@ flowchart TD
     G --> M[agent-main plus web]
     M --> GD[Native gateway delivery and Hermes cron]
 
-    X[Additional bot token] --> P[tg_multi polling thread]
-    P --> A[agent-slug plus web]
-    A --> DS[Direct synchronous sendMessage]
+    X[Employee profile bot] --> P[durable tg_multi worker]
+    P --> A[same agents.slug plus web]
+    A --> DS[(PostgreSQL outbox)]
 
     BA[Bitrix bot for a profile] --> BP[Bitrix turn builder]
     BP --> M
 ```
 
-- These are three separate runtimes. The native owner gateway has its own Telegram credential,
-  Hermes memory, allowlist and native cron. The client/IU workspace has durable PostgreSQL intake
-  and delivery. Additional Agent Center bots use one polling thread and token per profile inside
-  `albery-tg.service`.
-- A profile may technically hold both Bitrix and Telegram identities, and `agent-<slug>` gives both
-  channels the same private MCP capability boundary. The supported product path does not attach a
-  Telegram identity to the existing `main`/Bitrix profile, however, and the channel runtimes do not
-  share a prompt builder, dialogue history, requester identity, access model or delivery adapter.
-  “The same agent through two channels” is therefore an architectural target, not the current
-  end-to-end behavior.
-- Agent Center can create Telegram-only profiles and manage their tools, instructions, skills,
-  role and active state. Additional-bot conversation access is stored separately in
-  `telegram_bot_access`. Its current empty-list semantics are fail-open: a new bot accepts every
-  Telegram user until at least one allowlist entry exists, contrary to the UI wording. The native
-  owner gateway uses a different configuration allowlist.
-- The client workspace is the reliable Telegram path: raw updates are committed before offsets,
-  conversations are ordered, and outbound messages use an idempotent leased outbox with explicit
-  handling for ambiguous provider outcomes. Additional bots keep offsets in memory and call
-  `sendMessage` directly; a crash can replay an update, delivery is not durably retried, and a slow
-  model turn serially blocks that bot's polling thread.
-- Albery `agent_automations` are not channel-aware. Their `deliver_to` contract is a Bitrix dialog
-  id, and delivery always calls the Bitrix notifier. A Telegram chat id can therefore fail or be
-  misrouted, while a Telegram-only profile falls back to the main Bitrix sender. Native Hermes cron
-  can deliver through the owner gateway, but is a separate `kind='system'` mechanism outside the
-  CHG-07 durable automation worker and shared safety contour.
-- Latest inherited production evidence: standalone `albery-tg.service` and the client workspace
-  transport were healthy; the native Hermes Telegram platform was `retrying` because Telegram
-  rejected its configured token with HTTP 401. No current live health proof exists for each
-  additional bot token.
+- These remain three operational contours. The native owner gateway still has its own credential,
+  memory, allowlist and native cron. The client/IU workspace remains a separate zero-tool runtime.
+  Employee profile bots run inside `albery-tg.service`, but now use the same logical profile as
+  Bitrix rather than a Telegram-only profile.
+- Production profile `main` owns both its Bitrix and Telegram identities and the exact same private
+  `agent-main` capability boundary. Role, core rules, skills, knowledge and personal learning are
+  common; channel context, conversation history, rendering and delivery remain intentionally
+  channel-scoped.
+- Telegram access is fail-closed. An empty list, unknown identity or database failure denies before
+  Hermes. The deployed access row has a stable Telegram id; a changed username cannot override it.
+  Delegated Bitrix actions remain denied because no `bitrix_user_id` mapping was guessed during
+  migration.
+- Employee profile updates/offsets and outbound results are durable in PostgreSQL. Known delivery
+  failures retry stored output; ambiguous provider outcomes stop for review rather than blind resend.
+  Agent automations carry a typed channel/profile/conversation destination and re-check access before
+  later Telegram delivery.
+- `albery-tg.service` and its profile bot `getMe`, access, durable tables and workspace transport
+  pass production smoke. The separate native Hermes Telegram platform remains `retrying` because
+  Telegram rejects its pre-existing token; it is not the deployed employee-agent transport.
 
-### Locally implemented target under CHG-20260811-09
+### Deployed channel-neutral employee-agent runtime
 
-The production description above remains authoritative until rollout. The following replacement is
-implemented and regression-tested locally under [ADR-0005](../decisions/ADR-0005-channel-neutral-agent-runtime.md)
+The following runtime is deployed under [ADR-0005](../decisions/ADR-0005-channel-neutral-agent-runtime.md)
 and [CHG-20260811-09](../changes/CHG-20260811-09-channel-neutral-telegram-agents.md):
 
 ```mermaid
@@ -193,17 +183,17 @@ flowchart TD
 - Agent automations now store `delivery_channel`, `delivery_profile` and
   `delivery_conversation_id`. Telegram delivery uses the owning profile's token and re-checks that
   the recipient still has active access; revoked recipients do not receive later scheduled output.
-- The target is feature-gated by `TG_CHANNEL_NEUTRAL_ENABLED`. Local evidence is `1745 passed,
-  1 skipped`; GitHub tests/security passed, including migration `084` and DB-marked tests on
-  PostgreSQL 14 and 16. It is not production state: SSH authentication to server 186 was rejected,
-  live identities/jobs were not reconciled and the feature flag remains off by default.
+- `TG_CHANNEL_NEUTRAL_ENABLED=1` is active in the production worker. Local evidence is
+  `1745 passed, 1 skipped`; GitHub tests/security passed, including migration `084` and DB-marked
+  tests on PostgreSQL 14 and 16. Production migration, the explicit `albery-ai` to `main` binding
+  merge, fail-closed identity assertions and smoke passed. No real employee message was sent, so
+  user-visible round-trip acceptance remains open and the change status is `deployed`.
 
 ## Bitrix agent and automation split
 
-The profile ownership statements below are verified production behavior. The durable automation
-lane is implemented locally under [ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md)
-and [CHG-20260811-07](../changes/CHG-20260811-07-durable-conflict-safe-agent-automations.md),
-but is not production state until migration, connector materialization, CI and live smoke pass.
+The profile ownership and durable automation lane below are deployed production behavior under
+[ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md) and
+[CHG-20260811-07](../changes/CHG-20260811-07-durable-conflict-safe-agent-automations.md).
 
 ```mermaid
 flowchart LR
@@ -229,7 +219,7 @@ flowchart LR
     AO -->|ambiguous outcome| RV[Manual review; no blind replay]
 ```
 
-- The shared `agents` registry has ten active profiles across Bitrix, internal and Telegram
+- The shared `agents` registry has nine active profiles across Bitrix, internal and Telegram
   channels. For an employee Bitrix event, `bot_id` selects the profile with the matching
   `bitrix_bot_id`; dialogue scope is the pair `(agent_slug, dialog_id)`. Every profile has its own
   identity, instructions, knowledge, access rules and private MCP capability set, while channel
@@ -238,16 +228,16 @@ flowchart LR
   prompt is assembled with that profile's role, skills and personal instructions; Hermes receives
   the exact profile capability set, and delivery uses that profile's Bitrix bot identity.
 
-### Verified production behavior before CHG-20260811-07
+### Historical behavior before CHG-20260811-07
 
-- Scheduled and manually launched agent automations do not enter through the inbound Bitrix
-  webhook. They currently use an independent in-process FIFO lane with one worker and therefore
-  do not consume the two shared live Bitrix/Telegram slots.
-- Queue and delayed retry are process memory. A delivery failure can repeat the whole Hermes turn.
-  `Run now` is not a single atomic claim, and an interrupted run is eventually displayed as
+- Scheduled and manually launched agent automations did not enter through the inbound Bitrix
+  webhook. They used an independent in-process FIFO lane with one worker and therefore did not
+  consume the two shared live Bitrix/Telegram slots.
+- Queue and delayed retry were process memory. A delivery failure could repeat the whole Hermes turn.
+  `Run now` was not a single atomic claim, and an interrupted run was eventually displayed as
   `interrupted` rather than resumed from a durable stage.
 
-### Locally implemented target under CHG-20260811-07
+### Deployed durable automation runtime
 
 - `agent_automation_runs` is the durable stage machine. Manual triggers are protected by a partial
   unique active-run constraint under an automation row lock; scheduled triggers use
@@ -268,6 +258,9 @@ flowchart LR
 - `kind='system'` Hermes/crond mirror rows remain outside this worker and require their own runtime
   migration/audit. The actual automation inventory and business-output acceptance also remain a
   separate controlled audit step.
+- Migration `083`, exact private connector aliases and the worker are live. Production smoke and
+  empty-queue/restart safety passed, but no real automation or external write was triggered during
+  deployment; controlled reversible business acceptance remains before `verified`.
 
 ## Current operational status
 
