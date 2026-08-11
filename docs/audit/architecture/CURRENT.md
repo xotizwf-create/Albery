@@ -1,10 +1,10 @@
 # Current Albery architecture
 
-Last reviewed: 2026-08-10.
+Last reviewed: 2026-08-11.
 
 ## Verified production state
 
-Production server 186 runs implementation commit `1e0c3f87e5791570e4b6d08b3394c56d37b3575c`.
+Production server 186 runs implementation commit `d6ff01807818933c0efd56ae59fd69b9033fc0d7`.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
@@ -87,3 +87,16 @@ flowchart LR
   allowlist rather than a shared HTTP MCP credential. Missing main-agent wiring fails closed.
 - Dialogue summaries and diagnostic digests use the isolated zero-tool Codex quality contour;
   Groq remains responsible for audio and primary screenshot/OCR processing.
+
+## Current operational status
+
+- Outbound model/provider traffic is policy-routed through AmneziaWG exit `95.85.243.43`.
+  The watchdog verifies the effective route and reapplies missing policy rules; a fresh tunnel
+  handshake alone is no longer treated as healthy.
+- Codex, private MCP and Zoom report generation are operational after
+  [CHG-20260811-05](../changes/CHG-20260811-05-vpn-routing-automation-recovery.md).
+- Hermes Telegram is degraded: its platform state is `retrying` because Telegram rejects the
+  configured bot token. This credential predates the 2026-08-10 MCP migration. The standalone
+  Albery Telegram service and Bitrix delivery paths are separate and active.
+- Deploy smoke checks effective VPN health and the Telegram platform state, so this known
+  degradation prevents a false all-green acceptance until the bot token is replaced.

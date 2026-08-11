@@ -78,6 +78,13 @@ Observed consequences:
 - Shell syntax passed for both watchdogs. Pyflakes passed. Focused tests passed (`8 passed`), then
   the full local suite passed (`1888 passed, 43 skipped`); skips are the documented local
   PostgreSQL/LibreOffice cases.
+- Implementation commit: `d6ff01807818933c0efd56ae59fd69b9033fc0d7`. GitHub Actions tests
+  run `31469575216` and security audit run `31469575235` passed. Production fast-forwarded to the
+  same commit; Python compilation and both shell syntax checks passed there.
+- Production deploy smoke passed all 53 workflow references, ten exact private connector matrices,
+  retired/public MCP negative probes, services, VPN, site, calculator, workspace routes/tables and
+  workspace Telegram transport. It correctly returned non-zero only for
+  `Hermes Telegram platform state=retrying`.
 
 Production cannot yet be marked fully verified for every delivery channel: the Hermes Telegram
 platform is independently in `retrying`, and a direct `getMe` returns 401 for its configured bot
