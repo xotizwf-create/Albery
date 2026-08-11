@@ -88,6 +88,66 @@ flowchart LR
 - Dialogue summaries and diagnostic digests use the isolated zero-tool Codex quality contour;
   Groq remains responsible for audio and primary screenshot/OCR processing.
 
+## Telegram channel architecture
+
+The repository and inherited production evidence were audited under
+[CHG-20260811-08](../changes/CHG-20260811-08-telegram-agent-architecture-audit.md). No fresh live
+Telegram probe was possible on 2026-08-11 because the available SSH connection was rejected; the
+production-health statements below therefore retain the last usable CHG-20260811-05 evidence.
+
+```mermaid
+flowchart TD
+    C[Client and Telegram Business messages] --> W[albery-tg.service workspace path]
+    W --> Z[Zero-tool IU customer runtime]
+    Z --> O[(PostgreSQL transactional outbox)]
+    O --> API[Telegram Bot API]
+
+    T[Trusted owner Telegram] --> G[hermes-gateway.service]
+    G --> M[agent-main plus web]
+    M --> GD[Native gateway delivery and Hermes cron]
+
+    X[Additional bot token] --> P[tg_multi polling thread]
+    P --> A[agent-slug plus web]
+    A --> DS[Direct synchronous sendMessage]
+
+    BA[Bitrix bot for a profile] --> BP[Bitrix turn builder]
+    BP --> M
+```
+
+- These are three separate runtimes. The native owner gateway has its own Telegram credential,
+  Hermes memory, allowlist and native cron. The client/IU workspace has durable PostgreSQL intake
+  and delivery. Additional Agent Center bots use one polling thread and token per profile inside
+  `albery-tg.service`.
+- A profile may technically hold both Bitrix and Telegram identities, and `agent-<slug>` gives both
+  channels the same private MCP capability boundary. The supported product path does not attach a
+  Telegram identity to the existing `main`/Bitrix profile, however, and the channel runtimes do not
+  share a prompt builder, dialogue history, requester identity, access model or delivery adapter.
+  “The same agent through two channels” is therefore an architectural target, not the current
+  end-to-end behavior.
+- Agent Center can create Telegram-only profiles and manage their tools, instructions, skills,
+  role and active state. Additional-bot conversation access is stored separately in
+  `telegram_bot_access`. Its current empty-list semantics are fail-open: a new bot accepts every
+  Telegram user until at least one allowlist entry exists, contrary to the UI wording. The native
+  owner gateway uses a different configuration allowlist.
+- The client workspace is the reliable Telegram path: raw updates are committed before offsets,
+  conversations are ordered, and outbound messages use an idempotent leased outbox with explicit
+  handling for ambiguous provider outcomes. Additional bots keep offsets in memory and call
+  `sendMessage` directly; a crash can replay an update, delivery is not durably retried, and a slow
+  model turn serially blocks that bot's polling thread.
+- Albery `agent_automations` are not channel-aware. Their `deliver_to` contract is a Bitrix dialog
+  id, and delivery always calls the Bitrix notifier. A Telegram chat id can therefore fail or be
+  misrouted, while a Telegram-only profile falls back to the main Bitrix sender. Native Hermes cron
+  can deliver through the owner gateway, but is a separate `kind='system'` mechanism outside the
+  CHG-07 durable automation worker and shared safety contour.
+- Latest inherited production evidence: standalone `albery-tg.service` and the client workspace
+  transport were healthy; the native Hermes Telegram platform was `retrying` because Telegram
+  rejected its configured token with HTTP 401. No current live health proof exists for each
+  additional bot token.
+
+Required follow-up is a separate approved runtime change: channel-neutral identity binding,
+fail-closed Telegram access, durable additional-agent intake/delivery, per-bot health, and an
+explicit automation destination `{channel, profile, conversation_id}` with a Telegram adapter.
+
 ## Bitrix agent and automation split
 
 The profile ownership statements below are verified production behavior. The durable automation

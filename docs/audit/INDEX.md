@@ -30,6 +30,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260811-05](changes/CHG-20260811-05-vpn-routing-automation-recovery.md) | deployed | Restore VPN policy routing and recover model-backed automations; three live acceptance gates remain |
 | [CHG-20260811-06](changes/CHG-20260811-06-bitrix-agent-automation-diagram.md) | implemented_local | Document Bitrix per-agent routing and the independent agent-automation lane |
 | [CHG-20260811-07](changes/CHG-20260811-07-durable-conflict-safe-agent-automations.md) | implemented_local | Put agent automations under the shared limit and make queue, retry and effects durable/conflict-safe |
+| [CHG-20260811-08](changes/CHG-20260811-08-telegram-agent-architecture-audit.md) | implemented_local | Audit all Telegram contours, profile/permission mapping, delivery reliability and automation destinations |
 
 ## Status rule
 
