@@ -26,7 +26,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260810-02](changes/CHG-20260810-02-nanoid-security-update.md) | verified | Update locked nanoid after the mandatory security gate detected a high-severity advisory |
 | [CHG-20260810-03](changes/CHG-20260810-03-independent-acceptance-hardening.md) | verified | Independently re-test and harden all quality-routing paths |
 | [CHG-20260810-04](changes/CHG-20260810-04-private-per-agent-mcp.md) | verified | Retire shared MCP sets and make per-agent MCP private |
-| [CHG-20260811-05](changes/CHG-20260811-05-vpn-routing-automation-recovery.md) | implemented_production | Restore VPN policy routing and recover model-backed automations; Telegram credential recovery remains |
+| [CHG-20260811-05](changes/CHG-20260811-05-vpn-routing-automation-recovery.md) | deployed | Restore VPN policy routing and recover model-backed automations; three live acceptance gates remain |
 
 ## Status rule
 

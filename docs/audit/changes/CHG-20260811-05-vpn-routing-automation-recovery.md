@@ -1,6 +1,6 @@
 # CHG-20260811-05: VPN routing and automation recovery
 
-- Status: implemented_production
+- Status: deployed
 - Date opened: 2026-08-11
 - Incident window: confirmed at 2026-08-11 09:00 MSK; exact start is still under investigation
 - Related decisions: [ADR-0002](../decisions/ADR-0002-codex-reasoning-groq-media.md), [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md)
@@ -91,6 +91,48 @@ platform is independently in `retrying`, and a direct `getMe` returns 401 for it
 token. The credential fingerprint is unchanged across backups dating to June, so this was not
 introduced by the private-MCP migration. Recovery requires a newly issued Telegram bot token;
 deploy smoke now fails closed on this state instead of accepting an active process as healthy.
+
+Independent control acceptance at 10:50-10:56 MSK:
+
+- Local `HEAD` and `origin/main` matched; the worktree was clean; shell syntax and pyflakes passed;
+  the full suite passed again (`1888 passed, 43 skipped`). The two latest tests/security GitHub
+  Actions runs for `101db0b` were green.
+- Production `HEAD` and `origin/main` matched `101db0b`; tracked files were clean. Twelve older
+  untracked backup/runtime artifacts remain on the server and were not touched.
+- All seven core services were active, failed systemd units were zero, the five relevant timers
+  were active, available RAM was 889 MiB, swap use 109 MiB, and disk use 69%.
+- Ports `5002`, `5003`, and `5004` remained loopback-only. Hermes config was `0600`; all ten active
+  agents had unique non-empty credentials and exactly ten loopback/header connectors; retired
+  connectors were absent. Missing/wrong auth returned 403, path-token and forwarded/public access
+  returned 404. All ten exact live tool matrices passed.
+- Three consecutive VPN healthchecks passed with the Estonia exit and OpenAI HTTP 401. Required
+  policy rules, table-200 effective route, recent handshake, active timer, and repository/live
+  watchdog hash parity were confirmed.
+- Zero-tool Codex self-check and JSON probe passed. Hermes `agent-main,web` performed exactly one
+  read-only `health` call and returned `AUTOMATION-RECHECK-OK`. Post-recovery model logs contained
+  zero API failures, HTTP 403s, missing final responses, or permission denials.
+- Synthetic Groq media probes passed through the actual application functions: Whisper returned a
+  non-empty transcript and vision OCR read both the test marker and number from a generated image.
+- All three recent Zoom calls had `done` reports, full required top-level analysis shape and valid
+  required fields on all nine operational tasks; pending calls remained zero. The first malformed
+  save attempt was rejected by validation and did not persist an incomplete report.
+- Bitrix `user.current` read-only authentication returned HTTP 200. WB sync and Google Drive sync
+  completed successfully without document errors; self-check and quality services completed with
+  exit status zero. Application services had no post-recovery errors; their only warnings were the
+  expected rejected negative test and two network errors during the original routing transition.
+- Runtime queues were empty: zero employee turns in flight, zero running automations, zero pending
+  Zoom reports. Both recorded pre-change backup locations exist with restrictive permissions.
+
+Remaining gates before `verified`:
+
+1. Replace the rejected Hermes Telegram bot token and observe platform state `connected` plus a
+   successful non-production-recipient delivery test.
+2. Decide whether to replay automation 36 to its one configured Bitrix target; until then its
+   09:00 run correctly remains `error` rather than being silently marked successful.
+3. Automation 59 (`Ежедневное обновление цен WB`) is active but its previous 14:30 run timed out.
+   Its Google Sheet metadata/read and WB-price dependencies pass read-only probes now, but the full
+   write scenario was not rerun without owner approval. Observe its next scheduled run or approve a
+   controlled write test before claiming the automation fleet is fully healthy.
 
 During diagnosis, an additional source-of-truth drift was found: the production Zoom watchdog has
 the newer detached-worker/retry-safe implementation, while the repository copy is older. The live

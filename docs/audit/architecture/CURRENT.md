@@ -100,3 +100,6 @@ flowchart LR
   Albery Telegram service and Bitrix delivery paths are separate and active.
 - Deploy smoke checks effective VPN health and the Telegram platform state, so this known
   degradation prevents a false all-green acceptance until the bot token is replaced.
+- Agent automation 36 retains its failed 09:00 status pending an explicit resend decision.
+  Automation 59 has healthy read-only Google Sheet and WB-price dependencies, but its previous
+  full write run timed out and still needs a successful scheduled or owner-approved controlled run.
