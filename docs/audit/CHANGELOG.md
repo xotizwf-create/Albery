@@ -2,6 +2,11 @@
 
 Append entries in reverse chronological order. Link to the detailed record; do not duplicate its full content here.
 
+## 2026-08-11
+
+- `implemented_production` — [CHG-20260811-05](changes/CHG-20260811-05-vpn-routing-automation-recovery.md): policy routing restored and self-healing watchdog deployed; Codex, private MCP, end-to-end automation probe and all queued Zoom reports recovered. Hermes Telegram remains blocked by its pre-existing rejected bot token, and the missed employee report awaits explicit resend approval.
+- `approved` — [CHG-20260811-05](changes/CHG-20260811-05-vpn-routing-automation-recovery.md): production incident confirmed; a live AmneziaWG handshake masked missing policy routes, causing Codex HTTP 403, failed Zoom analysis, failed agent automations, and Telegram delivery loss. Restore routing and harden the watchdog.
+
 ## 2026-08-10
 
 - `verified` — [CHG-20260810-04](changes/CHG-20260810-04-private-per-agent-mcp.md): ten rotated per-agent connectors are loopback/header-only; five shared and all path-token/SSE routes are removed; the legacy MCP host is dark except for a webhook allowlist; CI, live tool matrices, public negative probes, Codex quality, in-process Telegram reads, webhooks, health and journals passed.

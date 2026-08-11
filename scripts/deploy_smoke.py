@@ -14,6 +14,7 @@ Checks:
 4. The site and standalone funnel workspace routes are wired.
 5. When the workspace is enabled, its password, at least one Telegram transport and
    rollout flags are coherent.
+6. On production, VPN policy routing is effective and the Hermes Telegram platform is connected.
 
 Exit code 0 = safe to walk away; 1 = do not leave the deploy like this.
 """
@@ -244,6 +245,37 @@ if Path("/run/systemd/system").is_dir():
             failures.append(
                 f"{service_name}: status не проверен ({type(exc).__name__})"
             )
+    vpn_healthcheck = Path("/usr/local/sbin/vpn-healthcheck.sh")
+    if vpn_healthcheck.is_file():
+        try:
+            check = subprocess.run(
+                [str(vpn_healthcheck)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=45,
+            )
+            if check.returncode:
+                failures.append("VPN: effective outbound route or provider reachability is unhealthy")
+            else:
+                print("VPN effective route/provider reachability: OK")
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"VPN healthcheck failed ({type(exc).__name__})")
+
+    gateway_state_path = Path("/root/.hermes/gateway_state.json")
+    if gateway_state_path.is_file():
+        try:
+            gateway_state = json.loads(gateway_state_path.read_text(encoding="utf-8"))
+            telegram_state = (
+                ((gateway_state.get("platforms") or {}).get("telegram") or {}).get("state")
+            )
+            if telegram_state != "connected":
+                # Never include error_message: upstream may embed the bot token in it.
+                failures.append(f"Hermes Telegram platform state={telegram_state or 'missing'}")
+            else:
+                print("Hermes Telegram platform: connected")
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"Hermes Telegram state unreadable ({type(exc).__name__})")
 else:
     print("systemd services: SKIP (systemd environment not detected)")
 

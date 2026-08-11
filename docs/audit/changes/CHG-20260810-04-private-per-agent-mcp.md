@@ -139,3 +139,9 @@ rollback; if emergency access is needed, restore within loopback and rotate cred
 Cross-host private MCP transport is out of scope until the runtime leaves this server. A Bitrix
 engineering task was intentionally not created because acceptance required no employee-visible
 task or message; the Git audit record is the durable change log.
+
+Correction recorded 2026-08-11: the acceptance above proved MCP capability and a synthetic Codex
+turn, but did not assert effective VPN policy routing, the connected state of the Telegram
+platform, or completion of a scheduled business output. CHG-20260811-05 adds these gates. The
+private MCP transport was not the root cause of that incident, but the earlier acceptance scope
+was insufficient to detect it.
