@@ -4,6 +4,7 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-11
 
+- `documentation_sync` — [CHG-20260811-07](changes/CHG-20260811-07-durable-conflict-safe-agent-automations.md): the workspace architecture Markdown is now the single human entry point and explicitly separates verified production from the locally implemented automation target; versioned ADR/CHG records remain canonical evidence.
 - `implemented_local` — [CHG-20260811-07](changes/CHG-20260811-07-durable-conflict-safe-agent-automations.md): agent automations now use PostgreSQL stages and leases, atomic trigger keys, the shared two-slot Hermes limit, delivery-only retry, per-run write deduplication and business-object advisory locks; production rollout is still pending.
 - `accepted` — [ADR-0004](decisions/ADR-0004-durable-conflict-safe-agent-automations.md): durable staged execution and fail-closed ambiguous outcomes replace the in-memory/whole-run retry model for agent automations.
 - `implemented_local` — [CHG-20260811-06](changes/CHG-20260811-06-bitrix-agent-automation-diagram.md): the Bitrix overview now separates profile routing from agent-owned automations and distinguishes the two live-turn slots from the independent one-worker automation lane.

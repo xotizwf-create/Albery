@@ -47,7 +47,8 @@ retry and mutating actions safe against restarts, duplicate triggers and concurr
   than an inner helper loop, owns retry and ambiguity decisions.
 - `Интерфейс/src/agent/views/AutomationsPanel.tsx`: honest `queued` and `review` states and a
   disabled Run-now button while a run is active.
-- automation unit/DB tests, ADR/audit/current architecture, and the workspace SVG/PNG overview.
+- automation unit/DB tests, ADR/audit/current architecture, the workspace SVG/PNG overview, and
+  the consolidated human master report `Hermes Brain/tmp/albery-architecture-actual-2026-08-10.md`.
 - `tests/unit/test_tg_closed_chats.py`: test-only clock freezing; its fixed August fixtures had
   crossed the real seven-day cutoff and would make otherwise green CI depend on wall-clock time.
 
@@ -103,6 +104,10 @@ Implemented local evidence on 2026-08-11:
 - SVG XML remained valid; Edge rendered the 1800 x 1540 final PNG without clipping. The diagram
   now shows one two-process global limit, PostgreSQL stages, delivery-only retry, action
   idempotency, business locks and manual review for ambiguous outcomes.
+- The workspace architecture Markdown was synchronized on 2026-08-11 and made the single human
+  entry point. It explicitly separates verified production from the locally implemented target
+  and links back to this CHG, ADR-0004 and `architecture/CURRENT.md`; technical evidence remains
+  canonical in the versioned audit base.
 
 - Implementation commit `971f0b808a57595b3563fb7ff2be396a5b716c58` was pushed to
   `origin/main`.
