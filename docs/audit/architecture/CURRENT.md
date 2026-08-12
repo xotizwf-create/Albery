@@ -1,10 +1,10 @@
 # Current Albery architecture
 
-Last reviewed: 2026-08-11.
+Last reviewed: 2026-08-12.
 
 ## Verified production state
 
-Production server 186 runs runtime implementation commit `216dccb`.
+Production server 186 runs runtime implementation commit `5d23c79`.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
@@ -83,7 +83,8 @@ flowchart LR
   Telegram profile is no longer an active connector, leaving nine active endpoints.
 - Ports `5002`, `5003`, and `5004` listen on `127.0.0.1` only. Nginx returns 404 for `/mcp*` and
   `/sse*` on both public hosts; the legacy MCP hostname also returns 404 for every default route,
-  including health/login/API, while forwarding only Bitrix, Zoom, and Drive webhooks.
+  including health/login/API, while forwarding only Bitrix, Zoom, Drive webhooks and the exact
+  HMAC+TTL-protected `/zoom-export/` compatibility prefix. No public route reaches the MCP role.
 - Owner Telegram uses `agent-main,web`. Deterministic Telegram/CRM operations use an in-process
   allowlist rather than a shared HTTP MCP credential. Missing main-agent wiring fails closed.
 - Dialogue summaries and diagnostic digests use the isolated zero-tool Codex quality contour;
@@ -263,6 +264,12 @@ flowchart LR
   deployment; controlled reversible business acceptance remains before `verified`.
 
 ## Current operational status
+
+- Employee-facing generated files use signed, time-limited URLs on `www.m4s.ru`. The final Bitrix
+  delivery path canonicalizes historical Albery export URLs to that host. Deploy smoke creates a
+  disposable artifact and verifies its bytes through public Nginx; the exact legacy-host export
+  prefix remains only so already-delivered valid links work until their own expiry. This behavior
+  is verified by [CHG-20260812-10](../changes/CHG-20260812-10-verified-agent-links.md).
 
 - Outbound model/provider traffic is policy-routed through AmneziaWG exit `95.85.243.43`.
   The watchdog verifies the effective route and reapplies missing policy rules; a fresh tunnel

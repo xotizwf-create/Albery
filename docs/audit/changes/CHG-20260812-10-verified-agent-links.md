@@ -1,6 +1,6 @@
 # CHG-20260812-10: Verify agent-generated links before delivery
 
-- Status: implemented_local
+- Status: verified
 - Date opened: 2026-08-12
 - Incident: an employee received one or more agent-generated links that did not exist
 - Approval: the owner explicitly requested an urgent production repair and root-cause analysis
@@ -71,8 +71,28 @@ drift, not a fabricated document or corrupted signature.
 - Full local regression: `1914 passed, 44 skipped`; the skipped PostgreSQL/LibreOffice scenarios are
   the documented CI/server-only cases. Nine warnings are third-party `httplib2` deprecations.
 - `pip-audit -r requirements.txt`: no known vulnerabilities.
-- CI, production backup/deployment, Nginx validation/reload, controlled service restart and live
-  public file round trip remain pending.
+- Implementation commit `5d23c7999f7f8a5f87de87c31b3d489ba698a276` passed GitHub tests run
+  `31593951073` and security run `31593950769`.
+- Production preflight at head `6ec6b9a` found a clean tracked tree, 846 MiB available RAM, 13 GiB
+  free disk, all five relevant application services active, valid Nginx configuration, zero
+  Bitrix in-flight turns and zero running legacy/durable agent automations.
+- Pre-deploy production backup:
+  `/var/backups/albery/pre-link-route-20260812_145622`. It contains a full Git bundle, tracked-code
+  archive, protected production environment, live Nginx configuration and manifest; files are mode
+  `0600`. No database backup was necessary because schema/data were not changed.
+- Production fast-forwarded to `5d23c79`; Python compilation passed. The repository Nginx file was
+  installed atomically, `nginx -t` passed and reload completed. A second empty-inflight gate passed
+  before controlled restarts of `albery-mcp`, `albery-web` and `albery`.
+- All six relevant services are active. Full deploy smoke passed all CHG-10 gates: canonical
+  `www.m4s.ru` signed download returned the exact disposable bytes; the narrow legacy-host path did
+  the same; all public MCP/SSE/default negative probes remained 404; nine exact private MCP
+  matrices, VPN, Bitrix/workspace routes and Albery Telegram transports passed. The only smoke
+  failure remains the known unrelated native Hermes Telegram state `retrying`.
+- An additional production acceptance called the real `export_document` tool through the legal
+  agent's private/header-authenticated MCP, received a `www.m4s.ru` URL, downloaded a valid DOCX with
+  HTTP 200 and removed the temporary document plus sidecar. No message was sent to the employee.
+- Post-deploy warning/error journals for the three restarted services were empty and the tracked
+  production tree remained clean.
 
 ## Changed files
 

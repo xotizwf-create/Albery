@@ -33,7 +33,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260811-07](changes/CHG-20260811-07-durable-conflict-safe-agent-automations.md) | deployed | Put agent automations under the shared limit and make queue, retry and effects durable/conflict-safe |
 | [CHG-20260811-08](changes/CHG-20260811-08-telegram-agent-architecture-audit.md) | implemented_local | Audit all Telegram contours, profile/permission mapping, delivery reliability and automation destinations |
 | [CHG-20260811-09](changes/CHG-20260811-09-channel-neutral-telegram-agents.md) | deployed | Implement one Bitrix/Telegram profile, closed access, durable Telegram delivery and typed automation destinations |
-| [CHG-20260812-10](changes/CHG-20260812-10-verified-agent-links.md) | implemented_local | Repair signed export links broken by the dark legacy MCP hostname and add public round-trip smoke |
+| [CHG-20260812-10](changes/CHG-20260812-10-verified-agent-links.md) | verified | Repair signed export links broken by the dark legacy MCP hostname and add public round-trip smoke |
 
 ## Status rule
 
