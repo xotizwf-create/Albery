@@ -64,4 +64,8 @@ re-created instead of echoing an expired bearer URL.
   PostgreSQL and LibreOffice cases that run in CI/production-capable environments.
 - `git diff --check` passed. Pyflakes reports only three warnings already present in unchanged
   lines of `b24bot.py`; this change introduces no new warning.
+- The first production verification showed that Hermes suppresses `INFO` in journald. The
+  scheduler-only marker was therefore changed to a flushed stdout marker, so self-check can
+  immediately separate pre-restart connector warnings from current state. The full suite remained
+  `1934 passed, 44 skipped` after that hardening.
 - No external message, task or business object was created while reproducing the incident.

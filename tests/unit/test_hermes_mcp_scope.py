@@ -40,7 +40,14 @@ def test_installed_hermes_patch_is_idempotent_and_pinned():
     patched_mcp, patched_gateway = patched_sources(mcp, gateway)
     assert MCP_MARKER in patched_mcp and "HERMES_MCP_SERVER_ALLOWLIST" in patched_mcp
     assert GATEWAY_MARKER in patched_gateway and "HERMES_GATEWAY_SCHEDULER_ONLY" in patched_gateway
+    assert "print('Albery scheduler-only gateway: MCP discovery skipped'" in patched_gateway
     assert patched_sources(patched_mcp, patched_gateway) == (patched_mcp, patched_gateway)
+    old_deployment = patched_gateway.replace(
+        "        print('Albery scheduler-only gateway: MCP discovery skipped', flush=True)\n", "",
+    )
+    assert "print('Albery scheduler-only gateway: MCP discovery skipped'" in patched_sources(
+        patched_mcp, old_deployment,
+    )[1]
 
 
 def test_materialization_prunes_inactive_managed_connectors():

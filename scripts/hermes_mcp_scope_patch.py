@@ -54,11 +54,18 @@ def patched_sources(mcp_source: str, gateway_source: str) -> tuple[str, str]:
         f"    {GATEWAY_MARKER}\n"
         "    if os.environ.get('HERMES_GATEWAY_SCHEDULER_ONLY', '').strip() == '1':\n"
         "        logger.info('Albery scheduler-only gateway: MCP discovery skipped')\n"
+        "        print('Albery scheduler-only gateway: MCP discovery skipped', flush=True)\n"
         "    else:\n"
         "        await _albery_discover_gateway_mcp()\n\n"
         "    # MCP tool discovery — run in an executor so the asyncio event loop\n"
         "    # stays responsive even when a configured MCP server is slow or\n"
     )
+    if GATEWAY_MARKER in gateway_source and "print('Albery scheduler-only gateway: MCP discovery skipped'" not in gateway_source:
+        old_log = "        logger.info('Albery scheduler-only gateway: MCP discovery skipped')\n"
+        new_log = old_log + "        print('Albery scheduler-only gateway: MCP discovery skipped', flush=True)\n"
+        if gateway_source.count(old_log) != 1:
+            raise RuntimeError("Hermes scheduler-only log anchor changed")
+        gateway_source = gateway_source.replace(old_log, new_log, 1)
     gateway_source = patch_text(gateway_source, gateway_anchor, gateway_replacement, GATEWAY_MARKER)
     # Move the existing discovery body into a helper without changing its behavior for non-Albery
     # gateways.  The exact block is deliberately pinned so an upstream change fails closed.
