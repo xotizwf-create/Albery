@@ -1,6 +1,6 @@
 # CHG-20260812-13: Retire redundant native Telegram and complete identity acceptance
 
-- Status: implemented_local
+- Status: deployed
 - Date opened: 2026-08-12
 - Related decisions: [ADR-0005](../decisions/ADR-0005-channel-neutral-agent-runtime.md)
 - Bitrix engineering task: pending
@@ -68,6 +68,17 @@ identity acceptance fails. No token is revoked as part of this change.
 
 ## Known gaps and follow-up
 
-CI and protected production retirement remain pending. A named recipient and exact message preview
-are still required for the first user-visible profile round trip; stable Telegram-to-Bitrix mapping
-requires separate confirmation of both immutable identities.
+Production evidence on 2026-08-12:
+
+- The rejected legacy `TELEGRAM_BOT_TOKEN` key was removed from the protected Hermes environment
+  after backup; no token was guessed, rotated or revoked. `HERMES_TELEGRAM_RETIRED=1` now records the
+  intentional state in Albery's protected environment.
+- `hermes-gateway.service` restarted cleanly and remains active for scheduler/orchestration only.
+  Its upstream state file still contains the historical word `retrying`, but the credential key is
+  absent and there are no post-restart Telegram or service errors.
+- The active Albery `main` profile passes Telegram `getMe`, and `albery-tg.service`, durable tables,
+  access checks and full deploy smoke are healthy. CI runs `31599857089` and `31599857094` passed.
+
+A named recipient and exact message preview are still required for the first user-visible profile
+round trip. Stable Telegram-to-Bitrix actor mapping remains fail-closed until both immutable IDs and
+the person are explicitly confirmed. This change therefore remains `deployed`, not `verified`.

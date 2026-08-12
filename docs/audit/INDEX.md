@@ -35,9 +35,9 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260811-08](changes/CHG-20260811-08-telegram-agent-architecture-audit.md) | implemented_local | Audit all Telegram contours, profile/permission mapping, delivery reliability and automation destinations |
 | [CHG-20260811-09](changes/CHG-20260811-09-channel-neutral-telegram-agents.md) | deployed | Implement one Bitrix/Telegram profile, closed access, durable Telegram delivery and typed automation destinations |
 | [CHG-20260812-10](changes/CHG-20260812-10-verified-agent-links.md) | verified | Repair signed export links broken by the dark legacy MCP hostname and add public round-trip smoke |
-| [CHG-20260812-11](changes/CHG-20260812-11-channel-native-artifacts.md) | implemented_local | Deliver generated files as Bitrix/Telegram attachments and remove legacy MCP-host export compatibility |
-| [CHG-20260812-12](changes/CHG-20260812-12-automation-acceptance-system-cron.md) | implemented_local | Complete durable automation acceptance and classify/migrate legacy system cron jobs |
-| [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md) | implemented_local | Retire redundant native Hermes Telegram and complete explicit channel identity acceptance |
+| [CHG-20260812-11](changes/CHG-20260812-11-channel-native-artifacts.md) | deployed | Deliver generated files as Bitrix/Telegram attachments and remove legacy MCP-host export compatibility |
+| [CHG-20260812-12](changes/CHG-20260812-12-automation-acceptance-system-cron.md) | verified | Complete durable automation acceptance and classify/migrate legacy system cron jobs |
+| [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md) | deployed | Retire redundant native Hermes Telegram and complete explicit channel identity acceptance |
 
 ## Status rule
 

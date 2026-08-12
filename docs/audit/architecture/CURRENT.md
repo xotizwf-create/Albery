@@ -83,8 +83,8 @@ flowchart LR
   Telegram profile is no longer an active connector, leaving nine active endpoints.
 - Ports `5002`, `5003`, and `5004` listen on `127.0.0.1` only. Nginx returns 404 for `/mcp*` and
   `/sse*` on both public hosts; the legacy MCP hostname also returns 404 for every default route,
-  including health/login/API, while forwarding only Bitrix, Zoom, Drive webhooks and the exact
-  HMAC+TTL-protected `/zoom-export/` compatibility prefix. No public route reaches the MCP role.
+  including health/login/API and `/zoom-export/`, while forwarding only authenticated Bitrix,
+  Zoom and Drive webhooks. No public route reaches the MCP role.
 - Owner Telegram uses `agent-main,web`. Deterministic Telegram/CRM operations use an in-process
   allowlist rather than a shared HTTP MCP credential. Missing main-agent wiring fails closed.
 - Dialogue summaries and diagnostic digests use the isolated zero-tool Codex quality contour;
@@ -104,9 +104,8 @@ flowchart TD
     Z --> O[(PostgreSQL transactional outbox)]
     O --> API[Telegram Bot API]
 
-    T[Trusted owner Telegram] --> G[hermes-gateway.service]
-    G --> M[agent-main plus web]
-    M --> GD[Native gateway delivery and Hermes cron]
+    G[hermes-gateway.service] --> GD[Reviewed Hermes system cron only]
+    GD --> GL[Albery shared two-slot wrapper]
 
     X[Employee profile bot] --> P[durable tg_multi worker]
     P --> A[same agents.slug plus web]
@@ -116,10 +115,10 @@ flowchart TD
     BP --> M
 ```
 
-- These remain three operational contours. The native owner gateway still has its own credential,
-  memory, allowlist and native cron. The client/IU workspace remains a separate zero-tool runtime.
-  Employee profile bots run inside `albery-tg.service`, but now use the same logical profile as
-  Bitrix rather than a Telegram-only profile.
+- These remain two Telegram transport contours plus a scheduler process. The rejected native
+  Hermes Telegram credential is retired; `hermes-gateway.service` remains active only for reviewed
+  cron/orchestration. The client/IU workspace remains a separate zero-tool runtime. Employee
+  profile bots run inside `albery-tg.service` and use the same logical profiles as Bitrix.
 - Production profile `main` owns both its Bitrix and Telegram identities and the exact same private
   `agent-main` capability boundary. Role, core rules, skills, knowledge and personal learning are
   common; channel context, conversation history, rendering and delivery remain intentionally
@@ -133,8 +132,9 @@ flowchart TD
   Agent automations carry a typed channel/profile/conversation destination and re-check access before
   later Telegram delivery.
 - `albery-tg.service` and its profile bot `getMe`, access, durable tables and workspace transport
-  pass production smoke. The separate native Hermes Telegram platform remains `retrying` because
-  Telegram rejects its pre-existing token; it is not the deployed employee-agent transport.
+  pass production smoke. The old Hermes token key is absent and retirement is explicit in the
+  Albery environment; the upstream gateway state file may retain a stale historical `retrying`
+  label, but the restarted service produces no Telegram error and no longer owns an employee bot.
 
 ### Deployed channel-neutral employee-agent runtime
 
@@ -256,31 +256,32 @@ flowchart LR
   `agent_automation_tool_effects`; a completed duplicate returns the stored result and an
   ambiguous prior effect fails closed. All model-facing mutating calls take a PostgreSQL advisory
   lock derived from the identifiable business object, with a deliberately coarse per-tool fallback.
-- `kind='system'` Hermes/crond mirror rows remain outside this worker and require their own runtime
-  migration/audit. The actual automation inventory and business-output acceptance also remain a
-  separate controlled audit step.
-- Migration `083`, exact private connector aliases and the worker are live. Production smoke and
-  empty-queue/restart safety passed, but no real automation or external write was triggered during
-  deployment; controlled reversible business acceptance remains before `verified`.
+- Deterministic `kind='system'` rows remain in their domain schedulers. The only heavy legacy job,
+  `zoom-to-tasks`, is checksum-pinned and enters the same PostgreSQL two-slot limit through a
+  reviewed allowlist wrapper; it refuses the process-local fallback. Its first natural post-cutover
+  run completed `ok` at 16:20 MSK.
+- Migration `083`, exact private connector aliases and the worker are live. A reversible local-file
+  production probe traversed the real `automation-agent-main` header connector and recorded exactly
+  one completed `export_document` effect before all probe rows/files were removed. Normal scheduled
+  runs 36 and 59 also completed and delivered on 2026-08-12 without replay.
 
 ## Current operational status
 
-- Employee-facing generated files use signed, time-limited URLs on `www.m4s.ru`. The final Bitrix
-  delivery path canonicalizes historical Albery export URLs to that host. Deploy smoke creates a
-  disposable artifact and verifies its bytes through public Nginx; the exact legacy-host export
-  prefix remains only so already-delivered valid links work until their own expiry. This behavior
-  is verified by [CHG-20260812-10](../changes/CHG-20260812-10-verified-agent-links.md).
+- Employee-facing generated files are materialized as native attachments by the owning Bitrix or
+  Telegram profile adapter. Exact bytes are retained under `0700/0600` permissions and referenced
+  by unguessable tokens in independent durable text/file parts; an invalid handoff fails closed.
+  `mcp.m4s.ru/zoom-export/` now returns 404. The canonical signed export remains only as an internal
+  model-to-adapter handoff and explicit non-chat compatibility surface. Structural live acceptance
+  is recorded by [CHG-20260812-11](../changes/CHG-20260812-11-channel-native-artifacts.md); a real
+  provider attachment requires an approved recipient before the change can be called verified.
 
 - Outbound model/provider traffic is policy-routed through AmneziaWG exit `95.85.243.43`.
   The watchdog verifies the effective route and reapplies missing policy rules; a fresh tunnel
   handshake alone is no longer treated as healthy.
 - Codex, private MCP and Zoom report generation are operational after
   [CHG-20260811-05](../changes/CHG-20260811-05-vpn-routing-automation-recovery.md).
-- Hermes Telegram is degraded: its platform state is `retrying` because Telegram rejects the
-  configured bot token. This credential predates the 2026-08-10 MCP migration. The standalone
-  Albery Telegram service and Bitrix delivery paths are separate and active.
-- Deploy smoke checks effective VPN health and the Telegram platform state, so this known
-  degradation prevents a false all-green acceptance until the bot token is replaced.
-- Agent automation 36 retains its failed 09:00 status pending an explicit resend decision.
-  Automation 59 has healthy read-only Google Sheet and WB-price dependencies, but its previous
-  full write run timed out and still needs a successful scheduled or owner-approved controlled run.
+- Native Hermes Telegram is explicitly retired; no credential was guessed, rotated or revoked.
+  Employee profile Telegram and IU transports remain active and independently checked.
+- Agent automations 36 and 59 completed their normal 2026-08-12 schedules and delivered successfully;
+  no historical employee output was replayed. Durable write effects and the system-cron shared limit
+  have controlled production evidence under [CHG-20260812-12](../changes/CHG-20260812-12-automation-acceptance-system-cron.md).

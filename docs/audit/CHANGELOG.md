@@ -4,6 +4,9 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-12
 
+- `deployed` — [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md): the rejected legacy Hermes Telegram credential was removed after protected backup; the gateway remains a healthy scheduler, the active Albery profile identity passes, and identity grants remain fail-closed pending an approved person.
+- `verified` — [CHG-20260812-12](changes/CHG-20260812-12-automation-acceptance-system-cron.md): the heavy Zoom cron entered the shared PostgreSQL slot through its pinned wrapper and completed naturally; a disposable private-MCP effect was recorded exactly once, and automations 36/59 completed without replay.
+- `deployed` — [CHG-20260812-11](changes/CHG-20260812-11-channel-native-artifacts.md): migration `085`, native exact-byte Bitrix/Telegram file adapters and restricted durable storage are live; the legacy export route returns 404 and production/CI smoke passed, while a real-recipient attachment remains an explicit acceptance gate.
 - `implemented_local` — [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md): explicitly retire the rejected redundant Hermes Telegram transport while retaining its scheduler process; profile mappings remain fail-closed and no real message was sent.
 - `implemented_local` — [CHG-20260812-12](changes/CHG-20260812-12-automation-acceptance-system-cron.md): the sole heavy legacy Zoom cron now has a reviewed checksum-pinned wrapper for Albery's shared PostgreSQL run slots; today's automations 36 and 59 succeeded naturally without replay.
 - `implemented_local` — [CHG-20260812-11](changes/CHG-20260812-11-channel-native-artifacts.md): generated files become exact-byte native Bitrix/Telegram deliveries with durable independent parts and bounded restricted storage; the unused MCP-host compatibility route is removed.

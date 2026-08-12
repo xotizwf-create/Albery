@@ -1,6 +1,6 @@
 # CHG-20260812-11: Channel-native generated file delivery
 
-- Status: implemented_local
+- Status: deployed
 - Date opened: 2026-08-12
 - Related decisions: [ADR-0006](../decisions/ADR-0006-channel-native-artifact-delivery.md), [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md)
 - Bitrix engineering task: pending
@@ -74,5 +74,20 @@ be restored only from the backed-up exact Nginx block if a forgotten valid link 
 
 ## Known gaps and follow-up
 
-CI, production migration/Nginx rollout and provider-native live acceptance remain pending. No
-employee file or message was sent during local verification.
+Production evidence on 2026-08-12:
+
+- Commit `15f4ffb` was deployed fast-forward after a protected code/config/database backup,
+  migration `085`, empty-inflight restart gate and successful full deploy smoke.
+- `mcp.m4s.ru/zoom-export/*` returns 404. The disposable internal handoff resolved to the exact
+  original bytes, exposed no URL to the channel answer and left no temporary artifact.
+- Production permissions are `0700` for the attachment directory and `0600` for payloads; the
+  durable outbox is empty after acceptance. Nginx and all six relevant services are active and
+  post-deploy error journals are empty.
+- Bitrix accepted `imbot.v2.File.upload` as a known method in a safe negative-dialogue probe; the
+  active Telegram profile passed provider identity verification. No employee message or file was
+  sent.
+- CI runs `31599857089` and `31599857094` passed, including PostgreSQL 14/16 migration matrices and
+  the security workflow.
+
+The first real provider-native file delivery remains an explicit acceptance gate: it needs a named
+recipient and exact preview. This change therefore remains `deployed`, not `verified`.

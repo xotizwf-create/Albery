@@ -1,6 +1,6 @@
 # CHG-20260812-12: Complete automation acceptance and system-cron safety
 
-- Status: implemented_local
+- Status: verified
 - Date opened: 2026-08-12
 - Related decisions: [ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md)
 - Bitrix engineering task: pending
@@ -71,5 +71,18 @@ and retain durable run/effect history for forensics.
 
 ## Known gaps and follow-up
 
-CI and production cron rebinding remain pending. A reversible private-MCP effect-ledger probe is
-still required after deployment; no live business object or employee delivery may be used for it.
+Production evidence on 2026-08-12:
+
+- The Hermes `zoom-to-tasks` cron was rebound to the versioned shim and checksum-pinned Albery
+  wrapper. Its first natural post-cutover run at 16:20 MSK completed `ok` with no reported error.
+- A disposable production run acquired the shared PostgreSQL slot, called the real
+  `automation-agent-main` private MCP boundary and completed one local-only `export_document`
+  effect. The effect ledger recorded it exactly once; the run, file and probe rows were removed.
+- Normal automations 36 and 59 completed and delivered on their 2026-08-12 schedules without replay
+  or mutation of the historical failed runs.
+- CI runs `31599857089` and `31599857094`, full deploy smoke, service health and post-acceptance
+  journals all passed. No live business object was created or modified and no employee output was
+  sent by the acceptance probe.
+
+The durable automation and heavy-system-job safety contract is verified in production. Future new
+heavy cron jobs must enter the same reviewed allowlist and shared slot before deployment.
