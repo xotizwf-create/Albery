@@ -79,6 +79,15 @@ def private_config(original: str, agents: list[dict[str, str]], base: str) -> st
     updated = original
     for name in SHARED_CONNECTORS:
         updated = remove_connector_block(updated, name)
+    allowed_managed = {
+        name
+        for agent in agents
+        for name in (f"agent-{agent['slug']}", f"automation-agent-{agent['slug']}")
+    }
+    existing = (yaml.safe_load(updated) or {}).get("mcp_servers") or {}
+    for name in set(existing) - allowed_managed:
+        if name.startswith(("agent-", "automation-agent-")):
+            updated = remove_connector_block(updated, name)
     for agent in agents:
         updated = replace_connector_block(
             updated,
@@ -94,6 +103,11 @@ def private_config(original: str, agents: list[dict[str, str]], base: str) -> st
     servers = parsed.get("mcp_servers") or {}
     if SHARED_CONNECTORS & set(servers):
         raise RuntimeError("shared connectors remain after migration")
+    managed = {
+        name for name in servers if name.startswith(("agent-", "automation-agent-"))
+    }
+    if managed != allowed_managed:
+        raise RuntimeError("managed connector set does not exactly match active agents")
     for agent in agents:
         item = servers.get(f"agent-{agent['slug']}")
         if not isinstance(item, dict):

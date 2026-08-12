@@ -162,6 +162,12 @@ def test_agent_sees_the_human_title_of_its_own_document(app_module, tmp_path, mo
     monkeypatch.setattr(_att, "store_attachment",
                         lambda **kw: captured.update(kw), raising=False)
 
-    b24bot._b24_capture_generated_doc("16", "agent-sklad", 16, f"Готово: /zoom-export/1/2/{stored_name}")
+    import time
+    from shared.channel_artifacts import export_token
+    expires = int(time.time()) + 1800
+    token = export_token(stored_name, expires)
+    b24bot._b24_capture_generated_doc(
+        "16", "agent-sklad", 16, f"Готово: /zoom-export/{expires}/{token}/{stored_name}",
+    )
 
     assert captured["file_name"] == "Договор оказания услуг.docx"

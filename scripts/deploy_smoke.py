@@ -199,8 +199,38 @@ try:
                 print(f"agent-{slug}: private header auth OK, tools={len(actual)}")
         except Exception as exc:  # noqa: BLE001
             failures.append(f"agent-{slug}: tools/list не прошёл ({type(exc).__name__})")
+    expected_managed = {
+        name
+        for row in active_agents
+        for name in (f"agent-{row['slug']}", f"automation-agent-{row['slug']}")
+    }
+    actual_managed = {
+        name for name in mcp_servers if name.startswith(("agent-", "automation-agent-"))
+    }
+    if actual_managed != expected_managed:
+        failures.append(
+            "Hermes managed connector set differs from active agents: "
+            f"extra={sorted(actual_managed - expected_managed)}, "
+            f"missing={sorted(expected_managed - actual_managed)}"
+        )
 except Exception as exc:  # noqa: BLE001
     failures.append(f"active agent connector check: {type(exc).__name__}")
+
+scope_patch = Path("/usr/local/lib/hermes-agent/tools/mcp_tool.py")
+gateway_patch = Path("/usr/local/lib/hermes-agent/gateway/run.py")
+try:
+    if "# PATCH albery-mcp-server-allowlist" not in scope_patch.read_text(encoding="utf-8"):
+        failures.append("Hermes MCP allowlist patch is absent")
+    if "# PATCH albery-scheduler-only-gateway" not in gateway_patch.read_text(encoding="utf-8"):
+        failures.append("Hermes scheduler-only gateway patch is absent")
+    unit = subprocess.run(
+        ["systemctl", "show", "hermes-gateway", "-p", "Environment"],
+        capture_output=True, text=True, timeout=15,
+    ).stdout
+    if "HERMES_GATEWAY_SCHEDULER_ONLY=1" not in unit:
+        failures.append("hermes-gateway is not marked scheduler-only")
+except Exception as exc:  # noqa: BLE001
+    failures.append(f"Hermes MCP scope deployment check: {type(exc).__name__}")
 
 
 def expect_status(url: str, status: int, *, method: str = "GET", headers: dict | None = None) -> None:

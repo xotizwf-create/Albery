@@ -1128,8 +1128,42 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
     format, we retry with an INLINE italic footnote so the answer is always delivered."""
     if not (client_endpoint and access_token and bot_id and dialog_id):
         return None
-    if _b24_native_artifacts_enabled() and "/zoom-export/" in (text or ""):
+    stored_tokens = _B24_STORED_DELIVER_RE.findall(text or "")
+    text = _B24_STORED_DELIVER_RE.sub("", text or "").strip()
+    if _b24_native_artifacts_enabled() and (stored_tokens or "/zoom-export/" in text):
         clean_text, artifacts, invalid_count = extract_export_artifacts(text)
+        if stored_tokens:
+            import attachments as _stored_attachments
+            try:
+                from agent_center import agent_for_bot_id
+                selected_slug = (agent_for_bot_id(bot_id) or {}).get("slug")
+            except Exception:  # noqa: BLE001
+                selected_slug = None
+            for token in dict.fromkeys(stored_tokens):
+                row = _stored_attachments.get_attachment(token)
+                scoped = bool(
+                    row
+                    and str(row.get("dialog_id") or "") == str(dialog_id or "")
+                    and str(row.get("kind") or "") == "agent_doc"
+                    and row.get("agent_slug") == selected_slug
+                )
+                payload = _stored_attachments.attachment_bytes(token) if scoped else None
+                if not payload:
+                    invalid_count += 1
+                    continue
+                data, name = payload
+                artifacts.append({
+                    "filename": name,
+                    "display_name": name,
+                    "data": data,
+                    "byte_size": len(data),
+                    "mime": __import__("mimetypes").guess_type(name)[0] or "application/octet-stream",
+                })
+            if artifacts and "📎 Файл прикреплён к сообщению." not in clean_text:
+                clean_text = (clean_text + "\n\n📎 Файл прикреплён к сообщению.").strip()
+            if invalid_count and "Не удалось безопасно приложить" not in clean_text:
+                clean_text = (clean_text + "\n\nНе удалось безопасно приложить сохранённый файл. "
+                              "Попросите создать документ ещё раз.").strip()
         if artifacts:
             file_message_id, artifact_error = _b24_app_file_reply(
                 client_endpoint, access_token, bot_id, dialog_id, clean_text, artifacts
@@ -2177,6 +2211,7 @@ _B24_IMG_EXTS = ("png", "jpg", "jpeg", "gif", "webp", "bmp", "heic")
 _B24_STT_EXTS = ("mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "webm", "flac",
                  "mp4", "mpga", "mpeg", "amr")
 _B24_DELIVER_RE = re.compile(r"\[\[DELIVER_(PDF|XLSX|EXCEL|DOCX|WORD):\s*([^\]]*)\]\]", re.I)
+_B24_STORED_DELIVER_RE = re.compile(r"\[\[DELIVER_STORED:\s*(att_[A-Za-z0-9_-]{8,})\s*\]\]", re.I)
 _B24_DELIVER_FMT = {"pdf": "pdf", "xlsx": "xlsx", "excel": "xlsx", "docx": "docx", "word": "docx"}
 
 
@@ -2979,20 +3014,24 @@ _ZOOM_LINK_RE = re.compile(r"/zoom-export/[^/\s]+/[^/\s]+/([^/\s\]\)]+\.(?:docx|
 
 
 def _b24_capture_generated_doc(dialog_id: str, agent_slug: str | None, from_user_id: Any,
-                               answer: str) -> None:
+                               answer: str, *, allow_expired: bool = False) -> None:
     """After a turn, store the FULL text of any document the agent just generated (its export link
     is in the answer), so the next turn can edit THAT document instead of rebuilding it from a
     clipped chat and losing filled-in fields (contract number, dates, requisites). Best-effort."""
     try:
         import urllib.parse
+        from shared.channel_artifacts import EXPORT_HANDOFF_RE, export_token
         seen = set()
-        for m in _ZOOM_LINK_RE.finditer(answer or ""):
-            fname = urllib.parse.unquote(m.group(1))
+        for m in EXPORT_HANDOFF_RE.finditer(answer or ""):
+            expires_at = int(m.group(1))
+            supplied_token = m.group(2)
+            fname = os.path.basename(urllib.parse.unquote(m.group(3)))
             if fname in seen:
                 continue
             seen.add(fname)
             path = ZOOM_EXPORT_DIR / fname
-            if not path.is_file():
+            signature_ok = hmac.compare_digest(supplied_token, export_token(fname, expires_at))
+            if not path.is_file() or not signature_ok or (not allow_expired and time.time() > expires_at):
                 continue
             data = path.read_bytes()
             ext = fname.rsplit(".", 1)[-1].lower()
@@ -3014,6 +3053,29 @@ def _b24_capture_generated_doc(dialog_id: str, agent_slug: str | None, from_user
         logging.warning("b24 testbot: generated-doc capture failed dlg=%s", dialog_id, exc_info=True)
 
 
+def _b24_capture_trusted_reply_doc(dialog_id: str, agent_slug: str | None, from_user_id: Any,
+                                   reply_text: str) -> None:
+    """Recover an expired export only when it is an exact prior answer in this agent/dialog."""
+    if "/zoom-export/" not in (reply_text or ""):
+        return
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM bitrix_bot_interactions "
+                    "WHERE dialog_id=%s AND agent_slug IS NOT DISTINCT FROM %s::text AND answer=%s "
+                    "LIMIT 1",
+                    (str(dialog_id or ""), agent_slug, reply_text),
+                )
+                trusted = bool(cur.fetchone())
+        if trusted:
+            _b24_capture_generated_doc(
+                dialog_id, agent_slug, from_user_id, reply_text, allow_expired=True,
+            )
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 testbot: trusted reply-doc recovery failed dlg=%s", dialog_id, exc_info=True)
+
+
 def _b24_recent_generated_doc(dialog_id: str, agent_slug: str | None, hours: int | None = None):
     """The freshest document THIS agent generated in this dialog (full text), for re-injection."""
     if hours is None:
@@ -3022,7 +3084,7 @@ def _b24_recent_generated_doc(dialog_id: str, agent_slug: str | None, hours: int
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT file_name, extracted_text, char_len, "
+                    "SELECT token, file_name, extracted_text, char_len, "
                     "       to_char(created_at at time zone 'Europe/Moscow', 'DD.MM HH24:MI') AS at_msk "
                     "FROM bitrix_bot_attachments "
                     "WHERE dialog_id = %s AND agent_slug IS NOT DISTINCT FROM %s::text "
@@ -3136,7 +3198,11 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_bl
             "прислать файл и НЕ применяй edit_attachment_document — исходник это текст ниже, его "
             "достаточно. НЕ теряй уже заполненные поля (номер договора, дату, сроки, реквизиты "
             "сторон, суммы, перечень услуг, все пункты) — переноси их дословно, кроме тех, что "
-            "правишь. Полный текст документа:\n" + str(recent_doc.get("extracted_text") or "")[:40000] + "]")
+            "правишь. Если пользователь просит только ПОВТОРНО ПРИСЛАТЬ этот файл БЕЗ ИЗМЕНЕНИЙ, "
+            "не пересобирай его и не копируй старую ссылку: в самом конце ответа добавь маркер "
+            "[[DELIVER_STORED: " + str(recent_doc.get("token") or "") + "]] — система отправит точные "
+            "сохранённые байты нативным вложением. Полный текст документа:\n"
+            + str(recent_doc.get("extracted_text") or "")[:40000] + "]")
     if not text and (image_texts or doc_blocks):
         blocks.append("(Текста в сообщении не было — отвечай по содержимому вложения.)")
     return _b24_clean_text("\n\n".join(blocks) if blocks else text)
@@ -3187,13 +3253,15 @@ _LIVE_TURNS: dict[str, list[dict]] = {}
 
 
 def _b24_hermes_popen_kwargs(cmd: list) -> dict[str, Any]:
+    from shared.hermes_mcp_scope import scoped_env_for_command
+
     kwargs: dict[str, Any] = {
         "args": cmd,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
         "cwd": "/root",
-        "env": {**os.environ, "HOME": "/root"},
+        "env": scoped_env_for_command(cmd, {**os.environ, "HOME": "/root"}),
     }
     if os.name == "posix":
         # Hermes can spawn children. Give the turn its own process group so reset/timeout
@@ -3522,6 +3590,10 @@ def hermes_brain_answer(user_text: str, dialog_id: str, tier: str = "", from_use
         "НАСТОЯЩУЮ таблицу в PDF/Excel/Word. Реальные данные бери из инструментов (задачи — search_tasks и "
         "т.п.), НЕ выдумывай содержимое. Система сама соберёт файл и пришлёт ссылку; маркер "
         "пользователь не увидит. Без явной просьбы о файле маркер НЕ добавляй. "
+        "НИКОГДА не копируй и не возвращай URL с /zoom-export/ из истории, цитаты или старого "
+        "сообщения: такая ссылка могла истечь. Для своего последнего файла без изменений используй "
+        "только показанный системой [[DELIVER_STORED: att_…]]; для изменённого документа создай новый "
+        "export_document; если ни исходника, ни сохранённого маркера нет — честно попроси файл заново. "
         "Если пользователь просит ПРАВКУ в присланном им файле — это НЕ файл-ответ: используй "
         "edit_attachment_document (сохранит оригинал), а не маркеры и не export_document."
     )
@@ -5159,6 +5231,9 @@ def _bitrix_imbot_app_event():
             recent_atts, recent_doc = [], None
             if not (parts["attachments"] or parts["doc_blocks"]
                     or parts["image_texts"] or parts["voice_texts"]):
+                _b24_capture_trusted_reply_doc(
+                    dialog_id, (agent or {}).get("slug"), from_user_id, parts["reply_text"],
+                )
                 recent_atts = _b24_recent_dialog_attachments(dialog_id, (agent or {}).get("slug"))
                 recent_doc = _b24_recent_generated_doc(dialog_id, (agent or {}).get("slug"))
             _b24_app_process(

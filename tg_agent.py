@@ -733,6 +733,7 @@ def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
     # Fresh session per run (hermes >=0.17 resumes --continue sessions; memory is prompt-injected)
     run_session = f"{session_prefix}-r{uuid.uuid4().hex[:8]}"
     cmd = ["hermes", "-z", prompt, "--continue", run_session, "-t", toolsets, "--yolo"]
+    from shared.hermes_mcp_scope import scoped_env
     # Hermes v0.17 top-level oneshot (``-z``) does not accept ``--max-turns``.
     # Customer connectors have zero tools at P0, so a tool loop is structurally
     # impossible without passing an unsupported flag that would kill every turn.
@@ -746,7 +747,10 @@ def hermes_answer(prompt: str, session_prefix: str, toolsets: str | None = None,
         if queued > 5:
             log.info("ход ждал очереди %.0f c (слот %s из %s, пул общий с appserver)",
                      queued, slot.index, _hermes_slots.limit)
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s,
+            env=scoped_env(toolsets),
+        )
     answer = (proc.stdout or "").strip()
     if proc.returncode != 0 or not answer or _HERMES_ERROR_RE.match(answer):
         raise RuntimeError(f"hermes turn failed rc={proc.returncode}: "

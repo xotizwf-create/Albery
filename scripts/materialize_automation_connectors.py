@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     original = config_path.read_text(encoding="utf-8")
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT slug, mcp_token FROM agents ORDER BY slug")
+            cur.execute("SELECT slug, mcp_token FROM agents WHERE is_active ORDER BY slug")
             agents = [
                 {"slug": str(row["slug"]), "token": str(row["mcp_token"] or "")}
                 for row in cur.fetchall()

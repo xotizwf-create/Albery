@@ -269,7 +269,17 @@ for line in sh(["free", "-m"]).splitlines():
 # --- MCP-серверы gateway, которые не подключаются ---------------------------------------
 gw_journal = sh(["journalctl", "-u", "hermes-gateway", "--since", "-15min", "--no-pager"])
 mcp_down: set[str] = set()
-for line in gw_journal.splitlines():
+gw_lines = gw_journal.splitlines()
+scheduler_marker = "Albery scheduler-only gateway: MCP discovery skipped"
+marker_indexes = [index for index, line in enumerate(gw_lines) if scheduler_marker in line]
+if marker_indexes:
+    # After Telegram retirement this process is a no-agent scheduler. Any later connector attempt
+    # means the scheduler-only guard failed; old pre-restart warnings must not generate alerts.
+    post_marker = gw_lines[marker_indexes[-1] + 1:]
+    if any("MCP server '" in line for line in post_marker):
+        problems.append("Hermes scheduler-only gateway unexpectedly opened MCP connectors")
+    gw_lines = []
+for line in gw_lines:
     if "still down after" in line or "failed initial connection after" in line:
         marker = "MCP server '"
         idx = line.find(marker)

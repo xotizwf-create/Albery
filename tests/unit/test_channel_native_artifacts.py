@@ -88,11 +88,64 @@ def test_generated_document_capture_retains_exact_original_bytes(app_module, tmp
     captured = []
     monkeypatch.setattr(b24bot, "_b24_extract_document", lambda *_args: "полный текст")
     monkeypatch.setattr(attachments, "store_attachment", lambda **kwargs: captured.append(kwargs) or "att_x")
+    expires = int(time.time()) + 1800
+    token = __import__("shared.channel_artifacts", fromlist=["export_token"]).export_token(name, expires)
 
-    b24bot._b24_capture_generated_doc("94", "agent-sklad", 94, f"/zoom-export/1/2/{name}")
+    b24bot._b24_capture_generated_doc(
+        "94", "agent-sklad", 94, f"/zoom-export/{expires}/{token}/{name}",
+    )
 
     assert captured[0]["data"] == b"ORIGINAL-DOCX"
     assert captured[0]["file_name"] == "Оригинал.docx"
+
+
+def test_bitrix_can_redeliver_scoped_stored_document(app_module, monkeypatch):
+    import agent_center
+    import attachments
+    import b24bot
+
+    calls = []
+    monkeypatch.setenv("CHANNEL_NATIVE_ARTIFACTS", "1")
+    monkeypatch.setattr(agent_center, "agent_for_bot_id", lambda _bot: {"slug": "agent-sklad"})
+    monkeypatch.setattr(attachments, "get_attachment", lambda _token: {
+        "dialog_id": "94", "agent_slug": "agent-sklad", "kind": "agent_doc",
+    })
+    monkeypatch.setattr(attachments, "attachment_bytes", lambda _token: (b"EXACT", "Договор.docx"))
+    monkeypatch.setattr(b24bot, "_b24_app_call", lambda ep, tok, method, payload=None, **kw:
+                        calls.append((method, payload)) or {"result": {"messageId": 77}})
+    monkeypatch.setattr(b24bot, "_b24_disclaimer", lambda: "")
+    monkeypatch.setattr(b24bot, "log_bot_message", lambda **_kw: None)
+
+    message_id = b24bot._b24_app_reply(
+        "https://portal/rest", "oauth", 70, "94", "Вот файл\n[[DELIVER_STORED: att_abcdefghij]]",
+    )
+
+    assert message_id == 77
+    assert calls[0][0] == "imbot.v2.File.upload"
+    assert base64.b64decode(calls[0][1]["fields"]["content"]) == b"EXACT"
+
+
+def test_stored_document_marker_is_scoped_to_the_same_dialog(app_module, monkeypatch):
+    import agent_center
+    import attachments
+    import b24bot
+
+    sent = []
+    monkeypatch.setenv("CHANNEL_NATIVE_ARTIFACTS", "1")
+    monkeypatch.setattr(agent_center, "agent_for_bot_id", lambda _bot: {"slug": "agent-sklad"})
+    monkeypatch.setattr(attachments, "get_attachment", lambda _token: {
+        "dialog_id": "another", "agent_slug": "agent-sklad", "kind": "agent_doc",
+    })
+    monkeypatch.setattr(b24bot, "_b24_app_call", lambda ep, tok, method, payload=None, **kw:
+                        sent.append((method, payload)) or {"result": 88})
+    monkeypatch.setattr(b24bot, "_b24_disclaimer", lambda: "")
+
+    b24bot._b24_app_reply(
+        "https://portal/rest", "oauth", 70, "94", "[[DELIVER_STORED: att_abcdefghij]]",
+    )
+
+    assert all(method != "imbot.v2.File.upload" for method, _payload in sent)
+    assert "Не удалось безопасно" in sent[-1][1]["MESSAGE"]
 
 
 def test_telegram_api_uses_multipart_for_native_document(monkeypatch):

@@ -831,10 +831,12 @@ def _brain_failure(run: dict[str, Any], error: str) -> None:
 
 
 def _hermes_once(cmd: list, timeout_s: int, tag: str) -> tuple[Any, str | None]:
+    from shared.hermes_mcp_scope import scoped_env_for_command
+
     try:
         return subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout_s,
-            cwd="/root", env={**os.environ, "HOME": "/root"},
+            cwd="/root", env=scoped_env_for_command(cmd, {**os.environ, "HOME": "/root"}),
         ), None
     except subprocess.TimeoutExpired:
         logging.warning("agent automation %s: hermes timed out after %ss", tag, timeout_s)
