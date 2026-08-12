@@ -4,7 +4,7 @@ Last reviewed: 2026-08-12.
 
 ## Verified production state
 
-Production server 186 runs runtime implementation commit `5d23c79`.
+Production server 186 runs runtime implementation commit `a38e2d1`.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
@@ -81,6 +81,10 @@ flowchart LR
 - Hermes stores loopback URLs and Bearer headers in a mode-`0600` configuration. The original ten
   agent credentials were rotated during the private-MCP migration; the later merged legacy
   Telegram profile is no longer an active connector, leaving nine active endpoints.
+- Hermes config contains exactly 18 managed aliases: one live and one automation alias for each of
+  the nine active profiles. Each Albery one-shot exports an exact process allowlist and therefore
+  opens only its requested alias; built-in-only turns open none. The scheduler-only
+  `hermes-gateway` skips MCP discovery completely. Inactive managed aliases are pruned.
 - Ports `5002`, `5003`, and `5004` listen on `127.0.0.1` only. Nginx returns 404 for `/mcp*` and
   `/sse*` on both public hosts; the legacy MCP hostname also returns 404 for every default route,
   including health/login/API and `/zoom-export/`, while forwarding only authenticated Bitrix,
@@ -274,6 +278,13 @@ flowchart LR
   model-to-adapter handoff and explicit non-chat compatibility surface. Structural live acceptance
   is recorded by [CHG-20260812-11](../changes/CHG-20260812-11-channel-native-artifacts.md); a real
   provider attachment requires an approved recipient before the change can be called verified.
+- A request quoting an old generated-file answer never reuses its expired `/zoom-export/` URL. Exact
+  stored bytes are redelivered only when the attachment remains physically available and matches
+  the same dialog/profile. For legacy text-only records, an exact prior answer may recover only the
+  nearest same-profile `agent_doc` within 120 seconds and rebuild it through `export_document`.
+  This incident's historical record matched at 5.26 seconds; no employee message was sent during
+  verification. MCP discovery fan-out and stale-file recovery are deployed under
+  [CHG-20260812-14](../changes/CHG-20260812-14-mcp-discovery-and-stale-file-recovery.md).
 
 - Outbound model/provider traffic is policy-routed through AmneziaWG exit `95.85.243.43`.
   The watchdog verifies the effective route and reapplies missing policy rules; a fresh tunnel

@@ -38,7 +38,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260812-11](changes/CHG-20260812-11-channel-native-artifacts.md) | deployed | Deliver generated files as Bitrix/Telegram attachments and remove legacy MCP-host export compatibility |
 | [CHG-20260812-12](changes/CHG-20260812-12-automation-acceptance-system-cron.md) | verified | Complete durable automation acceptance and classify/migrate legacy system cron jobs |
 | [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md) | deployed | Retire redundant native Hermes Telegram and complete explicit channel identity acceptance |
-| [CHG-20260812-14](changes/CHG-20260812-14-mcp-discovery-and-stale-file-recovery.md) | implemented_local | Scope one-shot/gateway MCP discovery and rebuild old generated-file requests instead of echoing expired URLs |
+| [CHG-20260812-14](changes/CHG-20260812-14-mcp-discovery-and-stale-file-recovery.md) | deployed | Scope one-shot/gateway MCP discovery and rebuild old generated-file requests instead of echoing expired URLs |
 
 ## Status rule
 

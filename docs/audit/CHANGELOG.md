@@ -4,7 +4,7 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-12
 
-- `implemented_local` — [CHG-20260812-14](changes/CHG-20260812-14-mcp-discovery-and-stale-file-recovery.md): repair the live stale-file resend failure and the MCP discovery fan-out that makes self-check report connector failures despite a healthy MCP role.
+- `deployed` — [CHG-20260812-14](changes/CHG-20260812-14-mcp-discovery-and-stale-file-recovery.md): repair the live stale-file resend failure and the MCP discovery fan-out that makes self-check report connector failures despite a healthy MCP role.
 - `deployed` — [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md): the rejected legacy Hermes Telegram credential was removed after protected backup; the gateway remains a healthy scheduler, the active Albery profile identity passes, and identity grants remain fail-closed pending an approved person.
 - `verified` — [CHG-20260812-12](changes/CHG-20260812-12-automation-acceptance-system-cron.md): the heavy Zoom cron entered the shared PostgreSQL slot through its pinned wrapper and completed naturally; a disposable private-MCP effect was recorded exactly once, and automations 36/59 completed without replay.
 - `deployed` — [CHG-20260812-11](changes/CHG-20260812-11-channel-native-artifacts.md): migration `085`, native exact-byte Bitrix/Telegram file adapters and restricted durable storage are live; the legacy export route returns 404 and production/CI smoke passed, while a real-recipient attachment remains an explicit acceptance gate.

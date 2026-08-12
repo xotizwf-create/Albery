@@ -1,6 +1,6 @@
 # CHG-20260812-14: Scope MCP discovery and recover stale generated-file requests
 
-- Status: implemented_local
+- Status: deployed
 - Date opened: 2026-08-12
 - Related decisions: [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md), [ADR-0006](../decisions/ADR-0006-channel-native-artifact-delivery.md)
 - Bitrix engineering task: pending
@@ -76,3 +76,38 @@ re-created instead of echoing an expired bearer URL.
   interaction. The incident match is 5.26 seconds and contains 16,061 extracted characters. Final
   local regression: `1936 passed, 44 skipped`.
 - No external message, task or business object was created while reproducing the incident.
+
+## Production evidence
+
+- Runtime commits: `05c4607`, `bf933b4`, `24e75a5`, final `a38e2d1`; production and
+  `origin/main` are identical and the tracked production worktree is clean.
+- Protected backups were created before every production stage under
+  `/var/backups/albery/pre-chg14-*`; they contain the previous commit, code archive, Hermes config,
+  installed Hermes patch targets and gateway unit/drop-ins.
+- All seven critical services are active; ports `5002`, `5003`, `5004` return HTTP 200. Final
+  available memory was 1,011 MB, with zero live Bitrix turns and zero running automations.
+- Production deploy smoke passed. Self-check dry-run reports zero problems. Hermes config contains
+  exactly 18 managed aliases for nine active profiles and neither inactive `albery-ai` alias.
+- A real no-action Hermes one-shot requested `agent-main`; the answer completed and MCP journal
+  showed only route `main`. The scheduler-only gateway emitted its marker and made no subsequent
+  MCP connector attempt.
+- The incident's exact prior answer resolves to the same-profile `agent_doc` created 5.26 seconds
+  later, containing 16,061 extracted characters. Its old bytes are absent, so production selects
+  the explicit rebuild path, forbids `DELIVER_STORED`, and never exposes the expired URL.
+
+## Known gap / acceptance boundary
+
+- The exact binary formatting of this pre-durable legacy document cannot be recovered because its
+  temporary bytes no longer exist. Albery can rebuild the content from the retained full text; new
+  documents retain exact durable bytes.
+- No message was sent to the employee during verification. A user-visible resend remains an
+  external action requiring an approved recipient/message preview under the production rules.
+- No Bitrix engineering task was created or closed because that external mutation was not
+  separately approved in this incident turn.
+
+## Rollback material
+
+- Restore the latest applicable `pre-chg14-*` code/config/vendor files, remove the
+  `30-albery-scheduler-only.conf` drop-in if rolling back the gateway boundary, run
+  `systemctl daemon-reload`, and restart only at the empty inflight/automation gate.
+- Do not restore public MCP routes or legacy `/zoom-export/` delivery.
