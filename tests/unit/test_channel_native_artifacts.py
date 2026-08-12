@@ -148,6 +148,24 @@ def test_stored_document_marker_is_scoped_to_the_same_dialog(app_module, monkeyp
     assert "Не удалось безопасно" in sent[-1][1]["MESSAGE"]
 
 
+def test_old_document_without_bytes_is_rebuilt_from_full_text(app_module):
+    import b24bot
+
+    prompt = b24bot._b24_compose_user_text(
+        "Пришли этот файл ещё раз", [], "", [], [],
+        recent_doc={
+            "token": "att_abcdefghij",
+            "file_name": "Договор.docx",
+            "extracted_text": "ПОЛНЫЙ ТЕКСТ ДОГОВОРА",
+            "stored_bytes_available": False,
+        },
+    )
+
+    assert "обязательно создай новый документ через export_document" in prompt
+    assert "не используй DELIVER_STORED" in prompt
+    assert "ПОЛНЫЙ ТЕКСТ ДОГОВОРА" in prompt
+
+
 def test_telegram_api_uses_multipart_for_native_document(monkeypatch):
     import tg_multi as multi
     seen = {}

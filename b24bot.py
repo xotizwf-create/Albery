@@ -3084,15 +3084,18 @@ def _b24_recent_generated_doc(dialog_id: str, agent_slug: str | None, hours: int
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT token, file_name, extracted_text, char_len, "
+                    "SELECT token, file_name, extracted_text, char_len, file_path, "
                     "       to_char(created_at at time zone 'Europe/Moscow', 'DD.MM HH24:MI') AS at_msk "
                     "FROM bitrix_bot_attachments "
                     "WHERE dialog_id = %s AND agent_slug IS NOT DISTINCT FROM %s::text "
                     "  AND kind = 'agent_doc' AND created_at >= now() - make_interval(hours => %s) "
                     "ORDER BY created_at DESC LIMIT 1",
                     (str(dialog_id or ""), agent_slug, hours))
-                row = cur.fetchone()
-                return dict(row) if row else None
+                row = dict(cur.fetchone() or {})
+        if row:
+            row["stored_bytes_available"] = Path(str(row.get("file_path") or "")).is_file()
+            return row
+        return None
     except Exception:  # noqa: BLE001
         logging.warning("b24 testbot: generated-doc recall failed dlg=%s", dialog_id, exc_info=True)
         return None
@@ -3198,11 +3201,18 @@ def _b24_compose_user_text(text: str, image_texts: list, reply_text: str, doc_bl
             "прислать файл и НЕ применяй edit_attachment_document — исходник это текст ниже, его "
             "достаточно. НЕ теряй уже заполненные поля (номер договора, дату, сроки, реквизиты "
             "сторон, суммы, перечень услуг, все пункты) — переноси их дословно, кроме тех, что "
-            "правишь. Если пользователь просит только ПОВТОРНО ПРИСЛАТЬ этот файл БЕЗ ИЗМЕНЕНИЙ, "
-            "не пересобирай его и не копируй старую ссылку: в самом конце ответа добавь маркер "
-            "[[DELIVER_STORED: " + str(recent_doc.get("token") or "") + "]] — система отправит точные "
-            "сохранённые байты нативным вложением. Полный текст документа:\n"
-            + str(recent_doc.get("extracted_text") or "")[:40000] + "]")
+            "правишь. "
+            + (
+                "Если пользователь просит только ПОВТОРНО ПРИСЛАТЬ этот файл БЕЗ ИЗМЕНЕНИЙ, "
+                "не пересобирай его и не копируй старую ссылку: в самом конце ответа добавь маркер "
+                "[[DELIVER_STORED: " + str(recent_doc.get("token") or "") + "]] — система отправит "
+                "точные сохранённые байты нативным вложением. "
+                if recent_doc.get("stored_bytes_available") else
+                "Сохранённые байты этого старого файла уже недоступны, но полный текст есть: даже "
+                "при просьбе просто прислать файл заново обязательно создай новый документ через "
+                "export_document из полного текста ниже; не используй DELIVER_STORED и старую ссылку. "
+            )
+            + "Полный текст документа:\n" + str(recent_doc.get("extracted_text") or "")[:40000] + "]")
     if not text and (image_texts or doc_blocks):
         blocks.append("(Текста в сообщении не было — отвечай по содержимому вложения.)")
     return _b24_clean_text("\n\n".join(blocks) if blocks else text)

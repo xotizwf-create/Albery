@@ -68,4 +68,8 @@ re-created instead of echoing an expired bearer URL.
   scheduler-only marker was therefore changed to a flushed stdout marker, so self-check can
   immediately separate pre-restart connector warnings from current state. The full suite remained
   `1934 passed, 44 skipped` after that hardening.
+- The incident document predates durable native bytes: its full extracted text remains in the
+  scoped attachment record, while the temporary export bytes no longer exist. Recall now checks
+  physical byte availability before offering `DELIVER_STORED`; text-only legacy rows are rebuilt
+  with `export_document`. Final local regression: `1935 passed, 44 skipped`.
 - No external message, task or business object was created while reproducing the incident.
