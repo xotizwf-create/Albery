@@ -4,6 +4,8 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-12
 
+- `verified_acceptance` — [CHG-20260812-10](changes/CHG-20260812-10-verified-agent-links.md): after explicit owner approval, the affected employee received exactly one legal-agent message with a freshly rebuilt Word result. Recipient/bot scope, full-text round trip, canonical signed URL, pre/post HTTP 200 byte download, journal uniqueness and service health all passed.
+
 - `verified` — [CHG-20260812-10](changes/CHG-20260812-10-verified-agent-links.md): production now generates signed documents on `www.m4s.ru`; a narrow HMAC+TTL compatibility path preserves old chat links without exposing MCP. Full CI, backup, empty-inflight restart, exact public byte download and real legal-agent `export_document` → HTTP 200 acceptance passed; temporary files were removed and journals are clean.
 - `implemented_local` — [CHG-20260812-10](changes/CHG-20260812-10-verified-agent-links.md): the reported document links were valid signed files routed through the intentionally dark legacy MCP hostname. New links use the public web host, historical export links are canonicalized, a narrow HMAC+TTL compatibility route is explicit, and deploy smoke now downloads real bytes through Nginx; full local regression and dependency audit passed.
 - `approved` — [CHG-20260812-10](changes/CHG-20260812-10-verified-agent-links.md): urgently reconstruct the invalid-link incident, identify provenance and add a deterministic fail-closed employee-facing link contract without exposing private URLs or conversation content.

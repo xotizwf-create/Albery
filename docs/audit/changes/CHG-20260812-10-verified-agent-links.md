@@ -94,6 +94,32 @@ drift, not a fabricated document or corrupted signature.
 - Post-deploy warning/error journals for the three restarted services were empty and the tracked
   production tree remained clean.
 
+## Post-verification controlled employee acceptance
+
+At 15:17 MSK on 2026-08-12 the owner explicitly approved sending the requested result to the
+affected employee. The original 30-minute export had expired, so the delivery was rebuilt from the
+complete `agent_doc` text already captured for the same legal-agent/dialog scope; no conversation
+content or download URL was copied into Git.
+
+- The active Bitrix employee identity and active legal-agent bot identity were checked both in the
+  local registry and against live Bitrix immediately before sending. The existing agent access rule
+  allowed the recipient, and a prior dialogue with that exact agent/bot pair existed.
+- The rebuilt DOCX was a valid Office archive. Extracting it again produced the same normalized
+  10,712-character text as the stored requested result.
+- The fresh canonical `www.m4s.ru` signed URL returned HTTP 200 and byte-identical DOCX content
+  before delivery.
+- Bitrix accepted exactly one outbound message from the legal agent. The full message journal
+  recorded exactly one matching outbound row for that returned Bitrix message id, with the intended
+  recipient/agent/bot scope and a direct instruction that the file could be downloaded.
+- A separate post-delivery process read the URL from the recorded message, downloaded it again with
+  HTTP 200, validated the DOCX archive, and proved that its extracted text still matched the stored
+  result. At that check the URL had 1,765 seconds of TTL remaining.
+- `albery`, `albery-web`, and `albery-mcp` were all `active` after delivery.
+- This acceptance changed no code, configuration, schema, or durable business data beyond the
+  explicitly approved outbound message and its normal journal entry. There was therefore no new
+  deployment backup or technical rollback; an external message is irreversible and was sent only
+  after the owner's explicit approval. The signed export remains subject to normal TTL cleanup.
+
 ## Changed files
 
 - `zoom.py`, `.env.example`: canonical public export host and final-link canonicalization.
