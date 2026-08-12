@@ -851,6 +851,24 @@ def _prepare_delivery(run: dict[str, Any], answer: str) -> None:
         raise RuntimeError("некорректный типизированный адрес доставки")
     targets = [t.strip() for t in raw.replace(";", ",").split(",") if t.strip()]
     profile_slug = str(snapshot.get("delivery_profile") or run["agent_slug"]).strip()
+    from zoom import extract_export_artifacts
+    clean_answer, artifacts, _invalid = extract_export_artifacts(answer)
+    artifact_tokens: list[str] = []
+    if artifacts:
+        import attachments
+        for artifact in artifacts:
+            token = attachments.store_attachment(
+                data=artifact["data"],
+                file_name=artifact["display_name"],
+                kind="agent_doc",
+                extracted_text="",
+                agent_slug=str(run["agent_slug"]),
+                dialog_id="automation:" + str(run["id"]),
+                mime=artifact.get("mime"),
+            )
+            if not token:
+                raise RuntimeError("generated automation artifact could not be persisted")
+            artifact_tokens.append(token)
     with pg_connect() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -858,15 +876,27 @@ def _prepare_delivery(run: dict[str, Any], answer: str) -> None:
                     "UPDATE agent_automation_runs SET result_text = %s, status = 'delivery_pending', "
                     "brain_finished_at = now(), available_at = now(), lease_until = NULL, "
                     "claimed_by = NULL, last_error = NULL, updated_at = now() WHERE id = %s",
-                    (answer, run["id"]),
+                    (clean_answer, run["id"]),
                 )
                 for target in targets:
+                    # Text and files are distinct durable parts. If the provider accepts the text
+                    # and a later file fails, only that file is retried; a Telegram caption limit
+                    # can never truncate the actual automation result.
                     cur.execute(
-                        "INSERT INTO agent_automation_deliveries (run_id, target, channel, profile_slug) "
-                        "VALUES (%s, %s, %s, %s) "
-                        "ON CONFLICT (run_id, target) DO NOTHING",
-                        (run["id"], target, channel, profile_slug),
+                        "INSERT INTO agent_automation_deliveries "
+                        "(run_id, target, channel, profile_slug, part_no, rendered_text) "
+                        "VALUES (%s, %s, %s, %s, 0, %s) "
+                        "ON CONFLICT (run_id, target, part_no) DO NOTHING",
+                        (run["id"], target, channel, profile_slug, clean_answer),
                     )
+                    for part_no, token in enumerate(artifact_tokens, start=1):
+                        cur.execute(
+                            "INSERT INTO agent_automation_deliveries "
+                            "(run_id, target, channel, profile_slug, part_no, attachment_token, rendered_text) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, '') "
+                            "ON CONFLICT (run_id, target, part_no) DO NOTHING",
+                            (run["id"], target, channel, profile_slug, part_no, token),
+                        )
 
 
 def _process_brain(run: dict[str, Any]) -> None:
@@ -994,16 +1024,52 @@ def _process_delivery(run: dict[str, Any]) -> None:
                                 "sendMessage", "Telegram recipient access is absent or revoked",
                                 status_code=403,
                             )
-                message = "⏰ " + snapshot["name"] + "\n" + str(run["result_text"] or "")
-                tg_multi.api(token, "sendMessage", chat_id=delivery["target"], text=message[:4000])
+                part_text = (delivery.get("rendered_text") if delivery.get("rendered_text") is not None
+                             else run["result_text"] or "")
+                message = "⏰ " + snapshot["name"] + "\n" + str(part_text)
+                if delivery.get("attachment_token"):
+                    import attachments
+                    blob = attachments.attachment_bytes(str(delivery["attachment_token"]))
+                    if not blob:
+                        raise tg_multi.TelegramAPIError(
+                            "sendDocument", "stored artifact is unavailable", status_code=400
+                        )
+                    data, file_name = blob
+                    tg_multi.api(
+                        token, "sendDocument", chat_id=delivery["target"],
+                        document=(file_name, data), caption=("📎 " + file_name)[:1024],
+                    )
+                else:
+                    tg_multi.api(token, "sendMessage", chat_id=delivery["target"], text=message[:4000])
                 ok, error = True, None
             else:
-                from b24bot import _albery_bitrix_notify
-                message = "[b]⏰ " + snapshot["name"] + "[/b]\n" + _bb_sanitize(run["result_text"] or "")
-                ok, error = _albery_bitrix_notify(
-                    message, dialog_id=delivery["target"], bot_id=agent.get("bitrix_bot_id"),
-                    retry_transient=False,
-                )
+                part_text = (delivery.get("rendered_text") if delivery.get("rendered_text") is not None
+                             else run["result_text"] or "")
+                message = "[b]⏰ " + snapshot["name"] + "[/b]\n" + _bb_sanitize(part_text)
+                if delivery.get("attachment_token"):
+                    import attachments
+                    from b24bot import _b24_app_access_token, _b24_app_file_reply
+                    blob = attachments.attachment_bytes(str(delivery["attachment_token"]))
+                    if not blob:
+                        ok, error = False, "stored artifact is unavailable"
+                    else:
+                        data, file_name = blob
+                        endpoint, access_token = _b24_app_access_token()
+                        message_id, error_kind = _b24_app_file_reply(
+                            endpoint, access_token, agent.get("bitrix_bot_id"), delivery["target"],
+                            "📎 " + file_name, [{"data": data, "display_name": file_name,
+                                       "filename": file_name, "byte_size": len(data)}],
+                        )
+                        ok = bool(message_id and error_kind is None)
+                        error = error_kind
+                        ambiguous = error_kind == "ambiguous"
+                        known_retryable = error_kind == "known"
+                else:
+                    from b24bot import _albery_bitrix_notify
+                    ok, error = _albery_bitrix_notify(
+                        message, dialog_id=delivery["target"], bot_id=agent.get("bitrix_bot_id"),
+                        retry_transient=False,
+                    )
         except Exception as exc:
             try:
                 import tg_multi

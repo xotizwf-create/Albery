@@ -4,6 +4,13 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-12
 
+- `implemented_local` — [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md): explicitly retire the rejected redundant Hermes Telegram transport while retaining its scheduler process; profile mappings remain fail-closed and no real message was sent.
+- `implemented_local` — [CHG-20260812-12](changes/CHG-20260812-12-automation-acceptance-system-cron.md): the sole heavy legacy Zoom cron now has a reviewed checksum-pinned wrapper for Albery's shared PostgreSQL run slots; today's automations 36 and 59 succeeded naturally without replay.
+- `implemented_local` — [CHG-20260812-11](changes/CHG-20260812-11-channel-native-artifacts.md): generated files become exact-byte native Bitrix/Telegram deliveries with durable independent parts and bounded restricted storage; the unused MCP-host compatibility route is removed.
+- `approved` — [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md): restore the rejected native Hermes Telegram credential and complete only explicitly mapped, owner-approved channel round trips.
+- `approved` — [CHG-20260812-12](changes/CHG-20260812-12-automation-acceptance-system-cron.md): complete reversible durable-automation production acceptance and inventory/migrate legacy system cron work without replaying employee output implicitly.
+- `approved` — [CHG-20260812-11](changes/CHG-20260812-11-channel-native-artifacts.md): replace employee-facing generated-file URLs with native Bitrix/Telegram attachments, retain exact bytes securely and remove the confirmed-unused legacy MCP-host export route.
+- `accepted` — [ADR-0006](decisions/ADR-0006-channel-native-artifact-delivery.md): the owning channel adapter delivers generated files; public signed URLs are no longer the employee-facing contract.
 - `verified_acceptance` — [CHG-20260812-10](changes/CHG-20260812-10-verified-agent-links.md): after explicit owner approval, the affected employee received exactly one legal-agent message with a freshly rebuilt Word result. Recipient/bot scope, full-text round trip, canonical signed URL, pre/post HTTP 200 byte download, journal uniqueness and service health all passed.
 
 - `verified` — [CHG-20260812-10](changes/CHG-20260812-10-verified-agent-links.md): production now generates signed documents on `www.m4s.ru`; a narrow HMAC+TTL compatibility path preserves old chat links without exposing MCP. Full CI, backup, empty-inflight restart, exact public byte download and real legal-agent `export_document` → HTTP 200 acceptance passed; temporary files were removed and journals are clean.

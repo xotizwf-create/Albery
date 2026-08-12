@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,8 @@ ATTACH_DIR = Path(os.getenv("B24_ATTACH_DIR", "/var/www/albery/.b24_attachments"
 # Keep files re-attachable for this many days, then the sweep may delete the bytes (text stays).
 ATTACH_RETENTION_DAYS = int(os.getenv("B24_ATTACH_RETENTION_DAYS", "30") or "30")
 _MAX_STORE_BYTES = int(os.getenv("B24_ATTACH_MAX_BYTES", str(40 * 1024 * 1024)) or str(40 * 1024 * 1024))
+_MAX_TOTAL_BYTES = int(os.getenv("B24_ATTACH_MAX_TOTAL_BYTES", str(1024 * 1024 * 1024)) or str(1024 * 1024 * 1024))
+_CLEANUP_STATE = {"at": 0.0}
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.\-]+")
 
@@ -41,6 +44,70 @@ def _safe_name(name: str) -> str:
 def _new_token() -> str:
     # Short, URL-safe, unguessable. 'att_' prefix makes it obvious in prompts/logs.
     return "att_" + secrets.token_urlsafe(9)
+
+
+def cleanup_attachment_bytes(*, force: bool = False) -> int:
+    """Remove expired/excess raw payloads while retaining extracted text and DB history.
+
+    Non-terminal Telegram outbox artifacts are protected even when old. The sweep is throttled to
+    once per hour during ordinary stores; deploy/maintenance checks may force it. Failures are
+    fail-open for chat availability and never remove a path outside ``ATTACH_DIR``.
+    """
+    now = time.time()
+    if not force and now - float(_CLEANUP_STATE["at"] or 0) < 3600:
+        return 0
+    _CLEANUP_STATE["at"] = now
+    if not ATTACH_DIR.is_dir():
+        return 0
+    protected: set[str] = set()
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT attachment_token FROM telegram_agent_outbox "
+                    "WHERE attachment_token IS NOT NULL "
+                    "AND status NOT IN ('sent','error','cancelled') "
+                    "UNION SELECT attachment_token FROM agent_automation_deliveries "
+                    "WHERE attachment_token IS NOT NULL AND status NOT IN ('delivered','error')"
+                )
+                protected = {str(row["attachment_token"]) for row in cur.fetchall()}
+    except Exception:  # noqa: BLE001
+        # Before migration 085 the column does not exist and no Telegram artifact can reference it.
+        protected = set()
+    try:
+        root = ATTACH_DIR.resolve()
+        files = [path for path in ATTACH_DIR.iterdir() if path.is_file() and "__" in path.name]
+        total = sum(path.stat().st_size for path in files)
+        cutoff = now - max(1, ATTACH_RETENTION_DAYS) * 86400
+        removed_tokens: list[str] = []
+        for path in sorted(files, key=lambda item: item.stat().st_mtime):
+            token = path.name.split("__", 1)[0]
+            if token in protected:
+                continue
+            stat = path.stat()
+            expired = stat.st_mtime < cutoff
+            over_limit = total > _MAX_TOTAL_BYTES
+            if not expired and not over_limit:
+                continue
+            resolved = path.resolve()
+            if resolved.parent != root:
+                continue
+            size = stat.st_size
+            path.unlink()
+            total = max(0, total - size)
+            removed_tokens.append(token)
+        if removed_tokens:
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE bitrix_bot_attachments SET file_path = NULL, byte_size = 0 "
+                        "WHERE token = ANY(%s)",
+                        (removed_tokens,),
+                    )
+        return len(removed_tokens)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("attachments cleanup failed: %s", repr(exc)[:160])
+        return 0
 
 
 def store_attachment(
@@ -66,8 +133,11 @@ def store_attachment(
         file_path = ""
         if data:
             ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+            os.chmod(ATTACH_DIR, 0o700)
+            cleanup_attachment_bytes()
             dest = ATTACH_DIR / f"{token}__{_safe_name(file_name)}"
             dest.write_bytes(data)
+            os.chmod(dest, 0o600)
             file_path = str(dest)
         text = (extracted_text or "").replace("\x00", "")  # NUL (0x00) is illegal in PG text
         with connect() as conn:

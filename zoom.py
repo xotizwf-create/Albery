@@ -29,6 +29,9 @@ from urllib.parse import unquote
 from urllib.parse import urlparse
 import requests
 
+from shared.channel_artifacts import export_token as channel_artifact_token
+from shared.channel_artifacts import extract_export_artifacts as extract_channel_artifacts
+
 from config import (
     EXPORT_DIR,
     MSK_TZ,
@@ -711,9 +714,7 @@ def _zoom_export_token(filename: str, expires_at: int) -> str:
     """Unguessable, stateless, time-bound token: HMAC over (expiry + filename). The
     public download route recomputes it and also checks the expiry, so a link works
     without login but cannot be guessed and stops working after expires_at."""
-    secret = (os.getenv("FLASK_SECRET_KEY") or os.getenv("MCP_SHARED_SECRET") or "albery-zoom-export").encode("utf-8")
-    message = f"{expires_at}:{os.path.basename(filename)}".encode("utf-8")
-    return hmac.new(secret, message, hashlib.sha256).hexdigest()[:32]
+    return channel_artifact_token(filename, expires_at)
 
 
 def export_public_host() -> str:
@@ -808,6 +809,22 @@ def repair_export_links(text: str) -> str:
     # Old tool results/history can still contain the legacy MCP hostname. Canonicalise every
     # Albery export link at the final delivery choke point; never rewrite arbitrary external URLs.
     return _EXPORT_URL_HOST_RE.sub(f"https://{export_public_host()}", repaired)
+
+
+def extract_export_artifacts(text: str) -> tuple[str, list[dict[str, Any]], int]:
+    """Resolve Albery export handoffs into local exact-byte artifacts.
+
+    The model sees a short signed URL returned by an MCP tool, but the final Bitrix/Telegram
+    adapter must deliver the real file instead of exposing that bearer URL to an employee. Only a
+    valid, unexpired HMAC for a file inside ``ZOOM_EXPORT_DIR`` is accepted. Every recognized handoff
+    is removed from the visible text even when invalid, so a broken/internal URL fails closed.
+
+    Returns ``(clean_text, artifacts, invalid_count)``. Artifact dictionaries contain bytes and
+    display metadata but never the signed URL.
+    """
+    return extract_channel_artifacts(text, repair_fn=repair_export_links)
+
+
 def cleanup_zoom_exports() -> int:
     """Delete export files older than the TTL so they don't accumulate on disk.
     Called opportunistically on each new export; safe to call anytime."""

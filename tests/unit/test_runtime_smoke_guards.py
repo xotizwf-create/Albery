@@ -11,11 +11,12 @@ def test_deploy_smoke_checks_effective_vpn_health():
     assert "effective outbound route or provider reachability is unhealthy" in source
 
 
-def test_deploy_smoke_requires_connected_telegram_without_exposing_error_message():
+def test_deploy_smoke_requires_connected_or_explicitly_retired_telegram_without_exposing_error():
     source = SMOKE.read_text(encoding="utf-8")
 
     assert "/root/.hermes/gateway_state.json" in source
-    assert 'telegram_state != "connected"' in source
+    assert 'telegram_state != "connected" and not telegram_retired' in source
+    assert 'HERMES_TELEGRAM_RETIRED' in source
     assert 'gateway_state.get("platforms")' in source
     assert 'gateway_state.get("error_message")' not in source
-
+    assert 'albery_global_limited_zoom.sh' in source

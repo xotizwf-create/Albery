@@ -14,7 +14,8 @@ Checks:
 4. The site and standalone funnel workspace routes are wired.
 5. When the workspace is enabled, its password, at least one Telegram transport and
    rollout flags are coherent.
-6. On production, VPN policy routing is effective and the Hermes Telegram platform is connected.
+6. On production, VPN policy routing is effective; the legacy Hermes Telegram platform is either
+   connected or explicitly retired after channel-neutral cutover.
 
 Exit code 0 = safe to walk away; 1 = do not leave the deploy like this.
 """
@@ -243,9 +244,9 @@ if active_agents:
     expect_status(f"{PUBLIC_MCP_BASE}/bitrix/imbot/not-a-secret", 403)
     print("path-token, forwarded and public MCP host access: 404; webhooks reach auth")
 
-# Signed employee files are an intentionally public capability, but not an MCP route. Create one
-# disposable artifact and fetch it through both the canonical www host and the narrow legacy-host
-# compatibility route. A Flask-only probe would have missed the 12.08.2026 Nginx 404 incident.
+# Signed exports remain an internal model-to-channel handoff and a non-chat compatibility
+# capability on the canonical web host. Create one disposable artifact and fetch it through www;
+# the legacy MCP host must stay completely dark, including the old export prefix.
 try:
     from zoom import ZOOM_EXPORT_DIR, _zoom_export_public_url, export_public_host
 
@@ -267,13 +268,8 @@ try:
                     failures.append(f"signed export canonical download: status={response.status}, body mismatch")
                 else:
                     print(f"signed export canonical download: OK ({parsed_export.hostname})")
-        compatibility_url = f"{PUBLIC_MCP_BASE}{parsed_export.path}"
-        with urllib.request.urlopen(compatibility_url, timeout=20) as response:
-            actual_body = response.read()
-            if response.status != 200 or actual_body != smoke_body:
-                failures.append(f"signed export legacy-host compatibility: status={response.status}, body mismatch")
-            else:
-                print("signed export legacy-host compatibility: OK")
+        expect_status(f"{PUBLIC_MCP_BASE}{parsed_export.path}", 404)
+        print("signed export legacy-host route: 404")
     finally:
         smoke_path.unlink(missing_ok=True)
         sidecar_path.unlink(missing_ok=True)
@@ -324,13 +320,29 @@ if Path("/run/systemd/system").is_dir():
             telegram_state = (
                 ((gateway_state.get("platforms") or {}).get("telegram") or {}).get("state")
             )
-            if telegram_state != "connected":
+            telegram_retired = os.getenv("HERMES_TELEGRAM_RETIRED", "0").strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+            if telegram_state != "connected" and not telegram_retired:
                 # Never include error_message: upstream may embed the bot token in it.
                 failures.append(f"Hermes Telegram platform state={telegram_state or 'missing'}")
+            elif telegram_retired:
+                print("Hermes Telegram platform: explicitly retired (channel-neutral service owns employee bots)")
             else:
                 print("Hermes Telegram platform: connected")
         except Exception as exc:  # noqa: BLE001
             failures.append(f"Hermes Telegram state unreadable ({type(exc).__name__})")
+
+    try:
+        cron_list = subprocess.run(
+            ["hermes", "cron", "list"], check=False, capture_output=True, text=True, timeout=30,
+        )
+        if cron_list.returncode != 0 or "albery_global_limited_zoom.sh" not in cron_list.stdout:
+            failures.append("Zoom system cron is outside the shared Albery run-slot wrapper")
+        else:
+            print("Zoom system cron shared run-slot wrapper: OK")
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"Zoom system cron contract unreadable ({type(exc).__name__})")
 else:
     print("systemd services: SKIP (systemd environment not detected)")
 

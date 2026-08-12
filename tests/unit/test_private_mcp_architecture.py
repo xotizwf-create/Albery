@@ -91,5 +91,5 @@ def test_nginx_blocks_mcp_on_both_public_hosts_without_logging_paths():
     webhook_marker = "location ~ ^/(bitrix/|zoom/events/|google-drive/events/)"
     assert source.count(webhook_marker) == 2
     assert "proxy_pass http://127.0.0.1:5004" not in source
-    assert source.count("location ^~ /zoom-export/") == 1
+    assert "location ^~ /zoom-export/" not in source
     assert source.count("access_log off;") >= 3

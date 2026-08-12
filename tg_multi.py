@@ -21,6 +21,7 @@ import requests
 
 import tg_agent as core
 from shared.agent_channel_runtime import ChannelContext, build_agent_policy, load_profile_knowledge
+from shared.channel_artifacts import extract_export_artifacts
 
 log = logging.getLogger("tg_multi")
 
@@ -74,8 +75,18 @@ def load_agents() -> list[dict]:
 
 def api(token: str, method: str, http_timeout: int = 35, **params):
     try:
-        resp = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=params,
-                             timeout=http_timeout)
+        document = params.pop("document", None)
+        if document is not None:
+            file_name, data = document
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/{method}",
+                data={key: str(value) for key, value in params.items()},
+                files={"document": (os.path.basename(str(file_name or "file")), data)},
+                timeout=http_timeout,
+            )
+        else:
+            resp = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=params,
+                                 timeout=http_timeout)
     except (requests.Timeout, requests.ConnectionError) as exc:
         # Do not expose the token-bearing request URL from requests' exception string.
         raise TelegramDeliveryAmbiguous(f"{method}: network outcome is unknown") from exc
@@ -579,15 +590,53 @@ def _finish_update(update: dict, *, chat_id, answer: str, review: bool = False,
                    error: str | None = None) -> None:
     status = "review" if review else "done"
     idem = f"telegram-agent-update:{update['agent_slug']}:{update['provider_update_id']}"
+    clean_answer, artifacts, invalid_count = extract_export_artifacts(answer)
+    if review:
+        # Ambiguous model/tool outcomes must never make a generated file look authoritative.
+        artifacts = []
+    artifact_tokens: list[str] = []
+    if artifacts:
+        try:
+            import attachments
+            for artifact in artifacts:
+                token = attachments.store_attachment(
+                    data=artifact["data"],
+                    file_name=artifact["display_name"],
+                    kind="agent_doc",
+                    extracted_text="",
+                    agent_slug=str(update["agent_slug"]),
+                    dialog_id=str(chat_id),
+                    mime=artifact.get("mime"),
+                )
+                if not token:
+                    raise RuntimeError("artifact persistence failed")
+                artifact_tokens.append(token)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Telegram generated artifact persistence failed for %s: %s",
+                        update["agent_slug"], type(exc).__name__)
+            artifact_tokens = []
+            clean_answer = (clean_answer + "\n\nНе удалось безопасно сохранить файл для отправки. "
+                            "Повторите создание документа.").strip()
+    if invalid_count and not clean_answer:
+        clean_answer = "Не удалось безопасно приложить сформированный файл. Повторите создание документа."
     with core._db() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO telegram_agent_outbox "
-                    "(agent_slug, update_id, chat_id, text, idempotency_key) "
-                    "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING",
-                    (update["agent_slug"], update["id"], str(chat_id), answer[:4000], idem),
+                    "(agent_slug, update_id, chat_id, text, idempotency_key, part_no) "
+                    "VALUES (%s, %s, %s, %s, %s, 0) ON CONFLICT (idempotency_key) DO NOTHING",
+                    (update["agent_slug"], update["id"], str(chat_id), clean_answer[:4000], idem),
                 )
+                for part_no, token in enumerate(artifact_tokens, start=1):
+                    cur.execute(
+                        "INSERT INTO telegram_agent_outbox "
+                        "(agent_slug, update_id, chat_id, text, idempotency_key, part_no, attachment_token) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (idempotency_key) DO NOTHING",
+                        (update["agent_slug"], update["id"], str(chat_id), "",
+                         f"{idem}:artifact:{part_no}", part_no, token),
+                    )
                 cur.execute(
                     "UPDATE telegram_agent_updates SET status = %s, locked_at = NULL, locked_until = NULL, "
                     "locked_by = NULL, last_error = %s, completed_at = now(), updated_at = now() WHERE id = %s",
@@ -702,7 +751,20 @@ def _process_outbox(item: dict) -> None:
                 (_LEASE_S, item["id"]),
             )
     try:
-        result = api(agent["bot_token"], "sendMessage", chat_id=item["chat_id"], text=item["text"])
+        if item.get("attachment_token"):
+            import attachments
+            blob = attachments.attachment_bytes(str(item["attachment_token"]))
+            if not blob:
+                raise TelegramAPIError("sendDocument", "stored artifact is unavailable", status_code=400)
+            data, file_name = blob
+            result = api(
+                agent["bot_token"],
+                "sendDocument",
+                chat_id=item["chat_id"],
+                document=(file_name, data),
+            )
+        else:
+            result = api(agent["bot_token"], "sendMessage", chat_id=item["chat_id"], text=item["text"])
     except TelegramDeliveryAmbiguous as exc:
         _set_outbox_status(int(item["id"]), "review", error=str(exc))
         return
@@ -717,8 +779,10 @@ def _process_outbox(item: dict) -> None:
         return
     provider_id = result.get("message_id") if isinstance(result, dict) else None
     _set_outbox_status(int(item["id"]), "sent", provider_message_id=str(provider_id or "") or None)
-    core.journal(item["agent_slug"], item["chat_id"], "out", item["text"], kind="bot_dm",
-                 status="ok", meta={"durable_outbox_id": item["id"]})
+    journal_text = item["text"] or ("📎 " + str(item.get("attachment_token") or "file"))
+    core.journal(item["agent_slug"], item["chat_id"], "out", journal_text, kind="bot_dm",
+                 status="ok", meta={"durable_outbox_id": item["id"],
+                                      "native_artifact": bool(item.get("attachment_token"))})
 
 
 def _recover_durable() -> None:

@@ -78,16 +78,16 @@ def test_nginx_conf_exposes_only_bot_and_web_upstreams():
     assert f"127.0.0.1:{PORT_MCP}" not in conf
 
 
-def test_mcp_host_is_dark_except_for_bot_webhooks_and_signed_exports():
-    """Legacy MCP host must never expose the MCP role; old signed file URLs stay usable."""
+def test_mcp_host_is_dark_except_for_bot_webhooks():
+    """Legacy MCP host exposes only authenticated bot/webhook callbacks, never MCP or files."""
     conf = _conf_text()
     mcp_block = conf.split("server_name mcp.m4s.ru;", 1)
     assert len(mcp_block) == 2, "блок mcp.m4s.ru не найден"
     tail = mcp_block[1].split("server {", 1)[0]
     assert f"127.0.0.1:{PORT_MCP}" not in tail
     assert f"127.0.0.1:{PORT_BOT}" in tail
-    assert "location ^~ /zoom-export/" in tail
-    assert f"proxy_pass http://127.0.0.1:{PORT_WEB};" in tail
+    assert "location ^~ /zoom-export/" not in tail
+    assert f"proxy_pass http://127.0.0.1:{PORT_WEB};" not in tail
     assert "location /" in tail and "return 404;" in tail
 
 

@@ -40,9 +40,9 @@ zero-tool funnel runtime rather than an employee agent.
 - Automation destinations are typed as `{channel, profile, conversation_id}`. A request defaults to
   the originating channel and conversation. Brain result and delivery retry remain separate; the
   Telegram adapter sends with the profile's Telegram identity.
-- The existing IU customer workspace remains isolated and zero-tool. Native Hermes Telegram cron
-  and owner gateway are retired only after their required jobs/identity are migrated and live
-  acceptance succeeds; this decision does not silently disable them.
+- The existing IU customer workspace remains isolated and zero-tool. Native Hermes Telegram
+  transport is retired explicitly after profile-bot cutover; the gateway process may remain for
+  reviewed scheduler jobs, which must enter Albery's shared heavy-process limit.
 
 ## Alternatives considered
 
@@ -64,8 +64,8 @@ zero-tool funnel runtime rather than an employee agent.
   require an explicit merge plan and are not automatically combined by name.
 - PostgreSQL migrations and new worker stages add operational complexity, but remove replay and
   silent-delivery failure classes.
-- Native Hermes gateway retirement requires a valid replacement bot credential and approved live
-  round trip; repository code alone cannot complete that credential operation.
+- Native Hermes transport retirement is reversible configuration, not credential rotation. A
+  rejected token is removed from the active gateway environment without guessing or revoking a bot.
 
 ## Verification / revisit trigger
 
