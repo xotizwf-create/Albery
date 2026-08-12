@@ -74,7 +74,35 @@ def test_intact_link_is_left_untouched(app_module, tmp_path, monkeypatch):
     token = app_module.zoom._zoom_export_token(name, expires)
     answer = f"https://mcp.m4s.ru/zoom-export/{expires}/{token}/{name}"
 
-    assert app_module.zoom.repair_export_links(answer) == answer
+    assert app_module.zoom.repair_export_links(answer) == answer.replace(
+        "https://mcp.m4s.ru", "https://www.m4s.ru"
+    )
+
+
+def test_export_links_never_use_the_dark_mcp_host(app_module, tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module.zoom, "ZOOM_EXPORT_DIR", tmp_path)
+    monkeypatch.setenv("MCP_HOST", "mcp.m4s.ru")
+    monkeypatch.delenv("CANONICAL_WEB_HOST", raising=False)
+    monkeypatch.delenv("EXPORT_PUBLIC_HOST", raising=False)
+
+    url = _make_export(app_module, tmp_path, monkeypatch, "Проверка маршрута")
+
+    assert url.startswith("https://www.m4s.ru/zoom-export/")
+    assert "mcp.m4s.ru" not in url
+
+
+def test_explicit_export_host_canonicalizes_historical_links(app_module, tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module.zoom, "ZOOM_EXPORT_DIR", tmp_path)
+    monkeypatch.setenv("EXPORT_PUBLIC_HOST", "downloads.example.test")
+    name = "1784446767_ab12cd34.docx"
+    (tmp_path / name).write_bytes(b"x")
+    expires = 1784448567
+    token = app_module.zoom._zoom_export_token(name, expires)
+    old = f"https://mcp.m4s.ru/zoom-export/{expires}/{token}/{name}"
+
+    fixed = app_module.zoom.repair_export_links(old)
+
+    assert fixed == old.replace("https://mcp.m4s.ru", "https://downloads.example.test")
 
 
 def test_damaged_token_is_re_signed_when_the_file_exists(app_module, tmp_path, monkeypatch):
@@ -95,7 +123,9 @@ def test_link_to_a_vanished_file_is_left_alone(app_module, tmp_path, monkeypatch
     (tmp_path / "1784446767_other.docx").write_bytes(b"x")
     answer = f"https://mcp.m4s.ru/zoom-export/1784448567/{'0' * 32}/1784446767_gone.docx"
 
-    assert app_module.zoom.repair_export_links(answer) == answer
+    assert app_module.zoom.repair_export_links(answer) == answer.replace(
+        "https://mcp.m4s.ru", "https://www.m4s.ru"
+    )
 
 
 def test_text_without_links_is_unchanged(app_module):

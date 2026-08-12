@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 from urllib.parse import unquote
+from urllib.parse import urlparse
 import requests
 
 from config import (
@@ -51,7 +52,6 @@ from utils import (
 from app import (  # shared Flask app + db glue still living in app.py
     ZoneInfo,
     app,
-    has_request_context,
     pg_connect,
     pg_json,
     pg_table_exists,
@@ -714,19 +714,33 @@ def _zoom_export_token(filename: str, expires_at: int) -> str:
     secret = (os.getenv("FLASK_SECRET_KEY") or os.getenv("MCP_SHARED_SECRET") or "albery-zoom-export").encode("utf-8")
     message = f"{expires_at}:{os.path.basename(filename)}".encode("utf-8")
     return hmac.new(secret, message, hashlib.sha256).hexdigest()[:32]
+
+
+def export_public_host() -> str:
+    """Hostname used in employee-facing signed download URLs.
+
+    `MCP_HOST` is deliberately excluded: since the private-MCP migration that legacy hostname is
+    dark by default and exists only for narrowly allowlisted callbacks/compatibility routes.  A
+    user artifact belongs to the public web host, not to the model transport boundary.
+    """
+    raw = (
+        os.getenv("EXPORT_PUBLIC_HOST")
+        or os.getenv("CANONICAL_WEB_HOST")
+        or "www.m4s.ru"
+    ).strip()
+    if "://" in raw:
+        raw = urlparse(raw).netloc
+    host = raw.split("/", 1)[0].strip().lower()
+    if not host or any(char.isspace() for char in host):
+        return "www.m4s.ru"
+    return host
+
+
 def _zoom_export_public_url(filename: str) -> str:
     expires_at = int(time.time()) + zoom_export_ttl_seconds()
     token = _zoom_export_token(filename, expires_at)
     path = f"/zoom-export/{expires_at}/{token}/{quote(os.path.basename(filename))}"
-    host = (os.getenv("MCP_HOST") or os.getenv("CANONICAL_WEB_HOST") or "").strip()
-    if not host:
-        # Fall back to the host of the current request (the MCP call comes in on mcp.m4s.ru).
-        try:
-            if has_request_context():
-                host = request.host
-        except Exception:
-            host = ""
-    return f"https://{host}{path}" if host else path
+    return f"https://{export_public_host()}{path}"
 def _export_display_name_path(filename: str) -> Path:
     return ZOOM_EXPORT_DIR / (os.path.basename(filename) + ".name")
 def write_export_display_name(filename: str, display_name: str) -> None:
@@ -747,6 +761,7 @@ def export_display_name(filename: str) -> str:
         pass
     return safe
 _EXPORT_URL_RE = re.compile(r"/zoom-export/(\d{9,12})/([0-9a-f]{8,32})/([^\s\]\)\"'<>]+)")
+_EXPORT_URL_HOST_RE = re.compile(r"https?://[^/\s\]\)\"'<>]+(?=/zoom-export/)", re.I)
 def repair_export_links(text: str) -> str:
     """Fix download links whose filename no longer matches their signature.
 
@@ -789,7 +804,10 @@ def repair_export_links(text: str) -> str:
         logging.info("repair_export_links: rebuilt a damaged download link -> %s", fname)
         return f"/zoom-export/{exp}/{tok}/{quote(fname)}"
 
-    return _EXPORT_URL_RE.sub(_fix, text)
+    repaired = _EXPORT_URL_RE.sub(_fix, text)
+    # Old tool results/history can still contain the legacy MCP hostname. Canonicalise every
+    # Albery export link at the final delivery choke point; never rewrite arbitrary external URLs.
+    return _EXPORT_URL_HOST_RE.sub(f"https://{export_public_host()}", repaired)
 def cleanup_zoom_exports() -> int:
     """Delete export files older than the TTL so they don't accumulate on disk.
     Called opportunistically on each new export; safe to call anytime."""

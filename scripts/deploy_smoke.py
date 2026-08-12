@@ -21,6 +21,7 @@ Exit code 0 = safe to walk away; 1 = do not leave the deploy like this.
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import urllib.parse
@@ -241,6 +242,43 @@ if active_agents:
     expect_status(f"{PUBLIC_MCP_BASE}/zoom/events/not-a-secret", 403)
     expect_status(f"{PUBLIC_MCP_BASE}/bitrix/imbot/not-a-secret", 403)
     print("path-token, forwarded and public MCP host access: 404; webhooks reach auth")
+
+# Signed employee files are an intentionally public capability, but not an MCP route. Create one
+# disposable artifact and fetch it through both the canonical www host and the narrow legacy-host
+# compatibility route. A Flask-only probe would have missed the 12.08.2026 Nginx 404 incident.
+try:
+    from zoom import ZOOM_EXPORT_DIR, _zoom_export_public_url, export_public_host
+
+    smoke_name = f"deploy_smoke_{secrets.token_hex(6)}.txt"
+    smoke_path = ZOOM_EXPORT_DIR / smoke_name
+    sidecar_path = ZOOM_EXPORT_DIR / f"{smoke_name}.name"
+    smoke_body = b"ALBERY_SIGNED_EXPORT_SMOKE"
+    ZOOM_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    smoke_path.write_bytes(smoke_body)
+    try:
+        public_url = _zoom_export_public_url(smoke_name)
+        parsed_export = urllib.parse.urlparse(public_url)
+        if parsed_export.hostname != export_public_host() or parsed_export.hostname == urllib.parse.urlparse(PUBLIC_MCP_BASE).hostname:
+            failures.append("signed export: canonical public host is invalid or still equals MCP host")
+        else:
+            with urllib.request.urlopen(public_url, timeout=20) as response:
+                actual_body = response.read()
+                if response.status != 200 or actual_body != smoke_body:
+                    failures.append(f"signed export canonical download: status={response.status}, body mismatch")
+                else:
+                    print(f"signed export canonical download: OK ({parsed_export.hostname})")
+        compatibility_url = f"{PUBLIC_MCP_BASE}{parsed_export.path}"
+        with urllib.request.urlopen(compatibility_url, timeout=20) as response:
+            actual_body = response.read()
+            if response.status != 200 or actual_body != smoke_body:
+                failures.append(f"signed export legacy-host compatibility: status={response.status}, body mismatch")
+            else:
+                print("signed export legacy-host compatibility: OK")
+    finally:
+        smoke_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)
+except Exception as exc:  # noqa: BLE001
+    failures.append(f"signed export public round trip failed ({type(exc).__name__})")
 
 # The two long-lived workers are part of the workspace data path.  Keep this
 # production-only so a local/container smoke without systemd remains useful.

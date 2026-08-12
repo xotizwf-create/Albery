@@ -145,3 +145,10 @@ turn, but did not assert effective VPN policy routing, the connected state of th
 platform, or completion of a scheduled business output. CHG-20260811-05 adds these gates. The
 private MCP transport was not the root cause of that incident, but the earlier acceptance scope
 was insufficient to detect it.
+
+Correction recorded 2026-08-12: making the legacy MCP host dark also blocked the pre-existing
+signed `/zoom-export/` file route, while the export generator continued to use `MCP_HOST`. MCP
+privacy itself remained intact, but production acceptance did not download a real employee-facing
+artifact through Nginx. [CHG-20260812-10](CHG-20260812-10-verified-agent-links.md) separates the
+public export host from MCP transport, adds an exact HMAC+TTL compatibility route for old links and
+makes a byte-for-byte public artifact download a mandatory deploy-smoke gate.
