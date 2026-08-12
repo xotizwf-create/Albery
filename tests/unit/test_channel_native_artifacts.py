@@ -166,6 +166,42 @@ def test_old_document_without_bytes_is_rebuilt_from_full_text(app_module):
     assert "ПОЛНЫЙ ТЕКСТ ДОГОВОРА" in prompt
 
 
+def test_old_quoted_answer_recovers_its_nearby_scoped_document(app_module, monkeypatch, tmp_path):
+    import datetime as dt
+    import b24bot
+
+    interaction_at = dt.datetime.now(dt.timezone.utc)
+    rows = iter([
+        {"created_at": interaction_at},
+        {
+            "token": "att_abcdefghij", "file_name": "Договор.docx",
+            "extracted_text": "ПОЛНЫЙ ТЕКСТ", "char_len": 11,
+            "file_path": str(tmp_path / "already-cleaned.docx"), "delta_seconds": 5.2,
+        },
+    ])
+
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, *_args, **_kwargs): return None
+        def fetchone(self): return next(rows)
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def cursor(self): return Cursor()
+
+    monkeypatch.setattr(b24bot, "pg_connect", lambda: Conn())
+    monkeypatch.setattr(b24bot, "_b24_capture_generated_doc", lambda *_args, **_kwargs: None)
+
+    doc = b24bot._b24_capture_trusted_reply_doc(
+        "94", "agent-sklad", 94, "Готово: /zoom-export/1234567890/abcdef12/file.docx",
+    )
+
+    assert doc["token"] == "att_abcdefghij"
+    assert doc["stored_bytes_available"] is False
+
+
 def test_telegram_api_uses_multipart_for_native_document(monkeypatch):
     import tg_multi as multi
     seen = {}

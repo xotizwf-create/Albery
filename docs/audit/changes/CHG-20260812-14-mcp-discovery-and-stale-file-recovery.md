@@ -71,5 +71,8 @@ re-created instead of echoing an expired bearer URL.
 - The incident document predates durable native bytes: its full extracted text remains in the
   scoped attachment record, while the temporary export bytes no longer exist. Recall now checks
   physical byte availability before offering `DELIVER_STORED`; text-only legacy rows are rebuilt
-  with `export_document`. Final local regression: `1935 passed, 44 skipped`.
+  with `export_document`. Exact old reply recovery is scoped to the same dialog and agent, requires
+  an exact prior answer, and accepts only an `agent_doc` row created within 120 seconds of that
+  interaction. The incident match is 5.26 seconds and contains 16,061 extracted characters. Final
+  local regression: `1936 passed, 44 skipped`.
 - No external message, task or business object was created while reproducing the incident.

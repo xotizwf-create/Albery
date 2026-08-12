@@ -3054,26 +3054,48 @@ def _b24_capture_generated_doc(dialog_id: str, agent_slug: str | None, from_user
 
 
 def _b24_capture_trusted_reply_doc(dialog_id: str, agent_slug: str | None, from_user_id: Any,
-                                   reply_text: str) -> None:
-    """Recover an expired export only when it is an exact prior answer in this agent/dialog."""
+                                   reply_text: str) -> dict | None:
+    """Recover context only for an exact prior answer from this agent/dialog.
+
+    Legacy export bytes may already be gone. Their extracted text is still safe to associate when
+    its attachment row was created within two minutes of that exact interaction.
+    """
     if "/zoom-export/" not in (reply_text or ""):
-        return
+        return None
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM bitrix_bot_interactions "
+                    "SELECT created_at FROM bitrix_bot_interactions "
                     "WHERE dialog_id=%s AND agent_slug IS NOT DISTINCT FROM %s::text AND answer=%s "
                     "LIMIT 1",
                     (str(dialog_id or ""), agent_slug, reply_text),
                 )
-                trusted = bool(cur.fetchone())
-        if trusted:
-            _b24_capture_generated_doc(
-                dialog_id, agent_slug, from_user_id, reply_text, allow_expired=True,
-            )
+                interaction = cur.fetchone()
+        if not interaction:
+            return None
+        _b24_capture_generated_doc(
+            dialog_id, agent_slug, from_user_id, reply_text, allow_expired=True,
+        )
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT token, file_name, extracted_text, char_len, file_path, "
+                    "       to_char(created_at at time zone 'Europe/Moscow', 'DD.MM HH24:MI') AS at_msk, "
+                    "       abs(extract(epoch FROM (created_at - %s::timestamptz))) AS delta_seconds "
+                    "FROM bitrix_bot_attachments "
+                    "WHERE dialog_id=%s AND agent_slug IS NOT DISTINCT FROM %s::text "
+                    "  AND kind='agent_doc' AND extracted_text <> '' "
+                    "ORDER BY delta_seconds ASC LIMIT 1",
+                    (interaction["created_at"], str(dialog_id or ""), agent_slug),
+                )
+                row = dict(cur.fetchone() or {})
+        if row and float(row.get("delta_seconds") or 999999) <= 120:
+            row["stored_bytes_available"] = Path(str(row.get("file_path") or "")).is_file()
+            return row
     except Exception:  # noqa: BLE001
         logging.warning("b24 testbot: trusted reply-doc recovery failed dlg=%s", dialog_id, exc_info=True)
+    return None
 
 
 def _b24_recent_generated_doc(dialog_id: str, agent_slug: str | None, hours: int | None = None):
@@ -5241,11 +5263,13 @@ def _bitrix_imbot_app_event():
             recent_atts, recent_doc = [], None
             if not (parts["attachments"] or parts["doc_blocks"]
                     or parts["image_texts"] or parts["voice_texts"]):
-                _b24_capture_trusted_reply_doc(
+                reply_doc = _b24_capture_trusted_reply_doc(
                     dialog_id, (agent or {}).get("slug"), from_user_id, parts["reply_text"],
                 )
                 recent_atts = _b24_recent_dialog_attachments(dialog_id, (agent or {}).get("slug"))
-                recent_doc = _b24_recent_generated_doc(dialog_id, (agent or {}).get("slug"))
+                recent_doc = reply_doc or _b24_recent_generated_doc(
+                    dialog_id, (agent or {}).get("slug"),
+                )
             _b24_app_process(
                 endpoint, access_token, bot_id, dialog_id,
                 _b24_compose_user_text("\n".join(parts["texts"]), parts["image_texts"],
