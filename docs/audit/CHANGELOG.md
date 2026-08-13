@@ -4,6 +4,8 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-13
 
+- `deployed_partial` — [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md): production `208bac4` changes Bitrix local-app OAuth state from host-readable `0644` to atomic owner-only `0600` without token rotation; backup, full CI, smoke and self-check passed. Four old unhandled task-comment claims prove the next durable-intake remediation is necessary and must not be blindly replayed.
+- `approved` — [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md): audit Bitrix webhook durability, OAuth/author identity, task/CRM concurrency and partial failures without creating real provider effects.
 - `deployed` — [CHG-20260813-20](changes/CHG-20260813-20-client-telegram-iu-crm-lifecycle-audit.md): production `34abacc` persists the Bitrix manager-alert send boundary, monitors every customer queue without message content, protects active upload references, removes 122 backed-up expired spool files and applies bounded form-data retention; CI/smoke/self-check are clean and the real-recipient round trip remains an approval gate.
 - `accepted` — [ADR-0009](decisions/ADR-0009-durable-client-telegram-provider-boundaries.md): provider calls become `sending` before the irreversible boundary and ambiguous outcomes stop at `unknown`; active rows protect files and monitoring is content-free.
 - `approved` — [CHG-20260813-20](changes/CHG-20260813-20-client-telegram-iu-crm-lifecycle-audit.md): map and failure-test the complete client Telegram/Business -> IU state -> manager/AI -> CRM/outbox lifecycle without sending messages or mutating real CRM objects.

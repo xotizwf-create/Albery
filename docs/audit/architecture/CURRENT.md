@@ -5,8 +5,14 @@ Last reviewed: 2026-08-13.
 ## Verified production state
 
 Production server 186 runs functional runtime `34abacc`; later audit-only commits do not change
-process behavior. The runtime includes the versioned scheduler, recovery, capability, PostgreSQL
-and client-Telegram hardening commits.
+process behavior. Bitrix OAuth-state hardening is deployed in later functional commit `208bac4`.
+The runtime includes the versioned scheduler, recovery, capability, PostgreSQL and client-Telegram
+hardening commits.
+
+The Bitrix local-app OAuth state is now atomically published with owner-only `0600` permissions.
+The wider Bitrix correctness audit remains active: task-comment events still ACK before durable
+capture, and four historical non-self first-sight rows remain `handled=false`. They are evidence for
+the durable queue redesign and are not blindly replayed.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under

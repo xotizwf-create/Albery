@@ -54,6 +54,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260813-18](changes/CHG-20260813-18-vpn-healthcheck-transient-hardening.md) | verified | Version and harden the VPN/provider healthcheck against proven one-shot false alarms while preserving fail-closed sustained-outage detection |
 | [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md) | deployed | Audit PostgreSQL and harden atomic local/offsite recovery with measured RPO/RTO; natural backup acceptance pending |
 | [CHG-20260813-20](changes/CHG-20260813-20-client-telegram-iu-crm-lifecycle-audit.md) | deployed | Harden the full client Telegram/IU lifecycle, manager-alert ambiguity, file retention and queue monitoring |
+| [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md) | in_progress | Audit webhook durability, OAuth/author identity and task/CRM partial-failure correctness; OAuth state is already owner-only/atomic |
 
 ## Runbooks
 
