@@ -14,10 +14,8 @@ ALBERY_BITRIX_NOTIFY_CHAT (default chat728). State path: B24_TESTBOT_STATE (defa
 """
 from __future__ import annotations
 
-import json
 import os
 import time
-from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -27,15 +25,16 @@ STATE_PATH = os.getenv("B24_TESTBOT_STATE", "/var/www/albery/.b24_testbot_state.
 
 
 def _load_state() -> dict:
-    try:
-        return json.loads(Path(STATE_PATH).read_text(encoding="utf-8")) or {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+    from shared.secure_json_state import load_json
+
+    return load_json(STATE_PATH)
 
 
 def _save_state(state: dict) -> None:
     try:
-        Path(STATE_PATH).write_text(json.dumps(state), encoding="utf-8")
+        from shared.secure_json_state import atomic_write_json
+
+        atomic_write_json(STATE_PATH, state)
     except OSError:
         pass
 

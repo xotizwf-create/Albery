@@ -466,17 +466,16 @@ def _b24_state_path() -> str:
 
 
 def _b24_load_state() -> dict[str, Any]:
-    try:
-        with open(_b24_state_path(), encoding="utf-8") as fh:
-            return json.load(fh) or {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+    from shared.secure_json_state import load_json
+
+    return load_json(_b24_state_path())
 
 
 def _b24_save_state(state: dict[str, Any]) -> None:
     try:
-        with open(_b24_state_path(), "w", encoding="utf-8") as fh:
-            json.dump(state, fh)
+        from shared.secure_json_state import atomic_write_json
+
+        atomic_write_json(_b24_state_path(), state)
     except OSError:
         logging.exception("b24 testbot: failed to persist state")
 
