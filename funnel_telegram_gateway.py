@@ -479,7 +479,9 @@ def process_iu_reminders_once(*, worker_id: str, limit: int = 20) -> int:
 def _maintenance_loop() -> None:
     last_crm = 0.0
     last_stage_sync = 0.0
-    last_retention = 0.0
+    # Run retention once on every process start.  A zero monotonic timestamp
+    # incorrectly postponed the first sweep for 24 hours after a host reboot.
+    last_retention = -float("inf")
     while not _stop_event.is_set():
         now = time.monotonic()
         try:

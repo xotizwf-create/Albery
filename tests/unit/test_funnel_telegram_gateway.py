@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import requests
@@ -1685,3 +1686,12 @@ def test_delivered_explicit_handoff_repairs_a_missed_synchronous_transition(
             },
         )
     ]
+def test_retention_maintenance_is_due_immediately_after_process_start():
+    source = Path(gateway.__file__).read_text(encoding="utf-8")
+    maintenance = source[
+        source.index("def _maintenance_loop()"):
+        source.index("def _process_update_lane_once")
+    ]
+
+    assert 'last_retention = -float("inf")' in maintenance
+    assert "funnel_workspace_uploads.sweep_expired()" in maintenance
