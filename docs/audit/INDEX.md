@@ -48,8 +48,8 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260812-14](changes/CHG-20260812-14-mcp-discovery-and-stale-file-recovery.md) | deployed | Scope one-shot/gateway MCP discovery and rebuild old generated-file requests instead of echoing expired URLs |
 | [CHG-20260813-15](changes/CHG-20260813-15-hermes-restart-production-hygiene.md) | verified | Make Hermes restart control compatible with systemd 249 and separate runtime/backup artifacts from the production Git tree |
 | [CHG-20260813-16](changes/CHG-20260813-16-audit-record-reconciliation.md) | verified | Reconcile historical CHG statuses against later production acceptance without overstating open employee-channel scenarios |
-| [CHG-20260813-17](changes/CHG-20260813-17-mcp-capability-rights-audit.md) | approved | Audit every MCP tool and the effective rights of all active agent profiles, then harden unsafe gaps |
-| [CHG-20260813-18](changes/CHG-20260813-18-vpn-healthcheck-transient-hardening.md) | implemented_local | Version and harden the VPN/provider healthcheck against proven one-shot false alarms while preserving fail-closed sustained-outage detection |
+| [CHG-20260813-17](changes/CHG-20260813-17-mcp-capability-rights-audit.md) | verified | Classify all MCP capabilities, freeze fail-closed per-agent caps and centrally guard consequential calls without changing live grants |
+| [CHG-20260813-18](changes/CHG-20260813-18-vpn-healthcheck-transient-hardening.md) | verified | Version and harden the VPN/provider healthcheck against proven one-shot false alarms while preserving fail-closed sustained-outage detection |
 
 ## Status rule
 

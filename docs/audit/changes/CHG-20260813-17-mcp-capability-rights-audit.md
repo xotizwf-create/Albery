@@ -1,6 +1,6 @@
 # CHG-20260813-17: MCP capability and agent-rights audit
 
-- Status: implemented_local
+- Status: verified
 - Date opened: 2026-08-13
 - Related decisions: [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md), [ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md), [ADR-0007](../decisions/ADR-0007-exhaustive-mcp-policy-and-fail-closed-caps.md)
 - Bitrix engineering task: pending; no external task mutation is approved yet
@@ -95,7 +95,7 @@ and generated connector sets. The approved remediation now changes these boundar
 5. Run full local regression, PostgreSQL 14/16 and security CI, then production negative/structural
    acceptance without writing live business data.
 
-### Evidence so far
+### Verified evidence
 
 - Production read-only inventory: 160 regular + six self tools; nine direct `tools/list` results
   exactly matched their calculated sets. No business tool was invoked.
@@ -105,7 +105,22 @@ and generated connector sets. The approved remediation now changes these boundar
 - Full local regression: `1955 passed, 44 skipped`; PostgreSQL-marked tests remain for CI.
 - Python compile and `git diff --check`: clean. New policy/inventory files have zero pyflakes issues;
   the unchanged repository baseline findings remain outside this change.
-- CI, production backup/deploy, post-restart smoke/self-check and negative calls are pending.
+- Implementation commit: `b5da07cf9c1518f2da8c9b4e0d09727fa11de136`. GitHub tests run
+  `31698926291` passed frontend plus PostgreSQL 14/Python 3.10 and PostgreSQL 16/Python 3.12;
+  security run `31698926377` passed.
+- Production was clean at prior commit `7c6040a`; no Bitrix turn, automation run or shared heavy
+  slot was active. The full source tree was backed up under
+  `/var/backups/albery/pre-chg17-20260813_152041` with directory mode `0700`.
+- Both shared heavy slots were held during the empty-work restart, closing the race between drain
+  inspection and systemd. The four affected services returned active; production Git stayed clean.
+- All nine post-deploy private `tools/list` sets exactly matched DB switches intersected with the
+  new manifest cap, preserving counts `110/137/166/109/0/0/116/141/20`.
+- Negative live calls for `delete_agent`, `send_telegram_message` and
+  `delete_my_instruction` omitted `confirm`; all three were rejected before their handlers. No
+  agent, message or instruction was changed.
+- Deploy smoke, dry-run self-check and generated capability inventory passed; relevant fresh error
+  journals were empty. Final acceptance ran on successor production commit `57a215a`, which changes
+  only the separately verified healthcheck/audit contour after the CHG-17 runtime commit.
 
 ## Risks
 
@@ -116,8 +131,8 @@ and generated connector sets. The approved remediation now changes these boundar
 
 ## Rollback
 
-Before production mutation, preserve the prior commit and affected source/manifests under
-`/var/backups/albery/pre-chg17-<timestamp>`. Roll back by returning to the prior commit and restarting
+The prior commit and affected source/manifests are preserved under
+`/var/backups/albery/pre-chg17-20260813_152041`. Roll back by returning to the prior commit and restarting
 `albery`, `albery-mcp`, `albery-web` and `albery-tg` at the empty-work gate. No DB rows are changed by
 this rollout. If only the new confirmation policy causes an incompatibility, revert the code commit;
 the cap snapshot can remain because the pre-deploy simulation proves it preserves all current sets.

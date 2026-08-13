@@ -4,8 +4,8 @@ Last reviewed: 2026-08-13.
 
 ## Verified production state
 
-Production server 186 runs repository commit `6cff732`; the current agent runtime implementation is
-`a38e2d1` plus the later versioned scheduler, recovery and infrastructure hardening commits.
+Production server 186 runs repository commit `57a215a`; the current agent runtime implementation is
+`a38e2d1` plus the later versioned scheduler, recovery, capability and infrastructure hardening commits.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
@@ -94,6 +94,12 @@ flowchart LR
   allowlist rather than a shared HTTP MCP credential. Missing main-agent wiring fails closed.
 - Dialogue summaries and diagnostic digests use the isolated zero-tool Codex quality contour;
   Groq remains responsible for audio and primary screenshot/OCR processing.
+- All 160 regular MCP tools and six profile self-service tools have an exhaustive versioned semantic
+  policy. Unknown names and missing/malformed agent caps fail closed. Forty-seven consequential
+  operations require model-visible and dispatcher-enforced `confirm=true`; unknown automation tools
+  are mutating and all writes retain the effect ledger/object lock. The nine exact live counts are
+  `110/137/166/109/0/0/116/141/20`; no grant changed during rollout. See
+  [CHG-20260813-17](../changes/CHG-20260813-17-mcp-capability-rights-audit.md).
 
 ## Telegram channel architecture
 
@@ -297,7 +303,11 @@ flowchart LR
 
 - Outbound model/provider traffic is policy-routed through AmneziaWG exit `95.85.243.43`.
   The watchdog verifies the effective route and reapplies missing policy rules; a fresh tunnel
-  handshake alone is no longer treated as healthy.
+  handshake alone is no longer treated as healthy. The versioned healthcheck validates all five
+  rules, table 200, the effective exit and exact OpenAI HTTP 401. External probes retry at most
+  three times: production improved from `17/20` one-shot checks to `20/20`, recovering five real
+  transient connects while sustained failure remains red under
+  [CHG-20260813-18](../changes/CHG-20260813-18-vpn-healthcheck-transient-hardening.md).
 - Codex, private MCP and Zoom report generation are operational after
   [CHG-20260811-05](../changes/CHG-20260811-05-vpn-routing-automation-recovery.md).
 - Native Hermes Telegram is explicitly retired; no credential was guessed, rotated or revoked.

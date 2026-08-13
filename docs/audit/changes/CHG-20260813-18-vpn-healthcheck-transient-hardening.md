@@ -1,6 +1,6 @@
 # CHG-20260813-18: VPN healthcheck transient hardening
 
-- Status: implemented_local
+- Status: verified
 - Date opened: 2026-08-13
 - Approval: the owner approved execution of the remaining audit/remediation plan and required all
   changes and decisions to be recorded
@@ -52,11 +52,26 @@ VPN or application services.
 
 - Before-state production series: `17/20` green; all three failures were OpenAI HTTP `000` with the
   correct VPN exit and healthy local state.
-- Pending after implementation: shell syntax, installer/unit regression, full suite, CI, protected
-  production backup/install, repeated live series, deploy smoke/self-check and fresh journals.
+- Shell syntax, pyflakes and focused installer/smoke tests passed. The full local suite passed with
+  `1958 passed, 46 skipped`; the two shell-execution cases were intentionally delegated to Linux CI.
+- Implementation commit `57a215acf667bd2412df095aa14d62838ae641fa`; tests run `31700557453`
+  passed frontend plus both PostgreSQL/Python matrices, including the transient/sustained mocked
+  shell scenarios. Security run `31700557352` passed.
+- The previous live script is preserved under
+  `/var/backups/albery/vpn/pre-healthcheck-hardening-20260813_153600` (`0700`). The atomic installer
+  wrote mode `0755`; live/source SHA-256 matched
+  `e6fa7c886dc239bee412e40d1ce1983ef159ee5eca6f21e079d98c71397bf4a0`.
+- Post-install production series passed `20/20`. Five samples encountered a real one-shot external
+  blip and recovered within the bounded retry, directly exercising the change instead of merely
+  observing an all-green network window.
+- Three complete deploy-smoke runs and dry-run self-check passed. All application, Hermes, VPN and
+  watchdog roles remained active without restart; failed units were zero and production Git clean.
+- Final MCP acceptance also passed all exact profile matrices and confirmation negative probes;
+  relevant fresh application journals were empty.
 
 ## Rollback
 
-Restore `/usr/local/sbin/vpn-healthcheck.sh` from the protected installer backup. No service restart
+Restore `/usr/local/sbin/vpn-healthcheck.sh` from
+`/var/backups/albery/vpn/pre-healthcheck-hardening-20260813_153600`. No service restart
 is required. The pre-CHG-17 source archive remains independently available under
 `/var/backups/albery/pre-chg17-*`.
