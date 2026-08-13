@@ -66,3 +66,26 @@ not a replay queue.
 `_b24_message_claim` currently returns `True` when PostgreSQL fails. This protects availability but
 can double-run Hermes and external tools during a database degradation. The channel needs durable
 capture-before-ACK rather than either dropping the message or failing open.
+
+## Post-deploy control: 2026-08-13 17:24 MSK
+
+A read-only production control after deployment `208bac4` found no regression:
+
+- `albery`, `albery-tg`, `albery-web`, `albery-mcp`, `hermes-gateway`, Nginx, PostgreSQL and the
+  self-check timer are active; there are no failed systemd units;
+- bot/web/MCP health endpoints report `database=ok`; the complete deploy smoke ends in `SMOKE OK`
+  and self-check reports `clean`;
+- all nine private MCP endpoints preserve their exact expected tool counts, public and retired MCP
+  routes remain closed, VPN/provider reachability and the canonical signed-export check pass;
+- the OAuth state exists, parses as non-empty JSON and is owner-only `0600`; no credential content
+  was emitted by the check;
+- all 2,648 task events and all seven recorded automation runs are `done`; no active task event,
+  in-flight Bitrix turn, workspace queue item or manager-alert delivery remains;
+- the relevant service journals contain no warning-or-higher entry since deployment and the
+  production Git tree is clean at `208bac4`.
+
+No real message or CRM mutation was used for this control. There were no new Bitrix bot interactions
+between the deployment and the check, so this evidence proves runtime/infrastructure regression
+coverage but does not replace an explicitly approved recipient-visible round trip. The two open
+durability findings above remain pre-existing design risks and were not introduced by the OAuth
+change.
