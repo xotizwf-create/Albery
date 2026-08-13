@@ -4,6 +4,7 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-13
 
+- `approved` — [CHG-20260813-20](changes/CHG-20260813-20-client-telegram-iu-crm-lifecycle-audit.md): map and failure-test the complete client Telegram/Business -> IU state -> manager/AI -> CRM/outbox lifecycle without sending messages or mutating real CRM objects.
 - `deployed` — [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md): production `95daa1f` verifies the existing exact local/offsite artifact through the new SHA-256/pg_restore status and self-check, full smoke/services/journals are clean with no restart; the first natural 03:15 -> 03:45 cycle remains the `verified` gate.
 - `implemented_local` — [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md): prove the current offsite dump through two isolated restores and `pg_amcheck`, then implement atomic local/offsite publication, SHA-256/pg_restore verification, continuous backup-chain monitoring and an isolated-only routine restore helper; full local regression is `1968 passed, 46 skipped`.
 - `accepted` — [ADR-0008](decisions/ADR-0008-verified-postgresql-backup-chain.md): a completed backup is an atomically published, SHA-256 and pg_restore-verified artifact; routine restores may target only a new isolated database.

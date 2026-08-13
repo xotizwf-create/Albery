@@ -52,6 +52,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260813-17](changes/CHG-20260813-17-mcp-capability-rights-audit.md) | verified | Classify all MCP capabilities, freeze fail-closed per-agent caps and centrally guard consequential calls without changing live grants |
 | [CHG-20260813-18](changes/CHG-20260813-18-vpn-healthcheck-transient-hardening.md) | verified | Version and harden the VPN/provider healthcheck against proven one-shot false alarms while preserving fail-closed sustained-outage detection |
 | [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md) | deployed | Audit PostgreSQL and harden atomic local/offsite recovery with measured RPO/RTO; natural backup acceptance pending |
+| [CHG-20260813-20](changes/CHG-20260813-20-client-telegram-iu-crm-lifecycle-audit.md) | approved | Audit the full client Telegram/IU, manager handoff, media, CRM and durable-delivery lifecycle |
 
 ## Runbooks
 
