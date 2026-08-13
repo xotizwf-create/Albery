@@ -278,6 +278,19 @@ flowchart LR
 
 ## Current operational status
 
+- PostgreSQL recovery is deployed under
+  [ADR-0008](../decisions/ADR-0008-verified-postgresql-backup-chain.md) and
+  [CHG-20260813-19](../changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md). Production
+  has 185 public base tables, 905 indexes and 576 partitions in a 3.84 GB database. The current
+  255,991,381-byte local/offsite dump has matching SHA-256 and passes `pg_restore --list`; two
+  isolated PostgreSQL 16 restores produced the same 185-table structure and clean `pg_amcheck`.
+  New local/offsite jobs publish only private atomic artifacts after SHA-256 and archive validation,
+  and five-minute self-check monitors the chain. Routine restore is restricted to a new
+  `albery_restore_*` database. Worst-case RPO is about 24 hours; PITR/page checksums/replication are
+  not claimed, and the 95%-used one-copy offsite receiver must be expanded before WAL shipping or
+  longer retention. Production code and monitoring are deployed; `verified` awaits the first
+  natural 03:15 -> 03:45 cycle.
+
 - `hermes-gateway` uses a systemd-249-compatible bounded restart policy: a fixed 30-second delay and
   at most five starts per five minutes. Unsupported newer-systemd directives were removed. Deploy
   smoke and recurring self-check detect both effective-policy drift and their reappearance. Legacy

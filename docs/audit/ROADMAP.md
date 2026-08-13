@@ -21,7 +21,7 @@ when its production behavior is `verified`; code review or a green unit suite al
 | P0 | verified | Audit-record reconciliation | old CHG gates are amended from later evidence; historical records are explicitly superseded rather than silently rewritten |
 | P0 | acceptance | Employee channel acceptance | approved Bitrix native-file delivery and employee Telegram round trip; Telegram-to-Bitrix identity remains fail-closed until immutable IDs and person are confirmed |
 | P1 | verified | MCP capability and agent-rights matrix | every registered tool classified by data domain, read/write danger, confirmation, idempotency, object locking and exact agent grants |
-| P1 | in_progress | PostgreSQL and disaster recovery | schema/retention/PII/performance review plus isolated restore drill and measured RPO/RTO for local and offsite backups |
+| P1 | acceptance | PostgreSQL and disaster recovery | deployed atomic/SHA-256/pg_restore chain and isolated drill; first natural 03:15 -> 03:45 production cycle pending |
 | P1 | pending | Client Telegram/IU and CRM funnel | full customer-message, manager handoff, form, media, CRM and durable-outbox lifecycle including restart, provider ambiguity and overdue spool cleanup/reference safety |
 | P2 | pending | Bitrix business correctness | webhook deduplication, OAuth recovery, authorship, tasks, CRM/funnel mutations, partial failure and boundary cases |
 | P2 | pending | Zoom, Google and Wildberries | token expiry, API drift, quotas/rate limits, retry/idempotency, partial writes and observable recovery for each connector |

@@ -1,6 +1,6 @@
 # CHG-20260813-19: PostgreSQL and disaster-recovery audit
 
-- Status: implemented_local
+- Status: deployed
 - Date opened: 2026-08-13
 - Approval: the owner approved execution of the full audit roadmap and required every step and
   decision to be recorded
@@ -121,6 +121,8 @@ the audit record.
 - Focused backup/restore/health tests: `24 passed`.
 - Changed Python files: `pyflakes` clean; Python compile and Linux shell parse passed.
 - Full local regression: `1968 passed, 46 skipped`.
+- GitHub tests `31704684329` passed on PostgreSQL 14/Python 3.10 and PostgreSQL 16/Python
+  3.12; security audit `31704684323` passed.
 - Practical isolated backup -> SHA-256 -> restore -> `pg_amcheck` cycle passed.
 
 ## Known gaps
@@ -131,8 +133,12 @@ the audit record.
   must not be increased on the current disk.
 - Domain retention/erasure policy, WB bloat maintenance, connection pooling and PostgreSQL memory
   tuning remain explicitly routed to privacy/capacity workstreams.
-- Production deployment, CI and the first verified natural backup cycle are still pending; this
-  record must not become `verified` before those gates pass.
+- Production is deployed at `95daa1f`: protected pre-change files are in
+  `/var/backups/albery/code/pre-chg19-20260813_162705`, exact current local/offsite metadata was
+  seeded only after SHA-256 and both archive checks passed, `--verify-only`, backup health, full
+  deploy smoke, services and dry-run self-check are green, production Git is clean and no service
+  restarted. The first natural 03:15 -> 03:45 cycle is still pending; this record must not become
+  `verified` before that gate passes.
 
 ## Rollback
 
