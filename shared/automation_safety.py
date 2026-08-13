@@ -1,7 +1,7 @@
 """Conflict and idempotency boundary for MCP writes made by agent automations.
 
-Unknown tools are deliberately treated as mutating. Read-only names must be added to the
-allow-list below; this makes a new tool safe by default, at the cost of possible serialization.
+The semantic read/write decision comes from the exhaustive versioned MCP policy.  Unknown tools
+are deliberately treated as mutating, so a missed policy review can never bypass serialization.
 """
 from __future__ import annotations
 
@@ -20,14 +20,6 @@ from psycopg.types.json import Jsonb
 from shared.db import _session_options, database_url
 
 
-READ_ONLY_PREFIXES = (
-    "get_", "list_", "search_", "find_", "read_", "fetch_", "preview_",
-    "check_", "validate_", "calculate_", "compare_", "analyze_", "inspect_",
-)
-READ_ONLY_EXACT = {
-    "start_here_always_read_ai_instructions",
-    "health",
-}
 OBJECT_ID_KEYS = (
     "bitrix_task_id", "task_id", "parent_task_id", "deal_id", "lead_id", "contact_id",
     "company_id", "pipeline_id", "category_id", "conversation_id", "dialog_id", "chat_id",
@@ -48,8 +40,12 @@ class AutomationEffectAmbiguous(RuntimeError):
 
 
 def is_mutating_tool(name: str) -> bool:
-    normalized = str(name or "").strip().lower()
-    return normalized not in READ_ONLY_EXACT and not normalized.startswith(READ_ONLY_PREFIXES)
+    from mcp.tool_policy import policy_for
+
+    try:
+        return policy_for(name).effect != "read"
+    except KeyError:
+        return True
 
 
 def business_object_key(name: str, args: dict[str, Any]) -> str:

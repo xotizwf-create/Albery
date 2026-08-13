@@ -7,8 +7,10 @@ def test_unknown_tools_fail_safe_as_mutating():
     assert is_mutating_tool("brand_new_tool") is True
     assert is_mutating_tool("update_bitrix_task") is True
     assert is_mutating_tool("delete_crm_deal") is True
-    assert is_mutating_tool("get_bitrix_task") is False
+    # A read-looking but unreviewed name is still a write until it enters the policy.
+    assert is_mutating_tool("get_bitrix_task") is True
     assert is_mutating_tool("list_crm_deals") is False
+    assert is_mutating_tool("workspace_get_conversation") is False
 
 
 def test_related_writes_share_one_business_object_key():

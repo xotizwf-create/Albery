@@ -4,6 +4,9 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-13
 
+- `implemented_local` — [CHG-20260813-17](changes/CHG-20260813-17-mcp-capability-rights-audit.md): classify all 166 MCP capabilities, freeze fail-closed versioned caps without changing current effective grants, centralize 47 confirmation gates and add deploy/continuous drift checks plus complete inventories.
+- `accepted` — [ADR-0007](decisions/ADR-0007-exhaustive-mcp-policy-and-fail-closed-caps.md): unknown tools and missing agent manifests fail closed; individual DB switches remain the exact active capability source within a reviewed snapshot cap.
+
 - `approved` — [CHG-20260813-17](changes/CHG-20260813-17-mcp-capability-rights-audit.md): enumerate and classify every MCP tool and every active profile grant before changing permissions or invoking business actions.
 - `verified` — [CHG-20260813-16](changes/CHG-20260813-16-audit-record-reconciliation.md): CHG-05/07 are promoted only from direct CHG-12/13 successor acceptance; CHG-06/08 are explicitly superseded historical records; all real-recipient Telegram/native-file changes remain deployed.
 - `approved` — [CHG-20260813-16](changes/CHG-20260813-16-audit-record-reconciliation.md): reconcile stale intermediate statuses against successor production evidence while preserving the open employee Telegram/native-file acceptance boundary.

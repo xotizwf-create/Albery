@@ -72,3 +72,68 @@ def test_forwarded_public_request_is_hidden_even_with_valid_header(client, priva
 )
 def test_shared_and_sse_routes_are_retired(client, path):
     assert _tools_list(client, path).status_code == 404
+
+
+def test_self_delete_requires_confirmation_before_handler(client, private_agent, monkeypatch):
+    import agent_center
+
+    monkeypatch.setattr(
+        agent_center, "_agent_self_tool_names", lambda _agent: {"delete_my_instruction"}
+    )
+    called = []
+    monkeypatch.setattr(
+        agent_center,
+        "_agent_self_tool_call",
+        lambda *_args: called.append(True) or {"ok": True},
+    )
+    response = client.post(
+        "/mcp-agent/private-test",
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "delete_my_instruction",
+                "arguments": {"name": "old"},
+            },
+        },
+        headers={"Authorization": "Bearer agent-header-secret"},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["error"]["code"] == -32602
+    assert called == []
+
+
+def test_self_delete_schema_and_confirmed_dispatch(client, private_agent, monkeypatch):
+    import agent_center
+
+    monkeypatch.setattr(
+        agent_center, "_agent_self_tool_names", lambda _agent: {"delete_my_instruction"}
+    )
+    listed = _tools_list(
+        client,
+        "/mcp-agent/private-test",
+        {"Authorization": "Bearer agent-header-secret"},
+    ).get_json()["result"]["tools"]
+    schema = next(t for t in listed if t["name"] == "delete_my_instruction")["inputSchema"]
+    assert "confirm" in schema["required"]
+
+    monkeypatch.setattr(
+        agent_center,
+        "_agent_self_tool_call",
+        lambda _agent, _tool, args: {"confirmed": args["confirm"]},
+    )
+    response = client.post(
+        "/mcp-agent/private-test",
+        json={
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "delete_my_instruction",
+                "arguments": {"name": "old", "confirm": True},
+            },
+        },
+        headers={"Authorization": "Bearer agent-header-secret"},
+    )
+    assert response.get_json()["result"]["content"]

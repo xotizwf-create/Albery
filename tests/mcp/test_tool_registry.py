@@ -21,6 +21,59 @@ def test_every_tool_is_well_formed(ctx):
         assert callable(spec.get("handler")), f"{name}: handler must be callable"
 
 
+def test_every_registered_tool_has_versioned_semantic_policy(ctx):
+    from mcp.tool_policy import (
+        CONFIRMATION_REQUIRED,
+        OPTIONAL_REGULAR_TOOL_NAMES,
+        REGULAR_TOOL_NAMES,
+        policy_for,
+    )
+
+    assert set(ctx.TOOLS) <= set(REGULAR_TOOL_NAMES)
+    assert set(REGULAR_TOOL_NAMES) - set(ctx.TOOLS) <= set(OPTIONAL_REGULAR_TOOL_NAMES)
+    for name, spec in ctx.TOOLS.items():
+        policy = policy_for(name)
+        assert policy.domain
+        assert policy.effect in {
+            "read", "write", "destructive", "local-artifact-write",
+            "privileged-configuration",
+        }
+        if name in CONFIRMATION_REQUIRED:
+            schema = spec["inputSchema"]
+            assert "confirm" in schema.get("properties", {}), name
+            assert "confirm" in schema.get("required", []), name
+        if "confirm" in spec["inputSchema"].get("required", []):
+            assert name in CONFIRMATION_REQUIRED, name
+
+
+@pytest.mark.parametrize(
+    "tool",
+    (
+        "create_agent",
+        "delete_agent",
+        "send_telegram_message",
+        "set_agent_tools",
+        "share_drive_item_for_everyone",
+        "update_ai_capabilities",
+    ),
+)
+def test_consequential_tools_fail_before_handler_without_confirmation(ctx, monkeypatch, tool):
+    called = []
+    monkeypatch.setitem(ctx.TOOLS[tool], "handler", lambda _args: called.append(True))
+    response = ctx.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 91,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": {}},
+        },
+        tool_names={tool},
+        allow_owner_tools=True,
+    )
+    assert response["error"]["code"] == -32602
+    assert called == []
+
+
 def test_faq_is_a_genuine_subset_of_full(ctx):
     full = set(ctx.TOOLS)
     faq = set(ctx.FAQ_TOOL_NAMES)

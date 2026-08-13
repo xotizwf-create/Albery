@@ -2055,6 +2055,31 @@ def agent_center_create_agent():
         logging.exception("agent create: db insert failed")
         return jsonify({"error": "Не удалось сохранить агента."}), 500
 
+    # Write the versioned upper bound before any external connector is created. The row
+    # starts in DB mode 'base'; this snapshot only permits owner toggles among reviewed
+    # current tools and prevents tools from a future deploy appearing automatically.
+    try:
+        from agent_knowledge import save_manifest
+        from mcp.tool_policy import REVIEWED_TOOL_NAMES
+
+        save_manifest(slug, [], [], tools=sorted(REVIEWED_TOOL_NAMES))
+        registry_git_sync(f"agent {slug}: create reviewed tool cap")
+    except Exception:  # noqa: BLE001
+        logging.exception("agent create: versioned tool cap failed")
+        try:
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE agents SET is_active = FALSE, updated_at = now() WHERE id = %s",
+                        (agent_id,),
+                    )
+        except Exception:  # noqa: BLE001
+            logging.exception("agent create: failed to deactivate row without a manifest")
+        _agent_cache_bust()
+        return jsonify({
+            "error": "Агент не активирован: не удалось создать безопасный реестр прав."
+        }), 500
+
     warnings = []
     bot_id = None
     try:
@@ -2828,7 +2853,7 @@ def _with_companion_tools(names: set[str]) -> set[str]:
 
 
 def _agent_manifest_tool_cap(agent: dict[str, Any]) -> set[str] | None:
-    """Versioned connector cap, or ``None`` for a legacy uncapped manifest."""
+    """Versioned connector cap; valid profiles are fail-closed when it is absent."""
     slug = str(agent.get("slug") or "").strip()
     if not slug:
         return None
@@ -2843,9 +2868,8 @@ def _agent_allowed_pool(agent: dict[str, Any]) -> set[str]:
     """The tools an agent may be given.
 
     A versioned manifest ``tools`` list is a hard upper bound when present. The
-    operational DB whitelist can narrow that cap, never expand it. Manifests that
-    predate the field keep the legacy full registry pool; customer-facing strict
-    agents are made fail-closed by :func:`agent_knowledge.load_manifest`.
+    operational DB whitelist can narrow that cap, never expand it. Missing and legacy
+    manifests load as an empty cap, so a configuration error removes authority.
     """
     from mcp.context_server import TOOLS
     pool = set(TOOLS)
@@ -3003,6 +3027,12 @@ def mcp_agent_http(slug: str):
         if tool in self_tool_names:
             args = ((payload.get("params") or {}).get("arguments")) or {}
             try:
+                from mcp.tool_policy import requires_confirmation
+
+                if requires_confirmation(tool) and args.get("confirm") is not True:
+                    raise ValueError(
+                        "Без явного подтверждения действие запрещено; передайте confirm=true."
+                    )
                 result = _agent_self_tool_call(agent, tool, args)
                 import json as _json
                 body = {"jsonrpc": "2.0", "id": req_id,
@@ -3343,6 +3373,11 @@ if os.getenv("ENSURE_MAIN_AGENT", "1").strip() != "0":
 import agent_automations as _agent_automations  # noqa: E402
 
 _SELF_TOOL_SPECS.update(_agent_automations.AUTOMATION_SELF_TOOL_SPECS)
+
+from mcp.tool_policy import apply_confirmation_schemas, validate_registry  # noqa: E402
+
+validate_registry(set(_SELF_TOOL_SPECS), regular=False)
+apply_confirmation_schemas(_SELF_TOOL_SPECS)
 
 # Agent-owned scheduler for recurring Bitrix tasks: starts its minute-tick thread at import (same
 # process as the MCP tools). Recurring tasks are fired by us — the portal has no Bitrix subscription

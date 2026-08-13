@@ -133,6 +133,8 @@ except Exception as exc:  # noqa: BLE001
 
 try:
     from agent_center import _agent_by_slug, _agent_self_tool_names, _agent_tool_names
+    from agent_knowledge import AGENTS_DIR, load_manifest
+    from mcp.tool_policy import REVIEWED_TOOL_NAMES, ZERO_TOOL_AGENT_SLUGS
 
     with connect() as conn:
         with conn.cursor() as cur:
@@ -141,6 +143,19 @@ try:
     for row in active_agents:
         slug = str(row["slug"])
         token = str(row.get("mcp_token") or "").strip()
+        manifest_path = AGENTS_DIR / f"{slug}.yaml"
+        try:
+            raw_manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:  # noqa: BLE001
+            raw_manifest = {}
+            failures.append(f"agent-{slug}: versioned manifest unreadable ({type(exc).__name__})")
+        cap = set(load_manifest(slug).get("tools") or [])
+        if not isinstance(raw_manifest, dict) or not isinstance(raw_manifest.get("tools"), list):
+            failures.append(f"agent-{slug}: versioned tool cap is absent")
+        elif cap - set(REVIEWED_TOOL_NAMES):
+            failures.append(f"agent-{slug}: tool cap contains unreviewed names")
+        elif not cap and slug not in ZERO_TOOL_AGENT_SLUGS:
+            failures.append(f"agent-{slug}: operational profile has an empty tool cap")
         connector = mcp_servers.get(f"agent-{slug}")
         automation_connector = mcp_servers.get(f"automation-agent-{slug}")
         if not token:

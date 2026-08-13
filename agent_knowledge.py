@@ -239,30 +239,24 @@ def load_skill_content(skill_id: str) -> str | None:
 # for the capability panel and for enforcement, so a doc an agent is not connected
 # to is neither injected nor returned by start_here.
 
-# Customer input is untrusted. These agents must never fall back to the broad DB
-# whitelist merely because their versioned manifest is missing or malformed.
-STRICT_TOOL_MANIFEST_SLUGS: frozenset[str] = frozenset({
-    "albery-ai-bot",
-    "iu-customer-runtime",
-})
+# Every model-facing profile is fail-closed.  An absent or malformed versioned manifest
+# must never turn into the whole registry merely because a DB row or mode still exists.
+# The two customer runtimes intentionally keep an empty cap; operational profiles receive
+# a reviewed snapshot cap when they are created and DB switches select the active subset.
 
 def _manifest_path(slug: str) -> Path:
     return AGENTS_DIR / f"{slug}.yaml"
 
 
 def _empty_manifest(slug: str) -> dict[str, list[str]]:
-    manifest: dict[str, list[str]] = {"instructions": [], "skills": []}
-    if slug in STRICT_TOOL_MANIFEST_SLUGS:
-        manifest["tools"] = []
-    return manifest
+    return {"instructions": [], "skills": [], "tools": []}
 
 
 def load_manifest(slug: str) -> dict[str, list[str]]:
     """Connected knowledge and optional tool cap for one agent.
 
-    Legacy manifests without ``tools`` keep their DB-driven behaviour. Strict
-    customer agents are fail-closed: a missing, malformed or invalid manifest
-    means an empty tool cap, never the broad operational preset.
+    Missing, malformed and legacy manifests without ``tools`` are fail-closed.  A DB
+    whitelist can narrow a versioned cap but can never substitute for an absent cap.
     """
     path = _manifest_path(slug)
     if not path.is_file():
@@ -285,12 +279,18 @@ def load_manifest(slug: str) -> dict[str, list[str]]:
             # A typo in a security cap must remove power, not restore the DB list.
             raw_tools = []
         manifest["tools"] = [str(x) for x in raw_tools if str(x).strip()]
-    elif slug in STRICT_TOOL_MANIFEST_SLUGS:
+    else:
         manifest["tools"] = []
     return manifest
 
 
-def save_manifest(slug: str, instructions: list[str], skills: list[str]) -> Path:
+def save_manifest(
+    slug: str,
+    instructions: list[str],
+    skills: list[str],
+    *,
+    tools: list[str] | None = None,
+) -> Path:
     """Persist an agent's connected instructions/skills as a readable yaml manifest.
     Written to the working tree; a watchdog commits+pushes it to GitHub (history).
 
@@ -306,8 +306,7 @@ def save_manifest(slug: str, instructions: list[str], skills: list[str]) -> Path
         "instructions": sorted(set(instructions)),
         "skills": sorted(set(skills)),
     }
-    if "tools" in existing:
-        payload["tools"] = sorted(set(existing["tools"]))
+    payload["tools"] = sorted(set(existing["tools"] if tools is None else tools))
     path.write_text(
         yaml.safe_dump(payload, allow_unicode=True, sort_keys=False, default_flow_style=False),
         encoding="utf-8",

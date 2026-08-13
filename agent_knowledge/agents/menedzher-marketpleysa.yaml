@@ -1,9 +1,6 @@
-slug: agent-sklad
-instructions:
-- Юридические документы / Подготовка договоров и претензий
-- Юридические документы / Проверка условий и оферт контрагентов
-skills:
-- skill:legal-contract-drafting
+slug: menedzher-marketpleysa
+instructions: []
+skills: []
 tools:
 - add_bitrix_task_comment
 - add_deal_comment

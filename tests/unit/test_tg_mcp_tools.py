@@ -134,7 +134,7 @@ def test_mcp_tools_are_registered_and_explain_the_limitation(ctx):
     assert "@AlberyAIManager" in send["description"]
     assert "не позволяет боту искать" in send["description"], "агент должен знать про ограничение"
     assert "не выдумывай id" in send["description"]
-    assert set(send["inputSchema"]["required"]) == {"to", "text"}
+    assert set(send["inputSchema"]["required"]) == {"to", "text", "confirm"}
     assert callable(ctx.TOOLS["list_telegram_contacts"]["handler"])
 
 

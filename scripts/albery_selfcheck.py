@@ -40,6 +40,7 @@ import requests
 from dotenv import load_dotenv
 
 BASE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE))
 load_dotenv(BASE / ".env")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -258,6 +259,39 @@ else:
             problems.append(f"ходы дольше 5 минут: {slow}")
 
 # --- Оперативная память ------------------------------------------------------------------
+# --- Versioned MCP capability caps ---------------------------------------------------------
+# Missing/malformed manifests remove power, but that safe failure is still an outage for an
+# operational profile and therefore needs an alert rather than silent zero-tool answers.
+try:
+    from agent_knowledge import AGENTS_DIR, load_manifest
+    from mcp.tool_policy import REVIEWED_TOOL_NAMES, ZERO_TOOL_AGENT_SLUGS
+
+    active_slugs = [
+        value.strip()
+        for value in sh([
+            "sudo", "-u", "postgres", "psql", "albery", "-tAc",
+            "SELECT slug FROM agents WHERE is_active ORDER BY slug",
+        ]).splitlines()
+        if value.strip()
+    ]
+    for slug in active_slugs:
+        path = AGENTS_DIR / f"{slug}.yaml"
+        source = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if not source or "\ntools:" not in "\n" + source:
+            problems.append(f"КРИТИЧНО: у активного агента {slug} нет versioned MCP cap")
+            critical = True
+            continue
+        cap = set(load_manifest(slug).get("tools") or [])
+        if cap - set(REVIEWED_TOOL_NAMES):
+            problems.append(f"КРИТИЧНО: MCP cap агента {slug} содержит непроверенные инструменты")
+            critical = True
+        elif not cap and slug not in ZERO_TOOL_AGENT_SLUGS:
+            problems.append(f"КРИТИЧНО: рабочий агент {slug} остался без MCP-инструментов")
+            critical = True
+except Exception as exc:  # noqa: BLE001
+    problems.append(f"КРИТИЧНО: не удалось проверить versioned MCP caps ({type(exc).__name__})")
+    critical = True
+
 for line in sh(["free", "-m"]).splitlines():
     if line.startswith("Mem:"):
         available_mb = int(line.split()[-1])

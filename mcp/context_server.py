@@ -12962,6 +12962,14 @@ TOOLS.update(AGENT_MGMT_TOOL_SPECS)
 # 'admin' chip + confirm in the UI; only reach an agent whose owner explicitly enabled them.
 OWNER_ONLY_TOOL_NAMES.update(AGENT_MGMT_TOOL_SPECS.keys())
 
+# Semantic policy is deliberately separate from handler code: every registry name must be
+# reviewed there before it can be exposed, and consequential operations advertise the same
+# mandatory confirmation contract that the dispatcher enforces below.
+from mcp.tool_policy import apply_confirmation_schemas, validate_registry  # noqa: E402
+
+validate_registry(set(TOOLS), regular=True)
+apply_confirmation_schemas(TOOLS)
+
 
 META_TOOL_SPECS: dict[str, dict[str, Any]] = {
     "find_tool": {
@@ -13162,10 +13170,11 @@ def handle_request(request: dict[str, Any], tool_names: set[str] | None = None,
             # Reject obviously unconfirmed destructive calls before taking a business lock or
             # opening any integration connection. Handlers keep their detailed confirm gates;
             # this is a central fail-fast backstop, not a replacement for them.
-            schema_required = set(available_tools[name].get("inputSchema", {}).get("required") or [])
+            from mcp.tool_policy import requires_confirmation
+
             destructive_action = str(args.get("action") or "").strip().lower() == "delete"
             if (
-                ("confirm" in schema_required or str(name).startswith("delete_") or destructive_action)
+                (requires_confirmation(name) or destructive_action)
                 and args.get("confirm") is not True
             ):
                 raise McpError(-32602, "Без явного подтверждения действие запрещено; передайте confirm=true.")

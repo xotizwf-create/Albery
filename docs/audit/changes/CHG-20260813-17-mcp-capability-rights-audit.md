@@ -1,8 +1,8 @@
 # CHG-20260813-17: MCP capability and agent-rights audit
 
-- Status: approved
+- Status: implemented_local
 - Date opened: 2026-08-13
-- Related decisions: [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md), [ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md)
+- Related decisions: [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md), [ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md), [ADR-0007](../decisions/ADR-0007-exhaustive-mcp-policy-and-fail-closed-caps.md)
 - Bitrix engineering task: pending; no external task mutation is approved yet
 
 ## Goal
@@ -33,9 +33,49 @@ capabilities required by its role with correct confirmation, idempotency and con
 
 ## Changed boundaries and files
 
-Initial phase is read-only across `mcp/`, agent manifest/configuration, production capability tables
-and generated connector sets. Any remediation will be added here before implementation; a new ADR is
-required if the capability model or public/private boundary changes.
+Discovery was read-only across `mcp/`, agent manifest/configuration, production capability tables
+and generated connector sets. The approved remediation now changes these boundaries:
+
+- `mcp/tool_policy.py` is the exhaustive semantic policy for 160 regular and six self-service tools;
+- `mcp/context_server.py` applies policy schemas and rejects consequential calls centrally;
+- `shared/automation_safety.py` uses policy effects instead of read-looking name prefixes;
+- `agent_knowledge.py`, every `agent_knowledge/agents/*.yaml` and new-agent creation make tool caps
+  mandatory and fail closed;
+- `scripts/deploy_smoke.py` and `scripts/albery_selfcheck.py` watch policy/cap drift;
+- [MCP capability inventory](../inventories/MCP_CAPABILITIES.md) describes every function;
+- [production grant matrix](../inventories/MCP_AGENT_GRANTS.md) records every effective profile/tool
+  combination observed before rollout.
+
+## Findings
+
+- Production exposed exactly 160 regular tools plus six per-profile self-service tools.
+- All nine private connectors exactly matched their calculated DB/manifest set: counts were 110,
+  137, 166, 109, 0, 0, 116, 141 and 20 in slug order recorded by the matrix.
+- Seven operational manifests had no `tools` cap. Two active slugs had no same-name manifest at all.
+  `agent-razrabotchik` used `max`, so a future registry addition was an automatic grant.
+- The old automation classifier used read-looking prefixes. It safely over-serialized
+  `workspace_get_*`, but a future mutation with a read-looking name could bypass the intended lock.
+- Several administrative, permission-changing and external-communication tools did not advertise
+  or uniformly enforce confirmation. Delete tools were centrally rejected by name, but four delete
+  schemas could not tell the model how to confirm.
+- Current role grants are broad: finance, lawyer, main and marketplace profiles expose 109-141
+  tools. They are now exactly documented and protected against future auto-grant, but aggressive
+  role narrowing was not guessed because it could silently remove legitimate employee workflows.
+
+## Implemented behavior
+
+- 166/166 names are classified: 77 read, 55 ordinary write, 17 privileged configuration,
+  11 destructive and six local-artifact writes across explicit data domains.
+- 47 consequential tools now require `confirm=true` in both model-visible schema and dispatcher.
+  This includes destructive, agent/permission, organization, Telegram send/join, contract/terms,
+  public Drive sharing and management-dispatch operations.
+- Unknown tools fail closed as mutating. All regular writes keep the cross-process object lock; an
+  automation write additionally keeps its per-run effect fingerprint/ledger.
+- Every versioned agent YAML has an explicit cap. Seven operational caps freeze the current
+  166-name reviewed maximum, while both customer runtimes remain empty. Individual DB switches still
+  determine the exact active subset, so the constructor remains on/off rather than fixed presets.
+- Missing/malformed caps resolve to zero. New-agent creation writes the reviewed snapshot before
+  external connectors and deactivates the row if that step fails.
 
 ## Safety and privacy
 
@@ -55,6 +95,18 @@ required if the capability model or public/private boundary changes.
 5. Run full local regression, PostgreSQL 14/16 and security CI, then production negative/structural
    acceptance without writing live business data.
 
+### Evidence so far
+
+- Production read-only inventory: 160 regular + six self tools; nine direct `tools/list` results
+  exactly matched their calculated sets. No business tool was invoked.
+- Pre-deploy production simulation applied the new caps to the live DB modes/lists: all nine profiles
+  reported `before == after` with the same counts.
+- Focused policy/manifest/HTTP tests: `100 passed`.
+- Full local regression: `1955 passed, 44 skipped`; PostgreSQL-marked tests remain for CI.
+- Python compile and `git diff --check`: clean. New policy/inventory files have zero pyflakes issues;
+  the unchanged repository baseline findings remain outside this change.
+- CI, production backup/deploy, post-restart smoke/self-check and negative calls are pending.
+
 ## Risks
 
 - A name-based classifier can label a dangerous tool as read-only.
@@ -64,10 +116,15 @@ required if the capability model or public/private boundary changes.
 
 ## Rollback
 
-Discovery has no rollback. Any later manifest/permission change will preserve the pre-change DB rows,
-config and commit, and will be reverted per profile at an empty-work gate.
+Before production mutation, preserve the prior commit and affected source/manifests under
+`/var/backups/albery/pre-chg17-<timestamp>`. Roll back by returning to the prior commit and restarting
+`albery`, `albery-mcp`, `albery-web` and `albery-tg` at the empty-work gate. No DB rows are changed by
+this rollout. If only the new confirmation policy causes an incompatibility, revert the code commit;
+the cap snapshot can remain because the pre-deploy simulation proves it preserves all current sets.
 
 ## Known gaps and follow-up
 
-This audit covers agent capability exposure and generic mutation safety. Bitrix/Zoom/Google/WB
-provider correctness, prompt injection and data retention remain separate roadmap workstreams.
+This audit covers capability exposure and generic mutation safety. Broad role grants are documented
+but not silently narrowed; provider-specific correctness and prompt injection remain separate roadmap
+workstreams. A real employee request that exercises a newly-confirmed operation is not required for
+safe structural acceptance because no external write may be triggered without exact preview/approval.

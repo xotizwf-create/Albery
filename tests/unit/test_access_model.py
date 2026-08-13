@@ -18,6 +18,12 @@ import pytest
 import agent_center as ac
 
 
+@pytest.fixture(autouse=True)
+def _uncapped_policy_for_mode_unit_tests(monkeypatch):
+    """These tests isolate DB mode math; manifest fail-closed behavior is tested separately."""
+    monkeypatch.setattr(ac, "_agent_manifest_tool_cap", lambda _agent: None)
+
+
 # --- Базовый и максимальный набор ------------------------------------------------------
 
 def test_bazovyy_nabor_est_u_lyubogo_agenta():

@@ -11,6 +11,11 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 5. [Chronological changelog](CHANGELOG.md)
 6. [Full audit roadmap](ROADMAP.md)
 
+## Inventories
+
+- [All 166 MCP capabilities](inventories/MCP_CAPABILITIES.md)
+- [Exact production agent/tool grants](inventories/MCP_AGENT_GRANTS.md)
+
 ## Decisions
 
 | ID | Status | Decision |
@@ -21,6 +26,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [ADR-0004](decisions/ADR-0004-durable-conflict-safe-agent-automations.md) | accepted | Agent automations use durable stages, the shared heavy-process limit and fail-closed idempotency |
 | [ADR-0005](decisions/ADR-0005-channel-neutral-agent-runtime.md) | accepted | Bitrix and employee Telegram are channel adapters for one logical agent profile |
 | [ADR-0006](decisions/ADR-0006-channel-native-artifact-delivery.md) | accepted | Generated files are delivered as native channel attachments, not employee-facing bearer links |
+| [ADR-0007](decisions/ADR-0007-exhaustive-mcp-policy-and-fail-closed-caps.md) | accepted | Every MCP tool is semantically classified and every agent cap fails closed |
 
 ## Changes
 
