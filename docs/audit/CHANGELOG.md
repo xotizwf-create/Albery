@@ -4,6 +4,7 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-13
 
+- `approved` — [CHG-20260813-17](changes/CHG-20260813-17-mcp-capability-rights-audit.md): enumerate and classify every MCP tool and every active profile grant before changing permissions or invoking business actions.
 - `verified` — [CHG-20260813-16](changes/CHG-20260813-16-audit-record-reconciliation.md): CHG-05/07 are promoted only from direct CHG-12/13 successor acceptance; CHG-06/08 are explicitly superseded historical records; all real-recipient Telegram/native-file changes remain deployed.
 - `approved` — [CHG-20260813-16](changes/CHG-20260813-16-audit-record-reconciliation.md): reconcile stale intermediate statuses against successor production evidence while preserving the open employee Telegram/native-file acceptance boundary.
 - `verified` — [CHG-20260813-15](changes/CHG-20260813-15-hermes-restart-production-hygiene.md): production now enforces a systemd-249-compatible `30s` restart delay and `5/5min` start limit; unsupported keys are gone, 12 legacy artifacts are protected outside Git, all roles/smoke/self-check pass and relevant fresh error journals are empty.

@@ -42,6 +42,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260812-14](changes/CHG-20260812-14-mcp-discovery-and-stale-file-recovery.md) | deployed | Scope one-shot/gateway MCP discovery and rebuild old generated-file requests instead of echoing expired URLs |
 | [CHG-20260813-15](changes/CHG-20260813-15-hermes-restart-production-hygiene.md) | verified | Make Hermes restart control compatible with systemd 249 and separate runtime/backup artifacts from the production Git tree |
 | [CHG-20260813-16](changes/CHG-20260813-16-audit-record-reconciliation.md) | verified | Reconcile historical CHG statuses against later production acceptance without overstating open employee-channel scenarios |
+| [CHG-20260813-17](changes/CHG-20260813-17-mcp-capability-rights-audit.md) | approved | Audit every MCP tool and the effective rights of all active agent profiles, then harden unsafe gaps |
 
 ## Status rule
 
