@@ -4,6 +4,7 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-13
 
+- `approved` — [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md): inventory PostgreSQL schema/growth/PII/performance and local/offsite backups, then prove recovery with an isolated restore and measured RPO/RTO without touching production data.
 - `verified` — [CHG-20260813-18](changes/CHG-20260813-18-vpn-healthcheck-transient-hardening.md): protected live install with no restart; exact checksum/mode passed, post-change health series improved from `17/20` to `20/20` while recovering five observed one-shot blips, three full smokes and self-check passed.
 - `verified` — [CHG-20260813-17](changes/CHG-20260813-17-mcp-capability-rights-audit.md): production preserves all nine exact grant counts under explicit fail-closed caps; dangerous no-confirm calls are rejected before handlers, smoke/self-check and journals pass, and rollback source is protected.
 - `implemented_local` — [CHG-20260813-18](changes/CHG-20260813-18-vpn-healthcheck-transient-hardening.md): a 20-run production series proved three one-shot OpenAI HTTP `000` false alarms despite the correct VPN exit and route; version the healthcheck, verify the full policy route, require exact HTTP 401 and use a bounded three-attempt external probe.
