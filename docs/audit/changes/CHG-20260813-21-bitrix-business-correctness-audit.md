@@ -89,3 +89,29 @@ between the deployment and the check, so this evidence proves runtime/infrastruc
 coverage but does not replace an explicitly approved recipient-visible round trip. The two open
 durability findings above remain pre-existing design risks and were not introduced by the OAuth
 change.
+
+## Owner-visible live round trip: 2026-08-13 17:29 MSK
+
+The owner explicitly approved a constrained live acceptance. The public authenticated Bitrix app
+webhook received one synthetic `ONIMBOTMESSAGEADD` event as Alexander Nikitenko (`user_id=16`) for
+the main Albery bot (`bot_id=24`) in the existing private dialog. The exact request prohibited tools
+and external actions and required the exact answer `Тест Albery пройден`.
+
+- the first public webhook call returned HTTP 200 with `accepted=true`;
+- an immediate redelivery of the same synthetic message id returned HTTP 200 with
+  `duplicate=true`;
+- PostgreSQL contains exactly one first-sight claim, one inbound journal row and one matching
+  interaction, proving the duplicate did not start a second turn;
+- Hermes completed in 13,610 ms with status `ok`, no error and exactly the required answer;
+- Bitrix accepted exactly one final outbound message for the owner and returned provider message id
+  `45262`; the same exact text is present once in the outbound journal;
+- no in-flight row remained, there was no warning-or-higher service log entry, all queues stayed
+  empty, all seven automations and 2,648 task events stayed `done`;
+- the post-send full smoke again ended in `SMOKE OK`, self-check was `clean`, all services and three
+  role health endpoints remained healthy.
+
+The synthetic inbound text exists in the internal immutable journal but was not posted as a visible
+human chat message; the bot's reply was a real provider-visible Bitrix message to the approved owner.
+No task, CRM object, automation or third-party recipient was changed. This closes the ordinary
+Bitrix private-chat live round-trip acceptance gap. It does not close Findings 2 and 3, which concern
+crash/database-degradation durability and still require implementation.
