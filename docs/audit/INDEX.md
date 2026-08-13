@@ -30,10 +30,10 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260810-02](changes/CHG-20260810-02-nanoid-security-update.md) | verified | Update locked nanoid after the mandatory security gate detected a high-severity advisory |
 | [CHG-20260810-03](changes/CHG-20260810-03-independent-acceptance-hardening.md) | verified | Independently re-test and harden all quality-routing paths |
 | [CHG-20260810-04](changes/CHG-20260810-04-private-per-agent-mcp.md) | verified | Retire shared MCP sets and make per-agent MCP private |
-| [CHG-20260811-05](changes/CHG-20260811-05-vpn-routing-automation-recovery.md) | deployed | Restore VPN policy routing and recover model-backed automations; three live acceptance gates remain |
-| [CHG-20260811-06](changes/CHG-20260811-06-bitrix-agent-automation-diagram.md) | implemented_local | Document Bitrix per-agent routing and the independent agent-automation lane |
-| [CHG-20260811-07](changes/CHG-20260811-07-durable-conflict-safe-agent-automations.md) | deployed | Put agent automations under the shared limit and make queue, retry and effects durable/conflict-safe |
-| [CHG-20260811-08](changes/CHG-20260811-08-telegram-agent-architecture-audit.md) | implemented_local | Audit all Telegram contours, profile/permission mapping, delivery reliability and automation destinations |
+| [CHG-20260811-05](changes/CHG-20260811-05-vpn-routing-automation-recovery.md) | verified | Restore VPN policy routing and recover model-backed automations; successor acceptance closed the original gates |
+| [CHG-20260811-06](changes/CHG-20260811-06-bitrix-agent-automation-diagram.md) | superseded | Historical Bitrix per-agent/independent-automation diagram replaced by the durable shared-limit architecture |
+| [CHG-20260811-07](changes/CHG-20260811-07-durable-conflict-safe-agent-automations.md) | verified | Put agent automations under the shared limit and make queue, retry and effects durable/conflict-safe |
+| [CHG-20260811-08](changes/CHG-20260811-08-telegram-agent-architecture-audit.md) | superseded | Historical Telegram before-state audit replaced by the channel-neutral runtime and final transport decision |
 | [CHG-20260811-09](changes/CHG-20260811-09-channel-neutral-telegram-agents.md) | deployed | Implement one Bitrix/Telegram profile, closed access, durable Telegram delivery and typed automation destinations |
 | [CHG-20260812-10](changes/CHG-20260812-10-verified-agent-links.md) | verified | Repair signed export links broken by the dark legacy MCP hostname and add public round-trip smoke |
 | [CHG-20260812-11](changes/CHG-20260812-11-channel-native-artifacts.md) | deployed | Deliver generated files as Bitrix/Telegram attachments and remove legacy MCP-host export compatibility |
@@ -41,7 +41,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md) | deployed | Retire redundant native Hermes Telegram and complete explicit channel identity acceptance |
 | [CHG-20260812-14](changes/CHG-20260812-14-mcp-discovery-and-stale-file-recovery.md) | deployed | Scope one-shot/gateway MCP discovery and rebuild old generated-file requests instead of echoing expired URLs |
 | [CHG-20260813-15](changes/CHG-20260813-15-hermes-restart-production-hygiene.md) | verified | Make Hermes restart control compatible with systemd 249 and separate runtime/backup artifacts from the production Git tree |
-| [CHG-20260813-16](changes/CHG-20260813-16-audit-record-reconciliation.md) | approved | Reconcile historical CHG statuses against later production acceptance without overstating open employee-channel scenarios |
+| [CHG-20260813-16](changes/CHG-20260813-16-audit-record-reconciliation.md) | verified | Reconcile historical CHG statuses against later production acceptance without overstating open employee-channel scenarios |
 
 ## Status rule
 

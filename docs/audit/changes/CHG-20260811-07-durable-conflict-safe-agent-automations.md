@@ -1,6 +1,6 @@
 # CHG-20260811-07: Durable and conflict-safe agent automations
 
-- Status: deployed
+- Status: verified
 - Date opened: 2026-08-11
 - Related decisions: [ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md)
 - Bitrix engineering task: pending
@@ -174,3 +174,16 @@ forensics; they are additive and old code does not read them.
 - Result/effect history retention requires a separate policy; no automatic deletion was introduced.
 - Production rollout is complete. Remaining acceptance is a controlled reversible live automation,
   not another schema or runtime deployment.
+
+## Amendment 2026-08-13: production acceptance completed by CHG-12
+
+CHG-12 executed the missing controlled production scenario through the real
+`automation-agent-main` private MCP boundary. One local-only `export_document` effect was recorded
+exactly once in the durable ledger and the disposable run/file rows were removed. The heavy Zoom
+cron entered the same PostgreSQL slots through its reviewed checksum-pinned wrapper and completed a
+natural run. Automations 36 and 59 also completed/delivered naturally without historical replay.
+
+The known external ambiguous-outcome/manual-review behavior, per-call lock granularity and retention
+policy are explicit design constraints/follow-up work, not evidence that the durable runtime failed
+acceptance. Current 2026-08-13 deploy smoke again verifies the wrapper, private connectors, service
+health and shared infrastructure. This change is therefore `verified`.

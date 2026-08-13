@@ -1,6 +1,6 @@
 # CHG-20260811-08: Telegram agent architecture audit
 
-- Status: implemented_local
+- Status: superseded
 - Date opened: 2026-08-11
 - Related decisions: [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md), [ADR-0004](../decisions/ADR-0004-durable-conflict-safe-agent-automations.md)
 - Bitrix engineering task: not required for a read-only audit; any runtime correction gets its own task/change
@@ -186,3 +186,12 @@ runtime, database, token, bot registration or production service change is autho
   server-wide run limit before calling all automations conflict-safe.
 - Any runtime correction requires a separate approved CHG, backup, tests, CI, deployment and live
   acceptance; this audit deliberately makes no production claim beyond inherited evidence.
+
+## Amendment 2026-08-13: superseded by the implemented channel architecture
+
+This read-only record remains the authoritative historical before-state. Its remediation target was
+implemented by CHG-09 (one logical Bitrix/Telegram profile, fail-closed stable identity, durable
+intake/outbox and typed automation destinations), CHG-12 (shared heavy-system limit) and CHG-13
+(explicit retirement of the duplicate rejected native Hermes transport). It is therefore
+`superseded`, not `verified`: the still-open first user-visible employee Telegram round trip belongs
+to CHG-09/13 and remains `deployed` until an approved recipient/message preview exists.

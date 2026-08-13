@@ -1,6 +1,6 @@
 # CHG-20260811-06: Bitrix agent and automation diagram
 
-- Status: implemented_local
+- Status: superseded
 - Date opened: 2026-08-11
 - Related decisions: [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md)
 - Bitrix engineering task: not created; this change documents existing production behavior
@@ -80,3 +80,11 @@ actual automation rows, schedules, recipients, tool dependencies, last results a
 Its independent in-memory lane description is the verified pre-change snapshot and is superseded
 for the locally implemented target by
 [CHG-20260811-07](CHG-20260811-07-durable-conflict-safe-agent-automations.md).
+
+## Amendment 2026-08-13: superseded
+
+This record remains the historical before-state diagram, but it is no longer a pending local target.
+CHG-07 replaced the independent in-memory lane with durable PostgreSQL stages and the shared limit;
+CHG-09 added channel-neutral Telegram profiles, and CHG-12 verified both the durable automation lane
+and the remaining heavy system cron. The current diagrams live in `architecture/CURRENT.md` and the
+master architecture. No production behavior is rolled back or removed by this status correction.

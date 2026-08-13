@@ -1,6 +1,6 @@
 # CHG-20260811-05: VPN routing and automation recovery
 
-- Status: deployed
+- Status: verified
 - Date opened: 2026-08-11
 - Incident window: confirmed at 2026-08-11 09:00 MSK; exact start is still under investigation
 - Related decisions: [ADR-0002](../decisions/ADR-0002-codex-reasoning-groq-media.md), [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md)
@@ -148,3 +148,21 @@ owner must confirm that resend after reviewing the affected automation.
 Restore the backed-up watchdog and run `/root/vpn_rollback.sh` only if the repaired routing breaks
 public service return paths. The application code and private MCP migration do not need rollback
 for this incident.
+
+## Amendment 2026-08-13: successor evidence closed the original gates
+
+This record is now `verified`; no failed employee output was replayed to obtain that status.
+
+1. The rejected native Hermes Telegram token belonged to a redundant transport. CHG-13 retired that
+   credential explicitly after backup and proved the active channel-neutral employee profile with
+   provider identity/access checks. Restoring the duplicate token is no longer the target state.
+2. CHG-12 observed automation 36 complete and deliver its normal 2026-08-12 09:00 run and automation
+   59 complete/deliver its normal 14:30 run. Historical failed runs remain truthful and unreplayed.
+3. CHG-12 put the heavy Zoom job behind the versioned checksum-pinned wrapper and shared slot; its
+   first natural post-cutover run succeeded. Current deploy smoke on 2026-08-13 again reports the
+   effective VPN route/provider reachability and Zoom wrapper healthy.
+
+The VPN watchdog validates the effective route rather than handshake freshness, all relevant roles
+are active, and fresh error journals are empty under CHG-15 acceptance. These successor records close
+the recovery contract; employee Telegram user-visible round-trip acceptance remains separately open
+under CHG-13 and is not claimed here.

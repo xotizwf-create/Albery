@@ -1,6 +1,6 @@
 # CHG-20260813-16: Audit-record reconciliation
 
-- Status: approved
+- Status: verified
 - Date opened: 2026-08-13
 - Related decisions: none
 - Bitrix engineering task: not created; this is a Git audit correction without external mutation
@@ -44,6 +44,17 @@ amended explicitly; it is not silently rewritten or deleted.
 2. Re-run current read-only smoke evidence relevant to VPN, shared cron wrapper and service health.
 3. Confirm no record requiring a real recipient is promoted to `verified`.
 4. Validate links/status tables and `git diff --check`.
+
+Completed evidence on 2026-08-13:
+
+- CHG-05 gates were mapped one by one to CHG-12/13 successor production evidence; current deploy
+  smoke additionally reports effective VPN/provider reachability and the Zoom wrapper healthy;
+- CHG-07's exact missing acceptance is explicitly present in CHG-12: one real private-MCP durable
+  effect exactly once, the shared heavy cron and natural scheduled runs 36/59;
+- CHG-06 and CHG-08 now contain dated `superseded` amendments and retain their historical content;
+- CHG-09/11/13/14 remain `deployed`; no message/file acceptance or identity mapping was invented;
+- INDEX, roadmap and changelog agree with the record headers. Link/status validation and
+  `git diff --check` passed.
 
 ## Risks
 
