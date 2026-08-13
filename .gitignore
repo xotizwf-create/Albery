@@ -8,6 +8,12 @@ backups/
 exports/
 logs/
 attachments_cache/
+tmp/
+
+# Production runtime/rollback artifacts. They are not source and may contain private bytes.
+.funnel_outgoing/
+.env-backup-*
+.b24_testbot_state.json.*
 
 __pycache__/
 *.py[cod]

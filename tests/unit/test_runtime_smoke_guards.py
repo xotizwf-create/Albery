@@ -20,3 +20,12 @@ def test_deploy_smoke_requires_connected_or_explicitly_retired_telegram_without_
     assert 'gateway_state.get("platforms")' in source
     assert 'gateway_state.get("error_message")' not in source
     assert 'albery_global_limited_zoom.sh' in source
+
+
+def test_deploy_smoke_checks_compatible_hermes_restart_policy():
+    source = SMOKE.read_text(encoding="utf-8")
+
+    assert 'policy_values.get("RestartUSec") != "30s"' in source
+    assert 'policy_values.get("StartLimitIntervalUSec") != "5min"' in source
+    assert 'policy_values.get("StartLimitBurst") != "5"' in source
+    assert 'systemd-analyze", "verify", "hermes-gateway.service"' in source

@@ -87,3 +87,13 @@ def test_role_ports_match_the_unit_files():
         assert ports.get(role) == bind_port, (
             f"роль {role}: мониторинг смотрит порт {ports.get(role)}, служба слушает {bind_port}"
         )
+
+
+def test_monitor_detects_hermes_restart_policy_drift():
+    source = _source()
+
+    assert 'restart_values.get("RestartUSec") != "30s"' in source
+    assert 'restart_values.get("StartLimitIntervalUSec") != "5min"' in source
+    assert 'restart_values.get("StartLimitBurst") != "5"' in source
+    assert '"RestartMaxDelaySec=" in unit_text' in source
+    assert '"RestartSteps=" in unit_text' in source

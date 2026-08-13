@@ -9,6 +9,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 3. [Decision register](#decisions)
 4. [Change register](#changes)
 5. [Chronological changelog](CHANGELOG.md)
+6. [Full audit roadmap](ROADMAP.md)
 
 ## Decisions
 
@@ -39,6 +40,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260812-12](changes/CHG-20260812-12-automation-acceptance-system-cron.md) | verified | Complete durable automation acceptance and classify/migrate legacy system cron jobs |
 | [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md) | deployed | Retire redundant native Hermes Telegram and complete explicit channel identity acceptance |
 | [CHG-20260812-14](changes/CHG-20260812-14-mcp-discovery-and-stale-file-recovery.md) | deployed | Scope one-shot/gateway MCP discovery and rebuild old generated-file requests instead of echoing expired URLs |
+| [CHG-20260813-15](changes/CHG-20260813-15-hermes-restart-production-hygiene.md) | implemented_local | Make Hermes restart control compatible with systemd 249 and separate runtime/backup artifacts from the production Git tree |
 
 ## Status rule
 

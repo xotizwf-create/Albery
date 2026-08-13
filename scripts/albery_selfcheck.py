@@ -16,6 +16,7 @@ Signals:
   реальное соединение с БД, а не через «слушает ли порт» — см. разбор простоя 07.08.2026);
 - КРИТИЧНО: PostgreSQL не отвечает на SELECT 1;
 - MCP-серверы gateway, которые не подключаются (agent-*);
+- дрейф совместимой restart-политики hermes-gateway;
 - внешний доступ (раз в час): Bitrix OAuth, Google OAuth (Drive/Sheets), Zoom OAuth;
 - hermes-cron джобы с упавшим последним прогоном (дедуп по сигнатуре).
 
@@ -289,6 +290,28 @@ for line in gw_lines:
                 mcp_down.add(name)
 if mcp_down:
     problems.append(f"MCP-серверы не подключаются: {', '.join(sorted(mcp_down))}")
+
+# --- Совместимая restart-политика Hermes -------------------------------------------------
+restart_policy = sh([
+    "systemctl", "show", "hermes-gateway",
+    "-p", "RestartUSec",
+    "-p", "StartLimitIntervalUSec",
+    "-p", "StartLimitBurst",
+])
+restart_values = dict(
+    line.split("=", 1) for line in restart_policy.splitlines() if "=" in line
+)
+if (
+    restart_values.get("RestartUSec") != "30s"
+    or restart_values.get("StartLimitIntervalUSec") != "5min"
+    or restart_values.get("StartLimitBurst") != "5"
+):
+    problems.append("КРИТИЧНО: restart-политика hermes-gateway отсутствует или изменилась")
+    critical = True
+unit_text = sh(["systemctl", "cat", "hermes-gateway.service"])
+if "RestartMaxDelaySec=" in unit_text or "RestartSteps=" in unit_text:
+    problems.append("КРИТИЧНО: hermes-gateway снова содержит несовместимые systemd-директивы")
+    critical = True
 
 # --- Свежесть батч-синка (run_daily_sync, /etc/cron.d/albery-daily-sync) ----------------
 def last_run_finished(path: Path) -> dict | None:

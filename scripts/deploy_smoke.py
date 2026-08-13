@@ -229,6 +229,31 @@ try:
     ).stdout
     if "HERMES_GATEWAY_SCHEDULER_ONLY=1" not in unit:
         failures.append("hermes-gateway is not marked scheduler-only")
+    restart_policy = subprocess.run(
+        [
+            "systemctl", "show", "hermes-gateway",
+            "-p", "RestartUSec",
+            "-p", "StartLimitIntervalUSec",
+            "-p", "StartLimitBurst",
+        ],
+        capture_output=True, text=True, timeout=15,
+    ).stdout
+    policy_values = dict(
+        line.split("=", 1) for line in restart_policy.splitlines() if "=" in line
+    )
+    if policy_values.get("RestartUSec") != "30s":
+        failures.append("hermes-gateway restart delay drifted from 30s")
+    if policy_values.get("StartLimitIntervalUSec") != "5min":
+        failures.append("hermes-gateway start-limit interval drifted from 5min")
+    if policy_values.get("StartLimitBurst") != "5":
+        failures.append("hermes-gateway start-limit burst drifted from 5")
+    verify = subprocess.run(
+        ["systemd-analyze", "verify", "hermes-gateway.service"],
+        capture_output=True, text=True, timeout=15,
+    )
+    unsupported = ("RestartMaxDelaySec", "RestartSteps")
+    if verify.returncode or any(name in verify.stderr for name in unsupported):
+        failures.append("hermes-gateway unit contains unsupported or invalid systemd directives")
 except Exception as exc:  # noqa: BLE001
     failures.append(f"Hermes MCP scope deployment check: {type(exc).__name__}")
 

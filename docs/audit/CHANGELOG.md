@@ -2,6 +2,12 @@
 
 Append entries in reverse chronological order. Link to the detailed record; do not duplicate its full content here.
 
+## 2026-08-13
+
+- `implemented_local` — [CHG-20260813-15](changes/CHG-20260813-15-hermes-restart-production-hygiene.md): add a systemd-249-compatible bounded restart policy, versioned installer, deploy/self-check drift guards and explicit Git exclusions; focused tests and the full `1940 passed, 44 skipped` regression are green.
+- `approved` — [CHG-20260813-15](changes/CHG-20260813-15-hermes-restart-production-hygiene.md): replace the ineffective systemd-249 Hermes backoff with a versioned bounded restart policy and separate secret backups/runtime spool files from the production Git tree.
+- `audit_program` — [Full audit roadmap](ROADMAP.md): sequence the remaining agent rights, disaster recovery, IU/customer funnel, integrations, web/API, knowledge, media, observability, host and capacity audits with explicit acceptance boundaries.
+
 ## 2026-08-12
 
 - `deployed` — [CHG-20260812-14](changes/CHG-20260812-14-mcp-discovery-and-stale-file-recovery.md): repair the live stale-file resend failure and the MCP discovery fan-out that makes self-check report connector failures despite a healthy MCP role.
