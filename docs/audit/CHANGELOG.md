@@ -4,6 +4,7 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-13
 
+- `verified` — [CHG-20260813-15](changes/CHG-20260813-15-hermes-restart-production-hygiene.md): production now enforces a systemd-249-compatible `30s` restart delay and `5/5min` start limit; unsupported keys are gone, 12 legacy artifacts are protected outside Git, all roles/smoke/self-check pass and relevant fresh error journals are empty.
 - `implemented_local` — [CHG-20260813-15](changes/CHG-20260813-15-hermes-restart-production-hygiene.md): add a systemd-249-compatible bounded restart policy, versioned installer, deploy/self-check drift guards and explicit Git exclusions; focused tests and the full `1940 passed, 44 skipped` regression are green.
 - `approved` — [CHG-20260813-15](changes/CHG-20260813-15-hermes-restart-production-hygiene.md): replace the ineffective systemd-249 Hermes backoff with a versioned bounded restart policy and separate secret backups/runtime spool files from the production Git tree.
 - `audit_program` — [Full audit roadmap](ROADMAP.md): sequence the remaining agent rights, disaster recovery, IU/customer funnel, integrations, web/API, knowledge, media, observability, host and capacity audits with explicit acceptance boundaries.

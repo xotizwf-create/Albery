@@ -1,6 +1,6 @@
 # CHG-20260813-15: Hermes restart and production-tree hygiene
 
-- Status: implemented_local
+- Status: verified
 - Date opened: 2026-08-13
 - Related decisions: none
 - Bitrix engineering task: pending; creating an external task was not separately approved
@@ -75,14 +75,27 @@ Local evidence:
 - the local `app.py` content hash equals `HEAD`; its modified status is OneDrive/line-ending metadata
   and it is intentionally excluded from this change.
 
-Production steps remain:
+Production evidence on 2026-08-13:
 
-1. Push the isolated implementation and require tests/security CI.
-2. Back up the live unit and affected root artifacts.
-3. Apply the policy, run `systemctl daemon-reload`, verify the unit and restart only at the empty gate.
-4. Assert effective restart interval/start limit, active scheduler-only gateway, healthy Albery roles,
-   full deploy smoke, self-check and clean fresh journals.
-5. Confirm production Git has no tracked drift and only explicitly classified ignored runtime files.
+- commits `c2f9acd` and `6cff732` passed tests CI `31695771552` on Python/PostgreSQL 3.10/14
+  and 3.12/16 plus frontend lint/build; security CI `31695771565` passed Python and frontend
+  dependency audits;
+- the first rollout attempt stopped before mutation because one agent automation was running; the
+  second waited for `inflight=0`, `running=0` and no gateway child process;
+- the pre-pull code backup is `/var/backups/albery/pre-chg15-20260813_143531`; the effective unit,
+  artifact and tracked-file backup is `/var/backups/albery/pre-chg15-20260813_143556`, mode `0700`;
+- production fast-forwarded from `8cd58ef` to `6cff732`; changed Python compiled. Production pytest
+  was intentionally not installed/run on the 2 GB host; both CI database matrices are the test gate;
+- the installer removed only `RestartMaxDelaySec` and `RestartSteps`, installed the versioned
+  drop-in and passed `systemd-analyze verify` with empty stderr;
+- effective properties are `RestartUSec=30s`, `StartLimitIntervalUSec=5min`,
+  `StartLimitBurst=5`; `hermes-gateway` is active with `NRestarts=0`;
+- 12 classified legacy rollback artifacts moved into the protected backup without deletion. The
+  active `.env` and `.funnel_outgoing/` were not moved; the spool remains mode `0700` with all
+  existing files intact;
+- production Git is clean. All Albery split roles, Telegram worker and gateway are active;
+  `scripts/deploy_smoke.py` returned `SMOKE OK`, self-check dry-run and two natural timer runs were
+  clean, and fresh error journals for all changed/adjacent services were empty.
 
 ## Risks
 
@@ -100,7 +113,7 @@ part of the move.
 
 ## Known gaps and follow-up
 
-- Progressive native backoff is unavailable in systemd 249. The target uses a safe fixed delay and
+- Progressive native backoff is unavailable in systemd 249. Production now uses a safe fixed delay and
   rate limit; upgrading the OS/systemd is a separate host-hardening decision.
 - Full customer-channel acceptance remains a separate owner-approved workstream.
 - The spool contained 122 mode-`0600` files (about 6.3 MB); its oldest file was about 14.85 days old

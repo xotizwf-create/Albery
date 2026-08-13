@@ -1,10 +1,11 @@
 # Current Albery architecture
 
-Last reviewed: 2026-08-12.
+Last reviewed: 2026-08-13.
 
 ## Verified production state
 
-Production server 186 runs runtime implementation commit `a38e2d1`.
+Production server 186 runs repository commit `6cff732`; the current agent runtime implementation is
+`a38e2d1` plus the later versioned scheduler, recovery and infrastructure hardening commits.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
@@ -270,6 +271,14 @@ flowchart LR
   runs 36 and 59 also completed and delivered on 2026-08-12 without replay.
 
 ## Current operational status
+
+- `hermes-gateway` uses a systemd-249-compatible bounded restart policy: a fixed 30-second delay and
+  at most five starts per five minutes. Unsupported newer-systemd directives were removed. Deploy
+  smoke and recurring self-check detect both effective-policy drift and their reappearance. Legacy
+  environment/state/frontend rollback artifacts were moved to mode-`0700` backups outside the Git
+  tree without deletion; `.funnel_outgoing/` remains a protected runtime spool and is explicitly
+  ignored. Production Git is clean under
+  [CHG-20260813-15](../changes/CHG-20260813-15-hermes-restart-production-hygiene.md).
 
 - Employee-facing generated files are materialized as native attachments by the owning Bitrix or
   Telegram profile adapter. Exact bytes are retained under `0700/0600` permissions and referenced
