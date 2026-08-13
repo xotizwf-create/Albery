@@ -4,8 +4,9 @@ Last reviewed: 2026-08-13.
 
 ## Verified production state
 
-Production server 186 runs repository commit `34abacc`; the current runtime includes the later
-versioned scheduler, recovery, capability, PostgreSQL and client-Telegram hardening commits.
+Production server 186 runs functional runtime `34abacc`; later audit-only commits do not change
+process behavior. The runtime includes the versioned scheduler, recovery, capability, PostgreSQL
+and client-Telegram hardening commits.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
