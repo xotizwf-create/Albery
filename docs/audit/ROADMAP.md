@@ -18,7 +18,7 @@ when its production behavior is `verified`; code review or a green unit suite al
 | Priority | Status | Workstream | Required outcome |
 | --- | --- | --- | --- |
 | P0 | verified | Hermes restart and production-tree hygiene | systemd-249-compatible restart control, no secret backups in the web repository, runtime files explicitly ignored |
-| P0 | pending | Audit-record reconciliation | old CHG gates are amended from later evidence; historical records are explicitly superseded rather than silently rewritten |
+| P0 | in_progress | Audit-record reconciliation | old CHG gates are amended from later evidence; historical records are explicitly superseded rather than silently rewritten |
 | P0 | acceptance | Employee channel acceptance | approved Bitrix native-file delivery and employee Telegram round trip; Telegram-to-Bitrix identity remains fail-closed until immutable IDs and person are confirmed |
 | P1 | pending | MCP capability and agent-rights matrix | every registered tool classified by data domain, read/write danger, confirmation, idempotency, object locking and exact agent grants |
 | P1 | pending | PostgreSQL and disaster recovery | schema/retention/PII/performance review plus isolated restore drill and measured RPO/RTO for local and offsite backups |
