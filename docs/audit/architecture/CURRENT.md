@@ -4,8 +4,8 @@ Last reviewed: 2026-08-13.
 
 ## Verified production state
 
-Production server 186 runs repository commit `57a215a`; the current agent runtime implementation is
-`a38e2d1` plus the later versioned scheduler, recovery, capability and infrastructure hardening commits.
+Production server 186 runs repository commit `34abacc`; the current runtime includes the later
+versioned scheduler, recovery, capability, PostgreSQL and client-Telegram hardening commits.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
@@ -110,10 +110,24 @@ channel-neutral employee-agent runtime was deployed under
 
 ```mermaid
 flowchart TD
-    C[Client and Telegram Business messages] --> W[albery-tg.service workspace path]
-    W --> Z[Zero-tool IU customer runtime]
-    Z --> O[(PostgreSQL transactional outbox)]
-    O --> API[Telegram Bot API]
+    C[Public IU bot today] --> I[(raw updates before offset)]
+    B[Telegram Business optional; disabled today] -.-> I
+    I --> S[conversation state and ownership]
+    S --> Z[Zero-tool IU customer runtime]
+    S --> H[Human operator workspace]
+    Z --> O[(transactional outbox)]
+    H --> O
+    O --> P[sending provider boundary]
+    P --> API[Telegram Bot API]
+    S --> Q[(idempotent CRM actions)]
+    Q --> CRM[Bitrix CRM]
+    S --> MA[(manager wait alerts)]
+    MA --> MB[sending boundary; timeout to unknown]
+    MB --> BITRIX[Bitrix manager group]
+    MON[Five-minute content-free queue health] -.-> I
+    MON -.-> O
+    MON -.-> Q
+    MON -.-> MA
 
     G[hermes-gateway.service] --> GD[Reviewed Hermes system cron only]
     GD --> GL[Albery shared two-slot wrapper]
@@ -146,6 +160,21 @@ flowchart TD
   pass production smoke. The old Hermes token key is absent and retirement is explicit in the
   Albery environment; the upstream gateway state file may retain a stale historical `retrying`
   label, but the restarted service produces no Telegram error and no longer owns an employee bot.
+- The client/IU production entry is the public bot (`IU_CLIENT_BOT_ENABLED=1`, AI enabled). The
+  global workspace-AI flag applies to optional Telegram Business intake, which is intentionally
+  disabled; historical Business connections are not live transports.
+- Client raw updates commit before the long-poll offset. AI jobs, reminders, Telegram delivery and
+  CRM effects are durable and idempotent. Both Telegram outbox and Bitrix manager alerts persist
+  `sending` immediately before the provider call; an interrupted/ambiguous result becomes `unknown`
+  and never retries blindly.
+- Active/ambiguous deliveries protect referenced outgoing files even beyond their seven-day normal
+  lifetime. Cleanup fails closed without PostgreSQL. The first deployed maintenance pass removed
+  122 expired unreferenced files after a protected backup. Five-minute self-check covers overdue,
+  expired, failed, unknown and dead-letter states using counts/timestamps only.
+- One-time form tokens follow the 30-day workspace retention; deleted-form recovery payloads default
+  to 90 days, after which payload is redacted and the merge ledger remains. See
+  [ADR-0009](../decisions/ADR-0009-durable-client-telegram-provider-boundaries.md) and
+  [CHG-20260813-20](../changes/CHG-20260813-20-client-telegram-iu-crm-lifecycle-audit.md).
 
 ### Deployed channel-neutral employee-agent runtime
 

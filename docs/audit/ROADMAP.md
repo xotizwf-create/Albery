@@ -22,7 +22,7 @@ when its production behavior is `verified`; code review or a green unit suite al
 | P0 | acceptance | Employee channel acceptance | approved Bitrix native-file delivery and employee Telegram round trip; Telegram-to-Bitrix identity remains fail-closed until immutable IDs and person are confirmed |
 | P1 | verified | MCP capability and agent-rights matrix | every registered tool classified by data domain, read/write danger, confirmation, idempotency, object locking and exact agent grants |
 | P1 | acceptance | PostgreSQL and disaster recovery | deployed atomic/SHA-256/pg_restore chain and isolated drill; first natural 03:15 -> 03:45 production cycle pending |
-| P1 | in_progress | Client Telegram/IU and CRM funnel | full customer-message, manager handoff, form, media, CRM and durable-outbox lifecycle including restart, provider ambiguity and overdue spool cleanup/reference safety |
+| P1 | acceptance | Client Telegram/IU and CRM funnel | structural lifecycle, provider ambiguity, reference-safe retention and queue monitoring are deployed/clean; an approved real customer/manager round trip remains |
 | P2 | pending | Bitrix business correctness | webhook deduplication, OAuth recovery, authorship, tasks, CRM/funnel mutations, partial failure and boundary cases |
 | P2 | pending | Zoom, Google and Wildberries | token expiry, API drift, quotas/rate limits, retry/idempotency, partial writes and observable recovery for each connector |
 | P2 | pending | Web/API and Agent Center | authentication, authorization, IDOR, CSRF/CORS, upload limits, atomic configuration, audit trail and rollback |
