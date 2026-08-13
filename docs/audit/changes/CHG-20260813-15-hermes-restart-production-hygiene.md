@@ -21,7 +21,8 @@ Read-only production evidence at 2026-08-13 13:38 MSK:
 - `RestartMaxDelaySec` and `RestartSteps` are unknown to this systemd version and are ignored;
 - a persistent failure can therefore restart indefinitely every five seconds;
 - the tracked production tree matches commit `8cd58ef`, but Git reports untracked artifacts:
-  old `.env-backup-*` files, a pre-repair state copy and `.funnel_outgoing/` runtime bytes;
+  old `.env-backup-*`/`env-backup-*` files, a pre-repair state copy, one old `dist.pre-*`
+  frontend rollback directory and `.funnel_outgoing/` runtime bytes;
 - `.funnel_outgoing/` is the intentional restricted seven-day spool used by
   `funnel_workspace_uploads.py`, not abandoned source code.
 
@@ -102,3 +103,6 @@ part of the move.
 - Progressive native backoff is unavailable in systemd 249. The target uses a safe fixed delay and
   rate limit; upgrading the OS/systemd is a separate host-hardening decision.
 - Full customer-channel acceptance remains a separate owner-approved workstream.
+- The spool contained 122 mode-`0600` files (about 6.3 MB); its oldest file was about 14.85 days old
+  despite a seven-day code retention target. Cleanup is currently opportunistic on a later upload.
+  No file is removed in this infrastructure change; lifecycle/references are an explicit IU audit item.
