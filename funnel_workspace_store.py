@@ -180,6 +180,12 @@ def retention_days() -> int:
     return _bounded_env_int("FUNNEL_WORKSPACE_RETENTION_DAYS", 30, 7, 90)
 
 
+def iu_form_recovery_days() -> int:
+    """Recovery window for the snapshot of a deleted duplicate CRM form deal."""
+
+    return _bounded_env_int("IU_FORM_RECOVERY_DAYS", 90, 30, 365)
+
+
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
         value = int(os.getenv(name, str(default)) or str(default))
@@ -5226,6 +5232,7 @@ def retention_cleanup(
     batch_size = min(10_000, max(1, int(batch_size or 1000)))
     max_batches = min(1000, max(1, int(max_batches or 50)))
     cutoff = _now(now) - timedelta(days=keep_days)
+    form_recovery_cutoff = _now(now) - timedelta(days=iu_form_recovery_days())
     deleted: dict[str, int] = {}
     with _connection(connect) as conn:
         with conn.cursor() as cur:
@@ -5289,6 +5296,61 @@ def retention_cleanup(
                     if removed < batch_size:
                         break
                 deleted[name] = removed_total
+
+            # Expired one-time links contain a Telegram identity and have no
+            # operational value after the retention window.  Form-deal snapshots
+            # are deliberately kept longer for manual recovery, then redacted
+            # while the non-sensitive merge ledger remains auditable.
+            removed_total = 0
+            for _ in range(max_batches):
+                cur.execute(
+                    """
+                    WITH doomed AS (
+                        SELECT token
+                          FROM iu_form_tokens
+                         WHERE COALESCE(used_at, expires_at) < %s
+                         ORDER BY created_at
+                         LIMIT %s
+                    )
+                    DELETE FROM iu_form_tokens
+                     WHERE token IN (SELECT token FROM doomed)
+                    """,
+                    (cutoff, batch_size),
+                )
+                removed = int(cur.rowcount or 0)
+                removed_total += removed
+                if callable(commit):
+                    commit()
+                if removed < batch_size:
+                    break
+            deleted["form_tokens"] = removed_total
+
+            redacted_total = 0
+            for _ in range(max_batches):
+                cur.execute(
+                    """
+                    WITH doomed AS (
+                        SELECT form_deal_id
+                          FROM iu_form_merges
+                         WHERE merged_at < %s
+                           AND payload IS NOT NULL
+                         ORDER BY merged_at
+                         LIMIT %s
+                    )
+                    UPDATE iu_form_merges m
+                       SET payload = NULL
+                      FROM doomed
+                     WHERE m.form_deal_id = doomed.form_deal_id
+                    """,
+                    (form_recovery_cutoff, batch_size),
+                )
+                redacted = int(cur.rowcount or 0)
+                redacted_total += redacted
+                if callable(commit):
+                    commit()
+                if redacted < batch_size:
+                    break
+            deleted["form_payloads_redacted"] = redacted_total
 
             # Сообщения удаляются последними: очереди выше уже освободили свои
             # завершённые строки, а те, что остались живыми, держат своё сообщение.
@@ -5375,6 +5437,7 @@ def retention_cleanup(
                     (_now(now), sorted(touched)),
                 )
     deleted["retention_days"] = keep_days
+    deleted["form_recovery_days"] = iu_form_recovery_days()
     return deleted
 
 

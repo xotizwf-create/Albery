@@ -320,6 +320,24 @@ def _claim(
     lease_until = now + timedelta(seconds=90)
     with connector() as connection:
         with connection.cursor() as cur:
+            # Crossing the provider boundary is irreversible.  A process crash
+            # while Bitrix is answering must never turn into a blind duplicate.
+            cur.execute(
+                """
+                UPDATE iu_manager_wait_alerts
+                   SET status = 'unknown',
+                       locked_by = NULL,
+                       locked_until = NULL,
+                       last_error = COALESCE(
+                           last_error,
+                           'worker stopped during the Bitrix delivery boundary'
+                       ),
+                       updated_at = now()
+                 WHERE status = 'sending'
+                   AND locked_until <= %s
+                """,
+                (now,),
+            )
             cur.execute(
                 """
                 UPDATE iu_manager_wait_alerts
@@ -407,12 +425,13 @@ def _finish(
     status: str,
     retry_at: datetime | None = None,
     error: str = "",
+    provider_message_id: str | None = None,
     connect_factory: Callable[[], Any] | None = None,
 ) -> None:
     ids = [int(row["id"]) for row in rows]
     if not ids:
         return
-    if status not in {"pending", "sent", "cancelled"}:
+    if status not in {"pending", "sent", "unknown", "cancelled"}:
         raise ValueError(status)
     connector = connect_factory or _connect
     with connector() as connection:
@@ -425,19 +444,51 @@ def _finish(
                        locked_by = NULL,
                        locked_until = NULL,
                        last_error = %s,
+                       provider_message_id = COALESCE(%s, provider_message_id),
                        updated_at = now()
                  WHERE id = ANY(%s)
-                   AND status = 'leased'
+                   AND status IN ('leased', 'sending')
                    AND locked_by = %s
                 """,
                 (
                     status,
                     retry_at,
                     str(error or "")[:1000] or None,
+                    str(provider_message_id or "")[:160] or None,
                     ids,
                     worker_id,
                 ),
             )
+
+
+def _begin_sending(
+    rows: Iterable[dict[str, Any]],
+    *,
+    worker_id: str,
+    connect_factory: Callable[[], Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Persist the irreversible Bitrix provider-call boundary."""
+
+    materialized = list(rows)
+    ids = [int(row["id"]) for row in materialized]
+    if not ids:
+        return []
+    connector = connect_factory or _connect
+    with connector() as connection:
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE iu_manager_wait_alerts
+                   SET status = 'sending', updated_at = now()
+                 WHERE id = ANY(%s)
+                   AND status = 'leased'
+                   AND locked_by = %s
+                RETURNING id
+                """,
+                (ids, worker_id),
+            )
+            accepted = {int(row["id"]) for row in cur.fetchall()}
+    return [row for row in materialized if int(row["id"]) in accepted]
 
 
 def _safe_client_name(value: Any) -> str:
@@ -578,14 +629,19 @@ def process_once(
             connect_factory=connect_factory,
         )
         if valid:
+            valid = _begin_sending(
+                valid,
+                worker_id=worker_id,
+                connect_factory=connect_factory,
+            )
+        if valid:
             try:
-                notify(format_morning_summary(valid, now=moment))
-            except Exception as exc:  # noqa: BLE001 - durable retry on integration failure
+                delivery = notify(format_morning_summary(valid, now=moment))
+            except Exception as exc:  # noqa: BLE001 - provider outcome may be ambiguous
                 _finish(
                     valid,
                     worker_id=worker_id,
-                    status="pending",
-                    retry_at=moment + timedelta(seconds=60),
+                    status="unknown",
                     error=str(exc),
                     connect_factory=connect_factory,
                 )
@@ -594,6 +650,11 @@ def process_once(
                     valid,
                     worker_id=worker_id,
                     status="sent",
+                    provider_message_id=str(
+                        delivery.get("message_id")
+                        if isinstance(delivery, dict)
+                        else ""
+                    ),
                     connect_factory=connect_factory,
                 )
         processed += len(morning)
@@ -624,14 +685,20 @@ def process_once(
                 connect_factory=connect_factory,
             )
             continue
+        sending = _begin_sending(
+            [row],
+            worker_id=worker_id,
+            connect_factory=connect_factory,
+        )
+        if not sending:
+            continue
         try:
-            notify(format_individual_alert(row))
-        except Exception as exc:  # noqa: BLE001 - durable retry on integration failure
+            delivery = notify(format_individual_alert(row))
+        except Exception as exc:  # noqa: BLE001 - provider outcome may be ambiguous
             _finish(
                 [row],
                 worker_id=worker_id,
-                status="pending",
-                retry_at=moment + timedelta(seconds=60),
+                status="unknown",
                 error=str(exc),
                 connect_factory=connect_factory,
             )
@@ -640,6 +707,11 @@ def process_once(
                 [row],
                 worker_id=worker_id,
                 status="sent",
+                provider_message_id=str(
+                    delivery.get("message_id")
+                    if isinstance(delivery, dict)
+                    else ""
+                ),
                 connect_factory=connect_factory,
             )
     return processed + len(individual)

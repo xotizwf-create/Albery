@@ -517,6 +517,11 @@ def _maintenance_loop() -> None:
                 last_stage_sync = now
             if now - last_retention >= 86_400:
                 store.retention_cleanup()
+                # Outgoing files have a shorter disk retention, but active or
+                # ambiguous outbox rows protect their tokens from deletion.
+                import funnel_workspace_uploads
+
+                funnel_workspace_uploads.sweep_expired()
                 last_retention = now
         except Exception:  # noqa: BLE001
             log.exception("workspace maintenance failed")

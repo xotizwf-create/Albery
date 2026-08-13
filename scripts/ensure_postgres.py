@@ -146,6 +146,9 @@ ALWAYS_APPLY_MIGRATIONS = [
     "083_durable_agent_automation_runs.sql",
     "084_channel_neutral_telegram_agents.sql",
     "085_channel_native_artifacts.sql",
+    # Durable Bitrix manager-alert provider boundary; timeouts become reviewable
+    # unknown outcomes instead of blind duplicate retries.
+    "086_iu_manager_alert_delivery_boundary.sql",
 ]
 
 

@@ -274,6 +274,21 @@ if backup_problems:
     problems.extend(f"КРИТИЧНО: {message}" for message in backup_problems)
     critical = True
 
+# --- Durable Telegram/IU queues -----------------------------------------------------------
+# This probe reads counters and timestamps only; client text and attachment payloads never
+# enter monitoring state or alert messages.
+try:
+    from scripts.workspace_queue_health import inspect_workspace_queue_health
+
+    workspace_queue_problems = inspect_workspace_queue_health()
+except Exception as exc:  # noqa: BLE001
+    workspace_queue_problems = [
+        f"Telegram/IU queue monitor failed ({type(exc).__name__})"
+    ]
+if workspace_queue_problems:
+    problems.extend(f"КРИТИЧНО: {message}" for message in workspace_queue_problems)
+    critical = True
+
 # --- Оперативная память ------------------------------------------------------------------
 # --- Versioned MCP capability caps ---------------------------------------------------------
 # Missing/malformed manifests remove power, but that safe failure is still an outage for an

@@ -4,6 +4,7 @@ from __future__ import annotations
 # доставка документом в тот же Telegram-диалог и показ вложения в ленте.
 
 import io
+import os
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -78,6 +79,75 @@ def test_dangerous_file_name_never_becomes_a_path(upload_dir):
     resolved = uploads.resolve_upload(saved["token"])
     assert "/" not in resolved["file_name"] and "\\" not in resolved["file_name"]
     assert resolved["path"].parent == uploads.outgoing_dir()
+
+
+def _upload_reference_connect(payloads):
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params=None):
+            pass
+
+        def fetchall(self):
+            return [{"payload": payload} for payload in payloads]
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    @contextmanager
+    def connect():
+        yield Connection()
+
+    return connect
+
+
+def _old_upload_pair(upload_dir, token):
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    paths = [upload_dir / f"{token}.bin", upload_dir / f"{token}.json"]
+    for path in paths:
+        path.write_text("old", encoding="utf-8")
+        os.utime(path, (1, 1))
+    return paths
+
+
+def test_sweep_keeps_expired_file_referenced_by_active_outbox(upload_dir):
+    token = "protected-upload-token-0001"
+    paths = _old_upload_pair(upload_dir, token)
+    connect = _upload_reference_connect(
+        [{"outgoing_file": {"token": token}}]
+    )
+
+    assert uploads.sweep_expired(now=10**9, connect_factory=connect) == 0
+    assert all(path.exists() for path in paths)
+
+
+def test_sweep_removes_only_expired_unreferenced_pair(upload_dir):
+    token = "expired-upload-token-000001"
+    paths = _old_upload_pair(upload_dir, token)
+
+    assert uploads.sweep_expired(
+        now=10**9,
+        connect_factory=_upload_reference_connect([]),
+    ) == 2
+    assert not any(path.exists() for path in paths)
+
+
+def test_sweep_fails_closed_when_queue_references_are_unavailable(upload_dir):
+    token = "fail-closed-upload-token-01"
+    paths = _old_upload_pair(upload_dir, token)
+
+    @contextmanager
+    def broken_connect():
+        raise RuntimeError("database unavailable")
+        yield
+
+    assert uploads.sweep_expired(now=10**9, connect_factory=broken_connect) == 0
+    assert all(path.exists() for path in paths)
 
 
 # --------------------------------------------------------------------------- очередь

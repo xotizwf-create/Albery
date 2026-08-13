@@ -351,3 +351,46 @@ def test_night_is_silent_and_next_morning_is_one_prioritized_summary():
         assert _alerts(second_id) == [{"kind": "morning", "status": "sent"}]
     finally:
         _cleanup(source_key)
+
+
+def test_ambiguous_bitrix_delivery_is_not_retried_blindly():
+    suffix = uuid4().hex[:10]
+    source_key = f"test-iu-manager-unknown-{suffix}"
+    start = datetime(2026, 8, 13, 10, 0, tzinfo=MSK_TZ)
+    attempts: list[str] = []
+    try:
+        store.ensure_source(
+            source_key,
+            source_type="test",
+            display_name="IU manager unknown",
+        )
+        conversation_id, _ = _client_waiting(
+            source_key,
+            occurred_at=start,
+            name="Неоднозначная доставка",
+        )
+
+        def ambiguous(text):
+            attempts.append(text)
+            raise TimeoutError("Bitrix response was lost")
+
+        assert watch.process_once(
+            worker_id="worker-unknown",
+            notify=ambiguous,
+            now=start + timedelta(minutes=10),
+            source_key=source_key,
+            connect_factory=connect,
+        ) == 1
+        assert len(attempts) == 1
+        assert _alerts(conversation_id) == [{"kind": "10m", "status": "unknown"}]
+
+        assert watch.process_once(
+            worker_id="worker-retry",
+            notify=ambiguous,
+            now=start + timedelta(minutes=11),
+            source_key=source_key,
+            connect_factory=connect,
+        ) == 0
+        assert len(attempts) == 1
+    finally:
+        _cleanup(source_key)

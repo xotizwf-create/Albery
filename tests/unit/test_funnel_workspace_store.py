@@ -1664,6 +1664,8 @@ def test_retention_drains_the_backlog_instead_of_one_batch_per_run():
             return [{"conversation_id": 41}] * batch
         if sql.startswith("DELETE FROM") or "DELETE FROM" in sql:
             return []
+        if "UPDATE iu_form_merges" in sql:
+            return []
         if sql.startswith("UPDATE funnel_workspace_conversations"):
             return []
         raise AssertionError(sql)
@@ -1703,6 +1705,8 @@ def test_retention_rebuilds_conversation_counters_after_deleting_history():
             return []
         if "DELETE FROM" in sql:
             return []
+        if "UPDATE iu_form_merges" in sql:
+            return []
         if sql.startswith("UPDATE funnel_workspace_conversations"):
             return []
         raise AssertionError(sql)
@@ -1722,6 +1726,34 @@ def test_retention_rebuilds_conversation_counters_after_deleting_history():
     assert "last_message_text =" in sql
     assert "last_read_message_id =" in sql
     assert params[-1] == [41]
+
+
+def test_retention_expires_form_tokens_and_redacts_old_recovery_snapshots():
+    def respond(sql, _params):
+        if "DELETE FROM iu_form_tokens" in sql:
+            return []
+        if "UPDATE iu_form_merges" in sql:
+            return []
+        if "DELETE FROM" in sql:
+            return []
+        raise AssertionError(sql)
+
+    connect, connection = connect_factory(respond)
+    result = store.retention_cleanup(
+        days=30,
+        batch_size=1000,
+        now=NOW,
+        connect=connect,
+    )
+
+    statements = [sql for sql, _params in connection.cursor_instance.executed]
+    token_sql = next(sql for sql in statements if "DELETE FROM iu_form_tokens" in sql)
+    merge_sql = next(sql for sql in statements if "UPDATE iu_form_merges" in sql)
+    assert "COALESCE(used_at, expires_at)" in token_sql
+    assert "payload IS NOT NULL" in merge_sql
+    assert result["form_tokens"] == 0
+    assert result["form_payloads_redacted"] == 0
+    assert result["form_recovery_days"] == 90
 
 
 def test_work_state_filters_use_the_answer_fact_not_a_stored_field():
