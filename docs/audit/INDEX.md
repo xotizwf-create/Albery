@@ -27,6 +27,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [ADR-0005](decisions/ADR-0005-channel-neutral-agent-runtime.md) | accepted | Bitrix and employee Telegram are channel adapters for one logical agent profile |
 | [ADR-0006](decisions/ADR-0006-channel-native-artifact-delivery.md) | accepted | Generated files are delivered as native channel attachments, not employee-facing bearer links |
 | [ADR-0007](decisions/ADR-0007-exhaustive-mcp-policy-and-fail-closed-caps.md) | accepted | Every MCP tool is semantically classified and every agent cap fails closed |
+| [ADR-0008](decisions/ADR-0008-verified-postgresql-backup-chain.md) | accepted | PostgreSQL backups are atomic, SHA-256/pg_restore verified and routine restores are isolated |
 
 ## Changes
 
@@ -50,7 +51,11 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260813-16](changes/CHG-20260813-16-audit-record-reconciliation.md) | verified | Reconcile historical CHG statuses against later production acceptance without overstating open employee-channel scenarios |
 | [CHG-20260813-17](changes/CHG-20260813-17-mcp-capability-rights-audit.md) | verified | Classify all MCP capabilities, freeze fail-closed per-agent caps and centrally guard consequential calls without changing live grants |
 | [CHG-20260813-18](changes/CHG-20260813-18-vpn-healthcheck-transient-hardening.md) | verified | Version and harden the VPN/provider healthcheck against proven one-shot false alarms while preserving fail-closed sustained-outage detection |
-| [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md) | approved | Audit PostgreSQL growth, privacy, performance and backup/restore recovery with measured RPO/RTO |
+| [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md) | implemented_local | Audit PostgreSQL and harden atomic local/offsite recovery with measured RPO/RTO |
+
+## Runbooks
+
+- [PostgreSQL recovery](runbooks/POSTGRES_RECOVERY.md)
 
 ## Status rule
 

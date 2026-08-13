@@ -4,6 +4,8 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-13
 
+- `implemented_local` — [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md): prove the current offsite dump through two isolated restores and `pg_amcheck`, then implement atomic local/offsite publication, SHA-256/pg_restore verification, continuous backup-chain monitoring and an isolated-only routine restore helper; full local regression is `1968 passed, 46 skipped`.
+- `accepted` — [ADR-0008](decisions/ADR-0008-verified-postgresql-backup-chain.md): a completed backup is an atomically published, SHA-256 and pg_restore-verified artifact; routine restores may target only a new isolated database.
 - `approved` — [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md): inventory PostgreSQL schema/growth/PII/performance and local/offsite backups, then prove recovery with an isolated restore and measured RPO/RTO without touching production data.
 - `verified` — [CHG-20260813-18](changes/CHG-20260813-18-vpn-healthcheck-transient-hardening.md): protected live install with no restart; exact checksum/mode passed, post-change health series improved from `17/20` to `20/20` while recovering five observed one-shot blips, three full smokes and self-check passed.
 - `verified` — [CHG-20260813-17](changes/CHG-20260813-17-mcp-capability-rights-audit.md): production preserves all nine exact grant counts under explicit fail-closed caps; dangerous no-confirm calls are rejected before handlers, smoke/self-check and journals pass, and rollback source is protected.

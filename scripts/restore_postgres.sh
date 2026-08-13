@@ -1,51 +1,74 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_DIR="${APP_DIR:-/var/www/albery}"
-
-if [ "$#" -ne 1 ]; then
-  echo "Usage: $0 /path/to/backup.dump" >&2
+# This helper is intentionally limited to an isolated drill database. Restoring over the
+# live `albery` database requires the reviewed DR runbook, a maintenance window and an
+# explicit operator confirmation; it must never happen from a one-argument command.
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 /path/to/backup.dump albery_restore_<drill_name>" >&2
   exit 2
 fi
 
 backup_path="$1"
+target_database="$2"
+pg_host="${PGHOST:-/var/run/postgresql}"
+pg_port="${PGPORT:-5432}"
+
+if ! [[ "$pg_port" =~ ^[0-9]+$ ]] || [ "$pg_port" -lt 1 ] || [ "$pg_port" -gt 65535 ]; then
+  echo "Invalid PostgreSQL port: $pg_port" >&2
+  exit 2
+fi
+
 if [ ! -f "$backup_path" ]; then
   echo "Backup file not found: $backup_path" >&2
   exit 1
 fi
+if ! [[ "$target_database" =~ ^albery_restore_[a-zA-Z0-9_]+$ ]]; then
+  echo "Refusing unsafe target; use an isolated albery_restore_* database" >&2
+  exit 2
+fi
+if [ "$target_database" = "albery" ]; then
+  echo "Refusing to restore over the production database" >&2
+  exit 2
+fi
 
-read_env_value() {
-  local key="$1"
-  local env_file="$2"
-  if [ ! -f "$env_file" ]; then
-    return 0
-  fi
-  awk -F= -v key="$key" '
-    $1 == key {
-      sub(/^[^=]*=/, "")
-      gsub(/^[ \t]+|[ \t]+$/, "")
-      gsub(/^"|"$/, "")
-      gsub(/^'\''|'\''$/, "")
-      print
-      exit
-    }
-  ' "$env_file"
-}
+pg_restore --list "$backup_path" >/dev/null
 
-DATABASE_URL="${DATABASE_URL:-$(read_env_value DATABASE_URL "$APP_DIR/.env")}"
-
-if [ -z "${DATABASE_URL:-}" ]; then
-  echo "DATABASE_URL is not set" >&2
+if sudo -u postgres psql --host="$pg_host" --port="$pg_port" -d postgres -tAc \
+  "SELECT 1 FROM pg_database WHERE datname = '$target_database'" | grep -qx 1; then
+  echo "Refusing to overwrite existing database: $target_database" >&2
   exit 1
 fi
 
-echo "Creating pre-restore backup..."
-"$APP_DIR/scripts/backup_postgres.sh"
+cleanup_failed_restore() {
+  if [ "${restore_complete:-0}" != "1" ]; then
+    sudo -u postgres dropdb --host="$pg_host" --port="$pg_port" --if-exists -- "$target_database"
+  fi
+}
+trap cleanup_failed_restore EXIT INT TERM
 
-echo "Restoring $backup_path..."
-pg_restore --clean --if-exists --no-owner --no-acl --dbname="$DATABASE_URL" "$backup_path"
+sudo -u postgres createdb --host="$pg_host" --port="$pg_port" -- "$target_database"
+sudo -u postgres pg_restore \
+  --exit-on-error --no-owner --no-acl --jobs="${RESTORE_JOBS:-2}" \
+  --host="$pg_host" --port="$pg_port" --dbname="$target_database" "$backup_path"
 
-echo "Applying required migrations..."
-"$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/ensure_postgres.py"
+sudo -u postgres psql --host="$pg_host" --port="$pg_port" -d "$target_database" -v ON_ERROR_STOP=1 -tAc \
+  "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'" \
+  | grep -Eq '^[1-9][0-9]*$'
 
-echo "Restore completed."
+amcheck_bin="$(command -v pg_amcheck || true)"
+if [ -z "$amcheck_bin" ] && command -v pg_config >/dev/null 2>&1; then
+  candidate="$(pg_config --bindir)/pg_amcheck"
+  if [ -x "$candidate" ]; then
+    amcheck_bin="$candidate"
+  fi
+fi
+if [ -n "$amcheck_bin" ]; then
+  sudo -u postgres "$amcheck_bin" --host="$pg_host" --port="$pg_port" \
+    --install-missing --database="$target_database"
+fi
+
+restore_complete=1
+trap - EXIT INT TERM
+echo "Isolated restore completed: $target_database"
+echo "Review it, then remove it explicitly: sudo -u postgres dropdb -- $target_database"

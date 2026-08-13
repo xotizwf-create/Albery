@@ -15,6 +15,8 @@ Signals:
 - КРИТИЧНО: роль web или mcp не отвечает на /healthz либо не видит базу (проверка идёт через
   реальное соединение с БД, а не через «слушает ли порт» — см. разбор простоя 07.08.2026);
 - КРИТИЧНО: PostgreSQL не отвечает на SELECT 1;
+- КРИТИЧНО: локальная/offsite цепочка резервных копий PostgreSQL устарела, неполна
+  или не прошла проверку pg_restore/SHA-256;
 - MCP-серверы gateway, которые не подключаются (agent-*);
 - дрейф совместимой restart-политики hermes-gateway;
 - внешний доступ (раз в час): Bitrix OAuth, Google OAuth (Drive/Sheets), Zoom OAuth;
@@ -257,6 +259,20 @@ else:
             problems.append(f"ходы бота со статусом error: {errors}")
         if slow:
             problems.append(f"ходы дольше 5 минут: {slow}")
+
+# --- PostgreSQL backup chain: local archive -> SHA-256 -> verified offsite copy ---------
+# This check is deliberately fast: the daily backup jobs hash every byte and validate the
+# archives. The five-minute self-check verifies freshness, modes and their signed status,
+# avoiding a 256+ MB disk read on every monitoring tick.
+try:
+    from scripts.postgres_backup_health import inspect_backup_health
+
+    backup_problems = inspect_backup_health()
+except Exception as exc:  # noqa: BLE001
+    backup_problems = [f"PostgreSQL backup monitor failed ({type(exc).__name__})"]
+if backup_problems:
+    problems.extend(f"КРИТИЧНО: {message}" for message in backup_problems)
+    critical = True
 
 # --- Оперативная память ------------------------------------------------------------------
 # --- Versioned MCP capability caps ---------------------------------------------------------
