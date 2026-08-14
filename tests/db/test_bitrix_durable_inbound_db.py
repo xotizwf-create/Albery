@@ -72,6 +72,13 @@ def test_capture_dedup_batch_and_ambiguous_delivery_boundary():
             batch["batch_id"], owner, "known rejection", ambiguous=False,
         ) == "delivery_retry"
 
+        assert queue.claim_next(owner) is None
+        with queue._db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE bitrix_inbound_jobs SET available_at=now() WHERE batch_id=%s",
+                    (batch["batch_id"],),
+                )
         delivery = queue.claim_next(owner)
         assert delivery is not None
         assert delivery["status"] == "delivery_retry"
