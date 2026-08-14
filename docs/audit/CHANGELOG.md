@@ -4,6 +4,7 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-14
 
+- `verified` — [CHG-20260814-23](changes/CHG-20260814-23-telegram-final-reaction-parity.md): production `aeefb68` now uses `eyes` while an authorized employee Telegram turn is in progress and changes the exact original message to `thumbs up` only after every durable answer part is sent; CI/security, private backup, empty-work restart, live Telegram provider acceptance, exact-once delivery identity, smoke, queues and fresh journals passed.
 - `implemented_local` — [CHG-20260814-23](changes/CHG-20260814-23-telegram-final-reaction-parity.md): complete Bitrix-parity reactions for employee Telegram—keep `eyes` during processing and change to `thumbs up` only after update=`done`, every durable reply part=`sent`, exact profile/chat match and current access; focused `40 passed`, full local `1993 passed, 48 skipped`.
 - `verified` — [CHG-20260814-22](changes/CHG-20260814-22-telegram-durable-acknowledgement.md): production `353136f` restores the authorized inbound `eyes` acknowledgement; protected backup, zero-active-work restart gate, provider acceptance on the owner's real message, full smoke, self-check, queues and fresh journals passed.
 - `verified` — [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md): one fresh owner-approved durable Bitrix event was captured once, deduplicated on redelivery, ran one brain/delivery attempt and produced exact provider message `45682`; all post-send health checks remained clean.

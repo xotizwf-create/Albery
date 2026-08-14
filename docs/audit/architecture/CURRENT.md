@@ -4,9 +4,9 @@ Last reviewed: 2026-08-14.
 
 ## Verified production state
 
-Production server 186 runs functional runtime `353136f`. The runtime includes the versioned
+Production server 186 runs functional runtime `aeefb68`. The runtime includes the versioned
 scheduler/recovery/capability/PostgreSQL/client-Telegram hardening, durable Bitrix inbound boundary
-and employee Telegram acknowledgement.
+and two-phase employee Telegram acknowledgement/finalization.
 
 The Bitrix local-app OAuth state is atomically published with owner-only `0600` permissions. Chat
 and task-comment webhooks persist a token-free event in PostgreSQL before HTTP ACK, then use durable
@@ -228,8 +228,11 @@ flowchart TD
   calls stop for manual review. A stopped model turn is not blindly replayed because tools may have
   produced an external effect.
 - After stable-id access succeeds, the profile bot places a best-effort content-free `eyes`
-  acknowledgement on the exact inbound message before the expensive turn. Reaction failure is
-  cosmetic and never changes update, brain or outbox state.
+  acknowledgement on the exact inbound message before the expensive turn. It changes that exact
+  reaction to `thumbs up` only when the captured update is `done`, every linked outbox part is
+  `sent`, profile/chat match and the sender still has access. Review/error/incomplete multipart and
+  manual/automation outbox rows do not claim final success. Reaction failure is cosmetic and never
+  changes update, brain or outbox state or causes a replay.
 - Screenshots, voice/audio and common documents are downloaded only after access passes. Groq turns
   image/audio into text; the same Hermes/Codex agent makes every business decision and tool call.
 - Agent automations now store `delivery_channel`, `delivery_profile` and
@@ -239,9 +242,13 @@ flowchart TD
   `1745 passed, 1 skipped`; GitHub tests/security passed, including migration `084` and DB-marked
   tests on PostgreSQL 14 and 16. Production migration, the explicit `albery-ai` to `main` binding
   merge, fail-closed identity assertions and smoke passed. On 2026-08-14 the owner completed one
-  real employee message/reply round trip with one update attempt and one sent outbox row. Telegram
-  also accepted one real reaction and one exact native file from the same profile; all queues,
-  smoke, self-check and error journals remained clean.
+  real employee message/reply round trip with one update attempt and one sent outbox row. On
+  2026-08-14 the deployed finalizer changed that exact original message from `eyes` to `thumbs up`;
+  Telegram accepted it while the reply/file provider IDs and one-attempt delivery rows remained
+  unchanged. One exact native file from the same profile also remains verified. All queues and
+  fresh error journals were clean and full production smoke passed. Self-check returned success;
+  its rolling window contained only a pre-deployment automation timeout whose durable retry had
+  already reached `done` with one delivery.
 
 ## Bitrix agent and automation split
 

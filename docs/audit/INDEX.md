@@ -57,7 +57,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260813-20](changes/CHG-20260813-20-client-telegram-iu-crm-lifecycle-audit.md) | deployed | Harden the full client Telegram/IU lifecycle, manager-alert ambiguity, file retention and queue monitoring |
 | [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md) | verified | OAuth state is owner-only/atomic and Bitrix chat/task-comment intake is capture-before-ACK with staged no-replay delivery; fresh durable live acceptance passed |
 | [CHG-20260814-22](changes/CHG-20260814-22-telegram-durable-acknowledgement.md) | verified | Restore immediate best-effort acknowledgement for authorized employee Telegram turns without weakening durable delivery |
-| [CHG-20260814-23](changes/CHG-20260814-23-telegram-final-reaction-parity.md) | implemented_local | Replace Telegram `eyes` with `thumbs up` only after the complete durable answer is sent |
+| [CHG-20260814-23](changes/CHG-20260814-23-telegram-final-reaction-parity.md) | verified | Replace Telegram `eyes` with `thumbs up` only after the complete durable answer is sent; live provider acceptance passed without replay |
 
 ## Runbooks
 

@@ -1,10 +1,10 @@
 # CHG-20260814-23: Complete Telegram reaction parity with Bitrix
 
-- Status: implemented_local
+- Status: verified
 - Date opened: 2026-08-14
 - Related decisions: [ADR-0005](../decisions/ADR-0005-channel-neutral-agent-runtime.md)
 - Supersedes the incomplete final-reaction behavior recorded by: [CHG-20260814-22](CHG-20260814-22-telegram-durable-acknowledgement.md)
-- Bitrix engineering task: pending
+- Bitrix engineering task: not required; this is an employee Telegram transport correction
 
 ## Goal
 
@@ -59,6 +59,25 @@ Local evidence on 2026-08-14:
   profile/chat and currently allowed stable identity. Incomplete/error/review, denied and manual
   outbox cases do not change the reaction.
 
+Production evidence on 2026-08-14:
+
+- Functional commit `aeefb6867b87a434190d0665d3a2a03f87b41e0c` passed GitHub tests run
+  `31797071579` and security run `31797071625` before deployment.
+- The preflight and restart gates both observed zero active Bitrix turns/jobs, automation brain or
+  delivery stages, Telegram brain turns and Telegram delivery leases. The private code backup is
+  `/var/backups/albery/code/pre-chg23-20260814_114219.tar.gz` with mode `0600`.
+- Only `albery-tg.service` restarted. `albery-tg`, `albery`, `albery-web` and `albery-mcp` were all
+  active afterward; the production worktree was clean at the exact approved commit.
+- The deployed finalizer resolved the existing approved owner update `1` to original Telegram
+  message `931`; Telegram accepted `thumbs up`. No reply/file was resent: response outbox `1`
+  remained `sent`, attempts=`1`, provider message=`932`, and the independent native-file outbox `2`
+  remained `sent`, attempts=`1`, provider message=`933`.
+- Full production smoke returned `SMOKE OK`; workspace/Telegram/Bitrix/automation queues were empty,
+  and fresh error journals for all four services contained no entries. Self-check returned success.
+  Its rolling 65-minute window still reported one automation timeout from 14:35 MSK, seven minutes
+  before this deployment; durable run `21` had already recovered to `done` on attempt two and made
+  exactly one successful delivery. A separate read-only probe confirmed current Bitrix OAuth.
+
 ## Risks
 
 A malformed/mismatched stored payload could target the wrong message. Fail closed unless update,
@@ -72,5 +91,6 @@ work gates. Stored update/outbox rows and delivered messages need no rollback.
 
 ## Known gaps and follow-up
 
-None at approval time. Production verification must use an existing approved conversation and must
-not resend any message or file.
+None. The production acceptance used the existing approved conversation and did not resend any
+message or file. The recovered pre-deployment automation timeout remains visible until it naturally
+ages out of self-check's rolling journal window; it is not an active queue or delivery failure.
