@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import re
+import time
 
 from datetime import datetime
 from datetime import timezone
@@ -77,6 +78,24 @@ def google_drive_company_sync_config() -> tuple[str, str]:
     if not token:
         raise ValueError("Укажите GOOGLE_APPS_SCRIPT_SYNC_TOKEN в .env")
     return sync_url, token
+def _persist_google_user_credentials(path: str, creds: Any) -> None:
+    """Atomically persist a refreshed OAuth token without widening file permissions."""
+    target = os.path.abspath(path)
+    temporary = f"{target}.tmp.{os.getpid()}"
+    payload = creds.to_json().encode("utf-8")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 def _google_user_credentials() -> Any:
     """Load the albery agent's Google OAuth user credentials from the secure token paths and
     refresh if needed. Requires the google-auth libraries in the venv."""
@@ -94,6 +113,7 @@ def _google_user_credentials() -> Any:
         creds = Credentials.from_authorized_user_info(data, data.get("scopes"))
         if not creds.valid:
             creds.refresh(_gtr.Request())
+            _persist_google_user_credentials(path, creds)
         return creds
     raise RuntimeError(f"Google OAuth token не найден в secure store ({last_err})")
 def _share_drive_anyone(drive, file_id, role: str = "writer") -> str:
@@ -107,7 +127,7 @@ def _share_drive_anyone(drive, file_id, role: str = "writer") -> str:
         except Exception:
             continue
     return ""
-def share_drive_item_for_everyone(item: str, role: str = "writer") -> dict[str, Any]:
+def share_drive_item_for_everyone(item: str, role: str = "reader") -> dict[str, Any]:
     """Open ANY Drive item (sheet/doc/folder/file/Apps Script) for anyone-with-the-link. Accepts id or URL."""
     from googleapiclient.discovery import build
     fid = _extract_drive_folder_id(item)
@@ -251,11 +271,9 @@ def create_drive_folder(name: str, parent_folder: str, reuse_existing: bool = Tr
         found = drive.files().list(q=q, fields="files(id,name,mimeType,parents,webViewLink)", pageSize=10, supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", []) or []
         if found:
             meta = found[0]
-            _share_drive_anyone(drive, meta.get("id"))
-            return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": False, "reused": True, "access": "anyone_with_link_editor"}
+            return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": False, "reused": True, "access": "inherits_parent"}
     meta = drive.files().create(body={"name": clean_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}, fields="id,name,mimeType,parents,webViewLink", supportsAllDrives=True).execute()
-    _share_drive_anyone(drive, meta.get("id"))
-    return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": True, "reused": False, "access": "anyone_with_link_editor"}
+    return {**_drive_public_meta(meta), "parent_folder_id": parent_id, "created": True, "reused": False, "access": "inherits_parent"}
 def company_drive_root_folder_id() -> str:
     """Google Drive folder id the company documents live under (the Apps Script sync root).
     From env GOOGLE_DRIVE_COMPANY_ROOT_FOLDER_ID; falls back to the live sync payload's folder_id."""
@@ -402,37 +420,38 @@ def fetch_google_drive_company_payload(
 ) -> dict[str, Any]:
     sync_url, token = google_drive_company_sync_config()
     timeout = int(os.getenv("GOOGLE_DRIVE_SYNC_TIMEOUT_SECONDS", "600") or "600")
-    used_post = False
-    if known_files is not None or known_folders is not None:
+    request_payload = {"token": token, "known_files": known_files or {}, "known_folders": known_folders or {}}
+    response: requests.Response | None = None
+    for attempt in range(1, 4):
         try:
             response = requests.post(
                 sync_url,
-                json={"token": token, "known_files": known_files or {}, "known_folders": known_folders or {}},
+                json=request_payload,
                 timeout=timeout,
             )
-            used_post = True
-        except requests.RequestException:
-            response = requests.get(sync_url, params={"token": token}, timeout=timeout)
-        else:
-            if response.status_code in {404, 405}:
-                response = requests.get(sync_url, params={"token": token}, timeout=timeout)
-                used_post = False
-    else:
-        response = requests.get(sync_url, params={"token": token}, timeout=timeout)
+        except requests.RequestException as exc:
+            if attempt >= 3:
+                raise RuntimeError(f"Google Apps Script network error: {type(exc).__name__}") from exc
+            time.sleep(attempt)
+            continue
+        if response.status_code == 429 or response.status_code in {500, 502, 503, 504}:
+            if attempt < 3:
+                retry_after = str(getattr(response, "headers", {}).get("Retry-After") or "").strip()
+                try:
+                    delay = max(0.0, min(float(retry_after), 30.0)) if retry_after else float(attempt)
+                except ValueError:
+                    delay = float(attempt)
+                time.sleep(delay)
+                continue
+        break
+    if response is None:
+        raise RuntimeError("Google Apps Script request did not produce a response")
     if not response.ok:
         raise RuntimeError(f"Google Apps Script вернул HTTP {response.status_code}: {response.text[:500]}")
     try:
         payload = response.json()
     except ValueError:
-        if not used_post:
-            raise RuntimeError(f"Google Apps Script вернул не JSON: {response.text[:500]}")
-        response = requests.get(sync_url, params={"token": token}, timeout=timeout)
-        if not response.ok:
-            raise RuntimeError(f"Google Apps Script вернул HTTP {response.status_code}: {response.text[:500]}")
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError(f"Google Apps Script вернул не JSON: {response.text[:500]}") from exc
+        raise RuntimeError(f"Google Apps Script вернул не JSON: {response.text[:500]}")
     if not isinstance(payload, dict) or not payload.get("ok"):
         error = payload.get("error") if isinstance(payload, dict) else "неожиданный формат ответа"
         raise RuntimeError(f"Google Apps Script error: {error}")
@@ -535,6 +554,9 @@ def google_drive_document_structured_content(document: dict[str, Any]) -> str:
     ]
     header_text = "\n".join(item for item in header if item)
     return f"{header_text}\n\n{structured}".strip() if header_text else structured
+def google_drive_payload_allows_deletions(payload: dict[str, Any]) -> bool:
+    """Deletion requires an explicit completeness assertion from the enumerator."""
+    return payload.get("listing_complete") is True
 def ensure_company_drive_root(cur: Any) -> str:
     root_name = os.getenv("GOOGLE_DRIVE_COMPANY_ROOT_NAME", "Google Drive").strip() or "Google Drive"
     cur.execute(
@@ -625,6 +647,7 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
     document_errors = payload.get("document_errors", [])
     skipped_files = payload.get("skipped_files", [])
     root_google_folder_id = str(payload.get("folder_id") or "").strip()
+    listing_complete = google_drive_payload_allows_deletions(payload)
     seen_file_ids: set[str] = set()
     seen_folder_ids: set[str] = set()
     created = 0
@@ -916,28 +939,31 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
                             if err_id:
                                 protected_file_ids.add(err_id)
 
-                if protected_file_ids:
-                    cur.execute(
-                        """
-                        DELETE FROM company_folders
-                        WHERE id IN (
-                            SELECT folder_id
-                            FROM company_drive_sources
-                            WHERE google_file_id <> ALL(%s)
+                if listing_complete:
+                    if protected_file_ids:
+                        cur.execute(
+                            """
+                            DELETE FROM company_folders
+                            WHERE id IN (
+                                SELECT folder_id
+                                FROM company_drive_sources
+                                WHERE google_file_id <> ALL(%s)
+                            )
+                            """,
+                            (list(protected_file_ids),),
                         )
-                        """,
-                        (list(protected_file_ids),),
-                    )
+                    else:
+                        cur.execute(
+                            """
+                            DELETE FROM company_folders
+                            WHERE id IN (SELECT folder_id FROM company_drive_sources)
+                            """
+                        )
+                    deleted = cur.rowcount
                 else:
-                    cur.execute(
-                        """
-                        DELETE FROM company_folders
-                        WHERE id IN (SELECT folder_id FROM company_drive_sources)
-                        """
-                    )
-                deleted = cur.rowcount
+                    deleted = 0
 
-                if has_folder_listing:
+                if listing_complete and has_folder_listing:
                     if seen_folder_ids:
                         cur.execute(
                             """
@@ -978,6 +1004,7 @@ def sync_google_drive_company_documents() -> dict[str, Any]:
         "document_errors_count": len(document_errors) if isinstance(document_errors, list) else 0,
         "skipped_files": skipped_files if isinstance(skipped_files, list) else [],
         "skipped_files_count": len(skipped_files) if isinstance(skipped_files, list) else 0,
+        "listing_complete": listing_complete,
     }
 DRIVE_CALLS_ACCOUNT_KEY = "GOOGLE_DRIVE_TRANSCRIPTS"
 def google_drive_calls_sync_config() -> tuple[str, str]:

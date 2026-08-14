@@ -155,3 +155,48 @@ def test_novinki_main_keeps_source_files_when_synthesis_fails(monkeypatch):
 
     with pytest.raises(RuntimeError, match="schema failure"):
         nw.main()
+
+
+def test_novinki_cleanup_removes_parent_but_never_deletes_drive_object(monkeypatch):
+    import novinki_watch as nw
+
+    calls = []
+
+    class Request:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def execute(self):
+            return self.payload
+
+    class Files:
+        def get(self, **kwargs):
+            calls.append(("get", kwargs))
+            return Request({"id": kwargs["fileId"], "parents": [nw.FOLDER]})
+
+        def update(self, **kwargs):
+            calls.append(("update", kwargs))
+            return Request({"id": kwargs["fileId"], "parents": []})
+
+        def delete(self, **kwargs):
+            raise AssertionError("Drive object must never be permanently deleted")
+
+    class Drive:
+        def files(self):
+            return Files()
+
+    monkeypatch.setattr(nw.time, "sleep", lambda *_: None)
+    deleted, moved, failed = nw._delete_items(
+        Drive(), [{"id": "f1", "name": "source.txt"}], dry=False
+    )
+
+    assert (deleted, moved, failed) == (0, 1, 0)
+    assert [name for name, _ in calls] == ["get", "update"]
+
+
+def test_novinki_durable_migration_is_registered():
+    from scripts import ensure_postgres
+
+    name = "088_durable_novinki_runs.sql"
+    assert ensure_postgres.REQUIRED_TABLE_MIGRATIONS["novinki_processing_runs"] == name
+    assert name in ensure_postgres.ALWAYS_APPLY_MIGRATIONS

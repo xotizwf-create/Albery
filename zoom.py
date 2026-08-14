@@ -84,6 +84,34 @@ def zoom_oauth_url() -> str:
     return value
 def zoom_api_base_url() -> str:
     return (os.getenv("ZOOM_API_BASE_URL") or "https://api.zoom.us/v2").strip().rstrip("/")
+def _zoom_retry_after(response: requests.Response, attempt: int) -> float:
+    raw = str(response.headers.get("Retry-After") or "").strip()
+    try:
+        return max(0.0, min(float(raw), 30.0)) if raw else float(attempt)
+    except ValueError:
+        return float(attempt)
+def _zoom_oauth_response(account_key: str, account_id: str, client_id: str, client_secret: str) -> requests.Response:
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            response = requests.post(
+                zoom_oauth_url(),
+                params={"grant_type": "account_credentials", "account_id": account_id},
+                auth=(client_id, client_secret),
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= 3:
+                raise RuntimeError(f"Zoom OAuth network error: {type(exc).__name__}") from exc
+            time.sleep(attempt)
+            continue
+        if response.status_code == 429 or response.status_code in {500, 502, 503, 504}:
+            if attempt < 3:
+                time.sleep(_zoom_retry_after(response, attempt))
+                continue
+        return response
+    raise RuntimeError(f"Zoom OAuth failed: {type(last_error).__name__ if last_error else 'unknown'}")
 def zoom_access_token(account_key: str = "ZOOM_ACC2") -> str:
     account_id = os.getenv(f"{account_key}_ACCOUNT_ID", "").strip()
     client_id = os.getenv(f"{account_key}_CLIENT_ID", "").strip()
@@ -99,19 +127,37 @@ def zoom_access_token(account_key: str = "ZOOM_ACC2") -> str:
     ]
     if missing:
         raise RuntimeError(f"Не заданы переменные Zoom: {', '.join(missing)}")
-    response = requests.post(
-        zoom_oauth_url(),
-        params={"grant_type": "account_credentials", "account_id": account_id},
-        auth=(client_id, client_secret),
-        timeout=30,
-    )
+    response = _zoom_oauth_response(account_key, account_id, client_id, client_secret)
     if not response.ok:
         raise RuntimeError(f"Zoom OAuth error {response.status_code}: {response.text[:500]}")
     return str(response.json()["access_token"])
 def zoom_session(account_key: str = "ZOOM_ACC2") -> requests.Session:
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {zoom_access_token(account_key)}"})
+    session.albery_zoom_account_key = account_key
     return session
+def zoom_get(session: requests.Session, url: str, **kwargs: Any) -> requests.Response:
+    """Bounded retry for read-only Zoom calls; refresh one expired bearer token."""
+    refreshed = False
+    for attempt in range(1, 4):
+        try:
+            response = session.get(url, **kwargs)
+        except requests.RequestException as exc:
+            if attempt >= 3:
+                raise RuntimeError(f"Zoom API network error: {type(exc).__name__}") from exc
+            time.sleep(attempt)
+            continue
+        if response.status_code == 401 and not refreshed:
+            account_key = str(getattr(session, "albery_zoom_account_key", "ZOOM_ACC2") or "ZOOM_ACC2")
+            session.headers.update({"Authorization": f"Bearer {zoom_access_token(account_key)}"})
+            refreshed = True
+            continue
+        if response.status_code == 429 or response.status_code in {500, 502, 503, 504}:
+            if attempt < 3:
+                time.sleep(_zoom_retry_after(response, attempt))
+                continue
+        return response
+    raise RuntimeError("Zoom API read retry exhausted")
 def parse_zoom_datetime(value: Any, tz_name: str = "Europe/Moscow") -> datetime | None:
     parsed = parse_datetime(value)
     if parsed is None:
@@ -169,7 +215,8 @@ def zoom_list_users(session: requests.Session) -> list[dict[str, Any]]:
     users: list[dict[str, Any]] = []
     page = ""
     while True:
-        response = session.get(
+        response = zoom_get(
+            session,
             f"{zoom_api_base_url()}/users",
             params={"page_size": 300, "next_page_token": page},
             timeout=30,
@@ -185,7 +232,8 @@ def zoom_list_recordings(session: requests.Session, user_id: str, date_from: dat
     meetings: list[dict[str, Any]] = []
     page = ""
     while True:
-        response = session.get(
+        response = zoom_get(
+            session,
             f"{zoom_api_base_url()}/users/{user_id}/recordings",
             params={
                 "from": date_from.isoformat(),
@@ -207,7 +255,8 @@ def zoom_list_participants(session: requests.Session, meeting_uuid: str) -> tupl
     page = ""
     try:
         while True:
-            response = session.get(
+            response = zoom_get(
+                session,
                 f"{zoom_api_base_url()}/past_meetings/{zoom_encoded_uuid(meeting_uuid)}/participants",
                 params={"page_size": 300, "next_page_token": page},
                 timeout=30,
@@ -219,10 +268,11 @@ def zoom_list_participants(session: requests.Session, meeting_uuid: str) -> tupl
             page = payload.get("next_page_token") or ""
             if not page:
                 return participants, None
-    except requests.RequestException as exc:
+    except Exception as exc:  # noqa: BLE001 - participant data is optional and retained on failure
         return participants, str(exc)
 def zoom_get_recording(session: requests.Session, meeting_uuid: str) -> dict[str, Any]:
-    response = session.get(
+    response = zoom_get(
+        session,
         f"{zoom_api_base_url()}/meetings/{zoom_encoded_uuid(meeting_uuid)}/recordings",
         timeout=30,
     )
@@ -325,16 +375,13 @@ def upsert_zoom_recording_meeting(
     ):
         download_url = file_item.get("download_url")
         if not download_url:
-            continue
-        response = session.get(download_url, timeout=60)
+            raise RuntimeError(f"Zoom transcript file {zoom_transcript_file_key(file_item) or segment_index} has no download URL")
+        response = zoom_get(session, download_url, timeout=60)
         if not response.ok:
-            transcript_payload.append(
-                {
-                    "file": file_item,
-                    "error": f"HTTP {response.status_code}: {response.text[:200]}",
-                }
+            raise RuntimeError(
+                f"Zoom transcript download failed for {zoom_transcript_file_key(file_item) or segment_index}: "
+                f"HTTP {response.status_code}"
             )
-            continue
         cues = parse_zoom_vtt(response.text)
         for cue in cues:
             cue["segment_index"] = segment_index
@@ -416,9 +463,11 @@ def upsert_zoom_recording_meeting(
         ),
     )
     call_id = cur.fetchone()["id"]
-    cur.execute("DELETE FROM zoom_call_participants WHERE call_id = %s", (call_id,))
+    replace_participants = participant_error is None or existing is None
+    if replace_participants:
+        cur.execute("DELETE FROM zoom_call_participants WHERE call_id = %s", (call_id,))
     cur.execute("DELETE FROM zoom_call_transcript_segments WHERE call_id = %s", (call_id,))
-    for participant in participants:
+    for participant in participants if replace_participants else []:
         cur.execute(
             """
             INSERT INTO zoom_call_participants (
@@ -567,37 +616,57 @@ def process_zoom_recording_event_queue(limit: int = 20) -> dict[str, Any]:
     limit = max(1, min(int(limit or 20), 100))
     processed: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+    claimed_ids: list[Any] = []
     with pg_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, event_name, zoom_uuid
-                FROM zoom_recording_events
-                WHERE status IN ('queued','error') AND attempts < 5
-                ORDER BY received_at ASC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cur.fetchall()
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE zoom_recording_events
+                    SET status = 'error',
+                        error_text = 'processing lease expired after final attempt',
+                        updated_at = now()
+                    WHERE status = 'processing'
+                      AND attempts >= 5
+                      AND updated_at < now() - interval '30 minutes'
+                    """
+                )
 
-    for row in rows:
-        event_id = row["id"]
-        event_name = row["event_name"]
-        zoom_uuid = row["zoom_uuid"]
+    for _ in range(limit):
         with pg_connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        UPDATE zoom_recording_events
-                        SET status = 'processing', attempts = attempts + 1, updated_at = now()
-                        WHERE id = %s AND status IN ('queued','error')
+                        WITH candidate AS (
+                            SELECT id
+                            FROM zoom_recording_events
+                            WHERE attempts < 5
+                              AND NOT (id = ANY(%s))
+                              AND (
+                                  status IN ('queued','error')
+                                  OR (status = 'processing' AND updated_at < now() - interval '30 minutes')
+                              )
+                            ORDER BY received_at ASC
+                            FOR UPDATE SKIP LOCKED
+                            LIMIT 1
+                        )
+                        UPDATE zoom_recording_events AS event
+                        SET status = 'processing', attempts = attempts + 1,
+                            error_text = NULL, updated_at = now()
+                        FROM candidate
+                        WHERE event.id = candidate.id
+                        RETURNING event.id, event.event_name, event.zoom_uuid
                         """,
-                        (event_id,),
+                        (claimed_ids,),
                     )
-                    if cur.rowcount != 1:
-                        continue
+                    row = cur.fetchone()
+        if not row:
+            break
+        event_id = row["id"]
+        claimed_ids.append(event_id)
+        event_name = row["event_name"]
+        zoom_uuid = row["zoom_uuid"]
         try:
             result = sync_zoom_recording_by_uuid(zoom_uuid, force=False)
             if event_name == "recording.transcript_completed" and result.get("status") in {"synced", "skipped_unchanged"}:

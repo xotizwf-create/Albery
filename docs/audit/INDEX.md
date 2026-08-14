@@ -58,6 +58,8 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md) | verified | OAuth state is owner-only/atomic and Bitrix chat/task-comment intake is capture-before-ACK with staged no-replay delivery; fresh durable live acceptance passed |
 | [CHG-20260814-22](changes/CHG-20260814-22-telegram-durable-acknowledgement.md) | verified | Restore immediate best-effort acknowledgement for authorized employee Telegram turns without weakening durable delivery |
 | [CHG-20260814-23](changes/CHG-20260814-23-telegram-final-reaction-parity.md) | verified | Replace Telegram `eyes` with `thumbs up` only after the complete durable answer is sent; live provider acceptance passed without replay |
+| [CHG-20260814-24](changes/CHG-20260814-24-employee-channel-closure.md) | in_progress | Exact Bitrix native-file target and cross-channel IDs are resolved; provider send and identity confirmation remain |
+| [CHG-20260814-25](changes/CHG-20260814-25-external-connectors-resilience-audit.md) | in_progress | Read probes pass; Zoom/Google recovery fixes and secret rotation are in local remediation |
 
 ## Runbooks
 

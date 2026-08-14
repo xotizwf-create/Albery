@@ -1,10 +1,12 @@
 const CALLS_FOLDER_ID = '11cy4HOs1IPOgrIsI9cVDZMnZ5i4UYgCG';
-const SYNC_TOKEN = 'C-NJb3jZB_PYpOAQZboPjcuL7zauBlOul1IYB6dt0dWslO2Rd70B6am-9teKP4aP';
+function syncToken_() {
+  return PropertiesService.getScriptProperties().getProperty('SYNC_TOKEN') || '';
+}
 const TRANSCRIPT_FILE_NAME = 'transcript.txt';
 
 function doGet(e) {
   const token = e && e.parameter ? String(e.parameter.token || '') : '';
-  if (token !== SYNC_TOKEN) {
+  if (!syncToken_() || token !== syncToken_()) {
     return jsonResponse({ ok: false, error: 'Unauthorized' });
   }
 

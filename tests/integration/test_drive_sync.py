@@ -29,7 +29,7 @@ def test_fetch_company_documents_parses_payload(gdrive_module, monkeypatch):
             "not-a-dict",  # filtered out
         ],
     }
-    monkeypatch.setattr(gdrive_module.requests, "get", lambda *a, **k: FakeResponse(payload))
+    monkeypatch.setattr(gdrive_module.requests, "post", lambda *a, **k: FakeResponse(payload))
 
     docs = gdrive_module.fetch_google_drive_company_documents()
     assert [d["file_id"] for d in docs] == ["f1", "f2"]
@@ -38,7 +38,7 @@ def test_fetch_company_documents_parses_payload(gdrive_module, monkeypatch):
 def test_fetch_company_payload_raises_on_error_flag(gdrive_module, monkeypatch):
     monkeypatch.setattr(gdrive_module, "google_drive_company_sync_config", lambda: ("https://fake.script", "tok"))
     monkeypatch.setattr(
-        gdrive_module.requests, "get",
+        gdrive_module.requests, "post",
         lambda *a, **k: FakeResponse({"ok": False, "error": "access denied"}),
     )
     with pytest.raises(RuntimeError, match="access denied"):
@@ -48,7 +48,7 @@ def test_fetch_company_payload_raises_on_error_flag(gdrive_module, monkeypatch):
 def test_fetch_company_payload_raises_on_http_error(gdrive_module, monkeypatch):
     monkeypatch.setattr(gdrive_module, "google_drive_company_sync_config", lambda: ("https://fake.script", "tok"))
     monkeypatch.setattr(
-        gdrive_module.requests, "get",
+        gdrive_module.requests, "post",
         lambda *a, **k: FakeResponse(None, ok=False, status_code=500, text="boom"),
     )
     with pytest.raises(RuntimeError, match="HTTP 500"):

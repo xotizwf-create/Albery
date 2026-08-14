@@ -1,6 +1,6 @@
 # Albery full audit roadmap
 
-Last reviewed: 2026-08-13.
+Last reviewed: 2026-08-14.
 
 This is the canonical queue for the full-system audit requested by the owner. Detailed facts,
 changes, tests and rollback evidence remain in linked `CHG-*` records. A workstream is complete only
@@ -21,10 +21,10 @@ when its production behavior is `verified`; code review or a green unit suite al
 | P0 | verified | Audit-record reconciliation | old CHG gates are amended from later evidence; historical records are explicitly superseded rather than silently rewritten |
 | P0 | acceptance | Employee channel acceptance | approved Bitrix native-file delivery and employee Telegram round trip; Telegram-to-Bitrix identity remains fail-closed until immutable IDs and person are confirmed |
 | P1 | verified | MCP capability and agent-rights matrix | every registered tool classified by data domain, read/write danger, confirmation, idempotency, object locking and exact agent grants |
-| P1 | acceptance | PostgreSQL and disaster recovery | deployed atomic/SHA-256/pg_restore chain and isolated drill; first natural 03:15 -> 03:45 production cycle pending |
+| P1 | verified | PostgreSQL and disaster recovery | atomic/SHA-256/pg_restore chain, natural local/offsite cycle and two isolated PostgreSQL 16 restore drills passed |
 | P1 | acceptance | Client Telegram/IU and CRM funnel | structural lifecycle, provider ambiguity, reference-safe retention and queue monitoring are deployed/clean; an approved real customer/manager round trip remains |
-| P2 | in_progress | Bitrix business correctness | webhook deduplication, OAuth recovery, authorship, tasks, CRM/funnel mutations, partial failure and boundary cases |
-| P2 | pending | Zoom, Google and Wildberries | token expiry, API drift, quotas/rate limits, retry/idempotency, partial writes and observable recovery for each connector |
+| P2 | verified | Bitrix business correctness | durable pre-ACK capture, OAuth recovery, authorship, task/CRM safety matrix and a fresh duplicate-safe owner round trip passed under CHG-21 |
+| P2 | in_progress | Zoom, Google and Wildberries | production read probes pass; Zoom partial-overwrite/lease and Google completeness/token-publication/secret-rotation findings are under CHG-25 remediation |
 | P2 | pending | Web/API and Agent Center | authentication, authorization, IDOR, CSRF/CORS, upload limits, atomic configuration, audit trail and rollback |
 | P2 | pending | Knowledge, memory and prompts | provenance, ACL, prompt injection, precedence, channel isolation, retention, deletion and versioned skill/prompt rollout |
 | P2 | pending | Document and media ingestion | MIME/content validation, archive/macro hazards, conversion sandbox, memory/size limits, temporary-file lifecycle and exact output |

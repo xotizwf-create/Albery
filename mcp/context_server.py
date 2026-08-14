@@ -6225,7 +6225,7 @@ def tool_create_google_sheet(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(
             -32602,
             "Создание Google-таблицы требует confirm=true. Сначала покажи пользователю, что создашь "
-            "(название, какие данные впишешь, как будет оформлена таблица, и что доступ будет «по ссылке — редактор»), "
+            "(название, какие данные впишешь, как будет оформлена таблица и будет ли отдельно открыт публичный доступ), "
             "получи согласие, и только потом вызови с confirm=true.",
         )
     title = str(args.get("title") or "").strip()
@@ -6234,10 +6234,13 @@ def tool_create_google_sheet(args: dict[str, Any]) -> dict[str, Any]:
     rows = args.get("rows")
     if rows is not None and not isinstance(rows, list):
         raise McpError(-32602, "rows должен быть списком строк (каждая — список ячеек).")
-    share = args.get("share_anyone_writer", True)
+    share = args.get("share_anyone_writer", False)
+    idempotency_key = str(args.get("idempotency_key") or "").strip()
+    if not idempotency_key:
+        raise McpError(-32602, "idempotency_key обязателен: стабильный ключ этой операции создания.")
     workflow = app_workflow_function("create_google_sheet")
     try:
-        return workflow(title, rows, bool(share))
+        return workflow(title, rows, bool(share), idempotency_key)
     except McpError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -6249,7 +6252,7 @@ def tool_create_google_doc(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(
             -32602,
             "Создание Google-документа требует confirm=true. Сначала покажи пользователю название и краткую структуру "
-            "содержимого (и что доступ будет «по ссылке — редактор»), получи согласие, затем вызови с confirm=true.",
+            "содержимого и будет ли отдельно открыт публичный доступ, получи согласие, затем вызови с confirm=true.",
         )
     title = str(args.get("title") or "").strip()
     if not title:
@@ -6257,10 +6260,13 @@ def tool_create_google_doc(args: dict[str, Any]) -> dict[str, Any]:
     html = str(args.get("html") or args.get("html_body") or args.get("content") or "").strip()
     if not html:
         raise McpError(-32602, "html (содержимое документа, HTML) обязателен.")
-    share = args.get("share_anyone_writer", True)
+    share = args.get("share_anyone_writer", False)
+    idempotency_key = str(args.get("idempotency_key") or "").strip()
+    if not idempotency_key:
+        raise McpError(-32602, "idempotency_key обязателен: стабильный ключ этой операции создания.")
     try:
         return app_workflow_function("create_google_doc")(
-            title, html, bool(share), args.get("font_size_pt"), args.get("line_spacing"))
+            title, html, bool(share), args.get("font_size_pt"), args.get("line_spacing"), idempotency_key)
     except McpError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -6497,10 +6503,18 @@ def tool_make_sheet_applet(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_share_drive_item_for_everyone(args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("confirm") is not True:
+        raise McpError(
+            -32602,
+            "Публичный доступ к Google Drive требует confirm=true. Сначала покажи точный объект и уровень "
+            "доступа (reader/writer), предупреди, что любой обладатель ссылки получит доступ, и получи согласие.",
+        )
     item = str(args.get("item") or args.get("file_id") or args.get("url") or "").strip()
     if not item:
         raise McpError(-32602, "item (Drive id or URL) is required.")
-    role = str(args.get("role") or "writer").strip().lower()
+    role = str(args.get("role") or "reader").strip().lower()
+    if role not in {"reader", "writer"}:
+        raise McpError(-32602, "role должен быть reader или writer.")
     try:
         return app_workflow_function("share_drive_item_for_everyone")(item, role)
     except McpError:
@@ -11735,8 +11749,8 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "create_google_sheet": {
         "description": (
-            "Создать НОВУЮ Google-таблицу (от имени Google-аккаунта агента). По умолчанию выдаёт доступ "
-            "«по ссылке — редактор» (anyone with link = editor) и возвращает ссылку. Можно сразу вписать "
+            "Создать НОВУЮ Google-таблицу (от имени Google-аккаунта агента). По умолчанию таблица приватная; "
+            "публичный доступ редактора включается только явным share_anyone_writer=true после предупреждения. Можно сразу вписать "
             "данные через rows (список строк, каждая — список ячеек, с A1). Если rows переданы, сервер "
             "автоматически применяет спокойное читабельное оформление: перенос текста, автоширины под русский "
             "текст/числа/₽, аккуратные границы, лёгкая зебра и без лишней пёстрой заливки. Перед созданием "
@@ -11748,18 +11762,19 @@ TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "title": {"type": "string", "description": "Название новой таблицы"},
                 "rows": {"type": "array", "items": {"type": "array"}, "description": "Опц.: начальные данные с A1 (список строк)"},
-                "share_anyone_writer": {"type": "boolean", "description": "Доступ «по ссылке — редактор» (по умолчанию true)"},
+                "share_anyone_writer": {"type": "boolean", "default": False, "description": "Явно открыть всем по ссылке редактирование; по умолчанию false"},
+                "idempotency_key": {"type": "string", "description": "Стабильный уникальный ключ операции; повтор с тем же ключом вернёт тот же объект"},
                 "confirm": {"type": "boolean", "description": "Должно быть true после явного согласия пользователя"},
             },
-            "required": ["title", "confirm"],
+            "required": ["title", "idempotency_key", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_create_google_sheet,
     },
     "create_google_doc": {
         "description": (
-            "Создать НОВЫЙ Google-ДОКУМЕНТ (Google Docs) из HTML от имени Google-аккаунта агента. По умолчанию сразу "
-            "выдаёт доступ «по ссылке — редактор» и возвращает ссылку. Это ЕДИНСТВЕННЫЙ правильный путь на просьбу "
+            "Создать НОВЫЙ Google-ДОКУМЕНТ (Google Docs) из HTML от имени Google-аккаунта агента. По умолчанию документ "
+            "приватный; публичное редактирование включается только явным share_anyone_writer=true после предупреждения. Это ЕДИНСТВЕННЫЙ правильный путь на просьбу "
             "«создай гугл документ»: НИКОГДА не создавай документы через Apps Script/веб-приложения и не давай "
             "пользователю ссылок script.google.com — он получит «нет доступа». Перед созданием покажи пользователю "
             "название и структуру, получи согласие, затем вызови с confirm=true. Оформление документа — один в один как у docx из export_document (тот же рендер docformat: заголовки, таблицы, отступы)."
@@ -11771,10 +11786,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "html": {"type": "string", "description": "Содержимое: полный HTML (h1/h2/p/ul/table)"},
                 "font_size_pt": {"type": "number", "description": "Кегль, как в export_document (по умолчанию 12)"},
                 "line_spacing": {"type": "number", "description": "Межстрочный интервал (по умолчанию 1.5, ГОСТ)"},
-                "share_anyone_writer": {"type": "boolean", "description": "Доступ «по ссылке — редактор» (по умолчанию true)"},
+                "share_anyone_writer": {"type": "boolean", "default": False, "description": "Явно открыть всем по ссылке редактирование; по умолчанию false"},
+                "idempotency_key": {"type": "string", "description": "Стабильный уникальный ключ операции; повтор с тем же ключом вернёт тот же объект"},
                 "confirm": {"type": "boolean", "description": "Должно быть true после явного согласия пользователя"},
             },
-            "required": ["title", "html", "confirm"],
+            "required": ["title", "html", "idempotency_key", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_create_google_doc,
@@ -12011,18 +12027,19 @@ TOOLS: dict[str, dict[str, Any]] = {
     "share_drive_item_for_everyone": {
         "description": (
             "Open ANY Google Drive item — spreadsheet, document, folder, file, or an Apps Script project — for "
-            "ANYONE WITH THE LINK (editor by default). Accepts a Drive/Docs/Sheets id or URL. ALWAYS call this "
-            "after creating a Google object, or before sending its link to a person, so the link is never "
-            "'Нет доступа'. For a sheet your Apps Script created at runtime, pass its id/url here too."
+            "ANYONE WITH THE LINK (viewer by default). This is a separate high-impact operation: show the exact "
+            "item and reader/writer level, warn that anyone holding the link gets access, obtain confirmation, "
+            "then call with confirm=true. Never publish automatically merely because a link will be sent."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "item": {"type": "string", "description": "Drive/Docs/Sheets id or URL"},
                 "file_id": {"type": "string", "description": "Alias for item"},
-                "role": {"type": "string", "description": "writer (default = editor) or reader (viewer)"},
+                "role": {"type": "string", "enum": ["reader", "writer"], "default": "reader", "description": "reader (default) or writer"},
+                "confirm": {"type": "boolean", "description": "Must be true after exact user confirmation"},
             },
-            "required": ["item"],
+            "required": ["item", "confirm"],
             "additionalProperties": False,
         },
         "handler": tool_share_drive_item_for_everyone,

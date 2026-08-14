@@ -289,6 +289,18 @@ if workspace_queue_problems:
     problems.extend(f"КРИТИЧНО: {message}" for message in workspace_queue_problems)
     critical = True
 
+# --- Zoom / Google Drive / Wildberries ---------------------------------------------------
+# Only timestamps, counters and JWT expiry metadata enter the monitor; provider payloads do not.
+try:
+    from scripts.provider_connector_health import inspect_provider_connector_health
+
+    provider_connector_problems = inspect_provider_connector_health()
+except Exception as exc:  # noqa: BLE001
+    provider_connector_problems = [f"provider connector monitor failed ({type(exc).__name__})"]
+if provider_connector_problems:
+    problems.extend(f"КРИТИЧНО: {message}" for message in provider_connector_problems)
+    critical = True
+
 # --- Durable Bitrix chat/task-comment intake ----------------------------------------------
 # Counts and timestamps only: message bodies and prepared answers never enter monitoring output.
 try:

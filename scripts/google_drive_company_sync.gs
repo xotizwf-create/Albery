@@ -1,7 +1,10 @@
 const FOLDER_ID = '11R9uAL6vkbWDiGvjOnS8k22NQxxmrAlK';
 const CALLS_FOLDER_ID = '11cy4HOs1IPOgrIsI9cVDZMnZ5i4UYgCG';
-const SYNC_TOKEN = 'C-NJb3jZB_PYpOAQZboPjcuL7zauBlOul1IYB6dt0dWslO2Rd70B6am-9teKP4aP';
 const TRANSCRIPT_FILE_NAME = 'transcript.txt';
+
+function syncToken_() {
+  return PropertiesService.getScriptProperties().getProperty('SYNC_TOKEN') || '';
+}
 
 const MIME_GOOGLE_DOC = 'application/vnd.google-apps.document';
 const MIME_GOOGLE_SHEET = 'application/vnd.google-apps.spreadsheet';
@@ -25,7 +28,7 @@ const SUPPORTED_MIME_TYPES = [
 
 function doGet(e) {
   const token = e && e.parameter ? String(e.parameter.token || '') : '';
-  if (token !== SYNC_TOKEN) {
+  if (!syncToken_() || token !== syncToken_()) {
     return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
   }
   return buildCompanySyncResponse({});
@@ -42,7 +45,7 @@ function doPost(e) {
   }
 
   const token = String(payload.token || '');
-  if (token !== SYNC_TOKEN) {
+  if (!syncToken_() || token !== syncToken_()) {
     return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
   }
 
@@ -95,6 +98,7 @@ function buildCompanySyncResponse(payload) {
 
   return jsonResponse({
     ok: true,
+    listing_complete: true,
     folder_id: FOLDER_ID,
     calls_folder_id: CALLS_FOLDER_ID,
     synced_at: new Date().toISOString(),

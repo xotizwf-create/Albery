@@ -666,7 +666,15 @@ def webapp_design_template(title: str | None = None) -> dict[str, Any]:
     }
 
 
-def create_google_sheet(title: str, rows: list | None = None, share_anyone_writer: bool = True) -> dict[str, Any]:
+def _google_create_idempotency(value: Any) -> tuple[str, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("idempotency_key обязателен для создания Google-объекта")
+    return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def create_google_sheet(title: str, rows: list | None = None, share_anyone_writer: bool = False,
+                        idempotency_key: str | None = None) -> dict[str, Any]:
     """Create a brand-new Google Sheet via the Sheets/Drive API (as the albery agent's Google
     account), optionally write initial rows, optionally share it as anyone-with-link = editor, and
     return its id + url."""
@@ -676,9 +684,28 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
     sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
     drive = build("drive", "v3", credentials=creds, cache_discovery=False)
     clean_title = (str(title or "").strip() or "Новая таблица")[:200]
-    spreadsheet = sheets.spreadsheets().create(body={"properties": {"title": clean_title}}).execute()
-    sid = spreadsheet["spreadsheetId"]
-    url = spreadsheet.get("spreadsheetUrl") or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
+    _raw_key, stored_key = _google_create_idempotency(idempotency_key)
+    found = drive.files().list(
+        q=("trashed=false and mimeType='application/vnd.google-apps.spreadsheet' and "
+           f"appProperties has {{ key='albery_idempotency' and value='{stored_key}' }}"),
+        fields="files(id,name,mimeType,webViewLink)", pageSize=2,
+    ).execute().get("files", []) or []
+    if len(found) > 1:
+        raise RuntimeError("Google idempotency key matched more than one spreadsheet")
+    reused = bool(found)
+    if found:
+        spreadsheet_file = found[0]
+    else:
+        spreadsheet_file = drive.files().create(
+            body={
+                "name": clean_title,
+                "mimeType": "application/vnd.google-apps.spreadsheet",
+                "appProperties": {"albery_idempotency": stored_key},
+            },
+            fields="id,name,mimeType,webViewLink",
+        ).execute()
+    sid = spreadsheet_file["id"]
+    url = spreadsheet_file.get("webViewLink") or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
     locale = _sheet_locale(sheets, sid)
     formula_separator = _formula_argument_separator_for_locale(locale)
     decimal_separator = _formula_decimal_separator_for_locale(locale)
@@ -701,16 +728,40 @@ def create_google_sheet(title: str, rows: list | None = None, share_anyone_write
         "decimal_separator": decimal_separator,
         "style_applied": style_applied,
         "access": "anyone_with_link_editor" if share_anyone_writer else "private",
+        "created": not reused,
+        "reused": reused,
     }
 
 
-def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = True,
-                      font_size_pt: float | None = None, line_spacing: float | None = None) -> dict[str, Any]:
+def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = False,
+                      font_size_pt: float | None = None, line_spacing: float | None = None,
+                      idempotency_key: str | None = None) -> dict[str, Any]:
     """Create a new Google Doc from HTML (as the agent's Google account), optionally share it
     anyone-with-link = editor and return its id + url. The only sanctioned way to make a Google
     Doc for a user: Apps Script web-app detours produce artifacts the requester cannot open."""
     drive = _build_drive_service()
     clean_title = (str(title or "").strip() or "Новый документ")[:200]
+    _raw_key, stored_key = _google_create_idempotency(idempotency_key)
+    found = drive.files().list(
+        q=("trashed=false and mimeType='application/vnd.google-apps.document' and "
+           f"appProperties has {{ key='albery_idempotency' and value='{stored_key}' }}"),
+        fields="files(id,name,mimeType,webViewLink)", pageSize=2,
+    ).execute().get("files", []) or []
+    if len(found) > 1:
+        raise RuntimeError("Google idempotency key matched more than one document")
+    if found:
+        created = found[0]
+        doc_id = created["id"]
+        if share_anyone_writer:
+            drive.permissions().create(fileId=doc_id, body={"type": "anyone", "role": "writer"}).execute()
+        return {
+            "document_id": doc_id,
+            "url": created.get("webViewLink") or f"https://docs.google.com/document/d/{doc_id}/edit",
+            "title": created.get("name") or clean_title,
+            "access": "anyone_with_link_editor" if share_anyone_writer else "private",
+            "created": False,
+            "reused": True,
+        }
     html = str(html_body or "").strip()
     if not html:
         raise RuntimeError("html_body пуст — соберите HTML содержимого документа.")
@@ -726,7 +777,11 @@ def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = Tr
         line_spacing=float(line_spacing or 1.5),
     ))
     created = drive.files().create(
-        body={"name": clean_title, "mimeType": "application/vnd.google-apps.document"},
+        body={
+            "name": clean_title,
+            "mimeType": "application/vnd.google-apps.document",
+            "appProperties": {"albery_idempotency": stored_key},
+        },
         media_body=media, fields="id,webViewLink,name,mimeType",
     ).execute()
     doc_id = created["id"]
@@ -740,6 +795,8 @@ def create_google_doc(title: str, html_body: str, share_anyone_writer: bool = Tr
         "url": url,
         "title": created.get("name") or clean_title,
         "access": "anyone_with_link_editor" if share_anyone_writer else "private",
+        "created": True,
+        "reused": False,
     }
 
 

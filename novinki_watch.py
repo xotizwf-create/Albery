@@ -54,6 +54,67 @@ MAX_CANDIDATES = 400
 CODEX_BATCH = max(10, int(os.getenv("NOVINKI_CODEX_BATCH", "40") or "40"))
 CODEX_FINAL_CAP = max(20, int(os.getenv("NOVINKI_CODEX_FINAL_CAP", "120") or "120"))
 
+
+def _snapshot_key(items):
+    identities = sorted(str(item.get("id") or "").strip() for item in items if item.get("id"))
+    return hashlib.sha256((FOLDER + "\n" + "\n".join(identities)).encode("utf-8")).hexdigest()
+
+
+def _load_or_create_run(snapshot_key, items):
+    from shared.db import connect
+
+    source_ids = sorted(str(item.get("id") or "").strip() for item in items if item.get("id"))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM novinki_processing_runs
+                WHERE folder_id = %s AND status <> 'done'
+                ORDER BY created_at
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (FOLDER,),
+            )
+            active = cur.fetchone()
+            if active:
+                return dict(active)
+            cur.execute(
+                """
+                INSERT INTO novinki_processing_runs (snapshot_key, folder_id, source_ids, source_count)
+                VALUES (%s, %s, %s::jsonb, %s)
+                ON CONFLICT (snapshot_key) DO UPDATE SET source_count = EXCLUDED.source_count
+                RETURNING *
+                """,
+                (snapshot_key, FOLDER, json.dumps(source_ids), len(source_ids)),
+            )
+            return dict(cur.fetchone())
+
+
+def _update_run(snapshot_key, status, **fields):
+    from shared.db import connect
+
+    allowed = {"recommendation_count", "sheet_id", "sheet_url", "bitrix_task_id", "last_error"}
+    updates = {key: value for key, value in fields.items() if key in allowed}
+    assignments = ["status = %s", "updated_at = now()"]
+    params = [status]
+    for key, value in updates.items():
+        assignments.append(f"{key} = %s")
+        params.append(value)
+    if status == "done":
+        assignments.append("completed_at = now()")
+    params.append(snapshot_key)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE novinki_processing_runs SET {', '.join(assignments)} WHERE snapshot_key = %s RETURNING *",
+                tuple(params),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("novinki durable run disappeared")
+            return dict(row)
+
 STRONG = re.compile(
     r"лайфхак|делюсь опыт|рекоменду|совету[юе]|инструкци|алгоритм|чек.?лист|"
     r"схема (работ|прост|так)|как (правильно|лучше|избежать|снизить|поднять|обойти|выбрать|посчитать)|"
@@ -288,7 +349,27 @@ def _deadline_3bd(now):
     return f"{d.isoformat()}T13:00:00+03:00"
 
 
-def _make_sheet(cs, drive, sheets, recs, files_info, date_label):
+def _grant_writer_to_email(drive, file_id, email):
+    clean_email = str(email or "").strip().lower()
+    if not clean_email:
+        raise RuntimeError("У ответственного Bitrix не указан email для приватного доступа к Google Sheet")
+    permissions = drive.permissions().list(
+        fileId=file_id, fields="permissions(id,type,role,emailAddress)"
+    ).execute().get("permissions", []) or []
+    if any(
+        str(item.get("emailAddress") or "").strip().lower() == clean_email
+        and item.get("role") in {"writer", "owner"}
+        for item in permissions
+    ):
+        return
+    drive.permissions().create(
+        fileId=file_id,
+        body={"type": "user", "role": "writer", "emailAddress": clean_email},
+        sendNotificationEmail=False,
+    ).execute()
+
+
+def _make_sheet(cs, drive, sheets, recs, files_info, date_label, run_key, responsible_email):
     header = ["№", "Категория", "Рекомендация (что внедрить/изменить)", "Обоснование",
               "Источник (файл, дата, автор)", "Есть ли в базе «О компании»", "Комментарий"]
     rows = [header] + [[str(i + 1), r.get("category", ""), r.get("recommendation", ""),
@@ -296,20 +377,46 @@ def _make_sheet(cs, drive, sheets, recs, files_info, date_label):
                        for i, r in enumerate(recs)]
     created = cs.tool_create_google_sheet({
         "title": f"Новинки — рекомендации по изменениям от {date_label}",
-        "rows": rows, "confirm": True})
+        "rows": rows,
+        "share_anyone_writer": False,
+        "idempotency_key": f"novinki:{run_key}:sheet",
+        "confirm": True,
+    })
     sid = created["spreadsheet_id"]
-    meta = sheets.spreadsheets().get(spreadsheetId=sid, fields="sheets(properties(sheetId))").execute()
-    first_id = meta["sheets"][0]["properties"]["sheetId"]
+    _grant_writer_to_email(drive, sid, responsible_email)
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=sid, fields="sheets(properties(sheetId,title))"
+    ).execute()
+    sheet_ids = {
+        str(item["properties"].get("title") or ""): item["properties"]["sheetId"]
+        for item in meta.get("sheets") or []
+    }
+    first_id = sheet_ids.get("Рекомендации")
+    if first_id is None:
+        first_id = (meta.get("sheets") or [])[0]["properties"]["sheetId"]
     doc_rows = [["Файл", "Тип", "Извлечено сообщений/симв.", "Инсайт-кандидатов"]] + files_info
     reqs = [
-        {"updateSheetProperties": {"properties": {"sheetId": first_id, "title": "Рекомендации"}, "fields": "title"}},
-        {"addSheet": {"properties": {"title": f"Документы ({len(files_info)})",
-                                     "gridProperties": {"rowCount": len(doc_rows) + 5, "columnCount": 5, "frozenRowCount": 1}}}},
-        {"addSheet": {"properties": {"title": "Сводка", "gridProperties": {"rowCount": 12, "columnCount": 2}}}},
     ]
-    resp = sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": reqs}).execute()
-    docs_id = resp["replies"][1]["addSheet"]["properties"]["sheetId"]
-    sum_id = resp["replies"][2]["addSheet"]["properties"]["sheetId"]
+    if "Рекомендации" not in sheet_ids:
+        reqs.append({"updateSheetProperties": {"properties": {"sheetId": first_id, "title": "Рекомендации"}, "fields": "title"}})
+    docs_title = f"Документы ({len(files_info)})"
+    if docs_title not in sheet_ids:
+        reqs.append({"addSheet": {"properties": {"title": docs_title,
+                                                   "gridProperties": {"rowCount": len(doc_rows) + 5, "columnCount": 5, "frozenRowCount": 1}}}})
+    if "Сводка" not in sheet_ids:
+        reqs.append({"addSheet": {"properties": {"title": "Сводка", "gridProperties": {"rowCount": 12, "columnCount": 2}}}})
+    if reqs:
+        sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": reqs}).execute()
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=sid, fields="sheets(properties(sheetId,title))"
+    ).execute()
+    sheet_ids = {
+        str(item["properties"].get("title") or ""): item["properties"]["sheetId"]
+        for item in meta.get("sheets") or []
+    }
+    first_id = sheet_ids["Рекомендации"]
+    docs_id = sheet_ids[docs_title]
+    sum_id = sheet_ids["Сводка"]
     summary = [["Параметр", "Значение"],
                ["Дата анализа", date_label],
                ["Источник", "Google Drive, папка «Новинки» (ежедневная автоматизация novinki_watch)"],
@@ -317,7 +424,13 @@ def _make_sheet(cs, drive, sheets, recs, files_info, date_label):
                ["Рекомендаций (новых для базы знаний)", str(len(recs))],
                ["Метод", "Извлечение текста → скоринг советов → синтез Codex без инструментов → фильтр дублей с базой «О компании» (FTS)"],
                ["Обработанные файлы", "удалены из папки после анализа"]]
-    sheets.spreadsheets().values().update(spreadsheetId=sid, range=f"'Документы ({len(files_info)})'!A1",
+    for sheet_title in ("Рекомендации", docs_title, "Сводка"):
+        sheets.spreadsheets().values().clear(
+            spreadsheetId=sid, range=f"'{sheet_title}'!A:Z", body={}
+        ).execute()
+    sheets.spreadsheets().values().update(spreadsheetId=sid, range="'Рекомендации'!A1",
+                                          valueInputOption="RAW", body={"values": rows}).execute()
+    sheets.spreadsheets().values().update(spreadsheetId=sid, range=f"'{docs_title}'!A1",
                                           valueInputOption="RAW", body={"values": doc_rows}).execute()
     sheets.spreadsheets().values().update(spreadsheetId=sid, range="'Сводка'!A1",
                                           valueInputOption="RAW", body={"values": summary}).execute()
@@ -325,7 +438,7 @@ def _make_sheet(cs, drive, sheets, recs, files_info, date_label):
                              "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
                              "fields": "userEnteredFormat.textFormat.bold"}} for gid in (docs_id, sum_id)]
     sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": style}).execute()
-    return created["url"]
+    return {"url": created["url"], "spreadsheet_id": sid}
 
 
 def _make_task(cs, url, n_files, n_recs, date_label):
@@ -350,23 +463,21 @@ def _make_task(cs, url, n_files, n_recs, date_label):
 
 
 def _delete_items(drive, items, dry):
-    """Убрать обработанные файлы из папки. Чужие файлы Drive не даёт удалить (403 с
-    ретраями), поэтому сначала быстрый removeParents (достаточно прав writer), и только
-    для своих файлов — настоящий delete."""
+    """Idempotently remove processed items from this folder without deleting Drive objects."""
     ok = moved = failed = 0
     for it in items:
         if dry:
             continue
         try:
+            current = drive.files().get(fileId=it["id"], fields="id,parents").execute()
+            if FOLDER not in (current.get("parents") or []):
+                moved += 1
+                continue
             drive.files().update(fileId=it["id"], removeParents=FOLDER).execute()
             moved += 1
-        except Exception:  # noqa: BLE001
-            try:
-                drive.files().delete(fileId=it["id"]).execute()
-                ok += 1
-            except Exception as exc2:  # noqa: BLE001
-                failed += 1
-                log.warning("cannot remove/delete %s: %s", it.get("name"), str(exc2)[:120])
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            log.warning("cannot remove %s from watched folder: %s", it.get("name"), str(exc)[:120])
         time.sleep(0.15)
     return ok, moved, failed
 
@@ -406,6 +517,57 @@ def main():
         log.info("cleanup-only: удалено %d, убрано из папки %d, не удалось %d", ok, moved, failed)
         return
 
+    run_key = _snapshot_key(items)
+    run = None if dry else _load_or_create_run(run_key, items)
+    if run:
+        run_key = str(run["snapshot_key"])
+        source_ids = {str(value) for value in (run.get("source_ids") or [])}
+        items = [item for item in items if str(item.get("id") or "") in source_ids]
+        status = str(run.get("status") or "analyzing")
+        if status == "analyzing" and len(items) != int(run.get("source_count") or 0):
+            _update_run(run_key, "review", last_error="source snapshot changed before sheet publication")
+            raise RuntimeError("novinki source snapshot changed; moved to review without partial publication")
+        if status == "review":
+            raise RuntimeError("novinki run requires manual review; no external action was replayed")
+        if status == "task_sending":
+            _update_run(run_key, "review", last_error="task provider outcome is ambiguous after interruption")
+            raise RuntimeError("novinki task outcome is ambiguous; moved to review without replay")
+        if status == "sheet_ready":
+            url = str(run.get("sheet_url") or "").strip()
+            if not url:
+                _update_run(run_key, "review", last_error="sheet_ready run has no sheet URL")
+                raise RuntimeError("novinki sheet state is incomplete; moved to review")
+            _update_run(run_key, "task_sending", last_error=None)
+            try:
+                created_at = run.get("created_at")
+                run_date_label = (
+                    created_at.astimezone(MSK).strftime("%d.%m.%Y")
+                    if isinstance(created_at, datetime)
+                    else datetime.now(MSK).strftime("%d.%m.%Y")
+                )
+                tid, dl = _make_task(
+                    cs,
+                    url,
+                    int(run.get("source_count") or len(source_ids)),
+                    int(run.get("recommendation_count") or 0),
+                    run_date_label,
+                )
+            except Exception as exc:
+                _update_run(run_key, "review", last_error=f"task send outcome requires review: {type(exc).__name__}")
+                raise
+            run = _update_run(run_key, "task_ready", bitrix_task_id=tid, last_error=None)
+            log.info("задача Bitrix %s создана (ответственный %s, дедлайн %s)", tid, RESPONSIBLE_ID, dl)
+            status = "task_ready"
+        if status in {"task_ready", "cleanup", "done"}:
+            _update_run(run_key, "cleanup", last_error=None)
+            ok, moved, failed = _delete_items(drive, items, dry)
+            if failed:
+                _update_run(run_key, "cleanup", last_error=f"cleanup failed for {failed} item(s)")
+                raise RuntimeError(f"novinki cleanup incomplete for {failed} item(s)")
+            _update_run(run_key, "done", last_error=None)
+            log.info("durable cleanup: удалено %d, убрано из папки %d", ok, moved)
+            return
+
     per_file, files_info, total_msgs = {}, [], 0
     for it in items:
         if it.get("mimeType") == "application/vnd.google-apps.folder":
@@ -438,7 +600,14 @@ def main():
 
     if not fresh:
         log.info("нового для базы знаний нет — молчим; файлы удаляем как обработанные")
+        if run:
+            _update_run(run_key, "cleanup", recommendation_count=0, last_error=None)
         ok, moved, failed = _delete_items(drive, items, dry)
+        if run and failed:
+            _update_run(run_key, "cleanup", last_error=f"cleanup failed for {failed} item(s)")
+            raise RuntimeError(f"novinki cleanup incomplete for {failed} item(s)")
+        if run:
+            _update_run(run_key, "done", last_error=None)
         log.info("удалено %d, убрано из папки %d, не удалось %d", ok, moved, failed)
         return
 
@@ -450,11 +619,34 @@ def main():
             log.info("  REC: [%s] %s", r.get("category"), str(r.get("recommendation"))[:100])
         return
 
-    url = _make_sheet(cs, drive, sheets, fresh, files_info, date_label)
+    responsible = cs._resolve_active_bitrix_user(RESPONSIBLE_ID)
+    sheet = _make_sheet(
+        cs, drive, sheets, fresh, files_info, date_label, run_key, responsible.get("email")
+    )
+    url = sheet["url"]
     log.info("таблица: %s", url)
-    tid, dl = _make_task(cs, url, len(items), len(fresh), date_label)
+    _update_run(
+        run_key,
+        "sheet_ready",
+        recommendation_count=len(fresh),
+        sheet_id=sheet["spreadsheet_id"],
+        sheet_url=url,
+        last_error=None,
+    )
+    _update_run(run_key, "task_sending", last_error=None)
+    try:
+        tid, dl = _make_task(cs, url, len(items), len(fresh), date_label)
+    except Exception as exc:
+        _update_run(run_key, "review", last_error=f"task send outcome requires review: {type(exc).__name__}")
+        raise
+    _update_run(run_key, "task_ready", bitrix_task_id=tid, last_error=None)
     log.info("задача Bitrix %s создана (ответственный %s, дедлайн %s)", tid, RESPONSIBLE_ID, dl)
+    _update_run(run_key, "cleanup", last_error=None)
     ok, moved, failed = _delete_items(drive, items, dry)
+    if failed:
+        _update_run(run_key, "cleanup", last_error=f"cleanup failed for {failed} item(s)")
+        raise RuntimeError(f"novinki cleanup incomplete for {failed} item(s)")
+    _update_run(run_key, "done", last_error=None)
     log.info("файлы обработаны: удалено %d, убрано из папки %d, не удалось %d", ok, moved, failed)
 
 

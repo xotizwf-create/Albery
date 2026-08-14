@@ -1,18 +1,24 @@
 const FOLDER_ID = '11R9uAL6vkbWDiGvjOnS8k22NQxxmrAlK';
 // Calls-folder (Zoom transcripts) sync removed 2026-06-16 — unused.
-const SYNC_TOKEN = 'C-NJb3jZB_PYpOAQZboPjcuL7zauBlOul1IYB6dt0dWslO2Rd70B6am-9teKP4aP';
 const TRANSCRIPT_FILE_NAME = 'transcript.txt';
 
 // Near-realtime sync: a 1-minute time-driven trigger checks the watched folder
 // and pings the server only when something actually changed. Run
 // setupDriveChangeTrigger() once from the editor to create the trigger.
-const CHANGE_NOTIFY_URL = 'https://mcp.m4s.ru/google-drive/events/jTL8ej_9dJuzaZAAFwYDV5nTh496n4Mytn-xT2W0Q_872nVX';
 const CHANGE_SIGNATURE_PROPERTY = 'companyFolderSignature';
 const CHANGE_SIGNATURE_SCHEMA_PROPERTY = 'companyFolderSignatureSchema';
 // Bump this whenever the change-detection logic changes. On the next run every
 // already-installed trigger sees a schema mismatch, forces one sync, and
 // re-baselines — so fixes self-heal without re-running setupDriveChangeTrigger.
 const CHANGE_SIGNATURE_SCHEMA = '2';
+
+function syncToken_() {
+  return PropertiesService.getScriptProperties().getProperty('SYNC_TOKEN') || '';
+}
+
+function changeNotifyUrl_() {
+  return PropertiesService.getScriptProperties().getProperty('CHANGE_NOTIFY_URL') || '';
+}
 
 const MIME_GOOGLE_DOC = 'application/vnd.google-apps.document';
 const MIME_GOOGLE_SHEET = 'application/vnd.google-apps.spreadsheet';
@@ -36,7 +42,7 @@ const SUPPORTED_MIME_TYPES = [
 
 function doGet(e) {
   const token = e && e.parameter ? String(e.parameter.token || '') : '';
-  if (token !== SYNC_TOKEN) {
+  if (!syncToken_() || token !== syncToken_()) {
     return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
   }
   if (e && e.parameter && e.parameter.diag === '1') {
@@ -49,7 +55,7 @@ function doGet(e) {
       last_trigger_result: props.getProperty('lastTriggerResult') || null,
       last_notify_detail: props.getProperty('lastNotifyDetail') || null,
       signature_schema: props.getProperty(CHANGE_SIGNATURE_SCHEMA_PROPERTY) || null,
-      notify_url_set: Boolean(CHANGE_NOTIFY_URL),
+      notify_url_set: Boolean(changeNotifyUrl_()),
     });
   }
   return buildCompanySyncResponse({});
@@ -66,7 +72,7 @@ function doPost(e) {
   }
 
   const token = String(payload.token || '');
-  if (token !== SYNC_TOKEN) {
+  if (!syncToken_() || token !== syncToken_()) {
     return jsonResponse({ ok: false, error: 'Unauthorized' }, 401);
   }
 
@@ -169,6 +175,7 @@ function buildCompanySyncResponse(payload) {
 
   return jsonResponse({
     ok: true,
+    listing_complete: true,
     folder_id: FOLDER_ID,
     synced_at: new Date().toISOString(),
     folders,
@@ -646,12 +653,13 @@ function checkDriveChangesAndNotify() {
 
 function notifyServerOfDriveChange() {
   const props = PropertiesService.getScriptProperties();
-  if (!CHANGE_NOTIFY_URL) {
+  const notifyUrl = changeNotifyUrl_();
+  if (!notifyUrl) {
     props.setProperty('lastNotifyDetail', 'no_url');
     return false;
   }
   try {
-    const response = UrlFetchApp.fetch(CHANGE_NOTIFY_URL, {
+    const response = UrlFetchApp.fetch(notifyUrl, {
       method: 'post',
       contentType: 'application/json',
       payload: JSON.stringify({ source: 'drive_change_trigger', at: new Date().toISOString() }),

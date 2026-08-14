@@ -70,7 +70,7 @@ def bitrix_module(app_module):
 
 
 @pytest.fixture(scope="session")
-def zoom_module():
+def zoom_module(app_module):
     """The Zoom integration module (extracted from app.py 2026-07-02) — patch/call here."""
     import zoom as zoom_module
 
@@ -78,7 +78,7 @@ def zoom_module():
 
 
 @pytest.fixture(scope="session")
-def gdrive_module():
+def gdrive_module(app_module):
     """The Google Drive integration module (extracted from app.py 2026-07-02) — patch/call here."""
     import gdrive as gdrive_module
 
