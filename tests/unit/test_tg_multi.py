@@ -277,6 +277,115 @@ def test_durable_turn_acknowledges_authorized_message_before_brain(multi, monkey
     assert events[2] == ("done",)
 
 
+def test_final_reaction_changes_to_thumbs_up_only_when_all_parts_are_sent(multi, monkeypatch):
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, sql, params):
+            assert "u.status = 'done'" in sql
+            assert "o.status <> 'sent'" in sql
+            assert params == (311, "prodazhi-bot")
+        def fetchone(self):
+            return {"payload": {"message": {
+                "message_id": 91,
+                "chat": {"id": 555, "type": "private"},
+                "from": {"id": 77, "username": "anna"},
+            }}}
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def cursor(self): return Cursor()
+
+    reactions = []
+    monkeypatch.setattr(multi.core, "_db", lambda: Conn())
+    monkeypatch.setattr(multi, "_access_identity", lambda *_args: {"allowed": True})
+    monkeypatch.setattr(
+        multi,
+        "_react",
+        lambda token, chat_id, message_id, emoji: reactions.append(
+            (token, chat_id, message_id, emoji)
+        ),
+    )
+
+    changed = multi._finalize_update_reaction(
+        AGENT,
+        {"update_id": 311, "agent_slug": "prodazhi-bot", "chat_id": "555"},
+    )
+
+    assert changed is True
+    assert reactions == [("111:AAA", 555, 91, "👍")]
+
+
+def test_final_reaction_never_marks_a_denied_sender_as_answered(multi, monkeypatch):
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, *_args): return None
+        def fetchone(self):
+            return {"payload": {"message": {
+                "message_id": 91,
+                "chat": {"id": 555, "type": "private"},
+                "from": {"id": 88, "username": "stranger"},
+            }}}
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def cursor(self): return Cursor()
+
+    reactions = []
+    monkeypatch.setattr(multi.core, "_db", lambda: Conn())
+    monkeypatch.setattr(multi, "_access_identity", lambda *_args: {"allowed": False})
+    monkeypatch.setattr(multi, "_react", lambda *_args: reactions.append(True))
+
+    changed = multi._finalize_update_reaction(
+        AGENT,
+        {"update_id": 311, "agent_slug": "prodazhi-bot", "chat_id": "555"},
+    )
+
+    assert changed is False
+    assert reactions == []
+
+
+def test_final_reaction_stays_eyes_for_incomplete_or_failed_parts(multi, monkeypatch):
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, *_args): return None
+        def fetchone(self): return None
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def cursor(self): return Cursor()
+
+    reactions = []
+    monkeypatch.setattr(multi.core, "_db", lambda: Conn())
+    monkeypatch.setattr(multi, "_react", lambda *_args: reactions.append(True))
+
+    changed = multi._finalize_update_reaction(
+        AGENT,
+        {"update_id": 311, "agent_slug": "prodazhi-bot", "chat_id": "555"},
+    )
+
+    assert changed is False
+    assert reactions == []
+
+
+def test_manual_outbox_without_update_never_changes_reaction(multi, monkeypatch):
+    monkeypatch.setattr(
+        multi.core,
+        "_db",
+        lambda: (_ for _ in ()).throw(AssertionError("database must not be touched")),
+    )
+
+    assert multi._finalize_update_reaction(
+        AGENT,
+        {"update_id": None, "agent_slug": "prodazhi-bot", "chat_id": "555"},
+    ) is False
+
+
 def test_ambiguous_brain_turn_is_never_replayed_automatically(multi, monkeypatch):
     update = {
         "id": 32,

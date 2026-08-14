@@ -243,15 +243,22 @@ def test_telegram_outbox_sends_stored_artifact_not_a_link(monkeypatch):
 
     calls = []
     statuses = []
+    finalized = []
     monkeypatch.setattr(multi, "_agent_for_slug", lambda _slug: AGENT_FOR_TEST)
     monkeypatch.setattr(multi.core, "_db", lambda: Conn())
     monkeypatch.setattr(attachments, "attachment_bytes", lambda _token: (b"DOCX", "Файл.docx"))
     monkeypatch.setattr(multi, "api", lambda token, method, **kwargs: calls.append((method, kwargs)) or {"message_id": 77})
     monkeypatch.setattr(multi, "_set_outbox_status", lambda oid, status, **kwargs: statuses.append((status, kwargs)))
+    monkeypatch.setattr(
+        multi,
+        "_finalize_update_reaction",
+        lambda agent, item: finalized.append((agent["slug"], item["update_id"])),
+    )
     monkeypatch.setattr(multi.core, "journal", lambda *_args, **_kwargs: None)
 
     multi._process_outbox({
         "id": 1,
+        "update_id": 12,
         "agent_slug": "prodazhi-bot",
         "chat_id": "55",
         "text": "",
@@ -261,6 +268,7 @@ def test_telegram_outbox_sends_stored_artifact_not_a_link(monkeypatch):
 
     assert calls == [("sendDocument", {"chat_id": "55", "document": ("Файл.docx", b"DOCX")})]
     assert statuses[-1][0] == "sent"
+    assert finalized == [("prodazhi-bot", 12)]
 
 
 def test_native_artifact_migration_keeps_text_and_files_as_independent_parts():

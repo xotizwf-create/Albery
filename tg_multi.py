@@ -742,6 +742,51 @@ def _set_outbox_status(outbox_id: int, status: str, *, error: str | None = None,
             )
 
 
+def _finalize_update_reaction(agent: dict, item: dict) -> bool:
+    """Replace `eyes` with `thumbs up` only after the whole captured reply is sent.
+
+    The reaction is cosmetic. Any database/provider problem must leave the committed delivery
+    untouched and must never cause the outbox item to be replayed.
+    """
+    update_id = item.get("update_id")
+    if update_id is None:
+        return False
+    try:
+        with core._db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT u.payload FROM telegram_agent_updates u "
+                    "WHERE u.id = %s AND u.agent_slug = %s AND u.status = 'done' "
+                    "AND NOT EXISTS (SELECT 1 FROM telegram_agent_outbox o "
+                    "WHERE o.update_id = u.id AND o.status <> 'sent')",
+                    (update_id, str(item["agent_slug"])),
+                )
+                row = cur.fetchone()
+        if not row:
+            return False
+        payload = row.get("payload") if hasattr(row, "get") else row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        payload = payload if isinstance(payload, dict) else {}
+        message = payload.get("message") or {}
+        sender = message.get("from") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        message_id = message.get("message_id")
+        if chat_id is None or message_id is None or str(chat_id) != str(item.get("chat_id")):
+            return False
+        if not _access_identity(str(item["agent_slug"]), sender).get("allowed"):
+            return False
+        _react(str(agent["bot_token"]), chat_id, message_id, "👍")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "final Telegram reaction was not set for %s: %s",
+            item.get("agent_slug"),
+            type(exc).__name__,
+        )
+        return False
+
+
 def _process_outbox(item: dict) -> None:
     agent = _agent_for_slug(str(item["agent_slug"]))
     if not agent:
@@ -783,6 +828,7 @@ def _process_outbox(item: dict) -> None:
         return
     provider_id = result.get("message_id") if isinstance(result, dict) else None
     _set_outbox_status(int(item["id"]), "sent", provider_message_id=str(provider_id or "") or None)
+    _finalize_update_reaction(agent, item)
     journal_text = item["text"] or ("📎 " + str(item.get("attachment_token") or "file"))
     core.journal(item["agent_slug"], item["chat_id"], "out", journal_text, kind="bot_dm",
                  status="ok", meta={"durable_outbox_id": item["id"],
