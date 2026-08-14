@@ -4,9 +4,10 @@ Last reviewed: 2026-08-14.
 
 ## Verified production state
 
-Production server 186 runs functional runtime `aeefb68`. The runtime includes the versioned
+Production server 186 runs functional runtime `efe606c`. The runtime includes the versioned
 scheduler/recovery/capability/PostgreSQL/client-Telegram hardening, durable Bitrix inbound boundary
-and two-phase employee Telegram acknowledgement/finalization.
+and two-phase employee Telegram acknowledgement/finalization. Connector hardening and the durable
+Novinki stage machine from migration `088` are also active.
 
 The Bitrix local-app OAuth state is atomically published with owner-only `0600` permissions. Chat
 and task-comment webhooks persist a token-free event in PostgreSQL before HTTP ACK, then use durable
@@ -343,6 +344,58 @@ flowchart LR
   runs 36 and 59 also completed and delivered on 2026-08-12 without replay.
 
 ## Current operational status
+
+### External connector resilience and Novinki
+
+The connector runtime below is deployed under
+[CHG-20260814-25](../changes/CHG-20260814-25-external-connectors-resilience-audit.md):
+
+```mermaid
+flowchart LR
+    Z[Zoom webhook or sync] --> ZQ[(Durable event lease)]
+    ZQ --> ZR[Safe GET retry and OAuth refresh]
+    ZR --> ZC[(Complete transcript and participants)]
+    ZR -->|partial or ambiguous| ZE[Preserve previous good data]
+
+    G[Google Drive listing] --> GC{Explicit listing_complete?}
+    GC -->|yes| GS[(Apply additions, updates and removals)]
+    GC -->|no| GF[Add/update only; deletion fails closed]
+
+    N[Novinki source snapshot] --> NR[(Durable run and idempotency key)]
+    NR --> NS[Private Sheet plus exact employee writer]
+    NS --> NT[Bitrix task sending boundary]
+    NT -->|known success| NC[Remove watched parent only]
+    NT -->|timeout or interruption| NV[Review; no blind replay]
+
+    W[Wildberries sync and token state] --> H[Content-free provider health]
+    ZC --> H
+    GS --> H
+    GF --> H
+    NR --> H
+```
+
+- Zoom retries only classified read/OAuth failures. A partial transcript download no longer
+  overwrites a previous complete transcript, a participant read failure preserves existing rows,
+  and expired `processing` event leases are reclaimed atomically with `FOR UPDATE SKIP LOCKED`.
+- Refreshed Google OAuth state is published atomically with owner-only `0600` permissions. Drive
+  sync may remove local rows only when the provider explicitly marks a complete listing. The live
+  legacy Apps Script does not yet send that flag, so the deployed compatibility path deliberately
+  performs additions/updates only and deletes nothing.
+- New Drive objects are private/inherited by default. Public sharing is a separate confirmed
+  operation; Docs/Sheets creation requires an idempotency key. The Novinki pipeline persists its
+  exact source snapshot and stages, creates one private Sheet, grants only the exact responsible
+  employee writer access, treats an interrupted Bitrix task call as `review`, and removes only the
+  watched folder parent after success. It never permanently deletes a source object.
+- Self-check now reports content-free Zoom freshness/event problems, Drive freshness, WB token and
+  recent-sync health, and Novinki review/stuck states. On 2026-08-14 the post-deploy production
+  probe found zero open Bitrix/automation/Telegram jobs, zero unfinished Zoom events, clean WB and
+  provider health, owner-only Google token files and no fresh service warnings. A real Drive sync
+  kept exactly 40 sources and 14 folders, changed/deleted none, and the Zoom API returned one user.
+- Remaining acceptance is explicit: the property-backed Apps Script must be published and its
+  reusable secret rotated from the correct Google owner account. Separately, 131 of 179 visible
+  legacy Drive objects still have public grants (128 writer, three reader); no permission is
+  changed until the owner chooses the migration policy. Python 3.10 must be upgraded before current
+  Google client support ends on 2026-10-04.
 
 - PostgreSQL recovery is deployed under
   [ADR-0008](../decisions/ADR-0008-verified-postgresql-backup-chain.md) and

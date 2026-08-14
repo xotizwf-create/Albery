@@ -76,10 +76,9 @@ fresh Zoom/Drive stores, successful current WB syncs and a WB token expiring in 
 audit confirmed three remediation boundaries: Zoom must preserve the previous transcript on a
 partial download and reclaim expired processing leases; Drive deletion must require an explicit
 complete listing and refreshed OAuth state must publish atomically; versioned Apps Script sources
-must not contain reusable sync/webhook secrets. Local remediation and failure-injection tests are in
-progress. No provider write, secret rotation or production deployment has run yet. Python 3.10 also
-becomes unsupported by current Google client releases after 2026-10-04 and is recorded as a host
-upgrade follow-up.
+must not contain reusable sync/webhook secrets. The remediation is deployed in production at commit
+`efe606c`. Python 3.10 becomes unsupported by current Google client releases after 2026-10-04 and is
+recorded as a host upgrade follow-up.
 
 The Google permission inventory read only permission types/roles, not object names, ids or content.
 Of 179 objects visible to the dedicated OAuth identity, 131 have an `anyone` permission: 113 files
@@ -106,3 +105,25 @@ search no longer finds the exposed Apps Script sync or webhook values. This does
 history and does not rotate the still-live values; both become harmless only after the correct Apps
 Script owner publishes the property-backed version and the server/Script values are rotated as one
 gated operation.
+
+## Production deployment and verification
+
+- Commit `efe606c` passed GitHub tests run `31803605877` and security run `31803605891`.
+- A mode-`0600` verified Git bundle and PostgreSQL custom dump were created under the protected
+  server backup tree before deploy. All Bitrix, automation, Zoom, employee Telegram and IU provider
+  work gates were empty before restart; migration `088` applied successfully.
+- `albery`, `albery-web`, `albery-mcp` and `albery-tg` are active. Production smoke and self-check
+  pass, the production tree is clean, and no fresh warning-level journal entry appeared in those
+  services after cutover.
+- A post-deploy Zoom OAuth/list-users call succeeded. Connector health reports no Zoom, Drive, WB
+  or Novinki problem; there are no unfinished Zoom events or open Bitrix/automation/Telegram jobs.
+  Both Google OAuth token files are mode `0600`.
+- A real company-Drive compatibility sync completed with 40 sources and 14 folders before and
+  after, 40 unchanged, zero document errors and zero deletion. It reported
+  `listing_complete=false`, proving the old live Apps Script cannot authorize removals while the
+  new server safely remains backward compatible.
+
+The CHG remains `in_progress`, not `verified`, because two owner-controlled Google mutations are
+still outstanding: publishing/rotating the property-backed Apps Script from its owning account and
+choosing a migration policy for the 131 existing public permission grants. The deployed Zoom, WB,
+Drive safety and Novinki runtime themselves have production evidence.

@@ -24,7 +24,7 @@ when its production behavior is `verified`; code review or a green unit suite al
 | P1 | verified | PostgreSQL and disaster recovery | atomic/SHA-256/pg_restore chain, natural local/offsite cycle and two isolated PostgreSQL 16 restore drills passed |
 | P1 | acceptance | Client Telegram/IU and CRM funnel | structural lifecycle, provider ambiguity, reference-safe retention and queue monitoring are deployed/clean; an approved real customer/manager round trip remains |
 | P2 | verified | Bitrix business correctness | durable pre-ACK capture, OAuth recovery, authorship, task/CRM safety matrix and a fresh duplicate-safe owner round trip passed under CHG-21 |
-| P2 | in_progress | Zoom, Google and Wildberries | production read probes pass; Zoom partial-overwrite/lease and Google completeness/token-publication/secret-rotation findings are under CHG-25 remediation |
+| P2 | in_progress | Zoom, Google and Wildberries | hardened connector runtime is deployed and live read/sync probes pass; Google Apps Script publication/secret rotation and an owner-approved migration of 131 legacy public grants remain under CHG-25 |
 | P2 | pending | Web/API and Agent Center | authentication, authorization, IDOR, CSRF/CORS, upload limits, atomic configuration, audit trail and rollback |
 | P2 | pending | Knowledge, memory and prompts | provenance, ACL, prompt injection, precedence, channel isolation, retention, deletion and versioned skill/prompt rollout |
 | P2 | pending | Document and media ingestion | MIME/content validation, archive/macro hazards, conversion sandbox, memory/size limits, temporary-file lifecycle and exact output |
