@@ -115,3 +115,17 @@ Fast rollback is the pre-change code tree plus restart of `albery-tg` and `alber
 no `sending/unknown` manager rows, then restoring the old status constraint/removing the provider-id
 column. Form tables can be restored from the targeted dump and removed spool files from the tar
 archive. Durable queue rows must never be deleted merely to make monitoring green.
+
+## Acceptance inventory: 2026-08-14
+
+Read-only provider and database checks confirm that the public customer entry is
+`@Albery_AI2_Bot`; its stored/provider identity matches and the employee owner already has one
+existing `telegram_bot` conversation linked to an existing CRM deal. This gives acceptance a named
+owner-controlled target instead of exposing or messaging an arbitrary customer. There are still
+nine client-bot conversations and all are deal-linked. Employee and workspace queue-health probes
+are empty, and all relevant services are active.
+
+No client/manager message or CRM mutation was made. Before a real customer-path run, the exact
+owner message, expected bot reply, existing deal id, allowed CRM notes/stage effects and cleanup
+must be previewed and freshly approved. The test must not create a new customer, contact or deal and
+must not involve any other recipient.

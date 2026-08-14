@@ -1,6 +1,6 @@
 # CHG-20260813-21: Bitrix business correctness audit
 
-- Status: in_progress
+- Status: deployed
 - Date opened: 2026-08-13
 - Approval: owner approved continued execution of the recorded full audit roadmap
 - Remediation approval: 2026-08-14, owner approved items 1–3 of the next-step plan
@@ -52,21 +52,23 @@ The existing file was changed from `0644` to `0600` without rewriting or rotatin
 Functional CI tests/security (`31709007521` / `31709007561`), full local regression
 `1978 passed, 47 skipped`, bot-role health, full smoke, self-check and fresh journals are clean.
 
-### Finding 2: task-comment work is acknowledged before it is durable — open
+### Finding 2: task-comment work was acknowledged before it was durable — remediated
 
-`OnTaskCommentAdd/Update` currently acknowledges Bitrix and starts a daemon thread. The thread fetches
+`OnTaskCommentAdd/Update` previously acknowledged Bitrix and started a daemon thread. The thread fetched
 the comment and inserts its first-sight marker before Hermes, but a process stop after HTTP ACK can
 lose the work; a stop after first-sight can leave `handled=false` and the duplicate webhook is then
 refused. The four historical rows above prove the terminal ambiguity exists. The safe target is a
 PostgreSQL state machine with durable capture before ACK, one lease, a no-replay brain boundary,
-stored answer and a `sending/sent/review` provider boundary. Until deployed, old rows remain evidence,
-not a replay queue.
+stored answer and a `sending/sent/review` provider boundary. Production now inserts a unique,
+token-free event row before HTTP 200; a PostgreSQL failure returns retryable HTTP 503 and starts no
+agent work. The four historical rows stay unchanged and are not imported into the new queue.
 
-### Finding 3: ordinary bot-message dedupe fails open on database error — open
+### Finding 3: ordinary bot-message dedupe failed open on database error — remediated
 
-`_b24_message_claim` currently returns `True` when PostgreSQL fails. This protects availability but
-can double-run Hermes and external tools during a database degradation. The channel needs durable
-capture-before-ACK rather than either dropping the message or failing open.
+`_b24_message_claim` returned `True` when PostgreSQL failed. The production webhook no longer uses
+that legacy claim while the durable flag is enabled: chat messages are captured atomically before
+ACK, and capture failure returns HTTP 503. The insert also writes the legacy first-sight marker in
+the same transaction so older observability remains coherent.
 
 ## Post-deploy control: 2026-08-13 17:24 MSK
 
@@ -120,6 +122,41 @@ growth and a deploy restart during a live turn. Rollback is the protected pre-ch
 backup plus the feature flag; the additive table remains inert on rollback. Production restart is
 allowed only with empty live/automation work, and deployment requires migration, compile, focused
 failure injection, full regression, CI, smoke, queue checks, exact profile counts and fresh logs.
+
+## Durable inbound deployment: 2026-08-14
+
+Functional commits `73ecbcb` and `2b93c6f` implement ADR-0010 for ordinary bot messages and task
+comments:
+
+- migration `087` adds `bitrix_inbound_jobs` with unique provider-event keys, durable batching,
+  leases, stored answers and explicit `brain_running`, `sending`, retry, review and terminal states;
+- authenticated webhooks persist a recursively token-free payload before ACK and fail closed with
+  retryable HTTP 503 when exact capture is unavailable;
+- concurrent stored-answer claims exclude active leases, the producing worker retains ownership
+  through the delivery boundary and long brain calls renew their lease;
+- safe preparation and known provider rejection retry in stages; an interrupted model/tool turn or
+  ambiguous send stops for review and is never replayed blindly;
+- self-check reads only state/count/age information and treats overdue, failed and review work as
+  critical. The worker still enters the existing shared two-slot Hermes limiter.
+
+Local focused tests passed `59/59`; the complete local suite passed `1988`, with 48 environment-only
+skips. The first PostgreSQL CI run correctly exposed an early retry-delay assumption in the new
+test; production was not touched. After correcting the test, GitHub tests `31788704439` passed on
+PostgreSQL 14/Python 3.10 and PostgreSQL 16/Python 3.12, and security run `31788704444` passed.
+
+Before production mutation, code and the three affected legacy tables were protected as private
+`0600` archives under `/var/backups/albery/code/pre-chg21-20260814_093827.tar.gz` and
+`/var/backups/albery/db/pre-chg21-20260814_093827.dump`; `pg_restore --list` accepted the database
+archive. The pull/restart gates both found zero in-flight Bitrix turns and zero running agent
+automations. Production is clean at `2b93c6f`, migration `087` is present, `albery`, `albery-web`,
+`albery-mcp` and `albery-tg` are active, full smoke is `SMOKE OK`, self-check is clean, the new queue
+and its content-free health result are empty, the public imbot readiness route returns HTTP 200 and
+fresh error journals are empty.
+
+This closes the structural crash/database durability findings. Status remains `deployed` until one
+fresh approved owner-visible chat round trip traverses the new queue; task-comment delivery remains
+covered by deterministic/DB tests unless an exact disposable task and cleanup are separately
+approved.
 
 ## Owner-visible live round trip: 2026-08-13 17:29 MSK
 

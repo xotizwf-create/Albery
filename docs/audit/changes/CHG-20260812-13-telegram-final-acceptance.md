@@ -82,3 +82,20 @@ Production evidence on 2026-08-12:
 A named recipient and exact message preview are still required for the first user-visible profile
 round trip. Stable Telegram-to-Bitrix actor mapping remains fail-closed until both immutable IDs and
 the person are explicitly confirmed. This change therefore remains `deployed`, not `verified`.
+
+## Acceptance inventory: 2026-08-14
+
+Read-only production discovery found one active employee profile bridge: `agents.slug='main'` owns
+`@albery_ai_bot`, its provider `getMe` identity matches the stored bot id and it has exactly one
+active stable-id recipient. A read-only `getChat` resolves that recipient to the owner, Alexander
+Nikitenko, in a private chat. No Telegram id or token is copied into this audit record. Employee
+update/outbox/journal tables are still empty, all workspace queue checks are clean and
+`albery-tg`, bot, web and MCP services are active. `bitrix_user_id` deliberately remains null, so a
+Telegram turn cannot impersonate an employee for Bitrix writes.
+
+The prepared no-tool inbound acceptance phrase is:
+`Контрольный тест Telegram Albery 14.08.2026. Ответь ровно: «Тест Telegram Albery пройден». Не используй инструменты и не выполняй внешние действия.`
+It must be sent by the owner to `@albery_ai_bot`; provider polling cannot safely impersonate a user.
+After that manual step, acceptance will check one captured update, one brain result, one outbox send,
+one inbound/outbound journal pair, exact response text, empty queues, unchanged delegated identity
+and clean services. No message has been sent as part of this inventory.

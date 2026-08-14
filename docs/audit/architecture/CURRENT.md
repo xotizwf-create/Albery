@@ -250,12 +250,20 @@ The profile ownership and durable automation lane below are deployed production 
 
 ```mermaid
 flowchart LR
-    B[Bitrix employee event] --> R[bot_id to agent_slug]
+    B[Authenticated Bitrix chat or task-comment event] --> Q[(Capture before ACK<br/>unique provider event)]
+    Q --> R[Durable batch lease<br/>bot_id to agent_slug]
     R --> P[Profile with matching bitrix_bot_id]
     P --> C[Own identity, rules, knowledge and dialog history]
-    C --> H[Hermes live turn]
+    C --> NB[(brain_running<br/>no-replay boundary)]
+    NB --> H[Hermes live turn]
     H --> M[Private MCP for this agent]
-    M --> O[Reply from this Bitrix bot]
+    M --> BA[(Stored answer)]
+    BA --> SD[(sending boundary)]
+    SD --> O[Reply from this Bitrix bot]
+    SD -->|known rejection| RD[(Delivery-only retry)]
+    RD --> SD
+    NB -->|expired/interrupted| BR[Manual review; no blind replay]
+    SD -->|timeout/unknown| BR
 
     S[Schedule or atomic Run now] --> Q[(PostgreSQL durable run queue)]
     Q --> AS[Owning agent_slug]
@@ -280,6 +288,15 @@ flowchart LR
 - An automation row belongs to exactly one profile through `agent_automations.agent_slug`. Its
   prompt is assembled with that profile's role, skills and personal instructions; Hermes receives
   the exact profile capability set, and delivery uses that profile's Bitrix bot identity.
+- Migration `087` makes both ordinary bot messages and task comments durable before HTTP ACK. A
+  PostgreSQL failure returns retryable HTTP 503 and starts no brain/provider work. Chat pieces are
+  batched by durable scope and active stored-answer leases cannot be claimed by a second worker.
+- Safe preparation may retry. The brain lease is renewed during long turns, but an actually
+  interrupted `brain_running` stage moves to review because MCP tools may already have changed a
+  business object. The completed answer is stored separately; only known provider rejection retries
+  delivery, while timeout/connection ambiguity stops at review. Content-free queue age/status is
+  checked every five minutes. This path uses the same shared two-slot limiter as the existing live
+  runtime and automations.
 
 ### Historical behavior before CHG-20260811-07
 
@@ -322,15 +339,16 @@ flowchart LR
 - PostgreSQL recovery is deployed under
   [ADR-0008](../decisions/ADR-0008-verified-postgresql-backup-chain.md) and
   [CHG-20260813-19](../changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md). Production
-  has 185 public base tables, 905 indexes and 576 partitions in a 3.84 GB database. The current
-  255,991,381-byte local/offsite dump has matching SHA-256 and passes `pg_restore --list`; two
+  has 186 public base tables, 912 indexes and 576 partitions after migration `087`. The unattended
+  2026-08-14 local/offsite dump is 256,397,116 bytes, has matching SHA-256 and passes
+  `pg_restore --list`; two
   isolated PostgreSQL 16 restores produced the same 185-table structure and clean `pg_amcheck`.
   New local/offsite jobs publish only private atomic artifacts after SHA-256 and archive validation,
   and five-minute self-check monitors the chain. Routine restore is restricted to a new
-  `albery_restore_*` database. Worst-case RPO is about 24 hours; PITR/page checksums/replication are
+  `albery_restore_*` database. The first natural 03:15 -> 03:45 post-change cycle passed and the
+  backup change is verified. Worst-case RPO is about 24 hours; PITR/page checksums/replication are
   not claimed, and the 95%-used one-copy offsite receiver must be expanded before WAL shipping or
-  longer retention. Production code and monitoring are deployed; `verified` awaits the first
-  natural 03:15 -> 03:45 cycle.
+  longer retention.
 
 - `hermes-gateway` uses a systemd-249-compatible bounded restart policy: a fixed 30-second delay and
   at most five starts per five minutes. Unsupported newer-systemd directives were removed. Deploy

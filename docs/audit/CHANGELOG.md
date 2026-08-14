@@ -2,6 +2,11 @@
 
 Append entries in reverse chronological order. Link to the detailed record; do not duplicate its full content here.
 
+## 2026-08-14
+
+- `deployed` — [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md): production `2b93c6f` captures Bitrix chat/task-comment events before ACK, stores brain output before delivery, retries only known-safe stages and stops ambiguous outcomes for review; CI, protected backup, empty-work restart, smoke, self-check, queue health and journals passed; a fresh owner-visible round trip remains.
+- `verified` — [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md): the first unattended 03:15 local and 03:45 offsite cycle published the same private 256,397,116-byte archive; SHA-256/size identity, both archive checks and production backup health passed.
+
 ## 2026-08-13
 
 - `accepted` — [ADR-0010](decisions/ADR-0010-durable-bitrix-inbound-boundary.md): authenticated Bitrix chat/task-comment events must be durable before ACK; brain and provider delivery have separate no-replay boundaries, stored answers and content-free queue monitoring.

@@ -1,6 +1,6 @@
 # CHG-20260813-19: PostgreSQL and disaster-recovery audit
 
-- Status: deployed
+- Status: verified
 - Date opened: 2026-08-13
 - Approval: the owner approved execution of the full audit roadmap and required every step and
   decision to be recorded
@@ -137,8 +137,14 @@ the audit record.
   `/var/backups/albery/code/pre-chg19-20260813_162705`, exact current local/offsite metadata was
   seeded only after SHA-256 and both archive checks passed, `--verify-only`, backup health, full
   deploy smoke, services and dry-run self-check are green, production Git is clean and no service
-  restarted. The first natural 03:15 -> 03:45 cycle is still pending; this record must not become
-  `verified` before that gate passes.
+  restarted.
+- The first unattended post-change cycle completed on 2026-08-14: cron created
+  `albery_20260814_031501.dump` (256,397,116 bytes, mode `0600`) and its private sidecar; local
+  `pg_restore --list` accepted 2,193 TOC lines. The offsite verified-status record names the same
+  artifact and confirms archive readability; the production health probe also confirms exact
+  size/SHA identity. `scripts/postgres_backup_health.py` returned
+  `PostgreSQL backup chain: healthy`. This natural 03:15 -> 03:45 gate promotes the change to
+  `verified`.
 
 ## Rollback
 
