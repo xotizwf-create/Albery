@@ -32,6 +32,8 @@ from flask import request
 from typing import Any
 import requests
 
+import bitrix_inbound
+
 from shared.role import background_jobs_enabled
 from shared.run_slots import build_default as build_run_slots
 from shared.agent_channel_runtime import ChannelContext, build_agent_policy
@@ -1104,7 +1106,7 @@ def _b24_app_file_reply(client_endpoint: str, access_token: str, bot_id: Any, di
         message_id = result.get("messageId") if isinstance(result, dict) else None
         if not message_id:
             logging.error("b24 native artifact returned no message id: bot=%s dialog=%s", bot_id, dialog_id)
-            return last_id, "known"
+            return last_id, "ambiguous"
         last_id = message_id
         log_bot_message(
             direction="out",
@@ -1118,7 +1120,8 @@ def _b24_app_file_reply(client_endpoint: str, access_token: str, bot_id: Any, di
 
 
 def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_id: str,
-                   text: str, keyboard: list[dict[str, Any]] | None = None) -> Any:
+                   text: str, keyboard: list[dict[str, Any]] | None = None,
+                   _durable_outcome: dict[str, Any] | None = None) -> Any:
     """Send a bot message; returns the new message id (or None). When a keyboard is attached, the
     buttons are moved off the previous bot message so only the latest reply shows them.
 
@@ -1126,6 +1129,8 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
     third-party imbot gets to Bitrix CoPilot's native footer). If the portal rejects the ATTACH
     format, we retry with an INLINE italic footnote so the answer is always delivered."""
     if not (client_endpoint and access_token and bot_id and dialog_id):
+        if _durable_outcome is not None:
+            _durable_outcome.update(status="known_failure", error="missing delivery identity")
         return None
     stored_tokens = _B24_STORED_DELIVER_RE.findall(text or "")
     text = _B24_STORED_DELIVER_RE.sub("", text or "").strip()
@@ -1168,6 +1173,11 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
                 client_endpoint, access_token, bot_id, dialog_id, clean_text, artifacts
             )
             if artifact_error == "ambiguous":
+                if _durable_outcome is not None:
+                    _durable_outcome.update(
+                        status="ambiguous", message_id=file_message_id,
+                        error="native artifact provider outcome is ambiguous",
+                    )
                 return file_message_id
             if artifact_error is None:
                 if keyboard and file_message_id:
@@ -1175,10 +1185,17 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
                     if prev and str(prev.get("id")) != str(file_message_id):
                         _b24_strip_keyboard(client_endpoint, access_token, bot_id,
                                             prev.get("id"), prev.get("text") or "")
+                if _durable_outcome is not None:
+                    _durable_outcome.update(status="sent", message_id=file_message_id)
                 return file_message_id
             if file_message_id:
                 # Some files were accepted before a later known rejection. Do not replay or add a
                 # misleading all-failed response; the journal/ops log makes the partial result visible.
+                if _durable_outcome is not None:
+                    _durable_outcome.update(
+                        status="sent", message_id=file_message_id,
+                        warning="partial native artifact delivery",
+                    )
                 return file_message_id
             text = (clean_text + "\n\nНе удалось прикрепить файл в Bitrix. Попробуйте создать его ещё раз.").strip()
         elif invalid_count:
@@ -1204,6 +1221,17 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
         try:
             res = _b24_app_call(client_endpoint, access_token, "imbot.message.add", attach_params)
             new_message_id = res.get("result")
+            if new_message_id is None and _durable_outcome is not None:
+                _durable_outcome.update(
+                    status="ambiguous", error="provider accepted request but returned no message id",
+                )
+                return None
+        except (requests.Timeout, requests.ConnectionError, ValueError) as exc:
+            if _durable_outcome is not None:
+                _durable_outcome.update(status="ambiguous", error=str(exc)[:500])
+                return None
+            logging.warning("b24 testbot: ATTACH transport outcome ambiguous", exc_info=True)
+            return None
         except Exception as exc:  # noqa: BLE001
             logging.warning("b24 testbot: ATTACH disclaimer rejected (%s) — using inline footnote", exc)
             sent_text = f"{text}\n\n[i]{disclaimer}[/i]"
@@ -1212,7 +1240,19 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
         try:
             res = _b24_app_call(client_endpoint, access_token, "imbot.message.add", base)
             new_message_id = res.get("result")
-        except Exception:  # noqa: BLE001
+            if new_message_id is None and _durable_outcome is not None:
+                _durable_outcome.update(
+                    status="ambiguous", error="provider accepted request but returned no message id",
+                )
+                return None
+        except (requests.Timeout, requests.ConnectionError, ValueError) as exc:
+            if _durable_outcome is not None:
+                _durable_outcome.update(status="ambiguous", error=str(exc)[:500])
+            logging.error("b24 testbot: app reply outcome ambiguous", exc_info=True)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            if _durable_outcome is not None:
+                _durable_outcome.update(status="known_failure", error=str(exc)[:500])
             logging.exception("b24 testbot: app reply failed")
             return None
 
@@ -1223,6 +1263,8 @@ def _b24_app_reply(client_endpoint: str, access_token: str, bot_id: Any, dialog_
         if prev and str(prev.get("id")) != str(new_message_id):
             _b24_strip_keyboard(client_endpoint, access_token, bot_id, prev.get("id"), prev.get("text") or "")
         _b24_set_last_kb(bot_id, dialog_id, new_message_id, sent_text)
+    if _durable_outcome is not None:
+        _durable_outcome.update(status="sent", message_id=new_message_id)
     return new_message_id
 
 
@@ -4775,13 +4817,16 @@ def _b24_task_context_text(task_id: int) -> str:
     return "\n".join(lines)
 
 
-def _b24_post_task_comment(task_id: int, text: str, agent_name: str, author_bot_id: Any = None) -> bool:
+def _b24_post_task_comment(task_id: int, text: str, agent_name: str, author_bot_id: Any = None,
+                           _durable_outcome: dict[str, Any] | None = None) -> bool:
     """Post the agent's reply as a task comment AS THE MENTIONED BOT (AUTHOR_ID = the bot's user
     id — probed live 2026-07-09: the comment really sticks as «Агент Албери»/«Агент-юрист»).
     Fallback when the bot id is unknown or rejected: the technical webhook user with a
     «🤖 <Имя>:» prefix. Loop-safe either way: the handler skips bot/webhook authors."""
     wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
     if not wh:
+        if _durable_outcome is not None:
+            _durable_outcome.update(status="known_failure", error="Bitrix webhook is not configured")
         return False
     text = bb_sanitize(text)
 
@@ -4789,6 +4834,12 @@ def _b24_post_task_comment(task_id: int, text: str, agent_name: str, author_bot_
         r = requests.post(f"{wh}/task.commentitem.add.json",
                           json={"TASKID": task_id, "FIELDS": fields}, timeout=30)
         data = r.json() if r.content else {}
+        if not getattr(r, "ok", True):
+            raise RuntimeError(f"task.commentitem.add HTTP {r.status_code}: {str(data)[:300]}")
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(
+                f"task.commentitem.add: {data.get('error')} ({data.get('error_description')})"
+            )
         return data.get("result")
 
     def _claim_own(created_id: Any) -> None:
@@ -4809,13 +4860,31 @@ def _b24_post_task_comment(task_id: int, text: str, agent_name: str, author_bot_
             if created:
                 _claim_own(created)
                 _journal(created)
+                if _durable_outcome is not None:
+                    _durable_outcome.update(status="sent", message_id=created)
                 return True
+            if _durable_outcome is not None:
+                _durable_outcome.update(
+                    status="ambiguous", error="provider returned no bot-authored comment id",
+                )
+                return False
         created = _post({"POST_MESSAGE": f"🤖 {agent_name}: {text}"[:20000]})
         if created:
             _claim_own(created)
             _journal(created)
+            if _durable_outcome is not None:
+                _durable_outcome.update(status="sent", message_id=created)
+        elif _durable_outcome is not None:
+            _durable_outcome.update(status="ambiguous", error="provider returned no comment id")
         return bool(created)
-    except Exception:  # noqa: BLE001
+    except (requests.Timeout, requests.ConnectionError, ValueError) as exc:
+        if _durable_outcome is not None:
+            _durable_outcome.update(status="ambiguous", error=str(exc)[:500])
+        logging.warning("b24 task-mention: reply outcome ambiguous task=%s", task_id, exc_info=True)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        if _durable_outcome is not None:
+            _durable_outcome.update(status="known_failure", error=str(exc)[:500])
         logging.warning("b24 task-mention: reply post failed task=%s", task_id, exc_info=True)
         return False
 
@@ -4829,6 +4898,21 @@ def _b24_task_comment_mark_handled(comment_id: int) -> None:
                             (int(comment_id),))
     except Exception:  # noqa: BLE001
         pass
+
+
+def _b24_task_comment_preclaimed(comment_id: int) -> bool:
+    """True only for a legacy/tool/self-reply claim which predates the durable intake job."""
+    try:
+        with pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM bitrix_task_comment_seen WHERE comment_id=%s",
+                    (int(comment_id),),
+                )
+                return cur.fetchone() is not None
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 task-mention: preclaim lookup failed comment=%s", comment_id, exc_info=True)
+        raise
 
 
 def _b24_task_all_file_ids(task_id: int, extra_file_ids=None) -> list[int]:
@@ -5190,6 +5274,55 @@ def _bitrix_imbot_app_event():
         message_text = str(_imbot_event_param(payload, "MESSAGE") or "").strip()
         message_id = _imbot_event_param(payload, "MESSAGE_ID") or ""
         from_user_id = _imbot_event_param(payload, "FROM_USER_ID") or ""
+        if bitrix_inbound.enabled():
+            mid = to_int(message_id)
+            if mid is None:
+                # Without the provider id no exact dedupe key exists. A retryable error is safer
+                # than ACKing an event which could then be lost or processed twice.
+                return jsonify({
+                    "ok": False, "event": event_name, "retry": True,
+                    "error": "durable_message_id_required",
+                }), 503
+            if not dialog_id:
+                return jsonify({"ok": True, "event": event_name, "ignored": True,
+                                "reason": "empty_dialog"}), 200
+            attachment_hint = any(
+                any(marker in str(key).upper() for marker in ("FILE", "ATTACH", "VOICE", "IMAGE"))
+                and value not in (None, "", [], {})
+                for key, value in payload.items()
+            )
+            delay = _B24_BATCH_FILE_WINDOW_S if attachment_hint else _B24_BATCH_TEXT_WINDOW_S
+            try:
+                queued = bitrix_inbound.enqueue(
+                    event_key=f"chat:{bot_id}:{mid}",
+                    event_kind="chat_message",
+                    scope_key=f"chat:{bot_id}:{dialog_id}:{from_user_id}",
+                    payload={
+                        "event_name": event_name,
+                        "bot_id": to_int(bot_id),
+                        "agent_slug": (agent or {}).get("slug"),
+                        "dialog_id": str(dialog_id),
+                        "from_user_id": to_int(from_user_id),
+                        "message_id": mid,
+                        "message_text": message_text,
+                        "event_payload": bitrix_inbound.token_free_payload(payload),
+                    },
+                    batch_delay_seconds=delay,
+                )
+            except Exception:  # noqa: BLE001
+                logging.warning("b24 durable capture failed mid=%s", message_id, exc_info=True)
+                return jsonify({
+                    "ok": False, "event": event_name, "retry": True,
+                    "error": "durable_capture_unavailable",
+                }), 503
+            return jsonify({
+                "ok": True,
+                "event": event_name,
+                "job_id": str(queued["id"]),
+                "accepted": bool(queued["inserted"]),
+                "duplicate": not bool(queued["inserted"]),
+                "status": queued["status"],
+            }), 200
         # Dedup a re-delivered event BEFORE any side effect (reaction, reset, model call) so a
         # Bitrix retry can never double-answer the user. Task comments have the same guard.
         if message_id and not _b24_message_claim(message_id, bot_id, dialog_id, from_user_id):
@@ -5326,5 +5459,441 @@ def bitrix_imbot_webhook(secret: str):
     # Respond to Bitrix immediately; run the (slower) agent loop in the background.
     threading.Thread(target=_b24_testbot_process, args=(dialog_id, message_text), daemon=True).start()
     return jsonify({"ok": True, "event": event_name, "accepted": True})
+
+
+# --- Durable Bitrix inbound workers -------------------------------------------------------
+
+def _b24_agent_by_stored_slug(slug: str | None) -> dict[str, Any] | None:
+    if not slug:
+        return None
+    try:
+        from agent_center import _agent_by_slug
+        return _agent_by_slug(slug)
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 durable intake: agent lookup failed slug=%s", slug, exc_info=True)
+        return None
+
+
+def _b24_durable_agent_allows(agent: dict[str, Any], user_id: Any) -> bool:
+    members = agent.get("members") or set()
+    uid = to_int(user_id)
+    return (uid in members) if members else _b24_has_access(user_id)
+
+
+def _b24_finish_answer_for_delivery(answer: str) -> tuple[str, str | None]:
+    """Apply the same final markers as the legacy live path before committing the stored answer."""
+    answer, escalation_request = _b24_extract_escalation(answer or "")
+    answer, deliver_name, deliver_fmt = _b24_extract_deliver(answer)
+    if deliver_name:
+        try:
+            if deliver_fmt == "xlsx":
+                data, ext, label = _b24_text_to_xlsx(deliver_name, answer or deliver_name), "xlsx", "Excel"
+            elif deliver_fmt == "docx":
+                data, ext, label = _b24_text_to_docx(deliver_name, answer or deliver_name), "docx", "Word"
+            else:
+                data, ext, label = _b24_text_to_pdf(deliver_name, answer or deliver_name), "pdf", "PDF"
+            link = _b24_save_export(data, deliver_name, ext)
+            answer = f"📎 Готово, оформил ответ в {label}:\n{link}\n\n(ссылка действует ~30 минут)"
+        except Exception:  # noqa: BLE001
+            logging.exception("b24 durable intake: generated file materialization failed")
+    return answer, escalation_request
+
+
+def _b24_durable_chat_prepare(batch: dict[str, Any], owner: str) -> None:
+    batch_id = batch["batch_id"]
+    rows = batch["rows"]
+    if not rows:
+        raise RuntimeError("empty durable Bitrix chat batch")
+    first = rows[0]["payload"] or {}
+    bot_id = to_int(first.get("bot_id"))
+    dialog_id = str(first.get("dialog_id") or "")
+    from_user_id = to_int(first.get("from_user_id"))
+    agent_slug = first.get("agent_slug") or None
+    agent = _b24_agent_by_stored_slug(agent_slug)
+    if agent_slug and (not agent or to_int(agent.get("bitrix_bot_id")) != bot_id):
+        raise RuntimeError("stored Bitrix agent identity no longer matches active profile")
+
+    endpoint, access_token = _b24_app_access_token()
+    if not (endpoint and access_token and bot_id and dialog_id and from_user_id is not None):
+        raise RuntimeError("Bitrix delivery identity is unavailable during preparation")
+
+    bitrix_inbound.journal_inbound(batch_id)
+    pieces = {key: [] for key in (
+        "texts", "image_texts", "doc_blocks", "attachments", "voice_texts", "message_ids",
+    )}
+    pieces["reply_text"] = ""
+    for row in rows:
+        payload = row["payload"] or {}
+        raw = payload.get("event_payload") or {}
+        message_text = str(payload.get("message_text") or "").strip()
+        image_texts: list[str] = []
+        reply_text = ""
+        doc_blocks: list[str] = []
+        msg_attachments: list[dict[str, Any]] = []
+        voice_texts: list[str] = []
+        try:
+            image_texts, reply_text, doc_blocks, msg_attachments, voice_texts = _b24_message_extras(
+                raw, endpoint, access_token, agent_slug=agent_slug,
+                dialog_id=dialog_id, from_user_id=from_user_id,
+            )
+        except Exception:  # noqa: BLE001
+            logging.exception("b24 durable intake: message extras failed")
+            raise
+        if message_text:
+            pieces["texts"].append(message_text)
+        pieces["image_texts"].extend(image_texts or [])
+        pieces["doc_blocks"].extend(doc_blocks or [])
+        pieces["attachments"].extend(msg_attachments or [])
+        pieces["voice_texts"].extend(voice_texts or [])
+        pieces["message_ids"].append(payload.get("message_id"))
+        if reply_text and not pieces["reply_text"]:
+            pieces["reply_text"] = reply_text
+
+    if not any(pieces[key] for key in (
+        "texts", "image_texts", "doc_blocks", "attachments", "voice_texts", "reply_text",
+    )):
+        bitrix_inbound.mark_ignored(batch_id, owner, "empty")
+        return
+
+    last_message_id = pieces["message_ids"][-1]
+    denied = (
+        (not _b24_main_allows(from_user_id)) if agent is None
+        else not _b24_durable_agent_allows(agent, from_user_id)
+    )
+    if agent is not None and not agent.get("is_active", True):
+        denied = True
+    tier = str(agent.get("slug") or "") if agent is not None else _b24_access_label(from_user_id)
+    base_prepared = {
+        "action": "chat_reply", "bot_id": bot_id, "dialog_id": dialog_id,
+        "from_user_id": from_user_id, "agent_slug": agent_slug, "tier": tier,
+        "last_message_id": last_message_id, "keyboard": True,
+    }
+    if denied:
+        answer = (
+            "😔 Этот агент сейчас выключен." if agent is not None and not agent.get("is_active", True)
+            else "😔 К сожалению, у вас нет доступа к агенту."
+        ) + "\n\nПожалуйста, обратитесь к вашему руководителю или к Александру Никитенко 🙏"
+        base_prepared.update(user_text="\n".join(pieces["texts"]), keyboard=False, no_brain=True)
+        bitrix_inbound.store_answer(batch_id, owner, answer, prepared=base_prepared)
+        _b24_durable_deliver(batch_id, owner, rows[0]["event_kind"], base_prepared, answer)
+        return
+
+    joined_text = "\n".join(pieces["texts"])
+    if len(rows) == 1 and _b24_pop_awaiting_error(bot_id, dialog_id):
+        # This special command forwards to two notification providers. Crossing a durable sending
+        # boundary prevents a crash from replaying the report blindly.
+        prepared = dict(base_prepared, action="error_report", user_text=joined_text, keyboard=False)
+        bitrix_inbound.store_answer(batch_id, owner, "", prepared=prepared)
+        bitrix_inbound.mark_sending(batch_id, owner)
+        try:
+            reporter = _b24_user_name(endpoint, access_token, from_user_id)
+            _b24_handle_error_report(
+                endpoint, access_token, bot_id, dialog_id, joined_text,
+                from_user_id, reporter, last_message_id,
+            )
+            bitrix_inbound.mark_sent(batch_id, owner)
+        except Exception as exc:  # noqa: BLE001
+            bitrix_inbound.mark_delivery_failure(batch_id, owner, str(exc), ambiguous=True)
+        return
+
+    if len(rows) == 1 and _b24_is_reset_command(joined_text):
+        stopped = _b24_cancel_live_turns(_b24_scope(dialog_id, agent_slug))
+        _b24_session_reset(dialog_id, agent_slug)
+        answer = (
+            "⏹ Остановил текущую работу и начал новую сессию — предыдущий контекст очищен. Спрашивайте!"
+            if stopped else
+            "🆕 Начал новую сессию — предыдущий контекст очищен. Спрашивайте!"
+        )
+        prepared = dict(base_prepared, action="chat_reply", user_text=joined_text, no_brain=True)
+        bitrix_inbound.store_answer(batch_id, owner, answer, prepared=prepared)
+        _b24_durable_deliver(batch_id, owner, rows[0]["event_kind"], prepared, answer)
+        return
+
+    recent_atts: list[dict[str, Any]] = []
+    recent_doc = None
+    if not (pieces["attachments"] or pieces["doc_blocks"]
+            or pieces["image_texts"] or pieces["voice_texts"]):
+        reply_doc = _b24_capture_trusted_reply_doc(
+            dialog_id, agent_slug, from_user_id, pieces["reply_text"],
+        )
+        recent_atts = _b24_recent_dialog_attachments(dialog_id, agent_slug)
+        recent_doc = reply_doc or _b24_recent_generated_doc(dialog_id, agent_slug)
+    user_text = _b24_compose_user_text(
+        joined_text, pieces["image_texts"], pieces["reply_text"], pieces["doc_blocks"],
+        pieces["attachments"], recent_attachments=recent_atts, recent_doc=recent_doc,
+        voice_texts=pieces["voice_texts"],
+    )
+    prepared = dict(base_prepared, user_text=user_text, no_brain=False)
+    bitrix_inbound.mark_brain_running(batch_id, owner, prepared)
+    _b24_app_react(endpoint, access_token, last_message_id, "eyes", add=True)
+    _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
+    stop_typing = threading.Event()
+
+    def _typing_keepalive() -> None:
+        while not stop_typing.wait(12):
+            bitrix_inbound.heartbeat(batch_id, owner, lease_seconds=480)
+            _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
+
+    threading.Thread(target=_typing_keepalive, daemon=True).start()
+    started = time.monotonic()
+    inflight_id = _b24_inflight_register(
+        bot_id, dialog_id, agent_slug, from_user_id, last_message_id, None, user_text,
+    )
+    try:
+        answer = hermes_brain_answer(user_text, dialog_id, tier, from_user_id, agent=agent)
+        turn_status, turn_error = _turn_outcome_get()
+    except Exception as exc:  # noqa: BLE001
+        bitrix_inbound.mark_review(batch_id, owner, f"brain exception: {type(exc).__name__}: {exc}")
+        raise
+    finally:
+        stop_typing.set()
+        _b24_inflight_clear(inflight_id)
+    if answer is None:
+        bitrix_inbound.mark_review(batch_id, owner, "brain returned no answer after no-replay boundary")
+        return
+    answer, escalation = _b24_finish_answer_for_delivery(answer)
+    prepared.update(
+        escalation_request=escalation,
+        latency_ms=int((time.monotonic() - started) * 1000),
+        turn_status=turn_status,
+        turn_error=turn_error,
+    )
+    bitrix_inbound.store_answer(
+        batch_id, owner, answer, prepared=prepared,
+        turn_status=turn_status, error_text=turn_error,
+    )
+    _b24_durable_deliver(batch_id, owner, rows[0]["event_kind"], prepared, answer)
+
+
+def _b24_durable_task_prepare(batch: dict[str, Any], owner: str) -> None:
+    batch_id = batch["batch_id"]
+    row = batch["rows"][0]
+    payload = row["payload"] or {}
+    task_id = to_int(payload.get("task_id"))
+    comment_id = to_int(payload.get("comment_id"))
+    if not task_id or not comment_id:
+        bitrix_inbound.mark_ignored(batch_id, owner, "no_ids")
+        return
+    if not _b24_task_mention_enabled():
+        bitrix_inbound.mark_ignored(batch_id, owner, "disabled")
+        return
+    comment = _b24_fetch_task_comment(task_id, comment_id)
+    if not comment:
+        raise RuntimeError("task comment is not visible yet")
+    author_id = to_int(comment.get("author_id"))
+    text = str(comment.get("text") or "")
+    targets = _b24_task_targets()
+    bot_authors = _b24_task_bot_author_ids() | {
+        to_int(target["bot_id"]) for target in targets if target.get("bot_id")
+    }
+    if author_id in bot_authors or text.lstrip().startswith("🤖"):
+        bitrix_inbound.mark_ignored(batch_id, owner, "own_comment")
+        return
+    target = _b24_task_pick_agent(text, targets)
+    if not target:
+        bitrix_inbound.mark_ignored(batch_id, owner, "no_agent_named")
+        return
+    if _b24_task_comment_preclaimed(comment_id):
+        bitrix_inbound.mark_ignored(batch_id, owner, "preclaimed")
+        return
+    bitrix_inbound.merge_payload(batch_id, owner, {
+        "comment_text": _b24_strip_task_bbcode(text), "author_id": author_id,
+        "from_user_id": author_id, "bot_id": target.get("bot_id"),
+        "agent_slug": target.get("slug"),
+    })
+    bitrix_inbound.journal_inbound(batch_id)
+    allowed = (
+        _b24_main_allows(author_id) if target["is_main"]
+        else _b24_task_subagent_allows(target["slug"], author_id)
+    )
+    base_prepared = {
+        "action": "task_reply", "task_id": task_id, "comment_id": comment_id,
+        "from_user_id": author_id, "bot_id": target.get("bot_id"),
+        "agent_slug": target.get("slug"), "agent_name": target["name"],
+        "dialog_id": f"task-{task_id}",
+    }
+    if not allowed:
+        refusal = (
+            "У вас нет доступа ко мне( Попросите администратора открыть вам доступ — "
+            "и я помогу прямо в задаче."
+        )
+        base_prepared.update(user_text=text, tier=target.get("slug") or "main", no_brain=True)
+        bitrix_inbound.store_answer(batch_id, owner, refusal, prepared=base_prepared)
+        _b24_durable_deliver(batch_id, owner, row["event_kind"], base_prepared, refusal)
+        return
+
+    agent = None if target["is_main"] else _b24_agent_by_stored_slug(target["slug"])
+    if not target["is_main"] and not agent:
+        raise RuntimeError("task-comment agent profile is unavailable")
+    tier = "main" if target["is_main"] else str((agent or {}).get("slug") or "")
+    context = _b24_task_context_text(task_id)
+    requester = _b24_portal_user_directory().get(author_id, {}).get("name") or f"id {author_id}"
+    files_block = ""
+    all_file_ids = _b24_task_all_file_ids(task_id, comment.get("file_ids"))
+    if all_file_ids:
+        parts: list[str] = []
+        for item in task_comment_files(all_file_ids, task_id, max_files=6):
+            label = {"image": "скрин/изображение", "audio": "голосовое/аудио"}.get(
+                item["kind"], "документ",
+            )
+            head = f"[Вложение задачи: «{item['name']}» ({label}"
+            if item.get("attachment_id"):
+                head += f", attachment_id={item['attachment_id']}"
+            parts.append(head + "). Распознанное/извлечённое содержимое:]\n" + (item["text"] or "")[:4000])
+        if parts:
+            files_block = "\n\n" + "\n\n".join(parts)
+    user_text = (
+        "Тебя позвали ПРЯМО В ЗАДАЧЕ Bitrix (в комментарии). Работай с ЭТОЙ задачей.\n\n"
+        + context + "\n\n"
+        + f"Сотрудник {requester} (id={author_id}) написал в комментарии к задаче №{task_id}:\n«{text.strip()}»"
+        + files_block + "\n\n"
+        + "КАК ОТВЕЧАТЬ: напиши только текст ответа — он автоматически уйдёт комментарием в эту задачу. "
+        + "Не вызывай add_bitrix_task_comment для своего ответа — получится дубль. "
+        + "Инструменты используй только для действий, которые сотрудник явно попросил."
+    )
+    prepared = dict(base_prepared, user_text=user_text, tier=tier, no_brain=False)
+    bitrix_inbound.mark_brain_running(batch_id, owner, prepared)
+    started = time.monotonic()
+    stop_heartbeat = threading.Event()
+
+    def _lease_keepalive() -> None:
+        while not stop_heartbeat.wait(12):
+            bitrix_inbound.heartbeat(batch_id, owner, lease_seconds=480)
+
+    threading.Thread(target=_lease_keepalive, daemon=True).start()
+    try:
+        answer = hermes_brain_answer(user_text, f"task-{task_id}", tier, author_id, agent=agent)
+        turn_status, turn_error = _turn_outcome_get()
+    except Exception as exc:  # noqa: BLE001
+        bitrix_inbound.mark_review(batch_id, owner, f"brain exception: {type(exc).__name__}: {exc}")
+        raise
+    finally:
+        stop_heartbeat.set()
+    if not answer:
+        bitrix_inbound.mark_review(batch_id, owner, "task brain returned no answer")
+        return
+    prepared.update(
+        latency_ms=int((time.monotonic() - started) * 1000),
+        turn_status=turn_status,
+        turn_error=turn_error,
+    )
+    bitrix_inbound.store_answer(
+        batch_id, owner, answer, prepared=prepared,
+        turn_status=turn_status, error_text=turn_error,
+    )
+    _b24_durable_deliver(batch_id, owner, row["event_kind"], prepared, answer)
+
+
+def _b24_durable_deliver(batch_id: str, owner: str, event_kind: str,
+                         prepared: dict[str, Any], answer: str) -> None:
+    bitrix_inbound.mark_sending(batch_id, owner)
+    outcome: dict[str, Any] = {}
+    if event_kind == "task_comment":
+        sent = _b24_post_task_comment(
+            int(prepared["task_id"]), answer, str(prepared["agent_name"]),
+            prepared.get("bot_id"), _durable_outcome=outcome,
+        )
+    else:
+        endpoint, access_token = _b24_app_access_token()
+        sent = bool(_b24_app_reply(
+            endpoint, access_token, prepared.get("bot_id"), prepared.get("dialog_id"), answer,
+            keyboard=_b24_keyboard() if prepared.get("keyboard", True) else None,
+            _durable_outcome=outcome,
+        ))
+    state = outcome.get("status")
+    if sent and state == "sent":
+        bitrix_inbound.mark_sent(batch_id, owner, outcome.get("message_id"))
+        if event_kind == "task_comment":
+            _b24_task_comment_claim(
+                int(prepared["comment_id"]), int(prepared["task_id"]),
+                prepared.get("agent_slug"), prepared.get("from_user_id"),
+            )
+            _b24_task_comment_mark_handled(int(prepared["comment_id"]))
+        else:
+            endpoint, access_token = _b24_app_access_token()
+            message_id = prepared.get("last_message_id")
+            _b24_app_react(endpoint, access_token, message_id, "eyes", add=False)
+            _b24_app_react(endpoint, access_token, message_id, "like", add=True)
+            _b24_session_touch(prepared.get("dialog_id"), prepared.get("agent_slug"))
+            _b24_ensure_command_registered(
+                endpoint, access_token, prepared.get("bot_id"),
+            )
+            if prepared.get("escalation_request") is not None:
+                threading.Thread(
+                    target=_b24_forward_access_request,
+                    args=(prepared.get("dialog_id"), prepared.get("from_user_id"),
+                          prepared.get("escalation_request") or prepared.get("user_text"),
+                          endpoint, access_token, prepared.get("bot_id")),
+                    daemon=True,
+                ).start()
+        _b24_log_interaction(
+            str(prepared.get("dialog_id") or ""), prepared.get("from_user_id"),
+            str(prepared.get("tier") or ""), str(prepared.get("user_text") or ""), answer,
+            int(prepared.get("latency_ms") or 0), str(prepared.get("turn_status") or "ok"),
+            prepared.get("turn_error"), agent_slug=prepared.get("agent_slug"),
+        )
+        return
+    ambiguous = state == "ambiguous"
+    bitrix_inbound.mark_delivery_failure(
+        batch_id, owner, str(outcome.get("error") or "Bitrix provider returned no message id"),
+        ambiguous=ambiguous,
+    )
+
+
+def _b24_durable_process_claim(batch: dict[str, Any], owner: str) -> None:
+    leader = batch.get("leader") or {}
+    event_kind = leader.get("event_kind")
+    if batch.get("status") in {"answer_ready", "delivery_retry"}:
+        prepared = leader.get("prepared") or {}
+        _b24_durable_deliver(
+            batch["batch_id"], owner, str(event_kind), prepared, str(leader.get("answer") or ""),
+        )
+    elif event_kind == "chat_message":
+        _b24_durable_chat_prepare(batch, owner)
+    elif event_kind == "task_comment":
+        _b24_durable_task_prepare(batch, owner)
+    else:
+        bitrix_inbound.mark_ignored(batch["batch_id"], owner, "unsupported_event_kind")
+
+
+_B24_DURABLE_WORKERS_STARTED = False
+
+
+def _b24_start_durable_workers() -> None:
+    global _B24_DURABLE_WORKERS_STARTED
+    if _B24_DURABLE_WORKERS_STARTED or not bitrix_inbound.enabled() or not background_jobs_enabled():
+        return
+    _B24_DURABLE_WORKERS_STARTED = True
+    workers = max(1, min(int(os.getenv("BITRIX_DURABLE_INBOUND_WORKERS", "2") or 2), 2))
+
+    def _loop(index: int) -> None:
+        owner = bitrix_inbound.worker_id(index)
+        while True:
+            batch = None
+            try:
+                batch = bitrix_inbound.claim_next(owner, lease_seconds=480)
+                if batch is None:
+                    time.sleep(1)
+                    continue
+                _b24_durable_process_claim(batch, owner)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("b24 durable intake worker failed")
+                if batch is not None:
+                    try:
+                        if batch.get("status") == "queued":
+                            bitrix_inbound.mark_preparation_failure(batch["batch_id"], owner, str(exc))
+                        else:
+                            bitrix_inbound.mark_review(batch["batch_id"], owner, str(exc))
+                    except Exception:  # noqa: BLE001
+                        logging.exception("b24 durable intake failure state could not be persisted")
+                time.sleep(2)
+
+    for index in range(workers):
+        threading.Thread(
+            target=_loop, args=(index,), daemon=True, name=f"b24-durable-inbound-{index}",
+        ).start()
+
+
+_b24_start_durable_workers()
 
 

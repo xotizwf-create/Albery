@@ -289,6 +289,18 @@ if workspace_queue_problems:
     problems.extend(f"КРИТИЧНО: {message}" for message in workspace_queue_problems)
     critical = True
 
+# --- Durable Bitrix chat/task-comment intake ----------------------------------------------
+# Counts and timestamps only: message bodies and prepared answers never enter monitoring output.
+try:
+    from bitrix_inbound import inspect_health as inspect_bitrix_inbound_health
+
+    bitrix_inbound_problems = inspect_bitrix_inbound_health()
+except Exception as exc:  # noqa: BLE001
+    bitrix_inbound_problems = [f"Bitrix inbound queue monitor failed ({type(exc).__name__})"]
+if bitrix_inbound_problems:
+    problems.extend(f"КРИТИЧНО: {message}" for message in bitrix_inbound_problems)
+    critical = True
+
 # --- Оперативная память ------------------------------------------------------------------
 # --- Versioned MCP capability caps ---------------------------------------------------------
 # Missing/malformed manifests remove power, but that safe failure is still an outage for an

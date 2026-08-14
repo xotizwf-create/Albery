@@ -22,6 +22,8 @@ from typing import Any
 from urllib.parse import urlencode
 import requests
 
+import bitrix_inbound
+
 from config import (
     LOCAL_TZ,
 )
@@ -2117,14 +2119,45 @@ def bitrix_task_event_webhook(secret: str):
 
     payload = flatten_request_payload()
     event_name = normalize_bitrix_event_name(first_non_empty(payload.get("event"), payload.get("EVENT")))
-    # In-task agent: an employee named an agent in a task comment. Fires on EVERY comment company-
-    # wide, so ACK immediately and do ALL work (fetch/detect/access/run) in a background thread —
-    # the guards + kill-switch live inside _b24_handle_task_comment_event.
+    # In-task agent: capture before ACK. The payload is normalized and token-free; a PostgreSQL
+    # failure returns 503 so Bitrix retries instead of losing an already-acknowledged comment.
     if (event_name or "").lower() in {"ontaskcommentadd", "ontaskcommentupdate"}:
         c_task_id = extract_bitrix_comment_event_task_id(payload)
         comment_id = _extract_bitrix_event_comment_id(payload)
         if not c_task_id or not comment_id:
             return jsonify({"ok": True, "event": event_name, "ignored": True, "reason": "no_ids"}), 200
+
+        if bitrix_inbound.enabled():
+            try:
+                queued = bitrix_inbound.enqueue(
+                    event_key=f"task-comment:{int(comment_id)}",
+                    event_kind="task_comment",
+                    scope_key=f"task-comment:{int(comment_id)}",
+                    payload={
+                        "event_name": event_name,
+                        "task_id": int(c_task_id),
+                        "comment_id": int(comment_id),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                __import__("logging").getLogger(__name__).warning(
+                    "durable task-comment capture failed task=%s comment=%s",
+                    c_task_id, comment_id, exc_info=True,
+                )
+                return jsonify({
+                    "ok": False,
+                    "event": event_name,
+                    "retry": True,
+                    "error": "durable_capture_unavailable",
+                }), 503
+            return jsonify({
+                "ok": True,
+                "event": event_name,
+                "job_id": str(queued["id"]),
+                "queued": bool(queued["inserted"]),
+                "duplicate": not bool(queued["inserted"]),
+                "status": queued["status"],
+            }), 200
 
         def _run_task_comment() -> None:
             try:

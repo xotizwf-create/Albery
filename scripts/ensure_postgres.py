@@ -42,6 +42,7 @@ REQUIRED_TABLE_MIGRATIONS = {
     "access_requests": "036_access_requests.sql",
     "iu_form_tokens": "075_iu_form_tokens.sql",
     "iu_form_merges": "076_iu_form_merges.sql",
+    "bitrix_inbound_jobs": "087_durable_bitrix_inbound.sql",
 }
 
 REQUIRED_FUNCTION_MIGRATIONS = {
@@ -149,6 +150,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     # Durable Bitrix manager-alert provider boundary; timeouts become reviewable
     # unknown outcomes instead of blind duplicate retries.
     "086_iu_manager_alert_delivery_boundary.sql",
+    # Capture-before-ACK and staged no-replay boundaries for Bitrix agent inbound events.
+    "087_durable_bitrix_inbound.sql",
 ]
 
 
