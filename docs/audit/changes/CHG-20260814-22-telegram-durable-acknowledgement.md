@@ -1,6 +1,6 @@
 # CHG-20260814-22: Restore employee Telegram acknowledgement on the durable path
 
-- Status: implemented_local
+- Status: verified
 - Date opened: 2026-08-14
 - Related decisions: [ADR-0005](../decisions/ADR-0005-channel-neutral-agent-runtime.md), [ADR-0009](../decisions/ADR-0009-durable-client-telegram-provider-boundaries.md)
 - Bitrix engineering task: pending
@@ -66,3 +66,14 @@ gates. The durable captured update and outbox rows need no rollback.
 The first observed owner message was a short ordinary message rather than the prepared exact phrase.
 It nevertheless traversed the real profile, brain and provider boundaries once. Final evidence and
 status will be appended after deployment and the approved file acceptance.
+
+## Production deployment and acceptance: 2026-08-14
+
+Commit `353136f` passed security and both PostgreSQL CI matrices, then deployed by fast-forward only
+after all Bitrix, Telegram and automation active-work gates were zero. Changed files were backed up
+to `/var/backups/albery/code/pre-chg22-20260814_100905.tar.gz` with mode `0600`; only
+`albery-tg.service` was restarted. The same production helper used by the automatic path placed the
+`eyes` reaction on the owner's real inbound Telegram message and the Telegram provider returned
+success. The actual durable message/reply pair remained exactly once, the approved native file was
+sent exactly once, smoke/self-check passed, all queues were terminal/clean and fresh service error
+journals were empty. The production behavior is `verified`.

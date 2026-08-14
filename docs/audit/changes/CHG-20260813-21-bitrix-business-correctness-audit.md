@@ -1,6 +1,6 @@
 # CHG-20260813-21: Bitrix business correctness audit
 
-- Status: deployed
+- Status: verified
 - Date opened: 2026-08-13
 - Approval: owner approved continued execution of the recorded full audit roadmap
 - Remediation approval: 2026-08-14, owner approved items 1–3 of the next-step plan
@@ -157,6 +157,19 @@ This closes the structural crash/database durability findings. Status remains `d
 fresh approved owner-visible chat round trip traverses the new queue; task-comment delivery remains
 covered by deterministic/DB tests unless an exact disposable task and cleanup are separately
 approved.
+
+## Fresh durable owner round trip: 2026-08-14
+
+After migration `087` and the staged worker were live, the owner approved the exact visible response
+`Тест durable Bitrix пройден` in the existing private chat. One authenticated synthetic provider
+event was captured before HTTP 200; an immediate redelivery returned `duplicate=true` and referenced
+the same job. PostgreSQL contains one event row. It completed `sent` with one brain attempt and one
+delivery attempt, stored the exact answer, and Bitrix returned provider message id `45682`. The exact
+outbound journal row exists once. No in-flight/open Bitrix job, automation, Telegram/workspace queue
+or warning/error journal remained; full smoke and self-check passed. This closes the stated fresh
+live gate and advances CHG-21 to `verified`. Task-comment provider delivery remains covered by the
+same deployed stage machine plus deterministic/PostgreSQL matrix tests; no disposable real task was
+created without separate approval.
 
 ## Owner-visible live round trip: 2026-08-13 17:29 MSK
 

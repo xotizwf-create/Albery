@@ -1,6 +1,6 @@
 # CHG-20260812-13: Retire redundant native Telegram and complete identity acceptance
 
-- Status: deployed
+- Status: verified
 - Date opened: 2026-08-12
 - Related decisions: [ADR-0005](../decisions/ADR-0005-channel-neutral-agent-runtime.md)
 - Bitrix engineering task: pending
@@ -99,3 +99,15 @@ It must be sent by the owner to `@albery_ai_bot`; provider polling cannot safely
 After that manual step, acceptance will check one captured update, one brain result, one outbox send,
 one inbound/outbound journal pair, exact response text, empty queues, unchanged delegated identity
 and clean services. No message has been sent as part of this inventory.
+
+## Owner profile round trip: 2026-08-14
+
+The owner wrote an ordinary short message to the exact employee bot `@albery_ai_bot`. Production
+captured one provider update for the stable allowed identity, advanced the offset atomically, ran one
+`main` profile turn and stored one durable reply. The update finished `done` with one attempt; the
+outbox finished `sent` with one attempt and Telegram provider message id `932`; one inbound and one
+outbound journal row exist. End-to-end latency was about 22 seconds and no error/review/retry row
+was created. The delegated `bitrix_user_id` remains intentionally null and fail-closed. Subsequent
+native-file acceptance, smoke, self-check and content-free queue health were clean. The transport
+identity and real profile round trip are therefore `verified` even though the user's harmless short
+message differed from the prepared deterministic phrase.

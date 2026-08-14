@@ -1,23 +1,19 @@
 # Current Albery architecture
 
-Last reviewed: 2026-08-13.
+Last reviewed: 2026-08-14.
 
 ## Verified production state
 
-Production server 186 runs functional runtime `34abacc`; later audit-only commits do not change
-process behavior. Bitrix OAuth-state hardening is deployed in later functional commit `208bac4`.
-The runtime includes the versioned scheduler, recovery, capability, PostgreSQL and client-Telegram
-hardening commits.
+Production server 186 runs functional runtime `353136f`. The runtime includes the versioned
+scheduler/recovery/capability/PostgreSQL/client-Telegram hardening, durable Bitrix inbound boundary
+and employee Telegram acknowledgement.
 
-The Bitrix local-app OAuth state is now atomically published with owner-only `0600` permissions.
-The wider Bitrix correctness audit remains active: task-comment events still ACK before durable
-capture, and four historical non-self first-sight rows remain `handled=false`. They are evidence for
-the durable queue redesign and are not blindly replayed.
-The approved, not-yet-deployed target under
-[ADR-0010](../decisions/ADR-0010-durable-bitrix-inbound-boundary.md) is capture-before-ACK for chat
-and task comments, durable batching/leases, a no-replay brain boundary, stored answers and a
-`sending/sent/review` provider boundary. Until production verification, the preceding paragraph is
-the current behavior.
+The Bitrix local-app OAuth state is atomically published with owner-only `0600` permissions. Chat
+and task-comment webhooks persist a token-free event in PostgreSQL before HTTP ACK, then use durable
+batch/lease stages, a no-replay brain boundary, stored answers and a `sending/sent/review` provider
+boundary under [ADR-0010](../decisions/ADR-0010-durable-bitrix-inbound-boundary.md). Four historical
+non-self first-sight rows remain preserved and are not blindly replayed. A fresh owner-approved
+durable chat event deduplicated and delivered the exact answer once; smoke/self-check stayed clean.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
@@ -231,6 +227,9 @@ flowchart TD
   Known provider failures retry only stored delivery; connection/timeouts and interrupted provider
   calls stop for manual review. A stopped model turn is not blindly replayed because tools may have
   produced an external effect.
+- After stable-id access succeeds, the profile bot places a best-effort content-free `eyes`
+  acknowledgement on the exact inbound message before the expensive turn. Reaction failure is
+  cosmetic and never changes update, brain or outbox state.
 - Screenshots, voice/audio and common documents are downloaded only after access passes. Groq turns
   image/audio into text; the same Hermes/Codex agent makes every business decision and tool call.
 - Agent automations now store `delivery_channel`, `delivery_profile` and
@@ -239,8 +238,10 @@ flowchart TD
 - `TG_CHANNEL_NEUTRAL_ENABLED=1` is active in the production worker. Local evidence is
   `1745 passed, 1 skipped`; GitHub tests/security passed, including migration `084` and DB-marked
   tests on PostgreSQL 14 and 16. Production migration, the explicit `albery-ai` to `main` binding
-  merge, fail-closed identity assertions and smoke passed. No real employee message was sent, so
-  user-visible round-trip acceptance remains open and the change status is `deployed`.
+  merge, fail-closed identity assertions and smoke passed. On 2026-08-14 the owner completed one
+  real employee message/reply round trip with one update attempt and one sent outbox row. Telegram
+  also accepted one real reaction and one exact native file from the same profile; all queues,
+  smoke, self-check and error journals remained clean.
 
 ## Bitrix agent and automation split
 
@@ -362,9 +363,10 @@ flowchart LR
   Telegram profile adapter. Exact bytes are retained under `0700/0600` permissions and referenced
   by unguessable tokens in independent durable text/file parts; an invalid handoff fails closed.
   `mcp.m4s.ru/zoom-export/` now returns 404. The canonical signed export remains only as an internal
-  model-to-adapter handoff and explicit non-chat compatibility surface. Structural live acceptance
-  is recorded by [CHG-20260812-11](../changes/CHG-20260812-11-channel-native-artifacts.md); a real
-  provider attachment requires an approved recipient before the change can be called verified.
+  model-to-adapter handoff and explicit non-chat compatibility surface. On 2026-08-14 the approved
+  employee Telegram recipient received an exact stored text file through native `sendDocument`
+  once, with no public link; idempotency, hash, journal, queues and provider id passed under
+  [CHG-20260812-11](../changes/CHG-20260812-11-channel-native-artifacts.md).
 - A request quoting an old generated-file answer never reuses its expired `/zoom-export/` URL. Exact
   stored bytes are redelivered only when the attachment remains physically available and matches
   the same dialog/profile. For legacy text-only records, an exact prior answer may recover only the

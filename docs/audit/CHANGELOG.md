@@ -4,6 +4,10 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-14
 
+- `verified` — [CHG-20260814-22](changes/CHG-20260814-22-telegram-durable-acknowledgement.md): production `353136f` restores the authorized inbound `eyes` acknowledgement; protected backup, zero-active-work restart gate, provider acceptance on the owner's real message, full smoke, self-check, queues and fresh journals passed.
+- `verified` — [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md): one fresh owner-approved durable Bitrix event was captured once, deduplicated on redelivery, ran one brain/delivery attempt and produced exact provider message `45682`; all post-send health checks remained clean.
+- `verified` — [CHG-20260812-13](changes/CHG-20260812-13-telegram-final-acceptance.md): the owner completed a real `@albery_ai_bot` profile round trip; one update and one stored reply finished exactly once with no retry/review row and delegated Bitrix identity remains fail-closed.
+- `verified` — [CHG-20260812-11](changes/CHG-20260812-11-channel-native-artifacts.md): the approved employee Telegram recipient received the exact stored acceptance file once through native `sendDocument`, with matching hash, one idempotency row/journal row and no public link.
 - `implemented_local` — [CHG-20260814-22](changes/CHG-20260814-22-telegram-durable-acknowledgement.md): restore the content-free `eyes` acknowledgement for authorized employee Telegram turns without allowing the cosmetic provider call to control durable brain/outbox state; production diagnosis already proved that the owner's message and one reply were delivered exactly once, and the full local suite is `1989 passed, 48 skipped`.
 
 - `deployed` — [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md): production `2b93c6f` captures Bitrix chat/task-comment events before ACK, stores brain output before delivery, retries only known-safe stages and stops ambiguous outcomes for review; CI, protected backup, empty-work restart, smoke, self-check, queue health and journals passed; a fresh owner-visible round trip remains.

@@ -1,6 +1,6 @@
 # CHG-20260812-11: Channel-native generated file delivery
 
-- Status: deployed
+- Status: verified
 - Date opened: 2026-08-12
 - Related decisions: [ADR-0006](../decisions/ADR-0006-channel-native-artifact-delivery.md), [ADR-0003](../decisions/ADR-0003-private-per-agent-mcp.md)
 - Bitrix engineering task: pending
@@ -91,3 +91,14 @@ Production evidence on 2026-08-12:
 
 The first real provider-native file delivery remains an explicit acceptance gate: it needs a named
 recipient and exact preview. This change therefore remains `deployed`, not `verified`.
+
+## Telegram native-file acceptance: 2026-08-14
+
+The owner approved an exact file preview and the existing private recipient for profile `main`.
+The durable employee Telegram outbox delivered
+`albery-telegram-acceptance-2026-08-14.txt` as a native `sendDocument` attachment. The stored bytes
+matched the approved UTF-8 content by SHA-256, Telegram returned provider message id `933`, the
+idempotency key exists exactly once, the attempt count is one and the native-artifact journal row
+exists exactly once. No public or signed URL was included. All employee/workspace queues, smoke,
+self-check, services and fresh error journals remained clean. This closes the explicit real-provider
+acceptance gate and advances the change to `verified`.
