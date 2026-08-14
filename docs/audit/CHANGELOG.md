@@ -4,6 +4,8 @@ Append entries in reverse chronological order. Link to the detailed record; do n
 
 ## 2026-08-14
 
+- `implemented_local` — [CHG-20260814-22](changes/CHG-20260814-22-telegram-durable-acknowledgement.md): restore the content-free `eyes` acknowledgement for authorized employee Telegram turns without allowing the cosmetic provider call to control durable brain/outbox state; production diagnosis already proved that the owner's message and one reply were delivered exactly once, and the full local suite is `1989 passed, 48 skipped`.
+
 - `deployed` — [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md): production `2b93c6f` captures Bitrix chat/task-comment events before ACK, stores brain output before delivery, retries only known-safe stages and stops ambiguous outcomes for review; CI, protected backup, empty-work restart, smoke, self-check, queue health and journals passed; a fresh owner-visible round trip remains.
 - `verified` — [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md): the first unattended 03:15 local and 03:45 offsite cycle published the same private 256,397,116-byte archive; SHA-256/size identity, both archive checks and production backup health passed.
 

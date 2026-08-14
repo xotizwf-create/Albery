@@ -27,6 +27,7 @@ def multi(monkeypatch, tmp_path):
     monkeypatch.setattr(tg_agent, "load_state", lambda: json.loads(state_file.read_text(encoding="utf-8")))
     monkeypatch.setattr(tg_agent, "save_state",
                         lambda s: state_file.write_text(json.dumps(s, ensure_ascii=False), encoding="utf-8"))
+    monkeypatch.setattr(tg_multi, "_react", lambda *_args, **_kwargs: None)
     tg_agent._ACCESS_CACHE.update({"at": 0.0, "by_bot": {}})
     return tg_multi
 
@@ -233,6 +234,47 @@ def test_durable_turn_uses_same_profile_and_creates_delivery_once(multi, monkeyp
     assert len(finished) == 1
     assert finished[0][0]["provider_update_id"] == 700
     assert finished[0][1] == {"chat_id": 555, "answer": "готово"}
+
+
+def test_durable_turn_acknowledges_authorized_message_before_brain(multi, monkeypatch):
+    update = {
+        "id": 311,
+        "agent_slug": "prodazhi-bot",
+        "provider_update_id": 7011,
+        "payload": {
+            "message": {
+                "message_id": 91,
+                "chat": {"id": 555, "type": "private"},
+                "from": {"id": 77, "username": "anna"},
+                "text": "ping",
+            }
+        },
+    }
+    events = []
+    monkeypatch.setattr(multi, "_agent_for_slug", lambda _slug: AGENT)
+    monkeypatch.setattr(multi, "_access_identity", lambda *_args: {
+        "allowed": True, "reason": "allowed", "bitrix_user_id": 17,
+    })
+    monkeypatch.setattr(
+        multi,
+        "_react",
+        lambda token, chat_id, message_id, emoji: events.append(
+            ("reaction", token, chat_id, message_id, emoji)
+        ),
+    )
+    monkeypatch.setattr(
+        multi,
+        "_run_agent_turn",
+        lambda *_args, **_kwargs: events.append(("brain",)) or "pong",
+    )
+    monkeypatch.setattr(multi, "_finish_update", lambda *_args, **_kwargs: events.append(("done",)))
+    monkeypatch.setattr(multi.core, "journal", lambda *_args, **_kwargs: None)
+
+    multi._process_update(update)
+
+    assert events[0] == ("reaction", "111:AAA", 555, 91, "👀")
+    assert events[1] == ("brain",)
+    assert events[2] == ("done",)
 
 
 def test_ambiguous_brain_turn_is_never_replayed_automatically(multi, monkeypatch):

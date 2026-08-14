@@ -680,6 +680,10 @@ def _process_update(update: dict) -> None:
         _finish_update(update, chat_id=chat_id,
                        answer=_denial_text(str(identity.get("reason") or "")))
         return
+    # The durable brain turn may take tens of seconds. Preserve the old channel UX without
+    # weakening the queue boundary: this content-free acknowledgement is best-effort and its
+    # provider outcome never controls update, brain or delivery state.
+    _react(str(agent["bot_token"]), chat_id, msg.get("message_id"), "👀")
     try:
         text_value = _telegram_message_text(agent, msg, identity)
     except Exception as exc:  # noqa: BLE001

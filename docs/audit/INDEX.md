@@ -56,6 +56,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [CHG-20260813-19](changes/CHG-20260813-19-postgresql-disaster-recovery-audit.md) | verified | Audit PostgreSQL and harden atomic local/offsite recovery with measured RPO/RTO; unattended local/offsite cycle accepted |
 | [CHG-20260813-20](changes/CHG-20260813-20-client-telegram-iu-crm-lifecycle-audit.md) | deployed | Harden the full client Telegram/IU lifecycle, manager-alert ambiguity, file retention and queue monitoring |
 | [CHG-20260813-21](changes/CHG-20260813-21-bitrix-business-correctness-audit.md) | deployed | OAuth state is owner-only/atomic and Bitrix chat/task-comment intake is capture-before-ACK with staged no-replay delivery; fresh live acceptance pending |
+| [CHG-20260814-22](changes/CHG-20260814-22-telegram-durable-acknowledgement.md) | implemented_local | Restore immediate best-effort acknowledgement for authorized employee Telegram turns without weakening durable delivery |
 
 ## Runbooks
 
