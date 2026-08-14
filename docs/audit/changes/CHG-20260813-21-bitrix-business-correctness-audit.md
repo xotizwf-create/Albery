@@ -3,6 +3,7 @@
 - Status: in_progress
 - Date opened: 2026-08-13
 - Approval: owner approved continued execution of the recorded full audit roadmap
+- Remediation approval: 2026-08-14, owner approved items 1–3 of the next-step plan
 
 ## Goal
 
@@ -89,6 +90,36 @@ between the deployment and the check, so this evidence proves runtime/infrastruc
 coverage but does not replace an explicitly approved recipient-visible round trip. The two open
 durability findings above remain pre-existing design risks and were not introduced by the OAuth
 change.
+
+## Approved remediation target: 2026-08-14
+
+Related decision: [ADR-0010](../decisions/ADR-0010-durable-bitrix-inbound-boundary.md).
+
+Before behavior:
+
+- chat dedupe fails open when PostgreSQL is unavailable;
+- chat batching and task-comment dispatch live in process memory after the webhook ACK;
+- an interrupted brain or provider call has no durable stage that distinguishes safe retry from an
+  ambiguous external outcome;
+- a successfully generated answer is not independently recoverable for delivery-only retry.
+
+Target behavior:
+
+- capture every authenticated chat/task-comment event in PostgreSQL before ACK, with secrets
+  removed and a unique provider-event key;
+- preserve multi-part chat batching through durable scope claims and leases;
+- commit `brain_running` as the no-replay boundary, store the completed answer, then commit
+  `sending` before the provider call;
+- retry only safe preparation and known delivery failures; move interrupted brain/sending work to
+  `review` without blind replay;
+- monitor all nonterminal/review states in self-check and retain the four historical unhandled
+  comments as non-replayed evidence.
+
+Risks are accidental double processing, altered batching, wrong profile/bot authorship, stuck queue
+growth and a deploy restart during a live turn. Rollback is the protected pre-change code/database
+backup plus the feature flag; the additive table remains inert on rollback. Production restart is
+allowed only with empty live/automation work, and deployment requires migration, compile, focused
+failure injection, full regression, CI, smoke, queue checks, exact profile counts and fresh logs.
 
 ## Owner-visible live round trip: 2026-08-13 17:29 MSK
 

@@ -29,6 +29,7 @@ This directory is the canonical, versioned knowledge base for Albery's architect
 | [ADR-0007](decisions/ADR-0007-exhaustive-mcp-policy-and-fail-closed-caps.md) | accepted | Every MCP tool is semantically classified and every agent cap fails closed |
 | [ADR-0008](decisions/ADR-0008-verified-postgresql-backup-chain.md) | accepted | PostgreSQL backups are atomic, SHA-256/pg_restore verified and routine restores are isolated |
 | [ADR-0009](decisions/ADR-0009-durable-client-telegram-provider-boundaries.md) | accepted | Client Telegram/Bitrix delivery uses persisted provider boundaries, reference-safe files and content-free queue monitoring |
+| [ADR-0010](decisions/ADR-0010-durable-bitrix-inbound-boundary.md) | accepted | Bitrix chat and task-comment webhooks capture before ACK and separate no-replay brain/delivery stages |
 
 ## Changes
 

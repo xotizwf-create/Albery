@@ -13,6 +13,11 @@ The Bitrix local-app OAuth state is now atomically published with owner-only `06
 The wider Bitrix correctness audit remains active: task-comment events still ACK before durable
 capture, and four historical non-self first-sight rows remain `handled=false`. They are evidence for
 the durable queue redesign and are not blindly replayed.
+The approved, not-yet-deployed target under
+[ADR-0010](../decisions/ADR-0010-durable-bitrix-inbound-boundary.md) is capture-before-ACK for chat
+and task comments, durable batching/leases, a no-replay brain boundary, stored answers and a
+`sending/sent/review` provider boundary. Until production verification, the preceding paragraph is
+the current behavior.
 The model routing was deployed under
 [CHG-20260810-01](../changes/CHG-20260810-01-quality-model-routing.md) and independently
 re-verified/hardened under
