@@ -19,7 +19,8 @@ import pytest
 SPLIT_ROUTES = Path("deploy/vpn-split-routes.sh")
 CONFIG = Path("deploy/vpn-split-domains.conf")
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="shell behavior is covered by Linux CI")
+# Прогон скрипта требует POSIX-шелла; проверка самого конфига работает везде.
+needs_shell = pytest.mark.skipif(os.name == "nt", reason="shell behavior is covered by Linux CI")
 
 
 def _write_executable(path: Path, text: str) -> None:
@@ -70,6 +71,7 @@ exit 0
 _SILENT_RESOLVER = "#!/bin/bash\nexit 0\n"
 
 
+@needs_shell
 def test_allowlist_goes_through_the_tunnel(tmp_path: Path):
     env, routes = _harness(tmp_path, _RESOLVER, "host api.openai.com\nnet 149.154.160.0/20\n")
 
@@ -80,6 +82,7 @@ def test_allowlist_goes_through_the_tunnel(tmp_path: Path):
     assert "route replace 149.154.160.0/20 dev awg0 table 200" in log
 
 
+@needs_shell
 def test_rotated_cdn_address_replaces_the_old_one(tmp_path: Path):
     env, routes = _harness(tmp_path, _RESOLVER, "host api.openai.com\n")
     assert _run(env).returncode == 0
@@ -101,6 +104,7 @@ exit 0
     assert "route del 104.18.0.1/32 dev awg0 table 200" in log, "устаревший адрес обязан уйти"
 
 
+@needs_shell
 def test_silent_resolver_keeps_the_last_known_addresses(tmp_path: Path):
     """DNS моргнул — маршруты к мозгу агента остаются на месте."""
     env, routes = _harness(tmp_path, _RESOLVER, "host api.openai.com\n")
@@ -118,6 +122,7 @@ def test_silent_resolver_keeps_the_last_known_addresses(tmp_path: Path):
     assert "route replace 104.18.0.1/32 dev awg0 table 200" in log
 
 
+@needs_shell
 def test_missing_tunnel_leaves_routes_untouched(tmp_path: Path):
     """Туннеля нет — это не ошибка: всё, кроме allowlist, работает напрямую."""
     env, routes = _harness(tmp_path, _RESOLVER, "host api.openai.com\n")
