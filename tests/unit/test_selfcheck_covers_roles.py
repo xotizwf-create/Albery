@@ -97,3 +97,21 @@ def test_monitor_detects_hermes_restart_policy_drift():
     assert 'restart_values.get("StartLimitBurst") != "5"' in source
     assert '"RestartMaxDelaySec=" in unit_text' in source
     assert '"RestartSteps=" in unit_text' in source
+
+
+def test_dry_run_shows_problems_even_when_the_alert_is_suppressed():
+    """Осмотр по требованию обязан показывать, ЧТО сломано.
+
+    16.08.2026: после сетевого сбоя монитор держал две проблемы, но ручной прогон
+    `--dry-run` печатал только «2 problem(s), alert suppressed (unchanged)» — состав
+    узнать было нельзя. Антиспам обязан глушить повторную ОТПРАВКУ, а не осмотр:
+    руками проверку запускают именно тогда, когда проблема уже висит.
+    """
+    source = _source()
+    assert "if should_notify or DRY_RUN:" in source, (
+        "в dry-run список проблем обязан печататься независимо от антиспама"
+    )
+    # И при этом состояние антиспама dry-run по-прежнему не трогает.
+    assert re.search(r"if not DRY_RUN:\s*\n\s*#.*\n\s*#.*\n\s*state\[\"last_digest\"\]", source), (
+        "dry-run не должен записывать состояние антиспама — иначе заглушит настоящий алерт"
+    )

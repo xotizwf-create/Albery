@@ -513,16 +513,23 @@ should_notify = bool(problems) and (
     or now_ts - last_alert_ts > repeat_pause)
 
 if problems:
-    if should_notify:
+    # Антиспам глушит ПОВТОРНУЮ отправку, но не осмотр. В dry-run список показываем
+    # всегда: человек запускает проверку руками именно тогда, когда проблема уже висит
+    # и алерт по ней подавлен, — и раньше в этот момент видел только «2 problem(s)»,
+    # то есть узнать, что именно сломано, было нельзя.
+    if should_notify or DRY_RUN:
         head = "🚨 Albery — КРИТИЧНО:" if critical else "🩺 Albery selfcheck — есть проблемы:"
         text = head + "\n" + "\n".join(f"- {p}" for p in problems) + \
             "\n\nДетали: journalctl -u albery (сервер 186)."
+        if DRY_RUN and not should_notify:
+            text += "\n\n(в бою этот алерт сейчас подавлен антиспамом как неизменившийся)"
         notify(text)
         if not DRY_RUN:
             # В dry-run состояние антиспама не трогаем: проверка монитора не должна
             # заглушить настоящий алерт, который придёт через минуту.
             state["last_digest"] = digest
             state["last_alert_ts"] = time.time()
+    if should_notify:
         logging.warning("selfcheck: %s problem(s) reported (critical=%s)", len(problems), critical)
     else:
         logging.warning("selfcheck: %s problem(s), alert suppressed (unchanged)", len(problems))
