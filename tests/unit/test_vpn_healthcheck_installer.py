@@ -75,9 +75,10 @@ if [[ $1 == link ]]; then exit 0; fi
 if [[ $1 == rule ]]; then
   printf '900: from all ipproto tcp sport 22 lookup main\n901: from all ipproto tcp sport 443 lookup main\n902: from all ipproto tcp sport 80 lookup main\n1000: from all fwmark 0x1 lookup main\n1001: from all lookup 200\n'
 elif [[ $1 == route && $2 == show ]]; then
-  echo 'default dev awg0 scope link'
+  # Раздельный туннель: по умолчанию напрямую, allowlist — через awg0.
+  printf 'default via 186.246.7.1 dev eth0\n104.18.0.1 dev awg0\n'
 else
-  echo '1.1.1.1 dev awg0 table 200 src 10.8.2.2'
+  echo '1.1.1.1 via 186.246.7.1 dev eth0 table 200'
 fi
 """,
     )

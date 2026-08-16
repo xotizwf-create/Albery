@@ -1,0 +1,12 @@
+[Unit]
+# Адреса сервисов за CDN (OpenAI и прочие) меняются, поэтому allowlist туннеля
+# пересобирается регулярно, а не один раз при старте.
+Description=Refresh the VPN split-tunnel allowlist routes
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=180
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target

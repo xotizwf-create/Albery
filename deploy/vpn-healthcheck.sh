@@ -16,7 +16,7 @@ retry_outbound_ip() {
   OUTBOUND_IP=""
   for ((attempt=1; attempt<=PROBE_ATTEMPTS; attempt++)); do
     OUTBOUND_ATTEMPTS_USED=$attempt
-    value=$(curl -fsS --connect-timeout 5 --max-time 12 https://ifconfig.me/ip 2>/dev/null || true)
+    value=$(curl -fsS --interface "$IFACE" --connect-timeout 5 --max-time 12 https://ifconfig.me/ip 2>/dev/null || true)
     if [ -n "$EXPECTED_EXIT" ] && [ "$value" = "$EXPECTED_EXIT" ]; then
       OUTBOUND_IP=$value
       return 0
@@ -58,17 +58,22 @@ else
   rc=1
 fi
 
+# Раздельный туннель (с 16.08.2026): по умолчанию НАПРЯМУЮ, в туннель — только allowlist.
+# Раньше здесь требовался `default dev awg0`, то есть весь трафик через VPN; та модель стоила
+# часового простоя, забрав с собой Битрикс, Google и Zoom, которым туннель не нужен.
 policy_ok=1
 ip rule show | grep -Eq '^[[:space:]]*900:.*sport 22.*lookup main' || policy_ok=0
 ip rule show | grep -Eq '^[[:space:]]*901:.*sport 443.*lookup main' || policy_ok=0
 ip rule show | grep -Eq '^[[:space:]]*902:.*sport 80.*lookup main' || policy_ok=0
 ip rule show | grep -Eq '^[[:space:]]*1000:.*fwmark 0x1.*lookup main' || policy_ok=0
 ip rule show | grep -Eq "^[[:space:]]*1001:.*lookup ${ROUTING_TABLE}([[:space:]]|$)" || policy_ok=0
-ip route show table "$ROUTING_TABLE" | grep -Eq "^default dev ${IFACE}([[:space:]]|$)" || policy_ok=0
-ip route get "$PROBE_IP" | grep -Eq "dev ${IFACE}([[:space:]]|$)" || policy_ok=0
+ip route show table "$ROUTING_TABLE" | grep -Eq "^default via .* dev " || policy_ok=0
+ip route show table "$ROUTING_TABLE" | grep -Eq "dev ${IFACE}([[:space:]]|$)" || policy_ok=0
 printf '%-30s %s\n' "policy route" "$([ "$policy_ok" -eq 1 ] && echo OK || echo PROBLEM)"
 [ "$policy_ok" -eq 1 ] || rc=1
 
+# Выходной адрес спрашиваем ЧЕРЕЗ туннель: маршрут по умолчанию теперь прямой, и без явной
+# привязки к интерфейсу проба вернула бы собственный адрес коробки и всегда «проходила» бы.
 EXPECTED_EXIT=$(awg show "$IFACE" endpoints 2>/dev/null | awk 'NF>=2{print $2; exit}' | sed -E 's/:[0-9]+$//' | tr -d '[]')
 if retry_outbound_ip; then
   printf '%-30s %s (expected %s; attempt %s/%s)\n' \

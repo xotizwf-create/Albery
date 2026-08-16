@@ -1,0 +1,7 @@
+[Unit]
+Description=Sync VPN split-tunnel allowlist routes
+After=awg-quick@awg0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpn-split-routes.sh
