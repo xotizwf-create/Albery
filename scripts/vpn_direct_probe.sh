@@ -60,7 +60,16 @@ probe() { # $1 = url, $2 = extra curl args
   printf '%s|%s|%s' "${code:-000}" "${elapsed:--}" "$body"
 }
 
-# Решение по одному сервису: DIRECT (идёт напрямую) | GEO (геоблок) | DEAD (нет связи).
+# Решение по одному сервису:
+#   DIRECT  — идёт напрямую, туннель не нужен
+#   GEO     — отказ по географии, обязан остаться в туннеле
+#   DEAD    — соединение не состоялось, обязан остаться в туннеле
+#   UNCLEAR — 403 с обеих сторон: оба сигнала промолчали, вывода нет
+#
+# UNCLEAR трактуется в безопасную сторону — «оставить в туннеле». Цена ошибок здесь
+# не симметрична: лишняя запись в allowlist стоит немного лишнего трафика, а лишнее
+# удаление выключает мозг агента. Так 16.08.2026 повёл себя auth.openai.com: 403 и
+# напрямую, и через туннель — и по прежнему правилу попал бы в «работает напрямую».
 classify() { # $1 = direct_code, $2 = direct_body, $3 = current_code
   local dcode="$1" dbody="$2" ccode="$3"
   [ "$dcode" = "000" ] && { echo DEAD; return; }
@@ -68,10 +77,14 @@ classify() { # $1 = direct_code, $2 = direct_body, $3 = current_code
     echo GEO
     return
   fi
-  # 403 напрямую при рабочем коде через текущий маршрут — тоже отказ по географии,
-  # даже если тело нам ничего не сказало.
-  if [ "$dcode" = "403" ] && printf '%s' "$ccode" | grep -Eq "$USABLE_CODES"; then
-    echo GEO
+  if [ "$dcode" = "403" ]; then
+    # 403 напрямую при рабочем ответе через туннель — отказ по географии,
+    # даже если тело нам ничего не сказало.
+    if printf '%s' "$ccode" | grep -Eq "$USABLE_CODES"; then
+      echo GEO
+    else
+      echo UNCLEAR
+    fi
     return
   fi
   echo DIRECT
@@ -82,15 +95,17 @@ printf '%s\n' "-----------------------------------------------------------------
 needs_vpn=()
 works_direct=()
 geo_blocked=()
+unclear=()
 for row in "${TARGETS[@]}"; do
   IFS='|' read -r name url purpose <<<"$row"
   IFS='|' read -r direct_code direct_time direct_body <<<"$(probe "$url" "--interface $IFACE")"
   IFS='|' read -r current_code current_time _ <<<"$(probe "$url" "")"
 
   case "$(classify "$direct_code" "$direct_body" "$current_code")" in
-    DEAD) verdict="нет связи"; needs_vpn+=("$name") ;;
-    GEO)  verdict="ГЕОБЛОК";   needs_vpn+=("$name"); geo_blocked+=("$name") ;;
-    *)    verdict="напрямую";  works_direct+=("$name") ;;
+    DEAD)    verdict="нет связи"; needs_vpn+=("$name") ;;
+    GEO)     verdict="ГЕОБЛОК";   needs_vpn+=("$name"); geo_blocked+=("$name") ;;
+    UNCLEAR) verdict="неясно";    needs_vpn+=("$name"); unclear+=("$name") ;;
+    *)       verdict="напрямую";  works_direct+=("$name") ;;
   esac
 
   printf '%-16s %-14s %-14s %-9s %s\n' \
@@ -101,7 +116,9 @@ printf '%s\n' "-----------------------------------------------------------------
 echo "Работает НАПРЯМУЮ (туннель не нужен): ${works_direct[*]:-—}"
 echo "Оставить в туннеле: ${needs_vpn[*]:-—}"
 [ ${#geo_blocked[@]} -gt 0 ] && echo "  из них отказ по географии (HTTP есть, но обслуживать не будут): ${geo_blocked[*]}"
+[ ${#unclear[@]} -gt 0 ] && echo "  из них неясно (403 с обеих сторон, вывода нет — оставлены из осторожности): ${unclear[*]}"
 echo
 echo "Как читать: 000 = соединение не состоялось. HTTP-код сам по себе НЕ означает, что"
 echo "сервисом можно пользоваться: 403 с телом про страну/регион — это отказ по географии,"
 echo "и такой сервис обязан остаться в туннеле (проверено 16.08.2026 на OpenAI и Groq)."
+echo "Убирать из allowlist можно ТОЛЬКО то, у чего вердикт «напрямую»."

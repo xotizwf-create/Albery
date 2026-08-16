@@ -25,10 +25,12 @@ RESPONSES = {
     "api.openai.com": (
         '{"error":{"code":"unsupported_country_region_territory",'
         '"message":"Country, region, or territory not supported"}}', "403", "401"),
-    "chatgpt.com": ('{"error":{"code":"unsupported_country_region_territory"}}', "403", "200"),
     # Тело без узнаваемого признака: ловится вторым сигналом — 403 напрямую при
     # рабочем ответе через туннель.
-    "auth.openai.com": ('{"error":"forbidden request"}', "403", "401"),
+    "chatgpt.com": ('{"detail":"request blocked"}', "403", "200"),
+    # 403 с ОБЕИХ сторон: оба сигнала промолчали, вывода нет. Именно так на проде
+    # 16.08.2026 повёл себя auth.openai.com.
+    "auth.openai.com": ('{"detail":"request blocked"}', "403", "403"),
     "api.groq.com": ('{"error":{"message":"Forbidden"}}', "403", "401"),
     "api.telegram.org": ("", "000", "302"),
     "b24-0xrp3s.bitrix24.ru": ("<html>redirect</html>", "302", "302"),
@@ -99,9 +101,9 @@ def _line_after(output: str, prefix: str) -> str:
 
 
 @needs_shell
-@pytest.mark.parametrize("service", ["openai-api", "openai-chatgpt", "groq"])
-def test_geo_blocked_services_stay_in_tunnel(tmp_path: Path, service: str) -> None:
-    """403 с телом про страну — это отказ, а не достижимость."""
+@pytest.mark.parametrize("service", ["openai-api", "openai-chatgpt", "groq", "openai-auth"])
+def test_services_refused_directly_stay_in_tunnel(tmp_path: Path, service: str) -> None:
+    """403 напрямую — это отказ, а не достижимость, каким бы сигналом он ни пойман."""
     out = _run(tmp_path)
     assert service in _line_after(out, "Оставить в туннеле:")
     assert service not in _line_after(out, "Работает НАПРЯМУЮ")
@@ -114,6 +116,18 @@ def test_geo_blocked_are_named_separately(tmp_path: Path) -> None:
     geo = _line_after(out, "  из них отказ по географии")
     assert "openai-api" in geo and "groq" in geo
     assert "telegram" not in geo  # у Telegram именно нет связи, а не отказ
+
+
+@needs_shell
+def test_inconclusive_403_is_kept_and_named(tmp_path: Path) -> None:
+    """403 с обеих сторон — вывода нет; молча записывать такое в «работает» нельзя.
+
+    Цена ошибок несимметрична: лишняя запись в allowlist стоит трафика, лишнее
+    удаление выключает обновление токена Codex.
+    """
+    out = _run(tmp_path)
+    assert "openai-auth" in _line_after(out, "  из них неясно")
+    assert "openai-auth" not in _line_after(out, "  из них отказ по географии")
 
 
 @needs_shell
@@ -134,5 +148,4 @@ def test_reachable_services_go_direct(tmp_path: Path, service: str) -> None:
 def test_403_without_geo_body_caught_by_comparison(tmp_path: Path) -> None:
     """Второй сигнал: тело промолчало, но 403 напрямую против рабочего ответа в туннеле."""
     out = _run(tmp_path)
-    assert "openai-auth" in _line_after(out, "Оставить в туннеле:")
-    assert "openai-auth" in _line_after(out, "  из них отказ по географии")
+    assert "openai-chatgpt" in _line_after(out, "  из них отказ по географии")
