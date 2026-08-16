@@ -9,6 +9,7 @@ unsupported_country_region_territory, а у api.groq.com — 403 Forbidden. По
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -38,7 +39,8 @@ RESPONSES = {
     "oauth2.googleapis.com": ('{"error":"not_found"}', "404", "404"),
     "zoom.us": ('{"reason":"method not allowed"}', "405", "405"),
     "github.com": ("<html>github</html>", "200", "200"),
-    "suppliers-api.wildberries.ru": ("", "000", "000"),
+    # 401 = «нужен токен», то есть хост жив и обслуживает: WB туннель не нужен.
+    "statistics-api.wildberries.ru": ('{"errors":["unauthorized"]}', "401", "401"),
     "1.1.1.1": ("<html>cf</html>", "301", "301"),
 }
 
@@ -137,7 +139,8 @@ def test_unreachable_services_stay_in_tunnel(tmp_path: Path) -> None:
 
 
 @needs_shell
-@pytest.mark.parametrize("service", ["bitrix", "google-api", "google-oauth", "zoom", "github"])
+@pytest.mark.parametrize("service",
+                         ["bitrix", "google-api", "google-oauth", "zoom", "github", "wildberries"])
 def test_reachable_services_go_direct(tmp_path: Path, service: str) -> None:
     """Ради этого всё и делалось: рабочие сервисы не привязаны к живучести VPN."""
     out = _run(tmp_path)
@@ -149,3 +152,21 @@ def test_403_without_geo_body_caught_by_comparison(tmp_path: Path) -> None:
     """Второй сигнал: тело промолчало, но 403 напрямую против рабочего ответа в туннеле."""
     out = _run(tmp_path)
     assert "openai-chatgpt" in _line_after(out, "  из них отказ по географии")
+
+
+def test_wb_probe_target_is_a_host_the_app_actually_uses():
+    """Цель замера не должна разъезжаться с боевыми хостами — молча и незаметно.
+
+    16.08.2026 в замере стоял suppliers-api.wildberries.ru: хост выведен из эксплуатации
+    и не резолвится, поэтому WB вечно показывался как «нет связи», хотя приложение ходит
+    совсем в другие адреса и они живы.
+    """
+    probe = PROBE.read_text(encoding="utf-8")
+    wb_line = next(line for line in probe.splitlines() if line.strip().startswith('"wildberries|'))
+    host = wb_line.split("https://", 1)[1].split("/", 1)[0]
+
+    app_hosts = set(re.findall(r"https://([a-z0-9.-]*wildberries\.ru)",
+                               Path("wb_cabinet.py").read_text(encoding="utf-8")))
+    assert host in app_hosts, (
+        f"замер стучится в {host}, а приложение ходит в {sorted(app_hosts)}"
+    )

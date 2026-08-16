@@ -40,7 +40,10 @@ TARGETS=(
   "google-oauth|https://oauth2.googleapis.com/|обновление Google-токена"
   "zoom|https://zoom.us/oauth/token|созвоны"
   "github|https://github.com|деплой, git pull на проде"
-  "wildberries|https://suppliers-api.wildberries.ru/ping|WB-аналитика"
+  # Хост берём тот, которым реально пользуется wb_cabinet.py. Прежний
+  # suppliers-api.wildberries.ru выведен из эксплуатации и не резолвится вовсе —
+  # замер показывал «нет связи» там, где связь никто и не проверял.
+  "wildberries|https://statistics-api.wildberries.ru/ping|WB-аналитика"
   "cloudflare-dns|https://1.1.1.1|контрольная точка «интернет вообще есть»"
 )
 
