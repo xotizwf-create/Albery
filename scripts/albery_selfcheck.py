@@ -26,8 +26,13 @@ Installed as systemd albery-selfcheck.timer (каждые 5 минут — «м�
 Silent when everything is fine. Одинаковый набор НЕ-критичных проблем не спамит: повторный
 алерт не чаще раза в 6 часов. Критичные (диск>=92%, RAM<100MB, сервис/PG down) — не чаще
 раза в 30 минут, пока не устранены.
+
+«Одинаковый набор» считается по СМЫСЛУ, а не по тексту (shared/alert_dedup): счётчики,
+проценты и возраст внутри строки меняются сами по себе, и раньше каждое такое изменение
+выглядело как новая авария. Сверх того у НЕ-критичных есть пол частоты — не чаще раза
+в полчаса, даже если набор действительно сменился: мигающая проблема (появилась →
+пропала → появилась) иначе давала алерт на каждой пятиминутке (16.08.2026).
 """
-import hashlib
 import json
 import logging
 import os
@@ -45,6 +50,9 @@ BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 load_dotenv(BASE / ".env")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# Импорт из репозитория — только после sys.path выше (скрипт запускается по абсолютному пути).
+from shared.alert_dedup import alert_signature  # noqa: E402
 
 STATE_PATH = Path("/var/log/albery/selfcheck_state.json")
 SYNC_LOG = Path(os.getenv("ALBERY_DAILY_SYNC_LOG", "/var/log/albery/daily-sync.log"))
@@ -75,6 +83,9 @@ def is_active(service: str) -> bool:
 
 
 def tg_token() -> str:
+    """Токен резервного канала. Последним идёт токен собственного TG-агента: после вывода
+    Telegram из шлюза TELEGRAM_BOT_TOKEN на коробке не осталось, и резерв молча умер —
+    алерт при недоступном Битриксе просто терялся («telegram fallback not configured»)."""
     token = os.getenv("ALBERY_TG_BOT_TOKEN", "").strip()
     if token:
         return token
@@ -84,7 +95,7 @@ def tg_token() -> str:
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     except OSError:
         pass
-    return ""
+    return os.getenv("TG_AGENT_BOT_TOKEN", "").strip()
 
 
 def _telegram_fallback(text: str) -> None:
@@ -487,12 +498,19 @@ state["cron_errors"] = new_cron_state
 # --- Отправка с антиспамом ---------------------------------------------------------------
 # Не-критичные: тот же набор — не чаще раза в 6 часов. Критичные (диск/RAM/сервис/PG) —
 # не чаще раза в 30 минут, пока проблема висит: их нельзя «замолчать» на полдня.
-digest = hashlib.sha256("\n".join(problems).encode("utf-8")).hexdigest() if problems else ""
+digest = alert_signature(problems)
 last_digest = str(state.get("last_digest", ""))
 last_alert_ts = float(state.get("last_alert_ts", 0) or 0)
 repeat_pause = 30 * 60 if critical else 6 * 3600
+# Пол частоты для НЕ-критичных: даже сменившийся набор не будит чаще раза в полчаса.
+# Без него любая мигающая проблема (появилась → пропала → появилась) давала алерт на
+# каждой пятиминутке. Критичные (диск/RAM/сервис/PG) этим полом не ограничены —
+# задерживать их нельзя, они и так эскалируют мимо шестичасовой паузы.
+min_gap_s = 0 if critical else 30 * 60
+now_ts = time.time()
 should_notify = bool(problems) and (
-    digest != last_digest or time.time() - last_alert_ts > repeat_pause)
+    (digest != last_digest and now_ts - last_alert_ts >= min_gap_s)
+    or now_ts - last_alert_ts > repeat_pause)
 
 if problems:
     if should_notify:

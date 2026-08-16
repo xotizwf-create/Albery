@@ -4362,7 +4362,11 @@ def _b24_do_reset(client_endpoint: str, access_token: str, bot_id: Any, dialog_i
 def _albery_tg_bot_token() -> str:
     """Telegram bot token for Albery notifications. Prefer an explicit ALBERY_TG_BOT_TOKEN;
     otherwise reuse the Hermes gateway bot (@albery_ai_bot) token from /root/.hermes/.env — the
-    albery service runs as root on the same box, so no secret needs to be duplicated."""
+    albery service runs as root on the same box, so no secret needs to be duplicated.
+
+    Последним в цепочке идёт токен собственного TG-агента (служба albery-tg). После вывода
+    Telegram из шлюза TELEGRAM_BOT_TOKEN на коробке не осталось, и резервный канал тревог
+    оказался мёртв: любая тревога при недоступном Битриксе просто терялась (16.08.2026)."""
     token = os.getenv("ALBERY_TG_BOT_TOKEN", "").strip()
     if token:
         return token
@@ -4372,7 +4376,7 @@ def _albery_tg_bot_token() -> str:
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     except OSError:
         pass
-    return ""
+    return os.getenv("TG_AGENT_BOT_TOKEN", "").strip()
 
 
 def _albery_tg_notify(text: str, chat_id: str | None = None) -> tuple[bool, str | None]:

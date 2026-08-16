@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 
 import requests
@@ -29,6 +30,7 @@ from flask import jsonify
 from flask import request
 from pathlib import Path
 from typing import Any
+from typing import Callable
 
 from app import (
     MSK_TZ,
@@ -116,10 +118,10 @@ def _user_names() -> dict[int, dict[str, str]]:
     except Exception:  # noqa: BLE001
         logging.exception("agent_center: access-name fallback load failed")
     try:
-        # Lazy import: b24bot may still be mid-import when a script imports it first
-        # (b24bot → app → agent_center), so never touch it at module level here.
-        from b24bot import _b24_portal_user_directory
-        for uid, info in _b24_portal_user_directory().items():
+        # Справочник берём из фоновой пробы: это второй вызов Битрикса, который раньше
+        # считался прямо в HTTP-запросе и на медленном портале держал страницу
+        # мониторинга те же десятки секунд, что и ping (см. _probe_value).
+        for uid, info in _portal_names().items():
             out[uid] = {"name": info.get("name") or f"#{uid}", "position": info.get("position") or ""}
     except Exception:  # noqa: BLE001
         logging.exception("agent_center: portal directory load failed")
@@ -1149,8 +1151,58 @@ def agent_center_tools():
 
 _STARTED_MONO = time.monotonic()
 _APP_DIR = Path(__file__).resolve().parent
-_HEALTH_CACHE: dict[str, Any] = {"at": 0.0, "bitrix": None}
 _GIT_CACHE: dict[str, Any] = {"at": 0.0, "head": "", "log": []}
+
+# --- Внешние пробы: запрос НИКОГДА не ждёт третью сторону ----------------------------------
+# 16.08.2026: Центр Агента открывался по 30+ секунд, и все обрывы за сутки в журнале nginx
+# пришлись ровно на /api/agent-center/monitoring (499 — браузер отменяет запрос через 30 с).
+# Причина: ping Битрикса, токен Zoom и портальный справочник имён считались ПРЯМО в запросе,
+# а BitrixClient.call ждёт ответа 60 с и пробует два пути подряд — до 120 с на один вызов.
+# Поток при этом занимал один из восьми потоков единственного веб-воркера, поэтому медленный
+# Битрикс подвешивал весь Центр Агента, а не только карточку здоровья.
+#
+# Теперь значение живёт в фоне: запрос забирает последнее известное и уходит, а обновление
+# идёт отдельным потоком (по одному на пробу — иначе восемь запросов завели бы восемь
+# одинаковых вызовов в уже медленный сервис).
+_PROBES: dict[str, dict[str, Any]] = {}
+_PROBES_LOCK = threading.Lock()
+
+
+def _probe_refresh(key: str, producer: Callable[[], Any]) -> None:
+    value: Any = None
+    try:
+        value = producer()
+    except Exception:  # noqa: BLE001
+        logging.warning("agent_center: внешняя проба %s не удалась", key, exc_info=True)
+    with _PROBES_LOCK:
+        state = _PROBES.setdefault(key, {"value": None, "at": 0.0, "running": False, "measured": False})
+        state.update(value=value, at=time.monotonic(), running=False, measured=True)
+
+
+def _probe_value(key: str, ttl_s: float, producer: Callable[[], Any]) -> Any:
+    """Последнее известное значение внешней пробы, без единого сетевого ожидания.
+
+    Устарело или ещё не измерялось — обновление уходит в фоновый поток, а вызывающий
+    получает то, что есть сейчас (None, пока первое измерение не завершилось)."""
+    now = time.monotonic()
+    with _PROBES_LOCK:
+        state = _PROBES.setdefault(key, {"value": None, "at": 0.0, "running": False, "measured": False})
+        start = (now - state["at"]) >= ttl_s and not state["running"]
+        if start:
+            state["running"] = True
+        value = state["value"]
+    if start:
+        threading.Thread(target=_probe_refresh, args=(key, producer), daemon=True,
+                         name=f"agent-probe-{key}").start()
+    return value
+
+
+def _probe_measured(key: str) -> bool:
+    """Была ли проба хоть раз доведена до конца. Отличает «ещё не мерили» (первые
+    секунды после рестарта) от «померили и не отвечает» — иначе рестарт сам себе
+    рисовал бы проблему и будил владельца уведомлением."""
+    with _PROBES_LOCK:
+        return bool(_PROBES.get(key, {}).get("measured"))
 
 
 def _uptime_label() -> str:
@@ -1209,37 +1261,40 @@ def _git_info() -> dict[str, Any]:
 
 
 def _bitrix_ping_ms() -> int | None:
-    """Light Bitrix REST liveness (server.time via the bot portal client), cached 60s."""
-    now = time.monotonic()
-    if now - _HEALTH_CACHE["at"] < 60:
-        return _HEALTH_CACHE["bitrix"]
-    ping: int | None = None
-    try:
+    """Light Bitrix REST liveness (server.time via the bot portal client), refreshed
+    in the background every 60s. None — либо ещё не измеряли, либо портал не ответил;
+    отличает эти два случая `_probe_measured('bitrix')`."""
+
+    def _measure() -> int:
         from b24bot import _b24_testbot_call, b24_testbot_client
         t0 = time.perf_counter()
         _b24_testbot_call(b24_testbot_client(), "server.time", {})
-        ping = int((time.perf_counter() - t0) * 1000)
-    except Exception:  # noqa: BLE001
-        logging.warning("agent_center: bitrix ping failed", exc_info=True)
-    _HEALTH_CACHE.update(at=now, bitrix=ping)
-    return ping
+        return int((time.perf_counter() - t0) * 1000)
+
+    return _probe_value("bitrix", 60, _measure)
 
 
-def _zoom_ping_ok() -> bool:
-    """Zoom OAuth liveness (token issuance), cached 5 min — the cheapest signal
-    that the integration credentials still work."""
-    now = time.monotonic()
-    cached = _HEALTH_CACHE.get("zoom")
-    if cached is not None and now - _HEALTH_CACHE.get("zoom_at", 0.0) < 300:
-        return cached
-    ok = False
-    try:
+def _zoom_ping_ok() -> bool | None:
+    """Zoom OAuth liveness (token issuance), refreshed in the background every 5 min —
+    the cheapest signal that the integration credentials still work. None — ещё не мерили."""
+
+    def _measure() -> bool:
         from zoom import zoom_access_token
-        ok = bool(zoom_access_token())
-    except Exception:  # noqa: BLE001
-        logging.warning("agent_center: zoom ping failed", exc_info=True)
-    _HEALTH_CACHE.update(zoom=ok, zoom_at=now)
-    return ok
+        return bool(zoom_access_token())
+
+    return _probe_value("zoom", 300, _measure)
+
+
+def _portal_names() -> dict[int, dict[str, str]]:
+    """Портальный справочник имён без ожидания Битрикса: тот же фоновый механизм,
+    что и у остальных внешних проб. До первого успешного обновления возвращает пусто —
+    имена в ленте событий подставятся из agent_access, а страница откроется мгновенно."""
+
+    def _measure() -> dict[int, dict[str, str]]:
+        from b24bot import _b24_portal_user_directory
+        return _b24_portal_user_directory(force=True)
+
+    return _probe_value("portal_users", 600, _measure) or {}
 
 
 def _server_memory() -> tuple[float, float] | None:
@@ -1324,9 +1379,13 @@ def monitoring_payload(chart_days: int = 1, agent: str = "all") -> dict[str, Any
             # Health is infrastructure (shared brain), so its freshness signal must stay
             # global even when cards/chart are scoped to one agent with few or no turns.
             global_last_ok = st.get("last_ok_at")
+            global_last_turn = st.get("last_turn_at")
             if flt:
-                cur.execute("SELECT MAX(created_at) FILTER (WHERE status = 'ok') AS m FROM bitrix_bot_interactions")
-                global_last_ok = (cur.fetchone() or {}).get("m")
+                cur.execute("SELECT MAX(created_at) FILTER (WHERE status = 'ok') AS m,"
+                            " MAX(created_at) AS t FROM bitrix_bot_interactions")
+                global_row = cur.fetchone() or {}
+                global_last_ok = global_row.get("m")
+                global_last_turn = global_row.get("t")
             zoom_last_at = drive_last_at = None
             try:
                 cur.execute("SELECT MAX(synced_at) AS m FROM zoom_calls")
@@ -1384,27 +1443,37 @@ def monitoring_payload(chart_days: int = 1, agent: str = "all") -> dict[str, Any
         health.append({"label": "MCP-инструменты", "status": "модуль не загрузился", "type": "warn"})
     last_ok = global_last_ok
     ok_fresh = bool(last_ok and (now_msk - last_ok.astimezone(MSK_TZ)) < timedelta(hours=24))
-    health.append({
-        "label": "Мозг агента (Hermes)",
-        "status": f"успешный ход {_ago_label(last_ok)}",
-        "type": "ok" if ok_fresh else "warn",
-    })
+    # Молчание — не поломка. Пока «свежесть» считалась по одному лишь возрасту последнего
+    # успешного хода, обычные выходные (боту никто не пишет) давали warn, карточка попадала
+    # в problems, и сторож здоровья будил владельца «проблемами» каждые три часа. Поломка —
+    # это когда ходы ИДУТ, а успешных среди них нет.
+    turns_fresh = bool(global_last_turn and (now_msk - global_last_turn.astimezone(MSK_TZ)) < timedelta(hours=24))
+    if ok_fresh:
+        brain_status, brain_type = f"успешный ход {_ago_label(last_ok)}", "ok"
+    elif not turns_fresh:
+        brain_status, brain_type = f"обращений не было • последний успешный ход {_ago_label(last_ok)}", "ok"
+    else:
+        brain_status, brain_type = f"ходы идут, успешных нет — последний {_ago_label(last_ok)}", "warn"
+    health.append({"label": "Мозг агента (Hermes)", "status": brain_status, "type": brain_type})
     bitrix_ms = _bitrix_ping_ms()
-    health.append({
-        "label": "Bitrix REST",
-        "status": f"ok • {bitrix_ms / 1000:.1f} с".replace(".", ",") if bitrix_ms is not None else "не отвечает",
-        "type": "ok" if bitrix_ms is not None else "warn",
-    })
+    if bitrix_ms is not None:
+        bitrix_status, bitrix_type = f"ok • {bitrix_ms / 1000:.1f} с".replace(".", ","), "ok"
+    elif not _probe_measured("bitrix"):
+        # Первые секунды после рестарта: проба ещё в фоне. «Не отвечает» здесь было бы
+        # ложной тревогой — рестарт сам себе рисовал бы проблему.
+        bitrix_status, bitrix_type = "проверяется", "ok"
+    else:
+        bitrix_status, bitrix_type = "не отвечает", "warn"
+    health.append({"label": "Bitrix REST", "status": bitrix_status, "type": bitrix_type})
     zoom_ok = _zoom_ping_ok()
     zoom_fresh = bool(zoom_last_at and (now_msk - zoom_last_at.astimezone(MSK_TZ)) < timedelta(days=4))
-    health.append({
-        "label": "Zoom API",
-        "status": (
-            ("токен ok" if zoom_ok else "токен не выдаётся")
-            + (f" • синк {_ago_label(zoom_last_at)}" if zoom_last_at else " • синков не было")
-        ),
-        "type": "ok" if zoom_ok and zoom_fresh else "warn",
-    })
+    sync_label = f" • синк {_ago_label(zoom_last_at)}" if zoom_last_at else " • синков не было"
+    if zoom_ok is None and not _probe_measured("zoom"):
+        zoom_status, zoom_type = "токен проверяется" + sync_label, "ok"
+    else:
+        zoom_status = ("токен ok" if zoom_ok else "токен не выдаётся") + sync_label
+        zoom_type = "ok" if zoom_ok and zoom_fresh else "warn"
+    health.append({"label": "Zoom API", "status": zoom_status, "type": zoom_type})
     drive_fresh = bool(drive_last_at and (now_msk - drive_last_at.astimezone(MSK_TZ)) < timedelta(days=2))
     health.append({
         "label": "Google Drive (документы)",
@@ -1497,19 +1566,44 @@ _watchdog_last_alert: dict[str, float] = {}
 _watchdog_had_problems = False
 
 
+def _watchdog_cooldown_key(problem: str) -> str:
+    """Ключ приглушения повторов — только НАЗВАНИЕ проверки, без изменчивого хвоста.
+
+    Текст проблемы содержит возраст («успешный ход 1 дн назад»), и назавтра он становится
+    другой строкой: ключ менялся, приглушение обнулялось, и владелец получал одно и то же
+    уведомление заново. Название карточки здоровья не меняется, пока проблема та же."""
+    return problem.split(":", 1)[0].strip() or problem
+
+
+def _watchdog_notify(text: str) -> tuple[bool, str | None]:
+    """Доставка тревог сторожа: группа «Уведомления» в Битриксе — основной канал (туда же
+    идут все остальные уведомления владельцу), Telegram — резерв на случай, когда недоступен
+    сам Битрикс. До 16.08.2026 сторож слал ТОЛЬКО в Telegram, токен которого на коробке не
+    задан, — тревоги молча терялись («telegram token/chat not configured» в журнале)."""
+    from b24bot import _albery_bitrix_notify, _albery_tg_notify
+
+    ok, err = _albery_bitrix_notify(text)
+    if ok:
+        return True, None
+    tg_ok, tg_err = _albery_tg_notify(text)
+    if tg_ok:
+        return True, None
+    return False, f"bitrix: {err}; telegram: {tg_err}"
+
+
 def _health_watchdog_once() -> None:
     global _watchdog_had_problems
     payload = monitoring_payload()
     problems = payload.get("problems") or []
     now = time.monotonic()
-    fresh = [p for p in problems if now - _watchdog_last_alert.get(p, -_WATCHDOG_COOLDOWN_S) >= _WATCHDOG_COOLDOWN_S]
-    from b24bot import _albery_tg_notify
+    fresh = [p for p in problems
+             if now - _watchdog_last_alert.get(_watchdog_cooldown_key(p), -_WATCHDOG_COOLDOWN_S) >= _WATCHDOG_COOLDOWN_S]
     if fresh:
         for p in fresh:
-            _watchdog_last_alert[p] = now
+            _watchdog_last_alert[_watchdog_cooldown_key(p)] = now
         text = "⚠️ Мониторинг Albery: проблемы\n" + "\n".join(f"— {p}" for p in problems) + \
             "\nДетали: /agent-monitoring (повторы приглушены на " + str(_WATCHDOG_COOLDOWN_S // 3600) + " ч)"
-        ok, err = _albery_tg_notify(text)
+        ok, err = _watchdog_notify(text)
         if not ok:
             logging.error("agent_center watchdog: alert delivery failed: %s", err)
     if problems:
@@ -1517,7 +1611,7 @@ def _health_watchdog_once() -> None:
     elif _watchdog_had_problems:
         _watchdog_had_problems = False
         _watchdog_last_alert.clear()
-        ok, err = _albery_tg_notify("✅ Мониторинг Albery: все системы снова в норме")
+        ok, err = _watchdog_notify("✅ Мониторинг Albery: все системы снова в норме")
         if not ok:
             logging.error("agent_center watchdog: recovery delivery failed: %s", err)
 
