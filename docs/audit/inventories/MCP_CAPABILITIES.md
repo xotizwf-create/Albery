@@ -1,4 +1,4 @@
-﻿# MCP capability inventory
+# MCP capability inventory
 
 Generated from the versioned runtime registry and `mcp.tool_policy`.
 The inventory includes 160 regular and 6 profile self-service tools.
@@ -12,6 +12,7 @@ The inventory includes 160 regular and 6 profile self-service tools.
 | `assign_employee_department` | people-and-org | privileged-configuration | explicit | yes | yes / yes | Перевести сотрудника(ов) в отдел и/или задать должность |
 | `attach_files_to_task` | bitrix-tasks-and-chat | write | none | yes | yes / yes | Attach one or more files the user sent the bot (screenshots, documents — referenced by their attachment tokens att_…) to a Bitrix task |
 | `cancel_owner_recommendation` | management-reporting | write | none | yes | yes / yes | Mark one owner_manager_recommendations row as cancelled (e.g |
+| `check_google_sheet_health` | google-workspace | read | none | no | no / no | Check a spreadsheet for LOGICAL defects and get them back as a list |
 | `complete_bitrix_task` | bitrix-tasks-and-chat | write | none | yes | yes / yes | Complete (close/«завершить») one Bitrix task |
 | `convert_document` | knowledge-and-documents | local-artifact-write | none | no | yes / yes | Преобразовать присланный документ: PDF → редактируемый Word (target='docx') или Word → PDF (target='pdf') |
 | `create_agent` | agent-management | privileged-configuration | explicit | yes | yes / yes | Создать нового субагента (Bitrix-бот зарегистрируется автоматически) |
@@ -148,7 +149,7 @@ The inventory includes 160 regular and 6 profile self-service tools.
 | `set_agent_team` | agent-management | privileged-configuration | explicit | yes | yes / yes | Добавить/убрать людей из команды агента (кому он доступен) |
 | `set_agent_tools` | agent-management | privileged-configuration | explicit | yes | yes / yes | Включить/выключить MCP-инструменты у агента |
 | `set_telegram_access` | telegram | privileged-configuration | explicit | yes | yes / yes | Выдать или забрать доступ к Telegram-агенту по @username |
-| `share_drive_item_for_everyone` | google-workspace | privileged-configuration | explicit | no | yes / yes | Open ANY Google Drive item — spreadsheet, document, folder, file, or an Apps Script project — for ANYONE WITH THE LINK (editor by default) |
+| `share_drive_item_for_everyone` | google-workspace | privileged-configuration | explicit | no | yes / yes | Open ANY Google Drive item — spreadsheet, document, folder, file, or an Apps Script project — for ANYONE WITH THE LINK (viewer by default) |
 | `start_here_always_read_ai_instructions` | knowledge-and-documents | read | none | no | no / no | MANDATORY FIRST TOOL |
 | `update_agent` | agent-management | privileged-configuration | explicit | yes | yes / yes | Изменить агента: имя/должность (синхронизируются с Bitrix), роль-промпт, вкл/выкл |
 | `update_ai_capabilities` | runtime | privileged-configuration | explicit | no | yes / yes | Record/update the assistant's capabilities note when this tool is enabled |

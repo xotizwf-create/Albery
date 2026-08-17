@@ -6654,7 +6654,15 @@ def tool_organize_drive_folder(args: dict[str, Any]) -> dict[str, Any]:
 
 def tool_read_google_sheet_values(args: dict[str, Any]) -> dict[str, Any]:
     sid = str(args.get("spreadsheet_id") or "").strip()
-    rng = str(args.get("range") or "").strip()
+    raw = args.get("range")
+    # Список диапазонов читается ОДНИМ запросом: каждый лишний вызов инструмента стоит
+    # отдельного хода модели (~20 с в замере 17.08.2026) против ~1 с сети.
+    if isinstance(raw, (list, tuple)):
+        rng: Any = [str(r).strip() for r in raw if str(r).strip()]
+        if not rng:
+            raise McpError(-32602, "range list is empty.")
+    else:
+        rng = str(raw or "").strip()
     if not sid or not rng:
         raise McpError(-32602, "spreadsheet_id and range are required.")
     render = str(args.get("value_render_option") or "FORMATTED_VALUE")
@@ -6664,6 +6672,18 @@ def tool_read_google_sheet_values(args: dict[str, Any]) -> dict[str, Any]:
         raise
     except Exception as exc:  # noqa: BLE001
         raise McpError(-32010, f"read_google_sheet_values failed: {exc}") from exc
+
+
+def tool_check_google_sheet_health(args: dict[str, Any]) -> dict[str, Any]:
+    sid = str(args.get("spreadsheet_id") or "").strip()
+    if not sid:
+        raise McpError(-32602, "spreadsheet_id is required.")
+    try:
+        return app_workflow_function("check_google_sheet_health")(sid)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"check_google_sheet_health failed: {exc}") from exc
 
 
 def tool_manage_apps_script(args: dict[str, Any]) -> dict[str, Any]:
@@ -11860,19 +11880,46 @@ TOOLS: dict[str, dict[str, Any]] = {
             "VERIFY BY READBACK what you just wrote: never report a sheet change or computation as done "
             "without reading the affected cells back. If the user gave a reference example (\"for X the "
             "result must be Y\"), read exactly that row and show the got/expected comparison. Read-only. "
-            "Keep ranges narrow — output is capped, whole-sheet reads get truncated."
+            "Keep ranges narrow — output is capped, whole-sheet reads get truncated. "
+            "READ SEVERAL RANGES IN ONE CALL by passing an array to `range` — one call with three "
+            "ranges instead of three calls saves two model turns, which costs far more than the "
+            "network does."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "spreadsheet_id": {"type": "string"},
-                "range": {"type": "string", "description": "A1 range incl. tab, e.g. \"'свод'!A6:L24\""},
+                "range": {
+                    "description": "A1 range incl. tab, e.g. \"'свод'!A6:L24\", or an ARRAY of such "
+                                   "ranges to read them all in one call.",
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                    ],
+                },
                 "value_render_option": {"type": "string", "enum": ["FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"]},
             },
             "required": ["spreadsheet_id", "range"],
             "additionalProperties": False,
         },
         "handler": tool_read_google_sheet_values,
+    },
+    "check_google_sheet_health": {
+        "description": (
+            "Check a spreadsheet for LOGICAL defects and get them back as a list. Run it BEFORE "
+            "reporting any spreadsheet work as done — it catches what a successful write call does "
+            "not: cells showing #REF!/#DIV/0!/#N/A, totals that show zero while the summed column "
+            "has numbers, and data rows whose criteria column (the one SUMIF/COUNTIF filters on) is "
+            "empty, so those rows silently fall out of every total. Empty `problems` means no "
+            "obvious logical defect was found — not that the sheet is perfect. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"spreadsheet_id": {"type": "string"}},
+            "required": ["spreadsheet_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_check_google_sheet_health,
     },
     "write_google_sheet_values": {
         "description": (
@@ -12783,6 +12830,11 @@ CORE_TOOL_NAMES: set[str] = {
     "get_google_sheet_meta",
     "read_google_sheet_values",
     "write_google_sheet_values",
+    # Проверка результата, а не своих действий: 17.08.2026 агент собрал таблицу учёта,
+    # оставил строку с пустым «Типом» — сводка на SUMIF по «Типу» показала 0 ₽ при живой
+    # записи на 232 ₽ — и отчитался «доработал и проверил». Инструмент, которого агент не
+    # видит, для него не существует, поэтому проверка живёт в ядре набора.
+    "check_google_sheet_health",
     "share_drive_item_for_everyone",
     "get_webapp_template",
     "make_sheet_applet",

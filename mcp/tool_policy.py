@@ -15,6 +15,7 @@ REGULAR_TOOL_NAMES = frozenset(
     """
 add_bitrix_task_comment add_deal_comment add_task_checklist add_task_reminder
 assign_employee_department attach_files_to_task cancel_owner_recommendation
+check_google_sheet_health
 complete_bitrix_task convert_document create_agent create_bitrix_task create_crm_deal
 create_crm_pipeline create_drive_folder create_google_doc create_google_sheet
 create_recurring_task create_telegram_agent delete_agent delete_bitrix_task

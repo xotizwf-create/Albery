@@ -327,11 +327,22 @@ def _build_sheets_service(creds: Any = None) -> Any:
                  cache_discovery=False)
 
 
+# Локаль таблицы не меняется годами, а запрашивалась на КАЖДОЕ форматирование — 1,15 с
+# сетевого похода при полезной работе batchUpdate около 0,4 с (замер 17.08.2026).
+_SHEET_LOCALE_CACHE: dict[str, str] = {}
+
+
 def _sheet_locale(sheets: Any, spreadsheet_id: str) -> str:
+    sid = str(spreadsheet_id)
+    cached = _SHEET_LOCALE_CACHE.get(sid)
+    if cached is not None:
+        return cached
     meta = sheets.spreadsheets().get(
-        spreadsheetId=str(spreadsheet_id), fields="properties(locale)"
+        spreadsheetId=sid, fields="properties(locale)"
     ).execute()
-    return (meta.get("properties") or {}).get("locale") or ""
+    locale = (meta.get("properties") or {}).get("locale") or ""
+    _SHEET_LOCALE_CACHE[sid] = locale
+    return locale
 
 
 def _a1_column_name(index: int) -> str:
@@ -948,31 +959,66 @@ def get_google_sheet_meta(spreadsheet_id: str) -> dict[str, Any]:
     }
 
 
+def _bound_sheet_rows(values: list, budget: int) -> tuple[list, bool]:
+    """Обрезать вывод по бюджету символов, чтобы один вызов не залил модель."""
+    out_rows, used = [], 0
+    for row in values:
+        row_len = sum(len(str(c)) + 4 for c in row) + 8
+        if used + row_len > budget:
+            return out_rows, True
+        out_rows.append(row)
+        used += row_len
+    return out_rows, False
+
+
 def read_google_sheet_values(
-    spreadsheet_id: str, cell_range: str, value_render_option: str = "FORMATTED_VALUE",
+    spreadsheet_id: str, cell_range: Any, value_render_option: str = "FORMATTED_VALUE",
 ) -> dict[str, Any]:
     """Read a 2D array of values from an A1 range. The verification counterpart of
     write_google_sheet_values: study a sheet's real layout before building on it and read back
     what was just written before reporting success. Output is bounded (~40k chars) so one call
-    cannot flood the model — narrow the range instead."""
+    cannot flood the model — narrow the range instead.
+
+    `cell_range` принимает СПИСОК диапазонов — тогда все они читаются одним запросом
+    (`values.batchGet`). Это важнее, чем кажется: дело не в сетевой экономии (~2,3x), а в том,
+    что каждый лишний вызов инструмента стоит отдельного хода модели — в замере 17.08.2026
+    около 20 секунд против одной секунды сети.
+    """
     from googleapiclient.discovery import build
     creds = _google_user_credentials()
     sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
     opt = value_render_option if value_render_option in (
         "FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA") else "FORMATTED_VALUE"
+
+    if isinstance(cell_range, (list, tuple)):
+        ranges = [str(r) for r in cell_range if str(r).strip()]
+        if not ranges:
+            raise ValueError("cell_range list is empty")
+        got = sheets.spreadsheets().values().batchGet(
+            spreadsheetId=str(spreadsheet_id), ranges=ranges, valueRenderOption=opt,
+        ).execute()
+        budget = max(4000, 40000 // len(ranges))
+        blocks, truncated_any = [], False
+        for vr in got.get("valueRanges", []):
+            values = vr.get("values", [])
+            rows, truncated = _bound_sheet_rows(values, budget)
+            truncated_any = truncated_any or truncated
+            block = {"range": vr.get("range"), "row_count": len(values), "values": rows}
+            if truncated:
+                block["truncated"] = True
+            blocks.append(block)
+        result = {"value_render_option": opt, "ranges": blocks, "range_count": len(blocks)}
+        if truncated_any:
+            result["note"] = ("Часть диапазонов обрезана по лимиту вывода — сузь их и дочитай "
+                              "отдельным вызовом.")
+        return result
+
     got = sheets.spreadsheets().values().get(
         spreadsheetId=str(spreadsheet_id), range=str(cell_range), valueRenderOption=opt,
     ).execute()
     values = got.get("values", [])
     total_rows = len(values)
-    out_rows, used, truncated = [], 0, False
-    for row in values:
-        row_len = sum(len(str(c)) + 4 for c in row) + 8
-        if used + row_len > 40000:
-            truncated = True
-            break
-        out_rows.append(row)
-        used += row_len
+    out_rows, truncated = _bound_sheet_rows(values, 40000)
     result = {"range": got.get("range"), "value_render_option": opt,
               "row_count": total_rows, "values": out_rows}
     if truncated:
@@ -1079,10 +1125,15 @@ def _apply_google_sheet_readability_polish(sheets: Any, spreadsheet_id: str) -> 
     return True
 
 
-def format_google_sheet(spreadsheet_id: str, requests: list) -> dict[str, Any]:
+def format_google_sheet(spreadsheet_id: str, requests: list, polish: bool = True) -> dict[str, Any]:
     """Apply Sheets API batchUpdate request objects: cell formatting, number/currency formats,
     conditional formatting, frozen rows/cols, column widths, merges, and charts (addChart)
-    for dashboards. The caller builds standard Sheets API request objects."""
+    for dashboards. The caller builds standard Sheets API request objects.
+
+    `polish=False` пропускает финальный проход по читаемости (он стоит ~3,75 с и имеет смысл
+    один раз, а не после каждого куска форматирования). Складывайте всё форматирование в ОДИН
+    вызов — тогда проход отработает ровно один раз и по умолчанию.
+    """
     if not isinstance(requests, list) or not requests:
         raise ValueError("requests must be a non-empty list of Sheets API request objects")
     sheets = _build_sheets_service()
@@ -1095,13 +1146,201 @@ def format_google_sheet(spreadsheet_id: str, requests: list) -> dict[str, Any]:
     resp = sheets.spreadsheets().batchUpdate(
         spreadsheetId=str(spreadsheet_id), body={"requests": requests},
     ).execute()
-    readability_polished = _apply_google_sheet_readability_polish(sheets, str(spreadsheet_id))
+    readability_polished = (
+        _apply_google_sheet_readability_polish(sheets, str(spreadsheet_id)) if polish else False
+    )
     return {
         "spreadsheet_id": str(spreadsheet_id),
         "applied": len(requests),
         "readability_polished": readability_polished,
         "replies_count": len(resp.get("replies", []) or []),
         "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+    }
+
+
+# --- Проверка таблицы на логические дефекты ------------------------------------------------
+# Агент проверяет СВОИ ДЕЙСТВИЯ («я записал значения»), но не РЕЗУЛЬТАТ («таблица осмысленна»).
+# 17.08.2026 это стоило владельцу сломанной таблицы: агент собрал учёт доходов/расходов,
+# оставил демо-строку с пустым «Типом» — и сводка, считающая SUMIF по «Типу», показала
+# 0,00 ₽ при живой записи на 232 ₽. Отчитался при этом «доработал и проверил».
+# Уговоры в промпте такое не ловят, поэтому проверка живёт в коде и возвращает факты.
+
+_SHEET_ERROR_VALUES = ("#REF!", "#DIV/0!", "#N/A", "#VALUE!", "#NAME?", "#NUM!",
+                       "#ERROR!", "#NULL!")
+
+# Агрегаты, у которых первый диапазон — это то, ПО ЧЕМУ идёт отбор.
+_CRITERIA_FUNCS = ("SUMIF", "SUMIFS", "COUNTIF", "COUNTIFS", "AVERAGEIF", "AVERAGEIFS")
+_AGGREGATE_FUNCS = _CRITERIA_FUNCS + ("SUM", "COUNT", "COUNTA", "AVERAGE", "MIN", "MAX")
+
+# Диапазон с ОБЯЗАТЕЛЬНЫМ двоеточием: иначе имя функции («SUM») само похоже на колонку.
+_A1_RANGE_RE = re.compile(
+    r"(?:(?:'(?P<quoted>[^']+)'|(?P<plain>[A-Za-zА-Яа-яЁё0-9_]+))!)?"
+    r"\$?(?P<col1>[A-Z]{1,3})\$?\d*"
+    r":\$?[A-Z]{1,3}\$?\d*"
+)
+
+
+def _column_index(letter: str) -> int:
+    """A -> 0, B -> 1, AA -> 26."""
+    idx = 0
+    for ch in str(letter or "").upper():
+        idx = idx * 26 + (ord(ch) - 64)
+    return max(0, idx - 1)
+
+
+def _first_range_in_formula(formula: str) -> tuple[str, int] | None:
+    """(лист, индекс колонки) первого диапазона формулы — то, по чему идёт отбор."""
+    body = str(formula or "")
+    for func in _CRITERIA_FUNCS:
+        pos = body.upper().find(func + "(")
+        if pos < 0:
+            continue
+        # Искать ПОСЛЕ открывающей скобки: иначе само имя функции читается как колонка.
+        match = _A1_RANGE_RE.search(body[pos + len(func) + 1:])
+        if match:
+            sheet = match.group("quoted") or match.group("plain") or ""
+            return sheet, _column_index(match.group("col1"))
+    return None
+
+
+def _looks_empty_number(value: Any) -> bool:
+    """Показывает ли ячейка ноль/пусто — с оглядкой на русский формат «0,00 ₽»."""
+    text = str(value or "").strip()
+    if not text:
+        return True
+    cleaned = re.sub(r"[^\d,.\-]", "", text).replace(",", ".")
+    if not cleaned or cleaned in {"-", ".", "-."}:
+        return True
+    try:
+        return float(cleaned) == 0.0
+    except ValueError:
+        return False
+
+
+def check_google_sheet_health(spreadsheet_id: str) -> dict[str, Any]:
+    """Проверить таблицу на логические дефекты и вернуть их списком.
+
+    Ловит то, что не видно по коду возврата записи, но сразу видно человеку:
+
+    * ошибки в ячейках (#REF!, #DIV/0!, #N/A и прочие);
+    * агрегат показывает ноль, хотя в суммируемой колонке есть числа;
+    * строки данных с пустым полем, ПО КОТОРОМУ считает SUMIF/COUNTIF — такие строки
+      молча не попадают ни в один итог (именно этот дефект уехал владельцу 17.08.2026);
+    * таблица без единой строки данных при наличии заголовков.
+
+    Возвращает `{"ok": bool, "problems": [...], "checked": {...}}`. Пустой `problems`
+    означает «явных логических дефектов не найдено», а не «всё идеально».
+    """
+    sheets = _build_sheets_service().spreadsheets()
+    sid = str(spreadsheet_id)
+    meta = sheets.get(
+        spreadsheetId=sid,
+        fields="properties(title),sheets(properties(title,gridProperties(rowCount,columnCount)))",
+    ).execute()
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if not titles:
+        return {"ok": True, "problems": [], "checked": {"sheets": 0}}
+
+    # Два пакетных чтения вместо двух на каждый лист: формулы и то, что реально видно.
+    ranges = [f"'{t}'!A1:Z200" for t in titles]
+    formulas = sheets.values().batchGet(
+        spreadsheetId=sid, ranges=ranges, valueRenderOption="FORMULA").execute()
+    shown = sheets.values().batchGet(
+        spreadsheetId=sid, ranges=ranges, valueRenderOption="FORMATTED_VALUE").execute()
+
+    grids_formula = {t: (r.get("values") or [])
+                     for t, r in zip(titles, formulas.get("valueRanges", []))}
+    grids_shown = {t: (r.get("values") or [])
+                   for t, r in zip(titles, shown.get("valueRanges", []))}
+
+    problems: list[dict[str, Any]] = []
+
+    def cell_ref(sheet: str, row: int, col: int) -> str:
+        return f"'{sheet}'!{_a1_column_name(col + 1)}{row + 1}"
+
+    for title in titles:
+        grid_f = grids_formula.get(title, [])
+        grid_s = grids_shown.get(title, [])
+
+        # 1. Ошибки в ячейках — самое громкое и самое незаметное для агента.
+        for r, row in enumerate(grid_s):
+            for c, value in enumerate(row):
+                text = str(value or "").strip()
+                if text in _SHEET_ERROR_VALUES:
+                    problems.append({
+                        "kind": "cell_error",
+                        "cell": cell_ref(title, r, c),
+                        "detail": f"ячейка содержит ошибку {text}",
+                    })
+
+        # 2. Лист с заголовками, но без данных.
+        if len(grid_f) == 1 and any(str(v).strip() for v in grid_f[0]):
+            problems.append({
+                "kind": "no_data_rows",
+                "cell": f"'{title}'!A2",
+                "detail": "есть заголовки, но нет ни одной строки данных",
+            })
+
+        # 3. Агрегаты: ноль при живых данных и пустые поля-критерии.
+        for r, row in enumerate(grid_f):
+            for c, raw in enumerate(row):
+                formula = str(raw or "")
+                if not formula.startswith("="):
+                    continue
+                upper = formula.upper()
+                if not any(f + "(" in upper for f in _AGGREGATE_FUNCS):
+                    continue
+                result = ""
+                if r < len(grid_s) and c < len(grid_s[r]):
+                    result = grid_s[r][c]
+                if not _looks_empty_number(result):
+                    continue
+
+                target = _first_range_in_formula(formula)
+                if not target:
+                    problems.append({
+                        "kind": "empty_aggregate",
+                        "cell": cell_ref(title, r, c),
+                        "detail": f"агрегат показывает «{result or 'пусто'}» — проверьте диапазон",
+                    })
+                    continue
+
+                ref_sheet, ref_col = target
+                ref_sheet = ref_sheet or title
+                ref_grid = grids_formula.get(ref_sheet, [])
+                data_rows = [row_v for row_v in ref_grid[1:] if any(str(v).strip() for v in row_v)]
+                if not data_rows:
+                    continue  # нечего суммировать — это не дефект формулы
+
+                blank = [i for i, row_v in enumerate(data_rows, start=2)
+                         if ref_col >= len(row_v) or not str(row_v[ref_col]).strip()]
+                col_name = _a1_column_name(ref_col + 1)
+                if blank:
+                    problems.append({
+                        "kind": "criteria_column_blank",
+                        "cell": cell_ref(title, r, c),
+                        "detail": (
+                            f"агрегат считает по колонке {col_name} листа «{ref_sheet}», "
+                            f"но в строках {', '.join(map(str, blank[:8]))} она пустая — "
+                            f"эти строки не попадут ни в один итог "
+                            f"(сейчас показывает «{result or 'пусто'}»)"
+                        ),
+                    })
+                else:
+                    problems.append({
+                        "kind": "empty_aggregate",
+                        "cell": cell_ref(title, r, c),
+                        "detail": (
+                            f"агрегат показывает «{result or 'пусто'}», хотя данные в "
+                            f"«{ref_sheet}» есть — проверьте условие отбора"
+                        ),
+                    })
+
+    return {
+        "ok": not problems,
+        "problems": problems,
+        "checked": {"sheets": len(titles), "titles": titles},
+        "url": f"https://docs.google.com/spreadsheets/d/{sid}/edit",
     }
 
 

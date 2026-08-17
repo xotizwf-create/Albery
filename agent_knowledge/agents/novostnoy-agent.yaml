@@ -9,6 +9,7 @@ tools:
 - assign_employee_department
 - attach_files_to_task
 - cancel_owner_recommendation
+- check_google_sheet_health
 - complete_bitrix_task
 - convert_document
 - create_agent
