@@ -1179,30 +1179,60 @@ def _probe_refresh(key: str, producer: Callable[[], Any]) -> None:
         state.update(value=value, at=time.monotonic(), running=False, measured=True)
 
 
+# Насколько старое измерение ещё можно показывать как текущее. Проба обновляется в фоне,
+# и запрос забирает ПРЕДЫДУЩЕЕ значение — после простоя страницы оно может быть суточной
+# давности. 17.08.2026 это выглядело как авария: страница показывала «Bitrix REST не
+# отвечает» и «Zoom: токен не выдаётся», хотя прямая проверка давала 0,13 с и живой токен, —
+# отображался кэш вчерашнего сетевого сбоя. Устаревшее измерение теперь считается
+# НЕИЗВЕСТНЫМ («проверяется»), а не выдаётся за настоящее: врать про аварию нельзя так же,
+# как нельзя врать про здоровье.
+_PROBE_MAX_AGE_FACTOR = 3.0
+# Сроки жизни проб держим рядом с проверкой актуальности: разъехавшись, они дают
+# ровно ту ошибку, которую этот код и лечит.
+_PROBE_TTL_BITRIX_S = 60
+_PROBE_TTL_ZOOM_S = 300
+_PROBE_TTL_PORTAL_USERS_S = 600
+
+
 def _probe_value(key: str, ttl_s: float, producer: Callable[[], Any]) -> Any:
     """Последнее известное значение внешней пробы, без единого сетевого ожидания.
 
     Устарело или ещё не измерялось — обновление уходит в фоновый поток, а вызывающий
-    получает то, что есть сейчас (None, пока первое измерение не завершилось)."""
+    получает то, что есть сейчас (None, пока первое измерение не завершилось).
+    Значение старше `ttl_s * _PROBE_MAX_AGE_FACTOR` не возвращается вовсе: оно уже не
+    описывает текущее состояние."""
     now = time.monotonic()
     with _PROBES_LOCK:
         state = _PROBES.setdefault(key, {"value": None, "at": 0.0, "running": False, "measured": False})
         start = (now - state["at"]) >= ttl_s and not state["running"]
         if start:
             state["running"] = True
-        value = state["value"]
+        value = state["value"] if _probe_is_current(state, ttl_s, now) else None
     if start:
         threading.Thread(target=_probe_refresh, args=(key, producer), daemon=True,
                          name=f"agent-probe-{key}").start()
     return value
 
 
-def _probe_measured(key: str) -> bool:
-    """Была ли проба хоть раз доведена до конца. Отличает «ещё не мерили» (первые
-    секунды после рестарта) от «померили и не отвечает» — иначе рестарт сам себе
-    рисовал бы проблему и будил владельца уведомлением."""
+def _probe_is_current(state: dict[str, Any], ttl_s: float, now: float | None = None) -> bool:
+    """Описывает ли сохранённое измерение ТЕКУЩЕЕ состояние, а не давнее прошлое."""
+    if not state.get("measured"):
+        return False
+    at = float(state.get("at") or 0.0)
+    if at <= 0.0:
+        return False
+    return ((now if now is not None else time.monotonic()) - at) <= ttl_s * _PROBE_MAX_AGE_FACTOR
+
+
+def _probe_measured(key: str, ttl_s: float | None = None) -> bool:
+    """Есть ли АКТУАЛЬНОЕ измерение пробы. Отличает «ещё не мерили» (первые секунды после
+    рестарта) и «данные устарели» от «померили и не отвечает» — иначе и рестарт, и простой
+    страницы сами себе рисуют аварию и будят владельца уведомлением."""
     with _PROBES_LOCK:
-        return bool(_PROBES.get(key, {}).get("measured"))
+        state = _PROBES.get(key, {})
+        if ttl_s is None:
+            return bool(state.get("measured"))
+        return _probe_is_current(state, ttl_s)
 
 
 def _uptime_label() -> str:
@@ -1271,7 +1301,7 @@ def _bitrix_ping_ms() -> int | None:
         _b24_testbot_call(b24_testbot_client(), "server.time", {})
         return int((time.perf_counter() - t0) * 1000)
 
-    return _probe_value("bitrix", 60, _measure)
+    return _probe_value("bitrix", _PROBE_TTL_BITRIX_S, _measure)
 
 
 def _zoom_ping_ok() -> bool | None:
@@ -1282,7 +1312,7 @@ def _zoom_ping_ok() -> bool | None:
         from zoom import zoom_access_token
         return bool(zoom_access_token())
 
-    return _probe_value("zoom", 300, _measure)
+    return _probe_value("zoom", _PROBE_TTL_ZOOM_S, _measure)
 
 
 def _portal_names() -> dict[int, dict[str, str]]:
@@ -1294,7 +1324,7 @@ def _portal_names() -> dict[int, dict[str, str]]:
         from b24bot import _b24_portal_user_directory
         return _b24_portal_user_directory(force=True)
 
-    return _probe_value("portal_users", 600, _measure) or {}
+    return _probe_value("portal_users", _PROBE_TTL_PORTAL_USERS_S, _measure) or {}
 
 
 def _server_memory() -> tuple[float, float] | None:
@@ -1458,7 +1488,7 @@ def monitoring_payload(chart_days: int = 1, agent: str = "all") -> dict[str, Any
     bitrix_ms = _bitrix_ping_ms()
     if bitrix_ms is not None:
         bitrix_status, bitrix_type = f"ok • {bitrix_ms / 1000:.1f} с".replace(".", ","), "ok"
-    elif not _probe_measured("bitrix"):
+    elif not _probe_measured("bitrix", _PROBE_TTL_BITRIX_S):
         # Первые секунды после рестарта: проба ещё в фоне. «Не отвечает» здесь было бы
         # ложной тревогой — рестарт сам себе рисовал бы проблему.
         bitrix_status, bitrix_type = "проверяется", "ok"
@@ -1468,7 +1498,7 @@ def monitoring_payload(chart_days: int = 1, agent: str = "all") -> dict[str, Any
     zoom_ok = _zoom_ping_ok()
     zoom_fresh = bool(zoom_last_at and (now_msk - zoom_last_at.astimezone(MSK_TZ)) < timedelta(days=4))
     sync_label = f" • синк {_ago_label(zoom_last_at)}" if zoom_last_at else " • синков не было"
-    if zoom_ok is None and not _probe_measured("zoom"):
+    if zoom_ok is None:
         zoom_status, zoom_type = "токен проверяется" + sync_label, "ok"
     else:
         zoom_status = ("токен ok" if zoom_ok else "токен не выдаётся") + sync_label
