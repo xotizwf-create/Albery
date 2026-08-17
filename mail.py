@@ -235,6 +235,46 @@ def parse_message(raw: dict[str, Any], *, keep_quoted: bool = False) -> dict[str
 
 # --- чтение ----------------------------------------------------------------------------
 
+# Gmail ограничивает ОДНОВРЕМЕННОСТЬ внутри пакета: пакет на 40 писем вернул шесть
+# ответов «429 Too many concurrent requests» (замер 17.08.2026). Поэтому пакеты дробим и
+# отбитые письма повторяем — скорость не должна покупаться потерянными ответами
+# поставщиков. Молча пропущенное письмо здесь дороже лишней секунды.
+_BATCH_CHUNK = 12
+_BATCH_ATTEMPTS = 3
+
+
+def _batch_fetch_metadata(svc: Any, ids: list[str]) -> tuple[dict[str, Any], list[str]]:
+    """Карточки писем пакетами, с повтором отбитых. Возвращает (полученное, не сдавшиеся)."""
+    import time as _time
+
+    fetched: dict[str, Any] = {}
+    pending = list(ids)
+    for attempt in range(_BATCH_ATTEMPTS):
+        if not pending:
+            break
+        failed: list[str] = []
+
+        def collect(request_id: str, response: Any, exception: Any) -> None:
+            if exception is not None:
+                failed.append(request_id)
+            else:
+                fetched[request_id] = response
+
+        for start in range(0, len(pending), _BATCH_CHUNK):
+            batch = svc.new_batch_http_request(callback=collect)
+            for mid in pending[start:start + _BATCH_CHUNK]:
+                batch.add(svc.users().messages().get(
+                    userId="me", id=mid, format="metadata",
+                    metadataHeaders=["From", "Subject", "Date", "To"],
+                ), request_id=mid)
+            batch.execute()
+
+        pending = failed
+        if pending and attempt + 1 < _BATCH_ATTEMPTS:
+            _time.sleep(0.7 * (attempt + 1))
+    return fetched, pending
+
+
 def mail_search(query: str, max_results: int = 20, *, creds: Any = None) -> dict[str, Any]:
     """Найти письма по синтаксису Gmail (from:, subject:, newer_than:, label: и т.д.).
 
@@ -246,13 +286,14 @@ def mail_search(query: str, max_results: int = 20, *, creds: Any = None) -> dict
         userId="me", q=str(query or ""), maxResults=max(1, min(int(max_results or 20), 100)),
     ).execute()
     ids = [m["id"] for m in (listing.get("messages") or [])]
+    fetched, errors = _batch_fetch_metadata(svc, ids)
+
     items: list[dict[str, Any]] = []
     used = 0
-    for mid in ids:
-        raw = svc.users().messages().get(
-            userId="me", id=mid, format="metadata",
-            metadataHeaders=["From", "Subject", "Date", "To"],
-        ).execute()
+    for mid in ids:  # порядок выдачи Gmail важен: свежие сверху
+        raw = fetched.get(mid)
+        if not raw:
+            continue
         card = parse_message(raw)
         card.pop("body", None)
         card.pop("attachments", None)
@@ -262,13 +303,24 @@ def mail_search(query: str, max_results: int = 20, *, creds: Any = None) -> dict
             break
         items.append(card)
         used += size
-    return {
+    result = {
         "query": query,
         "found": len(ids),
         "returned": len(items),
         "messages": items,
         "estimate": listing.get("resultSizeEstimate"),
     }
+    if errors:
+        # Молчаливо потерянное письмо — это пропущенный ответ поставщика.
+        result["failed"] = errors
+    if len(items) < len(ids):
+        # «Вернул 38 из 53» без пояснения выглядит как потеря писем. Это не потеря, а
+        # предел объёма ответа — но сказать об этом обязаны мы, а не пусть догадываются.
+        result["note"] = (
+            f"Показаны {len(items)} писем из {len(ids)} — упёрлись в предел объёма ответа. "
+            "Сузьте запрос (отправитель, период, ярлык), чтобы увидеть остальные."
+        )
+    return result
 
 
 def mail_read(message_id: str, *, keep_quoted: bool = False, creds: Any = None) -> dict[str, Any]:
