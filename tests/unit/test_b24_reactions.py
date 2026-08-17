@@ -1,13 +1,16 @@
-"""Реакцию под сообщением ставит САМ БОТ, а отказ обязан быть слышен.
+"""Реакции: 👀 когда взяли в работу, 👍 когда ответили — и отказ обязан быть слышен.
 
-17.08.2026 владелец сообщил, что агенты перестали ставить реакции. Причина: реакции шли
-через `im.v2.Chat.Message.Reaction.add`, у которого нет параметра бота, поэтому портал
-выполнял вызов от лица технического пользователя приложения. Тот не участник приватных
-чатов «сотрудник ↔ бот» и получал ACCESS_DENIED — проверено на проде на ВСЕХ сообщениях
-(и свежих, и недельной давности, у всех ботов) при живом scope `im`.
+Разобрано 17.08.2026 по жалобе владельца. В системе ДВА разных доступа к порталу:
 
-Вторая половина проблемы — тишина: ошибка глушилась в `logging.debug`, поэтому поломка
-жила несколько дней и её заметил владелец, а не мониторинг.
+* токен из события вебхука — контекст бота, у него есть доступ к приватному чату
+  «сотрудник ↔ бот», и через него im.v2 ставит любой эмодзи (так и работал 👀);
+* постоянный токен приложения ходит от лица технического пользователя 22, который в
+  этих чатах не участник — портал отвечает ACCESS_DENIED. Им пользуется отложенная
+  доставка, поэтому финальный 👍 молча не ставился.
+
+Первая попытка починки заменила ВСЕ реакции ботовым imbot.message.like и тем самым
+убила рабочий 👀: замер был снят только со сломанной половины. Здесь закреплено и то,
+что штатный путь остаётся основным, и то, что у лайка есть запасной.
 """
 from __future__ import annotations
 
@@ -16,6 +19,8 @@ import logging
 import pytest
 
 import b24bot
+
+DENIED = 'HTTP 400 {"error":"ACCESS_DENIED","error_description":"ACCESS_DENIED"}'
 
 
 @pytest.fixture()
@@ -30,53 +35,76 @@ def calls(monkeypatch):
     return seen
 
 
-def test_like_goes_through_the_bot_not_the_service_user(calls):
-    """Ботовый imbot.message.like отрабатывает там, где im.v2 отвечает ACCESS_DENIED."""
-    b24bot._b24_app_react("https://portal", "token", 46212, "like", add=True, bot_id=70)
+@pytest.fixture()
+def denied_calls(monkeypatch):
+    """Портал отказывает штатному пути — как с постоянным токеном приложения."""
+    seen: list[tuple[str, dict]] = []
 
-    assert len(calls) == 1
-    method, payload = calls[0]
-    assert method == "imbot.message.like"
-    assert payload["MESSAGE_ID"] == 46212
-    assert payload["BOT_ID"] == 70
+    def fake_call(endpoint, token, method, payload=None, **kw):
+        seen.append((method, dict(payload or {})))
+        if method.startswith("im.v2.Chat.Message.Reaction"):
+            raise RuntimeError(f"{method}: {DENIED}")
+        return {"result": True}
 
-
-def test_service_user_reaction_api_is_never_used(calls):
-    """Именно этот вызов и отваливался молча — он не должен вернуться."""
-    b24bot._b24_app_react("https://portal", "token", 46212, "like", add=True, bot_id=70)
-
-    assert not any(method.startswith("im.v2.Chat.Message.Reaction") for method, _ in calls)
+    monkeypatch.setattr(b24bot, "_b24_app_call", fake_call)
+    return seen
 
 
-def test_without_bot_id_nothing_is_sent_and_it_is_logged(calls, caplog):
-    """Без бота вызов ушёл бы от техпользователя и снова получил бы отказ."""
+def test_eye_reaction_uses_the_normal_path(calls):
+    """👀 — главный признак «сообщение увидели»; ботового аналога у него нет."""
+    b24bot._b24_app_react("https://portal", "event-token", 46212, "eyes", add=True, bot_id=70)
+
+    assert [m for m, _ in calls] == ["im.v2.Chat.Message.Reaction.add"]
+    assert calls[0][1] == {"messageId": 46212, "reaction": "eyes"}
+
+
+def test_like_uses_the_normal_path_when_access_allows(calls):
+    b24bot._b24_app_react("https://portal", "event-token", 46212, "like", add=True, bot_id=70)
+
+    assert [m for m, _ in calls] == ["im.v2.Chat.Message.Reaction.add"]
+
+
+def test_like_falls_back_to_the_bot_when_access_is_denied(denied_calls):
+    """Отложенная доставка ходит токеном приложения — там штатный путь закрыт."""
+    b24bot._b24_app_react("https://portal", "app-token", 46212, "like", add=True, bot_id=70)
+
+    methods = [m for m, _ in denied_calls]
+    assert methods == ["im.v2.Chat.Message.Reaction.add", "imbot.message.like"]
+    assert denied_calls[1][1] == {"MESSAGE_ID": 46212, "BOT_ID": 70}
+
+
+def test_denied_eye_reaction_is_reported_not_silent(denied_calls, caplog):
+    """У 👀 ботового пути нет — значит отказ обязан быть виден, а не проглочен."""
     with caplog.at_level(logging.WARNING):
-        b24bot._b24_app_react("https://portal", "token", 46212, "like", add=True)
-
-    assert calls == []
-    assert any("bot_id" in r.message or "bot_id" in r.getMessage() for r in caplog.records)
-
-
-def test_failure_is_visible_not_swallowed_in_debug(monkeypatch, caplog):
-    """Молчащая реакция — это то, из-за чего поломку нашёл владелец, а не мониторинг."""
-    def boom(*a, **kw):
-        raise RuntimeError('imbot.message.like: HTTP 400 {"error":"ACCESS_DENIED"}')
-
-    monkeypatch.setattr(b24bot, "_b24_app_call", boom)
-    with caplog.at_level(logging.WARNING):
-        b24bot._b24_app_react("https://portal", "token", 46212, "like", add=True, bot_id=70)
+        b24bot._b24_app_react("https://portal", "app-token", 46212, "eyes", add=True, bot_id=70)
 
     assert any(r.levelno >= logging.WARNING for r in caplog.records), (
-        "отказ реакции обязан быть виден на уровне WARNING, а не тонуть в debug"
+        "молчащий отказ — это то, из-за чего поломку нашёл владелец, а не мониторинг"
     )
 
 
-@pytest.mark.parametrize("reaction,add", [("eyes", True), ("eyes", False), ("like", False)])
-def test_unsupported_reactions_do_nothing_instead_of_pretending(calls, reaction, add):
-    """Произвольные эмодзи ботом на этом портале недоступны.
+def test_failure_of_the_bot_fallback_is_reported(monkeypatch, caplog):
+    def boom(endpoint, token, method, payload=None, **kw):
+        raise RuntimeError(f"{method}: {DENIED}")
 
-    Раньше такие вызовы уходили в портал и молча получали отказ — то есть код делал вид,
-    что ставит 👀. Сигнал «работаю» даёт индикатор «печатает…».
-    """
-    b24bot._b24_app_react("https://portal", "token", 46212, reaction, add=add, bot_id=70)
-    assert calls == []
+    monkeypatch.setattr(b24bot, "_b24_app_call", boom)
+    with caplog.at_level(logging.WARNING):
+        b24bot._b24_app_react("https://portal", "app-token", 46212, "like", add=True, bot_id=70)
+
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_non_access_errors_do_not_trigger_the_fallback(monkeypatch, caplog):
+    """Сеть моргнула — это не повод менять способ: иначе мы прячем настоящую причину."""
+    seen: list[str] = []
+
+    def fake_call(endpoint, token, method, payload=None, **kw):
+        seen.append(method)
+        raise RuntimeError(f"{method}: HTTP 500 internal")
+
+    monkeypatch.setattr(b24bot, "_b24_app_call", fake_call)
+    with caplog.at_level(logging.WARNING):
+        b24bot._b24_app_react("https://portal", "event-token", 46212, "like", add=True, bot_id=70)
+
+    assert seen == ["im.v2.Chat.Message.Reaction.add"]
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
