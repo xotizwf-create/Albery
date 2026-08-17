@@ -869,8 +869,8 @@ def _b24_send_onboarding(client_endpoint: str, access_token: str, bot_id: Any, d
     normal keyboard. The current step is remembered per (bot, dialog) so 'Далее' knows what's next."""
     step = max(1, min(step, _B24_ONB_LAST_STEP))
     if message_id:
-        _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
-        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
+        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True,
+                       bot_id=bot_id)
     keyboard = _b24_onb_next_keyboard() if step < _B24_ONB_LAST_STEP else _b24_keyboard()
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id,
                    _b24_onboarding_text(step, tier), keyboard=keyboard)
@@ -1525,15 +1525,37 @@ def _b24_app_typing(client_endpoint: str, access_token: str, bot_id: Any, dialog
         logging.debug("b24 testbot: typing failed", exc_info=True)
 
 
-def _b24_app_react(client_endpoint: str, access_token: str, message_id: Any, reaction: str, add: bool = True) -> None:
-    """Add/remove a chat reaction (👀 eyes on read, 👍 like on done) via the IM v2 API."""
+def _b24_app_react(client_endpoint: str, access_token: str, message_id: Any, reaction: str,
+                   add: bool = True, bot_id: Any = None) -> None:
+    """Поставить 👍 под сообщением пользователя силами САМОГО БОТА.
+
+    Через `im.v2.Chat.Message.Reaction.*` это не работает: у семейства im.v2 нет параметра
+    бота, поэтому портал выполняет вызов от лица технического пользователя приложения, а тот
+    не участник приватных чатов «сотрудник ↔ бот» и получает ACCESS_DENIED. Проверено
+    17.08.2026 на проде: отказ приходил на ВСЕ сообщения — и свежие, и недельной давности,
+    у всех ботов, при живом scope `im`. Ботовый `imbot.message.like` с BOT_ID отрабатывает
+    (`result: True`).
+
+    Произвольные эмодзи ботом на этом портале недоступны — есть только «лайк». Сигнал
+    «читаю/работаю» даёт индикатор «печатает…» (`_b24_app_typing`), поэтому 👀 здесь
+    сознательно ничего не делает, а не притворяется работающим.
+    """
     if not (client_endpoint and access_token and message_id):
         return
-    method = "im.v2.Chat.Message.Reaction.add" if add else "im.v2.Chat.Message.Reaction.delete"
+    if reaction != "like" or not add:
+        return
+    if not bot_id:
+        # Без бота вызов ушёл бы от лица техпользователя и снова получил бы ACCESS_DENIED.
+        logging.warning("b24 testbot: реакция пропущена — не передан bot_id (message_id=%s)", message_id)
+        return
     try:
-        _b24_app_call(client_endpoint, access_token, method, {"messageId": message_id, "reaction": reaction})
+        _b24_app_call(client_endpoint, access_token, "imbot.message.like",
+                      {"MESSAGE_ID": message_id, "BOT_ID": bot_id})
     except Exception:  # noqa: BLE001
-        logging.debug("b24 testbot: reaction %s/%s failed", reaction, add, exc_info=True)
+        # Раньше это молчало в debug — реакции отвалились на несколько дней, и заметил
+        # это владелец, а не мониторинг. Отказ обязан быть видимым.
+        logging.warning("b24 testbot: реакция не поставлена (message_id=%s bot_id=%s)",
+                        message_id, bot_id, exc_info=True)
 
 
 def _b24_full_user_ids() -> set[int]:
@@ -4294,10 +4316,9 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
         _b24_inflight_clear(inflight_id)
     if answer is None:
         # Turn cancelled by «Новая сессия»: the reset flow already replied to the user —
-        # drop the progress message, release the 👀 reaction and post nothing.
+        # drop the progress message and post nothing.
         if status_message_id:
             _b24_status_finish(client_endpoint, access_token, bot_id, status_message_id)
-        _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
         return
     latency_ms = int((time.monotonic() - started) * 1000)
     answer, escalation_request = _b24_extract_escalation(answer)
@@ -4325,9 +4346,9 @@ def _b24_app_process(client_endpoint: str, access_token: str, bot_id: Any, dialo
                   client_endpoint, access_token, bot_id),
             daemon=True,
         ).start()
-    # done: swap 👀 (read) → 👍 (done) on the user's message.
-    _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
-    _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
+    # done: 👍 on the user's message (ставит сам бот — см. _b24_app_react).
+    _b24_app_react(client_endpoint, access_token, message_id, "like", add=True,
+                   bot_id=bot_id)
     _b24_session_touch(dialog_id, (agent or {}).get("slug"))
     _b24_ensure_command_registered(client_endpoint, access_token, bot_id)
     _b24_log_interaction(dialog_id, from_user_id, tier, user_text, answer, latency_ms, status, error,
@@ -4343,8 +4364,8 @@ def _b24_do_reset(client_endpoint: str, access_token: str, bot_id: Any, dialog_i
     stopped = _b24_cancel_live_turns(_b24_scope(dialog_id, agent_slug))
     _b24_session_reset(dialog_id, agent_slug)
     if message_id:
-        _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
-        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
+        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True,
+                       bot_id=bot_id)
     _b24_app_reply(client_endpoint, access_token, bot_id, dialog_id,
                    ("⏹ Остановил текущую работу и начал новую сессию — предыдущий контекст очищен. "
                     "Спрашивайте!") if stopped else
@@ -4489,8 +4510,8 @@ def _b24_start_error_report(client_endpoint: str, access_token: str, bot_id: Any
     message the user later sends to a DIFFERENT bot."""
     _b24_set_awaiting_error(bot_id, dialog_id)
     if message_id:
-        _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
-        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
+        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True,
+                       bot_id=bot_id)
     _b24_app_reply(
         client_endpoint, access_token, bot_id, dialog_id,
         "Опишите, пожалуйста, вашу ошибку или предложение одним сообщением — "
@@ -4523,8 +4544,8 @@ def _b24_handle_error_report(client_endpoint: str, access_token: str, bot_id: An
     if not b24_ok:
         logging.warning("b24 testbot: error report Bitrix mirror failed: %s", b24_err)
     if message_id:
-        _b24_app_react(client_endpoint, access_token, message_id, "eyes", add=False)
-        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True)
+        _b24_app_react(client_endpoint, access_token, message_id, "like", add=True,
+                       bot_id=bot_id)
     if ok:
         confirm = "Спасибо! Передал ваше сообщение Александру."
     else:
@@ -5377,7 +5398,6 @@ def _bitrix_imbot_app_event():
         # bot so an error-report armed on another bot can't swallow a normal message here.
         if _b24_pop_awaiting_error(bot_id, dialog_id):
             reporter = _b24_user_name(endpoint, access_token, from_user_id)
-            _b24_app_react(endpoint, access_token, message_id, "eyes", add=True)
             threading.Thread(
                 target=_b24_handle_error_report,
                 args=(endpoint, access_token, bot_id, dialog_id, message_text, from_user_id, reporter, message_id),
@@ -5394,7 +5414,6 @@ def _bitrix_imbot_app_event():
         # Bitrix retries or drops the webhook. Do those signals inside the background worker.
         def _run_turn(parts: dict[str, Any]) -> None:
             last_message_id = parts["message_ids"][-1]
-            _b24_app_react(endpoint, access_token, last_message_id, "eyes", add=True)
             _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
             recent_atts, recent_doc = [], None
             if not (parts["attachments"] or parts["doc_blocks"]
@@ -5629,7 +5648,6 @@ def _b24_durable_chat_prepare(batch: dict[str, Any], owner: str) -> None:
     )
     prepared = dict(base_prepared, user_text=user_text, no_brain=False)
     bitrix_inbound.mark_brain_running(batch_id, owner, prepared)
-    _b24_app_react(endpoint, access_token, last_message_id, "eyes", add=True)
     _b24_app_typing(endpoint, access_token, bot_id, dialog_id)
     stop_typing = threading.Event()
 
@@ -5816,8 +5834,8 @@ def _b24_durable_deliver(batch_id: str, owner: str, event_kind: str,
         else:
             endpoint, access_token = _b24_app_access_token()
             message_id = prepared.get("last_message_id")
-            _b24_app_react(endpoint, access_token, message_id, "eyes", add=False)
-            _b24_app_react(endpoint, access_token, message_id, "like", add=True)
+            _b24_app_react(endpoint, access_token, message_id, "like", add=True,
+                           bot_id=prepared.get("bot_id"))
             _b24_session_touch(prepared.get("dialog_id"), prepared.get("agent_slug"))
             _b24_ensure_command_registered(
                 endpoint, access_token, prepared.get("bot_id"),
