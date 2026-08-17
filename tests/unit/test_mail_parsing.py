@@ -157,3 +157,83 @@ def test_missing_token_fails_with_an_actionable_message(monkeypatch, tmp_path):
     with pytest.raises(mail.MailNotConnected) as err:
         mail.mail_credentials()
     assert "согласие" in str(err.value).lower() or "токен" in str(err.value).lower()
+
+
+# --- недоставленные письма --------------------------------------------------------------
+
+class _FakeGmail:
+    """Минимальный Gmail: список отбойников и их полное содержимое."""
+
+    def __init__(self, messages: list[dict]):
+        self._messages = {m["id"]: m for m in messages}
+        self._pending = None
+
+    def users(self):
+        return self
+
+    def messages(self):
+        return self
+
+    def list(self, userId=None, q=None, maxResults=None):  # noqa: N803
+        self._pending = {"messages": [{"id": i} for i in self._messages]}
+        return self
+
+    def get(self, userId=None, id=None, format=None, metadataHeaders=None):  # noqa: A002,N803
+        self._pending = self._messages[id]
+        return self
+
+    def execute(self):
+        return self._pending
+
+
+BOUNCE_BODY = (
+    "Адрес не найден\n\nСообщение не доставлено, так как адрес "
+    "alexxandrn.nikitenko@gmail.com не найден или не принимает входящие письма.\n"
+    "Полученный ответ: 550 5.1.1 The email account that you tried to reach does not exist."
+)
+
+
+def test_bounce_names_the_address_that_failed(monkeypatch):
+    """Отправка «прошла», а письмо не дошло — это надо назвать вслух."""
+    fake = _FakeGmail([message(
+        id="b1",
+        headers={"From": "Mail Delivery Subsystem <mailer-daemon@googlemail.com>",
+                 "Subject": "Delivery Status Notification (Failure)",
+                 "Date": "Mon, 17 Aug 2026 11:10:30 +0300"},
+        parts=[text_part(BOUNCE_BODY)],
+    )])
+    monkeypatch.setattr(mail, "_service", lambda creds=None: fake)
+
+    report = mail.mail_bounces(own_address="allberi.otdel.zakupok@gmail.com")
+
+    assert report["count"] == 1
+    assert report["addresses"] == ["alexxandrn.nikitenko@gmail.com"]
+    assert "не найден" in report["bounces"][0]["reason"]
+
+
+def test_own_address_is_not_reported_as_failed(monkeypatch):
+    """В теле отбойника есть и наш адрес — обвинять себя незачем."""
+    body = ("Сообщение от allberi.otdel.zakupok@gmail.com не доставлено, "
+            "так как адрес triktex2@mail.ru не найден.")
+    fake = _FakeGmail([message(
+        id="b2",
+        headers={"From": "mailer-daemon@googlemail.com", "Subject": "Undelivered Mail"},
+        parts=[text_part(body)],
+    )])
+    monkeypatch.setattr(mail, "_service", lambda creds=None: fake)
+
+    report = mail.mail_bounces(own_address="allberi.otdel.zakupok@gmail.com")
+
+    assert report["addresses"] == ["triktex2@mail.ru"]
+
+
+def test_ordinary_letter_from_a_person_is_not_a_bounce(monkeypatch):
+    """Иначе обычный ответ поставщика попал бы в «не доставлено»."""
+    fake = _FakeGmail([message(
+        id="n1",
+        headers={"From": "info@stuff-textile.ru", "Subject": "Re: Запрос по трикотажу"},
+        parts=[text_part("Добрый день! Прайс во вложении.")],
+    )])
+    monkeypatch.setattr(mail, "_service", lambda creds=None: fake)
+
+    assert mail.mail_bounces(own_address="allberi.otdel.zakupok@gmail.com")["count"] == 0

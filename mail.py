@@ -382,6 +382,55 @@ def mail_send_raw(to: str, subject: str, body: str, *, cc: str = "", thread_id: 
             "to": to, "subject": subject}
 
 
+# Адрес, на который письмо не доставлено, почтовик называет в теле отбойника.
+_BOUNCE_ADDRESS_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_BOUNCE_SENDERS = ("mailer-daemon", "postmaster")
+
+
+def mail_bounces(newer_than: str = "7d", *, own_address: str = "",
+                 creds: Any = None) -> dict[str, Any]:
+    """Какие письма НЕ дошли. Возвращает список адресов с причиной.
+
+    Успешная отправка через API означает «принято к доставке», а не «доставлено»:
+    17.08.2026 два письма вернулись с «Адрес не найден», и это осталось незамеченным,
+    потому что проверялся код ответа, а не судьба письма. Для запроса поставщику такая
+    тишина означает потерянный контакт — никто никогда не узнает, что письмо не дошло.
+    """
+    svc = _service(creds)
+    me = own_address or mail_address(creds)
+    query = f"from:mailer-daemon OR from:postmaster newer_than:{newer_than}"
+    listing = svc.users().messages().list(userId="me", q=query, maxResults=50).execute()
+    ids = [m["id"] for m in (listing.get("messages") or [])]
+
+    bounced: list[dict[str, Any]] = []
+    for mid in ids:
+        raw = svc.users().messages().get(userId="me", id=mid, format="full").execute()
+        parsed = parse_message(raw)
+        sender = parsed["from"].lower()
+        if not any(marker in sender for marker in _BOUNCE_SENDERS):
+            continue
+        haystack = f"{parsed['subject']} {parsed['body']}"
+        candidates = [a for a in _BOUNCE_ADDRESS_RE.findall(haystack)
+                      if a.lower() != me.lower()
+                      and not any(m in a.lower() for m in _BOUNCE_SENDERS)]
+        # Первый адрес в теле отбойника — тот, до которого не дошло.
+        failed_address = candidates[0] if candidates else ""
+        reason = " ".join(parsed["body"].split())[:200]
+        bounced.append({
+            "message_id": parsed["message_id"],
+            "date": parsed["date"],
+            "failed_address": failed_address,
+            "subject": parsed["subject"],
+            "reason": reason,
+        })
+    return {
+        "period": newer_than,
+        "count": len(bounced),
+        "bounces": bounced,
+        "addresses": sorted({b["failed_address"] for b in bounced if b["failed_address"]}),
+    }
+
+
 def mail_add_label(message_id: str, label: str, *, creds: Any = None) -> dict[str, Any]:
     """Пометить письмо — так агент не разбирает одно и то же дважды."""
     svc = _service(creds)
