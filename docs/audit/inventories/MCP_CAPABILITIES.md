@@ -13,6 +13,7 @@ The inventory includes 160 regular and 6 profile self-service tools.
 | `attach_files_to_task` | bitrix-tasks-and-chat | write | none | yes | yes / yes | Attach one or more files the user sent the bot (screenshots, documents — referenced by their attachment tokens att_…) to a Bitrix task |
 | `cancel_owner_recommendation` | management-reporting | write | none | yes | yes / yes | Mark one owner_manager_recommendations row as cancelled (e.g |
 | `check_google_sheet_health` | google-workspace | read | none | no | no / no | Check a spreadsheet for LOGICAL defects and get them back as a list |
+| `check_mail_bounces` | operations | read | none | no | no / no | Find letters that did NOT reach the addressee |
 | `complete_bitrix_task` | bitrix-tasks-and-chat | write | none | yes | yes / yes | Complete (close/«завершить») one Bitrix task |
 | `convert_document` | knowledge-and-documents | local-artifact-write | none | no | yes / yes | Преобразовать присланный документ: PDF → редактируемый Word (target='docx') или Word → PDF (target='pdf') |
 | `create_agent` | agent-management | privileged-configuration | explicit | yes | yes / yes | Создать нового субагента (Bitrix-бот зарегистрируется автоматически) |
@@ -81,6 +82,7 @@ The inventory includes 160 regular and 6 profile self-service tools.
 | `get_zoom_call_transcript` | zoom | read | none | yes | no / no | Get one Zoom call with factual Zoom participants and raw transcript segments |
 | `health` | runtime | read | none | no | no / no | Check PostgreSQL connectivity and MCP server status. |
 | `join_telegram_chat` | telegram | privileged-configuration | explicit | yes | yes / yes | Вступить аккаунтом @AlberyAIManager в чат по ссылке-приглашению (t.me/+…) или в публичный канал по @имени |
+| `label_mail` | operations | write | none | no | yes / yes | Put a Gmail label on a message — this is how the agent remembers what it already processed and does not analyse the same reply twice. |
 | `link_tasks` | bitrix-tasks-and-chat | write | none | yes | yes / yes | Связать две задачи (СВЯЗАННЫЕ ЗАДАЧИ / зависимость для Ганта) |
 | `list_agents` | agent-management | read | none | yes | no / no | Список всех агентов системы (универсальный + субагенты) с их настройками: имя, должность, вкл/выкл, сколько инструментов включено, команда |
 | `list_available_sources` | content-retrieval | read | none | no | no / no | Show which known context tables exist and how many rows each has. |
@@ -125,6 +127,8 @@ The inventory includes 160 regular and 6 profile self-service tools.
 | `process_chat_ocr` | communications-archive | local-artifact-write | none | no | yes / yes | Run OCR processing for image/PDF chat attachments through the local app workflow |
 | `read_google_doc` | google-workspace | read | none | no | no / no | Прочитать СУЩЕСТВУЮЩИЙ Google-документ по ссылке или id: output_format='text' — текст для ответа пользователю, output_format='html' — разметка для правки |
 | `read_google_sheet_values` | google-workspace | read | none | no | no / no | Read a 2D array of cell values from an A1 range of a Google Sheet (value_render_option: FORMATTED_VALUE default \| UNFORMATTED_VALUE raw numbers \| FORMULA to inspect formulas) |
+| `read_mail` | operations | read | none | no | no / no | Read ONE message in full: headers, clean body and the list of attachments |
+| `read_mail_thread` | operations | read | none | no | no / no | Read the WHOLE conversation with one supplier in order |
 | `read_telegram_chat` | telegram | read | none | yes | no / no | СООБЩЕНИЯ одного чата Telegram глазами аккаунта @AlberyAIManager — закрытого канала и закрытой группы тоже |
 | `remove_drive_item_from_folder` | google-workspace | destructive | explicit | no | yes / yes | Remove a Google Drive item — file, spreadsheet, document OR folder — from one specified parent folder without deleting the item from Drive completely |
 | `reopen_bitrix_task` | bitrix-tasks-and-chat | write | explicit | yes | yes / yes | Reopen/renew one completed Bitrix task and write a comment explaining why |
@@ -137,11 +141,13 @@ The inventory includes 160 regular and 6 profile self-service tools.
 | `save_zoom_call_report` | zoom | write | none | yes | yes / yes | Save a generated AI report for one Zoom call directly to zoom_calls.analytical_note in PostgreSQL |
 | `schedule_my_automation` | agent-self-service | write | none | no | no / no | Создать или обновить расписание собственной автоматизации. |
 | `search_company_knowledge` | knowledge-and-documents | read | none | no | no / no | Search the persistent 'О компании' knowledge base, including Google Drive mirrored docs/sheets |
+| `search_mail` | operations | read | none | no | no / no | Search the purchasing mailbox with Gmail syntax (from:, subject:, newer_than:, has:attachment, label:, in:sent) |
 | `search_messages` | communications-archive | read | none | no | no / no | Search raw chat messages and OCR text from attached images for a period |
 | `search_tasks` | bitrix-tasks-and-chat | read | none | yes | no / no | Search Bitrix tasks by id, period, text, or responsible user |
 | `search_zoom_transcripts` | zoom | read | none | yes | no / no | Search Zoom transcript segments by text and optional date range |
 | `send_bitrix_message` | bitrix-tasks-and-chat | write | explicit | yes | yes / yes | Send one personal Bitrix message to a single employee via the configured BITRIX_WEBHOOK_BASE account (your own user — there is no separate bot user) |
 | `send_contract` | legal-contracts | write | explicit | no | yes / yes | ДОГОВОР КЛИЕНТУ: собирает готовый PDF по реквизитам из сделки (постоянный текст + реквизиты сторон), присваивает номер и отправляет клиенту в Telegram НА СОГЛАСОВАНИЕ |
+| `send_mail` | operations | write | none | no | yes / yes | Send a letter to a supplier — or, if it is not built from an OWNER-APPROVED template, leave it as a draft for review |
 | `send_owner_recommendations_to_bitrix` | bitrix-tasks-and-chat | write | explicit | yes | yes / yes | Create owner_daily_report recommendation TASKS in Bitrix from the configured BITRIX_WEBHOOK_BASE account (owner) — one task per recipient, NOT personal messages |
 | `send_owner_weekly_report_pdf` | management-reporting | write | explicit | yes | yes / yes | Send the current weekly owner report as a PDF into Bitrix personal messages (default recipient: Evgeniy Palei, bitrix_user_id 1) |
 | `send_telegram_message` | telegram | write | explicit | yes | yes / yes | Написать человеку в Telegram ОТ ЛИЦА аккаунта компании @AlberyAIManager (не от бота) |

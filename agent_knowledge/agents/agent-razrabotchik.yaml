@@ -14,6 +14,7 @@ tools:
 - attach_files_to_task
 - cancel_owner_recommendation
 - check_google_sheet_health
+- check_mail_bounces
 - complete_bitrix_task
 - convert_document
 - create_agent
@@ -82,6 +83,7 @@ tools:
 - get_zoom_call_transcript
 - health
 - join_telegram_chat
+- label_mail
 - link_tasks
 - list_agents
 - list_available_sources
@@ -126,6 +128,8 @@ tools:
 - process_chat_ocr
 - read_google_doc
 - read_google_sheet_values
+- read_mail
+- read_mail_thread
 - read_telegram_chat
 - remove_drive_item_from_folder
 - reopen_bitrix_task
@@ -138,11 +142,13 @@ tools:
 - save_zoom_call_report
 - schedule_my_automation
 - search_company_knowledge
+- search_mail
 - search_messages
 - search_tasks
 - search_zoom_transcripts
 - send_bitrix_message
 - send_contract
+- send_mail
 - send_owner_recommendations_to_bitrix
 - send_owner_weekly_report_pdf
 - send_telegram_message

@@ -146,7 +146,7 @@ def local_app_base_url() -> str:
 # app.py is being split module-by-module (move-only refactor), so a workflow may now
 # live in an extracted module; resolve across all of them, app first.
 WORKFLOW_MODULES = ("app", "bitrix", "gdrive", "zoom", "b24bot", "llm", "utils", "agent_center",
-                    "tg_agent")
+                    "tg_agent", "mail", "mail_policy")
 
 
 def app_workflow_function(name: str) -> Any:
@@ -6674,6 +6674,92 @@ def tool_read_google_sheet_values(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"read_google_sheet_values failed: {exc}") from exc
 
 
+def _mail_module(name: str) -> Any:
+    """Почтовый модуль лежит в корне приложения, как и остальные рабочие функции."""
+    return app_workflow_function(name)
+
+
+def tool_search_mail(args: dict[str, Any]) -> dict[str, Any]:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        raise McpError(-32602, "query is required (Gmail syntax: from:, subject:, newer_than:).")
+    limit = int(args.get("limit") or 20)
+    try:
+        return _mail_module("mail_search")(query, max_results=limit)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"search_mail failed: {exc}") from exc
+
+
+def tool_read_mail(args: dict[str, Any]) -> dict[str, Any]:
+    mid = str(args.get("message_id") or "").strip()
+    if not mid:
+        raise McpError(-32602, "message_id is required.")
+    try:
+        return _mail_module("mail_read")(mid, keep_quoted=bool(args.get("keep_quoted")))
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"read_mail failed: {exc}") from exc
+
+
+def tool_read_mail_thread(args: dict[str, Any]) -> dict[str, Any]:
+    tid = str(args.get("thread_id") or "").strip()
+    if not tid:
+        raise McpError(-32602, "thread_id is required.")
+    try:
+        return _mail_module("mail_thread")(tid)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"read_mail_thread failed: {exc}") from exc
+
+
+def tool_send_mail(args: dict[str, Any]) -> dict[str, Any]:
+    to = str(args.get("to") or "").strip()
+    if not to:
+        raise McpError(-32602, "to is required.")
+    subject = str(args.get("subject") or "").strip()
+    body = str(args.get("body") or "")
+    template = str(args.get("template") or "").strip()
+    if not template and not (subject and body):
+        raise McpError(-32602, "subject and body are required unless a template is used.")
+    try:
+        return _mail_module("send_or_draft")(
+            to, subject, body,
+            template=template, values=args.get("values") or {},
+            cc=str(args.get("cc") or ""), thread_id=str(args.get("thread_id") or ""),
+            reply_to_message_id=str(args.get("reply_to_message_id") or ""),
+        )
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"send_mail failed: {exc}") from exc
+
+
+def tool_check_mail_bounces(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _mail_module("mail_bounces")(str(args.get("period") or "7d"))
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"check_mail_bounces failed: {exc}") from exc
+
+
+def tool_label_mail(args: dict[str, Any]) -> dict[str, Any]:
+    mid = str(args.get("message_id") or "").strip()
+    label = str(args.get("label") or "").strip()
+    if not mid or not label:
+        raise McpError(-32602, "message_id and label are required.")
+    try:
+        return _mail_module("mail_add_label")(mid, label)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"label_mail failed: {exc}") from exc
+
+
 def tool_check_google_sheet_health(args: dict[str, Any]) -> dict[str, Any]:
     sid = str(args.get("spreadsheet_id") or "").strip()
     if not sid:
@@ -11903,6 +11989,108 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_read_google_sheet_values,
+    },
+    "search_mail": {
+        "description": (
+            "Search the purchasing mailbox with Gmail syntax (from:, subject:, newer_than:, "
+            "has:attachment, label:, in:sent). Returns short cards WITHOUT bodies — read the ones "
+            "you need with read_mail. Start here to find supplier replies: "
+            "\"newer_than:7d -from:me\" or \"from:<supplier domain>\"."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Gmail search query"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "handler": tool_search_mail,
+    },
+    "read_mail": {
+        "description": (
+            "Read ONE message in full: headers, clean body and the list of attachments. Quoted "
+            "history is stripped by default — otherwise our own request gets read back as if it "
+            "were the supplier's terms. Attachments (price lists) are listed with name and size; "
+            "their content is a separate step."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "string"},
+                "keep_quoted": {"type": "boolean", "description": "keep the quoted history"},
+            },
+            "required": ["message_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_read_mail,
+    },
+    "read_mail_thread": {
+        "description": (
+            "Read the WHOLE conversation with one supplier in order. Conclusions belong to the "
+            "thread, not to a single letter: price, stock and terms are usually spread across "
+            "several replies."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"thread_id": {"type": "string"}},
+            "required": ["thread_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_read_mail_thread,
+    },
+    "send_mail": {
+        "description": (
+            "Send a letter to a supplier — or, if it is not built from an OWNER-APPROVED template, "
+            "leave it as a draft for review. Always returns `action`: \"sent\" or \"drafted\", plus "
+            "the reason. Free-form letters are ALWAYS drafted; that is the rule, not a failure — "
+            "a letter to an external company cannot be recalled. Reply inside a conversation by "
+            "passing thread_id and reply_to_message_id, otherwise the thread falls apart."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "subject": {"type": "string"},
+                "body": {"type": "string"},
+                "template": {"type": "string", "description": "name of an approved template"},
+                "values": {"type": "object", "description": "values for the template placeholders"},
+                "cc": {"type": "string"},
+                "thread_id": {"type": "string"},
+                "reply_to_message_id": {"type": "string"},
+            },
+            "required": ["to"],
+            "additionalProperties": False,
+        },
+        "handler": tool_send_mail,
+    },
+    "check_mail_bounces": {
+        "description": (
+            "Find letters that did NOT reach the addressee. Sending successfully means «accepted "
+            "for delivery», not «delivered»: a bounced request to a supplier looks like a handled "
+            "contact while the supplier never got anything. Run it after a batch of requests and "
+            "before reporting that suppliers were contacted."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"period": {"type": "string", "description": "e.g. 7d, 30d"}},
+            "additionalProperties": False,
+        },
+        "handler": tool_check_mail_bounces,
+    },
+    "label_mail": {
+        "description": (
+            "Put a Gmail label on a message — this is how the agent remembers what it already "
+            "processed and does not analyse the same reply twice."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string"}, "label": {"type": "string"}},
+            "required": ["message_id", "label"],
+            "additionalProperties": False,
+        },
+        "handler": tool_label_mail,
     },
     "check_google_sheet_health": {
         "description": (
