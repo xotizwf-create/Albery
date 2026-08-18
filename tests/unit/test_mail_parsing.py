@@ -237,3 +237,71 @@ def test_ordinary_letter_from_a_person_is_not_a_bounce(monkeypatch):
     monkeypatch.setattr(mail, "_service", lambda creds=None: fake)
 
     assert mail.mail_bounces(own_address="allberi.otdel.zakupok@gmail.com")["count"] == 0
+
+
+# --- вложения ----------------------------------------------------------------------------
+
+def test_signature_logos_are_marked_inline():
+    """Логотипы подписи имеют Content-ID и не являются документами поставщика."""
+    part = {"mimeType": "image/png", "filename": "mailrusigimg_zbL3.png",
+            "headers": [{"name": "Content-ID", "value": "<logo@mail.ru>"},
+                        {"name": "Content-Disposition", "value": "inline"}],
+            "body": {"attachmentId": "a1", "size": 39000}}
+    raw = message(headers={"From": "a@b.ru"}, parts=[text_part("текст"), part])
+
+    assert mail.parse_message(raw)["attachments"][0]["inline"] is True
+
+
+def test_real_attachment_is_not_marked_inline():
+    raw = message(headers={"From": "a@b.ru"},
+                  parts=[attachment_part("ПРАЙС STUFF.xlsx")])
+    assert mail.parse_message(raw)["attachments"][0]["inline"] is False
+
+
+@pytest.mark.parametrize("filename,kind", [
+    ("Прайс.xlsx", "document"), ("прайс.pdf", "document"), ("Условия.docx", "document"),
+    ("остатки.xls", "document"), ("данные.csv", "document"),
+    ("фото.jpg", "image"), ("образец.JPEG", "image"), ("скан.png", "image"),
+    ("архив.rar", "other"), ("файл.exe", "other"), ("без_расширения", "other"),
+])
+def test_attachment_kind_routing(filename, kind):
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    assert mail._attachment_kind(ext) == kind
+
+
+def test_unknown_binary_is_refused_not_decoded(monkeypatch):
+    """PNG, разобранный как utf-8, даёт 12 000 символов мусора — это уехало бы в анализ."""
+    monkeypatch.setattr(mail, "mail_attachment_bytes", lambda *a, **kw: b"\x89PNG\x00\x01binary")
+    result = mail.mail_attachment_text("m1", {"filename": "непонятно.rar", "size": 1000,
+                                              "attachment_id": "a1"})
+
+    assert "не поддержан" in result["error"]
+    assert "text" not in result
+
+
+def test_model_reasoning_never_reaches_the_analysis():
+    """Распознавание возвращает и рассуждения модели — для агента это не содержимое фото."""
+    leaked = ("<think>The user wants me to extract text. Let me look.</think>\n"
+              "СВОБОДНАЯ ПОСАДКА, размер L")
+    assert mail._strip_model_reasoning(leaked) == "СВОБОДНАЯ ПОСАДКА, размер L"
+
+
+def test_unreadable_attachment_does_not_blame_the_supplier(monkeypatch):
+    """Свалить свой лимит на «плохой скан» — значит забраковать нормальную фабрику."""
+    monkeypatch.setattr(mail, "mail_attachment_bytes", lambda *a, **kw: b"\xff\xd8\xff\xe0jpeg")
+    monkeypatch.setattr(mail, "_VISION_ATTEMPTS", 1)
+    monkeypatch.setattr(mail, "_VISION_BACKOFF_S", 0)
+    import b24bot
+    monkeypatch.setattr(b24bot, "_b24_vision_ocr", lambda *a, **kw: "")
+
+    result = mail.mail_attachment_text("m1", {"filename": "фото.jpg", "size": 1000,
+                                              "attachment_id": "a1"})
+
+    assert "поставщик тут ни при чём" in result["error"]
+    assert "плохого качества" not in result["error"]
+
+
+def test_oversized_attachment_is_not_downloaded():
+    result = mail.mail_attachment_text("m1", {"filename": "огромный.pdf",
+                                              "size": 99 * 1024 * 1024, "attachment_id": "a1"})
+    assert "больше предела" in result["error"]

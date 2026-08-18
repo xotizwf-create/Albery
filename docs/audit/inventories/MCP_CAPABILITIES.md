@@ -128,6 +128,7 @@ The inventory includes 160 regular and 6 profile self-service tools.
 | `read_google_doc` | google-workspace | read | none | no | no / no | Прочитать СУЩЕСТВУЮЩИЙ Google-документ по ссылке или id: output_format='text' — текст для ответа пользователю, output_format='html' — разметка для правки |
 | `read_google_sheet_values` | google-workspace | read | none | no | no / no | Read a 2D array of cell values from an A1 range of a Google Sheet (value_render_option: FORMATTED_VALUE default \| UNFORMATTED_VALUE raw numbers \| FORMULA to inspect formulas) |
 | `read_mail` | operations | read | none | no | no / no | Read ONE message in full: headers, clean body and the list of attachments |
+| `read_mail_full` | operations | read | none | no | no / no | Read a message WITH all its attachments parsed in one call: price lists (pdf/xlsx/doc), size charts, and product photos (recognised visually) |
 | `read_mail_thread` | operations | read | none | no | no / no | Read the WHOLE conversation with one supplier in order |
 | `read_telegram_chat` | telegram | read | none | yes | no / no | СООБЩЕНИЯ одного чата Telegram глазами аккаунта @AlberyAIManager — закрытого канала и закрытой группы тоже |
 | `remove_drive_item_from_folder` | google-workspace | destructive | explicit | no | yes / yes | Remove a Google Drive item — file, spreadsheet, document OR folder — from one specified parent folder without deleting the item from Drive completely |

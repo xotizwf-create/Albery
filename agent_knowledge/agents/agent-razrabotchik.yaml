@@ -129,6 +129,7 @@ tools:
 - read_google_doc
 - read_google_sheet_values
 - read_mail
+- read_mail_full
 - read_mail_thread
 - read_telegram_chat
 - remove_drive_item_from_folder

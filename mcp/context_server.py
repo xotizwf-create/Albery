@@ -6692,6 +6692,18 @@ def tool_search_mail(args: dict[str, Any]) -> dict[str, Any]:
         raise McpError(-32010, f"search_mail failed: {exc}") from exc
 
 
+def tool_read_mail_full(args: dict[str, Any]) -> dict[str, Any]:
+    mid = str(args.get("message_id") or "").strip()
+    if not mid:
+        raise McpError(-32602, "message_id is required.")
+    try:
+        return _mail_module("mail_read_full")(mid)
+    except McpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise McpError(-32010, f"read_mail_full failed: {exc}") from exc
+
+
 def tool_read_mail(args: dict[str, Any]) -> dict[str, Any]:
     mid = str(args.get("message_id") or "").strip()
     if not mid:
@@ -12025,6 +12037,23 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_read_mail,
+    },
+    "read_mail_full": {
+        "description": (
+            "Read a message WITH all its attachments parsed in one call: price lists (pdf/xlsx/"
+            "doc), size charts, and product photos (recognised visually). Suppliers put the real "
+            "terms in the file, not in the letter body — a letter read without its attachments is "
+            "read only half-way. Signature logos are skipped. Anything that could not be parsed is "
+            "listed in `attachments_unreadable` with the reason: treat that letter as NOT fully "
+            "read rather than assuming the file was empty."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string"}},
+            "required": ["message_id"],
+            "additionalProperties": False,
+        },
+        "handler": tool_read_mail_full,
     },
     "read_mail_thread": {
         "description": (

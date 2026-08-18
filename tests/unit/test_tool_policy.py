@@ -51,7 +51,7 @@ def test_inventory_covers_every_reviewed_tool():
     from scripts.audit_mcp_capabilities import rows
 
     inventory = rows()
-    assert len(inventory) == 173
+    assert len(inventory) == 174
     assert {item["name"] for item in inventory} == set(REVIEWED_TOOL_NAMES)
 
 

@@ -177,11 +177,19 @@ def _walk_parts(payload: dict[str, Any]) -> tuple[str, str, list[dict[str, Any]]
         body = part.get("body") or {}
         filename = str(part.get("filename") or "")
         if filename and body.get("attachmentId"):
+            headers = {str(h.get("name", "")).lower(): str(h.get("value", ""))
+                       for h in (part.get("headers") or [])}
+            # Картинки подписи вставлены в тело письма и имеют Content-ID. Это логотипы,
+            # а не документы поставщика: 17.08.2026 четыре таких PNG попали в разбор и
+            # выглядели как содержательные вложения.
+            inline = ("inline" in headers.get("content-disposition", "").lower()
+                      or bool(headers.get("content-id")))
             attachments.append({
                 "filename": filename,
                 "mime_type": mime,
                 "size": int(body.get("size") or 0),
                 "attachment_id": body.get("attachmentId"),
+                "inline": inline,
             })
         elif mime == "text/plain":
             text_parts.append(_decode(body.get("data") or ""))
@@ -380,6 +388,170 @@ def mail_send_raw(to: str, subject: str, body: str, *, cc: str = "", thread_id: 
     sent = _service(creds).users().messages().send(userId="me", body=payload).execute()
     return {"message_id": sent.get("id"), "thread_id": sent.get("threadId"),
             "to": to, "subject": subject}
+
+
+# --- вложения --------------------------------------------------------------------------
+#
+# Условия поставщика чаще всего приходят ФАЙЛОМ: у stuff-textile.ru в теле письма общие
+# слова, а цены — в «ПРАЙС STUFF - 01.08.2026 - НДС». Письмо без разбора вложения прочитано
+# наполовину, поэтому неудача разбора обязана быть СКАЗАНА вслух: пустой текст неотличим
+# от «прайса не было», и такой поставщик молча выпадет из работы.
+
+_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+_ATTACHMENT_TEXT_BUDGET = 12000
+# Провайдер зрения отвечает 429, когда фото идут подряд: фабрики шлют их пачками.
+_VISION_ATTEMPTS = 3
+_VISION_BACKOFF_S = 2.5
+_VISION_PACE_S = 1.2
+
+_IMAGE_EXTS = ("png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "heic")
+_DOC_EXTS = ("pdf", "docx", "xlsx", "xlsm", "xls", "doc", "rtf", "odt", "ods", "odp",
+             "pptx", "ppt", "csv", "tsv", "txt", "md", "markdown", "json", "xml",
+             "htm", "html", "mht", "mhtml", "zip", "log", "yaml", "yml")
+
+
+# Распознавание картинки возвращает вместе с текстом рассуждения модели («The user wants
+# me to extract text…»). Для агента это не содержимое фотографии, а шум, который он примет
+# за описание товара. Вырезаем и сам блок, и «голое» вступление до него.
+_REASONING_RE = re.compile(r"<think>.*?</think>|<thinking>.*?</thinking>", re.S | re.I)
+_REASONING_LEAD_RE = re.compile(
+    r"^\s*(?:<think>|<thinking>)?\s*(?:The user wants|Пользователь (?:хочет|просит)).*?"
+    r"(?:\n\s*\n|$)", re.S | re.I)
+
+
+def _strip_model_reasoning(text: str) -> str:
+    cleaned = _REASONING_RE.sub(" ", str(text or ""))
+    if not _REASONING_RE.search(str(text or "")):
+        cleaned = _REASONING_LEAD_RE.sub("", cleaned, count=1)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def _attachment_kind(ext: str) -> str:
+    """image — читаем зрением, document — разбираем текстом, other — честно отказываем."""
+    if ext in _IMAGE_EXTS:
+        return "image"
+    if ext in _DOC_EXTS:
+        return "document"
+    return "other"
+
+
+def mail_attachment_bytes(message_id: str, attachment_id: str, *, creds: Any = None) -> bytes:
+    """Скачать вложение. Пустой attachment_id означает встроенный файл без тела."""
+    if not attachment_id:
+        raise ValueError("у вложения нет attachment_id — скачивать нечего")
+    part = _service(creds).users().messages().attachments().get(
+        userId="me", messageId=str(message_id), id=str(attachment_id)).execute()
+    return base64.urlsafe_b64decode((part.get("data") or "").encode("ascii") + b"==")
+
+
+def mail_attachment_text(message_id: str, attachment: dict[str, Any], *,
+                         creds: Any = None) -> dict[str, Any]:
+    """Разобрать одно вложение в текст. Возвращает и результат, и честную причину отказа."""
+    name = str(attachment.get("filename") or "")
+    size = int(attachment.get("size") or 0)
+    out: dict[str, Any] = {"filename": name, "size": size,
+                           "mime_type": attachment.get("mime_type", "")}
+    if size > _ATTACHMENT_MAX_BYTES:
+        out["error"] = (f"файл {size // 1024 // 1024} МБ — больше предела "
+                        f"{_ATTACHMENT_MAX_BYTES // 1024 // 1024} МБ, не скачивался")
+        return out
+    try:
+        blob = mail_attachment_bytes(message_id, attachment.get("attachment_id"), creds=creds)
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"не удалось скачать: {type(exc).__name__}: {str(exc)[:160]}"
+        return out
+
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    out["kind"] = _attachment_kind(ext)
+    try:
+        if out["kind"] == "image":
+            # Фото товара и сканы прайсов — обычная форма ответа фабрики, их читаем
+            # зрением. Берём ОБЁРТКУ с перебором провайдеров, а не codex напрямую:
+            # на этой коробке codex не залогинен, и прямой вызов молча возвращал пусто —
+            # все фото товара выглядели как нечитаемые.
+            #
+            # Повторы нужны потому, что в одном письме фабрики шлют по десять фото, и
+            # провайдер отвечает 429: без повтора половина карточек товара просто пропала бы,
+            # причём с формулировкой «скан плохого качества» — то есть обвинили бы поставщика.
+            import time as _time
+
+            from b24bot import _b24_vision_ocr
+            text = ""
+            for attempt in range(_VISION_ATTEMPTS):
+                text = _b24_vision_ocr(blob, name) or ""
+                if text:
+                    break
+                if attempt + 1 < _VISION_ATTEMPTS:
+                    _time.sleep(_VISION_BACKOFF_S * (attempt + 1))
+        elif out["kind"] == "document":
+            from b24bot import _b24_extract_document
+            text = _b24_extract_document(blob, name) or ""
+        else:
+            # НИКАКОГО decode(utf-8) для неизвестных двоичных файлов: он выдаёт мусор,
+            # неотличимый от текста. 17.08.2026 так «разобрались» PNG из подписи письма —
+            # 12 000 символов бинарного шума, которые уехали бы в анализ как условия
+            # поставщика. Честный отказ полезнее правдоподобной чепухи.
+            out["error"] = (f"формат «{ext or 'без расширения'}» не поддержан для разбора — "
+                            "файл надо открыть человеку")
+            return out
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"разбор упал: {type(exc).__name__}: {str(exc)[:160]}"
+        return out
+
+    text = _strip_model_reasoning(text).strip()
+    if not text:
+        # Именно здесь молчание опаснее всего: «прайс не прочитан» и «прайса нет» для
+        # человека выглядят одинаково, а решения по ним противоположные.
+        #
+        # И причину называем ЧЕСТНО. Для картинок пустой результат почти всегда означает,
+        # что провайдер зрения не ответил (лимит 429 при пачке фото из одного письма),
+        # а не что фабрика прислала плохой скан. Свалить свою неудачу на поставщика —
+        # значит забраковать нормального поставщика.
+        out["error"] = (
+            "распознать не удалось: провайдер зрения не ответил (обычно исчерпан лимит "
+            "при пачке фото) — файл надо открыть глазами, поставщик тут ни при чём"
+            if out["kind"] == "image" else
+            "содержимое не извлеклось (возможно, скан или защищённый файл) — "
+            "условия из этого файла надо смотреть глазами")
+        return out
+    if len(text) > _ATTACHMENT_TEXT_BUDGET:
+        out["truncated"] = True
+        out["note"] = (f"показаны первые {_ATTACHMENT_TEXT_BUDGET} символов из {len(text)} — "
+                       "прайс длинный, ищите нужные позиции по артикулу или категории")
+        text = text[:_ATTACHMENT_TEXT_BUDGET]
+    out["text"] = text
+    return out
+
+
+def mail_read_full(message_id: str, *, creds: Any = None) -> dict[str, Any]:
+    """Письмо ЦЕЛИКОМ: текст плюс разобранные вложения — за один вызов.
+
+    Отдельный вызов на каждое вложение стоил бы лишнего хода модели на каждый файл;
+    здесь всё письмо приходит одним куском, как его и читает человек.
+    """
+    letter = mail_read(message_id, creds=creds)
+    parsed: list[dict[str, Any]] = []
+    skipped_signature: list[str] = []
+    for att in letter.get("attachments") or []:
+        # Логотип из подписи разбирать незачем — это трата хода и мусор в анализе.
+        if att.get("inline") and _attachment_kind(
+                (att.get("filename") or "").rsplit(".", 1)[-1].lower()) == "image":
+            skipped_signature.append(att.get("filename", ""))
+            continue
+        if parsed and att.get("filename", "").rsplit(".", 1)[-1].lower() in _IMAGE_EXTS:
+            import time as _t
+            _t.sleep(_VISION_PACE_S)
+        parsed.append(mail_attachment_text(message_id, att, creds=creds))
+    letter["attachments"] = parsed
+    if skipped_signature:
+        letter["signature_images_skipped"] = skipped_signature
+    unreadable = [a["filename"] for a in parsed if a.get("error")]
+    if unreadable:
+        letter["attachments_unreadable"] = unreadable
+        letter["attachments_warning"] = (
+            "Не разобраны вложения: " + ", ".join(unreadable) +
+            ". Условия могли остаться именно в них — не считайте письмо прочитанным.")
+    return letter
 
 
 # Адрес, на который письмо не доставлено, почтовик называет в теле отбойника.
