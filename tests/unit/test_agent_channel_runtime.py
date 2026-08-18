@@ -51,6 +51,18 @@ def test_profile_behaviour_and_knowledge_are_identical_across_channels():
     assert "Telegram" in telegram and "без Bitrix BBCode" in telegram
 
 
+def test_agent_never_names_a_document_it_has_no_link_for():
+    """Агент закупок назвал таблицу «Закупки — товарные предложения», а ссылки на неё
+    не было ни в роли, ни в реестре таблиц, ни на Диске: собеседник получил название
+    и следом «точную ссылку не нашёл». Название без адреса — это не документ."""
+    for channel in ("bitrix", "telegram"):
+        policy = _policy(channel, 17)
+
+        assert "РАБОЧИЕ ТАБЛИЦЫ И ДОКУМЕНТЫ" in policy
+        assert "сразу давай ссылку" in policy.replace("\n", " ")
+        assert "документа у тебя нет" in policy
+
+
 def test_unmapped_telegram_user_cannot_be_impersonated_in_bitrix():
     policy = _policy("telegram")
 
