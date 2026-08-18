@@ -155,6 +155,8 @@ ALWAYS_APPLY_MIGRATIONS = [
     "087_durable_bitrix_inbound.sql",
     # Durable stage boundary for the Google-sheet -> Bitrix-task -> source cleanup pipeline.
     "088_durable_novinki_runs.sql",
+    # След правки автоматизации из диалога: авторство строки остаётся владельца.
+    "089_automation_edit_audit.sql",
 ]
 
 

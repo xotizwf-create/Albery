@@ -165,6 +165,7 @@ tools:
 - update_crm_deal
 - update_crm_pipeline
 - update_employee_dossier
+- update_my_automation
 - update_recurring_task
 - upload_file_to_drive
 - upsert_ai_instruction

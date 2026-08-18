@@ -74,7 +74,7 @@ _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 _COLS = ("id, agent_slug, name, description, schedule, prompt, deliver_to, delivery_channel, "
          "delivery_profile, delivery_conversation_id, kind, created_by, "
          "creator_label, is_active, last_run_at, last_status, last_result, last_error, created_at, "
-         "system_key")
+         "system_key, last_edited_by, last_edited_at")
 
 
 def _load_rows(where: str = "", args: tuple = ()) -> list[dict[str, Any]]:
@@ -1347,6 +1347,31 @@ AUTOMATION_SELF_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": "АВТОМАТИЗАЦИИ: список твоих регулярных задач (расписание, статус последнего запуска).",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    "update_my_automation": {
+        "description": (
+            "АВТОМАТИЗАЦИИ: измени УЖЕ СУЩЕСТВУЮЩУЮ автоматизацию этого агента — сценарий (task), "
+            "расписание (schedule), включённость (active), описание. Правится и та, которую завёл "
+            "владелец в приложении: меняется её содержание, а авторство строки остаётся прежним, "
+            "правка подписывается тем, кто попросил (requested_by). Передавай ТОЛЬКО те поля, которые "
+            "меняешь — остальные останутся как есть. Нашёл дефект в своей же автоматизации (например, "
+            "она не проверяет результат записи) — почини её здесь, а не сообщай о невозможности. "
+            "Системную автоматизацию (Hermes cron) так править нельзя: её сценарий живёт на сервере. "
+            "Меняешь смысл сценария — сначала честно проверь, что твоих инструментов хватит на новый."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Точное название автоматизации (list_my_automations)."},
+                "task": {"type": "string", "description": "Новый сценарий: что делать при каждом запуске."},
+                "schedule": {"type": "string", "description": "Новое расписание, 5 полей cron, время МСК."},
+                "active": {"type": "boolean", "description": "false — приостановить, true — включить."},
+                "description": {"type": "string", "description": "Новое описание для владельца."},
+                "requested_by": {"type": "string",
+                                 "description": "Имя сотрудника, который попросил правку (собеседник текущего диалога)."},
+            },
+            "required": ["name", "requested_by"],
+        },
+    },
     "delete_my_automation": {
         "description": (
             "АВТОМАТИЗАЦИИ: удали СВОЮ автоматизацию по названию. Удалять можно только те, что ты сам "
@@ -1392,6 +1417,9 @@ def automation_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, 
                  "delivery_conversation_id": r.get("delivery_conversation_id") or r["deliver_to"] or "",
                  "active": bool(r["is_active"]),
                  "managed_by": ("Hermes (системная)" if r["kind"] == "system" else r["creator_label"] or r["created_by"]),
+                 "editable": r["kind"] == "agent",
+                 "last_edited_by": r.get("last_edited_by") or "",
+                 "last_edited": _when(r.get("last_edited_at")),
                  "last_status": r["last_status"] or "", "last_run": _when(r["last_run_at"])}
                 for r in rows
             ],
@@ -1449,6 +1477,62 @@ def automation_self_tool_call(agent: dict[str, Any], name: str, args: dict[str, 
                 "schedule_label": cron_schedule.describe(schedule),
                 "next_run": _when(nxt),
                 "note": "Автоматизация видна владельцу в Центре Агента (Агенты → Автоматизации)."}
+    if name == "update_my_automation":
+        rows = _load_rows("WHERE agent_slug = %s AND name = %s", (slug, auto_name))
+        if not rows:
+            raise ValueError("Такой автоматизации нет (list_my_automations покажет точные названия).")
+        row = rows[0]
+        if row["kind"] == "system":
+            raise ValueError(
+                f"«{auto_name}» — системная автоматизация: её сценарий живёт на сервере (Hermes cron), "
+                "из диалога он не правится. Владелец меняет расписание и включённость в Центре Агента "
+                "(Агенты → Автоматизации); правка самого сценария — задача на сервере."
+            )
+        if row["kind"] != "agent":
+            raise ValueError(
+                f"«{auto_name}» — не автоматизация агента, а регулярная задача Bitrix. "
+                "Меняй её через update_recurring_task."
+            )
+        task, schedule = args.get("task"), args.get("schedule")
+        active, new_description = args.get("active"), args.get("description")
+        if task is None and schedule is None and active is None and new_description is None:
+            raise ValueError("Нечего менять: передай task, schedule, active или description.")
+        prompt = str(task).strip() if task is not None else (row["prompt"] or "")
+        new_schedule = str(schedule).strip() if schedule is not None else row["schedule"]
+        # Потолок частоты берётся по происхождению строки, а не по тому, кто её сейчас правит:
+        # автоматизация владельца может законно ходить раз в 15 минут, и правка её сценария
+        # не должна упираться в часовой лимит агента.
+        cap = _OWNER_MAX_FIRES_PER_DAY if row["created_by"] == "owner" else _SELF_MAX_FIRES_PER_DAY
+        problem = _validate(auto_name, new_schedule, prompt, cap)
+        if problem:
+            raise ValueError(problem)
+        is_active = bool(active) if active is not None else bool(row["is_active"])
+        description = (str(new_description).strip() if new_description is not None
+                       else (row["description"] or ""))
+        editor = f"агент «{agent.get('name') or slug}»"
+        requester = _requester_name(str(args.get("requested_by") or ""),
+                                    row.get("delivery_conversation_id") or row["deliver_to"] or "")
+        if requester:
+            editor += f" · по просьбе: {requester}"
+        with pg_connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE agent_automations SET prompt = %s, schedule = %s, is_active = %s, "
+                        "description = %s, last_edited_by = %s, last_edited_at = now(), "
+                        "updated_at = now() WHERE id = %s",
+                        (prompt, new_schedule, is_active, description, editor[:200], row["id"]),
+                    )
+        changed = [field for field, value in (("task", task), ("schedule", schedule),
+                                              ("active", active), ("description", new_description))
+                   if value is not None]
+        nxt = cron_schedule.next_run(new_schedule, msk_now()) if is_active else None
+        return {"ok": True, "updated": auto_name, "changed": changed,
+                "schedule_label": cron_schedule.describe(new_schedule),
+                "active": is_active,
+                "next_run": _when(nxt),
+                "note": "Правка видна владельцу в Центре Агента (Агенты → Автоматизации); "
+                        "автор автоматизации не изменился."}
     if name == "delete_my_automation":
         rows = _load_rows("WHERE agent_slug = %s AND name = %s", (slug, auto_name))
         if not rows:

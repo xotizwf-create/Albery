@@ -71,6 +71,7 @@ SELF_TOOL_NAMES = frozenset(
         "list_my_automations",
         "list_my_instructions",
         "schedule_my_automation",
+        "update_my_automation",
         "upsert_my_instruction",
     }
 )
@@ -129,6 +130,7 @@ CONFIRMATION_REQUIRED = frozenset(
         "update_agent",
         "update_ai_capabilities",
         "update_employee_dossier",
+        "update_my_automation",
         "upsert_ai_instruction",
         "write_company_sheet",
     }
