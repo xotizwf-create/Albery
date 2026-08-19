@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
+from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 MESSENGER_URL = "https://www.avito.ru/profile/messenger"
@@ -513,6 +514,63 @@ def start_chat_from_item(page, item_id: str, text: str) -> tuple[bool, str]:
     return True, chat_id
 
 
+def search_listings(page, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+    """Поиск объявлений живой сессией.
+
+    Берём ссылки и подписи прямо из карточек выдачи: у каждой есть разметка `item`, внутри —
+    ссылка вида `/…_<номер>`. Номер объявления — то единственное, что нужно, чтобы написать
+    автору; остальное (заголовок, цена) идёт для глаз человека.
+    """
+    page.goto(f"https://www.avito.ru/all?q={urlparse.quote(query)}",
+              wait_until="domcontentloaded", timeout=90000)
+    page.wait_for_timeout(random.randint(*HUMAN_PAUSE_MS))
+    try:
+        page.wait_for_selector('[data-marker="item"]', timeout=25000)
+    except Exception:  # noqa: BLE001
+        return []
+    cards = page.locator('[data-marker="item"]')
+    found: list[dict[str, Any]] = []
+    for index in range(min(cards.count(), limit * 2)):
+        card = cards.nth(index)
+        try:
+            link = card.locator('[itemprop="url"], a[href*="_"]').first
+            href = link.get_attribute("href") or ""
+            match = re.search(r"_(\d{9,})", href)
+            if not match:
+                continue
+            title = (card.locator('[itemprop="name"]').first.inner_text()
+                     if card.locator('[itemprop="name"]').count() else link.inner_text())
+            price = (card.locator('[itemprop="price"]').first.get_attribute("content")
+                     if card.locator('[itemprop="price"]').count() else "")
+            found.append({"item_id": match.group(1),
+                          "title": " ".join((title or "").split())[:90],
+                          "price": price or "",
+                          "url": f"https://www.avito.ru{href}" if href.startswith("/") else href})
+        except Exception:  # noqa: BLE001
+            continue
+        if len(found) >= limit:
+            break
+    return found
+
+
+def command_search(args) -> int:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        context = _browser_context(playwright, args.account, headless=not args.show)
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            found = search_listings(page, args.query, limit=args.limit)
+        finally:
+            context.close()
+    out = profile_path(args.account) / "search.json"
+    out.write_text(json.dumps(found, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"найдено объявлений: {len(found)} -> {out}")
+    for item in found[:args.limit]:
+        print(f"  {item['item_id']}  {item['price'] or '—':>10}  {item['title'][:60]}")
+    return 0 if found else 1
+
+
 def command_send(args) -> int:
     """Ручная отправка одного сообщения — для проверки боем перед включением очереди."""
     from playwright.sync_api import sync_playwright
@@ -650,6 +708,7 @@ def main() -> int:
                             ("capture", "записать сырые ответы мессенджера"),
                             ("inspect-chat", "показать строение окна чата"),
                             ("send", "отправить одно сообщение вручную (проверка боем)"),
+                            ("search", "найти объявления по запросу"),
                             ("mirror", "рабочий режим: зеркалить переписки")):
         item = sub.add_parser(name, help=help_text)
         item.add_argument("--account", required=True, help="код аккаунта, как в интерфейсе")
@@ -657,6 +716,10 @@ def main() -> int:
             item.add_argument("--show", action="store_true", help="показать окно браузера")
         if name == "inspect-chat":
             item.add_argument("--chat", required=True, help="идентификатор чата (u2i-…)")
+        if name == "search":
+            item.add_argument("--query", required=True, help="что ищем")
+            item.add_argument("--limit", type=int, default=10)
+            item.add_argument("--show", action="store_true", help="показать окно браузера")
         if name == "send":
             item.add_argument("--chat", default="", help="ответ в существующий чат (u2i-…)")
             item.add_argument("--item", default="", help="написать первым автору объявления (id)")
@@ -672,7 +735,8 @@ def main() -> int:
     args = parser.parse_args()
     handlers = {"login": command_login, "probe": command_probe,
                 "capture": command_capture, "mirror": command_mirror,
-                "inspect-chat": command_inspect_chat, "send": command_send}
+                "inspect-chat": command_inspect_chat, "send": command_send,
+                "search": command_search}
     return handlers[args.command](args)
 
 

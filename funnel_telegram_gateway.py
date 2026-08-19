@@ -2587,12 +2587,28 @@ def _cancel_ai_job_safely(job_id: int, *, worker_id: str, reason: str) -> None:
         pass
 
 
+TELEGRAM_SOURCE_KEYS = frozenset({"telegram", BOT_SOURCE_KEY})
+
+
 def process_outbox_once(*, worker_id: str, limit: int = 25) -> int:
+    """Отправка исходящих Telegram. Очередь общая на все каналы, поэтому чужое НЕ трогаем.
+
+    19.08.2026 этот обход выгреб строки канала Авито и пометил их «бизнес-подключение этого
+    диалога больше не существует»: проверка Telegram-соединения ничего не знает о других
+    источниках. Сообщения людям при этом молча не ушли. Чужую строку возвращаем в очередь
+    нетронутой — её заберёт воркер своего канала.
+    """
     store = _store()
     rows = store.claim_outbox(worker_id=worker_id, limit=limit, lease_seconds=90)
+    handled = 0
     for row in rows:
+        if str(row.get("source_key") or "") not in TELEGRAM_SOURCE_KEYS:
+            store.finish_outbox(row["id"], worker_id=worker_id, result="pending",
+                                error="строка другого канала — возвращена в очередь")
+            continue
         _process_outbox_item(row, worker_id=worker_id)
-    return len(rows)
+        handled += 1
+    return handled
 
 
 def ai_allowed_in_channel(row: Mapping[str, Any], telegram_id: Any) -> bool:
