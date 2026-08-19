@@ -556,7 +556,11 @@ def ingest_inbound(payload: Mapping[str, Any]) -> dict[str, Any]:
                         "INSERT INTO funnel_workspace_messages (conversation_id, external_message_id, "
                         "author_type, author_name, direction, text, delivery_status, metadata, occurred_at) "
                         "VALUES (%s, %s, %s, %s, %s, %s, 'sent', %s, COALESCE(%s, now())) "
-                        "ON CONFLICT (conversation_id, external_message_id) DO NOTHING "
+                        # Индекс уникальности здесь ЧАСТИЧНЫЙ (миграция 070: только строки с
+                        # внешним id), поэтому его условие обязано стоять и в ON CONFLICT —
+                        # иначе Postgres не находит совпадающий индекс и падает.
+                        "ON CONFLICT (conversation_id, external_message_id) "
+                        "WHERE external_message_id IS NOT NULL DO NOTHING "
                         "RETURNING id",
                         (conversation_id, external_id, author,
                          str(message.get("author_name") or "") or None, direction, text,

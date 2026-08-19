@@ -103,7 +103,11 @@ def test_inbound_stores_the_talk_and_survives_a_repeat(avito, worker, monkeypatc
     joined = " | ".join(seen_sql)
     # Сырой пакет и каждое сообщение защищены от повторной доставки на уровне базы.
     assert "ON CONFLICT (source_key, external_update_id) DO NOTHING" in joined
-    assert "ON CONFLICT (conversation_id, external_message_id) DO NOTHING" in joined
+    # Условие частичного индекса обязано быть в ON CONFLICT: без него Postgres не находит
+    # совпадающий индекс и падает «no unique or exclusion constraint matching» — так и
+    # случилось на первом живом прогоне 19.08.2026.
+    assert ("ON CONFLICT (conversation_id, external_message_id) "
+            "WHERE external_message_id IS NOT NULL DO NOTHING") in joined
     # Счётчик непрочитанного пересобирается по переписке, а не увеличивается на веру.
     assert "unread_count = unread.n" in joined
 

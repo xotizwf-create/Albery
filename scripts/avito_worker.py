@@ -35,7 +35,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import socket
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
@@ -117,7 +120,9 @@ def _load_local_env() -> None:
     env_file = profiles_dir() / ".env"
     if not env_file.exists():
         return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig, а не utf-8: файл нередко создают редактором или PowerShell, и они ставят
+    # BOM. С обычным utf-8 первая переменная файла молча теряется — читается как «﻿KEY».
+    for line in env_file.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -135,8 +140,56 @@ def albery_from_env() -> Albery:
     return Albery(base, token)
 
 
+def _default_local_ip() -> str | None:
+    """Каким локальным адресом машина выходит в интернет по умолчанию (обычно это VPN)."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("1.1.1.1", 443))
+        return probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+
+
+def direct_avito_ip(host: str = "www.avito.ru") -> str | None:
+    """Адрес Авито, который на этой машине идёт МИМО VPN.
+
+    У avito.ru несколько A-записей, а исключение в VPN-клиенте прописано на ту, которую он
+    разрезолвил сам: остальные уходят в туннель, и оттуда прилетает «Доступ ограничен:
+    проблема с IP». Браузер об этом не знает и берёт адрес как повезёт, поэтому нужный мы
+    находим сами — по тому, каким локальным адресом вышло соединение.
+    """
+    default_ip = _default_local_ip()
+    try:
+        candidates = [info[4][0] for info in socket.getaddrinfo(host, 443, socket.AF_INET,
+                                                                socket.SOCK_STREAM)]
+    except socket.gaierror:
+        return None
+    for address in dict.fromkeys(candidates):
+        try:
+            with socket.create_connection((address, 443), timeout=10) as sock:
+                if default_ip is None or sock.getsockname()[0] != default_ip:
+                    return address
+        except OSError:
+            continue
+    return None
+
+
 def _browser_context(playwright, account: str, *, headless: bool):
     """Постоянный профиль: куки и localStorage живут между запусками, вход — один раз."""
+    args = ["--disable-blink-features=AutomationControlled"]
+    direct = direct_avito_ip()
+    if direct:
+        # Прибиваем имена Авито к адресу, который выпущен мимо VPN. Иначе браузер сам
+        # выберет A-запись, та уйдёт в туннель, и Авито ответит блокировкой по IP.
+        rules = ",".join(f"MAP {name} {direct}" for name in
+                         ("avito.ru", "*.avito.ru", "avito.st", "*.avito.st"))
+        args.append(f"--host-resolver-rules={rules}")
+        print(f"адрес Авито мимо VPN: {direct}")
+    else:
+        print("ВНИМАНИЕ: прямого адреса Авито не нашлось — пойдём через VPN, "
+              "возможен отказ «проблема с IP»")
     return playwright.chromium.launch_persistent_context(
         user_data_dir=str(profile_path(account)),
         channel="chrome",
@@ -144,7 +197,7 @@ def _browser_context(playwright, account: str, *, headless: bool):
         locale="ru-RU",
         timezone_id="Europe/Moscow",
         viewport={"width": 1600, "height": 900},
-        args=["--disable-blink-features=AutomationControlled"],
+        args=args,
     )
 
 
@@ -196,6 +249,17 @@ def command_probe(args) -> int:
     return 0 if status == "ok" else 1
 
 
+def _maybe_json(payload: Any) -> Any:
+    """Кадр сокета — либо JSON, либо служебный текст; разбираем что можем, остальное как есть."""
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8", "replace")
+    text = str(payload)
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return text[:2000]
+
+
 def command_capture(args) -> int:
     """Записывает сырые сетевые ответы мессенджера — основа для разбора.
 
@@ -212,54 +276,175 @@ def command_capture(args) -> int:
         page = context.pages[0] if context.pages else context.new_page()
 
         def on_response(response):
-            url = response.url
-            if "messenger" not in url and "/web/" not in url:
-                return
             try:
                 if "application/json" not in (response.headers.get("content-type") or ""):
                     return
-                captured.append({"url": url, "status": response.status,
-                                 "body": response.json()})
+                captured.append({"kind": "http", "url": response.url,
+                                 "status": response.status, "body": response.json()})
             except Exception:  # noqa: BLE001
                 return
 
+        def on_websocket(ws):
+            # Переписку мессенджер получает сокетом, а не запросами: без кадров сокета
+            # разбирать нечего.
+            captured.append({"kind": "ws-open", "url": ws.url})
+            ws.on("framereceived", lambda payload: captured.append(
+                {"kind": "ws-in", "url": ws.url, "body": _maybe_json(payload)}))
+            ws.on("framesent", lambda payload: captured.append(
+                {"kind": "ws-out", "url": ws.url, "body": _maybe_json(payload)}))
+
         page.on("response", on_response)
+        page.on("websocket", on_websocket)
         page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=90000)
         page.wait_for_timeout(args.seconds * 1000)
         logged_in = _logged_in(page)
+        html = page.content()
         context.close()
 
     out.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in captured),
                    encoding="utf-8")
-    print(f"вошли: {logged_in}; записано ответов: {len(captured)} -> {out}")
-    for item in captured[:15]:
-        print(f"  {item['status']} {item['url'][:110]}")
+    html_path = out.with_suffix(".html")
+    html_path.write_text(html, encoding="utf-8")
+    kinds: dict[str, int] = {}
+    for item in captured:
+        kinds[item["kind"]] = kinds.get(item["kind"], 0) + 1
+    print(f"вошли: {logged_in}; записано: {kinds} -> {out}")
+    print(f"HTML страницы -> {html_path} ({len(html)} символов)")
+    for item in captured[:25]:
+        print(f"  {item['kind']:7} {str(item.get('status') or ''):3} {item['url'][:100]}")
     return 0
 
 
+def extract_state(html: str) -> dict[str, Any]:
+    """Достаёт встроенное состояние мессенджера из страницы.
+
+    Авито отдаёт мессенджер уже с данными: в одном из script-тегов лежит цельный JSON, а в
+    нём — список чатов. Разбираем именно его, а не вёрстку: имена CSS-классов Авито меняет
+    когда угодно, а контракт собственных данных живёт куда дольше.
+    """
+    # Якорь ищем регулярным выражением, а не подстрокой: подстрока держалась бы на том, что
+    # Авито минифицирует JSON, и первый же пробел после «"channels":» сломал бы разбор молча.
+    match = re.search(r'"channels"\s*:\s*\{\s*"ids"', html)
+    if match is None:
+        return {}
+    anchor = match.start()
+    script_start = html.rfind("<script", 0, anchor)
+    if script_start < 0:
+        return {}
+    body_start = html.find(">", script_start) + 1
+    body_end = html.find("</script>", body_start)
+    try:
+        return json.loads(html[body_start:body_end].strip())
+    except ValueError:
+        return {}
+
+
+def _avito_time(value: Any) -> str | None:
+    """Время Авито — в сотнях наносекунд от эпохи; переводим в обычную метку времени."""
+    try:
+        seconds = int(value) / 10_000_000
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+
+
+def parse_channels(html: str) -> list[dict[str, Any]]:
+    """Список переписок в том виде, в каком их принимает Albery."""
+    state = extract_state(html)
+    channels = (((state.get("state") or {}).get("ssrState") or {}).get("channels")) or {}
+    entities = channels.get("entities") or {}
+    result: list[dict[str, Any]] = []
+    for channel_id in channels.get("ids") or []:
+        entity = entities.get(channel_id) or {}
+        users = entity.get("users") or []
+        # Свой пользователь — тот, у кого есть originalId (числовой id аккаунта); собеседник
+        # приходит без него. Проверено на живых чатах аккаунта владельца.
+        mine = next((u for u in users if u.get("originalId")), None)
+        other = next((u for u in users if u is not mine), None)
+        listing = ((entity.get("context") or {}).get("value")) or {}
+        last = entity.get("lastMessage") or {}
+        text = str(last.get("preview") or last.get("body") or "").strip()
+        author = "operator" if (mine and last.get("fromUid") == mine.get("id")) else "client"
+        messages = []
+        if last.get("id") and text:
+            messages.append({
+                "external_message_id": str(last["id"]),
+                "text": text,
+                "author_type": author,
+                "author_name": (mine if author == "operator" else other or {}).get("name") or "",
+                "occurred_at": _avito_time(last.get("created")),
+            })
+        listing_id = str(listing.get("id") or "")
+        result.append({
+            "external_chat_id": str(channel_id),
+            "display_name": str((other or {}).get("name") or "Собеседник"),
+            "listing": {
+                "id": listing_id,
+                "title": str(listing.get("title") or listing.get("name") or ""),
+                "price": str(listing.get("priceString") or listing.get("price") or ""),
+                "url": f"https://www.avito.ru/{listing_id}" if listing_id else "",
+            },
+            "update_id": f"{channel_id}:{last.get('id') or entity.get('updated') or ''}",
+            "messages": messages,
+        })
+    return result
+
+
 def command_mirror(args) -> int:
+    from playwright.sync_api import sync_playwright
+
     albery = albery_from_env()
-    worker_id = f"avito-worker:{os.getenv('COMPUTERNAME') or os.uname().nodename}:{os.getpid()}"
+    worker_id = f"avito-worker:{os.getenv('COMPUTERNAME') or 'pc'}:{os.getpid()}"
     print(f"Зеркало запущено ({worker_id}). Аккаунт: {args.account}. Ctrl+C — остановка.")
-    while True:
+
+    with sync_playwright() as playwright:
+        context = _browser_context(playwright, args.account, headless=not args.show)
+        page = context.pages[0] if context.pages else context.new_page()
         try:
-            pending = albery.claim_outbox(worker_id, args.account)
-            if pending:
-                print(f"в очереди на отправку: {len(pending)}")
-            for item in pending:
-                # Отправку включим сразу после того, как разбор мессенджера будет снят
-                # с живой сессии (команда capture). Пока строку возвращаем в очередь
-                # честно: «не отправлено» лучше, чем тихо потерянное сообщение.
-                albery.finish(item["outbox_id"], worker_id, "failed",
-                              error="отправка в Авито ещё не подключена")
-        except RuntimeError as exc:
-            print(f"Albery недоступен: {exc}")
+            while True:
+                try:
+                    page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=90000)
+                    page.wait_for_timeout(2500)
+                    if not _logged_in(page):
+                        albery.report_session(args.account, "needs_login",
+                                              "Авито просит войти заново")
+                        print("сессия просрочена — нужен повторный вход (команда login)")
+                        return 1
+                    channels = parse_channels(page.content())
+                    albery.report_session(args.account, "ok")
+                    stored = 0
+                    for channel in channels:
+                        answer = albery.push_inbound({"account": args.account, **channel})
+                        stored += int(answer.get("stored_messages") or 0)
+                    print(f"переписок: {len(channels)}, новых сообщений: {stored}")
+                except RuntimeError as exc:
+                    print(f"Albery недоступен: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"сбой обхода: {type(exc).__name__}: {exc}")
+                    albery.report_session(args.account, "error", str(exc)[:300])
+
+                try:
+                    pending = albery.claim_outbox(worker_id, args.account)
+                    for item in pending:
+                        # Отправка включается следующим шагом. Пока строка возвращается с
+                        # честным «не отправлено»: тихо потерянное сообщение хуже отказа.
+                        albery.finish(item["outbox_id"], worker_id, "failed",
+                                      error="отправка в Авито ещё не подключена")
+                    if pending:
+                        print(f"строк в очереди отправки: {len(pending)} (пока не отправляем)")
+                except RuntimeError as exc:
+                    print(f"очередь недоступна: {exc}")
+
+                if args.once:
+                    return 0
+                time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
             print("\nОстановлено.")
             return 0
-        if args.once:
-            return 0
-        time.sleep(POLL_SECONDS)
+        finally:
+            context.close()
 
 
 def main() -> int:
@@ -279,6 +464,7 @@ def main() -> int:
             item.add_argument("--out", default="")
         if name == "mirror":
             item.add_argument("--once", action="store_true", help="один проход и выход")
+            item.add_argument("--show", action="store_true", help="показать окно браузера")
 
     args = parser.parse_args()
     handlers = {"login": command_login, "probe": command_probe,
