@@ -293,14 +293,18 @@ def command_capture(args) -> int:
             try:
                 if "application/json" not in (response.headers.get("content-type") or ""):
                     return
+                # Записываем и ЗАПРОС: мессенджер спрашивает данные по JSON-RPC, и без тела
+                # запроса ответ невозможно повторить — видно «что пришло», но не «о чём спросили».
                 captured.append({"kind": "http", "url": response.url,
-                                 "status": response.status, "body": response.json()})
+                                 "status": response.status,
+                                 "request": _maybe_json(response.request.post_data or ""),
+                                 "body": response.json()})
             except Exception:  # noqa: BLE001
                 return
 
         def on_websocket(ws):
-            # Переписку мессенджер получает сокетом, а не запросами: без кадров сокета
-            # разбирать нечего.
+            # Сокет мессенджера живёт в web-воркере, и его кадры сюда обычно НЕ попадают —
+            # поэтому список чатов записываем отдельно, спросив его тем же протоколом.
             captured.append({"kind": "ws-open", "url": ws.url})
             ws.on("framereceived", lambda payload: captured.append(
                 {"kind": "ws-in", "url": ws.url, "body": _maybe_json(payload)}))
@@ -313,6 +317,10 @@ def command_capture(args) -> int:
         page.wait_for_timeout(args.seconds * 1000)
         logged_in = _logged_in(page)
         html = page.content()
+        try:
+            captured.append({"kind": "rpc", "url": RPC_CHATS, "body": rpc(page, RPC_CHATS)})
+        except Exception as error:  # noqa: BLE001
+            captured.append({"kind": "rpc", "url": RPC_CHATS, "body": str(error)})
         context.close()
 
     out.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in captured),
@@ -329,28 +337,55 @@ def command_capture(args) -> int:
     return 0
 
 
-def extract_state(html: str) -> dict[str, Any]:
-    """Достаёт встроенное состояние мессенджера из страницы.
+# Мессенджер разговаривает с Авито своим протоколом — JSON-RPC. Обычно он идёт по сокету из
+# web-воркера (снаружи такие запросы не видны вовсе), но у сокета есть HTTP-двойник, и он
+# принимает те же методы с той же сессией браузера. Спрашиваем данные им, а не вычитываем со
+# страницы: это СОБСТВЕННЫЙ контракт мессенджера, он переживает и вёрстку, и перерисовки.
+RPC_URL = "/web/1/socket/fallback?app_name=web&app_version=7.596.2&id_version=v3"
+RPC_CHATS = "avito.getChats.v5"
+RPC_HISTORY = "messenger.history.v2"
+RPC_SESSION = "avito.getSession"
 
-    Авито отдаёт мессенджер уже с данными: в одном из script-тегов лежит цельный JSON, а в
-    нём — список чатов. Разбираем именно его, а не вёрстку: имена CSS-классов Авито меняет
-    когда угодно, а контракт собственных данных живёт куда дольше.
-    """
-    # Якорь ищем регулярным выражением, а не подстрокой: подстрока держалась бы на том, что
-    # Авито минифицирует JSON, и первый же пробел после «"channels":» сломал бы разбор молча.
-    match = re.search(r'"channels"\s*:\s*\{\s*"ids"', html)
-    if match is None:
-        return {}
-    anchor = match.start()
-    script_start = html.rfind("<script", 0, anchor)
-    if script_start < 0:
-        return {}
-    body_start = html.find(">", script_start) + 1
-    body_end = html.find("</script>", body_start)
+_RPC_SCRIPT = """
+async ([url, method, params]) => {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    credentials: 'include',
+    body: JSON.stringify({jsonrpc: '2.0', id: Date.now(), method, params}),
+  });
+  return await response.json();
+}
+"""
+
+
+def rpc(page, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Зовёт метод мессенджера из контекста страницы — её же сессией и с её же куками."""
+    answer = page.evaluate(_RPC_SCRIPT, [RPC_URL, method, params or {}])
+    if isinstance(answer, dict) and answer.get("error"):
+        raise RuntimeError(f"{method}: {answer['error'].get('message') or answer['error']}")
+    return (answer or {}).get("result") or {}
+
+
+def own_user_id(page) -> str:
+    """Числовой идентификатор нашего аккаунта — по нему отличаем свои сообщения от чужих."""
     try:
-        return json.loads(html[body_start:body_end].strip())
-    except ValueError:
-        return {}
+        return str(rpc(page, RPC_SESSION).get("userId") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def item_chat_id(page, item_id: str) -> str:
+    """Идентификатор чата по объявлению — по данным Авито, а не по адресу страницы.
+
+    Со страницы объявления в чат не переходят: окно переписки открывается прямо на ней.
+    Поэтому настоящий идентификатор чата берём здесь — он же нужен, чтобы связать разговор.
+    """
+    for channel in rpc(page, RPC_CHATS).get("channels") or []:
+        context = channel.get("context") or {}
+        if str(((context.get("value") or {}).get("id")) or "") == str(item_id):
+            return str(channel.get("channelId") or "")
+    return ""
 
 
 def _avito_time(value: Any) -> str | None:
@@ -387,18 +422,31 @@ def _message_text(message: dict[str, Any]) -> str:
     return labels.get(kind, "")
 
 
-def parse_channels(html: str) -> list[dict[str, Any]]:
-    """Список переписок в том виде, в каком их принимает Albery."""
-    state = extract_state(html)
-    channels = (((state.get("state") or {}).get("ssrState") or {}).get("channels")) or {}
-    entities = channels.get("entities") or {}
+def _user_original_id(user: dict[str, Any]) -> str:
+    """Числовой id пользователя. У Авито он лежит в профиле, а не в самой записи участника."""
+    profile = user.get("publicUserProfile") or {}
+    return str(user.get("originalId") or profile.get("originalId") or "")
+
+
+def parse_channels(payload: Any, *, own_id: str = "") -> list[dict[str, Any]]:
+    """Список переписок в том виде, в каком их принимает Albery.
+
+    На вход — ответ `avito.getChats.v5`. Разбор вынесен в чистую функцию: он закреплён
+    тестами на синтетическом примере, настоящие переписки владельца в репозиторий не попадают.
+    """
+    channels = (payload or {}).get("channels") or []
     result: list[dict[str, Any]] = []
-    for channel_id in channels.get("ids") or []:
-        entity = entities.get(channel_id) or {}
+    for entity in channels:
+        channel_id = str(entity.get("channelId") or "")
+        if not channel_id:
+            continue
         users = entity.get("users") or []
-        # Свой пользователь — тот, у кого есть originalId (числовой id аккаунта); собеседник
-        # приходит без него. Проверено на живых чатах аккаунта владельца.
-        mine = next((u for u in users if u.get("originalId")), None)
+        # Свой участник — тот, чей числовой id совпадает с id нашего аккаунта. Раньше своим
+        # считался «тот, у кого вообще есть originalId», но в ответе сокета он есть у обоих:
+        # так вся переписка записалась бы как чужая.
+        mine = next((u for u in users if own_id and _user_original_id(u) == own_id), None)
+        if mine is None:
+            mine = next((u for u in users if _user_original_id(u)), None)
         other = next((u for u in users if u is not mine), None)
         listing = ((entity.get("context") or {}).get("value")) or {}
         last = entity.get("lastMessage") or {}
@@ -410,12 +458,12 @@ def parse_channels(html: str) -> list[dict[str, Any]]:
                 "external_message_id": str(last["id"]),
                 "text": text,
                 "author_type": author,
-                "author_name": (mine if author == "operator" else other or {}).get("name") or "",
+                "author_name": ((mine if author == "operator" else other) or {}).get("name") or "",
                 "occurred_at": _avito_time(last.get("created")),
             })
         listing_id = str(listing.get("id") or "")
         result.append({
-            "external_chat_id": str(channel_id),
+            "external_chat_id": channel_id,
             "display_name": str((other or {}).get("name") or "Собеседник"),
             "listing": {
                 "id": listing_id,
@@ -431,8 +479,10 @@ def parse_channels(html: str) -> list[dict[str, Any]]:
 
 REPLY_INPUT = '[data-marker="reply/input"]'
 MESSAGE_TEXT = '[data-marker="messageText"]'
-# Встроенное окошко на странице объявления: «Написать» открывает его, а не мессенджер.
-ICEBREAKER_INPUT = '[data-marker="icebreakers/extended-input"]'
+# Виджет переписки живёт на САМОЙ странице объявления (разметка icebreakers), отдельного окна
+# нет: кнопка «Написать» лишь подводит к нему.
+ITEM_MESSAGE_BUTTON = '[data-marker="messenger-button/button"]'
+ICEBREAKER_INPUT = '[data-marker="icebreakers/textarea"], [data-marker="icebreakers/extended-input"]'
 ICEBREAKER_SEND = '[data-marker="icebreakers/send-message"]'
 
 
@@ -447,12 +497,18 @@ def _type_like_a_human(page, selector: str, text: str) -> None:
     field.type(text, delay=random.randint(18, 55))
 
 
+def _history_messages(page, chat_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    return list(rpc(page, RPC_HISTORY, {"channelId": chat_id, "limit": limit,
+                                        "offset": 0}).get("items") or [])
+
+
 def send_message(page, chat_id: str, text: str) -> tuple[bool, str]:
     """Отправляет сообщение в существующий чат и ПРОВЕРЯЕТ, что оно появилось в переписке.
 
-    Возвращает (успех, пояснение). Успехом считается только увиденное в истории сообщение:
-    нажатая клавиша — это ещё не доставка, а «кажется, отправилось» в журнале хуже честного
-    отказа, потому что оператор перестанет перепроверять.
+    Возвращает (успех, пояснение). Успех — это НОВОЕ сообщение с нашим текстом в истории,
+    которую отдаёт сам Авито. Нажатая клавиша — ещё не доставка, а «кажется, отправилось» в
+    журнале хуже честного отказа: оператор перестанет перепроверять. Сверяем именно новые
+    сообщения, а не наличие текста: тот же ответ мог уже стоять в переписке раньше.
     """
     page.goto(f"{MESSENGER_URL}/channel/{chat_id}", wait_until="domcontentloaded", timeout=90000)
     try:
@@ -462,73 +518,69 @@ def send_message(page, chat_id: str, text: str) -> tuple[bool, str]:
             return False, "сессия просрочена — нужен повторный вход"
         return False, "поле ввода не найдено: возможно, Авито поменял мессенджер"
 
+    try:
+        seen = {str(m.get("id")) for m in _history_messages(page, chat_id)}
+    except Exception as error:  # noqa: BLE001
+        return False, f"история переписки недоступна ({error})"
+
     page.wait_for_timeout(random.randint(*HUMAN_PAUSE_MS))
     _type_like_a_human(page, REPLY_INPUT, text)
     page.keyboard.press("Enter")
 
     needle = text.strip()[:60]
-    try:
-        page.wait_for_function(
-            """([selector, needle]) => Array.from(document.querySelectorAll(selector))
-                   .some(node => (node.textContent || '').includes(needle))""",
-            arg=[MESSAGE_TEXT, needle],
-            timeout=20000,
-        )
-    except Exception:  # noqa: BLE001
-        # Ушло или нет — неизвестно: повторять нельзя, человек может получить дубль.
-        return False, "unknown: сообщение не появилось в переписке за 20 секунд"
-    return True, page.url.rsplit("/", 1)[-1]
+    for attempt in range(4):
+        page.wait_for_timeout(2000 + attempt * 2000)
+        try:
+            fresh = [m for m in _history_messages(page, chat_id) if str(m.get("id")) not in seen]
+        except Exception as error:  # noqa: BLE001
+            return False, f"unknown: история переписки недоступна ({error})"
+        for message in fresh:
+            if needle in _message_text(message):
+                return True, str(message.get("id") or "")
+    # Ушло или нет — неизвестно: повторять нельзя, человек может получить дубль.
+    return False, "unknown: сообщение не появилось в переписке"
 
 
 def start_chat_from_item(page, item_id: str, text: str) -> tuple[bool, str]:
-    """Пишет первым автору объявления: открывает объявление, жмёт «Написать», отправляет.
+    """Пишет первым автору объявления прямо со страницы объявления.
 
-    Возвращает (успех, id чата или причина). Чат создаётся самим Авито в момент отправки,
-    поэтому его идентификатор забираем из адреса уже после доставки.
+    Возвращает (успех, id чата или причина). Чат создаёт сам Авито в момент отправки, и
+    настоящий его идентификатор мы СПРАШИВАЕМ У АВИТО, а не вычитываем из адреса страницы:
+    перехода в чат не происходит, адрес остаётся адресом объявления. Раньше из-за этого
+    разговор так и оставался с временным ключом (случай 19.08.2026, разговор 648).
+
+    Успехом считается только чат, который Авито показывает в своём же списке. Появление
+    текста на странице — не доказательство: 19.08.2026 страница показывала отправленным
+    сообщение, которого у Авито не было вовсе.
     """
     page.goto(f"https://www.avito.ru/{item_id}", wait_until="domcontentloaded", timeout=90000)
     page.wait_for_timeout(random.randint(*HUMAN_PAUSE_MS))
     if not _logged_in(page):
         return False, "сессия просрочена — нужен повторный вход"
+    if "404" in (page.title() or ""):
+        return False, "объявление снято: страница отдаёт 404"
 
-    opened = False
-    # ВАЖНО: сюда нельзя класть кнопку отправки встроенного окошка — до ввода текста она
-    # неактивна, и клик по ней висит до таймаута (проверено 19.08.2026).
-    for locator in (page.locator('[data-marker="item-contact-bar/message"]'),
-                    page.get_by_role("button", name=re.compile("Написать", re.I)),
-                    page.get_by_role("link", name=re.compile("Написать", re.I))):
-        try:
-            if locator.count():
-                locator.first.click(timeout=15000)
-                opened = True
-                break
-        except Exception:  # noqa: BLE001
-            continue
-    if not opened:
-        return False, "кнопка «Написать» не найдена: объявление снято или изменилась страница"
-
-    # Кнопка «Написать» на объявлении открывает НЕ мессенджер, а встроенное окошко прямо на
-    # странице (разметка icebreakers). Ожидание поля мессенджера здесь висело до таймаута —
-    # проверено на живой странице 19.08.2026.
+    # Кнопка «Написать» не открывает окно, а подводит к виджету переписки на той же странице.
+    # Клик по ней не обязателен, но с ним виджет гарантированно попадает в поле зрения.
+    button = page.locator(ITEM_MESSAGE_BUTTON).first
     try:
-        page.wait_for_selector(f"{ICEBREAKER_INPUT}, {REPLY_INPUT}", timeout=30000)
+        if button.count():
+            button.click(timeout=15000)
+            page.wait_for_timeout(random.randint(*HUMAN_PAUSE_MS))
     except Exception:  # noqa: BLE001
-        return False, "окно переписки не открылось"
+        pass
 
-    # Печатаем в САМО поле ввода, а не в обёртку: замер показал, что после открытия
-    # окошка на странице ровно одно textarea. Ввод в обёртку не долетал до виджета, и его
-    # кнопка отправки оставалась неактивной — 29 попыток клика по «element is not enabled».
-    page.wait_for_timeout(random.randint(*HUMAN_PAUSE_MS))
-    field = page.locator("textarea").first
+    field = page.locator(f"{ICEBREAKER_INPUT}, {REPLY_INPUT}").first
     if not field.count():
-        return False, "поле ввода во встроенном окне не найдено"
+        return False, "поле переписки на объявлении не найдено: писать автору здесь нельзя"
     field.click()
     field.type(text, delay=random.randint(18, 55))
     page.wait_for_timeout(random.randint(400, 900))
 
-    # Сначала Enter — так отправляет человек. Кнопка остаётся запасным путём.
+    # Отправляет Enter. Кнопка виджета остаётся НЕактивной даже при заполненном поле
+    # (19.08.2026: 29 попыток клика по «element is not enabled»), поэтому она — запасной путь.
     page.keyboard.press("Enter")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(2000)
     send_button = page.locator(ICEBREAKER_SEND).first
     try:
         if send_button.count() and send_button.is_enabled():
@@ -536,22 +588,16 @@ def start_chat_from_item(page, item_id: str, text: str) -> tuple[bool, str]:
     except Exception:  # noqa: BLE001
         pass
 
-    # Успех — это либо переход в сам чат, либо появление нашего текста в переписке.
-    needle = text.strip()[:60]
-    try:
-        page.wait_for_function(
-            """([selector, needle]) => location.href.includes('/messenger/channel/')
-                   || Array.from(document.querySelectorAll(selector))
-                        .some(node => (node.textContent || '').includes(needle))""",
-            arg=[MESSAGE_TEXT, needle],
-            timeout=25000,
-        )
-    except Exception:  # noqa: BLE001
-        return False, "unknown: подтверждения отправки не увидели за 25 секунд"
-
-    page.wait_for_timeout(1500)
-    match = re.search(r"/messenger/channel/([^/?#]+)", page.url)
-    return True, match.group(1) if match else f"item:{item_id}"
+    # Спрашиваем у Авито: появился ли чат по этому объявлению. Список обновляется не мгновенно.
+    for attempt in range(4):
+        page.wait_for_timeout(2500 + attempt * 2500)
+        try:
+            chat_id = item_chat_id(page, item_id)
+        except Exception as error:  # noqa: BLE001
+            return False, f"unknown: список чатов недоступен ({error})"
+        if chat_id:
+            return True, chat_id
+    return False, "unknown: Авито не показывает чат по этому объявлению после отправки"
 
 
 def search_listings(page, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -682,7 +728,7 @@ def command_mirror(args) -> int:
                                               "Авито просит войти заново")
                         print("сессия просрочена — нужен повторный вход (команда login)")
                         return 1
-                    channels = parse_channels(page.content())
+                    channels = parse_channels(rpc(page, RPC_CHATS), own_id=own_user_id(page))
                     albery.report_session(args.account, "ok")
                     stored = 0
                     for channel in channels:
