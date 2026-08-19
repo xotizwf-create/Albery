@@ -30,7 +30,10 @@ from flask import Blueprint, Response, current_app, jsonify, request
 from psycopg.types.json import Json
 
 import funnel_workspace_store as store
-from app import pg_connect
+# База — напрямую из общего слоя, а не через приложение: этот модуль зовут не только из веба,
+# но и из роли MCP (инструменты агента) и из скриптов, а тянуть туда всё приложение ради одного
+# соединения — лишние сотни мегабайт на коробке с 2 ГБ.
+from shared.db import connect as pg_connect
 
 SOURCE_KEY = "avito"
 SOURCE_TYPE = "avito_web"
@@ -366,12 +369,16 @@ def avito_messages(conversation_id: int):
         return _bad("Не удалось загрузить переписку.", 500)
 
 
-def _delivery_block_reason(conversation: dict[str, Any]) -> str | None:
-    """Почему ответ отправить нельзя. Пустая очередь честнее ложного «отправлено»."""
+def delivery_block_reason(account_slug: str) -> str | None:
+    """Почему сообщение в этот аккаунт Авито сейчас не доставить (или None).
+
+    Публичная — тем же правилом обязаны пользоваться и кабинет, и инструменты агента:
+    строка, поставленная в очередь, которую никто не разгребает, выглядит как «отправлено»
+    и не доставляется. Двух разных ответов на вопрос «можно ли отправить» быть не должно.
+    """
     if not transport_enabled():
         return ("Транспорт Авито выключен (AVITO_CHANNEL_ENABLED=0) — сообщение никто не доставит. "
                 "Включите канал на сервере, тогда ответы уйдут.")
-    account_slug = conversation["account_slug"]
     account = get_account(account_slug) if account_slug else None
     if not account:
         return f"Аккаунт «{account_slug or '—'}» не зарегистрирован в канале."
@@ -383,6 +390,10 @@ def _delivery_block_reason(conversation: dict[str, Any]) -> str | None:
         return (f"Сессия аккаунта «{account['label']}»: "
                 f"{human.get(account['session_status'], account['session_status'])}.")
     return None
+
+
+def _delivery_block_reason(conversation: dict[str, Any]) -> str | None:
+    return delivery_block_reason(str(conversation.get("account_slug") or ""))
 
 
 @avito_bp.post(f"{API_PREFIX}/conversations/<int:conversation_id>/reply")

@@ -5,11 +5,19 @@
 вынесена из ``mcp/context_server.py``: тот файл уже монолит, а эти операции трогают
 живую переписку с клиентами и обязаны быть покрыты тестами отдельно.
 
+Набор — ОДИН НА ВСЕ КАНАЛЫ (Telegram, клиентский бот, Авито). Переписки всех каналов лежат
+в одних таблицах, поэтому второй комплект инструментов «для Авито» означал бы два места, где
+чинят одно и то же. Канал виден в карточке обращения и служит фильтром, а не поводом
+заводить отдельный инструмент.
+
 Границы, которые здесь соблюдаются:
 
 * Отвечать клиенту агент может только когда диалог ведёт он сам. Если оператор забрал
   разговор себе, инструмент отказывает — иначе клиент получит два ответа, и вся защита
   от двойных ответов в очереди отправки теряет смысл.
+* Отправка отказывает, если канал не может доставить (транспорт Авито выключен, сессия
+  аккаунта не жива). Иначе агент увидит «поставлено в очередь» и решит, что ответил, а
+  строку никто не разгребёт.
 * Инструменты предназначены операторскому контуру (агент ИУ в Битриксе). Клиентский
   коннектор остаётся с нулевым набором инструментов: недоверенный текст клиента не
   должен получать доступ к чужим диалогам.
@@ -38,6 +46,14 @@ CONTROL_LABELS = {
     "ai": "отвечает ИИ",
     "human": "отвечает человек",
     "paused": "ответы приостановлены",
+}
+
+AVITO_SOURCE_KEY = "avito"
+
+CHANNEL_LABELS = {
+    "telegram": "Telegram",
+    "telegram_bot": "Telegram (бот)",
+    AVITO_SOURCE_KEY: "Авито",
 }
 
 
@@ -78,6 +94,28 @@ def _waiting_minutes(value: Any) -> int | None:
     return max(0, int((datetime.now(timezone.utc) - value).total_seconds() // 60))
 
 
+def _source_key(row: Mapping[str, Any]) -> str:
+    return str(row.get("source_key") or "")
+
+
+def _channel_label(row: Mapping[str, Any]) -> str:
+    source_key = _source_key(row)
+    return CHANNEL_LABELS.get(source_key, str(row.get("source_name") or source_key or "—"))
+
+
+def _transport_block_reason(conversation: Mapping[str, Any]) -> str | None:
+    """Может ли канал этого обращения доставить сообщение прямо сейчас.
+
+    Для Авито ответ знает сам канал (транспорт выключен, аккаунт выключен, сессия не жива).
+    Импорт ленивый: роль MCP не должна тянуть модуль канала, пока агент не тронул Авито.
+    """
+    if _source_key(conversation) != AVITO_SOURCE_KEY:
+        return None
+    import avito_channel
+
+    return avito_channel.delivery_block_reason(str(conversation.get("business_connection_id") or ""))
+
+
 def _conversation_brief(row: Mapping[str, Any]) -> dict[str, Any]:
     """Короткая карточка обращения — то, по чему агент ориентируется в списке."""
     waiting_minutes = _waiting_minutes(row.get("awaiting_reply_since"))
@@ -91,17 +129,21 @@ def _conversation_brief(row: Mapping[str, Any]) -> dict[str, Any]:
         work_state = store.WORK_STATE_CLIENT_WAITING
     else:
         work_state = store.WORK_STATE_WAITING_CLIENT
+    channel = _channel_label(row)
+    # Имя канала в подписи, а не «Telegram» всегда: обращение с Авито, подписанное телеграмом,
+    # уводит агента в неверный вывод о том, откуда пришёл человек и как с ним говорить.
     name = (
         row.get("display_name")
         or (f"@{row['username']}" if row.get("username") else None)
-        or f"Telegram {row.get('external_chat_id')}"
+        or f"{channel} {row.get('external_chat_id')}"
     )
-    return {
+    brief = {
         "conversation_id": int(row["id"]),
         "url": funnel_workspace.conversation_url(row["id"]),
+        "channel": channel,
+        "channel_key": _source_key(row),
         "client": name,
         "username": row.get("username"),
-        "telegram_id": row.get("external_user_id"),
         "deal_id": row.get("deal_id"),
         "stage_id": row.get("stage_id"),
         "status": row.get("status"),
@@ -116,6 +158,35 @@ def _conversation_brief(row: Mapping[str, Any]) -> dict[str, Any]:
         "last_message": row.get("last_message_text"),
         "last_message_at": row.get("last_message_at"),
     }
+    if _source_key(row) in ("telegram", "telegram_bot"):
+        brief["telegram_id"] = row.get("external_user_id")
+    listing = (row.get("metadata") or {}).get("listing")
+    if isinstance(listing, Mapping) and listing.get("id"):
+        # Разговор на Авито всегда идёт вокруг объявления — без него агент не поймёт, о чём
+        # спрашивает человек и что мы ему писали.
+        brief["listing"] = {
+            "id": str(listing.get("id") or ""),
+            "title": str(listing.get("title") or ""),
+            "price": str(listing.get("price") or ""),
+            "url": str(listing.get("url") or ""),
+        }
+    return brief
+
+
+def _channel_filter(args: Mapping[str, Any]) -> str:
+    """Канал, по которому фильтруем список: принимаем и наш ключ, и человеческое название."""
+    value = str(args.get("channel") or args.get("source") or "").strip().lower()
+    if not value:
+        return ""
+    if value in CHANNEL_LABELS:
+        return value
+    for key, label in CHANNEL_LABELS.items():
+        if value == label.lower():
+            return key
+    raise WorkspaceToolError(
+        "Неизвестный канал. Доступны: "
+        + ", ".join(f"{key} ({label})" for key, label in CHANNEL_LABELS.items())
+    )
 
 
 def list_conversations(args: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -128,6 +199,7 @@ def list_conversations(args: Mapping[str, Any] | None = None) -> dict[str, Any]:
         state=str(args.get("state") or "").strip(),
         urgency=str(args.get("urgency") or "").strip(),
         status=str(args.get("status") or "").strip(),
+        source=_channel_filter(args),
         limit=max(1, min(MAX_LIST_LIMIT, limit)),
     )
     items = [_conversation_brief(row) for row in result["items"]]
@@ -207,6 +279,10 @@ def reply(args: Mapping[str, Any]) -> dict[str, Any]:
         )
     if conversation.get("status") not in store.ACTIVE_STATUSES:
         raise WorkspaceToolError("Обращение закрыто — отвечать в нём нельзя.")
+    blocked = _transport_block_reason(conversation)
+    if blocked:
+        # Строка в очереди, которую некому разгрести, выглядит как отправленный ответ.
+        raise WorkspaceToolError(f"{blocked} Ответ НЕ поставлен в очередь.")
     result = store.enqueue_outgoing_agent(
         conversation_id,
         text=text,
@@ -271,10 +347,29 @@ def set_status(args: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def set_control(args: Mapping[str, Any]) -> dict[str, Any]:
-    """Передать диалог человеку или вернуть его агенту."""
+def _ai_control_block_reason(conversation: Mapping[str, Any]) -> str | None:
+    """Можно ли отдать этот разговор ИИ — по правилам ЕГО канала.
+
+    У Telegram это точечный список раскатки, и спрашивать его про Авито бессмысленно: там нет
+    ни telegram-id, ни раскатки, и отказ звучал бы как «ИИ не включён для Telegram-канала» на
+    разговоре с Авито. Для Авито важно другое — сможет ли канал доставить ответ. Автоответов
+    на Авито нет: агент отвечает по запросу, поэтому передача разговора ИИ ничего не запускает
+    сама по себе.
+    """
+    if _source_key(conversation) == AVITO_SOURCE_KEY:
+        return _transport_block_reason(conversation)
     import funnel_telegram_gateway
 
+    if not funnel_telegram_gateway.ai_allowed_in_channel(
+        conversation,
+        conversation.get("external_user_id"),
+    ):
+        return "ИИ не включён для Telegram-канала этого диалога."
+    return None
+
+
+def set_control(args: Mapping[str, Any]) -> dict[str, Any]:
+    """Передать диалог человеку или вернуть его агенту."""
     conversation_id = _int_arg(args, "conversation_id")
     mode = _text_arg(args, "mode", limit=20).lower()
     if mode not in store.VALID_CONTROL_MODES:
@@ -282,11 +377,10 @@ def set_control(args: Mapping[str, Any]) -> dict[str, Any]:
             "Режим должен быть одним из: " + ", ".join(sorted(store.VALID_CONTROL_MODES))
         )
     conversation = store.get_conversation(conversation_id)
-    if mode == "ai" and not funnel_telegram_gateway.ai_allowed_in_channel(
-        conversation,
-        conversation.get("external_user_id"),
-    ):
-        raise WorkspaceToolError("ИИ не включён для Telegram-канала этого диалога.")
+    if mode == "ai":
+        blocked = _ai_control_block_reason(conversation)
+        if blocked:
+            raise WorkspaceToolError(blocked)
     updated = store.transition_control(
         conversation_id,
         mode=mode,
