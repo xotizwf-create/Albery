@@ -7,6 +7,8 @@ Signals:
 - HTTP 500 on /mcp* endpoints (tools broken while the site looks healthy);
 - bot-turn failures in the journal (timeouts, failed/empty hermes runs, queue overflow);
 - bitrix_bot_interactions rows with status<>'ok' or latency >= 300s in the last hour;
+- канал Авито (когда включён): выход не отзывался 30 минут, сессия аккаунта не жива или
+  сообщения висят в очереди — выход живёт на машине владельца, и его пропажа была невидимой;
 - available RAM below 150 MB (the box has 2 GB and has been OOM-killed before);
 - батч-синк run_daily_sync: последний run_finished старше 2 часов или упал;
 - systemd failed units и заполнение диска / от 85% (>=92% — КРИТИЧНО, без анти-спам-паузы);
@@ -67,6 +69,12 @@ CRITICAL_SERVICES = ["albery", "albery-tg", "albery-web", "albery-mcp",
 # обращении к данным. «Процесс жив» и «процесс умеет работать» — разные вещи.
 ROLE_ENDPOINTS = {"web": 5003, "mcp": 5004}
 HEALTHZ_TIMEOUT_S = 20
+
+# Канал Авито. Воркер сообщает состояние сессии на каждом обходе (обход — раз в 20 секунд),
+# поэтому полчаса тишины означают, что выхода нет: машина владельца выключена или воркер не
+# запущен. Порог сознательно большой — перезагрузка компьютера не должна будить владельца.
+AVITO_SILENT_AFTER_MIN = 30
+AVITO_QUEUE_STUCK_AFTER_MIN = 30
 EXTERNAL_CHECK_EVERY_S = 3600  # внешние доступы (Google/Zoom/Bitrix) — раз в час, чтобы не ловить лимиты
 
 
@@ -270,6 +278,40 @@ else:
             problems.append(f"ходы бота со статусом error: {errors}")
         if slow:
             problems.append(f"ходы дольше 5 минут: {slow}")
+
+    # --- Канал Авито: жив ли выход ------------------------------------------------------
+    # Выход в Авито — браузер с живой сессией на машине владельца (датацентровый адрес прода
+    # Авито не пускает). Пока эта машина выключена, зеркало не приносит переписку, а ответы
+    # копятся в очереди — и до 19.08.2026 это было СОВСЕМ невидимо: канал просто замолкал.
+    # Молчание не должно выглядеть как «новых сообщений нет».
+    if os.getenv("AVITO_CHANNEL_ENABLED", "0").strip() == "1":
+        egress_sql = (
+            "SELECT count(*) FILTER (WHERE session_status <> 'ok'), "
+            "coalesce(max(extract(epoch FROM now() - session_checked_at) / 60)::int, 999999) "
+            "FROM avito_accounts WHERE is_active"
+        )
+        row = sh(["sudo", "-u", "postgres", "psql", "albery", "-tAc", egress_sql]).strip()
+        if row and "|" in row:
+            broken, silent_min = (int(part or 0) for part in row.split("|"))
+            if silent_min >= AVITO_SILENT_AFTER_MIN:
+                age = "ни разу" if silent_min >= 999999 else f"{silent_min} мин"
+                problems.append(
+                    f"канал Авито: выход не отзывался {age} — на машине владельца не запущен "
+                    f"воркер (scripts/avito_worker.py mirror --account main)")
+            elif broken:
+                problems.append(
+                    f"канал Авито: сессия аккаунта не жива ({broken} шт) — нужен повторный вход "
+                    f"(scripts/avito_worker.py login)")
+        queue_sql = (
+            "SELECT count(*) FROM funnel_workspace_outbox "
+            "WHERE source_key = 'avito' AND delivery_status = 'pending' "
+            f"AND created_at < now() - interval '{AVITO_QUEUE_STUCK_AFTER_MIN} minutes'"
+        )
+        stuck = sh(["sudo", "-u", "postgres", "psql", "albery", "-tAc", queue_sql]).strip()
+        if stuck.isdigit() and int(stuck):
+            problems.append(
+                f"канал Авито: {stuck} сообщений ждут отправки дольше "
+                f"{AVITO_QUEUE_STUCK_AFTER_MIN} мин")
 
 # --- PostgreSQL backup chain: local archive -> SHA-256 -> verified offsite copy ---------
 # This check is deliberately fast: the daily backup jobs hash every byte and validate the
