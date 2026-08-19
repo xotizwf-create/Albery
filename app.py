@@ -16643,6 +16643,14 @@ def require_admin_auth():
 
     if is_workspace_request(path):
         return workspace_request_gate()
+    # Воркер браузерной сессии Авито приходит с машины-выхода по своему токену: сессии
+    # кабинета у него нет и быть не должно. Токен проверяет blueprint канала; здесь дверь
+    # только пропускается мимо админской сессии и мимо общего рубильника /api — иначе
+    # выключенный кабинетный API молча отрезал бы переписку с клиентами.
+    from avito_channel import is_worker_request
+
+    if is_worker_request(path):
+        return None
     if path == "/":
         return redirect("/main", code=302)
     if path.startswith("/api/") and not legacy_http_api_enabled():

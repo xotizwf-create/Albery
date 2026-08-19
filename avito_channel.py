@@ -18,13 +18,16 @@
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import re
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 from flask import Blueprint, Response, current_app, jsonify, request
+from psycopg.types.json import Json
 
 import funnel_workspace_store as store
 from app import pg_connect
@@ -35,6 +38,9 @@ SOURCE_DISPLAY_NAME = "Авито"
 
 PAGE_PREFIX = "/avito"
 API_PREFIX = "/api/agent-center/avito"
+# Воркер браузерной сессии живёт на другой машине (выход в Авито) и приходит по токену,
+# а не по сессии кабинета: у него нет браузера оператора и нет права видеть кабинет.
+WORKER_PREFIX = "/api/avito-worker"
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 _LABEL_MAX = 80
@@ -446,6 +452,237 @@ def avito_control(conversation_id: int):
     except Exception:  # noqa: BLE001
         logging.exception("avito control failed: %s", conversation_id)
         return _bad("Не удалось передать управление.", 500)
+
+
+# --- Дверь воркера браузерной сессии ----------------------------------------------------------
+#
+# Воркер живёт на машине-выходе (у неё российский адрес и браузер с живой сессией Авито) и
+# ходит сюда по токену. Он НЕ получает прав кабинета: только положить входящее, забрать
+# исходящее и отчитаться о состоянии сессии. Веб-процесс, наоборот, никогда не ходит в Авито.
+
+def worker_authorized() -> bool:
+    """Fail closed: без заданного токена дверь закрыта совсем, а не открыта всем."""
+    expected = os.getenv("AVITO_WORKER_TOKEN", "").strip()
+    if not expected:
+        return False
+    provided = str(request.headers.get("X-Avito-Worker-Token") or "").strip()
+    # Сравниваем БАЙТЫ: hmac.compare_digest на строках с не-ASCII символами бросает
+    # TypeError, то есть токен с кириллицей ронял бы дверь в 500 вместо честного отказа.
+    return bool(provided) and hmac.compare_digest(provided.encode("utf-8"),
+                                                  expected.encode("utf-8"))
+
+
+def is_worker_request(path: str) -> bool:
+    return path == WORKER_PREFIX or path.startswith(WORKER_PREFIX + "/")
+
+
+@avito_bp.before_request
+def _guard_worker_routes():
+    if is_worker_request(request.path) and not worker_authorized():
+        return jsonify({"error": "forbidden"}), 403
+    return None
+
+
+@avito_bp.post(f"{WORKER_PREFIX}/session")
+def worker_session_report():
+    body = request.get_json(silent=True) or {}
+    slug = str(body.get("account") or "").strip().lower()
+    status = str(body.get("status") or "").strip()
+    if status not in _SESSION_STATUSES:
+        return _bad(f"Состояние сессии: одно из {', '.join(_SESSION_STATUSES)}.")
+    try:
+        account = set_session_status(slug, status=status, error=str(body.get("error") or "") or None)
+        if not account:
+            return _bad("Аккаунт не найден.", 404)
+        return jsonify({"account": account["slug"], "session_status": account["session_status"]})
+    except Exception:  # noqa: BLE001
+        logging.exception("avito worker session report failed: %s", slug)
+        return _bad("Не удалось записать состояние сессии.", 500)
+
+
+def ingest_inbound(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Кладёт переписку из Авито в общий журнал.
+
+    Идемпотентность держится на двух ключах: сырой пакет пишется в очередь обновлений с
+    внешним идентификатором (повтор доставки не создаёт вторую строку), а каждое сообщение —
+    на уникальном (диалог, внешний id сообщения). Поэтому воркер может смело повторять
+    отправку после обрыва: дубля у оператора не будет.
+    """
+    slug = str(payload.get("account") or "").strip().lower()
+    chat_id = str(payload.get("external_chat_id") or "").strip()
+    if not slug or not chat_id:
+        raise ValueError("Нужны account и external_chat_id.")
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("messages должен быть списком.")
+
+    store.ensure_source(SOURCE_KEY, source_type=SOURCE_TYPE, display_name=SOURCE_DISPLAY_NAME)
+    listing = payload.get("listing") if isinstance(payload.get("listing"), Mapping) else {}
+    conversation = store.ensure_conversation(
+        external_chat_id=chat_id,
+        source_key=SOURCE_KEY,
+        business_connection_id=slug,
+        external_user_id=payload.get("external_user_id"),
+        username=str(payload.get("username") or "") or None,
+        display_name=str(payload.get("display_name") or "") or None,
+        metadata={"listing": dict(listing)} if listing else None,
+    )
+    conversation_id = int(conversation["id"])
+
+    update_key = str(payload.get("update_id") or "").strip() or f"{slug}:{chat_id}:{len(messages)}"
+    inserted = 0
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO funnel_workspace_updates (source_key, external_update_id, payload, "
+                    "processing_status, conversation_id, completed_at) "
+                    "VALUES (%s, %s, %s, 'done', %s, now()) "
+                    "ON CONFLICT (source_key, external_update_id) DO NOTHING",
+                    (SOURCE_KEY, update_key, Json(dict(payload)), conversation_id),
+                )
+                for message in messages:
+                    if not isinstance(message, Mapping):
+                        continue
+                    external_id = str(message.get("external_message_id") or "").strip()
+                    text = str(message.get("text") or "")
+                    if not external_id:
+                        continue
+                    author = str(message.get("author_type") or "client").strip()
+                    if author not in {"client", "agent", "operator", "system"}:
+                        author = "client"
+                    direction = "inbound" if author == "client" else "outbound"
+                    cur.execute(
+                        "INSERT INTO funnel_workspace_messages (conversation_id, external_message_id, "
+                        "author_type, author_name, direction, text, delivery_status, metadata, occurred_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, 'sent', %s, COALESCE(%s, now())) "
+                        "ON CONFLICT (conversation_id, external_message_id) DO NOTHING "
+                        "RETURNING id",
+                        (conversation_id, external_id, author,
+                         str(message.get("author_name") or "") or None, direction, text,
+                         Json({"channel": SOURCE_KEY}), message.get("occurred_at")),
+                    )
+                    if cur.fetchone():
+                        inserted += 1
+                if inserted:
+                    # Превью, счётчик непрочитанного и «последнее слово» пересобираются по
+                    # уцелевшей переписке, а не досчитываются на веру: повторная доставка
+                    # того же пакета не должна раздувать счётчик.
+                    cur.execute(
+                        """
+                        WITH last AS (
+                            SELECT id, text, occurred_at, author_type
+                              FROM funnel_workspace_messages
+                             WHERE conversation_id = %s
+                             ORDER BY id DESC LIMIT 1
+                        ), unread AS (
+                            SELECT count(*) AS n
+                              FROM funnel_workspace_messages m, funnel_workspace_conversations c
+                             WHERE m.conversation_id = %s AND c.id = %s
+                               AND m.author_type = 'client' AND m.id > c.last_read_message_id
+                        )
+                        UPDATE funnel_workspace_conversations c
+                           SET last_message_id = last.id,
+                               last_message_text = left(last.text, 500),
+                               last_message_at = last.occurred_at,
+                               last_author_type = last.author_type,
+                               unread_count = unread.n,
+                               status = CASE WHEN c.status IN ('closed', 'expired') THEN 'open'
+                                             ELSE c.status END,
+                               updated_at = now()
+                          FROM last, unread
+                         WHERE c.id = %s
+                        """,
+                        (conversation_id, conversation_id, conversation_id, conversation_id),
+                    )
+    return {"conversation_id": conversation_id, "stored_messages": inserted,
+            "received": len(messages)}
+
+
+@avito_bp.post(f"{WORKER_PREFIX}/inbound")
+def worker_inbound():
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(ingest_inbound(body))
+    except ValueError as exc:
+        return _bad(str(exc))
+    except Exception:  # noqa: BLE001
+        logging.exception("avito worker inbound failed")
+        return _bad("Не удалось сохранить переписку.", 500)
+
+
+@avito_bp.post(f"{WORKER_PREFIX}/outbox/claim")
+def worker_outbox_claim():
+    body = request.get_json(silent=True) or {}
+    worker_id = str(body.get("worker_id") or "").strip()[:200]
+    if not worker_id:
+        return _bad("Укажите worker_id — по нему держится аренда строки.")
+    account = str(body.get("account") or "").strip().lower()
+    try:
+        claimed = store.claim_outbox(worker_id=worker_id, limit=int(body.get("limit") or 10),
+                                     lease_seconds=int(body.get("lease_seconds") or 120))
+    except Exception:  # noqa: BLE001
+        logging.exception("avito worker outbox claim failed")
+        return _bad("Не удалось забрать очередь отправки.", 500)
+    items = []
+    for row in claimed:
+        if str(row.get("source_key") or "") != SOURCE_KEY:
+            # Чужой канал: аренду сразу отпускаем, иначе телеграмное сообщение зависнет.
+            store.finish_outbox(row["id"], worker_id=worker_id, result="pending",
+                                error="claimed by the avito worker by mistake")
+            continue
+        if account and str(row.get("business_connection_id") or "") != account:
+            store.finish_outbox(row["id"], worker_id=worker_id, result="pending",
+                                error="another avito account")
+            continue
+        items.append({
+            "outbox_id": row["id"],
+            "conversation_id": row["conversation_id"],
+            "account": row.get("business_connection_id") or "",
+            "external_chat_id": row.get("external_chat_id") or "",
+            "text": row.get("text") or "",
+            "author_type": row.get("author_type") or "operator",
+        })
+    return jsonify({"items": items})
+
+
+@avito_bp.post(f"{WORKER_PREFIX}/outbox/<int:outbox_id>/sending")
+def worker_outbox_sending(outbox_id: int):
+    """Граница побочного эффекта: до вызова Авито строка помечается «отправляется».
+
+    Без этой отметки обрыв ВО ВРЕМЯ отправки был бы неотличим от обрыва ДО неё, и повтор
+    отправил бы человеку второе сообщение.
+    """
+    body = request.get_json(silent=True) or {}
+    worker_id = str(body.get("worker_id") or "").strip()[:200]
+    try:
+        guard = store.outbox_send_guard(outbox_id, worker_id=worker_id)
+        if not guard.get("allowed"):
+            store.finish_outbox(outbox_id, worker_id=worker_id, result="cancelled",
+                                error=str(guard.get("reason") or "guard rejected"))
+            return jsonify({"allowed": False, "reason": guard.get("reason")}), 409
+        store.begin_outbox_send(outbox_id, worker_id=worker_id)
+        return jsonify({"allowed": True})
+    except Exception:  # noqa: BLE001
+        logging.exception("avito worker outbox sending failed: %s", outbox_id)
+        return _bad("Не удалось начать отправку.", 500)
+
+
+@avito_bp.post(f"{WORKER_PREFIX}/outbox/<int:outbox_id>/result")
+def worker_outbox_result(outbox_id: int):
+    body = request.get_json(silent=True) or {}
+    worker_id = str(body.get("worker_id") or "").strip()[:200]
+    result = str(body.get("result") or "").strip()
+    if result not in {"sent", "failed", "unknown"}:
+        return _bad("result: sent, failed или unknown.")
+    try:
+        store.finish_outbox(outbox_id, worker_id=worker_id, result=result,
+                            provider_message_id=body.get("provider_message_id"),
+                            error=str(body.get("error") or "") or None)
+        return jsonify({"ok": True})
+    except Exception:  # noqa: BLE001
+        logging.exception("avito worker outbox result failed: %s", outbox_id)
+        return _bad("Не удалось записать итог отправки.", 500)
 
 
 @avito_bp.post(f"{API_PREFIX}/conversations/<int:conversation_id>/read")
