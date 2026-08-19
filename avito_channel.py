@@ -623,7 +623,8 @@ def worker_outbox_claim():
         return _bad("Укажите worker_id — по нему держится аренда строки.")
     account = str(body.get("account") or "").strip().lower()
     try:
-        claimed = store.claim_outbox(worker_id=worker_id, limit=int(body.get("limit") or 10),
+        claimed = store.claim_outbox(worker_id=worker_id, source_keys=[SOURCE_KEY],
+                                     limit=int(body.get("limit") or 10),
                                      lease_seconds=int(body.get("lease_seconds") or 120))
     except Exception:  # noqa: BLE001
         logging.exception("avito worker outbox claim failed")

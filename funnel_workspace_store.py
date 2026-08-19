@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 from uuid import uuid4
 
 from psycopg.types.json import Jsonb
@@ -3920,6 +3920,7 @@ def _cancel_stale_agent_outbox(cur: Any, timestamp: datetime) -> None:
 def claim_outbox(
     *,
     worker_id: str,
+    source_keys: "Iterable[str] | None" = None,
     limit: int = 25,
     lease_seconds: int = 45,
     now: datetime | None = None,
@@ -3930,6 +3931,11 @@ def claim_outbox(
     lease_seconds = min(300, max(10, int(lease_seconds or 45)))
     timestamp = _now(now)
     locked_until = timestamp + timedelta(seconds=lease_seconds)
+    # Очередь одна на все каналы, а воркеры разные. Фильтр стоит В ЗАПРОСЕ, а не после
+    # выдачи: 19.08.2026 телеграмный обход забирал строки Авито в аренду и заваливал их
+    # своей проверкой, а сообщения людям молча не уходили. Отпустить чужую строку «вернув
+    # в очередь» нельзя — finish_outbox принимает только окончательные исходы.
+    sources = sorted({str(key).strip() for key in (source_keys or ()) if str(key).strip()})
     with _connection(connect) as conn:
         with conn.cursor() as cur:
             _recover_outbox_cursor(cur, timestamp)
@@ -3942,6 +3948,7 @@ def claim_outbox(
                       JOIN funnel_workspace_conversations c ON c.id = o.conversation_id
                      WHERE o.delivery_status = 'pending'
                        AND o.available_at <= %s
+                       AND (%s::text[] IS NULL OR o.source_key = ANY(%s::text[]))
                        AND o.cancel_requested = false
                        AND (
                             o.author_type = 'operator'
@@ -3975,7 +3982,8 @@ def claim_outbox(
                  WHERE o.id = c.id
              RETURNING o.*
                 """,
-                (timestamp, limit, timestamp, locked_until, worker, timestamp),
+                (timestamp, sources or None, sources or None, limit,
+                 timestamp, locked_until, worker, timestamp),
             )
             return [dict(row) for row in cur.fetchall()]
 

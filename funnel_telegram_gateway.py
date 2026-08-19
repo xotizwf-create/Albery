@@ -2599,16 +2599,11 @@ def process_outbox_once(*, worker_id: str, limit: int = 25) -> int:
     нетронутой — её заберёт воркер своего канала.
     """
     store = _store()
-    rows = store.claim_outbox(worker_id=worker_id, limit=limit, lease_seconds=90)
-    handled = 0
+    rows = store.claim_outbox(worker_id=worker_id, source_keys=TELEGRAM_SOURCE_KEYS,
+                              limit=limit, lease_seconds=90)
     for row in rows:
-        if str(row.get("source_key") or "") not in TELEGRAM_SOURCE_KEYS:
-            store.finish_outbox(row["id"], worker_id=worker_id, result="pending",
-                                error="строка другого канала — возвращена в очередь")
-            continue
         _process_outbox_item(row, worker_id=worker_id)
-        handled += 1
-    return handled
+    return len(rows)
 
 
 def ai_allowed_in_channel(row: Mapping[str, Any], telegram_id: Any) -> bool:
