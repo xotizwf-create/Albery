@@ -64,10 +64,19 @@ def test_content_free_health_reports_only_status_and_count():
             {"status": "review", "n": 1, "oldest": now - timedelta(seconds=1)},
         ]
 
-    assert bitrix_inbound.inspect_health(now=now, query=query) == [
-        "Bitrix inbound queued overdue: 2",
-        "Bitrix inbound review: 1",
-    ]
+    problems = bitrix_inbound.inspect_health(now=now, query=query)
+
+    assert len(problems) == 2
+    assert "Bitrix inbound queued overdue: 2" in problems
+
+    # Формулировка про зависший ход изменена 19.08.2026: «Bitrix inbound review: 1» не
+    # объясняло ни что случилось, ни что делать, и владелец спрашивал об этом отдельно.
+    # Суть теста прежняя и она в названии — в тревогу не должно утекать СОДЕРЖИМОЕ
+    # переписки: только состояние и количество.
+    review = next(p for p in problems if "без ответа" in p)
+    assert "1" in review and "вручную" in review
+    for leak in ("dialog", "payload", "message_text", "@"):
+        assert leak not in review.lower(), f"в тревогу утекло содержимое: {leak}"
 
 
 def test_chat_webhook_fails_closed_when_durable_capture_is_unavailable(client, monkeypatch):

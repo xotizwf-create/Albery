@@ -3127,6 +3127,27 @@ def _core_mode_agents() -> set[str]:
     return {slug.strip() for slug in raw.split(",") if slug.strip()}
 
 
+def advertised_tool_names(agent: dict[str, Any]) -> set[str]:
+    """Что этот коннектор ОБЯЗАН объявить в tools/list — один источник правды о составе.
+
+    Собрано ровно из тех же частей, что и боевой ответ ниже: реестр (в режиме ядра — его
+    пересечение с CORE_TOOL_NAMES плюс find_tool/call_tool) и самообученные инструменты,
+    которые ядром не режутся и добавляются после ответа.
+
+    Нужна отдельной функцией, потому что послед-деплойный smoke обязан сверять живую выдачу
+    с контрактом, а не с собственной копией состава: 19.08.2026 главный агент перешёл на ядро,
+    ворота продолжили ждать полный набор и покраснели на здоровом агенте — то есть перестали
+    ловить настоящую поломку. Поведение коннектора этой функцией не меняется.
+    """
+    from mcp.context_server import CORE_TOOL_NAMES, META_TOOL_SPECS
+
+    regular = _agent_tool_names(agent)
+    self_tools = _agent_self_tool_names(agent)
+    if str(agent.get("slug") or "") not in _core_mode_agents():
+        return regular | self_tools
+    return (regular & set(CORE_TOOL_NAMES)) | set(META_TOOL_SPECS) | self_tools
+
+
 @app.post("/mcp-agent/<slug>")
 def mcp_agent_http(slug: str):
     from app import mcp_internal_request_ok

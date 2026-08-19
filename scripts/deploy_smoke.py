@@ -132,7 +132,7 @@ except Exception as exc:  # noqa: BLE001
     failures.append(f"Hermes config не читается ({type(exc).__name__})")
 
 try:
-    from agent_center import _agent_by_slug, _agent_self_tool_names, _agent_tool_names
+    from agent_center import _agent_by_slug, _core_mode_agents, advertised_tool_names
     from agent_knowledge import AGENTS_DIR, load_manifest
     from mcp.tool_policy import REVIEWED_TOOL_NAMES, ZERO_TOOL_AGENT_SLUGS
 
@@ -198,7 +198,7 @@ try:
             continue
 
         agent = _agent_by_slug(slug)
-        expected = _agent_tool_names(agent) | _agent_self_tool_names(agent)
+        expected = advertised_tool_names(agent)
         try:
             status, body = post_json(
                 connector_url,
@@ -207,11 +207,18 @@ try:
             )
             actual = {tool.get("name") for tool in ((body.get("result") or {}).get("tools") or [])}
             if status != 200 or actual != expected:
+                mode = "ядро" if slug in _core_mode_agents() else "полный набор"
+                # Имена, а не только счётчики: с одними числами разбор занимает часы —
+                # непонятно, агент обеднел или ворота отстали от нового режима.
+                missing = sorted(expected - actual)[:8]
+                extra = sorted(actual - expected)[:8]
                 failures.append(
-                    f"agent-{slug}: status={status}, tools={len(actual)}, ожидалось={len(expected)}"
+                    f"agent-{slug} ({mode}): status={status}, tools={len(actual)}, "
+                    f"ожидалось={len(expected)}; нет={missing or '—'}; лишние={extra or '—'}"
                 )
             else:
-                print(f"agent-{slug}: private header auth OK, tools={len(actual)}")
+                mode = "ядро" if slug in _core_mode_agents() else "полный набор"
+                print(f"agent-{slug}: private header auth OK, tools={len(actual)} ({mode})")
         except Exception as exc:  # noqa: BLE001
             failures.append(f"agent-{slug}: tools/list не прошёл ({type(exc).__name__})")
     expected_managed = {

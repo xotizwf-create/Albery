@@ -6,6 +6,7 @@ enter ``payload``.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import socket
@@ -479,6 +480,42 @@ def journal_inbound(batch_id: str) -> int:
                 return len(rows)
 
 
+def resolve_answered_reviews() -> int:
+    """Закрыть «неоднозначные» ходы, на которые человек ВСЁ РАВНО получил ответ.
+
+    Ход, у которого истекла аренда мозга, помечается `review` намеренно: система не знает,
+    успел агент ответить, и не переигрывает вслепую, чтобы не отправить второй ответ. Но
+    дальше запись не двигается никогда — а сторож видит её и раз в полчаса будит владельца.
+    19.08.2026 так ушло 8 одинаковых тревог за сутки про один ход, на который Софья ответ
+    получила через минуту после вопроса.
+
+    Двусмысленность снимается фактом: если в ТОТ ЖЕ диалог после сообщения ушёл ответ бота,
+    значит человек не остался без ответа и разбирать нечего. Не «замолчать тревогу», а
+    ответить на её вопрос данными.
+    """
+    with _db() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE bitrix_inbound_jobs AS j
+                       SET status='sent',
+                           error_text='автоматически закрыто: ответ пользователю доставлен '
+                                      '(найден исходящий в том же диалоге после сообщения)',
+                           updated_at=now()
+                     WHERE j.status='review'
+                       AND EXISTS (
+                           SELECT 1 FROM bitrix_bot_messages m
+                            WHERE m.direction='out'
+                              AND m.dialog_id = j.payload->>'dialog_id'
+                              AND m.created_at BETWEEN j.updated_at - interval '20 minutes'
+                                                   AND j.updated_at + interval '20 minutes'
+                       )
+                    """
+                )
+                return cur.rowcount or 0
+
+
 def inspect_health(
     *,
     now: datetime | None = None,
@@ -487,6 +524,14 @@ def inspect_health(
     """Return content-free queue problems for self-check and tests."""
     now = now or datetime.now(timezone.utc)
     if query is None:
+        # Сначала снимаем ложную двусмысленность, потом смотрим, что осталось: иначе
+        # мониторинг докладывает о ходах, по которым человек давно получил ответ.
+        try:
+            resolve_answered_reviews()
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("bitrix inbound: не удалось закрыть отвеченные review: %s",
+                            repr(exc)[:200])
+
         def query(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
             with _db() as conn:
                 with conn.cursor() as cur:
@@ -514,8 +559,19 @@ def inspect_health(
         status = str(row.get("status") or "")
         count = int(row.get("n") or 0)
         oldest = row.get("oldest")
-        if status in {"review", "failed"} and count:
-            problems.append(f"Bitrix inbound {status}: {count}")
+        if status == "review" and count:
+            # Сюда доходит только то, где ответ человеку НЕ найден — отвеченные закрыты
+            # выше. Формулировка называет и суть, и действие: «Bitrix inbound review: 1»
+            # не говорит ни о том, что случилось, ни о том, что с этим делать.
+            problems.append(
+                f"ходов без ответа человеку: {count} — сообщение приняли, но ответ не ушёл "
+                f"(ход прервался). Посмотрите диалог и ответьте вручную"
+            )
+        elif status == "failed" and count:
+            problems.append(
+                f"обработка сообщений сорвалась: {count} — исчерпаны попытки, "
+                f"сообщения остались без обработки"
+            )
         elif count and status in limits and oldest and now - oldest > limits[status]:
             problems.append(f"Bitrix inbound {status} overdue: {count}")
     return problems
