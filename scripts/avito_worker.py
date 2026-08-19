@@ -350,6 +350,29 @@ def _avito_time(value: Any) -> str | None:
     return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
 
 
+def _message_text(message: dict[str, Any]) -> str:
+    """Текст сообщения из ответа Авито.
+
+    preview и body приходят объектами вида {"text": "..."}, а не строками: без разбора в
+    журнал попадала запись целиком — оператор видел «{'text': 'Здравствуйте…'}» вместо
+    сообщения (поймано на живых данных 19.08.2026). Нетекстовые вложения называем словами,
+    а не пустой строкой, иначе переписка выглядит как пропуск.
+    """
+    for key in ("preview", "body", "content"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            text = value.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    kind = str(message.get("type") or "").strip()
+    labels = {"image": "[изображение]", "voice": "[голосовое сообщение]",
+              "file": "[файл]", "item": "[объявление]", "location": "[геопозиция]",
+              "call": "[звонок]", "video": "[видео]"}
+    return labels.get(kind, "")
+
+
 def parse_channels(html: str) -> list[dict[str, Any]]:
     """Список переписок в том виде, в каком их принимает Albery."""
     state = extract_state(html)
@@ -365,7 +388,7 @@ def parse_channels(html: str) -> list[dict[str, Any]]:
         other = next((u for u in users if u is not mine), None)
         listing = ((entity.get("context") or {}).get("value")) or {}
         last = entity.get("lastMessage") or {}
-        text = str(last.get("preview") or last.get("body") or "").strip()
+        text = _message_text(last)
         author = "operator" if (mine and last.get("fromUid") == mine.get("id")) else "client"
         messages = []
         if last.get("id") and text:

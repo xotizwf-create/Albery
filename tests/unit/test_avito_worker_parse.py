@@ -44,7 +44,7 @@ def _channel(**over):
                                               "title": "2-к. квартира, 40 м²",
                                               "priceString": "45 000 ₽"}},
         "lastMessage": {"id": "m-1", "fromUid": "hash-them", "created": 17856721011584856,
-                        "preview": "Квартира ещё свободна?"},
+                        "preview": {"text": "Квартира ещё свободна?"}},
         "updated": 17856721011584856,
     }
     channel.update(over)
@@ -115,6 +115,24 @@ def test_update_key_changes_with_the_last_message_so_repeats_are_free(worker):
 
     assert first["update_id"] == same["update_id"]
     assert newer["update_id"] != first["update_id"]
+
+
+def test_preview_object_is_unwrapped_into_plain_text(worker):
+    """Авито отдаёт превью объектом. Без разбора оператор видел «{'text': '…'}»."""
+    parsed = worker.parse_channels(_page({"ids": ["u2i-abc"],
+                                          "entities": {"u2i-abc": _channel()}}))
+
+    assert parsed[0]["messages"][0]["text"] == "Квартира ещё свободна?"
+    assert "{" not in parsed[0]["messages"][0]["text"]
+
+
+def test_attachment_without_text_is_named_not_dropped(worker):
+    channel = _channel(lastMessage={"id": "m-4", "fromUid": "hash-them", "type": "image",
+                                    "created": 17856721011584856, "preview": {}})
+
+    parsed = worker.parse_channels(_page({"ids": ["u2i-abc"], "entities": {"u2i-abc": channel}}))
+
+    assert parsed[0]["messages"][0]["text"] == "[изображение]"
 
 
 def test_a_page_without_the_messenger_gives_nothing_instead_of_crashing(worker):
