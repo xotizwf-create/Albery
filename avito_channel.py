@@ -500,6 +500,135 @@ def worker_session_report():
         return _bad("Не удалось записать состояние сессии.", 500)
 
 
+# --- Сшивка «написали первым» с настоящим чатом ------------------------------------------------
+#
+# Пишем первыми — чата ещё нет: его заводит сам Авито в момент отправки, поэтому разговор живёт
+# с временным ключом `item:<номер объявления>`. Настоящий идентификатор со страницы объявления к
+# нам не возвращается: окно переписки открывается прямо на ней, перехода в чат нет, и адрес
+# остаётся адресом объявления. Значит связывать надо не по адресу после отправки, а по номеру
+# объявления в момент зеркалирования — эта связь есть у КАЖДОГО чата Авито.
+
+PLACEHOLDER_PREFIX = "item:"
+
+
+def placeholder_chat_id(listing_id: str) -> str:
+    """Временный ключ разговора, заведённого до появления чата."""
+    return f"{PLACEHOLDER_PREFIX}{listing_id}"
+
+
+def find_conversation_by_listing(*, account: str, listing_id: str) -> dict[str, Any] | None:
+    """Настоящий разговор с автором этого объявления, если он уже есть.
+
+    Один наш аккаунт и одно объявление — это один чат: Авито ведёт переписку вокруг объявления.
+    Если подходящих разговоров больше одного, не угадываем: так бывает у ПРОДАВЦА, которому об
+    одном объявлении пишут разные покупатели. В этом случае пусть работает обычный путь.
+    """
+    listing_id = str(listing_id or "").strip()
+    if not listing_id:
+        return None
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, state_version, control_mode FROM funnel_workspace_conversations "
+                "WHERE source_key = %s AND business_connection_id = %s "
+                "AND external_chat_id NOT LIKE 'item:%%' "
+                "AND metadata->'listing'->>'id' = %s "
+                "AND metadata->>'merged_into' IS NULL "
+                "ORDER BY id LIMIT 2",
+                (SOURCE_KEY, account, listing_id),
+            )
+            rows = list(cur.fetchall())
+    return dict(rows[0]) if len(rows) == 1 else None
+
+
+def stitch_outreach_conversation(*, account: str, listing_id: str,
+                                 chat_id: str) -> dict[str, Any] | None:
+    """Связывает временный разговор `item:<номер>` с настоящим чатом Авито.
+
+    Вызывается в момент зеркалирования: чат пришёл из мессенджера, и в нём есть объявление.
+    Без этой сшивки на одного и того же человека завелось бы ДВА разговора — один с временным
+    ключом, другой настоящий, и оператор видел бы половину переписки в каждом.
+
+    Возвращает описание сделанного или None, если сшивать было нечего.
+    """
+    listing_id = str(listing_id or "").strip()
+    chat_id = str(chat_id or "").strip()
+    if not listing_id or not chat_id or chat_id.startswith(PLACEHOLDER_PREFIX):
+        return None
+    placeholder = placeholder_chat_id(listing_id)
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM funnel_workspace_conversations "
+                    "WHERE source_key = %s AND business_connection_id = %s "
+                    "AND external_chat_id = %s FOR UPDATE",
+                    (SOURCE_KEY, account, placeholder),
+                )
+                temporary = cur.fetchone()
+                if not temporary:
+                    return None
+                temp_id = int(temporary["id"])
+                cur.execute(
+                    "SELECT id, state_version FROM funnel_workspace_conversations "
+                    "WHERE source_key = %s AND business_connection_id = %s "
+                    "AND external_chat_id = %s FOR UPDATE",
+                    (SOURCE_KEY, account, chat_id),
+                )
+                real = cur.fetchone()
+                if not real:
+                    # Настоящего разговора ещё нет — временный САМ становится настоящим вместе
+                    # со своей перепиской, режимом «ведёт человек» и строками очереди.
+                    cur.execute(
+                        "UPDATE funnel_workspace_conversations SET external_chat_id = %s, "
+                        "updated_at = now() WHERE id = %s",
+                        (chat_id, temp_id),
+                    )
+                    # Ещё не отправленное письмо теперь уйдёт прямо в чат, а не через страницу
+                    # объявления: чат уже существует, и открывать его надёжнее.
+                    cur.execute(
+                        "UPDATE funnel_workspace_outbox SET external_chat_id = %s, "
+                        "updated_at = now() "
+                        "WHERE conversation_id = %s AND delivery_status = 'pending'",
+                        (chat_id, temp_id),
+                    )
+                    logging.info("avito: разговор %s сшит с чатом %s по объявлению %s",
+                                 temp_id, chat_id, listing_id)
+                    return {"action": "adopted", "conversation_id": temp_id,
+                            "external_chat_id": chat_id}
+
+                # Настоящий разговор уже успел завестись — складываем в него переписку
+                # временного. Сам временный не удаляем: на нём висит история очереди отправки.
+                real_id = int(real["id"])
+                cur.execute(
+                    "UPDATE funnel_workspace_messages m SET conversation_id = %s "
+                    "WHERE m.conversation_id = %s AND NOT EXISTS ("
+                    "SELECT 1 FROM funnel_workspace_messages x "
+                    "WHERE x.conversation_id = %s AND x.external_message_id IS NOT NULL "
+                    "AND x.external_message_id = m.external_message_id)",
+                    (real_id, temp_id, real_id),
+                )
+                cur.execute(
+                    "UPDATE funnel_workspace_outbox SET conversation_id = %s, "
+                    "external_chat_id = %s, conversation_version = %s, updated_at = now() "
+                    "WHERE conversation_id = %s AND delivery_status = 'pending'",
+                    (real_id, chat_id, int(real["state_version"]), temp_id),
+                )
+                # Временный ключ уходит в отставку: иначе следующий обход снова нашёл бы его и
+                # каждый раз пытался сшивать заново.
+                cur.execute(
+                    "UPDATE funnel_workspace_conversations "
+                    "SET external_chat_id = %s, status = 'closed', closed_at = now(), "
+                    "metadata = metadata || jsonb_build_object('merged_into', %s), "
+                    "updated_at = now() WHERE id = %s",
+                    (f"merged:{chat_id}", real_id, temp_id),
+                )
+                logging.info("avito: разговор %s свёрнут в %s по объявлению %s",
+                             temp_id, real_id, listing_id)
+                return {"action": "merged", "conversation_id": real_id,
+                        "merged_from": temp_id, "external_chat_id": chat_id}
+
+
 def ingest_inbound(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Кладёт переписку из Авито в общий журнал.
 
@@ -518,6 +647,10 @@ def ingest_inbound(payload: Mapping[str, Any]) -> dict[str, Any]:
 
     store.ensure_source(SOURCE_KEY, source_type=SOURCE_TYPE, display_name=SOURCE_DISPLAY_NAME)
     listing = payload.get("listing") if isinstance(payload.get("listing"), Mapping) else {}
+    # Сшивка идёт ДО того, как разговор будет заведён по настоящему ключу: иначе рядом с
+    # временным появится второй разговор на того же человека.
+    stitched = stitch_outreach_conversation(account=slug, listing_id=str(listing.get("id") or ""),
+                                            chat_id=chat_id)
     conversation = store.ensure_conversation(
         external_chat_id=chat_id,
         source_key=SOURCE_KEY,
@@ -600,7 +733,7 @@ def ingest_inbound(payload: Mapping[str, Any]) -> dict[str, Any]:
                         (conversation_id, conversation_id, conversation_id, conversation_id),
                     )
     return {"conversation_id": conversation_id, "stored_messages": inserted,
-            "received": len(messages)}
+            "received": len(messages), "stitched": stitched}
 
 
 @avito_bp.post(f"{WORKER_PREFIX}/inbound")
@@ -711,9 +844,13 @@ def avito_outreach():
     """Написать первым автору объявления.
 
     Чата ещё нет: его создаст Авито в момент отправки. Поэтому разговор заводится с временным
-    внешним ключом `item:<id>`, а настоящий идентификатор чата воркер пришлёт вместе с итогом
-    доставки. Так исходящее сообщение с самого начала лежит в общей очереди и подчиняется тем
-    же правилам, что и ответы: одна отправка, ключ идемпотентности, честный итог.
+    внешним ключом `item:<id>`. Настоящий идентификатор приходит одним из двух путей: воркер
+    присылает его вместе с итогом доставки, если после отправки оказался в чате, — а если нет
+    (со страницы объявления перехода в чат не происходит), разговор сшивается по номеру
+    объявления при ближайшем зеркалировании, см. `stitch_outreach_conversation`.
+
+    Так исходящее сообщение с самого начала лежит в общей очереди и подчиняется тем же
+    правилам, что и ответы: одна отправка, ключ идемпотентности, честный итог.
     """
     body = request.get_json(silent=True) or {}
     account = str(body.get("account") or "").strip().lower()
@@ -741,16 +878,20 @@ def avito_outreach():
 
     try:
         store.ensure_source(SOURCE_KEY, source_type=SOURCE_TYPE, display_name=SOURCE_DISPLAY_NAME)
-        conversation = store.ensure_conversation(
-            external_chat_id=f"item:{item_id}",
-            source_key=SOURCE_KEY,
-            business_connection_id=account,
-            display_name=str(body.get("display_name") or f"Объявление {item_id}"),
-            metadata={"listing": {"id": item_id,
-                                  "title": str(body.get("listing_title") or ""),
-                                  "url": f"https://www.avito.ru/{item_id}"},
-                      "outreach": True},
-        )
+        # Об этом объявлении уже говорим — пишем в тот же разговор. Иначе рядом с живой
+        # перепиской завёлся бы второй разговор на того же человека, с временным ключом.
+        conversation = find_conversation_by_listing(account=account, listing_id=item_id)
+        if conversation is None:
+            conversation = store.ensure_conversation(
+                external_chat_id=placeholder_chat_id(item_id),
+                source_key=SOURCE_KEY,
+                business_connection_id=account,
+                display_name=str(body.get("display_name") or f"Объявление {item_id}"),
+                metadata={"listing": {"id": item_id,
+                                      "title": str(body.get("listing_title") or ""),
+                                      "url": f"https://www.avito.ru/{item_id}"},
+                          "outreach": True},
+            )
         conversation_id = int(conversation["id"])
         # Пишем первыми — разговор ведёт человек, пока он сам не отдаст его ИИ.
         if conversation.get("control_mode") != "human":

@@ -75,10 +75,19 @@ def test_inbound_stores_the_talk_and_survives_a_repeat(avito, worker, monkeypatc
     seen_sql: list[str] = []
 
     class _Cur:
+        _last = None
+
         def __enter__(self): return self
         def __exit__(self, *_e): return False
-        def execute(self, sql, args=()): seen_sql.append(" ".join(sql.split()))
-        def fetchone(self): return {"id": 1}
+
+        def execute(self, sql, args=()):
+            statement = " ".join(sql.split())
+            seen_sql.append(statement)
+            # Разговора «написали первым» по этому объявлению нет — обычный входящий чат.
+            # Без этого поддельная база утверждала бы, что нашла сразу всё, что спросили.
+            self._last = None if statement.startswith("SELECT") else {"id": 1}
+
+        def fetchone(self): return self._last
 
     class _Conn:
         def __enter__(self): return self

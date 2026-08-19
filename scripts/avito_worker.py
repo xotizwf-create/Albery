@@ -688,6 +688,12 @@ def command_mirror(args) -> int:
                     for channel in channels:
                         answer = albery.push_inbound({"account": args.account, **channel})
                         stored += int(answer.get("stored_messages") or 0)
+                        # Сшивку печатаем: разговор, заведённый «написать первым», именно
+                        # здесь получает настоящий чат — по номеру объявления.
+                        stitched = answer.get("stitched") or {}
+                        if stitched:
+                            print(f"  разговор {stitched.get('conversation_id')}: "
+                                  f"{stitched.get('action')} -> {channel['external_chat_id']}")
                     print(f"переписок: {len(channels)}, новых сообщений: {stored}")
                 except RuntimeError as exc:
                     print(f"Albery недоступен: {exc}")
