@@ -1,6 +1,6 @@
 ---
 name: Google Sheets и Apps Script
-scope: universal
+scope: optional
 sort_order: 40
 ---
 

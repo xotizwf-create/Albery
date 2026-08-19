@@ -78,14 +78,21 @@ def test_skills_shared_vs_hermes_base(tmp_path, monkeypatch):
     assert skills["skill:apple/foo"]["custom"] is False
 
 
-def test_scope_defaults_to_universal_on_bad_value(tmp_path, monkeypatch):
+def test_scope_defaults_to_optional_on_bad_or_missing_value(tmp_path, monkeypatch):
+    """Забывчивость обязана давать ДЕШЁВЫЙ вариант.
+
+    До 19.08.2026 умолчанием был universal: документ без явной области уезжал в промпт
+    каждого агента в каждом ходе. Так набралось 63 553 символа «универсальных» инструкций
+    поверх 116 445 символов схем инструментов, и ответ на «Ты тут?» занимал 278 секунд.
+    Теперь «всегда в контексте» требует осознанного `scope: universal`.
+    """
     reg = tmp_path / "reg"
     _write(reg, "instructions/X.md", "---\nname: X\nscope: garbage\n---\n\nтело\n")
     _write(reg, "instructions/Y.md", "---\nname: Y\n---\n\nтело\n")
     k = _reload_with(reg, monkeypatch)
     items = {i["id"]: i for i in k.load_instructions()}
-    assert items["X"]["scope"] == "universal"
-    assert items["Y"]["scope"] == "universal"
+    assert items["X"]["scope"] == "optional"
+    assert items["Y"]["scope"] == "optional"
 
 
 def _base_registry(reg):

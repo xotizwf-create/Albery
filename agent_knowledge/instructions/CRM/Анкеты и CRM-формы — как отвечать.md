@@ -1,6 +1,6 @@
 ---
 name: Анкеты и CRM-формы — как отвечать
-scope: universal
+scope: optional
 sort_order: 0
 db_id: 1c0ff42b-1b15-4fa0-b65a-a9aa906f68b5
 ---

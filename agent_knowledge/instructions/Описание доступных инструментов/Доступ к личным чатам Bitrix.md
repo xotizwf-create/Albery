@@ -1,6 +1,6 @@
 ---
 name: Доступ к личным чатам Bitrix
-scope: universal
+scope: optional
 sort_order: 2
 db_id: 5a20eb25-88cb-4412-9d7b-f443b09f12e0
 ---

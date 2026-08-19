@@ -93,9 +93,15 @@ def load_instructions() -> list[dict[str, Any]] | None:
             meta, body = parse_doc(md.read_text(encoding="utf-8", errors="replace"))
             path = _instruction_path_from_file(md)
             parts = path.split(" / ")
-            scope = (meta.get("scope") or SCOPE_UNIVERSAL).strip().lower()
+            # Умолчание — OPTIONAL, и это осознанно. Раньше документ без явного scope
+            # становился универсальным, то есть уезжал в промпт КАЖДОГО агента в каждом
+            # ходе. Так набралось 63 553 символа «универсальных» инструкций (замер
+            # 19.08.2026): дорогой вариант стоял по умолчанию, и промпт рос от простой
+            # забывчивости. Теперь забывчивость даёт дешёвый вариант, а «всегда в
+            # контексте» требует явного `scope: universal`.
+            scope = (meta.get("scope") or SCOPE_OPTIONAL).strip().lower()
             if scope not in (SCOPE_UNIVERSAL, SCOPE_OPTIONAL):
-                scope = SCOPE_UNIVERSAL
+                scope = SCOPE_OPTIONAL
             out.append({
                 "id": path,
                 "path": path,
