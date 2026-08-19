@@ -38,6 +38,7 @@ import os
 import random
 import re
 import socket
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,14 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
+
+# Консоль Windows по умолчанию cp1251: любое «×» или «₽» в тексте объявления роняло вывод
+# воркера посреди отчёта об отправке. Печать не должна ронять транспорт.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
 
 MESSENGER_URL = "https://www.avito.ru/profile/messenger"
 DEFAULT_PROFILES_DIR = Path.home() / ".avito-profiles"
@@ -186,8 +195,10 @@ def _browser_context(playwright, account: str, *, headless: bool):
     if direct:
         # Прибиваем имена Авито к адресу, который выпущен мимо VPN. Иначе браузер сам
         # выберет A-запись, та уйдёт в туннель, и Авито ответит блокировкой по IP.
-        rules = ",".join(f"MAP {name} {direct}" for name in
-                         ("avito.ru", "*.avito.ru", "avito.st", "*.avito.st"))
+        # ТОЛЬКО avito.ru: статика живёт на отдельном хосте avito.st с другими адресами,
+        # и подмена ломала загрузку стилей и скриптов — страница оставалась «голой», виджет
+        # переписки не оживал, кнопка отправки не включалась. Проверено 19.08.2026.
+        rules = ",".join(f"MAP {name} {direct}" for name in ("avito.ru", "*.avito.ru"))
         args.append(f"--host-resolver-rules={rules}")
         print(f"адрес Авито мимо VPN: {direct}")
     else:
@@ -420,6 +431,9 @@ def parse_channels(html: str) -> list[dict[str, Any]]:
 
 REPLY_INPUT = '[data-marker="reply/input"]'
 MESSAGE_TEXT = '[data-marker="messageText"]'
+# Встроенное окошко на странице объявления: «Написать» открывает его, а не мессенджер.
+ICEBREAKER_INPUT = '[data-marker="icebreakers/extended-input"]'
+ICEBREAKER_SEND = '[data-marker="icebreakers/send-message"]'
 
 
 def _type_like_a_human(page, selector: str, text: str) -> None:
@@ -478,6 +492,8 @@ def start_chat_from_item(page, item_id: str, text: str) -> tuple[bool, str]:
         return False, "сессия просрочена — нужен повторный вход"
 
     opened = False
+    # ВАЖНО: сюда нельзя класть кнопку отправки встроенного окошка — до ввода текста она
+    # неактивна, и клик по ней висит до таймаута (проверено 19.08.2026).
     for locator in (page.locator('[data-marker="item-contact-bar/message"]'),
                     page.get_by_role("button", name=re.compile("Написать", re.I)),
                     page.get_by_role("link", name=re.compile("Написать", re.I))):
@@ -491,27 +507,51 @@ def start_chat_from_item(page, item_id: str, text: str) -> tuple[bool, str]:
     if not opened:
         return False, "кнопка «Написать» не найдена: объявление снято или изменилась страница"
 
+    # Кнопка «Написать» на объявлении открывает НЕ мессенджер, а встроенное окошко прямо на
+    # странице (разметка icebreakers). Ожидание поля мессенджера здесь висело до таймаута —
+    # проверено на живой странице 19.08.2026.
     try:
-        page.wait_for_selector(REPLY_INPUT, timeout=30000)
+        page.wait_for_selector(f"{ICEBREAKER_INPUT}, {REPLY_INPUT}", timeout=30000)
     except Exception:  # noqa: BLE001
         return False, "окно переписки не открылось"
 
+    # Печатаем в САМО поле ввода, а не в обёртку: замер показал, что после открытия
+    # окошка на странице ровно одно textarea. Ввод в обёртку не долетал до виджета, и его
+    # кнопка отправки оставалась неактивной — 29 попыток клика по «element is not enabled».
     page.wait_for_timeout(random.randint(*HUMAN_PAUSE_MS))
-    _type_like_a_human(page, REPLY_INPUT, text)
-    page.keyboard.press("Enter")
+    field = page.locator("textarea").first
+    if not field.count():
+        return False, "поле ввода во встроенном окне не найдено"
+    field.click()
+    field.type(text, delay=random.randint(18, 55))
+    page.wait_for_timeout(random.randint(400, 900))
 
+    # Сначала Enter — так отправляет человек. Кнопка остаётся запасным путём.
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(1500)
+    send_button = page.locator(ICEBREAKER_SEND).first
+    try:
+        if send_button.count() and send_button.is_enabled():
+            send_button.click(timeout=8000)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Успех — это либо переход в сам чат, либо появление нашего текста в переписке.
     needle = text.strip()[:60]
     try:
         page.wait_for_function(
-            """([selector, needle]) => Array.from(document.querySelectorAll(selector))
-                   .some(node => (node.textContent || '').includes(needle))""",
+            """([selector, needle]) => location.href.includes('/messenger/channel/')
+                   || Array.from(document.querySelectorAll(selector))
+                        .some(node => (node.textContent || '').includes(needle))""",
             arg=[MESSAGE_TEXT, needle],
-            timeout=20000,
+            timeout=25000,
         )
     except Exception:  # noqa: BLE001
-        return False, "unknown: сообщение не появилось в переписке за 20 секунд"
-    chat_id = page.url.rstrip("/").rsplit("/", 1)[-1]
-    return True, chat_id
+        return False, "unknown: подтверждения отправки не увидели за 25 секунд"
+
+    page.wait_for_timeout(1500)
+    match = re.search(r"/messenger/channel/([^/?#]+)", page.url)
+    return True, match.group(1) if match else f"item:{item_id}"
 
 
 def search_listings(page, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
