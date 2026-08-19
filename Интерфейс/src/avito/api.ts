@@ -111,6 +111,19 @@ export const avitoApi = {
       body: JSON.stringify(payload),
     }),
 
+  /** Написать первым автору объявления: разговор заведётся сам, чат создаст Авито. */
+  outreach: (payload: {
+    account: string;
+    item_url: string;
+    text: string;
+    operator_name: string;
+    listing_title?: string;
+  }) =>
+    request<{ queued: boolean; conversation: AvitoConversation }>("/outreach", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
   markRead: (conversationId: number, throughMessageId: number) =>
     request<{ conversation: AvitoConversation }>(`/conversations/${conversationId}/read`, {
       method: "POST",

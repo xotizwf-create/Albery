@@ -8,6 +8,7 @@ import {
   ExternalLink,
   Loader2,
   Pause,
+  PenLine,
   Plus,
   RefreshCw,
   Search,
@@ -94,6 +95,9 @@ export function AvitoInbox() {
   const [loading, setLoading] = useState(true);
   const [showAccountForm, setShowAccountForm] = useState(false);
   const [newAccount, setNewAccount] = useState({ slug: "", label: "", egress_label: "" });
+  const [showOutreach, setShowOutreach] = useState(false);
+  const [outreach, setOutreach] = useState({ item_url: "", text: "" });
+  const [outreachSending, setOutreachSending] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
   const report = useCallback((err: unknown) => {
@@ -261,6 +265,32 @@ export function AvitoInbox() {
       await loadState();
     } catch (err) {
       report(err);
+    }
+  };
+
+  const sendOutreach = async () => {
+    const target = account || accounts.find((a) => a.is_active && a.session_status === "ok")?.slug || "";
+    if (!target) {
+      setError("Выберите аккаунт слева: писать первым можно только от живой сессии.");
+      return;
+    }
+    setOutreachSending(true);
+    try {
+      const payload = await avitoApi.outreach({
+        account: target,
+        item_url: outreach.item_url.trim(),
+        text: outreach.text.trim(),
+        operator_name: operatorName(),
+      });
+      setOutreach({ item_url: "", text: "" });
+      setShowOutreach(false);
+      setNotice("Сообщение поставлено в очередь — воркер откроет объявление и напишет автору.");
+      await loadConversations();
+      if (payload.conversation) openConversation(payload.conversation);
+    } catch (err) {
+      report(err);
+    } finally {
+      setOutreachSending(false);
     }
   };
 
@@ -466,6 +496,42 @@ export function AvitoInbox() {
 
         <section className="w-[380px] shrink-0 rounded-2xl border border-slate-200 bg-white">
           <div className="border-b border-slate-100 p-4">
+            <button
+              onClick={() => setShowOutreach((value) => !value)}
+              className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl bg-[#5440F6] px-3 py-2 text-[13px] font-bold text-white transition hover:bg-[#4433d6]"
+            >
+              <PenLine className="h-4 w-4" /> Написать первым
+            </button>
+
+            {showOutreach && (
+              <div className="mb-3 space-y-2 rounded-xl border border-slate-200 p-3">
+                <input
+                  value={outreach.item_url}
+                  onChange={(e) => setOutreach({ ...outreach, item_url: e.target.value })}
+                  placeholder="ссылка на объявление или его номер"
+                  className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-[13px] font-semibold outline-none focus:border-[#5440F6]"
+                />
+                <textarea
+                  value={outreach.text}
+                  onChange={(e) => setOutreach({ ...outreach, text: e.target.value })}
+                  rows={3}
+                  placeholder="первое сообщение автору объявления"
+                  className="w-full resize-none rounded-lg border border-slate-200 px-2.5 py-1.5 text-[13px] font-medium outline-none focus:border-[#5440F6]"
+                />
+                <button
+                  onClick={() => void sendOutreach()}
+                  disabled={!outreach.item_url.trim() || !outreach.text.trim() || outreachSending}
+                  className="w-full rounded-lg bg-[#5440F6] px-3 py-2 text-[13px] font-bold text-white transition hover:bg-[#4433d6] disabled:opacity-40"
+                >
+                  {outreachSending ? "Ставлю в очередь…" : "Отправить"}
+                </button>
+                <p className="text-[11px] font-semibold text-slate-400">
+                  Разговор появится в списке сразу, сообщение уйдёт, когда воркер откроет
+                  объявление. Диалог сразу под управлением человека.
+                </p>
+              </div>
+            )}
+
             <div className="relative">
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
               <input

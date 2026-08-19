@@ -683,10 +683,99 @@ def worker_outbox_result(outbox_id: int):
         store.finish_outbox(outbox_id, worker_id=worker_id, result=result,
                             provider_message_id=body.get("provider_message_id"),
                             error=str(body.get("error") or "") or None)
+        # Написали первыми — настоящий идентификатор чата известен только после отправки:
+        # заменяем временный ключ `item:<id>`, иначе следующий обход завёл бы второй разговор
+        # на того же человека.
+        real_chat_id = str(body.get("external_chat_id") or "").strip()
+        if result == "sent" and real_chat_id and not real_chat_id.startswith("item:"):
+            with pg_connect() as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE funnel_workspace_conversations c "
+                            "SET external_chat_id = %s, updated_at = now() "
+                            "FROM funnel_workspace_outbox o "
+                            "WHERE o.id = %s AND c.id = o.conversation_id "
+                            "AND c.source_key = %s AND c.external_chat_id LIKE 'item:%%'",
+                            (real_chat_id, outbox_id, SOURCE_KEY),
+                        )
         return jsonify({"ok": True})
     except Exception:  # noqa: BLE001
         logging.exception("avito worker outbox result failed: %s", outbox_id)
         return _bad("Не удалось записать итог отправки.", 500)
+
+
+@avito_bp.post(f"{API_PREFIX}/outreach")
+def avito_outreach():
+    """Написать первым автору объявления.
+
+    Чата ещё нет: его создаст Авито в момент отправки. Поэтому разговор заводится с временным
+    внешним ключом `item:<id>`, а настоящий идентификатор чата воркер пришлёт вместе с итогом
+    доставки. Так исходящее сообщение с самого начала лежит в общей очереди и подчиняется тем
+    же правилам, что и ответы: одна отправка, ключ идемпотентности, честный итог.
+    """
+    body = request.get_json(silent=True) or {}
+    account = str(body.get("account") or "").strip().lower()
+    item_id = re.sub(r"\D", "", str(body.get("item_id") or str(body.get("item_url") or "")))[-12:]
+    text = str(body.get("text") or "").strip()
+    operator_name = str(body.get("operator_name") or "Оператор").strip()[:_LABEL_MAX]
+    if not account:
+        return _bad("Укажите аккаунт, от имени которого пишем.")
+    if not item_id:
+        return _bad("Укажите объявление: его номер или ссылку на него.")
+    if not text:
+        return _bad("Пустое сообщение отправить нельзя.")
+    if len(text) > _TEXT_MAX:
+        return _bad(f"Сообщение длиннее {_TEXT_MAX} символов.")
+
+    account_row = get_account(account)
+    if not account_row:
+        return _bad(f"Аккаунт «{account}» не зарегистрирован в канале.", 404)
+    if not transport_enabled():
+        return jsonify({"error": "Транспорт Авито выключен — сообщение никто не доставит.",
+                        "code": "avito_transport_unavailable"}), 409
+    if account_row["session_status"] != "ok":
+        return jsonify({"error": f"Сессия аккаунта «{account_row['label']}» не готова.",
+                        "code": "avito_transport_unavailable"}), 409
+
+    try:
+        store.ensure_source(SOURCE_KEY, source_type=SOURCE_TYPE, display_name=SOURCE_DISPLAY_NAME)
+        conversation = store.ensure_conversation(
+            external_chat_id=f"item:{item_id}",
+            source_key=SOURCE_KEY,
+            business_connection_id=account,
+            display_name=str(body.get("display_name") or f"Объявление {item_id}"),
+            metadata={"listing": {"id": item_id,
+                                  "title": str(body.get("listing_title") or ""),
+                                  "url": f"https://www.avito.ru/{item_id}"},
+                      "outreach": True},
+        )
+        conversation_id = int(conversation["id"])
+        # Пишем первыми — разговор ведёт человек, пока он сам не отдаст его ИИ.
+        if conversation.get("control_mode") != "human":
+            store.transition_control(conversation_id, mode="human",
+                                     expected_version=int(conversation["state_version"]),
+                                     actor_type="operator", actor_name=operator_name,
+                                     reason="написали первыми", permanent=True)
+            conversation = dict(store.get_conversation(conversation_id) or conversation)
+        result = store.enqueue_outgoing_operator(
+            conversation_id,
+            text=text,
+            expected_version=int(conversation["state_version"]),
+            operator_name=operator_name,
+            idempotency_key=str(body.get("idempotency_key") or f"avito-outreach-{uuid.uuid4()}"),
+            metadata={"channel": SOURCE_KEY, "account": account, "outreach_item": item_id},
+        )
+        return jsonify({"queued": True, "conversation": get_conversation(conversation_id),
+                        "message_id": (result.get("message") or {}).get("id")})
+    except store.WorkspaceConflictError:
+        return jsonify({"error": "Разговор уже изменился — обновите страницу и повторите.",
+                        "code": "version_conflict"}), 409
+    except (store.WorkspaceControlError, store.WorkspaceValidationError) as exc:
+        return jsonify({"error": str(exc), "code": "rejected"}), 409
+    except Exception:  # noqa: BLE001
+        logging.exception("avito outreach failed: %s", item_id)
+        return _bad("Не удалось поставить сообщение в очередь.", 500)
 
 
 @avito_bp.post(f"{API_PREFIX}/conversations/<int:conversation_id>/read")

@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import socket
 import time
@@ -105,10 +106,11 @@ class Albery:
         return bool(answer.get("allowed"))
 
     def finish(self, outbox_id: int, worker_id: str, result: str, *, error: str = "",
-               provider_message_id: str = "") -> None:
+               provider_message_id: str = "", external_chat_id: str = "") -> None:
         self.post(f"/api/avito-worker/outbox/{outbox_id}/result",
                   {"worker_id": worker_id, "result": result, "error": error,
-                   "provider_message_id": provider_message_id})
+                   "provider_message_id": provider_message_id,
+                   "external_chat_id": external_chat_id})
 
 
 def _load_local_env() -> None:
@@ -415,6 +417,153 @@ def parse_channels(html: str) -> list[dict[str, Any]]:
     return result
 
 
+REPLY_INPUT = '[data-marker="reply/input"]'
+MESSAGE_TEXT = '[data-marker="messageText"]'
+
+
+def _type_like_a_human(page, selector: str, text: str) -> None:
+    """Печатаем с задержкой, а не вставляем разом.
+
+    Мгновенно возникший в поле текст — самый простой признак автоматизации, а нам важно
+    сохранить аккаунт живым. Задержка на символ примерно как у быстрого человека.
+    """
+    field = page.locator(selector).first
+    field.click()
+    field.type(text, delay=random.randint(18, 55))
+
+
+def send_message(page, chat_id: str, text: str) -> tuple[bool, str]:
+    """Отправляет сообщение в существующий чат и ПРОВЕРЯЕТ, что оно появилось в переписке.
+
+    Возвращает (успех, пояснение). Успехом считается только увиденное в истории сообщение:
+    нажатая клавиша — это ещё не доставка, а «кажется, отправилось» в журнале хуже честного
+    отказа, потому что оператор перестанет перепроверять.
+    """
+    page.goto(f"{MESSENGER_URL}/channel/{chat_id}", wait_until="domcontentloaded", timeout=90000)
+    try:
+        page.wait_for_selector(REPLY_INPUT, timeout=25000)
+    except Exception:  # noqa: BLE001
+        if not _logged_in(page):
+            return False, "сессия просрочена — нужен повторный вход"
+        return False, "поле ввода не найдено: возможно, Авито поменял мессенджер"
+
+    page.wait_for_timeout(random.randint(*HUMAN_PAUSE_MS))
+    _type_like_a_human(page, REPLY_INPUT, text)
+    page.keyboard.press("Enter")
+
+    needle = text.strip()[:60]
+    try:
+        page.wait_for_function(
+            """([selector, needle]) => Array.from(document.querySelectorAll(selector))
+                   .some(node => (node.textContent || '').includes(needle))""",
+            arg=[MESSAGE_TEXT, needle],
+            timeout=20000,
+        )
+    except Exception:  # noqa: BLE001
+        # Ушло или нет — неизвестно: повторять нельзя, человек может получить дубль.
+        return False, "unknown: сообщение не появилось в переписке за 20 секунд"
+    return True, page.url.rsplit("/", 1)[-1]
+
+
+def start_chat_from_item(page, item_id: str, text: str) -> tuple[bool, str]:
+    """Пишет первым автору объявления: открывает объявление, жмёт «Написать», отправляет.
+
+    Возвращает (успех, id чата или причина). Чат создаётся самим Авито в момент отправки,
+    поэтому его идентификатор забираем из адреса уже после доставки.
+    """
+    page.goto(f"https://www.avito.ru/{item_id}", wait_until="domcontentloaded", timeout=90000)
+    page.wait_for_timeout(random.randint(*HUMAN_PAUSE_MS))
+    if not _logged_in(page):
+        return False, "сессия просрочена — нужен повторный вход"
+
+    opened = False
+    for locator in (page.locator('[data-marker="item-contact-bar/message"]'),
+                    page.get_by_role("button", name=re.compile("Написать", re.I)),
+                    page.get_by_role("link", name=re.compile("Написать", re.I))):
+        try:
+            if locator.count():
+                locator.first.click(timeout=15000)
+                opened = True
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if not opened:
+        return False, "кнопка «Написать» не найдена: объявление снято или изменилась страница"
+
+    try:
+        page.wait_for_selector(REPLY_INPUT, timeout=30000)
+    except Exception:  # noqa: BLE001
+        return False, "окно переписки не открылось"
+
+    page.wait_for_timeout(random.randint(*HUMAN_PAUSE_MS))
+    _type_like_a_human(page, REPLY_INPUT, text)
+    page.keyboard.press("Enter")
+
+    needle = text.strip()[:60]
+    try:
+        page.wait_for_function(
+            """([selector, needle]) => Array.from(document.querySelectorAll(selector))
+                   .some(node => (node.textContent || '').includes(needle))""",
+            arg=[MESSAGE_TEXT, needle],
+            timeout=20000,
+        )
+    except Exception:  # noqa: BLE001
+        return False, "unknown: сообщение не появилось в переписке за 20 секунд"
+    chat_id = page.url.rstrip("/").rsplit("/", 1)[-1]
+    return True, chat_id
+
+
+def command_send(args) -> int:
+    """Ручная отправка одного сообщения — для проверки боем перед включением очереди."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        context = _browser_context(playwright, args.account, headless=not args.show)
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            if args.item:
+                ok, detail = start_chat_from_item(page, args.item, args.text)
+            else:
+                ok, detail = send_message(page, args.chat, args.text)
+        finally:
+            context.close()
+    print(("отправлено, чат " if ok else "НЕ отправлено: ") + detail)
+    return 0 if ok else 1
+
+
+def command_inspect_chat(args) -> int:
+    """Строение одного чата: поле ввода и кнопка отправки. Ничего не отправляет."""
+    from playwright.sync_api import sync_playwright
+
+    report: dict[str, Any] = {}
+    with sync_playwright() as playwright:
+        context = _browser_context(playwright, args.account, headless=not args.show)
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(f"{MESSENGER_URL}/channel/{args.chat}", wait_until="domcontentloaded",
+                  timeout=90000)
+        page.wait_for_timeout(5000)
+        report["url"] = page.url
+        report["logged_in"] = _logged_in(page)
+        html = page.content()
+        report["markers"] = sorted(set(re.findall(r'data-marker="([^"]{3,60})"', html)))
+        report["textareas"] = page.locator("textarea").count()
+        report["contenteditable"] = page.locator("[contenteditable='true']").count()
+        report["buttons"] = [
+            (page.locator("button").nth(i).get_attribute("data-marker")
+             or (page.locator("button").nth(i).inner_text() or "").strip()[:30])
+            for i in range(min(page.locator("button").count(), 25))
+        ]
+        out = profile_path(args.account) / "chat_inspect.json"
+        out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        context.close()
+    print(f"строение чата -> {out}")
+    print("вошли:", report["logged_in"], "| textarea:", report["textareas"],
+          "| contenteditable:", report["contenteditable"])
+    print("маркеры ввода:", [m for m in report["markers"]
+                             if any(k in m for k in ("input", "send", "message", "text"))][:12])
+    return 0
+
+
 def command_mirror(args) -> int:
     from playwright.sync_api import sync_playwright
 
@@ -451,12 +600,34 @@ def command_mirror(args) -> int:
                 try:
                     pending = albery.claim_outbox(worker_id, args.account)
                     for item in pending:
-                        # Отправка включается следующим шагом. Пока строка возвращается с
-                        # честным «не отправлено»: тихо потерянное сообщение хуже отказа.
-                        albery.finish(item["outbox_id"], worker_id, "failed",
-                                      error="отправка в Авито ещё не подключена")
-                    if pending:
-                        print(f"строк в очереди отправки: {len(pending)} (пока не отправляем)")
+                        outbox_id = item["outbox_id"]
+                        # Границу побочного эффекта отмечает сервер ДО нажатия «отправить»:
+                        # обрыв во время отправки не должен выглядеть как обрыв до неё.
+                        if not albery.mark_sending(outbox_id, worker_id):
+                            print(f"  строка {outbox_id}: отправлять нельзя, отменена")
+                            continue
+                        chat_id = str(item.get("external_chat_id") or "")
+                        text = str(item.get("text") or "")
+                        try:
+                            if chat_id.startswith("item:"):
+                                # Пишем первыми: чата ещё нет, его создаст Авито в момент
+                                # отправки, и настоящий идентификатор вернём серверу.
+                                ok, detail = start_chat_from_item(page, chat_id[5:], text)
+                            else:
+                                ok, detail = send_message(page, chat_id, text)
+                        except Exception as exc:  # noqa: BLE001
+                            ok, detail = False, f"unknown: {type(exc).__name__}: {exc}"
+                        if ok:
+                            albery.finish(outbox_id, worker_id, "sent", provider_message_id=detail,
+                                          external_chat_id=detail)
+                            print(f"  строка {outbox_id}: отправлено")
+                        else:
+                            # «unknown» — отдельный исход: сообщение могло уйти, и повтор
+                            # показал бы человеку дубль. Такие строки разбирает оператор.
+                            result = "unknown" if detail.startswith("unknown") else "failed"
+                            albery.finish(outbox_id, worker_id, result, error=detail)
+                            print(f"  строка {outbox_id}: {result} — {detail}")
+                        time.sleep(random.uniform(2.0, 5.0))
                 except RuntimeError as exc:
                     print(f"очередь недоступна: {exc}")
 
@@ -477,10 +648,19 @@ def main() -> int:
     for name, help_text in (("login", "разовый вход в аккаунт"),
                             ("probe", "проверить сессию и сообщить состояние в Albery"),
                             ("capture", "записать сырые ответы мессенджера"),
+                            ("inspect-chat", "показать строение окна чата"),
+                            ("send", "отправить одно сообщение вручную (проверка боем)"),
                             ("mirror", "рабочий режим: зеркалить переписки")):
         item = sub.add_parser(name, help=help_text)
         item.add_argument("--account", required=True, help="код аккаунта, как в интерфейсе")
-        if name in {"probe", "capture"}:
+        if name in {"probe", "capture", "inspect-chat"}:
+            item.add_argument("--show", action="store_true", help="показать окно браузера")
+        if name == "inspect-chat":
+            item.add_argument("--chat", required=True, help="идентификатор чата (u2i-…)")
+        if name == "send":
+            item.add_argument("--chat", default="", help="ответ в существующий чат (u2i-…)")
+            item.add_argument("--item", default="", help="написать первым автору объявления (id)")
+            item.add_argument("--text", required=True, help="текст сообщения")
             item.add_argument("--show", action="store_true", help="показать окно браузера")
         if name == "capture":
             item.add_argument("--seconds", type=int, default=25)
@@ -491,7 +671,8 @@ def main() -> int:
 
     args = parser.parse_args()
     handlers = {"login": command_login, "probe": command_probe,
-                "capture": command_capture, "mirror": command_mirror}
+                "capture": command_capture, "mirror": command_mirror,
+                "inspect-chat": command_inspect_chat, "send": command_send}
     return handlers[args.command](args)
 
 
