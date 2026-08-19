@@ -19001,6 +19001,10 @@ from funnel_workspace import register_funnel_workspace  # noqa: E402
 register_funnel_workspace(app)
 
 import agent_center  # noqa: E402,F401
+from avito_channel import register_avito_channel  # noqa: E402  — канал Авито: /avito
+
+register_avito_channel(app)
+
 import wb_cabinet  # noqa: E402,F401  — WB-кабинет: /api/wb-cab/*
 import funnel_view  # noqa: E402,F401  — воронка ИУ в кабинете: /api/agent-center/funnel/*
 import iu_form_link  # noqa: E402,F401  — персональная ссылка на анкету ИУ: /iu/<токен>

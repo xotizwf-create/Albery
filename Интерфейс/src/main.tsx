@@ -9,9 +9,13 @@ async function bootstrap() {
   // ней кабинет вместо рабочего окна, и человек попадал на пустой раздел.
   const isWorkspace =
     pathname === '/agent-funnels' || pathname.startsWith('/agent-funnels/');
+  // Канал Авито — такое же отдельное рабочее окно со своим адресом обращения (/avito/37).
+  const isAvito = pathname === '/avito' || pathname.startsWith('/avito/');
   const RootComponent = isWorkspace
     ? (await import('./funnel-workspace/FunnelWorkspace.tsx')).FunnelWorkspace
-    : (await import('./App.tsx')).default;
+    : isAvito
+      ? (await import('./avito/AvitoInbox.tsx')).AvitoInbox
+      : (await import('./App.tsx')).default;
 
   const rootElement = document.getElementById('root');
   if (!rootElement) {

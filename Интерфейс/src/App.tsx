@@ -327,6 +327,7 @@ const VISIBLE_MENU_ITEMS = MENU_ITEMS.filter((item) => !HIDDEN_MAIN_MENU_LABELS.
 const AGENT_MENU_ITEMS = [
   { label: "Диалоги", icon: MessageSquare },
   { label: "Работа с воронками", icon: GitBranch },
+  { label: "Авито", icon: Store },
   { label: "Агенты", icon: Bot },
   { label: "База знаний", icon: BookOpen },
   { label: "Мониторинг", icon: Activity },
@@ -338,6 +339,7 @@ const AGENT_TAB_ROUTES: Record<string, string> = {
   "Агенты": "/agent",
   "Диалоги": "/agent-dialogs",
   "Работа с воронками": "/agent-funnels",
+  "Авито": "/avito",
   "База знаний": "/agent-knowledge",
   "Мониторинг": "/agent-monitoring",
   "Использование": "/agent-usage",
@@ -8022,6 +8024,8 @@ export default function App() {
                       onClick={() => {
                         if (item.label === "Работа с воронками") {
                           window.location.assign("/agent-funnels");
+                        } else if (item.label === "Авито") {
+                          window.location.assign("/avito");
                         } else if (item.label === "WB-кабинет") {
                           window.location.assign("/analytics");
                         } else {
