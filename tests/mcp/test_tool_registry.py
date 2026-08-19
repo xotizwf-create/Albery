@@ -108,7 +108,13 @@ def test_task_mutation_tools_registered(ctx):
     }
     missing = required - set(ctx.TOOLS)
     assert not missing, f"missing task mutation tools: {sorted(missing)}"
-    assert {"add_bitrix_task_comment", "reopen_bitrix_task"} <= set(ctx.CORE_TOOL_NAMES)
+    # С 19.08.2026 ядро урезано до рабочего набора по статистике вызовов: схемы 111
+    # инструментов стоили 116 445 символов в КАЖДОМ ходе, и ответ на «Ты тут?» занимал
+    # 278 секунд. Редкие инструменты не пропали — они объявляются агенту списком имён
+    # и достаются через find_tool/call_tool. Поэтому проверяем ДОСТУПНОСТЬ, а членство
+    # в ядре требуем только от того, что вызывается постоянно.
+    assert "add_bitrix_task_comment" in ctx.CORE_TOOL_NAMES
+    assert "reopen_bitrix_task" in ctx.TOOLS
 
 
 def test_task_management_and_attachment_tools_registered(ctx):
@@ -120,8 +126,13 @@ def test_task_management_and_attachment_tools_registered(ctx):
     }
     missing = required - set(ctx.TOOLS)
     assert not missing, f"missing task/attachment tools: {sorted(missing)}"
-    # All reachable via the chat bot's core toolset.
-    assert required <= set(ctx.CORE_TOOL_NAMES)
+    # С 19.08.2026 ядро урезано до рабочего набора по статистике вызовов: схемы 111
+    # инструментов стоили 116 445 символов в КАЖДОМ ходе, и ответ на «Ты тут?» занимал
+    # 278 секунд. Редкие инструменты не пропали — они объявляются агенту списком имён
+    # и достаются через find_tool/call_tool. Поэтому проверяем ДОСТУПНОСТЬ, а членство
+    # в ядре требуем только от того, что вызывается постоянно.
+    assert required <= set(ctx.TOOLS)
+    assert "get_attachment_text" in ctx.CORE_TOOL_NAMES
     # Reading an attachment is read-only -> safe on the FAQ tier (token-gated, unguessable).
     assert "get_attachment_text" in ctx.FAQ_TOOL_NAMES
     # Mutating tools must NOT be on the read-only FAQ tier.
@@ -147,9 +158,13 @@ def test_crm_funnel_tools_registered(ctx):
     }
     missing = required - set(ctx.TOOLS)
     assert not missing, f"missing CRM funnel tools: {sorted(missing)}"
-    # Everyday funnel work is reachable from the chat bot's core toolset.
+    # С 19.08.2026 ядро урезано до рабочего набора по статистике вызовов: схемы 111
+    # инструментов стоили 116 445 символов в КАЖДОМ ходе, и ответ на «Ты тут?» занимал
+    # 278 секунд. Редкие инструменты не пропали — они объявляются агенту списком имён
+    # и достаются через find_tool/call_tool. Поэтому проверяем ДОСТУПНОСТЬ, а членство
+    # в ядре требуем только от того, что вызывается постоянно.
     assert {"list_crm_pipelines", "list_crm_deals", "get_crm_deal",
-            "create_crm_deal", "update_crm_deal"} <= set(ctx.CORE_TOOL_NAMES)
+            "create_crm_deal", "update_crm_deal"} <= set(ctx.TOOLS)
     # Destroying a funnel or a deal is admin-class.
     assert {"delete_crm_pipeline", "delete_crm_deal"} <= set(ctx.OWNER_ONLY_TOOL_NAMES)
     # CRM is private business data — never on the FAQ tier.
@@ -207,8 +222,11 @@ def test_ops_core_does_not_list_owner_only_delete(ctx):
         core=True,
     )
     listed = {t["name"] for t in resp["result"]["tools"]}
+    # Режим ядра отдаёт рабочий набор...
     assert "add_bitrix_task_comment" in listed
-    assert "reopen_bitrix_task" in listed
+    assert "search_tasks" in listed
+    # ...и это НЕ должно стать лазейкой: разрушительное админское не появляется у
+    # обычного уровня доступа ни в ядре, ни через call_tool (резолвер тира тот же).
     assert "delete_bitrix_task" not in listed
 
 

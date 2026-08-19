@@ -12983,82 +12983,74 @@ OPS_TOOL_NAMES: set[str] = set(TOOLS) - OWNER_ONLY_TOOL_NAMES
 # Per-agent turns receive their exact dynamically computed tool list. This curated list remains
 # only for historical two-stage behavior and compatibility tests while old preset metadata exists.
 CORE_TOOL_NAMES: set[str] = {
-    # entry / self-knowledge
+    # Состав собран по ФАКТИЧЕСКОЙ статистике вызовов главного агента за месяц
+    # (/root/.hermes/state.db, messages.tool_name), а не по представлениям о полезности.
+    # Верхние 16 позиций дают 85% всех обращений; сюда добавлены редкие, но обязательные
+    # по смыслу пары (создал задачу — должен уметь закрыть) и проверка результата таблицы.
+    #
+    # Зачем ядро. Схемы 111 инструментов — 116 445 символов В КАЖДОМ ходе, плюс инструкции:
+    # итого около 45 000 токенов постоянной части. Из-за этого ответ на «Ты тут?» занимал
+    # 278 секунд (замер 19.08.2026) — время уходило не на работу, а на разбор промпта.
+    # Остальные инструменты НЕ пропадают: их имена объявляются агенту списком
+    # (more_tools_via_call_tool), находятся через find_tool и вызываются через call_tool.
+
+    # вход и самознание — самый частый вызов вообще (1020 обращений)
     "start_here_always_read_ai_instructions",
     "get_ai_instructions",
     "get_ai_capabilities",
     "get_context_guide",
-    # links to the company's specialised agents (+ access check for the asker)
     "get_agent_link",
-    # company knowledge
+    # знания компании (301 + 97)
     "search_company_knowledge",
-    "list_company_files",
     "get_company_file",
     "get_org_structure",
-    "get_employee_absences",
-    # tasks
+    "get_bitrix_departments",
+    # задачи: поиск (479), комментарии (141), создание (129) + обязательный жизненный цикл.
+    # Группы держим ЦЕЛИКОМ, даже если хвост группы вызывается редко: 29.07.2026 у агента
+    # было «создать документ» без «изменить», и он отвечал пользователям, что не имеет
+    # доступа, хотя доступ был. Неполный набор хуже лишних символов в промпте.
     "search_tasks",
     "list_overdue_tasks",
-    "get_task_history",
-    "report_overdue_discipline",
     "get_task_comments",
-    "add_bitrix_task_comment",
     "create_bitrix_task",
     "update_bitrix_task",
+    "add_bitrix_task_comment",
+    "complete_bitrix_task",
     "add_task_checklist",
     "log_task_time",
     "link_tasks",
     "create_recurring_task",
     "list_recurring_tasks",
-    "update_recurring_task",
     "delete_recurring_task",
-    "complete_bitrix_task",
-    "reopen_bitrix_task",
-    "delete_bitrix_task",
-    "attach_files_to_task",
-    "get_attachment_text",
-    "edit_attachment_document",
-    "convert_document",
-    "get_wb_prices",
-    # zoom
-    "list_zoom_calls",
-    "get_zoom_call_transcript",
-    "search_zoom_transcripts",
-    # dialog memory
-    "get_bitrix_bot_chat",
-    "list_bitrix_bot_sessions",
-    # crm funnels & deals
-    "list_crm_pipelines",
-    "list_crm_deals",
-    "get_crm_deal",
-    "create_crm_deal",
-    "update_crm_deal",
-    # messaging / web
-    "send_bitrix_message",
-    "fetch_url",
-    # google workflow the bot prompt teaches
+    # таблицы: чтение (234), запись (126), метаданные (82), оформление (56) — и создание,
+    # без которого набор снова становится неполным
     "create_google_sheet",
-    "create_google_doc",
-    # Documents must be as visible as sheets. While only "create" was in the core set, the model
-    # saw no way to change an existing document and told users it lacked ACCESS (29.07.2026) —
-    # a capability the agent cannot see is a capability it does not have.
-    "read_google_doc",
-    "edit_google_doc",
     "get_google_sheet_meta",
     "read_google_sheet_values",
     "write_google_sheet_values",
-    # Проверка результата, а не своих действий: 17.08.2026 агент собрал таблицу учёта,
-    # оставил строку с пустым «Типом» — сводка на SUMIF по «Типу» показала 0 ₽ при живой
-    # записи на 232 ₽ — и отчитался «доработал и проверил». Инструмент, которого агент не
-    # видит, для него не существует, поэтому проверка живёт в ядре набора.
+    "format_google_sheet",
+    "write_company_sheet",
+    # документы — той же симметрии ради
+    "create_google_doc",
+    "read_google_doc",
+    "edit_google_doc",
+    # проверка результата обязательна инструкцией — без неё агент отчитается о сломанной
+    # таблице как о готовой (случай 17.08.2026)
     "check_google_sheet_health",
-    "share_drive_item_for_everyone",
-    "get_webapp_template",
-    "make_sheet_applet",
+    # документы и вложения (74)
+    "get_attachment_text",
+    # внешние источники и переписка
+    "fetch_url",
+    "search_messages",
+    "send_bitrix_message",
+    "get_bitrix_bot_chat",
+    # созвоны (84 + 65)
+    "list_zoom_calls",
+    "get_zoom_call_transcript",
+    # маркетплейс (110)
+    "get_wb_prices",
+    # скрипты в таблицах (80)
     "manage_apps_script",
-    # Google Drive uploads (task 1502): upload sent files into company folders + list folders.
-    "upload_file_to_drive",
-    "list_drive_folders",
 }
 
 

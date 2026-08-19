@@ -3111,6 +3111,22 @@ def mcp_agent_info(slug: str):
     })
 
 
+def _core_mode_agents() -> set[str]:
+    """Кто работает на ЯДРЕ инструментов вместо полного набора.
+
+    Схемы 111 инструментов — 116 445 символов в каждом ходе (замер 19.08.2026), из-за чего
+    ответ на «Ты тут?» занимал 278 секунд: время уходило на разбор промпта, а не на работу.
+    В режиме ядра агент носит рабочий набор, а остальное объявляется списком имён и
+    достаётся через find_tool/call_tool — доступ не теряется.
+
+    Список агентов, а не общий тумблер: включаем по одному и смотрим замер. Кроны и
+    служебные агенты сюда попадать не должны — они ходят по полным наборам, и перевод их
+    на ядро сломает сценарии, где инструмент вызывается без диалога.
+    """
+    raw = os.getenv("B24_CORE_AGENTS", "").strip()
+    return {slug.strip() for slug in raw.split(",") if slug.strip()}
+
+
 @app.post("/mcp-agent/<slug>")
 def mcp_agent_http(slug: str):
     from app import mcp_internal_request_ok
@@ -3177,6 +3193,7 @@ def mcp_agent_http(slug: str):
     response = handle_request(
         payload,
         tool_names=tool_names,
+        core=agent["slug"] in _core_mode_agents(),
         allow_owner_tools=True,
         instruction_scope=instruction_scope,
         agent_slug=agent["slug"],
