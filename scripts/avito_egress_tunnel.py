@@ -101,6 +101,75 @@ def _read_target(channel) -> tuple[str, int]:
     return host, port
 
 
+_TUNNEL_LOCAL_IP: str | None = None
+_DIRECT_ADDRESS_CACHE: dict[str, tuple[str, float]] = {}
+_DIRECT_CACHE_TTL_S = 600
+
+
+def _detect_tunnel_local_ip() -> str | None:
+    """Каким локальным адресом машина выходит в интернет ПО УМОЛЧАНИЮ.
+
+    На машине-выходе поднят VPN, и обычный трафик уходит его адресом. Зная этот адрес, мы
+    отличаем «пошло в туннель» от «пошло напрямую», не зная ничего про конкретный VPN.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("1.1.1.1", 443))  # UDP-connect: пакетов не шлёт, только выбирает маршрут
+        return probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+
+
+def _connect_preferring_direct(host: str, port: int):
+    """Соединение с предпочтением адреса, который идёт МИМО VPN.
+
+    Авито отдаёт три A-записи, а исключение в VPN-клиенте прописывается на тот адрес,
+    который клиент разрезолвил сам — остальные продолжают уходить в туннель, и с них
+    прилетает «Доступ ограничен: проблема с IP». Поэтому здесь мы пробуем кандидатов и
+    оставляем того, чьё соединение НЕ вышло адресом туннеля. Выбор кэшируется на 10 минут
+    и пересматривается сам, если правила выхода поменялись.
+    """
+    cached = _DIRECT_ADDRESS_CACHE.get(host)
+    if cached and time.time() - cached[1] < _DIRECT_CACHE_TTL_S:
+        return socket.create_connection((cached[0], port), timeout=CONNECT_TIMEOUT_S)
+
+    try:
+        candidates = [info[4][0] for info in socket.getaddrinfo(host, port, socket.AF_INET,
+                                                                socket.SOCK_STREAM)]
+    except socket.gaierror:
+        candidates = []
+    seen: list[str] = []
+    for address in candidates:
+        if address not in seen:
+            seen.append(address)
+    if not seen:
+        return socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
+
+    fallback = None
+    for address in seen:
+        try:
+            sock = socket.create_connection((address, port), timeout=CONNECT_TIMEOUT_S)
+        except OSError:
+            continue
+        local_ip = sock.getsockname()[0]
+        if _TUNNEL_LOCAL_IP is None or local_ip != _TUNNEL_LOCAL_IP:
+            _DIRECT_ADDRESS_CACHE[host] = (address, time.time())
+            if len(seen) > 1:
+                logging.info("%s: выбран %s (напрямую, локальный %s)", host, address, local_ip)
+            return sock
+        if fallback is None:
+            fallback = sock  # держим на случай, если прямого не найдётся вовсе
+        else:
+            sock.close()
+    if fallback is not None:
+        logging.warning("%s: прямого маршрута нет, идём через туннель — Авито может ответить "
+                        "блокировкой по IP", host)
+        return fallback
+    raise OSError(f"не удалось соединиться ни с одним адресом {host}")
+
+
 def _pump(channel, sock) -> None:
     """Перекачивает байты в обе стороны, пока одна из сторон не закроется."""
     try:
@@ -135,7 +204,7 @@ def handle_channel(channel, origin) -> None:
 
         host, port = _read_target(channel)
         try:
-            sock = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
+            sock = _connect_preferring_direct(host, port)
         except OSError as exc:
             logging.warning("не дозвонились до %s:%s (%s)", host, port, exc.__class__.__name__)
             channel.sendall(bytes([SOCKS_VERSION, REPLY_HOST_UNREACHABLE, 0, ATYP_IPV4, 0, 0, 0, 0, 0, 0]))
@@ -165,6 +234,12 @@ def handle_channel(channel, origin) -> None:
 
 
 def serve(host: str, username: str, password: str, *, port: int, remote_port: int) -> int:
+    global _TUNNEL_LOCAL_IP
+    _TUNNEL_LOCAL_IP = _detect_tunnel_local_ip()
+    if _TUNNEL_LOCAL_IP:
+        print(f"Обычный выход этой машины: {_TUNNEL_LOCAL_IP} "
+              "(адреса Авито будем выбирать так, чтобы идти мимо него).")
+
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(host, port=port, username=username, password=password,
