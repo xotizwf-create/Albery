@@ -213,6 +213,31 @@ def attachment_bytes(token: str) -> tuple[bytes, str] | None:
         return None
 
 
+def finalize_capture(token: str, *, kind: str, extracted_text: str) -> str | None:
+    """Fill in the recognised text of a raw file captured at intake, keeping ONE row per file.
+
+    Intake stores the bytes while the sender's token still grants access; recognition happens
+    later in the worker. Without this the same file would end up twice in the store — once
+    bytes-only, once with text — and the bytes-only row, being the freshest, would win every
+    lookup by disk file id."""
+    tok = str(token or "").strip()
+    if not tok:
+        return None
+    text = (extracted_text or "").replace("\x00", "")  # NUL (0x00) is illegal in PG text
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE bitrix_bot_attachments "
+                    "SET kind = %s, extracted_text = %s, char_len = %s WHERE token = %s",
+                    (kind, text, len(text), tok),
+                )
+        return tok
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("attachments.finalize failed (%s): %s", tok, repr(exc)[:160])
+        return None
+
+
 def set_disk_id(token: str, disk_id: Any) -> None:
     """Remember the Bitrix disk file id after a re-upload, so repeated attaches reuse it."""
     did = _to_int(disk_id)

@@ -2920,6 +2920,85 @@ def _b24_disk_file_meta(endpoint: str, access_token: str, wh: str, fid) -> tuple
     return name, ""
 
 
+def _b24_event_files(payload: dict, endpoint: str = "", access_token: str = "",
+                     dialog_id: str = "", recover_dialog_id: str = "") -> dict:
+    """Disk file ids attached to THIS imbot event -> their inline metadata ({} when absent).
+
+    Files arrive as data[PARAMS][FILES][<disk id>][field]. Bitrix delivers that block
+    inconsistently (an uncaptioned or follow-up file often has none), so the ids are also
+    recovered from the dialog by message id and merged in."""
+    files: dict = {}
+    if not isinstance(payload, dict):
+        return files
+    pat = re.compile(r"^data\[PARAMS\]\[FILES\]\[([^\]]+)\]\[([^\]]+)\]$", re.I)
+    for k, v in payload.items():
+        m = pat.match(str(k))
+        if not m:
+            continue
+        val = v[0] if isinstance(v, list) and v else v
+        files.setdefault(m.group(1), {})[m.group(2)] = val
+    message_id = _imbot_event_param(payload, "MESSAGE_ID") or ""
+    try:
+        for _rfid in _b24_message_file_ids(endpoint, access_token,
+                                           recover_dialog_id or dialog_id, message_id):
+            files.setdefault(str(_rfid), {})
+    except Exception:  # noqa: BLE001
+        logging.warning("b24 extras: file-id recovery failed", exc_info=True)
+    return files
+
+
+def _b24_capture_event_files(payload: dict, endpoint: str, access_token: str, *,
+                             agent_slug: str | None = None, dialog_id: str = "",
+                             from_user_id: Any = None, bot_id: Any = None,
+                             budget_s: float = 45.0) -> int:
+    """Download the event's attachments NOW, while the SENDER's own OAuth token is in hand.
+
+    Bitrix hands every event an access token that belongs to the employee who caused it, and
+    only that identity may read the file: the file lives in the sender's Disk and its ACL is
+    the private «employee ↔ bot» chat, where the permanent application user (22) is not a
+    participant and gets ACCESS_DENIED.  Durable intake deliberately strips tokens before the
+    payload becomes a queue row, so the deferred worker has nothing but the application token —
+    which is why every attachment sent after 14.08.2026 came back as «не удалось скачать файл».
+
+    Only the bytes are taken here (a plain HTTP GET, no model calls): OCR, transcription and
+    text extraction stay in the worker, reading from the attachment store by disk file id.
+    Best-effort — a failure here never blocks accepting the event."""
+    import attachments as _att
+
+    stored = 0
+    deadline = time.time() + max(1.0, budget_s)
+    wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
+    # Recovery must ask the dialog the SENDER sees: their private chat with the bot is keyed by
+    # the bot's id, not by the sender's own id (which is what the event's DIALOG_ID carries).
+    files = _b24_event_files(payload, endpoint, access_token, dialog_id,
+                            recover_dialog_id=str(bot_id or ""))
+    for fid, f in list(files.items())[:10]:
+        if time.time() > deadline:
+            logging.warning("b24 capture: time budget spent, %s left undownloaded", fid)
+            break
+        try:
+            if _att.find_by_disk_file_id(fid):
+                continue  # already captured (Bitrix re-delivers events at least once)
+            name = str(f.get("name") or "")
+            if not name:
+                name, _ft = _b24_disk_file_meta(endpoint, access_token, wh, fid)
+            durl = _b24_app_download_url(endpoint, access_token, fid)
+            data = _b24_fetch_bytes(durl, access_token) if durl else b""
+            if not data:
+                logging.warning("b24 capture: could not download fid=%s name=%s", fid, name)
+                continue
+            token = _att.store_attachment(
+                data=data, file_name=name or f"файл {fid}", kind="inbound_raw",
+                extracted_text="", agent_slug=agent_slug, dialog_id=str(dialog_id or ""),
+                bitrix_user_id=from_user_id, mime=str(f.get("type") or "") or None,
+                source_disk_file_id=fid)
+            if token:
+                stored += 1
+        except Exception:  # noqa: BLE001
+            logging.warning("b24 capture: failed fid=%s", fid, exc_info=True)
+    return stored
+
+
 def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "",
                         agent_slug: str | None = None, dialog_id: str = "", from_user_id: Any = None):
     """Parse images + documents + reply-context straight from the flattened imbot event payload.
@@ -2950,25 +3029,20 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
         if v and str(v).strip():
             reply_text = str(v).strip()
             break
-    files: dict = {}
-    pat = re.compile(r"^data\[PARAMS\]\[FILES\]\[([^\]]+)\]\[([^\]]+)\]$", re.I)
-    for k, v in payload.items():
-        m = pat.match(str(k))
-        if not m:
-            continue
-        val = v[0] if isinstance(v, list) and v else v
-        files.setdefault(m.group(1), {})[m.group(2)] = val
+    import attachments as _att
+
     wh = (os.getenv("B24_TESTBOT_WEBHOOK_BASE", "") or "").rstrip("/")
-    # Recover files referenced by THIS message (inline FILES is delivered inconsistently by
-    # Bitrix; an uncaptioned or follow-up file often has no inline block) and merge by disk id.
-    message_id = _imbot_event_param(payload, "MESSAGE_ID") or ""
-    try:
-        for _rfid in _b24_message_file_ids(endpoint, access_token, dialog_id, message_id):
-            files.setdefault(str(_rfid), {})
-    except Exception:  # noqa: BLE001
-        logging.warning("b24 extras: file-id recovery failed", exc_info=True)
+    files = _b24_event_files(payload, endpoint, access_token, dialog_id)
     for fid, f in list(files.items())[:10]:
-        name = str(f.get("name") or "")
+        # Bytes captured at intake with the sender's token (see _b24_capture_event_files): the
+        # deferred worker only holds the application token, which the portal denies on a file
+        # belonging to someone else's private chat.
+        captured = _att.find_by_disk_file_id(fid)
+        captured_bytes = b""
+        if captured:
+            got = _att.attachment_bytes(captured["token"])
+            captured_bytes = got[0] if got else b""
+        name = str(f.get("name") or "") or (captured or {}).get("file_name") or ""
         ftype = str(f.get("type") or "").lower()
         if not name:
             # Recovered by id (no inline metadata): resolve its real name via disk.file.get.
@@ -2984,18 +3058,20 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
         is_other = not is_image and not is_audio and not is_doc
         if not name and not ext:
             continue
-        # Download the chat file. The BOT is a member of this dialog, so it can read the
-        # file via its own OAuth token once the local app has the 'disk' scope; the static
-        # inbound webhook user is NOT a chat member (403), so the bot token is tried first
-        # and the webhook only as a fallback. The inline urlDownload is a session-bound ajax
-        # URL (needs a browser cookie) and is intentionally not used server-side.
-        durl = _b24_app_download_url(endpoint, access_token, fid)
-        if not durl and wh:
-            try:
-                durl = _refresh_bitrix_download_url(wh, fid) or ""
-            except Exception:  # noqa: BLE001
-                logging.warning("b24 extras: webhook disk.file.get failed fid=%s", fid)
-        data = _b24_fetch_bytes(durl, access_token) if durl else b""
+        # Download the chat file only when intake did not already capture it. A chat file is
+        # ACL-guarded by chat membership, so this path succeeds only for the identity that owns
+        # the token in hand — the sender on the live event, and nobody on the deferred worker.
+        # The inline urlDownload is a session-bound ajax URL (needs a browser cookie) and is
+        # intentionally not used server-side.
+        data = captured_bytes
+        if not data:
+            durl = _b24_app_download_url(endpoint, access_token, fid)
+            if not durl and wh:
+                try:
+                    durl = _refresh_bitrix_download_url(wh, fid) or ""
+                except Exception:  # noqa: BLE001
+                    logging.warning("b24 extras: webhook disk.file.get failed fid=%s", fid)
+            data = _b24_fetch_bytes(durl, access_token) if durl else b""
         if not data:
             # Never drop a file silently: tell the brain a file arrived but could not be
             # read, so it asks for a resend / PDF instead of inventing the contents.
@@ -3013,12 +3089,14 @@ def _b24_message_extras(payload: dict, endpoint: str = "", access_token: str = "
         # later and re-attach the original to a task. Best-effort — never blocks the reply.
         def _store(kind: str, full_text: str) -> str | None:
             try:
-                import attachments as _att
+                if captured:
+                    return _att.finalize_capture(captured["token"], kind=kind,
+                                                 extracted_text=full_text or "")
                 return _att.store_attachment(
                     data=data, file_name=name or ("image" if kind == "image" else "file"),
                     kind=kind, extracted_text=full_text or "", agent_slug=agent_slug,
                     dialog_id=str(dialog_id or ""), bitrix_user_id=from_user_id,
-                    mime=str(f.get("type") or "") or None,
+                    mime=str(f.get("type") or "") or None, source_disk_file_id=fid,
                 )
             except Exception:  # noqa: BLE001
                 logging.warning("b24 extras: attachment store failed name=%s", name)
@@ -5332,6 +5410,16 @@ def _bitrix_imbot_app_event():
                 for key, value in payload.items()
             )
             delay = _B24_BATCH_FILE_WINDOW_S if attachment_hint else _B24_BATCH_TEXT_WINDOW_S
+            if attachment_hint:
+                # The event token is the ONLY identity allowed to read these files, and it dies
+                # with this request — the queue row is stored token-free. Take the bytes now.
+                try:
+                    _b24_capture_event_files(
+                        payload, endpoint, access_token, agent_slug=(agent or {}).get("slug"),
+                        dialog_id=dialog_id, from_user_id=to_int(from_user_id), bot_id=bot_id)
+                except Exception:  # noqa: BLE001
+                    logging.warning("b24 durable capture: attachments failed mid=%s",
+                                    message_id, exc_info=True)
             try:
                 queued = bitrix_inbound.enqueue(
                     event_key=f"chat:{bot_id}:{mid}",
