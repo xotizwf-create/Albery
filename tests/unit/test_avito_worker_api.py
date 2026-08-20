@@ -98,6 +98,10 @@ def test_inbound_stores_the_talk_and_survives_a_repeat(avito, worker, monkeypatc
     monkeypatch.setattr(avito, "pg_connect", lambda: _Conn())
     monkeypatch.setattr(avito.store, "ensure_source", lambda *a, **k: {"source_key": "avito"})
     monkeypatch.setattr(avito.store, "ensure_conversation", lambda **kw: {"id": 42})
+    # Разговор уже заведён — то есть рабочий, и граница зеркала его пропускает. Здесь
+    # проверяется защита от повторной доставки, а не сама граница: она в
+    # tests/unit/test_avito_mirror_scope.py.
+    monkeypatch.setattr(avito.store, "find_conversation", lambda **kw: {"id": 42})
 
     payload = {
         "account": "main", "external_chat_id": "u2i-abc", "display_name": "Пётр",

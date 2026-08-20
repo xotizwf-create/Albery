@@ -63,6 +63,28 @@ def transport_enabled() -> bool:
     return os.getenv("AVITO_CHANNEL_ENABLED", "0").strip() == "1"
 
 
+def mirror_scope_is_limited() -> bool:
+    """Тянуть ли в кабинет ТОЛЬКО рабочие переписки.
+
+    Выход в Авито — личный аккаунт владельца, и зеркало шлёт все чаты подряд: аренду
+    квартир, продавцов подписок, репетиторов. В кабинете это видят сотрудники, то есть
+    без границы личная переписка утекает в рабочую систему. Поэтому шлюз закрыт по
+    умолчанию, а не открыт: забыть его включить дороже, чем забыть выключить.
+    """
+    return os.getenv("AVITO_MIRROR_ONLY_KNOWN", "1").strip() != "0"
+
+
+def chat_belongs_to_work(*, account: str, chat_id: str) -> bool:
+    """Наш ли это разговор. Признак — происхождение, а не текст сообщения.
+
+    Наш разговор либо завела сама система («написать первым» и его сшивка по номеру
+    объявления), либо он уже заведён в базе на прошлом обходе. Разбирать содержимое
+    бессмысленно: продавец генератора и хозяин квартиры пишут одинаковое «Здравствуйте».
+    """
+    return store.find_conversation(source_key=SOURCE_KEY, business_connection_id=account,
+                                   external_chat_id=chat_id) is not None
+
+
 # --- Аккаунты --------------------------------------------------------------------------------
 
 _ACCOUNT_COLS = ("slug, label, profile_dir, egress_label, session_status, session_checked_at, "
@@ -662,6 +684,14 @@ def ingest_inbound(payload: Mapping[str, Any]) -> dict[str, Any]:
     # временным появится второй разговор на того же человека.
     stitched = stitch_outreach_conversation(account=slug, listing_id=str(listing.get("id") or ""),
                                             chat_id=chat_id)
+    # Граница зеркала. Отбиваем ДО ensure_conversation: разговор, заведённый «на всякий
+    # случай», уже виден сотрудникам и уже не может быть удалён навсегда — следующий обход
+    # завёл бы его снова. Пропуск — штатный исход, а не ошибка: воркер печатает сводку и
+    # идёт дальше.
+    if not stitched and mirror_scope_is_limited() and not chat_belongs_to_work(
+            account=slug, chat_id=chat_id):
+        return {"skipped": "outside_mirror_scope", "conversation_id": None,
+                "stored_messages": 0, "received": len(messages), "stitched": None}
     conversation = store.ensure_conversation(
         external_chat_id=chat_id,
         source_key=SOURCE_KEY,
