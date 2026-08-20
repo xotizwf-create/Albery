@@ -73,8 +73,21 @@ HEALTHZ_TIMEOUT_S = 20
 # Канал Авито. Воркер сообщает состояние сессии на каждом обходе (обход — раз в 20 секунд),
 # поэтому полчаса тишины означают, что выхода нет: машина владельца выключена или воркер не
 # запущен. Порог сознательно большой — перезагрузка компьютера не должна будить владельца.
-AVITO_SILENT_AFTER_MIN = 30
+AVITO_SILENT_AFTER_MIN = 120
 AVITO_QUEUE_STUCK_AFTER_MIN = 30
+# Выход в Авито живёт на компьютере владельца, и ночью и в выходные этот компьютер выключен —
+# то есть «выход не отзывается» там НОРМА, а не авария. Проверять пропажу имеет смысл только
+# когда рабочий день идёт и выход обязан быть: иначе каждое утро начиналось с тревоги о том,
+# что все и так знают.
+AVITO_WATCH_HOURS = (9, 19)
+
+
+def avito_egress_expected(now: datetime | None = None) -> bool:
+    from config import MSK_TZ
+
+    moment = now or datetime.now(MSK_TZ)
+    start, end = AVITO_WATCH_HOURS
+    return moment.weekday() < 5 and start <= moment.hour < end
 EXTERNAL_CHECK_EVERY_S = 3600  # внешние доступы (Google/Zoom/Bitrix) — раз в час, чтобы не ловить лимиты
 
 
@@ -293,7 +306,9 @@ else:
         row = sh(["sudo", "-u", "postgres", "psql", "albery", "-tAc", egress_sql]).strip()
         if row and "|" in row:
             broken, silent_min = (int(part or 0) for part in row.split("|"))
-            if silent_min >= AVITO_SILENT_AFTER_MIN:
+            if silent_min >= AVITO_SILENT_AFTER_MIN and not avito_egress_expected():
+                pass  # нерабочее время: выключенный компьютер владельца — не поломка
+            elif silent_min >= AVITO_SILENT_AFTER_MIN:
                 age = "ни разу" if silent_min >= 999999 else f"{silent_min} мин"
                 problems.append(
                     f"канал Авито: выход не отзывался {age} — на машине владельца не запущен "
@@ -340,6 +355,22 @@ except Exception as exc:  # noqa: BLE001
     ]
 if workspace_queue_problems:
     problems.extend(f"КРИТИЧНО: {message}" for message in workspace_queue_problems)
+    critical = True
+
+# Терминальные очереди (dead_letter / failed): о них сообщают ОДИН раз — на новых строках.
+# Граница показанного хранится здесь же, в состоянии монитора, и сдвигается только когда
+# алерт действительно ушёл человеку (см. блок отправки), иначе подавленный антиспамом
+# алерт молча «съел» бы аварию.
+terminal_marks: dict[str, int] = {}
+try:
+    from scripts.workspace_queue_health import inspect_terminal_queues, unreported_terminal_queues
+
+    terminal_marks = inspect_terminal_queues()
+    terminal_problems = unreported_terminal_queues(terminal_marks, state.get("terminal_queues_seen"))
+except Exception as exc:  # noqa: BLE001
+    terminal_problems = [f"terminal queue monitor failed ({type(exc).__name__})"]
+if terminal_problems:
+    problems.extend(f"КРИТИЧНО: {message}" for message in terminal_problems)
     critical = True
 
 # --- Zoom / Google Drive / Wildberries ---------------------------------------------------
@@ -571,6 +602,9 @@ if problems:
             # заглушить настоящий алерт, который придёт через минуту.
             state["last_digest"] = digest
             state["last_alert_ts"] = time.time()
+            # Показанные мёртвые строки считаются разобранными: инцидент назван один раз.
+            if terminal_marks:
+                state["terminal_queues_seen"] = terminal_marks
     if should_notify:
         logging.warning("selfcheck: %s problem(s) reported (critical=%s)", len(problems), critical)
     else:

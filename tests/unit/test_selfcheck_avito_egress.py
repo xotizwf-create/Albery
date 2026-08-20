@@ -56,4 +56,14 @@ def test_the_alert_says_what_to_do():
 def test_the_threshold_is_forgiving_enough_for_a_reboot():
     source = _source()
     minutes = int(re.search(r"AVITO_SILENT_AFTER_MIN\s*=\s*(\d+)", source).group(1))
-    assert 15 <= minutes <= 60, "перезагрузка компьютера не должна будить владельца"
+    assert minutes >= 15, "перезагрузка компьютера не должна будить владельца"
+
+
+def test_missing_egress_is_an_incident_only_while_the_workday_runs():
+    """Ночью и в выходные компьютер владельца выключен — это норма, а не авария.
+
+    Решение владельца 20.08.2026: будни 9–19 МСК, молчание дольше двух часов. До этого
+    каждое утро начиналось с КРИТИЧНО о том, что все и так знают."""
+    assert "avito_egress_expected()" in _avito_block()
+    minutes = int(re.search(r"AVITO_SILENT_AFTER_MIN\s*=\s*(\d+)", _source()).group(1))
+    assert minutes == 120

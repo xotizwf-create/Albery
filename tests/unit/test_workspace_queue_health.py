@@ -45,13 +45,13 @@ def test_healthy_workspace_queues_are_silent():
 def test_queue_probe_reports_counts_without_business_payloads():
     problems = inspect_workspace_queue_health(
         connect_factory=_connect_with_row(
-            {"outbox_unknown": 2, "crm_dead": 1, "manager_expired": 3}
+            {"outbox_unknown": 2, "crm_overdue": 1, "manager_expired": 3}
         ),
         now=NOW,
     )
 
     assert problems == [
         "Telegram deliveries have ambiguous outcome: 2",
-        "Telegram CRM actions in dead letter: 1",
+        "Telegram CRM actions overdue: 1",
         "IU manager alert leases expired: 3",
     ]
