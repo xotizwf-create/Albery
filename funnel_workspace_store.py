@@ -99,6 +99,10 @@ UNDELIVERED_STATUSES = frozenset({"failed", "cancelled"})
 VALID_UPDATE_LANES = frozenset({"business", "bot"})
 ACTIVE_STATUSES = frozenset({"new", "open", "waiting"})
 DEFAULT_SOURCE_KEY = "telegram"
+#: Каналы, для которых у CRM-адаптера есть реализация связки со сделкой. Один список на две
+#: стороны: и тот, кто ставит задачу, и тот, кто её выполняет, — иначе они расходятся, и
+#: расхождение видно только по мёртвым задачам в очереди.
+CRM_LINKED_SOURCES = frozenset({"telegram", "telegram_bot"})
 MAX_MESSAGE_LENGTH = 4096
 #: Telegram обрезает подпись к документу на 1024 символах — отправлять больше нечестно.
 MAX_CAPTION_LENGTH = 1024
@@ -2453,6 +2457,7 @@ def ingest_business_message(
                             cur,
                             conversation_id=conversation["id"],
                             message_id=existing["id"],
+                            source_key=conversation.get("source_key"),
                         )
                         if existing["author_type"] == "client"
                         and not conversation.get("deal_id")
@@ -2471,6 +2476,7 @@ def ingest_business_message(
                         cur,
                         conversation_id=conversation["id"],
                         message_id=existing["id"],
+                        source_key=conversation.get("source_key"),
                     )
                     if existing["author_type"] == "client"
                     and not conversation.get("deal_id")
@@ -2671,6 +2677,7 @@ def ingest_business_message(
                     cur,
                     conversation_id=updated["id"],
                     message_id=message["id"],
+                    source_key=updated.get("source_key"),
                 )
                 if clean_author == "client" and not updated.get("deal_id")
                 else None
@@ -4480,9 +4487,16 @@ def _enqueue_ensure_deal_action_cursor(
     *,
     conversation_id: Any,
     message_id: Any,
-) -> dict[str, Any]:
-    """Schedule one bounded, deduplicated CRM-link action per conversation."""
+    source_key: Any = None,
+) -> dict[str, Any] | None:
+    """Schedule one bounded, deduplicated CRM-link action per conversation.
 
+    Каналы вне CRM_LINKED_SOURCES пропускаются: адаптер отбивает их по построению, и задача
+    гарантированно доедет только до dead_letter. 19.08.2026 канал Авито за вечер положил туда
+    75 таких задач, и монитор потом сутками звал разбирать то, что нельзя было выполнить."""
+
+    if source_key is not None and str(source_key).strip().lower() not in CRM_LINKED_SOURCES:
+        return None
     item_id = _positive_int(conversation_id, "conversation_id")
     trigger_message_id = _positive_int(message_id, "message_id")
     idempotency_key = f"crm-ensure:conversation:{item_id}"
@@ -4603,6 +4617,7 @@ def ensure_deal_action(
                 cur,
                 conversation_id=item_id,
                 message_id=trigger_message_id,
+                source_key=conversation.get("source_key"),
             )
 
 
@@ -4620,6 +4635,7 @@ def _backfill_missing_deal_actions_cursor(cur: Any, limit: int) -> int:
                  LIMIT 1
           ) trigger ON true
          WHERE c.deal_id IS NULL
+           AND c.source_key = ANY(%s)
            AND NOT EXISTS (
                 SELECT 1
                   FROM funnel_workspace_crm_actions a
@@ -4630,7 +4646,7 @@ def _backfill_missing_deal_actions_cursor(cur: Any, limit: int) -> int:
          FOR UPDATE OF c SKIP LOCKED
          LIMIT %s
         """,
-        (limit,),
+        (sorted(CRM_LINKED_SOURCES), limit),
     )
     rows = [dict(row) for row in cur.fetchall()]
     for row in rows:
