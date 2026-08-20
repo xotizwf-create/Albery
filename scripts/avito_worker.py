@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import random
@@ -93,6 +94,15 @@ class Albery:
             raise RuntimeError(f"Albery ответил {exc.code}: {detail}") from None
         except urlerror.URLError as exc:
             raise RuntimeError(f"нет связи с Albery: {exc.reason}") from None
+        # URLError покрывает только фазу ЗАПРОСА: в CPython h.getresponse() стоит вне того
+        # try, который заворачивает ошибки в URLError. Обрыв на фазе ОТВЕТА прилетает сырым
+        # RemoteDisconnected и 20.08.2026 убил воркер после часа штатной работы — канал
+        # Авито замолчал молча. Перезапуск Albery не должен ронять зеркало.
+        except (OSError, http.client.HTTPException) as exc:
+            raise RuntimeError(f"связь с Albery оборвалась: {type(exc).__name__}: {exc}") from None
+        except json.JSONDecodeError as exc:
+            # Во время перезапуска nginx отдаёт HTML-страницу ошибки вместо JSON.
+            raise RuntimeError(f"Albery ответил не-JSON: {exc}") from None
 
     def report_session(self, account: str, status: str, error: str = "") -> None:
         self.post("/api/avito-worker/session", {"account": account, "status": status,
@@ -745,41 +755,14 @@ def command_mirror(args) -> int:
                     print(f"Albery недоступен: {exc}")
                 except Exception as exc:  # noqa: BLE001
                     print(f"сбой обхода: {type(exc).__name__}: {exc}")
-                    albery.report_session(args.account, "error", str(exc)[:300])
+                    # Сообщить о беде — попытка, а не обязанность: когда связи с Albery нет,
+                    # именно этот вызов и падал, унося весь процесс из обработчика ошибки.
+                    try:
+                        albery.report_session(args.account, "error", str(exc)[:300])
+                    except RuntimeError as report_exc:
+                        print(f"  состояние сессии сообщить не удалось: {report_exc}")
 
-                try:
-                    pending = albery.claim_outbox(worker_id, args.account)
-                    for item in pending:
-                        outbox_id = item["outbox_id"]
-                        # Границу побочного эффекта отмечает сервер ДО нажатия «отправить»:
-                        # обрыв во время отправки не должен выглядеть как обрыв до неё.
-                        if not albery.mark_sending(outbox_id, worker_id):
-                            print(f"  строка {outbox_id}: отправлять нельзя, отменена")
-                            continue
-                        chat_id = str(item.get("external_chat_id") or "")
-                        text = str(item.get("text") or "")
-                        try:
-                            if chat_id.startswith("item:"):
-                                # Пишем первыми: чата ещё нет, его создаст Авито в момент
-                                # отправки, и настоящий идентификатор вернём серверу.
-                                ok, detail = start_chat_from_item(page, chat_id[5:], text)
-                            else:
-                                ok, detail = send_message(page, chat_id, text)
-                        except Exception as exc:  # noqa: BLE001
-                            ok, detail = False, f"unknown: {type(exc).__name__}: {exc}"
-                        if ok:
-                            albery.finish(outbox_id, worker_id, "sent", provider_message_id=detail,
-                                          external_chat_id=detail)
-                            print(f"  строка {outbox_id}: отправлено")
-                        else:
-                            # «unknown» — отдельный исход: сообщение могло уйти, и повтор
-                            # показал бы человеку дубль. Такие строки разбирает оператор.
-                            result = "unknown" if detail.startswith("unknown") else "failed"
-                            albery.finish(outbox_id, worker_id, result, error=detail)
-                            print(f"  строка {outbox_id}: {result} — {detail}")
-                        time.sleep(random.uniform(2.0, 5.0))
-                except RuntimeError as exc:
-                    print(f"очередь недоступна: {exc}")
+                drain_outbox(albery, page, worker_id, args.account)
 
                 if args.once:
                     return 0
@@ -789,6 +772,55 @@ def command_mirror(args) -> int:
             return 0
         finally:
             context.close()
+
+
+def drain_outbox(albery, page, worker_id: str, account: str) -> None:
+    """Разбирает очередь отправки за один обход.
+
+    Вынесено из цикла отдельной функцией не ради красоты: пока это был вложенный блок,
+    единственный способ проверить «переживёт ли обход неожиданную ошибку» — поднять
+    браузер. Здесь же граница проверяется прямо, без Playwright.
+
+    Ни одна ошибка отсюда не выходит наружу: обход обязан продолжиться со следующей
+    попытки, а не уронить зеркало на сутки.
+    """
+    try:
+        pending = albery.claim_outbox(worker_id, account)
+        for item in pending:
+            outbox_id = item["outbox_id"]
+            # Границу побочного эффекта отмечает сервер ДО нажатия «отправить»:
+            # обрыв во время отправки не должен выглядеть как обрыв до неё.
+            if not albery.mark_sending(outbox_id, worker_id):
+                print(f"  строка {outbox_id}: отправлять нельзя, отменена")
+                continue
+            chat_id = str(item.get("external_chat_id") or "")
+            text = str(item.get("text") or "")
+            try:
+                if chat_id.startswith("item:"):
+                    # Пишем первыми: чата ещё нет, его создаст Авито в момент
+                    # отправки, и настоящий идентификатор вернём серверу.
+                    ok, detail = start_chat_from_item(page, chat_id[5:], text)
+                else:
+                    ok, detail = send_message(page, chat_id, text)
+            except Exception as exc:  # noqa: BLE001
+                ok, detail = False, f"unknown: {type(exc).__name__}: {exc}"
+            if ok:
+                albery.finish(outbox_id, worker_id, "sent", provider_message_id=detail,
+                              external_chat_id=detail)
+                print(f"  строка {outbox_id}: отправлено")
+            else:
+                # «unknown» — отдельный исход: сообщение могло уйти, и повтор
+                # показал бы человеку дубль. Такие строки разбирает оператор.
+                result = "unknown" if detail.startswith("unknown") else "failed"
+                albery.finish(outbox_id, worker_id, result, error=detail)
+                print(f"  строка {outbox_id}: {result} — {detail}")
+            time.sleep(random.uniform(2.0, 5.0))
+    except RuntimeError as exc:
+        print(f"очередь недоступна: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        # Неожиданное здесь не должно останавливать зеркало: следующий обход через
+        # двадцать секунд, а молчащий канал заметят в лучшем случае через два часа.
+        print(f"сбой разбора очереди: {type(exc).__name__}: {exc}")
 
 
 def main() -> int:
