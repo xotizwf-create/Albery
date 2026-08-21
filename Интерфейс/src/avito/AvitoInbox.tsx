@@ -254,14 +254,35 @@ export function AvitoInbox() {
 
   const addAccount = async () => {
     try {
-      await avitoApi.createAccount({
-        slug: newAccount.slug.trim().toLowerCase(),
+      // Код не передаём: сервер выведет его из названия одним способом для всех входов.
+      const created = await avitoApi.createAccount({
         label: newAccount.label.trim(),
         egress_label: newAccount.egress_label.trim(),
       });
       setNewAccount({ slug: "", label: "", egress_label: "" });
       setShowAccountForm(false);
-      setNotice("Аккаунт добавлен. Вход в Авито выполняет воркер транспорта.");
+      setAccount(created.account.slug);
+      setNotice(
+        'Аккаунт добавлен. Теперь нажмите «Войти в Авито» — на компьютере, где стоит ' +
+          "зеркало, откроется окно браузера.",
+      );
+      await loadState();
+    } catch (err) {
+      report(err);
+    }
+  };
+
+  // Кабинет — страница на сервере, открыть браузер на компьютере человека он не может.
+  // Поэтому кнопка не «открывает окно», а оставляет заявку: воркер, который и так работает
+  // на нужной машине, откроет окно там на ближайшем обходе (не дольше 20 секунд).
+  const requestLogin = async (item: AvitoAccount) => {
+    try {
+      await avitoApi.requestLogin(item.slug, operatorName());
+      setNotice(
+        `Запросили вход в «${item.label}». На компьютере, где работает зеркало, вот-вот ` +
+          "откроется окно браузера: пройдите капчу, войдите и введите код из SMS. " +
+          "Здесь состояние сменится на «сессия жива» само.",
+      );
       await loadState();
     } catch (err) {
       report(err);
@@ -422,10 +443,14 @@ export function AvitoInbox() {
                 <span
                   className={cn(
                     "mt-1 inline-block rounded-md px-1.5 py-0.5 text-[11px] font-bold",
-                    SESSION_LABELS[item.session_status].tone,
+                    item.login_requested_at && item.session_status !== "ok"
+                      ? "bg-amber-50 text-amber-700"
+                      : SESSION_LABELS[item.session_status].tone,
                   )}
                 >
-                  {SESSION_LABELS[item.session_status].text}
+                  {item.login_requested_at && item.session_status !== "ok"
+                    ? "ждём вход на устройстве"
+                    : SESSION_LABELS[item.session_status].text}
                 </span>
               </button>
             ))}
@@ -440,29 +465,27 @@ export function AvitoInbox() {
             {showAccountForm && (
               <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
                 <input
-                  value={newAccount.slug}
-                  onChange={(e) => setNewAccount({ ...newAccount, slug: e.target.value })}
-                  placeholder="код: main"
-                  className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-[13px] font-semibold outline-none focus:border-[#5440F6]"
-                />
-                <input
                   value={newAccount.label}
                   onChange={(e) => setNewAccount({ ...newAccount, label: e.target.value })}
-                  placeholder="название: Основной"
+                  placeholder="Название: Отдел закупок"
+                  autoFocus
                   className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-[13px] font-semibold outline-none focus:border-[#5440F6]"
                 />
                 <input
                   value={newAccount.egress_label}
                   onChange={(e) => setNewAccount({ ...newAccount, egress_label: e.target.value })}
-                  placeholder="выход: компьютер владельца"
+                  placeholder="Чей компьютер (необязательно)"
                   className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-[13px] font-semibold outline-none focus:border-[#5440F6]"
                 />
+                <p className="text-[11px] font-medium text-slate-400">
+                  Код аккаунта придумывать не нужно — он получится из названия.
+                </p>
                 <button
                   onClick={() => void addAccount()}
-                  disabled={!newAccount.slug.trim() || !newAccount.label.trim()}
+                  disabled={!newAccount.label.trim()}
                   className="w-full rounded-lg bg-[#5440F6] px-3 py-2 text-[13px] font-bold text-white transition hover:bg-[#4433d6] disabled:opacity-40"
                 >
-                  Добавить
+                  Добавить и войти
                 </button>
               </div>
             )}
@@ -484,9 +507,30 @@ export function AvitoInbox() {
                   {activeAccount.last_error}
                 </p>
               )}
+              {activeAccount.session_status === "ok" ? (
+                <p className="mt-3 rounded-lg bg-emerald-50 px-2 py-1.5 font-semibold text-emerald-700">
+                  Вход выполнен. Сессия сохранена на сервере — переживёт переустановку системы.
+                </p>
+              ) : (
+                <>
+                  <button
+                    onClick={() => void requestLogin(activeAccount)}
+                    className="mt-3 w-full rounded-lg bg-[#5440F6] px-3 py-2 font-bold text-white transition hover:bg-[#4433d6]"
+                  >
+                    {activeAccount.login_requested_at ? "Открыть окно входа ещё раз" : "Войти в Авито"}
+                  </button>
+                  <p className="mt-2 font-medium text-slate-500">
+                    {activeAccount.login_requested_at
+                      ? "Окно браузера открывается на компьютере, где работает зеркало. " +
+                        "Пройдите там капчу, войдите и введите код из SMS."
+                      : "На компьютере, где работает зеркало, откроется окно браузера. " +
+                        "Войти можно только оттуда: Авито не пускает адреса дата-центров."}
+                  </p>
+                </>
+              )}
               <button
                 onClick={() => void toggleAccount(activeAccount)}
-                className="mt-3 w-full rounded-lg border border-slate-200 px-3 py-1.5 font-bold text-slate-600 transition hover:bg-slate-50"
+                className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-1.5 font-bold text-slate-600 transition hover:bg-slate-50"
               >
                 {activeAccount.is_active ? "Выключить аккаунт" : "Включить аккаунт"}
               </button>

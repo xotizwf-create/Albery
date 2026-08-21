@@ -8,6 +8,8 @@ export type AvitoAccount = {
   session_checked_at?: string | null;
   last_error?: string;
   is_active: boolean;
+  /** Кабинет попросил воркер открыть окно входа; снимается сервером при подтверждённом входе. */
+  login_requested_at?: string | null;
 };
 
 export type AvitoChannelState = {

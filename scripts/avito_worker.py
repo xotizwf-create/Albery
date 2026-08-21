@@ -122,6 +122,9 @@ class Albery:
                   {"account": account, "state": state, "worker_id": worker_id,
                    "avito_user_id": avito_user_id})
 
+    def login_requests(self) -> list[dict[str, Any]]:
+        return list(self.get("/api/avito-worker/login-requests").get("accounts") or [])
+
     def load_session_state(self, account: str) -> dict[str, Any] | None:
         answer = self.get(f"/api/avito-worker/session-state?account={urlparse.quote(account)}")
         return answer.get("state") or None
@@ -369,6 +372,61 @@ def _remember_session(albery, context, page, account: str, worker_id: str = "") 
         print(f"  слепок сессии не сохранён: {exc}")
     except Exception as exc:  # noqa: BLE001
         print(f"  слепок сессии не сохранён: {type(exc).__name__}: {exc}")
+
+
+def serve_login_requests(albery, playwright, *, minutes: int = 15) -> None:
+    """Открывает окно входа для аккаунтов, которым его попросили из кабинета.
+
+    Кабинет живёт на сервере и открыть браузер здесь не может, поэтому он оставляет заявку,
+    а мы — единственные, кто стоит на нужной машине с домашним адресом. Окно открывается
+    ВИДИМЫМ: человеку надо пройти капчу и ввести код из SMS.
+
+    Заявка снимается сервером сама, когда вход подтверждён, — поэтому здесь ничего не
+    «отмечаем выполненным»: не дошёл человек до компьютера, заявка ждёт дальше.
+    """
+    try:
+        requests = albery.login_requests()
+    except RuntimeError as exc:
+        print(f"заявки на вход недоступны: {exc}")
+        return
+    if not requests:
+        return
+
+    for item in requests:
+        slug = str(item.get("slug") or "")
+        if not slug:
+            continue
+        print(f"\n>>> из кабинета просят войти в аккаунт «{item.get('label') or slug}»")
+        context = _browser_context(playwright, slug, headless=False)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(2500)
+
+            if page_state(page) != "ok" and not _restore_from_server(albery, context, page, slug):
+                print("    ОТКРЫТО ОКНО БРАУЗЕРА: пройдите капчу, войдите, введите код из SMS")
+                deadline = time.time() + minutes * 60
+                while time.time() < deadline and page_state(page) != "ok":
+                    time.sleep(5)
+
+            if page_state(page) == "ok":
+                albery.report_session(slug, "ok")
+                _remember_session(albery, context, page, slug, worker_id="login-request")
+                print(f"    вход выполнен, аккаунт {slug} включается — сессия сохранена")
+                try:
+                    albery.post("/api/avito-worker/register",
+                                {"account": slug, "label": item.get("label") or slug,
+                                 "activate": True})
+                except RuntimeError as exc:
+                    print(f"    включить аккаунт не вышло: {exc}")
+            else:
+                status, note, _ = session_report_for(page_state(page))
+                albery.report_session(slug, status, note)
+                print(f"    войти не успели: {note}. Заявка останется — окно откроется снова.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"    сбой окна входа: {type(exc).__name__}: {exc}")
+        finally:
+            context.close()
 
 
 def _slug_from_label(label: str) -> str:
@@ -1015,6 +1073,10 @@ def command_mirror(args) -> int:
 
                 drain_outbox(albery, page, worker_id, args.account)
 
+                # Заявки из кабинета обслуживаем здесь же: эта машина — единственная с
+                # домашним адресом, и открыть окно входа больше некому.
+                serve_login_requests(albery, playwright, minutes=args.login_minutes)
+
                 if args.once:
                     return 0
                 time.sleep(POLL_SECONDS)
@@ -1106,6 +1168,8 @@ def main() -> int:
         if name == "mirror":
             item.add_argument("--once", action="store_true", help="один проход и выход")
             item.add_argument("--show", action="store_true", help="показать окно браузера")
+            item.add_argument("--login-minutes", type=int, default=15,
+                              help="сколько ждать человека, когда из кабинета просят войти")
 
     # Мастер подключения стоит особняком: у остальных команд --account обязателен, а здесь
     # его как раз ещё нет — человек называет аккаунт словами, код выводится сам.

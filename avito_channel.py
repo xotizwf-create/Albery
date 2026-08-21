@@ -89,7 +89,27 @@ def chat_belongs_to_work(*, account: str, chat_id: str) -> bool:
 # --- Аккаунты --------------------------------------------------------------------------------
 
 _ACCOUNT_COLS = ("slug, label, profile_dir, egress_label, session_status, session_checked_at, "
-                 "last_error, is_active, created_at, updated_at")
+                 "last_error, is_active, created_at, updated_at, "
+                 "login_requested_at, login_requested_by")
+
+
+_TRANSLIT = {"а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
+             "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+             "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "c",
+             "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e",
+             "ю": "yu", "я": "ya"}
+
+
+def slug_from_label(label: str) -> str:
+    """Код аккаунта из названия.
+
+    Человек называет аккаунт словами — придумывать латинский код он не должен: поле «код»
+    в форме и было тем, на чём люди спотыкались (21.08.2026 так завелись «1212» и дубль
+    «Рабочий»).
+    """
+    slug = "".join(_TRANSLIT.get(ch, ch) for ch in (label or "").strip().lower())
+    slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")[:63]
+    return slug or f"avito-{uuid.uuid4().hex[:8]}"
 
 
 def list_accounts(*, include_disabled: bool = True) -> list[dict[str, Any]]:
@@ -199,6 +219,32 @@ def set_account_active(slug: str, *, is_active: bool) -> dict[str, Any] | None:
                 return cur.fetchone()
 
 
+def request_login(slug: str, *, requested_by: str = "") -> dict[str, Any] | None:
+    """Кабинет просит воркер открыть окно входа на своей машине."""
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE avito_accounts SET login_requested_at = now(), "
+                    "login_requested_by = %s, updated_at = now() "
+                    f"WHERE slug = %s RETURNING {_ACCOUNT_COLS}",
+                    (requested_by[:200] or None, slug),
+                )
+                return cur.fetchone()
+
+
+def pending_login_requests() -> list[dict[str, Any]]:
+    """Аккаунты, которым ждут вход. Отдаём самую старую заявку первой — по-честному."""
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_ACCOUNT_COLS} FROM avito_accounts "
+                "WHERE login_requested_at IS NOT NULL AND session_status <> 'ok' "
+                "ORDER BY login_requested_at"
+            )
+            return list(cur.fetchall())
+
+
 def set_session_status(slug: str, *, status: str, error: str | None = None) -> dict[str, Any] | None:
     """Состояние веб-сессии пишет воркер транспорта; интерфейс его только показывает."""
     if status not in _SESSION_STATUSES:
@@ -208,9 +254,14 @@ def set_session_status(slug: str, *, status: str, error: str | None = None) -> d
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE avito_accounts SET session_status = %s, last_error = %s, "
-                    "session_checked_at = now(), updated_at = now() "
+                    "session_checked_at = now(), updated_at = now(), "
+                    # Заявку на вход снимает ТОЛЬКО подтверждённый вход. Снять её по факту
+                    # «воркер увидел» нельзя: человек мог не дойти до компьютера, и заявка
+                    # обязана дожить до настоящего входа, а не до попытки.
+                    "login_requested_at = CASE WHEN %s = 'ok' THEN NULL "
+                    "ELSE login_requested_at END "
                     f"WHERE slug = %s RETURNING {_ACCOUNT_COLS}",
-                    (status, (error or "")[:500] or None, slug),
+                    (status, (error or "")[:500] or None, status, slug),
                 )
                 return cur.fetchone()
 
@@ -369,6 +420,7 @@ def avito_state():
                     "session_checked_at": _iso(a["session_checked_at"]),
                     "last_error": a["last_error"] or "",
                     "is_active": bool(a["is_active"]),
+                    "login_requested_at": _iso(a["login_requested_at"]),
                 }
                 for a in accounts
             ],
@@ -383,12 +435,14 @@ def avito_state():
 @avito_bp.post(f"{API_PREFIX}/accounts")
 def avito_account_create():
     body = request.get_json(silent=True) or {}
-    slug = str(body.get("slug") or "").strip().lower()
     label = str(body.get("label") or "").strip()[:_LABEL_MAX]
-    if not _SLUG_RE.match(slug):
-        return _bad("Код аккаунта: латиница, цифры, дефис или подчёркивание, до 63 символов.")
     if not label:
         return _bad("Укажите название аккаунта — его видит оператор в списке.")
+    # Код выводим из названия, если его не прислали: придумывать латинский код человек
+    # не должен, и именно на этом поле спотыкались.
+    slug = str(body.get("slug") or "").strip().lower() or slug_from_label(label)
+    if not _SLUG_RE.match(slug):
+        return _bad("Код аккаунта: латиница, цифры, дефис или подчёркивание, до 63 символов.")
     try:
         account = upsert_account(
             slug=slug, label=label,
@@ -577,6 +631,42 @@ def _guard_worker_routes():
     if is_worker_request(request.path) and not worker_authorized():
         return jsonify({"error": "forbidden"}), 403
     return None
+
+
+@avito_bp.post(f"{API_PREFIX}/accounts/<slug>/login-request")
+def avito_account_login_request(slug: str):
+    """Кнопка «Войти в Авито» в кабинете.
+
+    Кабинет — страница на сервере и открыть браузер на машине человека не может. Поэтому
+    он оставляет заявку, а воркер, который и так работает на нужном компьютере, открывает
+    окно там на ближайшем обходе.
+    """
+    slug = (slug or "").strip().lower()
+    if not get_account(slug):
+        return _bad("Аккаунт не найден.", 404)
+    body = request.get_json(silent=True) or {}
+    try:
+        account = request_login(slug, requested_by=str(body.get("operator_name") or ""))
+        return jsonify({"account": {"slug": account["slug"],
+                                    "login_requested_at": _iso(account["login_requested_at"])}})
+    except Exception:  # noqa: BLE001
+        logging.exception("avito login request failed: %s", slug)
+        return _bad("Не удалось запросить вход.", 500)
+
+
+@avito_bp.get(f"{WORKER_PREFIX}/login-requests")
+def worker_login_requests():
+    """Воркер спрашивает, каким аккаунтам на этой машине нужно открыть окно входа."""
+    try:
+        return jsonify({"accounts": [
+            {"slug": a["slug"], "label": a["label"],
+             "requested_at": _iso(a["login_requested_at"]),
+             "session_status": a["session_status"]}
+            for a in pending_login_requests()
+        ]})
+    except Exception:  # noqa: BLE001
+        logging.exception("avito login requests failed")
+        return _bad("Не удалось прочитать заявки на вход.", 500)
 
 
 @avito_bp.post(f"{WORKER_PREFIX}/register")

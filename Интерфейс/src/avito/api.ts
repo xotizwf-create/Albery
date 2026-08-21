@@ -65,11 +65,19 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 export const avitoApi = {
   getState: () => request<AvitoChannelState>("/state"),
 
-  createAccount: (payload: { slug: string; label: string; egress_label?: string }) =>
+  createAccount: (payload: { label: string; slug?: string; egress_label?: string }) =>
     request<{ account: AvitoAccount }>("/accounts", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+
+  // Кабинет живёт на сервере и открыть браузер на компьютере человека не может. Поэтому он
+  // оставляет заявку, а воркер на нужной машине открывает окно входа сам.
+  requestLogin: (slug: string, operatorName: string) =>
+    request<{ account: { slug: string; login_requested_at: string | null } }>(
+      `/accounts/${encodeURIComponent(slug)}/login-request`,
+      { method: "POST", body: JSON.stringify({ operator_name: operatorName }) },
+    ),
 
   setAccountActive: (slug: string, isActive: boolean) =>
     request<{ account: AvitoAccount }>(`/accounts/${encodeURIComponent(slug)}`, {
