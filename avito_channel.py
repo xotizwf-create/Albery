@@ -219,6 +219,41 @@ def set_account_active(slug: str, *, is_active: bool) -> dict[str, Any] | None:
                 return cur.fetchone()
 
 
+def count_account_conversations(slug: str) -> int:
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM funnel_workspace_conversations "
+                "WHERE source_key = %s AND business_connection_id = %s", (SOURCE_KEY, slug))
+            return int((cur.fetchone() or {}).get("n") or 0)
+
+
+def delete_account(slug: str, *, with_conversations: bool = False) -> dict[str, Any]:
+    """Убирает аккаунт. Переписку уносит только по явному согласию.
+
+    Разговоры привязаны к аккаунту не внешним ключом, а строкой (business_connection_id),
+    поэтому база не помешает оставить их сиротами: они просто исчезнут из кабинета, но
+    останутся в таблицах и будут путать при разборе. Значит решать должен человек, а
+    молчаливое удаление переписки недопустимо — это единственная копия разговора с клиентом.
+    """
+    talks = count_account_conversations(slug)
+    if talks and not with_conversations:
+        return {"deleted": False, "conversations": talks}
+
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if talks:
+                    # Сообщения, очередь и события уходят каскадом за разговором (миграция 070).
+                    cur.execute(
+                        "DELETE FROM funnel_workspace_conversations "
+                        "WHERE source_key = %s AND business_connection_id = %s",
+                        (SOURCE_KEY, slug))
+                # Слепок сессии уходит каскадом за аккаунтом (миграция 091).
+                cur.execute("DELETE FROM avito_accounts WHERE slug = %s", (slug,))
+    return {"deleted": True, "conversations": talks}
+
+
 def request_login(slug: str, *, requested_by: str = "") -> dict[str, Any] | None:
     """Кабинет просит воркер открыть окно входа на своей машине."""
     with pg_connect() as conn:
@@ -631,6 +666,34 @@ def _guard_worker_routes():
     if is_worker_request(request.path) and not worker_authorized():
         return jsonify({"error": "forbidden"}), 403
     return None
+
+
+@avito_bp.delete(f"{API_PREFIX}/accounts/<slug>")
+def avito_account_delete(slug: str):
+    """Убирает аккаунт из кабинета.
+
+    Аккаунт с перепиской по умолчанию НЕ удаляется: отвечаем, сколько разговоров пропадёт,
+    и ждём явного согласия. Переписка с клиентом существует в одном экземпляре, и снести её
+    заодно с аккаунтом «потому что нажали удалить» нельзя.
+    """
+    slug = (slug or "").strip().lower()
+    if not get_account(slug):
+        return _bad("Аккаунт не найден.", 404)
+    with_talks = str(request.args.get("with_conversations") or "").strip() in {"1", "true", "yes"}
+    try:
+        result = delete_account(slug, with_conversations=with_talks)
+    except Exception:  # noqa: BLE001
+        logging.exception("avito account delete failed: %s", slug)
+        return _bad("Не удалось удалить аккаунт.", 500)
+    if not result["deleted"]:
+        return jsonify({
+            "deleted": False,
+            "conversations": result["conversations"],
+            "error": (f"У аккаунта {result['conversations']} переписок. Удаление уберёт их "
+                      f"вместе с сообщениями — это единственная копия. Подтвердите, если "
+                      f"действительно нужно."),
+        }), 409
+    return jsonify({"deleted": True, "conversations": result["conversations"]})
 
 
 @avito_bp.post(f"{API_PREFIX}/accounts/<slug>/login-request")

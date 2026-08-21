@@ -272,6 +272,33 @@ export function AvitoInbox() {
     }
   };
 
+  const removeAccount = async (item: AvitoAccount) => {
+    if (!window.confirm(`Удалить аккаунт «${item.label}»?`)) return;
+    try {
+      await avitoApi.deleteAccount(item.slug);
+      setNotice(`Аккаунт «${item.label}» удалён.`);
+      setAccount("");
+      await loadState();
+    } catch (err) {
+      // 409 — у аккаунта есть переписка. Сервер прислал, сколько именно: спрашиваем
+      // ещё раз, уже с числом, и только потом уносим разговоры вместе с аккаунтом.
+      const conflict = err instanceof AvitoApiError && err.status === 409;
+      if (!conflict) {
+        report(err);
+        return;
+      }
+      if (!window.confirm(`${err.message}\n\nУдалить аккаунт вместе с перепиской?`)) return;
+      try {
+        await avitoApi.deleteAccount(item.slug, true);
+        setNotice(`Аккаунт «${item.label}» удалён вместе с перепиской.`);
+        setAccount("");
+        await loadState();
+      } catch (second) {
+        report(second);
+      }
+    }
+  };
+
   // Кабинет — страница на сервере, открыть браузер на компьютере человека он не может.
   // Поэтому кнопка не «открывает окно», а оставляет заявку: воркер, который и так работает
   // на нужной машине, откроет окно там на ближайшем обходе (не дольше 20 секунд).
@@ -533,6 +560,12 @@ export function AvitoInbox() {
                 className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-1.5 font-bold text-slate-600 transition hover:bg-slate-50"
               >
                 {activeAccount.is_active ? "Выключить аккаунт" : "Включить аккаунт"}
+              </button>
+              <button
+                onClick={() => void removeAccount(activeAccount)}
+                className="mt-2 w-full rounded-lg border border-rose-200 px-3 py-1.5 font-bold text-rose-600 transition hover:bg-rose-50"
+              >
+                Удалить аккаунт
               </button>
             </div>
           )}

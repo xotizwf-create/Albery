@@ -79,6 +79,14 @@ export const avitoApi = {
       { method: "POST", body: JSON.stringify({ operator_name: operatorName }) },
     ),
 
+  // Аккаунт с перепиской сервер по умолчанию не удаляет: отвечает 409 и числом разговоров,
+  // чтобы человек решил осознанно. Переписка с клиентом существует в одном экземпляре.
+  deleteAccount: (slug: string, withConversations = false) =>
+    request<{ deleted: boolean; conversations: number }>(
+      `/accounts/${encodeURIComponent(slug)}${withConversations ? "?with_conversations=1" : ""}`,
+      { method: "DELETE" },
+    ),
+
   setAccountActive: (slug: string, isActive: boolean) =>
     request<{ account: AvitoAccount }>(`/accounts/${encodeURIComponent(slug)}`, {
       method: "PATCH",
