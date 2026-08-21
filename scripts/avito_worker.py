@@ -225,13 +225,148 @@ def _browser_context(playwright, account: str, *, headless: bool):
     )
 
 
-def _logged_in(page) -> bool:
-    """Вошли или нет — по ответу самого сайта, а не по вёрстке.
+# Состояния, которые принимает Albery (см. _SESSION_STATUSES в avito_channel.py).
+SESSION_STATUSES = ("unknown", "ok", "needs_login", "blocked", "error")
 
-    Селекторы Авито меняются без предупреждения, поэтому признаком служит редирект на форму
-    входа: если после открытия мессенджера мы оказались на /login, сессии нет.
+# Стена Авито для подозрительных сессий. Ловим по видимому человеку тексту, а не по вёрстке:
+# разметка меняется без предупреждения, а эти слова — то, что читает владелец на экране.
+BLOCK_MARKERS = ("проблема с ip", "доступ ограничен")
+
+
+def page_state(page) -> str:
+    """Что перед нами на самом деле: 'ok' | 'blocked' | 'login' | 'unknown'.
+
+    Раньше здесь стоял признак «в адресе нет /login — значит вошли». 21.08.2026 он подвёл:
+    Авито отдал стену «Доступ ограничен: проблема с IP», адрес остался /profile/messenger —
+    и проверка сказала, что мы внутри. Отсутствие формы входа НЕ означает вход.
+
+    Настоящий признак один: Авито само называет id вошедшего аккаунта. Всё остальное —
+    «неизвестно», и это честнее, чем оптимистичное «ok».
     """
-    return "/login" not in page.url and "authorize" not in page.url
+    try:
+        url = page.url or ""
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    try:
+        html = (page.content() or "").lower()
+    except Exception:  # noqa: BLE001
+        # Страница умерла — про сессию это не говорит ничего, кроме «не знаем».
+        return "unknown"
+
+    if any(marker in html for marker in BLOCK_MARKERS):
+        return "blocked"
+    # Форма входа Авито живёт по адресу с РЕШЁТКОЙ: https://www.avito.ru/#login?next=…
+    # Прежняя проверка искала «/login» и потому не видела её вовсе — снято с живого
+    # адреса 21.08.2026.
+    if any(marker in url.lower() for marker in ("/login", "#login", "authorize")):
+        return "login"
+    return "ok" if own_user_id(page) else "unknown"
+
+
+def session_report_for(state: str) -> tuple[str, str, bool]:
+    """По состоянию страницы — что доложить Albery и продолжать ли обход.
+
+    Третье значение — «выходить ли воркеру». Выход оправдан только когда без человека
+    дальше никак (просят войти заново). Стена по IP временная: выйти на ней значит
+    остановить канал до тех пор, пока кто-нибудь не заметит.
+    """
+    return {
+        "ok": ("ok", "сессия жива", False),
+        "blocked": ("blocked", "Авито закрыл доступ этому IP — нужна капча", False),
+        "login": ("needs_login", "Авито просит войти заново", True),
+    }.get(state, ("unknown", "страница не похожа ни на вход, ни на мессенджер", False))
+
+
+def _logged_in(page) -> bool:
+    """Совместимость: вошли или нет. Единственный источник правды — page_state."""
+    return page_state(page) == "ok"
+
+
+def _slug_from_label(label: str) -> str:
+    """Код аккаунта из названия: латиницей, чтобы человек не придумывал его сам."""
+    table = {"а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
+             "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+             "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "c",
+             "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e",
+             "ю": "yu", "я": "ya"}
+    slug = "".join(table.get(ch, ch) for ch in label.strip().lower())
+    slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")[:63]
+    return slug or f"avito-{int(time.time())}"
+
+
+def command_connect(args) -> int:
+    """Мастер подключения аккаунта Авито: от названия до работающего зеркала.
+
+    Смысл — чтобы человек подключил свой аккаунт сам, без разработчика. Всё, что можно
+    сделать за него, делается за него; человеку остаётся то, что за него не может сделать
+    никто: пройти капчу и ввести код из SMS со своего телефона.
+    """
+    from playwright.sync_api import sync_playwright
+
+    albery = albery_from_env()
+
+    label = (args.label or "").strip()
+    while not label:
+        label = input("Название аккаунта (как подписать его в кабинете): ").strip()
+    slug = (args.account or "").strip().lower() or _slug_from_label(label)
+
+    print(f"\nАккаунт: {label}  (код: {slug})")
+    try:
+        albery.post("/api/avito-worker/register",
+                    {"account": slug, "label": label, "egress_label": args.egress})
+        print("Аккаунт заведён в Albery — пока выключен, включим после входа.")
+    except RuntimeError as exc:
+        print(f"Не удалось завести аккаунт: {exc}")
+        return 1
+
+    with sync_playwright() as playwright:
+        context = _browser_context(playwright, slug, headless=False)
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(3000)
+
+            if page_state(page) == "ok":
+                print("В этом профиле уже живая сессия — вход не нужен.")
+            else:
+                print("\n" + "=" * 64)
+                print("  ОТКРЫЛОСЬ ОКНО БРАУЗЕРА. Сделайте в нём три вещи:")
+                print("   1. Если просят капчу — нажмите «Продолжить» и пройдите её.")
+                print("   2. Войдите в свой аккаунт Авито.")
+                print("   3. Введите код из SMS.")
+                print(f"\n  Жду до {args.minutes} минут и проверяю сам. Окно не закрывайте.")
+                print("=" * 64 + "\n")
+
+                deadline = time.time() + args.minutes * 60
+                last = ""
+                while time.time() < deadline:
+                    state = page_state(page)
+                    if state == "ok":
+                        break
+                    if state != last:
+                        hint = {"blocked": "Авито просит капчу — нажмите «Продолжить»",
+                                "login": "показана форма входа — войдите и введите код из SMS",
+                                "unknown": "страница ещё не та, продолжаю ждать"}.get(state, state)
+                        print(f"  [{int(deadline - time.time()) // 60} мин] {hint}")
+                        last = state
+                    time.sleep(5)
+
+            if page_state(page) != "ok":
+                print("\nВойти не удалось. Окно можно закрыть и запустить мастер заново.")
+                albery.report_session(slug, *session_report_for(page_state(page))[:2])
+                return 1
+
+            me = own_user_id(page)
+            print(f"\nВход выполнен. Авито подтверждает аккаунт id {me}.")
+        finally:
+            context.close()
+
+    albery.report_session(slug, "ok")
+    albery.post("/api/avito-worker/register",
+                {"account": slug, "label": label, "egress_label": args.egress, "activate": True})
+    print("Аккаунт включён — зеркало будет забирать его переписку.")
+    print(f"\nЗапускать зеркало так:\n  python scripts/avito_worker.py mirror --account {slug}")
+    return 0
 
 
 def command_login(args) -> int:
@@ -733,11 +868,20 @@ def command_mirror(args) -> int:
                 try:
                     page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=90000)
                     page.wait_for_timeout(2500)
-                    if not _logged_in(page):
-                        albery.report_session(args.account, "needs_login",
-                                              "Авито просит войти заново")
-                        print("сессия просрочена — нужен повторный вход (команда login)")
-                        return 1
+                    state = page_state(page)
+                    if state != "ok":
+                        status, note, stop = session_report_for(state)
+                        albery.report_session(args.account, status, note)
+                        print(f"сессия недоступна: {note}")
+                        if stop:
+                            print("нужен повторный вход: python scripts/avito_worker.py "
+                                  f"connect --account {args.account}")
+                            return 1
+                        # Стена по IP и невнятная страница — состояния временные. Выйти на
+                        # них значит остановить канал до тех пор, пока кто-нибудь заметит;
+                        # ждём следующего обхода.
+                        time.sleep(POLL_SECONDS)
+                        continue
                     channels = parse_channels(rpc(page, RPC_CHATS), own_id=own_user_id(page))
                     albery.report_session(args.account, "ok")
                     stored = 0
@@ -856,11 +1000,21 @@ def main() -> int:
             item.add_argument("--once", action="store_true", help="один проход и выход")
             item.add_argument("--show", action="store_true", help="показать окно браузера")
 
+    # Мастер подключения стоит особняком: у остальных команд --account обязателен, а здесь
+    # его как раз ещё нет — человек называет аккаунт словами, код выводится сам.
+    connect = sub.add_parser("connect", help="подключить новый аккаунт Авито (мастер)")
+    connect.add_argument("--label", default="", help="название аккаунта для кабинета")
+    connect.add_argument("--account", default="", help="код аккаунта (по умолчанию из названия)")
+    connect.add_argument("--egress", default="компьютер владельца",
+                         help="откуда идёт выход в Авито — видно оператору")
+    connect.add_argument("--minutes", type=int, default=15,
+                         help="сколько ждать капчу и код из SMS")
+
     args = parser.parse_args()
     handlers = {"login": command_login, "probe": command_probe,
                 "capture": command_capture, "mirror": command_mirror,
                 "inspect-chat": command_inspect_chat, "send": command_send,
-                "search": command_search}
+                "search": command_search, "connect": command_connect}
     return handlers[args.command](args)
 
 

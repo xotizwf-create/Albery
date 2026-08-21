@@ -43,6 +43,90 @@ def test_worker_door_rejects_a_wrong_token(avito, worker):
     assert response.status_code == 403
 
 
+# --- Мастер подключения: заводит аккаунт сам, но включает только после входа -----------
+
+def _wire_accounts(avito, monkeypatch, *, existing=None):
+    """Поддельное хранилище аккаунтов: помним, что просили включить или выключить."""
+    state = {"row": dict(existing) if existing else None, "active_calls": []}
+
+    def _get(slug):
+        return state["row"]
+
+    def _upsert(**kw):
+        state["row"] = {"slug": kw["slug"], "label": kw["label"], "session_status": "unknown",
+                        "is_active": True if state["row"] is None else state["row"]["is_active"]}
+        return state["row"]
+
+    def _set_active(slug, *, is_active):
+        state["active_calls"].append(is_active)
+        state["row"]["is_active"] = is_active
+        return state["row"]
+
+    monkeypatch.setattr(avito, "get_account", _get)
+    monkeypatch.setattr(avito, "upsert_account", _upsert)
+    monkeypatch.setattr(avito, "set_account_active", _set_active)
+    return state
+
+
+def test_a_new_account_is_registered_switched_off(avito, worker, monkeypatch):
+    """Включить заранее — значит отдать воркеру аккаунт без сессии и разбудить сторожа."""
+    state = _wire_accounts(avito, monkeypatch)
+
+    response = worker.post("/api/avito-worker/register",
+                           json={"account": "sklad", "label": "Склад"}, headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.get_json()["account"]["is_active"] is False
+    assert state["active_calls"] == [False]
+
+
+def test_the_account_is_switched_on_only_after_a_confirmed_login(avito, worker, monkeypatch):
+    state = _wire_accounts(avito, monkeypatch)
+
+    worker.post("/api/avito-worker/register",
+                json={"account": "sklad", "label": "Склад"}, headers=HEADERS)
+    response = worker.post("/api/avito-worker/register",
+                           json={"account": "sklad", "label": "Склад", "activate": True},
+                           headers=HEADERS)
+
+    assert response.get_json()["account"]["is_active"] is True
+    assert state["active_calls"] == [False, True]
+
+
+def test_re_running_the_wizard_does_not_switch_off_a_working_account(avito, worker, monkeypatch):
+    """Повторный мастер на живом аккаунте не должен гасить канал."""
+    state = _wire_accounts(avito, monkeypatch,
+                           existing={"slug": "main", "label": "Основной",
+                                     "session_status": "ok", "is_active": True})
+
+    response = worker.post("/api/avito-worker/register",
+                           json={"account": "main", "label": "Основной"}, headers=HEADERS)
+
+    assert response.get_json()["account"]["is_active"] is True
+    assert state["active_calls"] == [], "флаг существующего аккаунта трогать было нельзя"
+
+
+def test_the_account_code_is_validated_at_the_door(avito, worker, monkeypatch):
+    _wire_accounts(avito, monkeypatch)
+
+    bad_slug = worker.post("/api/avito-worker/register",
+                           json={"account": "Склад №1", "label": "Склад"}, headers=HEADERS)
+    no_label = worker.post("/api/avito-worker/register",
+                           json={"account": "sklad", "label": "  "}, headers=HEADERS)
+
+    assert bad_slug.status_code == 400 and no_label.status_code == 400
+
+
+def test_registering_needs_the_worker_token(avito, client, monkeypatch):
+    monkeypatch.setenv("AVITO_WORKER_TOKEN", "тест-токен")
+
+    response = client.post("/api/avito-worker/register",
+                           json={"account": "sklad", "label": "Склад"},
+                           headers={"X-Avito-Worker-Token": "не тот"})
+
+    assert response.status_code == 403
+
+
 def test_worker_door_does_not_need_the_cabinet_session(avito, worker, monkeypatch):
     """Ключевое: у воркера нет сессии кабинета, и общий рубильник /api его не отрезает."""
     monkeypatch.delenv("ALLOW_LEGACY_HTTP_API", raising=False)

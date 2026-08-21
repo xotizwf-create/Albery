@@ -516,6 +516,43 @@ def _guard_worker_routes():
     return None
 
 
+@avito_bp.post(f"{WORKER_PREFIX}/register")
+def worker_register_account():
+    """Мастер подключения заводит аккаунт сам, без похода в базу руками.
+
+    НОВЫЙ аккаунт заводится ВЫКЛЮЧЕННЫМ (колонка is_active по умолчанию true, поэтому
+    гасим явно): пока вход в Авито не подтверждён, воркеру брать его нельзя, иначе сторож
+    начнёт тревожить о мёртвой сессии, которой ещё не было. Включение — отдельным вызовом
+    с `activate: true`, который мастер делает уже ПОСЛЕ успешного входа.
+
+    Существующему аккаунту флаг не трогаем: повторный запуск мастера на работающем
+    аккаунте не должен его гасить, а выключенный руками — не должен воскресать сам.
+    """
+    body = request.get_json(silent=True) or {}
+    slug = str(body.get("account") or body.get("slug") or "").strip().lower()
+    label = str(body.get("label") or "").strip()[:_LABEL_MAX]
+    if not _SLUG_RE.match(slug):
+        return _bad("Код аккаунта: латиница, цифры, дефис или подчёркивание, до 63 символов.")
+    if not label:
+        return _bad("Укажите название аккаунта — его видит оператор в списке.")
+    try:
+        existed = get_account(slug) is not None
+        account = upsert_account(
+            slug=slug, label=label,
+            egress_label=str(body.get("egress_label") or "").strip()[:_LABEL_MAX],
+        )
+        if body.get("activate"):
+            account = set_account_active(slug, is_active=True) or account
+        elif not existed:
+            account = set_account_active(slug, is_active=False) or account
+        return jsonify({"account": {"slug": account["slug"], "label": account["label"],
+                                    "session_status": account["session_status"],
+                                    "is_active": bool(account["is_active"])}})
+    except Exception:  # noqa: BLE001
+        logging.exception("avito worker register failed: %s", slug)
+        return _bad("Не удалось завести аккаунт.", 500)
+
+
 @avito_bp.post(f"{WORKER_PREFIX}/session")
 def worker_session_report():
     body = request.get_json(silent=True) or {}
