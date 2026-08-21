@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import os
 import re
@@ -122,6 +123,68 @@ def upsert_account(*, slug: str, label: str, egress_label: str = "",
                     (slug, label, egress_label or None, profile_dir),
                 )
                 return cur.fetchone()
+
+
+# --- Слепок браузерной сессии ------------------------------------------------------------
+#
+# Браузер обязан работать с домашнего адреса, но профиль на чужой машине — единственная копия
+# входа. Переустановил систему — проходи капчу и SMS заново. Здесь лежит слепок сессии, чтобы
+# вход переживал потерю компьютера.
+#
+# Слепок равносилен доступу к аккаунту, поэтому в базу он попадает только зашифрованным.
+
+class SessionKeyMissing(RuntimeError):
+    """Ключа шифрования нет. Храним слепок ТОЛЬКО зашифрованным — открытым не сохраняем."""
+
+
+def _session_cipher():
+    from cryptography.fernet import Fernet
+
+    key = os.getenv("AVITO_SESSION_KEY", "").strip()
+    if not key:
+        raise SessionKeyMissing(
+            "Не задан AVITO_SESSION_KEY — слепок сессии Авито хранить негде. "
+            "Сгенерировать: python -c \"from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())\" и положить в .env сервера.")
+    return Fernet(key.encode("utf-8"))
+
+
+def save_session_state(slug: str, state: Mapping[str, Any], *,
+                       saved_by: str = "", avito_user_id: str = "") -> dict[str, Any]:
+    blob = _session_cipher().encrypt(json.dumps(dict(state), ensure_ascii=False).encode("utf-8"))
+    with pg_connect() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO avito_sessions (slug, payload, saved_by, avito_user_id) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (slug) DO UPDATE SET payload = EXCLUDED.payload, "
+                    "saved_at = now(), saved_by = EXCLUDED.saved_by, "
+                    "avito_user_id = EXCLUDED.avito_user_id "
+                    "RETURNING slug, saved_at, avito_user_id",
+                    (slug, blob, saved_by or None, avito_user_id or None),
+                )
+                return cur.fetchone()
+
+
+def load_session_state(slug: str) -> dict[str, Any] | None:
+    with pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload, saved_at, avito_user_id FROM avito_sessions "
+                        "WHERE slug = %s", (slug,))
+            row = cur.fetchone()
+    if not row:
+        return None
+    from cryptography.fernet import InvalidToken
+
+    try:
+        state = json.loads(_session_cipher().decrypt(bytes(row["payload"])).decode("utf-8"))
+    except InvalidToken:
+        # Ключ сменили — слепок больше не наш. Молчать нельзя: человек будет думать, что
+        # вход сохранён, а на деле его придётся проходить заново.
+        logging.error("avito session for %s cannot be decrypted: AVITO_SESSION_KEY changed", slug)
+        return None
+    return {"state": state, "saved_at": row["saved_at"], "avito_user_id": row["avito_user_id"]}
 
 
 def set_account_active(slug: str, *, is_active: bool) -> dict[str, Any] | None:
@@ -551,6 +614,51 @@ def worker_register_account():
     except Exception:  # noqa: BLE001
         logging.exception("avito worker register failed: %s", slug)
         return _bad("Не удалось завести аккаунт.", 500)
+
+
+@avito_bp.post(f"{WORKER_PREFIX}/session-state")
+def worker_session_state_save():
+    """Воркер кладёт слепок своей браузерной сессии, чтобы вход пережил потерю машины."""
+    body = request.get_json(silent=True) or {}
+    slug = str(body.get("account") or "").strip().lower()
+    state = body.get("state")
+    if not slug or not isinstance(state, Mapping):
+        return _bad("Нужны account и state (storage_state браузера).")
+    if not get_account(slug):
+        return _bad("Аккаунт не найден.", 404)
+    try:
+        saved = save_session_state(
+            slug, state,
+            saved_by=str(body.get("worker_id") or "")[:200],
+            avito_user_id=str(body.get("avito_user_id") or "")[:64],
+        )
+        return jsonify({"account": saved["slug"], "saved_at": _iso(saved["saved_at"])})
+    except SessionKeyMissing as exc:
+        # Открытым текстом слепок не сохраняем: он равносилен доступу к аккаунту.
+        return _bad(str(exc), 503)
+    except Exception:  # noqa: BLE001
+        logging.exception("avito session state save failed: %s", slug)
+        return _bad("Не удалось сохранить слепок сессии.", 500)
+
+
+@avito_bp.get(f"{WORKER_PREFIX}/session-state")
+def worker_session_state_load():
+    """Воркер забирает слепок, чтобы поднять сессию на чистом профиле без капчи и SMS."""
+    slug = str(request.args.get("account") or "").strip().lower()
+    if not slug:
+        return _bad("Укажите account.")
+    try:
+        stored = load_session_state(slug)
+    except SessionKeyMissing as exc:
+        return _bad(str(exc), 503)
+    except Exception:  # noqa: BLE001
+        logging.exception("avito session state load failed: %s", slug)
+        return _bad("Не удалось прочитать слепок сессии.", 500)
+    if not stored:
+        return jsonify({"account": slug, "state": None})
+    return jsonify({"account": slug, "state": stored["state"],
+                    "saved_at": _iso(stored["saved_at"]),
+                    "avito_user_id": stored["avito_user_id"] or ""})
 
 
 @avito_bp.post(f"{WORKER_PREFIX}/session")

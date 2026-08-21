@@ -59,6 +59,9 @@ for _stream in (sys.stdout, sys.stderr):
 MESSENGER_URL = "https://www.avito.ru/profile/messenger"
 DEFAULT_PROFILES_DIR = Path.home() / ".avito-profiles"
 POLL_SECONDS = 20
+# Как часто освежать слепок сессии на сервере. Обходов 180 в час; писать слепок каждый —
+# значит гонять одни и те же куки в базу без нужды.
+SESSION_SAVE_EVERY_S = 3600
 # Живой человек не открывает тридцать чатов в секунду. Пауза между действиями — не украшение:
 # именно темп отличает нашу сессию от парсера и бережёт аккаунт от блокировки.
 HUMAN_PAUSE_MS = (900, 2100)
@@ -86,6 +89,10 @@ class Albery:
         req = urlrequest.Request(f"{self.base}{path}", data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("X-Avito-Worker-Token", self.token)
+        return self._send(req)
+
+    def _send(self, req) -> dict[str, Any]:
+        """Одна дверь для GET и POST: обрыв связи обязан быть одинаково восстановимым."""
         try:
             with urlrequest.urlopen(req, timeout=60) as response:
                 return json.loads(response.read().decode("utf-8") or "{}")
@@ -103,6 +110,21 @@ class Albery:
         except json.JSONDecodeError as exc:
             # Во время перезапуска nginx отдаёт HTML-страницу ошибки вместо JSON.
             raise RuntimeError(f"Albery ответил не-JSON: {exc}") from None
+
+    def get(self, path: str) -> dict[str, Any]:
+        req = urlrequest.Request(f"{self.base}{path}", method="GET")
+        req.add_header("X-Avito-Worker-Token", self.token)
+        return self._send(req)
+
+    def save_session_state(self, account: str, state: dict[str, Any], *,
+                           worker_id: str = "", avito_user_id: str = "") -> None:
+        self.post("/api/avito-worker/session-state",
+                  {"account": account, "state": state, "worker_id": worker_id,
+                   "avito_user_id": avito_user_id})
+
+    def load_session_state(self, account: str) -> dict[str, Any] | None:
+        answer = self.get(f"/api/avito-worker/session-state?account={urlparse.quote(account)}")
+        return answer.get("state") or None
 
     def report_session(self, account: str, status: str, error: str = "") -> None:
         self.post("/api/avito-worker/session", {"account": account, "status": status,
@@ -282,6 +304,73 @@ def _logged_in(page) -> bool:
     return page_state(page) == "ok"
 
 
+def capture_session(context) -> dict[str, Any]:
+    """Слепок сессии: куки и localStorage в том виде, в каком их отдаёт браузер."""
+    return context.storage_state()
+
+
+def apply_session(context, state: Mapping[str, Any]) -> None:
+    """Поднимает сессию из слепка в чистом профиле.
+
+    Куки ставятся в контекст целиком. localStorage так поставить нельзя — он привязан к
+    источнику, поэтому для каждого источника открываем страницу и кладём значения там же.
+    Без localStorage Авито считает вход неполным и всё равно уводит на форму.
+    """
+    cookies = list(state.get("cookies") or [])
+    if cookies:
+        context.add_cookies(cookies)
+
+    page = context.pages[0] if context.pages else context.new_page()
+    for origin in state.get("origins") or []:
+        url = str(origin.get("origin") or "")
+        items = origin.get("localStorage") or []
+        if not url or not items:
+            continue
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.evaluate(
+                "items => { for (const it of items) localStorage.setItem(it.name, it.value); }",
+                items)
+        except Exception as exc:  # noqa: BLE001
+            # Один источник не поднялся — это не повод бросать восстановление целиком.
+            print(f"  localStorage для {url} не восстановлен: {type(exc).__name__}")
+
+
+def _restore_from_server(albery, context, page, account: str) -> bool:
+    """Пробует поднять сессию со слепка на сервере. True — если после этого мы внутри."""
+    try:
+        state = albery.load_session_state(account)
+    except RuntimeError as exc:
+        print(f"  слепок сессии недоступен: {exc}")
+        return False
+    if not state:
+        return False
+    print("  на сервере есть сохранённая сессия — восстанавливаю")
+    try:
+        apply_session(context, state)
+        page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(2500)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  восстановить не вышло: {type(exc).__name__}: {exc}")
+        return False
+    if page_state(page) == "ok":
+        print("  сессия поднята из слепка — вход руками не нужен")
+        return True
+    print("  слепок больше не годится (Авито закрыл сессию) — нужен вход руками")
+    return False
+
+
+def _remember_session(albery, context, page, account: str, worker_id: str = "") -> None:
+    """Кладёт свежий слепок на сервер. Не критично: не вышло — работаем дальше."""
+    try:
+        albery.save_session_state(account, capture_session(context),
+                                  worker_id=worker_id, avito_user_id=own_user_id(page))
+    except RuntimeError as exc:
+        print(f"  слепок сессии не сохранён: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  слепок сессии не сохранён: {type(exc).__name__}: {exc}")
+
+
 def _slug_from_label(label: str) -> str:
     """Код аккаунта из названия: латиницей, чтобы человек не придумывал его сам."""
     table = {"а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
@@ -328,6 +417,8 @@ def command_connect(args) -> int:
 
             if page_state(page) == "ok":
                 print("В этом профиле уже живая сессия — вход не нужен.")
+            elif _restore_from_server(albery, context, page, slug):
+                pass  # подняли из слепка: ни капчи, ни SMS
             else:
                 print("\n" + "=" * 64)
                 print("  ОТКРЫЛОСЬ ОКНО БРАУЗЕРА. Сделайте в нём три вещи:")
@@ -358,6 +449,10 @@ def command_connect(args) -> int:
 
             me = own_user_id(page)
             print(f"\nВход выполнен. Авито подтверждает аккаунт id {me}.")
+            # Слепок кладём СРАЗУ: если этот компьютер пропадёт, вход не придётся
+            # проходить заново — ни капчи, ни SMS.
+            _remember_session(albery, context, page, slug, worker_id="connect")
+            print("Слепок сессии сохранён на сервере — вход переживёт потерю компьютера.")
         finally:
             context.close()
 
@@ -858,6 +953,7 @@ def command_mirror(args) -> int:
 
     albery = albery_from_env()
     worker_id = f"avito-worker:{os.getenv('COMPUTERNAME') or 'pc'}:{os.getpid()}"
+    last_saved = time.time()  # только что поднялись — слепок освежим через час работы
     print(f"Зеркало запущено ({worker_id}). Аккаунт: {args.account}. Ctrl+C — остановка.")
 
     with sync_playwright() as playwright:
@@ -869,6 +965,11 @@ def command_mirror(args) -> int:
                     page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=90000)
                     page.wait_for_timeout(2500)
                     state = page_state(page)
+                    if state == "login" and _restore_from_server(albery, context, page,
+                                                                 args.account):
+                        # Сессия в профиле протухла, а на сервере лежит живой слепок:
+                        # поднимаем и продолжаем, не дёргая человека капчей и SMS.
+                        state = page_state(page)
                     if state != "ok":
                         status, note, stop = session_report_for(state)
                         albery.report_session(args.account, status, note)
@@ -895,6 +996,12 @@ def command_mirror(args) -> int:
                             print(f"  разговор {stitched.get('conversation_id')}: "
                                   f"{stitched.get('action')} -> {channel['external_chat_id']}")
                     print(f"переписок: {len(channels)}, новых сообщений: {stored}")
+                    # Куки Авито обновляет по ходу работы, поэтому слепок освежаем — но
+                    # раз в час, а не каждый обход: обходов 180 в час, и лишние записи в
+                    # базу ради тех же данных не нужны никому.
+                    if time.time() - last_saved > SESSION_SAVE_EVERY_S:
+                        _remember_session(albery, context, page, args.account, worker_id)
+                        last_saved = time.time()
                 except RuntimeError as exc:
                     print(f"Albery недоступен: {exc}")
                 except Exception as exc:  # noqa: BLE001
